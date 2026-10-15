@@ -200,6 +200,40 @@ pub fn tab_of<'a>(tabs: &'a [Tab], layout: &LayoutMap, chart_id: &str) -> Option
     Some(named.unwrap_or(first).id.as_str())
 }
 
+/// Write the first tab on every tile that names none (`BI-18` part C review
+/// fix (BLOCKER) R1). A tile with no tab falls back to the first tab BY POSITION
+/// when it is read, so leaving it untagged lets a reorder of the tabs carry it
+/// to whatever tab is first afterwards. Called on every write of a board's
+/// layout or tabs with `before`, the tabs as stored before the write: those
+/// tiles are on `before`'s first tab; only a board that had no tabs takes the
+/// first of `after`. A tab that `after` no longer has falls back to `after`'s
+/// first. A board that ends with no tabs has no tile naming one. Returns whether
+/// a tile was changed.
+pub fn stamp_untagged(layout: &mut LayoutMap, before: &[Tab], after: &[Tab]) -> bool {
+    let Some(first_after) = after.first() else {
+        // A board with no tabs has tiles that name none (deleting the last tab
+        // can reach here after the layout write stamped them).
+        let mut changed = false;
+        for tile in layout.values_mut().filter(|t| t.tab.is_some()) {
+            tile.tab = None;
+            changed = true;
+        }
+        return changed;
+    };
+    let target = before
+        .first()
+        .filter(|b| after.iter().any(|t| t.id == b.id))
+        .unwrap_or(first_after)
+        .id
+        .clone();
+    let mut changed = false;
+    for tile in layout.values_mut().filter(|t| t.tab.is_none()) {
+        tile.tab = Some(target.clone());
+        changed = true;
+    }
+    changed
+}
+
 /// The filters a tile on `tab` is given.
 #[must_use]
 pub fn filters_for_tab(filters: &[FilterDef], tab: Option<&str>) -> Vec<FilterDef> {
@@ -372,6 +406,15 @@ pub fn move_to_tab(
         return Err("that tab does not exist.".to_owned());
     }
     let moving: HashSet<&str> = chart_ids.iter().map(String::as_str).collect();
+    // Where each moved tile was, and on which tab, to close the space it leaves.
+    let holes: Vec<((i32, i32, i32, i32), String)> = chart_ids
+        .iter()
+        .filter_map(|id| {
+            let t = layout.get(id)?;
+            let from = tab_of(tabs, layout, id)?;
+            (from != tab).then(|| ((t.x, t.w, t.y, t.h), from.to_owned()))
+        })
+        .collect();
     let mut y = bottom_of_tab(tabs, layout, tab, &moving);
     let mut out = layout.clone();
     for id in chart_ids {
@@ -388,7 +431,74 @@ pub fn move_to_tab(
         y += tile.h;
         out.insert(id.clone(), tile);
     }
+    // BI-18 part C review fix (SHOULD-FIX) R4: the space a tile leaves on the
+    // tab it came from is closed.
+    for (rect, from) in &holes {
+        let peers: Vec<String> = out
+            .keys()
+            .filter(|id| !moving.contains(id.as_str()))
+            .filter(|id| tab_of(tabs, &out, id) == Some(from.as_str()))
+            .cloned()
+            .collect();
+        close_space(&mut out, *rect, &peers);
+    }
     Ok(out)
+}
+
+/// Move the `peers` that sit below `rect` (x, w, top, h: the space a tile
+/// left) and over any of its columns up to its top, as far as the tiles above
+/// them let them (`BI-18` part C review fix (SHOULD-FIX) R4, R9). Used when a
+/// tile leaves a tab or is deleted; the general rule that a layout save pulls
+/// nothing up stays, so a gap the user made by hand is kept.
+pub fn close_space(layout: &mut LayoutMap, rect: (i32, i32, i32, i32), peers: &[String]) {
+    let (x, w, top, h) = rect;
+    let mut below: Vec<&String> = peers
+        .iter()
+        .filter(|id| {
+            layout
+                .get(id.as_str())
+                .is_some_and(|t| t.y >= top + h && t.x < x + w && t.x + t.w > x)
+        })
+        .collect();
+    below.sort_by_key(|id| layout[id.as_str()].y);
+    for id in below {
+        let tile = layout[id.as_str()].clone();
+        let floor = peers
+            .iter()
+            .filter(|other| *other != id)
+            .filter_map(|other| layout.get(other.as_str()))
+            .filter(|o| o.y < tile.y && o.x < tile.x + tile.w && o.x + o.w > tile.x)
+            .map(|o| o.y + o.h)
+            .max()
+            .unwrap_or(0)
+            .max(top);
+        if floor < tile.y
+            && let Some(slot) = layout.get_mut(id.as_str())
+        {
+            slot.y = floor;
+        }
+    }
+}
+
+/// The layout without the tile of a deleted chart, the tiles under it moved up
+/// to close its space on its tab (`BI-18` part C review fix (SHOULD-FIX) R9).
+/// A chart with no tile changes nothing.
+#[must_use]
+pub fn without_tile(tabs: &[Tab], layout: &LayoutMap, chart_id: &str) -> LayoutMap {
+    let Some(gone) = layout.get(chart_id) else {
+        return layout.clone();
+    };
+    let rect = (gone.x, gone.w, gone.y, gone.h);
+    let tab = tab_of(tabs, layout, chart_id).map(str::to_owned);
+    let mut out = layout.clone();
+    out.shift_remove(chart_id);
+    let peers: Vec<String> = out
+        .keys()
+        .filter(|id| tab_of(tabs, &out, id).map(str::to_owned) == tab)
+        .cloned()
+        .collect();
+    close_space(&mut out, rect, &peers);
+    out
 }
 
 /// What deleting a tab leaves: the tabs, the layout and the filters.
@@ -747,5 +857,148 @@ mod tests {
         assert_eq!(next[1], tab("t_b", "Maps"));
         assert!(rename_tab(&tabs, "t_b", "").is_err());
         assert!(rename_tab(&tabs, "gone", "x").is_err());
+    }
+
+    fn tiles(names: &[(&str, Option<&str>)]) -> LayoutMap {
+        names
+            .iter()
+            .map(|(id, t)| ((*id).to_owned(), tile(*t)))
+            .collect()
+    }
+
+    /// BI-18 part C review fix (BLOCKER) R1: the three-tile board of the QA.
+    /// Tabs A and B are added, one tile moves to B, then B moves left: A keeps
+    /// its two tiles and B its one.
+    #[test]
+    fn reordering_tabs_leaves_each_tile_on_the_tab_it_showed_on() {
+        let (a, b) = (tab("t_a", "A"), tab("t_b", "B"));
+        let mut layout = tiles(&[("c1", None), ("c2", None), ("c3", None)]);
+        // The first tab is added: every tile is stamped with it.
+        assert!(stamp_untagged(&mut layout, &[], std::slice::from_ref(&a)));
+        let two = vec![a, b];
+        let layout = move_to_tab(&two, &layout, "t_b", &["c3".to_owned()]).unwrap();
+        // Legacy: a stored board whose tiles name nothing, then B moves left.
+        let mut legacy = tiles(&[("c1", None), ("c2", None), ("c3", Some("t_b"))]);
+        let reordered = reorder_tabs(&two, &["t_b".to_owned(), "t_a".to_owned()]).unwrap();
+        assert!(stamp_untagged(&mut legacy, &two, &reordered));
+        for (l, tabs) in [(&layout, &reordered), (&legacy, &reordered)] {
+            assert_eq!(tab_of(tabs, l, "c1"), Some("t_a"));
+            assert_eq!(tab_of(tabs, l, "c2"), Some("t_a"));
+            assert_eq!(tab_of(tabs, l, "c3"), Some("t_b"));
+            // A filter tied to B is not given to A's tiles after the reorder.
+            let tied_to_b = tied(Some(&["t_b"]));
+            let filters = [tied_to_b];
+            assert!(filters_for_chart(&filters, tabs, l, "c1").is_empty());
+            assert!(filters_for_chart(&filters, tabs, l, "c2").is_empty());
+            assert_eq!(filters_for_chart(&filters, tabs, l, "c3").len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_first_tab_is_the_one_before_the_write_and_a_deleted_one_falls_back() {
+        let (a, b) = (tab("t_a", "A"), tab("t_b", "B"));
+        let mut layout = tiles(&[("c1", None), ("c2", Some("t_b"))]);
+        assert!(stamp_untagged(
+            &mut layout,
+            &[a.clone(), b.clone()],
+            &[b.clone(), a.clone()]
+        ));
+        assert_eq!(layout["c1"].tab.as_deref(), Some("t_a"));
+        let mut gone = tiles(&[("c1", None)]);
+        assert!(stamp_untagged(&mut gone, &[a], &[b]));
+        assert_eq!(gone["c1"].tab.as_deref(), Some("t_b"));
+        let mut stamped = tiles(&[("c1", Some("t_b"))]);
+        assert!(!stamp_untagged(&mut stamped, &[], &[tab("t_b", "B")]));
+    }
+
+    #[test]
+    fn a_board_with_no_tabs_has_tiles_that_name_none() {
+        let mut layout = tiles(&[("c1", Some("t_a")), ("c2", None)]);
+        assert!(stamp_untagged(&mut layout, &[tab("t_a", "A")], &[]));
+        assert!(layout.values().all(|t| t.tab.is_none()));
+        assert!(!stamp_untagged(&mut layout, &[], &[]));
+    }
+
+    fn at(x: i32, y: i32, w: i32, h: i32, tab: &str) -> TileBox {
+        TileBox {
+            x,
+            y,
+            w,
+            h,
+            tab: Some(tab.to_owned()),
+        }
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R4: the choropleth at the top of
+    /// Overview moves to Maps; what was below it moves up into its space, a tile
+    /// beside it that did not sit below it stays, and nothing overlaps.
+    #[test]
+    fn moving_a_tile_to_another_tab_closes_the_space_it_leaves() {
+        let tabs = vec![tab("t_a", "Overview"), tab("t_b", "Maps")];
+        let layout: LayoutMap = [
+            ("map", at(0, 0, 12, 6, "t_a")),
+            ("kpi", at(0, 6, 6, 4, "t_a")),
+            ("bar", at(6, 6, 6, 4, "t_a")),
+            ("low", at(0, 10, 6, 4, "t_a")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let out = move_to_tab(&tabs, &layout, "t_b", &["map".to_owned()]).unwrap();
+        assert_eq!((out["map"].tab.as_deref(), out["map"].y), (Some("t_b"), 0));
+        assert_eq!(out["kpi"].y, 0);
+        assert_eq!(out["bar"].y, 0);
+        assert_eq!(out["low"].y, 4, "stays under the tile that moved up");
+    }
+
+    #[test]
+    fn a_gap_the_user_made_and_a_move_within_a_tab_are_left_alone() {
+        let tabs = vec![tab("t_a", "A"), tab("t_b", "B")];
+        let layout: LayoutMap = [
+            ("one", at(0, 0, 6, 4, "t_a")),
+            ("gap", at(0, 20, 6, 4, "t_a")),
+            ("two", at(0, 0, 6, 4, "t_b")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        // Moving `two` onto B again leaves no hole; `gap` on A is untouched.
+        let out = move_to_tab(&tabs, &layout, "t_b", &["two".to_owned()]).unwrap();
+        assert_eq!(out["gap"].y, 20);
+        // A tile that was not under the one that left does not move.
+        let out = move_to_tab(&tabs, &layout, "t_b", &["one".to_owned()]).unwrap();
+        assert_eq!(out["gap"].y, 0, "it was under it, so it closes up");
+        let beside: LayoutMap = [("a", at(0, 0, 6, 4, "t_a")), ("b", at(6, 8, 6, 4, "t_a"))]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        let out = move_to_tab(&tabs, &beside, "t_b", &["a".to_owned()]).unwrap();
+        assert_eq!(out["b"].y, 8);
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R9: deleting a chart removes its tile
+    /// and closes the space on its tab, like a move to another tab does.
+    #[test]
+    fn deleting_a_chart_drops_its_tile_and_closes_the_space_on_its_tab() {
+        let tabs = vec![tab("t_a", "A"), tab("t_b", "B")];
+        let layout: LayoutMap = [
+            ("map", at(0, 0, 12, 6, "t_a")),
+            ("kpi", at(0, 6, 6, 4, "t_a")),
+            ("other", at(0, 6, 6, 4, "t_b")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let out = without_tile(&tabs, &layout, "map");
+        assert!(!out.contains_key("map"));
+        assert_eq!(out["kpi"].y, 0);
+        assert_eq!(out["other"].y, 6, "another tab is not touched");
+        // No tabs: every tile is a peer.
+        let plain: LayoutMap = [("a", tile(None)), ("b", TileBox { y: 6, ..tile(None) })]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        assert_eq!(without_tile(&[], &plain, "a")["b"].y, 0);
+        assert_eq!(without_tile(&[], &plain, "zz"), plain);
     }
 }

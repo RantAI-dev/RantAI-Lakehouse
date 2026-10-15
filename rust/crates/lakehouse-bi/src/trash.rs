@@ -17,9 +17,10 @@
 //! Restoring a dashboard brings back exactly the charts its delete took
 //! (`deleted_with = <board>`), charts first so a failure in the middle leaves
 //! the dashboard in the trash to retry. Restoring a chart on its own puts the
-//! row back; if its dashboard is still in the trash it reappears with the
-//! dashboard ([`crate::access::Viewer::chart_clause`] hides a chart on a
-//! trashed board), and if the dashboard is gone it is a chart on no dashboard.
+//! row back, unless its dashboard is in the trash too: then it is refused
+//! ([`DASHBOARD_IN_TRASH`]), because restoring the dashboard does not bring back
+//! a chart deleted before it. If the dashboard is gone it is a chart on no
+//! dashboard.
 //! The route requires `dashboard:write`, the permission that deletes.
 //!
 //! # Sweep
@@ -52,6 +53,11 @@ const LIST_LIMIT: usize = 200;
 /// Said when the item is not in the trash for this viewer: unknown id, already
 /// restored, removed for good, or somebody else's private draft.
 const NOT_IN_TRASH: &str = "That item is not in the trash.";
+
+/// Said when a chart is restored while its dashboard is in the trash too
+/// (`BI-18` part C review fix (SHOULD-FIX) R10). The route answers it as a 409.
+pub const DASHBOARD_IN_TRASH: &str =
+    "Its dashboard is in the trash too: restore the dashboard first.";
 
 /// One item in the trash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -174,6 +180,32 @@ fn id_list(ids: &[String]) -> String {
         .map(|i| SqlLiteral::from(i.as_str()).to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The ids of the charts of dashboard `board` that are in the trash (deleted on
+/// their own, or with the dashboard at some time). The version revert uses it to
+/// tell a chart that can come back from one removed for good.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn trashed_chart_ids(
+    ch: &ChClient,
+    board: &str,
+) -> Result<std::collections::HashSet<String>, ChError> {
+    ensure_bi_table(ch).await?;
+    Ok(ch
+        .rows(
+            &format!(
+                "SELECT id FROM console.bi_chart FINAL WHERE is_deleted = 2 AND board = {}",
+                SqlLiteral::from(board)
+            ),
+            None,
+        )
+        .await?
+        .iter()
+        .map(|r| row_str(r, "id").to_owned())
+        .collect())
 }
 
 /// Everything in the trash that `viewer` may see: dashboards, and charts that
@@ -353,7 +385,6 @@ pub async fn restore_chart(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<R
         return Err(BiError::Validation(NOT_IN_TRASH.to_owned()));
     };
     let board = row_str(row, "board").to_owned();
-    ch.exec(&restore_chart_statement(id), None).await?;
     let board_state = if board.is_empty() || board == DEFAULT_BOARD_ID {
         "live"
     } else {
@@ -368,6 +399,13 @@ pub async fn restore_chart(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<R
             .await?;
         board_state_of(state.first().and_then(|r| row_state(r, "is_deleted")))
     };
+    // BI-18 part C review fix (SHOULD-FIX) R10: a chart deleted on its own
+    // while its dashboard is in the trash too is restored after the dashboard,
+    // which does not bring it back; the entry says so and this refuses.
+    if board_state == "trash" {
+        return Err(BiError::Validation(DASHBOARD_IN_TRASH.to_owned()));
+    }
+    ch.exec(&restore_chart_statement(id), None).await?;
     Ok(Restored {
         kind: "chart",
         id: id.to_owned(),

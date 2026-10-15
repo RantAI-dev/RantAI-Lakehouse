@@ -372,4 +372,114 @@ mod tests {
         );
         assert!(sent.iter().all(|s| !s.trim_start().starts_with("INSERT")));
     }
+
+    use wiremock::matchers::body_string_contains;
+
+    /// A board `b1` with tabs A and B, two tiles naming none and one on B.
+    async fn tabbed_state(server: &MockServer) -> AppState {
+        let board = json!({
+            "id": "b1", "name": "B", "description": "", "created_by": "t",
+            "layout_json": r#"{"c1":{"x":0,"y":0,"w":6,"h":4},"c2":{"x":0,"y":4,"w":6,"h":4},"c3":{"x":6,"y":0,"w":6,"h":4,"tab":"t_b"}}"#,
+            "tabs_json": r#"[{"id":"t_a","title":"A"},{"id":"t_b","title":"B"}]"#,
+            "filters_json": "[]", "created_at": "2026-10-14 00:00:00",
+        });
+        let chart = |id: &str| {
+            let spec = json!({ "id": id, "title": id, "kind": "bar", "mart": "m", "sql": "SELECT 1", "x": "d", "y": "v" });
+            json!({
+                "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": {} }).to_string(),
+            })
+        };
+        let rules: Vec<(&str, Vec<Value>)> = vec![
+            (
+                "SELECT is_deleted, owner_id FROM console.bi_board",
+                vec![json!({ "is_deleted": 0, "owner_id": "" })],
+            ),
+            (
+                "FROM console.bi_board FINAL WHERE is_deleted = 0",
+                vec![board],
+            ),
+            (
+                "FROM console.bi_chart FINAL",
+                vec![chart("c1"), chart("c2"), chart("c3")],
+            ),
+        ];
+        for (needle, data) in rules {
+            Mock::given(method("POST"))
+                .and(body_string_contains(needle))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+        let env = HashMap::from([
+            ("CH_URL".to_owned(), server.uri()),
+            (
+                "DATABASE_URL".to_owned(),
+                "not a connection string".to_owned(),
+            ),
+        ]);
+        AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    async fn last_board_insert(server: &MockServer) -> String {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .rfind(|s| s.contains("INSERT INTO console.bi_board ("))
+            .expect("the board was saved")
+    }
+
+    fn tab_count(insert: &str, tab: &str) -> usize {
+        insert.matches(&format!(r#""tab":"{tab}""#)).count()
+    }
+
+    /// BI-18 part C review fix (BLOCKER) R1, assistant path: `move_tab` moves B
+    /// to the front; A keeps its two tiles and B its one.
+    #[tokio::test]
+    async fn move_tab_leaves_each_tile_on_the_tab_it_showed_on() {
+        let server = MockServer::start().await;
+        let state = tabbed_state(&server).await;
+        let mut a = args();
+        a.insert("tab".to_owned(), json!("t_b"));
+        a.insert("position".to_owned(), json!(1));
+        let reply = run(&state, Some(&person()), "move_tab", &a).await;
+        assert_eq!(reply["moved"], json!(true), "{reply}");
+        let insert = last_board_insert(&server).await;
+        assert_eq!(tab_count(&insert, "t_a"), 2, "{insert}");
+        // The `t_b` in the tab list is `"id"`, not a tile's `"tab"`.
+        assert_eq!(tab_count(&insert, "t_b"), 1, "{insert}");
+    }
+
+    /// `move_charts_to_tab` stamps the tiles it does not move, and closes the
+    /// space the moved tile leaves on its source tab (R4).
+    #[tokio::test]
+    async fn move_charts_to_tab_stamps_the_others_and_closes_the_space_it_leaves() {
+        let server = MockServer::start().await;
+        let state = tabbed_state(&server).await;
+        let mut a = args();
+        a.insert("tab".to_owned(), json!("t_b"));
+        a.insert("chartIds".to_owned(), json!(["c1"]));
+        let reply = run(&state, Some(&person()), "move_charts_to_tab", &a).await;
+        assert_eq!(reply["moved"], json!(true), "{reply}");
+        let insert = last_board_insert(&server).await;
+        // c2 stays on A (stamped), c1 and c3 are on B.
+        assert!(
+            insert.contains(r#""c2":{"x":0,"y":0,"w":6,"h":4,"tab":"t_a"}"#),
+            "{insert}"
+        );
+        assert!(insert.contains(r#""c1":{"x":0,"y":4"#), "{insert}");
+    }
 }

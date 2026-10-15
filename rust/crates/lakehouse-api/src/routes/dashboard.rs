@@ -32,8 +32,8 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::dashboard_organise::{
-    require_board, require_chart_board, require_editable_chart, snapshot, viewer_of,
-    visible_live_chart_board,
+    drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
+    snapshot, viewer_of, visible_live_chart_board,
 };
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
@@ -431,7 +431,13 @@ async fn get_body(
 
     let mut boards_out = vec![json!({ "id": "default", "name": "Main" })];
     for b in &boards {
-        boards_out.push(json!({ "id": b.id, "name": b.name, "folderId": b.folder_id }));
+        let mut entry = json!({ "id": b.id, "name": b.name, "folderId": b.folder_id });
+        // BI-18 part C review fix (SHOULD-FIX) R11: the page needs to know a
+        // dashboard is in a personal space; the key is absent for every other.
+        if let (Some(owner), Some(map)) = (&b.owner_id, entry.as_object_mut()) {
+            map.insert("ownerId".to_owned(), json!(owner));
+        }
+        boards_out.push(entry);
     }
 
     let kpis_out: Vec<Value> = if on_default {
@@ -689,6 +695,7 @@ pub async fn specs_create(
                 upstream_error::FailedAs::BadRequest,
             )
         })?;
+    place_new_chart(&state.clickhouse, &spec.board, &spec.spec.id).await;
     snapshot(&state.clickhouse, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
@@ -917,6 +924,7 @@ pub async fn specs_delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
+    drop_tile(ch, &board, &id).await;
     snapshot(ch, &board, &principal).await;
     Ok(ApiJson(json!({ "ok": true })))
 }

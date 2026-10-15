@@ -23,8 +23,12 @@
 //! The API route re-checks the stored state against today's rules before it
 //! writes anything (a column or metric that no longer exists makes the whole
 //! revert fail with a plain sentence) and then writes the state back as a NEW
-//! version, so going back is itself undoable. Charts deleted since come back
-//! only from the trash; charts added since move to the trash.
+//! version, labelled "Restored v<n>" ([`record`]'s `label`), so going back is
+//! itself undoable. Every chart the version had comes back: one deleted since is
+//! taken out of the trash (`BI-18` part C review fix (BLOCKER) R7, which
+//! withdrew the first decision that it would not); one removed from the trash
+//! for good cannot, and the revert names it and leaves its tile out. Charts
+//! added since move to the trash.
 
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
@@ -110,7 +114,8 @@ pub struct VersionEntry {
     pub author: String,
     /// When, `ClickHouse`-formatted.
     pub at: String,
-    /// What changed against the version before it, in a few words.
+    /// What changed against the version before it, in a few words, or the label
+    /// the version was written with ("Restored v2" for a revert).
     pub summary: String,
     /// Charts on the dashboard in this version.
     pub charts: usize,
@@ -189,6 +194,8 @@ pub async fn capture(ch: &ChClient, id: &str) -> Result<Option<BoardState>, ChEr
 }
 
 /// Write a version of dashboard `id` if its content differs from the last one.
+/// `label` names it when the change is not best described by what differs (a
+/// revert is "Restored v2", `BI-18` part C review fix (SHOULD-FIX) R8).
 /// Returns the new number, `None` when nothing changed or the board is not
 /// live. Call it once per request, after the change succeeded.
 ///
@@ -196,7 +203,12 @@ pub async fn capture(ch: &ChClient, id: &str) -> Result<Option<BoardState>, ChEr
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure (the caller logs it: a
 /// history write that fails must not fail the change that already happened).
-pub async fn record(ch: &ChClient, id: &str, author: &Author) -> Result<Option<u32>, ChError> {
+pub async fn record(
+    ch: &ChClient,
+    id: &str,
+    author: &Author,
+    label: Option<&str>,
+) -> Result<Option<u32>, ChError> {
     // The built-in dashboard is code plus a saved layout; it keeps no history.
     if id == DEFAULT_BOARD_ID {
         return Ok(None);
@@ -235,12 +247,13 @@ pub async fn record(ch: &ChClient, id: &str, author: &Author) -> Result<Option<u
     let next = top.first().map_or(0, |r| row_u32(r, "v")) + 1;
     ch.exec(
         &format!(
-            "INSERT INTO console.bi_board_version (board, version, state_json, author_id, author_name) \
-             VALUES ({}, {next}, {}, {}, {})",
+            "INSERT INTO console.bi_board_version (board, version, state_json, author_id, author_name, label) \
+             VALUES ({}, {next}, {}, {}, {}, {})",
             SqlLiteral::from(id),
             SqlLiteral::from(json),
             SqlLiteral::from(author.id.as_str()),
             SqlLiteral::from(author.name.as_str()),
+            SqlLiteral::from(label.unwrap_or("")),
         ),
         None,
     )
@@ -292,7 +305,7 @@ pub async fn list(ch: &ChClient, id: &str) -> Result<Vec<VersionEntry>, ChError>
     let rows = ch
         .rows(
             &format!(
-                "SELECT version, author_name, toString(created_at) AS created_at, state_json \
+                "SELECT version, author_name, label, toString(created_at) AS created_at, state_json \
                  FROM console.bi_board_version FINAL WHERE board = {} AND is_deleted = 0 \
                  ORDER BY version DESC LIMIT {}",
                 SqlLiteral::from(id),
@@ -316,7 +329,10 @@ pub async fn list(ch: &ChClient, id: &str) -> Result<Vec<VersionEntry>, ChError>
                 version: row_u32(r, "version"),
                 author: row_str(r, "author_name").to_owned(),
                 at: row_str(r, "created_at").to_owned(),
-                summary: now.map_or_else(String::new, |n| describe_change(before, n)),
+                summary: match row_str(r, "label") {
+                    "" => now.map_or_else(String::new, |n| describe_change(before, n)),
+                    label => label.to_owned(),
+                },
                 charts: now.map_or(0, |n| n.charts.len()),
             }
         })

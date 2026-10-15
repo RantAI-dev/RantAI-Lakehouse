@@ -896,6 +896,13 @@ async fn ensure_organise_tables(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // A version written by a revert is labelled "Restored v<n>" (BI-18 part C
+    // review fix (SHOULD-FIX) R8); every other version leaves it empty.
+    ch.exec(
+        "ALTER TABLE console.bi_board_version ADD COLUMN IF NOT EXISTS label String DEFAULT ''",
+        None,
+    )
+    .await?;
     // Favourites and recent items per user (`crate::items`).
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_user_item (\n\
@@ -1265,6 +1272,19 @@ async fn save_board_patch(
     let grain = patch.grain.or(board.grain.as_deref()).unwrap_or("");
     let params = patch.params.or(board.params.as_deref()).unwrap_or_default();
     let tabs = patch.tabs.or(board.tabs.as_deref()).unwrap_or_default();
+    // BI-18 part C review fix (BLOCKER) R1: no tile of a tabbed board is left
+    // naming no tab, whatever this write was for. The first tab is the one the
+    // board had BEFORE this write.
+    let mut stamped = layout.clone();
+    let layout = if crate::layout::stamp_untagged(
+        &mut stamped,
+        board.tabs.as_deref().unwrap_or_default(),
+        tabs,
+    ) {
+        &stamped
+    } else {
+        layout
+    };
     let phone_layout = patch
         .phone_layout
         .or(board.phone_layout.as_deref())
@@ -1625,6 +1645,75 @@ pub async fn update_board_phone_layout(
     Ok(())
 }
 
+/// Give a chart just added to a board with tabs a tile on the first tab, so
+/// its tab is written at creation and a later reorder of the tabs cannot move
+/// it (`BI-18` part C review fix (BLOCKER) R1). A board without tabs, a chart
+/// that already has a tile (the console places it on the selected tab next) and
+/// a board that cannot be found are left as they are.
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn place_new_chart(ch: &ChClient, board_id: &str, chart_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let Some(board) = get_board(ch, board_id, &Viewer::system()).await? else {
+        return Ok(());
+    };
+    let tabs = board.tabs.clone().unwrap_or_default();
+    let layout = board.layout.clone().unwrap_or_default();
+    let (Some(first), false) = (tabs.first(), layout.contains_key(chart_id)) else {
+        return Ok(());
+    };
+    // A half-width tile below what is on that tab, as a move would make it.
+    let placed = crate::layout::move_to_tab(&tabs, &layout, &first.id, &[chart_id.to_owned()])
+        .map_err(BiError::Validation)?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            layout: Some(&placed),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Take a deleted chart's tile out of its board's layout and close the space it
+/// leaves on its tab (`BI-18` part C review fix (SHOULD-FIX) R9). A board with
+/// no tile for it, or none at all, is left as it is. When the chart comes back
+/// from the trash it is placed like a new one ([`place_new_chart`]).
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn drop_tile_of_deleted_chart(
+    ch: &ChClient,
+    board_id: &str,
+    chart_id: &str,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let Some(board) = get_board(ch, board_id, &Viewer::system()).await? else {
+        return Ok(());
+    };
+    let layout = board.layout.clone().unwrap_or_default();
+    if !layout.contains_key(chart_id) {
+        return Ok(());
+    }
+    let tabs = board.tabs.clone().unwrap_or_default();
+    let after = crate::layout::without_tile(&tabs, &layout, chart_id);
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            layout: Some(&after),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// The content of a board that a version holds, borrowed for
 /// [`restore_board_fields`].
 pub struct BoardFields<'a> {
@@ -1669,13 +1758,19 @@ pub async fn restore_board_fields(
         None if id == DEFAULT_BOARD_ID => shell_board(id),
         None => return Err(BiError::Validation("dashboard not found.".to_owned())),
     };
+    // BI-18 part C review fix (BLOCKER) R1: a version saved before tiles were
+    // stamped holds tiles that name no tab; they sat on THAT version's first
+    // tab, not on the live board's, so they are stamped with it here, before
+    // the save would stamp them with the live one.
+    let mut layout = fields.layout.clone();
+    crate::layout::stamp_untagged(&mut layout, fields.tabs, fields.tabs);
     save_board_patch(
         ch,
         &board,
         BoardPatch {
             name: Some(fields.name),
             description: Some(fields.description),
-            layout: Some(fields.layout),
+            layout: Some(&layout),
             filters: Some(fields.filters),
             refresh_seconds: Some(fields.refresh_seconds.unwrap_or(0)),
             grain: Some(fields.grain),
@@ -4728,12 +4823,13 @@ mod tests {
         // 24 = those 22 plus the BI-2 `console.bi_metric` and
         // `console.bi_segment` tables. 26 = those 24 plus the BI-18 part C
         // `bi_board.tabs_json` and `bi_board.phone_layout_json` columns.
+        // 36 = those 35 plus the `bi_board_version.label` column (review fix R8).
         // 35 = those 26 plus part 2: three trash/owner columns on `bi_board`,
         // three on `bi_chart`, `bi_folder.owner_id`, and the
         // `console.bi_board_version` and `console.bi_user_item` tables.
         assert_eq!(
-            first_call_requests, 35,
-            "first call should issue all 35 DDL statements"
+            first_call_requests, 36,
+            "first call should issue all 36 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();

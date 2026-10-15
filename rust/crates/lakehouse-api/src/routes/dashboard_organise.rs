@@ -144,23 +144,44 @@ pub(crate) async fn require_chart_board(
     }
 }
 
+/// Give a chart just created on `board` its tab (`BI-18` part C review fix
+/// (BLOCKER) R1). A failure is logged under a reference and swallowed: the chart
+/// exists, and the read still shows an untagged tile on the first tab.
+pub(crate) async fn place_new_chart(ch: &ChClient, board: &str, chart: &str) {
+    if let Err(BiError::Clickhouse(cause)) = store::place_new_chart(ch, board, chart).await {
+        let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cause);
+    }
+}
+
+/// Take a deleted chart's tile out of the layout and close its space (`BI-18`
+/// part C review fix (SHOULD-FIX) R9). A failure is logged and swallowed, as for
+/// [`place_new_chart`]: the chart is already in the trash.
+pub(crate) async fn drop_tile(ch: &ChClient, board: &str, chart: &str) {
+    if let Err(BiError::Clickhouse(cause)) =
+        store::drop_tile_of_deleted_chart(ch, board, chart).await
+    {
+        let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cause);
+    }
+}
+
 /// Write a version of `board` after a successful change. A history write that
 /// fails is logged under a reference and swallowed: the change it describes
 /// has already happened and must not be reported as failed.
 pub(crate) async fn snapshot(ch: &ChClient, board: &str, principal: &Principal) {
-    let _ = snapshot_version(ch, board, Some(principal)).await;
+    let _ = snapshot_version(ch, board, Some(principal), None).await;
 }
 
 /// [`snapshot`] for a change made with no signed-in person attached (the
 /// assistant's tools outside a session): recorded as the assistant.
 pub(crate) async fn snapshot_as(ch: &ChClient, board: &str, principal: Option<&Principal>) {
-    let _ = snapshot_version(ch, board, principal).await;
+    let _ = snapshot_version(ch, board, principal, None).await;
 }
 
 async fn snapshot_version(
     ch: &ChClient,
     board: &str,
     principal: Option<&Principal>,
+    label: Option<&str>,
 ) -> Option<u32> {
     let author = principal.map_or_else(
         || Author {
@@ -169,7 +190,7 @@ async fn snapshot_version(
         },
         author_of,
     );
-    match versions::record(ch, board, &author).await {
+    match versions::record(ch, board, &author, label).await {
         Ok(number) => number,
         Err(err) => {
             let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
@@ -362,9 +383,12 @@ fn cannot_go_back(version: u32, reason: &str) -> ApiError {
 struct RevertPlan {
     /// Charts to write, rebuilt and run once.
     charts: Vec<StoredChartSpec>,
-    /// Titles of charts the version had that are not on the dashboard now
-    /// (deleted since): they come back only from the trash.
-    skipped: Vec<String>,
+    /// Titles of charts the version had that were in the trash: they are taken
+    /// out of it by the write (`BI-18` part C review fix (BLOCKER) R7).
+    restored: Vec<String>,
+    /// Titles of charts the version had that were removed from the trash for
+    /// good: they cannot come back, and their tiles are left out.
+    gone: Vec<String>,
     /// Ids of charts on the dashboard now that the version did not have.
     added_since: Vec<String>,
     /// The layout and phone layout with the tiles of skipped charts removed.
@@ -416,11 +440,14 @@ async fn prepare_revert(
         .filter(|c| c.board == board)
         .collect();
     let live_ids: HashSet<&str> = live.iter().map(|c| c.spec.id.as_str()).collect();
+    let trashed = trash::trashed_chart_ids(ch, board)
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
     let kept_ids: HashSet<&str> = state
         .charts
         .iter()
         .map(|c| c.id.as_str())
-        .filter(|id| live_ids.contains(id))
+        .filter(|id| live_ids.contains(id) || trashed.contains(*id))
         .collect();
     let layout: store::LayoutMap = state
         .layout
@@ -448,11 +475,15 @@ async fn prepare_revert(
         .unwrap_or_default();
 
     let mut charts = Vec::new();
-    let mut skipped = Vec::new();
+    let mut restored = Vec::new();
+    let mut gone = Vec::new();
     for chart in &state.charts {
         if !kept_ids.contains(chart.id.as_str()) {
-            skipped.push(chart.title.clone());
+            gone.push(chart.title.clone());
             continue;
+        }
+        if !live_ids.contains(chart.id.as_str()) {
+            restored.push(chart.title.clone());
         }
         charts.push(rebuild_chart(ch, chart, board, number, time).await?);
     }
@@ -463,7 +494,8 @@ async fn prepare_revert(
         .collect();
     Ok(RevertPlan {
         charts,
-        skipped,
+        restored,
+        gone,
         added_since,
         layout,
         phone_layout,
@@ -563,6 +595,8 @@ pub async fn revert(
     let plan = prepare_revert(ch, &stored, id, body.version, &time).await?;
     // Past this line nothing is refused for the content's sake; a failing
     // write is a store failure and the same request can be sent again.
+    // A chart that was in the trash comes out of it here: the new row has the
+    // defaults (`is_deleted = 0`, no `deleted_*`), and is the newest of its id.
     for chart in &plan.charts {
         store::insert_chart_unchecked(ch, chart)
             .await
@@ -590,13 +624,16 @@ pub async fn revert(
     )
     .await
     .map_err(|err| classify_bi_error(&err))?;
-    let version = snapshot_version(ch, id, Some(&principal)).await;
+    // R8: the version a revert writes says what it is.
+    let label = format!("Restored v{}", body.version);
+    let version = snapshot_version(ch, id, Some(&principal), Some(&label)).await;
     Ok(ApiJson(json!({
         "ok": true,
         "restoredFrom": body.version,
         "version": version,
         "chartsRemoved": plan.added_since.len(),
-        "chartsNotBrought": plan.skipped,
+        "chartsRestored": plan.restored,
+        "chartsGone": plan.gone,
     })))
 }
 
@@ -657,6 +694,11 @@ pub async fn trash_restore(
     }
     .map_err(|err| match err {
         // "Not in the trash" is our own sentence; make it a 404.
+        // R10: a chart whose dashboard is in the trash too is a conflict, not a
+        // missing item.
+        BiError::Validation(message) if message == trash::DASHBOARD_IN_TRASH => {
+            ApiError::Conflict(message)
+        }
         BiError::Validation(message) => ApiError::NotFound(message),
         BiError::Clickhouse(cause) => classify_ch_error(&cause),
     })?;
@@ -669,6 +711,8 @@ pub async fn trash_restore(
                 .await
                 .map_err(|err| classify_ch_error(&err))?
             {
+                // Its tile was taken out of the layout when it was deleted.
+                place_new_chart(ch, &board, id).await;
                 snapshot(ch, &board, &principal).await;
             }
         }

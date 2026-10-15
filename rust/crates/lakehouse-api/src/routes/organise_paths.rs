@@ -22,6 +22,7 @@ use lakehouse_core::ApiError;
 use serde_json::{Value, json};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+use super::super::dashboard_organise::trash_restore;
 use super::typed_filters::{chart_row, client, statements};
 use super::{
     DashboardQuery, GrainRequest, RecordsQuery, TableExportQuery, ValuesQuery, boards_delete,
@@ -1062,7 +1063,7 @@ async fn the_built_in_dashboard_keeps_no_history_and_cannot_be_reverted() {
         name: "x".into(),
     };
     assert_eq!(
-        lakehouse_bi::versions::record(&ch, "default", &author)
+        lakehouse_bi::versions::record(&ch, "default", &author, None)
             .await
             .unwrap(),
         None
@@ -1108,7 +1109,7 @@ async fn a_version_is_written_only_for_a_change_and_only_fifteen_are_kept() {
     )]))
     .await;
     assert_eq!(
-        lakehouse_bi::versions::record(&client(&unchanged), "b1", &author)
+        lakehouse_bi::versions::record(&client(&unchanged), "b1", &author, None)
             .await
             .unwrap(),
         None
@@ -1128,7 +1129,7 @@ async fn a_version_is_written_only_for_a_change_and_only_fifteen_are_kept() {
     ]))
     .await;
     assert_eq!(
-        lakehouse_bi::versions::record(&client(&changed), "b1", &author)
+        lakehouse_bi::versions::record(&client(&changed), "b1", &author, None)
             .await
             .unwrap(),
         Some(17)
@@ -1473,6 +1474,424 @@ async fn a_sql_source_used_by_a_private_chart_cannot_be_deleted_and_the_chart_is
         "{:?}",
         writes(&server).await
     );
+}
+
+// ── BI-18 part C review fix (BLOCKER) R1: no tile is left naming no tab ──
+
+const T_A: &str = r#"{"id":"t_a","title":"A"}"#;
+const T_B: &str = r#"{"id":"t_b","title":"B"}"#;
+
+/// Board `b1` as stored: three tiles, two of them naming no tab.
+fn untagged_board(tabs: &str) -> Value {
+    let mut b = board_row("b1", "");
+    b["layout_json"] = json!(
+        r#"{"c1":{"x":0,"y":0,"w":6,"h":4},"c2":{"x":6,"y":0,"w":6,"h":4},"c3":{"x":0,"y":4,"w":6,"h":4,"tab":"t_b"}}"#
+    );
+    b["tabs_json"] = json!(tabs);
+    if tabs == "[]" {
+        // A board with no tabs has no tile naming one.
+        b["layout_json"] = json!(
+            r#"{"c1":{"x":0,"y":0,"w":6,"h":4},"c2":{"x":6,"y":0,"w":6,"h":4},"c3":{"x":0,"y":4,"w":6,"h":4}}"#
+        );
+    }
+    b
+}
+
+fn tile_of(insert: &str, id: &str, tab: &str) -> bool {
+    insert.contains(&format!(r#""{id}":{{"x":"#)) && {
+        let at = insert.find(&format!(r#""{id}":{{"#)).unwrap();
+        let tile = &insert[at..insert[at..].find('}').unwrap() + at];
+        tile.contains(&format!(r#""tab":"{tab}""#))
+    }
+}
+
+async fn board_server() -> MockServer {
+    engine(vec![
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board(&format!("[{T_A},{T_B}]"))],
+        ),
+    ])
+    .await
+}
+
+fn last_board_write(written: &[String]) -> &String {
+    written
+        .iter()
+        .rev()
+        .find(|s| s.contains("INTO console.bi_board ("))
+        .expect("the board was saved")
+}
+
+fn assert_tiles_stayed(insert: &str) {
+    assert!(tile_of(insert, "c1", "t_a"), "{insert}");
+    assert!(tile_of(insert, "c2", "t_a"), "{insert}");
+    assert!(tile_of(insert, "c3", "t_b"), "{insert}");
+}
+
+/// Console path: Maps moves left; the tiles that named no tab were on the first
+/// tab as stored (A), and are written as A before the order changes.
+#[tokio::test]
+async fn the_console_save_that_reorders_tabs_stamps_untagged_tiles_with_the_stored_first_tab() {
+    let server = board_server().await;
+    let body = json!({ "id": "b1", "tabs": [
+        { "id": "t_b", "title": "B" }, { "id": "t_a", "title": "A" } ] });
+    boards_update(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        body.to_string().into(),
+    )
+    .await
+    .done("saved");
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    assert_tiles_stayed(board);
+    // The order itself was written.
+    assert!(
+        board.find(r#""id":"t_b""#) < board.find(r#""id":"t_a""#),
+        "{board}"
+    );
+}
+
+/// Creating the first tab stamps every tile with it.
+#[tokio::test]
+async fn creating_the_first_tab_stamps_every_tile() {
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board("[]")],
+        ),
+    ])
+    .await;
+    let body = json!({ "id": "b1", "tabs": [{ "id": "t_a", "title": "A" }] });
+    boards_update(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        body.to_string().into(),
+    )
+    .await
+    .done("saved");
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    for id in ["c1", "c2", "c3"] {
+        assert!(tile_of(board, id, "t_a"), "{id}: {board}");
+    }
+}
+
+/// A chart added to a board with tabs gets its tab when it is created.
+#[tokio::test]
+async fn a_chart_added_to_a_tabbed_board_gets_its_tab_at_creation() {
+    let server = board_server().await;
+    let ch = client(&server);
+    lakehouse_bi::store::place_new_chart(&ch, "b1", "u_new")
+        .await
+        .unwrap();
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    assert!(tile_of(board, "u_new", "t_a"), "{board}");
+    assert_tiles_stayed(board);
+    // A board without tabs, and a chart that has a tile, are left alone.
+    let none = engine(vec![(
+        &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+        vec![untagged_board("[]")],
+    )])
+    .await;
+    lakehouse_bi::store::place_new_chart(&client(&none), "b1", "u_new")
+        .await
+        .unwrap();
+    lakehouse_bi::store::place_new_chart(&ch, "b1", "c1")
+        .await
+        .unwrap();
+    assert!(writes(&none).await.is_empty());
+    assert_eq!(writes(&server).await.len(), 1);
+}
+
+/// A duplicate of an unstamped tabbed board names its tab on every tile.
+#[tokio::test]
+async fn a_duplicate_of_a_tabbed_board_names_the_tab_of_every_tile() {
+    let server = engine(vec![
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board(&format!("[{T_A},{T_B}]"))],
+        ),
+        (
+            &[
+                "SELECT id, spec_json, board, created_by",
+                "FROM console.bi_chart FINAL",
+            ],
+            vec![
+                chart_row("c1", "b1", "mart_a", None),
+                chart_row("c2", "b1", "mart_a", None),
+                chart_row("c3", "b1", "mart_a", None),
+            ],
+        ),
+    ])
+    .await;
+    let ch = client(&server);
+    let copy = lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::system())
+        .await
+        .unwrap();
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    let tags = board.matches(r#""tab":"t_a""#).count();
+    assert_eq!(tags, 2, "{board}");
+    assert_eq!(board.matches(r#""tab":"t_b""#).count(), 1, "{board}");
+    assert!(board.contains(&copy.id));
+}
+
+/// Going back to a version saved before the stamping: its untagged tiles were on
+/// ITS first tab (B), not the live board's (A).
+#[tokio::test]
+async fn going_back_to_an_unstamped_version_keeps_every_tile_on_the_tab_it_showed_on() {
+    let mut state = one_chart_state("provinsi", "hotels");
+    state.tabs = vec![
+        lakehouse_bi::layout::Tab {
+            id: "t_b".into(),
+            title: "B".into(),
+        },
+        lakehouse_bi::layout::Tab {
+            id: "t_a".into(),
+            title: "A".into(),
+        },
+    ];
+    state.layout =
+        serde_json::from_value(json!({ "c1": { "x": 0, "y": 0, "w": 6, "h": 4 } })).unwrap();
+    let mut rules = history_rules(
+        &state,
+        vec![
+            json!({ "name": "provinsi", "type": "String" }),
+            json!({ "name": "hotels", "type": "UInt32" }),
+        ],
+    );
+    // The live board has the tabs in the other order.
+    rules.retain(|(n, _)| !n[0].contains("id='b1'"));
+    rules.push((
+        vec!["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+        vec![untagged_board(&format!("[{T_A},{T_B}]"))],
+    ));
+    let server = history_server(rules).await;
+    assert!(revert_to(&server, 2).await.is_ok(), "not restored");
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    assert!(tile_of(board, "c1", "t_b"), "{board}");
+}
+
+// ── BI-18 part C review fixes R7 to R10 ─────────────────────────────────
+
+/// The rules of a revert to version 2 of board `b1` whose one chart `c1` is
+/// not live: `trashed` says whether it is in the trash.
+fn trash_rules(trashed: bool) -> Vec<(Vec<&'static str>, Vec<Value>)> {
+    let mut state = one_chart_state("provinsi", "hotels");
+    state.layout =
+        serde_json::from_value(json!({ "c1": { "x": 0, "y": 0, "w": 6, "h": 4 } })).unwrap();
+    let mut rules = history_rules(
+        &state,
+        vec![
+            json!({ "name": "provinsi", "type": "String" }),
+            json!({ "name": "hotels", "type": "UInt32" }),
+        ],
+    );
+    rules.retain(|(n, _)| !n.contains(&"SELECT id, spec_json, board, created_by"));
+    rules.insert(
+        0,
+        (
+            vec!["SELECT id FROM console.bi_chart FINAL WHERE is_deleted = 2"],
+            if trashed {
+                vec![json!({ "id": "c1" })]
+            } else {
+                vec![]
+            },
+        ),
+    );
+    rules
+}
+
+/// R7: a chart the version had that is in the trash comes back with the revert:
+/// written live, named in the answer, its tile in the written layout.
+#[tokio::test]
+async fn going_back_brings_back_a_chart_that_is_in_the_trash() {
+    let server = history_server(trash_rules(true)).await;
+    let done = match revert_to(&server, 2).await {
+        Ok(done) => done,
+        Err(response) => panic!("not restored: {}", text_of(response).await),
+    };
+    assert_eq!(done["chartsRestored"], json!(["Hotels"]));
+    assert_eq!(done["chartsGone"], json!([]));
+    let written = writes(&server).await;
+    let chart = written
+        .iter()
+        .position(|s| s.contains("INTO console.bi_chart"))
+        .unwrap();
+    let board = written
+        .iter()
+        .position(|s| s.contains("INTO console.bi_board ("))
+        .unwrap();
+    assert!(chart < board, "{written:?}");
+    // A plain insert: the new row has the defaults, so it is live.
+    assert!(!written[chart].contains("is_deleted"), "{}", written[chart]);
+    assert!(
+        written[board].contains(r#""c1":{"x":0,"y":0,"w":6,"h":4}"#),
+        "{}",
+        written[board]
+    );
+    // R8: the version it writes says where it came from.
+    let version = written
+        .iter()
+        .find(|s| s.contains("INTO console.bi_board_version"))
+        .unwrap();
+    assert!(version.contains("'Restored v2'"), "{version}");
+}
+
+/// R7: a chart removed from the trash for good cannot come back; the revert
+/// still succeeds, names it, and its tile is not in the layout.
+#[tokio::test]
+async fn going_back_names_a_chart_that_was_removed_for_good_and_leaves_no_hole() {
+    let server = history_server(trash_rules(false)).await;
+    let done = match revert_to(&server, 2).await {
+        Ok(done) => done,
+        Err(response) => panic!("not restored: {}", text_of(response).await),
+    };
+    assert_eq!(done["chartsGone"], json!(["Hotels"]));
+    assert_eq!(done["chartsRestored"], json!([]));
+    let written = writes(&server).await;
+    assert!(
+        written.iter().all(|s| !s.contains("INTO console.bi_chart")),
+        "{written:?}"
+    );
+    let board = last_board_write(&written);
+    assert!(!board.contains(r#""c1":"#), "{board}");
+}
+
+/// R8, and the question about dragging: a layout save (what a drag in edit mode
+/// sends) records a version.
+#[tokio::test]
+async fn a_layout_save_by_dragging_records_a_version() {
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["SELECT version, state_json FROM console.bi_board_version"],
+            vec![json!({ "version": 1, "state_json": "{}" })],
+        ),
+        (&["SELECT max(version) AS v"], vec![json!({ "v": 1 })]),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board("[]")],
+        ),
+    ])
+    .await;
+    boards_update(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        json!({ "id": "b1", "layout": { "c1": { "x": 3, "y": 0, "w": 6, "h": 4 } } })
+            .to_string()
+            .into(),
+    )
+    .await
+    .done("saved");
+    let written = writes(&server).await;
+    let version = written
+        .iter()
+        .find(|s| s.contains("INTO console.bi_board_version"))
+        .expect("a version");
+    assert!(version.contains("VALUES ('b1', 2,"), "{version}");
+}
+
+/// R9: deleting a chart closes the space its tile leaves.
+#[tokio::test]
+async fn deleting_a_chart_closes_the_space_its_tile_leaves() {
+    let mut board = board_row("b1", "");
+    board["layout_json"] =
+        json!(r#"{"map":{"x":0,"y":0,"w":12,"h":6},"kpi":{"x":0,"y":6,"w":6,"h":4}}"#);
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, board FROM console.bi_chart"],
+            vec![json!({ "is_deleted": 0, "board": "b1" })],
+        ),
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![board],
+        ),
+    ])
+    .await;
+    specs_delete(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        Query(serde_json::from_value(json!({ "id": "map" })).unwrap()),
+    )
+    .await
+    .done("deleted");
+    let written = writes(&server).await;
+    let saved = last_board_write(&written);
+    assert!(
+        saved.contains(r#""kpi":{"x":0,"y":0,"w":6,"h":4}"#),
+        "{saved}"
+    );
+    assert!(!saved.contains(r#""map":"#), "{saved}");
+}
+
+/// R10: a chart deleted on its own while its dashboard is in the trash is
+/// refused, with a 409 and the sentence the entry shows; nothing is written.
+#[tokio::test]
+async fn restoring_a_chart_whose_dashboard_is_in_the_trash_is_a_conflict() {
+    let server = engine(vec![
+        (
+            &["SELECT id, board FROM console.bi_chart FINAL WHERE is_deleted = 2"],
+            vec![json!({ "id": "c1", "board": "b1" })],
+        ),
+        (
+            &["SELECT is_deleted FROM console.bi_board"],
+            vec![json!({ "is_deleted": 2 })],
+        ),
+    ])
+    .await;
+    let outcome = trash_restore(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        json!({ "kind": "chart", "id": "c1" }).to_string().into(),
+    )
+    .await;
+    let response = axum::response::IntoResponse::into_response(match outcome {
+        Err(rejection) => rejection,
+        Ok(_) => panic!("must be refused"),
+    });
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let body = text_of(response).await;
+    assert_eq!(
+        body["error"],
+        "Its dashboard is in the trash too: restore the dashboard first."
+    );
+    assert!(writes(&server).await.is_empty());
+}
+
+/// R11: the payload's board list says which dashboard is private, so the page
+/// can show it; a shared dashboard has no `ownerId` key.
+#[tokio::test]
+async fn the_payload_names_the_owner_of_a_private_dashboard_and_only_that() {
+    let server = engine(vec![(
+        &["FROM console.bi_board FINAL WHERE is_deleted = 0"],
+        vec![board_row("b_shared", ""), board_row("b_draft", &id_of(ME))],
+    )])
+    .await;
+    let body = payload(&server, &Viewer::user(id_of(ME), false), "b_draft").await;
+    let boards = body["boards"].as_array().unwrap();
+    let find = |id: &str| boards.iter().find(|b| b["id"] == id).unwrap();
+    assert_eq!(find("b_draft")["ownerId"], json!(id_of(ME)));
+    assert!(find("b_shared").get("ownerId").is_none());
 }
 
 // ── The real engine (scratch database) ─────────────────────────────────
@@ -1824,18 +2243,28 @@ mod engine {
             trash::restore_board(&ch, &shared.id, &you).await.is_err(),
             "twice is refused"
         );
-        // A chart restored while its dashboard is in the trash waits for it.
+        // R10: a chart deleted on its own while its dashboard is in the trash
+        // too is not restored before the dashboard, and the dashboard's restore
+        // does not bring it back.
         let c_wait = add_chart(&ch, &shared.id, "Waits for the board").await;
         store::delete_chart(&ch, &c_wait, "Me").await.unwrap();
         store::delete_board(&ch, &shared.id, "Me").await.unwrap();
-        let restored = trash::restore_chart(&ch, &c_wait, &you).await.unwrap();
-        assert_eq!(restored.board_state, "trash");
-        assert!(
-            !chart_ids(&ch, &system).await.contains(&c_wait),
-            "invisible until the board returns"
-        );
+        let refusal = trash::restore_chart(&ch, &c_wait, &you).await.unwrap_err();
+        assert_eq!(refusal.to_string(), trash::DASHBOARD_IN_TRASH);
+        let listed = trash::list_trash(&ch, &you).await.unwrap();
+        let entry = listed
+            .iter()
+            .find(|t| t.id == c_wait)
+            .expect("its own entry");
+        assert_eq!(entry.board_state, "trash");
         let back = trash::restore_board(&ch, &shared.id, &you).await.unwrap();
         assert_eq!(back.charts, 1, "only the chart the board's delete took");
+        assert!(
+            !chart_ids(&ch, &you).await.contains(&c_wait),
+            "deleted on its own: still in the trash"
+        );
+        let restored = trash::restore_chart(&ch, &c_wait, &you).await.unwrap();
+        assert_eq!(restored.board_state, "live");
         assert!(chart_ids(&ch, &you).await.contains(&c_wait));
         // Deleting the draft's chart earlier must not come back with the draft.
         store::delete_board(&ch, &draft.id, "Me").await.unwrap();
@@ -1868,7 +2297,7 @@ mod engine {
             .unwrap();
         let c_old = add_chart(&ch, &old.id, "Old chart").await;
         assert!(
-            versions::record(&ch, &old.id, &author("Me"))
+            versions::record(&ch, &old.id, &author("Me"), None)
                 .await
                 .unwrap()
                 .is_some()
@@ -1919,13 +2348,13 @@ mod engine {
         // ── Version history ──────────────────────────────────────────────
         let hist = store::create_board(&ch, "History", "", "Me").await.unwrap();
         assert_eq!(
-            versions::record(&ch, &hist.id, &author("Ann"))
+            versions::record(&ch, &hist.id, &author("Ann"), None)
                 .await
                 .unwrap(),
             Some(1)
         );
         assert_eq!(
-            versions::record(&ch, &hist.id, &author("Ann"))
+            versions::record(&ch, &hist.id, &author("Ann"), None)
                 .await
                 .unwrap(),
             None,
@@ -1935,14 +2364,14 @@ mod engine {
             .await
             .unwrap();
         assert_eq!(
-            versions::record(&ch, &hist.id, &author("Bob"))
+            versions::record(&ch, &hist.id, &author("Bob"), None)
                 .await
                 .unwrap(),
             Some(2)
         );
         let h_chart = add_chart(&ch, &hist.id, "Hotels history").await;
         assert_eq!(
-            versions::record(&ch, &hist.id, &author("Bob"))
+            versions::record(&ch, &hist.id, &author("Bob"), None)
                 .await
                 .unwrap(),
             Some(3)
@@ -1963,7 +2392,7 @@ mod engine {
             store::rename_board(&ch, &hist.id, &format!("History {n}"))
                 .await
                 .unwrap();
-            versions::record(&ch, &hist.id, &author("Bob"))
+            versions::record(&ch, &hist.id, &author("Bob"), None)
                 .await
                 .unwrap();
         }
@@ -1975,6 +2404,20 @@ mod engine {
             "pruned"
         );
         assert!(versions::load(&ch, &hist.id, 19).await.unwrap().is_some());
+        // R8: a version written with a label lists under it, not under the diff.
+        store::rename_board(&ch, &hist.id, "History 20")
+            .await
+            .unwrap();
+        assert_eq!(
+            versions::record(&ch, &hist.id, &author("Bob"), Some("Restored v7"))
+                .await
+                .unwrap(),
+            Some(20)
+        );
+        assert_eq!(
+            versions::list(&ch, &hist.id).await.unwrap()[0].summary,
+            "Restored v7"
+        );
         // A version holds content, never sharing, folder or owner.
         let state = versions::load(&ch, &hist.id, 19).await.unwrap().unwrap();
         assert_eq!(state.charts.len(), 1);

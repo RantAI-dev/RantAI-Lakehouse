@@ -11,8 +11,8 @@ use serde_json::{Map, Value, json};
 
 use super::arg_str;
 use crate::routes::dashboard_organise::{
-    Gate, require_chart_board, require_editable_chart, snapshot_as, viewer_of,
-    visible_live_chart_board,
+    Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
+    viewer_of, visible_live_chart_board,
 };
 use crate::routes::support::is_numeric_type;
 use crate::upstream_error;
@@ -62,6 +62,7 @@ pub(super) async fn create_chart(
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => {
+                place_new_chart(ch, &spec.board, &spec.spec.id).await;
                 snapshot_as(ch, &spec.board, principal).await;
                 json!({
                 "created": true,
@@ -324,6 +325,7 @@ pub(super) async fn delete_chart(
     let by = principal.map_or("Assistant", |p| p.display_name.as_str());
     match store::delete_chart(ch, &id, by).await {
         Ok(()) => {
+            drop_tile(ch, &board, &id).await;
             snapshot_as(ch, &board, principal).await;
             json!({ "deleted": true, "id": id })
         }

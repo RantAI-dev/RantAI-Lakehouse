@@ -58,7 +58,7 @@ And ask the assistant to put charts in a tab, or to start a dashboard from a tem
 
 ## Limits to tell a customer
 
-- Going back to an older version restores the dashboard as it was, including charts that were changed since; charts deleted outright come back only from the trash.
+- Going back to an older version restores the dashboard as it was, including charts that were changed or deleted since (they come out of the trash). A chart that was already removed from the trash for good cannot come back: the step still works, says which chart it left out, and leaves no empty space. Charts added since move to the trash.
 - The trash is emptied after 30 days; nothing older can be restored.
 - A phone layout is per dashboard, not per device.
 
