@@ -315,3 +315,64 @@ For the product owner:
   should include editing an annotation on one asset of each layer.
 - In the write, the asset is checked before the body, so a bad body for an
   unknown id answers 404, not 400.
+
+## 9. Round 2 (2026-10-15): bring the branch up to `main`
+
+Planner: the Security & Delivery lane. The branch was 532 commits behind
+`origin/main` (`41d7677a`). The 2026-10-08 review ran no Rust test locally;
+this round does. The review of the merged result goes under §10.
+
+### Decisions already made
+
+- Merge, do not rebase: one merge commit. Nobody force-pushes this branch.
+- E1–E6 stand. Where `main` already fixed one of the three leaks in §1 in
+  its own way, keep `main`'s fix, drop the branch's duplicate, and say so
+  in the handoff with the `main` commit (12 chars). Do not keep two
+  guards for one rule (rule 4).
+- `main` moved the shapes these tasks touch: `lakehouse-store/src/connectors.rs`
+  gained run state, schema-change state, pause policy and alert-rule
+  scoping (SRC-7, SRC-8, SRC-16, SRC-17); `routes/catalog.rs` gained one
+  catalog assembly and the SEC-11 `upstream_error` path; `routes/uploads.rs`
+  gained Parquet and SRC-9. Adapt the branch's code to `main`'s shapes,
+  never the other way.
+- Upstream errors: any error path the branch adds or keeps goes through
+  `upstream_error` (SEC-11; `tests/sec11_guard.rs` must pass). E5's 503 is a
+  fixed sentence.
+- E1's service check: `main` may have changed `Principal`; re-check that a
+  service principal is still told apart by the auth layer's own kind, not
+  a display name (E2). If not, stop and report.
+
+### Tasks (one commit each, in order)
+
+**M1. Merge `origin/main`.** Conflicts expected in `CHANGELOG.md`
+(keep both sides' bullets), `rust/crates/lakehouse-api/src/routes/catalog.rs`,
+`rust/crates/lakehouse-store/src/connectors.rs`,
+`rust/crates/lakehouse-store/tests/connectors.rs`. Resolve hunk by hunk.
+Acceptance: `cargo check -j 4 -p lakehouse-store -p lakehouse-api --all-targets`
+compiles.
+
+**M2. Make the merged branch pass, if M1 alone does not.** Fix compile
+errors, clippy and tests that the merge broke, in a separate commit whose
+body lists each fix and why. Do not weaken a test (rule 2); if a test of
+`main` fails because of an E-decision (for example a test that expects the
+old `TABLE_NOT_FREE` text or an annotation on a non-existent id), change
+it and name it in the commit body.
+
+**M3. Verification on the final commit, foreground, under the heavy lock:**
+```
+cd rust && cargo fmt --check
+cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings
+RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-store --no-fail-fast
+RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-api --no-fail-fast > /home/shiro/rantai/review-logs/sec16-api-test.log 2>&1
+```
+The `lakehouse-api` run takes long: run it in the background redirected to
+the log and poll it; quote each suite's `test result:` line count totals
+and every failure name. Known environment failure, not a regression:
+`state::tests::connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag`.
+Then `bun test src/services/clients` (the branch changed `uploads.test.ts`)
+and gitleaks.
+
+### Out of scope
+
+Unchanged from §5, plus: no new leaks you notice on `main` outside §1;
+list them in the handoff and the planner files backlog items.
