@@ -1,5 +1,11 @@
 # Rantai Lake — Spesifikasi Produk & Perilaku Fitur
 
+> **Archived 2026-10-15 (`DOC-1`).** This document predates the current build and
+> contradicts it in places. It is kept for history only and is not maintained.
+> What the product is and has: [`docs/core/PRODUCT.md`](../core/PRODUCT.md);
+> the work list: [`docs/core/BACKLOG.md`](../core/BACKLOG.md). Where any of
+> them differs from the code, trust the code.
+
 Dokumen ini menjelaskan **spesifikasi fungsional** dan **perilaku yang diharapkan** setiap area aplikasi Rantai Lake. Dipakai sebagai referensi kontrak antara desain, produk, engineering, dan AI agent saat mengembangkan atau menguji fitur.
 
 **Hubungan dengan dokumen lain**

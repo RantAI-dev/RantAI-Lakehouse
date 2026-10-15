@@ -69,7 +69,7 @@ estimate (S, M, L), which the base has no field for.
 | `QA-1` | Task | Accept each built feature with a checklist, starting with what a demo shows | Delivery | P1 | Todo |  | PRODUCT §4 blocker 1 |
 | `SEC-1` | Task | Confirm the leaked key is rotated; decide on rewriting git history. Decided 2026-10-14: no rewrite; the key and the staging values are rotated (product owner) and their history findings are baselined by exact fingerprint in `.gitleaksignore` | Administration & Security | P1 | Done | #153 | `SECURITY.md` |
 | `REL-1` | Task | Protect the main branch | Delivery | P1 | Todo |  | `docs/CI.md` |
-| `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Todo |  | PRODUCT §6 |
+| `DOC-1` | Task | Archive or rewrite the old product documents that contradict the build | Docs | P1 | Done | #171 | PRODUCT §6 |
 | `GOV-2` | Decision | Decide which role may publish a table in open format | Governance | P1 | Open |  | PRODUCT §6 |
 | `SEC-10` | Task | Alert webhooks can be pointed at internal addresses; use the allowlisted resolver. The `SRC-17` gate (`ops/g6/src17_alert_delivery_test.py`) receives webhooks on its own network: this item gives that gate its documented opt-in | Administration & Security | P1 | Done | #105 | `lakehouse-notify` |
 | `SEC-11` | Task | Dashboard tiles and public/embed links return raw database error text. Same rule as `SEC-6` | Administration & Security | P1 | Done | #105 | `routes/support.rs` |
@@ -81,7 +81,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-28` | Task | A pipeline built in the console can be read, edited, deleted, restored, run and paused by its ID from another organisation: the per-ID pipeline routes and the run routes do not check the caller's tenant. Also: run settings checked by top-level key only; a restored version is not validated; orchestrator error text in some responses. Fixed on the branch of PR #80, written before this backlog tracked it | Administration & Security | P1 | Done | #80 | PR #59 review (F2); PR #80 review |
 | `SEC-30` | Task | The Security workflow is red on `main`: `rustls` 0.23.45 has four advisories published 2026-10-14 (`RUSTSEC-2026-0346` `Debug` exposes TLS secrets, `-0347` buffered data sent after an ECH rejection, `-0348` certificate decompression can allocate 1 GiB before authentication, `-0349` an unauthenticated ServerHello can downgrade later connections). Update to `rustls` >= 0.23.46. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Done | #159 | CI on `main` at `c9a8d56f`, re-run 2026-10-14; named in the PR #155 review |
 | `SEC-35` | Task | The lineage route shows every tenant's connectors and pipelines to a caller who belongs to no tenant: `tenant_scope::resolve` returns `None` for such a caller, and `lineage::add_tenant_owned` passes it on as "no filter", against `tenant_scope`'s own rule (no tenant means an empty list). Being fixed with `DATA-19` (review BLOCKER 1), which also covers the upload edges it adds; check the other callers of `ConnectorFilter { tenant_id: None }` for the same mistake. **Blocked by `DATA-19` (fixed in its PR)** | Administration & Security | P1 | In Progress |  | `DATA-19` review, round 1 |
-| `SEC-36` | Task | The full-history `gitleaks` scan runs `git fetch --all`, so it scans every branch, not only `main` and the PR: test values pushed on an open branch turn it red on `main` and on every PR. Since 2026-10-15 it is red with 20 `generic-api-key` findings, all on `feat/phase-1-rest` (#144, `SRC-12`/`SRC-13`): `CONNECTOR_SECRETS_KEY=` in `ci.yml` and the AES vector fixture `connector_secret_vector.json`. #144 must either use values the rule does not match or add exact fingerprints with proof (`SEC-1`) before it merges; then decide whether the scan should cover only `main` plus the PR head | Administration & Security | P1 | In Progress |  | `DATA-2` review (PR #164) |
+| `SEC-36` | Task | The full-history `gitleaks` scan runs `git fetch --all`, so it scans every branch, not only `main` and the PR: test values pushed on an open branch turn it red on `main` and on every PR. Since 2026-10-15 it is red with 20 `generic-api-key` findings, all on `feat/phase-1-rest` (#144, `SRC-12`/`SRC-13`): `CONNECTOR_SECRETS_KEY=` in `ci.yml` and the AES vector fixture `connector_secret_vector.json`. #144 must either use values the rule does not match or add exact fingerprints with proof (`SEC-1`) before it merges; then decide whether the scan should cover only `main` plus the PR head | Administration & Security | P1 | Done | #172 | `DATA-2` review (PR #164) |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
 ## Next (P2)
@@ -143,9 +143,9 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Done | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | In Acceptance | #115 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice. **Blocked by `SEC-36` (#144 merge)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in. **Blocked by `SEC-36` (#144 merge)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-13` | Feature | Table discovery for every source type, not only databases. **Blocked by `SEC-36` (#144 merge)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice. | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in. | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-13` | Feature | Table discovery for every source type, not only databases. | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-15` | Feature | Load a SQL column whose type changed to one its Bronze column cannot hold (integer to text, text to a number, a changed decimal) into a second column when the change is approved. Today such a change cannot be approved and the table waits (`SRC-8`, decision 10). Starts after the g6 gate has shown the loader's behaviour on a real database. No spec yet | Data | P3 | Idea |  | `features/source-schema-changes.md` |
 | `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07). **Blocked by `SRC-11` (column choice), `SEC-14` (credentials)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter waits for `DATA-12` | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
@@ -229,7 +229,7 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
-| `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/FEATURE_COVERAGE.md` |
+| `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
 | `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
 
@@ -247,7 +247,6 @@ parity), built after it.
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
 | `BI-18` | Building | — | `AI-2`, `AI-9` (layout part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
-| `SEC-36` | In Progress | — | `SRC-11` (#144 merge), `SRC-12` (#144 merge), `SRC-13` (#144 merge) |
 | `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
 | `BI-10` | Planned | — | `AI-6`, `BI-16` (histogram bins) |
 | `DATA-19` | Building | — | `BLD-4`, `SEC-35` (fixed in its PR) |
@@ -272,8 +271,8 @@ parity), built after it.
 | `SEC-14` | Building | — | `SRC-4` (credentials) |
 | `SEC-20` | Todo | — | `QS-3` |
 | `SEC-21` | Todo | — | `QS-2` (full-result download) |
-| `SRC-11` | Planned | `SEC-36` (#144 merge) | `SRC-4` (column choice) |
-| `SRC-12` | Planned | `SEC-36` (#144 merge) | `SRC-3` (OAuth sign-in) |
+| `SRC-11` | Planned | — | `SRC-4` (column choice) |
+| `SRC-12` | Planned | — | `SRC-3` (OAuth sign-in) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
@@ -290,13 +289,12 @@ parity), built after it.
 | `QS-2` | Planned | `SEC-21` (full-result download) | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `SEC-35` | In Progress | `DATA-19` (fixed in its PR) | — |
-| `SRC-13` | Planned | `SEC-36` (#144 merge) | — |
 | `SRC-3` | Planned | `DEC-9`, `SRC-12` (OAuth sign-in) | — |
 | `SRC-4` | Planned | `SRC-11` (column choice), `SEC-14` (credentials) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-1`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-16`, `SEC-17`, `SEC-18`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-27`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-36`, `SEC-4`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -335,7 +333,8 @@ set by the product owner and are left empty until they are.
 | `SEC-17` | 2026-10-08 | | |
 | `SEC-18` | 2026-10-08 | | |
 | `SEC-27` | 2026-10-13 | 2026-10-13 | |
-| `SEC-36` | 2026-10-15 | | |
+| `SEC-36` | 2026-10-15 | 2026-10-15 | |
+| `DOC-1` | 2026-10-15 | 2026-10-15 | |
 | `SEC-13` | 2026-10-13 | 2026-10-14 | |
 | `SEC-1` | 2026-10-14 | 2026-10-14 | |
 | `SEC-10` | 2026-10-10 | 2026-10-15 | |

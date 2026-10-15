@@ -1,5 +1,12 @@
 # RantAI Lake — On-Premise Sales Playbook
 
+> **Out of date (2026-10-15, `DOC-1`).** This playbook leads with running on
+> the customer's own servers; the product's positioning is now a lakehouse
+> with business intelligence built in, with on-premises as one option
+> ([`docs/core/PRODUCT.md`](../docs/core/PRODUCT.md)). Its rewrite waits on the
+> product owner (`PRODUCT.md` section 6, decision 6). Check any claim here
+> against the code before using it.
+
 Written against the code at `4e02361` (the rebased P0–P6 + R1 + Gold-export
 stack, 84 commits ahead of `main`), not against `PRODUCT_SPECS.md`, the
 README, or the current deck. Every claim below was checked against source,
