@@ -133,6 +133,13 @@ fn chart_args(mart: &str, dimension: &str) -> String {
     .to_string()
 }
 
+/// `chart_args` with one extra top-level key merged in.
+fn chart_args_with(dimension: &str, key: &str, value: Value) -> String {
+    let mut args: Value = serde_json::from_str(&chart_args(MART, dimension)).unwrap();
+    args[key] = value;
+    args.to_string()
+}
+
 fn env_for(llm: &MockServer, ch: &MockServer) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
     env.insert("LLM_URL".to_owned(), llm.uri());
@@ -259,6 +266,24 @@ async fn a_valid_draft_is_still_offered_as_a_draft_and_writes_nothing() {
     let (status, body) = tool_call(&llm, &ch, "create_chart", &chart_args(MART, COLUMN)).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "needs_confirmation", "{body}");
+    assert_eq!(body["result"]["needs_confirmation"], json!(true), "{body}");
+    assert!(
+        !has_insert(&statements(&ch).await),
+        "a draft writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_valid_draft_that_carries_confirmed_false_is_still_a_draft_and_writes_nothing() {
+    let llm = mock_model(vec![]).await;
+    let ch = mock_clickhouse(true).await;
+    let args = chart_args_with(COLUMN, "confirmed", json!(false));
+
+    let (status, body) = tool_call(&llm, &ch, "create_chart", &args).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["result"]["error"].is_null(), "{body}");
     assert_eq!(body["outcome"], "needs_confirmation", "{body}");
     assert_eq!(body["result"]["needs_confirmation"], json!(true), "{body}");
     assert!(
