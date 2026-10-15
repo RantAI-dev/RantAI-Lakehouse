@@ -99,6 +99,80 @@ after part B's review.
 8. **A7. Docs (planner).** Feature page, `CHANGELOG.md`, `BACKLOG.md`,
    `docs/plans/SRC-12-RESULT.md` part A.
 
+## 3b. Tasks, part B — the four secret managers (planned 2026-10-15, after part A)
+
+### Decisions as built (D1, D2, D3, D11, D12; the planner's notes in italics)
+
+- **One manager per installation**, chosen by `SECRET_MANAGER` = `vault` |
+  `aws` | `gcp` | `azure` (unset: none). Its connection settings are the
+  operator's, in the environment of the API and the orchestrator:
+  - Vault: `VAULT_ADDR`; sign-in by `VAULT_TOKEN`, or AppRole
+    (`VAULT_ROLE_ID`, `VAULT_SECRET_ID`); KV version 2.
+  - AWS Secrets Manager: `AWS_REGION` and the standard credential chain
+    (instance or task role first; access keys in the environment
+    otherwise); `AWS_ENDPOINT_URL_SECRETS_MANAGER` only for the gate's
+    stand-in.
+  - Google Secret Manager: `GOOGLE_APPLICATION_CREDENTIALS` (a service
+    account file) or the platform's metadata identity; the project is part
+    of the reference.
+  - Azure Key Vault: `AZURE_TENANT_ID` with `AZURE_CLIENT_ID` and
+    `AZURE_CLIENT_SECRET`, or a managed identity.
+- **A reference is a new credential kind**, written by the API only:
+  `vault:<mount>/<path>#<key>`, `aws-sm:<secret id>[#<key>]`,
+  `gcp-sm:projects/<project>/secrets/<name>/versions/<version|latest>`,
+  `azure-kv:<vault name>/<secret name>[/<version>]`. Both allowlists admit
+  only the configured manager's scheme, and only when `SECRET_MANAGER` is
+  set; *the two allowlists stay identical, checked by a shared test list as
+  part A's vector is.*
+- **Read at each use, no cache** (D1): every test, every listing, every
+  run start. A manager that cannot be reached fails that use with a fixed
+  text; nothing falls back to an older copy.
+- **Both sides read** (D1): the API in Rust, the orchestrator in Python.
+  *Prefer one small HTTP client per manager over a full cloud SDK where the
+  manager's REST interface and its sign-in are simple (Vault, Azure,
+  Google with a service-account token exchange); AWS needs request signing:
+  use the `aws-sigv4` crate in Rust and `botocore`'s signer in Python, or
+  the official SDKs if they pass `cargo deny` and add little. Every new
+  dependency is named in the commit with its licence and why.*
+- **The console** (D2): when a manager is set, the credential form offers
+  "Reference a secret" with the fields of that manager's reference; the API
+  reads the reference once and tests the connection before saving, as a
+  typed credential is tested today; only the reference is stored. Typing a
+  value stays possible unless `CONNECTOR_TYPED_CREDENTIALS=false`.
+- **Proof** (D3): gates against Vault's development server and an
+  AWS-compatible stand-in (a `moto` server container), each a step in a job
+  of its own; Google and Azure by tests against recorded responses of their
+  documented REST interfaces, and the result document says they were not
+  run against the real services.
+- **Errors** (D12): fixed texts — the manager cannot be reached, the
+  product may not sign in to it, the reference does not exist, the product
+  may not read it, the value is not a single text. Never a manager's own
+  text.
+- **Part A's open review item, done first** (`SRC-12 review 1 SHOULD-FIX
+  1`): a credential file that cannot be opened with the key now says so
+  with its own fixed text ("the stored credential cannot be decrypted with
+  this installation's key"), instead of the generic "resolved to nothing".
+
+### Tasks
+
+1. **B0.** Part A's SHOULD-FIX above.
+2. **B1. The seam.** A manager resolver behind `SecretResolver` and its
+   Python twin, chosen once at start-up from `SECRET_MANAGER`; the reference
+   parsers; both allowlists and the shared test list; the fixed errors.
+3. **B2–B5. One commit per manager**, Rust and Python together, each with
+   unit tests against recorded or mocked HTTP (no network): Vault, AWS,
+   Google, Azure.
+4. **B6. Saving a reference.** The credential routes accept a reference
+   for a configured manager (validated, read once, connection-tested,
+   audited without the reference's secret parts); the console form; the
+   connector page shows "Secret manager: <kind>".
+5. **B7. Gates.** Vault and AWS stand-in steps: store a source password in
+   the manager, reference it, test and load a connector, change the secret
+   in the manager, the next run uses the new value, and the credentials
+   volume holds no copy. Registered as part A's gate was.
+6. **B8. Docs (planner).** ADR 0002 addendum 6, `docs/OPERATIONS.md`, the
+   feature page, `CHANGELOG.md`, `docs/plans/SRC-12-RESULT.md` part B.
+
 ## 4. Build limits on this machine
 
 As the `SRC-11` and `SRC-13` plans: no `cargo test`/`build`/`nextest`/`clean`,
