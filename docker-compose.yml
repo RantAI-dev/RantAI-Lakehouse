@@ -2305,6 +2305,13 @@ services:
   # 503 "Upload storage is not configured."). The CI job writes both into its
   # `.env`; see `.github/workflows/ci.yml`'s `g9-upload`.
   #
+  # `PIPELINE_RUN_TOKEN` too, for the same reason the g6 gates set it: the
+  # gate's step 10 (DATA-19) authors a pipeline over the table it uploaded,
+  # so `dagster-code-location` has to build an authored job and its chain
+  # sensor. Unset, `authored_factory` loads zero of both and the gate fails
+  # at "the orchestrator built authored__<id>", which is the honest answer
+  # for such a stack rather than a gate that cannot prove anything.
+  #
   # The gate reads its fixtures from `ops/fixtures/` beside `ops/g9/`, so the
   # two directories are mounted side by side under /work, read-only: the
   # runner writes nothing into the checkout, and a read-only mount also keeps
