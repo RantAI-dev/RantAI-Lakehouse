@@ -160,7 +160,7 @@ def test_a_sealed_file_copied_under_another_connectors_name_does_not_open(monkey
     vector = _vector()
     monkeypatch.setenv("CONNECTOR_SECRETS_KEY", vector["key_base64"])
     sealed = base64.b64decode(vector["sealed_base64"])
-    with pytest.raises(SecretRefRejected, match="cannot be opened with the configured key"):
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted with this installation's key"):
         open_managed_credential(vector["other_file_name"], sealed)
 
 
@@ -168,7 +168,7 @@ def test_the_previous_key_opens_a_file_sealed_before_a_key_change(monkeypatch: p
     vector = _vector()
     monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _other_key())
     sealed = base64.b64decode(vector["sealed_base64"])
-    with pytest.raises(SecretRefRejected, match="cannot be opened"):
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted"):
         open_managed_credential(vector["file_name"], sealed)
     monkeypatch.setenv("CONNECTOR_SECRETS_KEY_PREVIOUS", vector["key_base64"])
     assert open_managed_credential(vector["file_name"], sealed) == vector["plaintext"]
@@ -182,15 +182,18 @@ def test_a_malformed_key_is_refused_with_a_fixed_text_that_never_echoes_it(
     monkeypatch.setenv("CONNECTOR_SECRETS_KEY", bad_key)
     with pytest.raises(SecretRefRejected) as excinfo:
         open_managed_credential(vector["file_name"], base64.b64decode(vector["sealed_base64"]))
-    assert "32 random bytes in base64" in str(excinfo.value)
+    assert "key is missing or invalid" in str(excinfo.value)
     assert bad_key not in str(excinfo.value)
 
 
-def test_a_missing_key_is_refused_and_names_the_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_missing_key_is_refused_with_the_fixed_text_and_the_setting_goes_to_the_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     vector = _vector()
     monkeypatch.delenv("CONNECTOR_SECRETS_KEY", raising=False)
-    with pytest.raises(SecretRefRejected, match="CONNECTOR_SECRETS_KEY is not set"):
+    with pytest.raises(SecretRefRejected, match="key is missing or invalid"):
         open_managed_credential(vector["file_name"], base64.b64decode(vector["sealed_base64"]))
+    assert "CONNECTOR_SECRETS_KEY is not set" in caplog.text
 
 
 def test_bytes_that_are_not_a_seal_are_refused_not_read_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -243,7 +246,7 @@ def test_resolve_secret_ref_refuses_a_managed_file_under_the_wrong_key(
     monkeypatch.delenv("CONNECTOR_SECRETS_KEY_PREVIOUS", raising=False)
     _point_secrets_dir_at(monkeypatch, tmp_path)
     (tmp_path / vector["file_name"]).write_bytes(base64.b64decode(vector["sealed_base64"]))
-    with pytest.raises(SecretRefRejected, match="cannot be opened with the configured key") as excinfo:
+    with pytest.raises(SecretRefRejected, match="cannot be decrypted with this installation's key") as excinfo:
         resolve_secret_ref(f"file:{tmp_path}/{vector['file_name']}")
     assert vector["plaintext"] not in str(excinfo.value)
     assert os.environ["CONNECTOR_SECRETS_KEY"] not in str(excinfo.value)

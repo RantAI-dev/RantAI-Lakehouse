@@ -13,7 +13,7 @@ use lakehouse_auth::{
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{
     AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver, FileSecretResolver,
-    SecretError, SecretResolver, SecretValue,
+    SecretError, SecretFailure, SecretResolver, SecretValue,
 };
 use lakehouse_dagster::DgClient;
 use lakehouse_iceberg::IcebergClient;
@@ -28,7 +28,7 @@ use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
-use crate::secret_crypto::{Keyring, MANAGED_FILE_PREFIX};
+use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -425,20 +425,27 @@ impl ConnectorSecretResolver {
         secret_ref: &str,
         file_name: &str,
     ) -> Result<SecretValue, SecretError> {
-        let not_found = || SecretError::NotFound {
+        let failed = |failure: SecretFailure| SecretError::Failed {
             secret_ref: secret_ref.to_owned(),
-            resolver: "file",
+            failure,
         };
         let bytes = self.file.read_confined(&self.located(secret_ref))?;
         let keyring: &Keyring = self.keyring.as_deref().map_err(|err| {
             tracing::warn!(secret_ref, "{err}");
-            not_found()
+            failed(SecretFailure::KeyUnavailable)
         })?;
         let opened = keyring.open(file_name, &bytes).map_err(|err| {
             tracing::warn!(secret_ref, "{err}");
-            not_found()
+            // `SRC-12 review 1 SHOULD-FIX 1`: say which of the three it is
+            // instead of "resolved to nothing".
+            failed(match err {
+                CryptoError::WrongKey => SecretFailure::WrongKey,
+                CryptoError::KeyMissing | CryptoError::KeyInvalid => SecretFailure::KeyUnavailable,
+                CryptoError::Unreadable | CryptoError::SealFailed => SecretFailure::UnreadableFile,
+            })
         })?;
-        let text = String::from_utf8(opened.plaintext).map_err(|_| not_found())?;
+        let text = String::from_utf8(opened.plaintext)
+            .map_err(|_| failed(SecretFailure::UnreadableFile))?;
         Ok(SecretValue::new(text.trim().to_owned()))
     }
 
@@ -739,38 +746,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value.expose_secret(), "pw");
-        for refused in [
-            "file:/run/secrets/connector_managed_conn_y_password",
-            "file:/run/secrets/connector_managed_conn_z_password",
+        // `SRC-12 review 1 SHOULD-FIX 1`: each refusal says why.
+        for (refused, expected) in [
+            (
+                "file:/run/secrets/connector_managed_conn_y_password",
+                SecretFailure::WrongKey,
+            ),
+            (
+                "file:/run/secrets/connector_managed_conn_z_password",
+                SecretFailure::UnreadableFile,
+            ),
         ] {
-            assert!(
-                matches!(
-                    resolver.resolve(refused).await,
-                    Err(SecretError::NotFound { .. })
-                ),
-                "{refused}"
-            );
+            match resolver.resolve(refused).await {
+                Err(SecretError::Failed { failure, .. }) => {
+                    assert_eq!(failure, expected, "{refused}");
+                }
+                other => panic!("{refused}: {other:?}"),
+            }
         }
 
-        for keyring in [
-            Err(crate::secret_crypto::CryptoError::KeyMissing),
-            Keyring::from_values(
-                Some(&{
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD.encode([8_u8; 32])
-                }),
-                None,
-            )
-            .map(Arc::new),
+        for (keyring, expected) in [
+            (
+                Err(crate::secret_crypto::CryptoError::KeyMissing),
+                SecretFailure::KeyUnavailable,
+            ),
+            (
+                Keyring::from_values(
+                    Some(&{
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.encode([8_u8; 32])
+                    }),
+                    None,
+                )
+                .map(Arc::new),
+                SecretFailure::WrongKey,
+            ),
         ] {
             let resolver =
                 ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), keyring);
-            assert!(matches!(
-                resolver
-                    .resolve("file:/run/secrets/connector_managed_conn_x_password")
-                    .await,
-                Err(SecretError::NotFound { .. })
-            ));
+            let err = resolver
+                .resolve("file:/run/secrets/connector_managed_conn_x_password")
+                .await
+                .unwrap_err();
+            // The user-facing text is the fixed one, with no ref in it.
+            assert_eq!(err.to_string(), expected.to_string());
         }
     }
 

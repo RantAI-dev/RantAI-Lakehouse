@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 from pathlib import Path
 
@@ -84,11 +85,15 @@ _KEY_ENV = "CONNECTOR_SECRETS_KEY"
 _PREVIOUS_KEY_ENV = "CONNECTOR_SECRETS_KEY_PREVIOUS"
 
 # Fixed texts (decision 12): they say what is wrong, never carry a key, a
-# value or a library's own message.
-_KEY_MISSING = f"{_KEY_ENV} is not set; connector credentials cannot be read without it"
-_KEY_INVALID = f"{_KEY_ENV} (or {_PREVIOUS_KEY_ENV}) is not 32 random bytes in base64"
-_WRONG_KEY = "the stored credential cannot be opened with the configured key"
+# value or a library's own message. They are the same words as the API's
+# `SecretFailure` (`lakehouse-core/src/secret.rs`); both sides' tests read
+# them from `secret_manager_refs.json`. `SRC-12 review 1 SHOULD-FIX 1`: a
+# file that does not open with the key says so, instead of "resolved to
+# nothing".
+_KEY_UNAVAILABLE = "this installation's connector secrets key is missing or invalid, so stored credentials cannot be read"
+_WRONG_KEY = "the stored credential cannot be decrypted with this installation's key"
 _NOT_SEALED = "the stored credential file is not in a format this build reads"
+_log = logging.getLogger(__name__)
 
 
 class SecretRefRejected(Exception):
@@ -110,14 +115,17 @@ def _key_from_env(name: str, *, required: bool) -> AESGCM | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
         if required:
-            raise SecretRefRejected(_KEY_MISSING)
+            _log.warning("%s is not set; managed connector credentials cannot be read", name)
+            raise SecretRefRejected(_KEY_UNAVAILABLE)
         return None
     try:
         key = base64.b64decode(raw, validate=True)
     except (binascii.Error, ValueError):
-        raise SecretRefRejected(_KEY_INVALID) from None
+        _log.warning("%s is not base64", name)
+        raise SecretRefRejected(_KEY_UNAVAILABLE) from None
     if len(key) != _KEY_LEN:
-        raise SecretRefRejected(_KEY_INVALID)
+        _log.warning("%s is not 32 bytes", name)
+        raise SecretRefRejected(_KEY_UNAVAILABLE)
     return AESGCM(key)
 
 
