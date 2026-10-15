@@ -26,6 +26,10 @@
 # Image tags are pinned (no `latest`). The values below are CI-only fixtures
 # (`ci-…-not-real` / `testing`), never defaults of the product.
 services:
+  # Licence note (SRC-12 review B1 SHOULD-FIX 2): the hashicorp/vault image is
+  # BUSL-1.1 from 1.15 on. It is used here only as a CI test fixture and is not
+  # distributed with the product. OpenBao (MPL-2.0, API-compatible, image
+  # `openbao/openbao`) is the drop-in if that is ever not acceptable.
   vault-g6:
     image: hashicorp/vault:1.18.5
     command:
