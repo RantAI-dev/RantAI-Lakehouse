@@ -508,3 +508,26 @@ found".
 After both: re-run `cargo test -p lakehouse-api lineage` and the full Rust
 line on the final commit, and the gitleaks working-tree scan:
 `sg docker -c "docker run --rm -v /home/shiro/rantai/wt-data-19:/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact -v"`.
+
+### Round 2 (planner/reviewer, Claude Opus), at `8136c5c41ad2`
+
+Read: the BLOCKER 1 fix (`16d341ac9b01`: a caller with no tenant gets no
+tenant-owned edges unless unrestricted, with a coverage note), BLOCKER 2
+(merge of `main`), the lineage-test fixes after `main` moved (`b49ffb2ac0d1`
+no `unwrap`/`expect` in tests; `e566a3932dc2` seeds `tenant` rows for the
+new foreign key), and the two merges of `main` since (`79127eaf9040`, and
+`8136c5c41ad2` by the reviewer: in `ci.yml`'s g9 `.env`, main's #83 ci-only
+RustFS values were kept and this branch's `PIPELINE_RUN_TOKEN` block added;
+the feature page took main's Plan row). The branch's compose additions carry
+no default credential (#83's rule). No open finding.
+
+Reviewer's verification on `8136c5c41ad2`, fresh build of this worktree's
+crates (`cargo-locked`): `cargo fmt --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test --workspace
+--no-fail-fast` 106 suites, 5284 passed, 0 failed, 9 ignored; `bun run
+typecheck` clean; `bun run lint` 0 errors (6 warnings, all on `main`); `bun
+test` folder by folder 1636 passed, 0 failed, 2 skipped; both `ops/lint`
+checks pass; `pytest dispar_orchestrate` 1073 passed; `docker compose
+--profile '*' config --quiet` passes with the six must-set variables given
+dummy values (#83 makes them required); `gitleaks dir` no leaks. CI on the
+PR: 31 of 31 checks pass. Merged as #165; it also closes `SEC-35`.
