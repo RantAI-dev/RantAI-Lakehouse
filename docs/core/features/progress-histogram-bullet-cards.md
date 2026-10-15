@@ -65,19 +65,19 @@ Planner defaults; the owner confirms or changes them at the phase 3 QA.
 | Pivot table | Pivot (`BI-16` A) |
 | Number | KPI |
 | Trend | KPI with comparison and sparkline (`BI-16` A) |
-| Detail | Record detail (`BI-16` A) |
+| Detail | Not a tile kind: the one-record view with every field and Previous / Next in the record list that opens from a table, a chart or a KPI (`BI-16` A) |
 | Progress | Progress (this part) |
 | Gauge | Gauge |
-| Line, bar, combo, area, row | Line, bar, combo, area, row |
+| Line, bar, combo, area, row | Line, bar, combo, area, and the horizontal bar (`hbar`) for Metabase's row chart |
 | Waterfall | Waterfall |
 | Scatter, bubble | Scatter, bubble |
-| Pie, donut | Pie, donut |
+| Pie, donut | Pie (drawn as a donut; one kind, `pie`) |
 | Funnel | Funnel |
-| Maps | Indonesia and Jakarta maps; world maps in `BI-16` C |
+| Maps | Region, point and density maps of Indonesia and Jakarta (`geomap`, `pointmap`, `geoheat`); world maps in `BI-16` C |
 | Sankey | Sankey |
 | Box plot | Box plot |
 
-The developer checks this table against the code and corrects any row that does not hold.
+The developer checks this table against the code and corrects any row that does not hold. `src/lib/chart-coverage.test.ts` reads this table and fails when a row has no kind or decision there, or the code has no such kind.
 
 ## Asking the assistant
 
