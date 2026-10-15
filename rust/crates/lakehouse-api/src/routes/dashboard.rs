@@ -707,29 +707,11 @@ async fn mark_marts(state: &AppState, body: &mut Value) {
     let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
         return;
     };
-    let id_of = |m: &Value| {
-        m.get("name")
-            .and_then(Value::as_str)
-            .map(|n| format!("serving.{n}"))
-    };
-    let ids: Vec<String> = marts.iter().filter_map(id_of).collect();
-    // The marts are the names a replacement can have in this list.
-    let names: std::collections::HashMap<String, String> = ids
-        .iter()
-        .filter_map(|id| Some((id.clone(), id.strip_prefix("serving.")?.to_owned())))
-        .collect();
-    let by_id = crate::routes::catalog::certification_marks(state, &ids, &names).await;
-    if by_id.is_empty() {
-        return;
-    }
-    for mart in marts {
-        let Some(fields) = id_of(mart).and_then(|id| by_id.get(&id)) else {
-            continue;
-        };
-        if let Some(o) = mart.as_object_mut() {
-            o.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-    }
+    // `DATA-12` task 10 moved the merge itself to
+    // `catalog::apply_serving_certification`: the assistant's
+    // `describe_mart` marks its marts the same way, so the guard, the id
+    // convention and the field shape have one owner instead of two.
+    crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
 /// `?source=` branch of [`fields`]: the SQL source's columns, split the same

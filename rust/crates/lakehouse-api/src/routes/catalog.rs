@@ -1562,6 +1562,45 @@ pub(crate) async fn certification_marks(
         .collect()
 }
 
+/// `DATA-12` task 10: the same certification fields on entries read from
+/// `ClickHouse` `serving` — the mart list the chart builder's picker and
+/// the assistant's `describe_mart` both show. A mart's catalog id is
+/// `serving.<name>`; `name_key` is the entry's own mart-name field (`name`
+/// in the picker's list, `mart` in `describe_mart`'s output). One batch
+/// read for the whole list; an unmarked entry gains no key.
+pub(crate) async fn apply_serving_certification(
+    state: &AppState,
+    entries: &mut [Value],
+    name_key: &str,
+) {
+    let id_of = |e: &Value| {
+        e.get(name_key)
+            .and_then(Value::as_str)
+            .map(|n| format!("serving.{n}"))
+    };
+    let ids: Vec<String> = entries.iter().filter_map(id_of).collect();
+    if ids.is_empty() {
+        return;
+    }
+    // The marts are the names a replacement can have in this list.
+    let names: HashMap<String, String> = ids
+        .iter()
+        .filter_map(|id| Some((id.clone(), id.strip_prefix("serving.")?.to_owned())))
+        .collect();
+    let by_id = certification_marks(state, &ids, &names).await;
+    if by_id.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        let Some(fields) = id_of(entry).and_then(|id| by_id.get(&id)) else {
+            continue;
+        };
+        if let Some(o) = entry.as_object_mut() {
+            o.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+}
+
 /// The `name` of the asset `id` in an assembled list, if it is there.
 fn asset_name_in<'a>(assets: &'a [Value], id: &str) -> Option<&'a str> {
     assets

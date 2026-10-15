@@ -129,7 +129,7 @@ pub(in crate::routes) async fn run_tool(
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
-        "describe_mart" => data::describe_mart(ch, args).await,
+        "describe_mart" => data::describe_mart(state, args).await,
         "create_chart" => dashboards::create_chart(ch, args, None).await,
         "update_chart" => dashboards::update_chart(ch, args).await,
         "create_board" => dashboards::create_board(ch, args).await,
