@@ -935,3 +935,39 @@ def test_the_job_is_registered_and_its_op_declares_its_source_and_what_it_writes
     assert node.definition.name == "run_discover"
     assert node.definition.tags["source_ref"] == "dispar_orchestrate/discover.py::run_discover"
     assert "discovery-results" in node.definition.tags["writes"]
+
+
+def test_the_real_kafka_consumer_is_built_only_from_settings_kafka_python_knows(monkeypatch) -> None:
+    # SRC-13 review 3 BLOCKER 1: the consumer was given `api_version_auto_timeout_ms`, which kafka-python
+    # 3.0.11 rejects at construction ("Unrecognized configs"), so every Kafka listing failed in CI while the
+    # loader's consumer worked. The fake refuses what the real class refuses: a key outside its DEFAULT_CONFIG.
+    from kafka import KafkaConsumer as RealConsumer
+    from kafka.errors import KafkaConfigurationError
+
+    seen: dict = {}
+
+    class _Strict:
+        def __init__(self, **configs) -> None:
+            unknown = set(configs) - set(RealConsumer.DEFAULT_CONFIG)
+            if unknown:
+                raise KafkaConfigurationError(f"Unrecognized configs: {unknown}")
+            seen.update(configs)
+
+    monkeypatch.setattr(discover, "KafkaConsumer", _Strict)
+    discover._real_kafka_consumer({"bootstrapServers": ["k:9092"], "auth": {"type": "none"}}, {}, group_id="g")
+    assert seen["enable_auto_commit"] is False and seen["group_id"] == "g"
+    assert seen["request_timeout_ms"] > 10_000  # kafka-python wants it above the session timeout
+
+
+def test_an_unclassified_failure_is_logged_at_warning_with_its_type_name_and_never_its_text(caplog) -> None:
+    class Odd(Exception):
+        pass
+
+    def loader(_id: str) -> dict:
+        raise Odd("secret-looking upstream text")
+
+    with caplog.at_level(logging.WARNING, logger=discover.logger.name):
+        discover.run_request(_request("list"), connector_loader=loader, poster=lambda body: None)
+    records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert records and "Odd" in records[0].getMessage()
+    assert "secret-looking" not in caplog.text

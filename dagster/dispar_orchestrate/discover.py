@@ -470,7 +470,10 @@ def _real_kafka_consumer(spec: dict, secrets: dict[str, str], *, group_id: str) 
         enable_auto_commit=False,
         value_deserializer=lambda v: v,
         request_timeout_ms=30_000,
-        api_version_auto_timeout_ms=10_000,
+        # SRC-13 review 3 BLOCKER 1: no `api_version_auto_timeout_ms` here. kafka-python 3.0.11 does not
+        # know that key and raises KafkaConfigurationError ("Unrecognized configs") at construction, which
+        # `classify_discovery` could only call `failed`. Every key above must be in
+        # `KafkaConsumer.DEFAULT_CONFIG` (test_discover.py pins that against the installed library).
         **kafka_security_kwargs(spec, secrets),
     )
 
@@ -774,7 +777,9 @@ def run_request(
     except Exception as exc:  # noqa: BLE001 -- every failure of the read is classified and posted
         error_class = classify_discovery(exc)
         # The class and the exception's TYPE NAME only: never its text.
-        logger.info("discovery failed: class=%s type=%s.%s", error_class, type(exc).__module__, type(exc).__name__)
+        # Warning level (SRC-13 review 3 BLOCKER 1): an unclassified failure must be visible in CI logs;
+        # the type name is the library's class name, not upstream text.
+        logger.warning("discovery failed: class=%s type=%s.%s", error_class, type(exc).__module__, type(exc).__name__)
     poster(result_body(request, result=result, error_class=error_class))
     return error_class
 
