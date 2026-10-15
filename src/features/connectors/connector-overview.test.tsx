@@ -37,6 +37,7 @@ const DETAIL: ConnectorDetail = {
   recentErrors: [],
   dependentPipelines: [{ id: "pl-1", name: "ingest_northwind", kind: "pipeline" }],
   credentialManaged: true,
+  credentialSource: "managed",
   credentialKind: "password",
   credentialSecondaryKind: null,
   residency: "Depok",

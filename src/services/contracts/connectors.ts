@@ -134,6 +134,14 @@ export type ConnectorDetail = Connector & {
    */
   credentialManaged: boolean
   /**
+   * How the primary credential is held (`SRC-12` decision 10): `managed` is
+   * sealed on lakehouse's credentials volume, `env` is an operator's
+   * environment variable (read at start-up, so a change needs a restart),
+   * `file` an operator's file. `null` for any other reference scheme. A
+   * scheme only; the reference is never sent.
+   */
+  credentialSource: CredentialSource | null
+  /**
    * The stored primary credential's kind (password, access key, …), read
    * from its reference name — so the edit page asks for the right thing.
    * `null` for a hand-seeded reference with no recognizable suffix. A kind

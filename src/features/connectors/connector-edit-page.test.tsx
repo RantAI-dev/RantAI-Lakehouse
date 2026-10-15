@@ -65,6 +65,7 @@ const DETAIL = {
   recentErrors: [],
   dependentPipelines: [],
   credentialManaged: false,
+  credentialSource: "env",
   residency: "id-jakarta",
   tenantId: "t-acme",
 }
@@ -443,7 +444,7 @@ describe("ConnectorEditPage", () => {
         "GET /api/connectors/conn-a/ingest-spec": () => json(restSpec),
         "PUT /api/connectors/conn-a/ingest-spec": () => json(restSpec),
       },
-      { ...DETAIL, type: "REST API", credentialManaged: true, credentialKind: "token", credentialSecondaryKind: null }
+      { ...DETAIL, type: "REST API", credentialManaged: true, credentialSource: "managed", credentialKind: "token", credentialSecondaryKind: null }
     )
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))

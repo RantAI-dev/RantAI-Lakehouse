@@ -174,6 +174,13 @@ pub struct ConnectorDetail {
     /// boolean derived from the ref on read — the ref itself is still never
     /// returned (module doc comment, guarantee 1).
     pub credential_managed: bool,
+    /// How the primary credential is held: `managed` (sealed on the
+    /// credentials volume, `SRC-12`), `env` (an operator's environment
+    /// variable, read at start-up) or `file` (an operator's file). `None` for
+    /// a reference of any other scheme. `SRC-12` decision 10: the connector
+    /// page names it and, for `env`, says a restart is needed after a
+    /// change. A scheme only, never the reference or the value.
+    pub credential_source: Option<CredentialSource>,
     /// The primary credential's kind (password, access key, …), read from
     /// its ref's suffix so the edit page asks for the right thing. `None`
     /// for a ref whose name does not end in a known suffix (e.g. a
@@ -476,6 +483,7 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
         return Ok(None);
     };
     let credential_managed = is_managed_secret_ref(&row.secret_ref);
+    let credential_source = credential_source_of_ref(&row.secret_ref);
     let credential_kind = credential_kind_of_ref(&row.secret_ref);
     // Not in `CONNECTOR_COLUMNS` (list rows never need it); read here only
     // to report its KIND — the ref itself is never returned.
@@ -503,6 +511,7 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
     Ok(Some(ConnectorDetail {
         audit_event_id,
         credential_managed,
+        credential_source,
         credential_kind,
         credential_secondary_kind,
         residency,
@@ -587,6 +596,21 @@ pub const MANAGED_SECRET_REF_PREFIX: &str = "file:/run/secrets/connector_managed
 #[must_use]
 pub fn is_managed_secret_ref(secret_ref: &str) -> bool {
     secret_ref.starts_with(MANAGED_SECRET_REF_PREFIX)
+}
+
+/// How a reference NAME says its credential is held (`SRC-12` decision 10).
+/// A pure predicate over the name, like [`is_managed_secret_ref`].
+#[must_use]
+pub fn credential_source_of_ref(secret_ref: &str) -> Option<CredentialSource> {
+    if is_managed_secret_ref(secret_ref) {
+        Some(CredentialSource::Managed)
+    } else if secret_ref.starts_with("env:") {
+        Some(CredentialSource::Env)
+    } else if secret_ref.starts_with("file:") {
+        Some(CredentialSource::File)
+    } else {
+        None
+    }
 }
 
 /// The credential kind a reference NAME ends in, e.g.
@@ -2519,6 +2543,7 @@ mod tests {
             // fabricate.
             audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
             credential_managed: true,
+            credential_source: Some(CredentialSource::Managed),
             credential_kind: Some(CredentialKind::Password),
             credential_secondary_kind: None,
             residency: "in-region".to_owned(),
@@ -2533,6 +2558,10 @@ mod tests {
         assert_eq!(
             value.get("credentialManaged"),
             Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            value.get("credentialSource"),
+            Some(&serde_json::Value::String("managed".to_owned()))
         );
     }
 
@@ -2679,6 +2708,20 @@ mod tests {
         }
         // The seeded, deployment-owned refs are never managed.
         assert!(!is_managed_secret_ref("env:CONNECTOR_PG_PASSWORD"));
+        // SRC-12 decision 10: the scheme the connector page names.
+        assert_eq!(
+            credential_source_of_ref("env:CONNECTOR_PG_PASSWORD"),
+            Some(CredentialSource::Env)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_conn_x_password"),
+            Some(CredentialSource::File)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_managed_conn_x_password"),
+            Some(CredentialSource::Managed)
+        );
+        assert_eq!(credential_source_of_ref("vault:secret/x"), None);
         assert!(!is_managed_secret_ref(
             "file:/run/secrets/connector_pg_password"
         ));

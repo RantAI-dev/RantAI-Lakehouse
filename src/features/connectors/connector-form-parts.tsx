@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils"
 import type {
   CdcDial,
   CredentialKind,
+  CredentialSource,
   FilesDial,
   KafkaDial,
   MongoDial,
@@ -320,6 +321,7 @@ export function CredentialFields({
   noCredential,
   optional,
   credentialManaged,
+  credentialSource,
   slots,
   primaryValue,
   onPrimaryValueChange,
@@ -332,6 +334,8 @@ export function CredentialFields({
   optional: boolean
   /** Edit page: whether the current credential is stored by lakehouse. */
   credentialManaged?: boolean
+  /** Edit page: how the current credential is held (`SRC-12` decision 10). */
+  credentialSource?: CredentialSource | null
   slots: CredentialSlots
   primaryValue: string
   onPrimaryValueChange: (value: string) => void
@@ -375,7 +379,9 @@ export function CredentialFields({
         {optional
           ? credentialManaged
             ? "Leave blank to keep the current credential. A new one is tested against the source before it replaces the old."
-            : "This connector's credential is provisioned by an operator on the server. Leave blank to keep it, or enter one to have lakehouse store it instead."
+            : credentialSource === "env"
+              ? "This connector's credential is an environment variable on the server, read when the API and the orchestrator start: if an operator changes it, they must restart both. Leave blank to keep it, or enter one to have lakehouse store it instead."
+              : "This connector's credential is provisioned by an operator on the server. Leave blank to keep it, or enter one to have lakehouse store it instead."
           : "Stored by lakehouse when you create the connector, and never shown again. You can replace it later from the connector's edit page."}
       </p>
     </div>

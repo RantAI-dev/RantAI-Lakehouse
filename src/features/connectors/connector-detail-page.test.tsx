@@ -70,6 +70,7 @@ const DETAIL = {
   dependentPipelines: [] as { id: string; name: string; kind: string }[],
   auditEventId: "evt-1",
   credentialManaged: true,
+  credentialSource: "managed",
   credentialKind: "password",
   credentialSecondaryKind: null,
   residency: "id-jakarta",
@@ -376,7 +377,7 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")).toBe("Acme Co")
     expect(fact("Residency")).toBe("id-jakarta")
     expect(fact("Owner")).toBe("admin")
-    expect(fact("Credential")).toBe("Stored by lakehouse")
+    expect(fact("Credential")).toBe("Stored by lakehouse, encrypted")
     expect(fact("Last test")).toBe("Never tested")
     // The type (the description) and the environment (a pill by the name) are
     // in the header already, so the row does not say them a second time.
@@ -400,6 +401,7 @@ describe("ConnectorDetailPage", () => {
         residency: "",
         owner: "",
         credentialManaged: false,
+        credentialSource: "env",
         lastTestAt: "2026-10-04T00:00:00.000Z",
       }
     )
@@ -410,7 +412,10 @@ describe("ConnectorDetailPage", () => {
     expect(fact("Tenant")?.textContent).toBe("Unassigned")
     expect(fact("Residency")?.textContent).toBe("—")
     expect(fact("Owner")?.textContent).toBe("—")
-    expect(fact("Credential")?.textContent).toBe("Provisioned on the server")
+    // SRC-12 decision 10: an environment variable says a restart is needed.
+    expect(fact("Credential")?.textContent).toBe(
+      "Environment variable on the server (a restart is needed after a change)"
+    )
     const lastTest = fact("Last test")
     expect(lastTest?.textContent).not.toBe("Never tested")
     expect(lastTest?.querySelector("[title]")?.getAttribute("title")).toMatch(/2026/)

@@ -49,6 +49,24 @@ function parseTab(raw: string | null): ConnectorTab {
 }
 
 /**
+ * How the credential is held, in words (`SRC-12` decision 10). An
+ * environment variable is read when the API and the orchestrator start, so
+ * the page says a restart is needed after changing one.
+ */
+function credentialFact(source: ConnectorDetail["credentialSource"]): string {
+  switch (source) {
+    case "managed":
+      return "Stored by lakehouse, encrypted"
+    case "env":
+      return "Environment variable on the server (a restart is needed after a change)"
+    case "file":
+      return "File on the server"
+    default:
+      return "Provisioned on the server"
+  }
+}
+
+/**
  * The row of facts under the title, the asset page's `MetadataList` with the
  * connector's own: who it belongs to, how its credential is held and when it
  * was last tested. The type (the description) and the environment (a pill by
@@ -60,7 +78,7 @@ function connectorFacts(c: ConnectorDetail): MetadataItem[] {
     { label: "Tenant", value: c.tenant || "Unassigned" },
     { label: "Residency", value: c.residency || "—" },
     { label: "Owner", value: c.owner || "—" },
-    { label: "Credential", value: c.credentialManaged ? "Stored by lakehouse" : "Provisioned on the server" },
+    { label: "Credential", value: credentialFact(c.credentialSource) },
     {
       label: "Last test",
       value:

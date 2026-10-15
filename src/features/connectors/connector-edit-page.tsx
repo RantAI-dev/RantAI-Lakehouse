@@ -452,6 +452,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 noCredential={noCredential}
                 optional={!signInChanged && !repoints}
                 credentialManaged={detail.credentialManaged}
+                credentialSource={detail.credentialSource}
                 slots={slots}
                 primaryValue={primaryValue}
                 onPrimaryValueChange={setPrimaryValue}
