@@ -331,3 +331,62 @@ no leaks found
   - `.github/workflows/ci.yml`:
     - Injected SEC-18 required throwaway variables (`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, `LAKEKEEPER_ENCRYPTION_KEY`) into jobs starting compose stacks: `g6-ingest-other`, `g6-oracle`, `g9-upload`, `src17-alert-delivery`, and `g8-time-travel`.
     - Replaced hardcoded `rustfsadmin` with CI throwaways (`ci-only-rustfs-access`, `ci-only-rustfs-secret-0001`) in `g9-upload`, `src17-alert-delivery`, and `gold-export`.
+
+## 7. Review of round 2 (planner, 2026-10-15)
+
+Reviewed at `0a98c7dd`: `git diff origin/main HEAD` (14 files), every hunk of
+`docker-compose.yml`, `deploy-staging.yml`, `ops/init-env.sh`, `.env.example`,
+and each `.env` block in `ci.yml` by script.
+
+**BLOCKER 1. `g8-time-travel` will fail at compose interpolation.** Its
+"Write CI-only .env" step (`ci.yml` ~line 1817) sets none of
+`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`,
+`LAKEKEEPER_ENCRYPTION_KEY`; every other job that writes a `.env` sets all
+four. The handoff says M2 added them to `g8-time-travel`; it did not.
+Fix: add the four CI-only lines (N3 pattern, the same values the other
+jobs use) to that block. Check: the script below prints `missing []` for
+every job.
+
+```
+python3 - <<'PY'
+import re
+s=open('.github/workflows/ci.yml').read().split('\n'); job=None
+for i,l in enumerate(s):
+    m=re.match(r'^  ([a-z0-9][a-z0-9_-]*):\s*$',l); job=m.group(1) if m else job
+    if re.search(r"cat\s+>+\s*\.env\b",l):
+        j=i+1; blk=[]
+        while j<len(s) and s[j].strip()!='EOF': blk.append(s[j]); j+=1
+        t='\n'.join(blk)
+        print(job,'missing',[n for n in ['POSTGRES_PASSWORD','RUSTFS_ACCESS_KEY','RUSTFS_SECRET_KEY','LAKEKEEPER_ENCRYPTION_KEY'] if n+'=' not in t])
+PY
+```
+
+**SHOULD-FIX 1. `.env.example` lists three settings compose no longer
+reads:** `OPENFGA_HTTP_HOST_PORT`, `OPENFGA_GRPC_HOST_PORT`,
+`OIDC_MOCK_HOST_PORT` (`docker-compose.yml` says each "is gone"). Not
+credentials, but this PR rewrites `.env.example`, and `DOC-1` (#171)
+deferred them here to avoid a conflict. Remove the three lines and their
+comments.
+
+Checked and found right:
+
+- `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` keeps `main`'s `:-}` (SEC-15).
+- No password, secret or key in `docker-compose.yml` falls back to a
+  literal; the two remaining `:-` defaults are `env:UPLOAD_S3_*` refs.
+  `POSTGRES_USER`/`POSTGRES_DB` keep `lakehouse`, which D1 allows.
+- `rustfsadmin`, `seaweedfsadmin` and the old Lakekeeper key are gone from
+  compose, `.env.example` and the workflows; in each CI job the
+  `UPLOAD_S3_*`/`CONNECTOR_S3_*` values equal that job's `RUSTFS_*`.
+- `deploy-staging.yml`: stops before touching staging when any of the six
+  `STAGING_*` secrets is empty; values are injected through `env:` and
+  written last-wins, never echoed.
+- `ops/init-env.sh`: refuses to overwrite `.env`, `umask 077`, values from
+  `openssl rand -hex` (or `/dev/urandom`), passed through the environment
+  not argv.
+- AC1 and AC2 evidence in the handoff (empty `.env` refused naming the
+  variable; default profile up from a clean project, all healthy or
+  exited 0, then `down -v`).
+
+Merge preconditions (owner): the six `STAGING_*` repository secrets exist
+with staging's current values; existing installs set the four must-set
+variables before pulling (upgrade note in `docs/OPERATIONS.md`).
