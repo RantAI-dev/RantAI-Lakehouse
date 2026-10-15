@@ -278,10 +278,6 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
     let row = get(&pool, PG, Kind::List).await.unwrap().unwrap();
     assert_eq!(row.state, State::Running);
 
-    let no_columns = Preview {
-        columns: vec![],
-        primary_key: None,
-    };
     let too_many_columns = Preview {
         columns: (0..=MAX_COLUMNS)
             .map(|i| ListedColumn {
@@ -292,22 +288,41 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
             .collect(),
         primary_key: None,
     };
-    for bad in [no_columns, too_many_columns] {
-        begin(&pool, PG, Kind::Preview, "req-p", "public.a", "", t0)
-            .await
-            .unwrap();
-        let err = finish(
+    begin(&pool, PG, Kind::Preview, "req-p", "public.a", "", t0)
+        .await
+        .unwrap();
+    let err = finish(
+        &pool,
+        PG,
+        Kind::Preview,
+        "req-p",
+        &Outcome::Preview(too_many_columns),
+        t0,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+
+    // A source with nothing to sample is no columns, not a refusal (D6).
+    let nothing_to_sample = Preview {
+        columns: vec![],
+        primary_key: None,
+    };
+    assert!(
+        finish(
             &pool,
             PG,
             Kind::Preview,
             "req-p",
-            &Outcome::Preview(bad),
-            t0,
+            &Outcome::Preview(nothing_to_sample),
+            t0
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
-    }
+        .unwrap()
+    );
+    let stored = get(&pool, PG, Kind::Preview).await.unwrap().unwrap();
+    assert_eq!(stored.state, State::Done);
+    assert!(stored.preview.unwrap().columns.is_empty());
     Ok(())
 }
 

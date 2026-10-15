@@ -14,6 +14,7 @@ mod catalog_search_cache;
 mod config;
 mod connector_deprovision;
 mod connector_discover;
+mod connector_listing;
 mod connector_probe;
 mod connector_secret_store;
 mod error;

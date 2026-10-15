@@ -606,6 +606,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/connectors/{id}/run-reports/{runId}/attempts", Policy::RequiresPermission("ingest:read")),
     ("POST", "/api/connectors/{id}/run-reports/{runId}/log", Policy::RequiresPermission("ingest:read")),
     ("POST", "/api/connectors/{id}/run-reports/{runId}/end", Policy::RequiresPermission("ingest:read")),
+    // `SRC-13`: the orchestrator posts the answer to a discovery request it was
+    // launched for. `ingest:read` is the one permission its service identity
+    // holds; a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports above do.
+    ("POST", "/api/connectors/{id}/discovery-results", Policy::RequiresPermission("ingest:read")),
     // A person reads what changed at the source and approves what waits
     // (`SRC-8` decision D6). The tenant gate is the route layer.
     ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),

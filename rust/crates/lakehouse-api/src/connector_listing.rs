@@ -1388,7 +1388,7 @@ mod tests {
                 &InternalHosts::NONE,
             )
             .await;
-            assert!(matches!(out, Dispatch::Orchestrator), "{connector:?}");
+            assert!(matches!(out, Dispatch::Orchestrator));
         }
 
         let rest = info(

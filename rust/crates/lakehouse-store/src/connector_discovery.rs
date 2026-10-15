@@ -316,7 +316,10 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preview {
-    /// The columns, in the source's order, at most [`MAX_COLUMNS`].
+    /// The columns, in the source's order, at most [`MAX_COLUMNS`]. Empty when
+    /// the source had nothing to infer them from (an empty topic, collection or
+    /// file): "no sample" is said as no columns, not as a failure and not as
+    /// invented ones (`SRC-13` decision D6; the first load learns them).
     pub columns: Vec<ListedColumn>,
     /// The primary key's columns in key order, when the source declares one;
     /// absent when it declares none or the type has no key.
@@ -394,15 +397,10 @@ impl Preview {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Validation`] for no column, more than [`MAX_COLUMNS`], a
-    /// blank, oversize or control-character name or type, a key longer than the
+    /// [`StoreError::Validation`] for more than [`MAX_COLUMNS`], a blank,
+    /// oversize or control-character name or type, a key longer than the
     /// columns, or a result past [`MAX_RESULT_BYTES`].
     pub fn validate(&self) -> Result<(), StoreError> {
-        if self.columns.is_empty() {
-            return Err(StoreError::Validation(
-                "a preview holds at least one column".to_owned(),
-            ));
-        }
         if self.columns.len() > MAX_COLUMNS {
             return Err(StoreError::Validation(format!(
                 "a preview holds at most {MAX_COLUMNS} columns"

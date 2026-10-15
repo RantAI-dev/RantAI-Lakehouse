@@ -620,6 +620,17 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/run-reports/{runId}/end",
             axum::routing::post(connector_runs::report_end),
         )
+        // `SRC-13`: the orchestrator's answer to a discovery request. Outside the
+        // tenant gate for the same reason (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`. The
+        // body may carry a listing of up to 3 MiB, so this route, and only this
+        // one, takes the larger body limit.
+        .route(
+            "/api/connectors/{id}/discovery-results",
+            axum::routing::post(connector_discovery::report_result).layer(DefaultBodyLimit::max(
+                connector_discovery::MAX_RESULT_BODY_BYTES,
+            )),
+        )
         .merge(per_connector)
 }
 
