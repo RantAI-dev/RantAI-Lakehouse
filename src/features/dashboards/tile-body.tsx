@@ -16,7 +16,12 @@ import { useReporting } from "./reporting-context";
 import { KpiCard } from "./kpi-card";
 import { PivotTable } from "./pivot-table";
 import { RawTable } from "./raw-table";
-import { cellClass, CellValue, columnStyle } from "./table-cell";
+import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
+import { domainsOf } from "@/lib/conditional-format";
+import { decimalsFor } from "@/lib/chart-axis";
+import type { StyleFields } from "@/lib/chart-style";
+import { formatValue, withMetricFormats } from "@/lib/value-format";
+import { styleOption } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
@@ -57,7 +62,7 @@ export function TileBody({
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
-  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields) | undefined, spec.resolved);
+  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields & StyleFields) | undefined, spec.resolved);
   // BI-6: "avg of stay" for a measure with its own aggregate, or one that takes the chart's (phase 2 QA R7).
   const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps, hasRows(cell) ? cell.metricLabels : undefined, def?.aggregate);
   // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
@@ -79,9 +84,12 @@ export function TileBody({
   }
   if (spec.kind === "kpi") {
     const v = hasRows(cell) ? Number(cell.rows[0]?.v ?? 0) : null;
+    const kpiFormat = def?.format ?? (hasRows(cell) ? withMetricFormats(undefined, cell.metricFormats)?.valueFormats?.[Object.keys(cell.metricFormats ?? {})[0] ?? ""] : undefined);
+    // BI-17: the KPI's number format, and the colour a rule gives its value ("green above the goal").
+    const paint = v === null ? undefined : conditionalCss(def?.conditional, null, v);
     return (
       <div className="grid h-full place-content-center px-2 text-center">
-        <p className="text-4xl font-semibold tabular-nums text-foreground">{v === null ? "—" : fmtInt(v)}</p>
+        <p className="text-4xl font-semibold tabular-nums text-foreground" style={paint && { color: paint.color, backgroundColor: paint.backgroundColor }}>{v === null ? "—" : kpiFormat ? formatValue(v, kpiFormat, reporting.numberLocale, decimalsFor([v])) : fmtInt(v)}</p>
         {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
       </div>
     );
@@ -94,7 +102,7 @@ export function TileBody({
     if (def?.tableMode === "rows") {
       return <RawTable spec={{ mart: spec.mart, sqlSource: spec.sqlSource, title: spec.title, def, chart: spec.source !== "builtin" && (def?.filters?.length || def?.joins?.length) ? spec.id : undefined }} cell={cell} paging={paging} onSortChange={onTableSort} />;
     }
-    return <TableView columns={cell.columns} rows={relabelBins(cell.rows, bins)} settings={def?.columnSettings} labels={measureLabels} />;
+    return <TableView columns={cell.columns} rows={relabelBins(cell.rows, bins)} settings={def?.columnSettings} labels={measureLabels} style={withMetricFormats(def, cell.metricFormats)} />;
   }
 
   if (spec.kind === "pivot") {
@@ -109,7 +117,7 @@ export function TileBody({
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
     }
-    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} />;
+    return <GeoChart spec={spec} rows={cell.rows} dark={dark} onDataClick={onDataClick} format={def?.format} locale={reporting.numberLocale} byValue={def?.colors?.byValue} />;
   }
 
   // BI-13: a chart with more questions on it draws all of them on one axis.
@@ -130,14 +138,38 @@ export function TileBody({
     // BI-6: the computed "Other" group is drawn last and is never a value to
     // click; a real value that is also called "Other" stays apart from it.
     const { rows, otherLabels } = labelOtherRows(bucketed, spec.x);
-    // BI-11: the reference lines, at the values this read gave them.
+    // BI-17: formats, palette, axes, labels and notes; BI-11/BI-17: the reference lines, at the values this read gave them.
+    const locale = reporting.numberLocale ?? "en-US";
+    const style = withMetricFormats(def as StyleFields | undefined, cell.metricFormats);
+    const yCols = Array.isArray(spec.y) ? spec.y : [spec.y];
+    const decimals = decimalsFor(rows.flatMap((r) => yCols.map((c) => Number(r[c] ?? 0))));
+    const built = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart), style, locale, companyPalette: reporting.companyPalette });
+    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals });
+    if (styled.message) {
+      return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
+    }
+    const fmtOf = (column?: string) => style?.valueFormats?.[column ?? yCols[0] ?? ""] ?? style?.format;
     const option = withReferenceLines(
-      buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart) }),
+      styled.option,
       cell.referenceLines, spec.kind === "hbar", dark,
+      {
+        values: (measure) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
+        format: (measure, v) => formatValue(v, fmtOf(measure), locale, decimals),
+        cutOff: !!cell.truncated,
+      },
     );
-    return (
+    const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
+    );
+    if (!styled.hiddenNotes) return chart;
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="min-h-0 flex-1">{chart}</div>
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+          {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+        </p>
+      </div>
     );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
@@ -163,11 +195,23 @@ function CombinedBody({
   onDataClick?: ChartClickHandler;
 }) {
   const grain = isGrain(cell.grain) ? cell.grain : null;
+  const reporting = useReporting();
+  const style = def as StyleFields | undefined;
+  const locale = reporting.numberLocale ?? "en-US";
   const combined = buildCombinedOption({
     kind: spec.kind, x: spec.x, y: spec.y, measureLabels, metricLabels: cell.metricLabels, rows: cell.rows, layers,
     layerMeasures: def?.layers?.map((l) => l.measures), baseDraw: def?.draw, baseAxis: def?.axis, grain,
+    style, locale, companyPalette: reporting.companyPalette,
   }, dark);
-  const option = withReferenceLines(combined.option, cell.referenceLines, false, dark);
+  const decimals = decimalsFor(Array.isArray(combined.option.series) ? combined.option.series.flatMap((s) => ((s as { data?: unknown[] }).data ?? []).filter((v): v is number => typeof v === "number")) : []);
+  const styled = styleOption(combined.option, {
+    kind: spec.kind, y: spec.y, style, locale, decimals,
+    columns: Array.isArray(combined.option.series) ? combined.option.series.map((s) => (s as { name?: string }).name) : undefined,
+  });
+  if (styled.message) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
+  }
+  const option = withReferenceLines(styled.option, cell.referenceLines, false, dark);
   const failed = failedLayers(layers);
   const cut = cutLayers(layers);
   const click = onDataClick
@@ -186,6 +230,11 @@ function CombinedBody({
       <div className="min-h-0 flex-1">
         <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%" onDataClick={click} />
       </div>
+      {styled.hiddenNotes ? (
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+          {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+        </p>
+      ) : null}
       {cut.length ? (
         <p className="px-1 pt-1 text-[11px] text-muted-foreground" aria-label="Questions that were cut off">
           {cut.map((label) => `${label}: not every value is shown`).join(" · ")}
@@ -202,7 +251,8 @@ function CombinedBody({
   );
 }
 
-function TableView({ columns, rows, settings = {}, labels = {} }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string> }) {
+function TableView({ columns, rows, settings = {}, labels = {}, style }: { columns: string[]; rows: Record<string, unknown>[]; settings?: Record<string, ColumnSetting>; labels?: Record<string, string>; style?: StyleFields }) {
+  const domains = React.useMemo(() => domainsOf(style?.conditional, rows), [style?.conditional, rows]);
   // The flag that marks the computed "Other" group is not a column to read.
   const shown = visibleColumns(columns).filter((c) => !settings[c]?.hidden);
   return (
@@ -216,7 +266,7 @@ function TableView({ columns, rows, settings = {}, labels = {} }: { columns: str
         <tbody>
           {rows.map((r, i) => (
             <tr key={i} className="border-b border-border/40 last:border-0">
-              {shown.map((c) => <td key={c} style={columnStyle(settings[c])} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} /></td>)}
+              {shown.map((c) => <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(style?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={style?.valueFormats?.[c] ?? style?.format} /></td>)}
             </tr>
           ))}
         </tbody>

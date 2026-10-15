@@ -1,6 +1,9 @@
 import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
-import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { decimalsFor, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { DEFAULT_PALETTE, resolvePalette } from "@/lib/chart-palettes";
+import type { ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
+import { formatAxisValue, formatValue } from "@/lib/value-format";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
@@ -21,11 +24,7 @@ type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target"> & {
 };
 
 /** The console's categorical palette (indigo-led). Used consistently across charts. */
-export const PALETTE = [
-  "#6366f1", "#0ea5e9", "#10b981", "#f59e0b",
-  "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899",
-  "#84cc16", "#f97316",
-];
+export const PALETTE: readonly string[] = DEFAULT_PALETTE;
 
 // English number format, matching the English UI (data values stay as-is).
 const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
@@ -52,21 +51,37 @@ export function buildOption(
   rows: Row[],
   dark: boolean,
   /** `firstDay`: the calendar's first weekday (0 Sunday, 1 Monday), from the Settings (BI-9). */
-  opts: { firstDay?: 0 | 1 } = {},
+  opts: {
+    firstDay?: 0 | 1;
+    /** BI-17: the chart's formats and colours; absent draws the chart as it always was. */
+    style?: StyleFields;
+    /** BI-17: the deployment's number locale. */
+    locale?: string;
+    /** BI-17: the company palette (Admin > Settings). */
+    companyPalette?: readonly string[];
+  } = {},
 ): EChartsOption {
   // BI-8 review fix (SHOULD-FIX) R4: axis, tooltip and label numbers carry the
   // decimals the drawn values need (none for whole numbers, as before).
   const yColumns = Array.isArray(spec.y) ? spec.y : [spec.y];
   const decimals = decimalsFor(rows.flatMap((r) => yColumns.map((c) => num(r[c]))));
-  const fmtInt = (v: number) => formatNumber(v, decimals);
-  const fmtCompact = (v: number) => formatCompactNumber(v, decimals);
+  // BI-17 (D3, D4): every number goes through the one formatter, with the
+  // chart's format (or the one of its first value) and the deployment's locale.
+  // With no format this is `formatNumber` / `formatCompactNumber`, as before.
+  const locale = opts.locale ?? "en-US";
+  const fmtOf = (column?: string): ValueFormat | undefined => (column ? opts.style?.valueFormats?.[column] : undefined) ?? opts.style?.format;
+  const fmtInt = (v: number) => formatValue(v, fmtOf(yColumns[0]), locale, decimals);
+  const fmtCompact = (v: number) => formatAxisValue(v, fmtOf(yColumns[0]), locale, decimals);
+  const pal = resolvePalette(opts.style?.colors, opts.companyPalette);
+  // A company palette may hold only two colours, so an index wraps.
+  const pc = (i: number) => pal[i % pal.length] ?? DEFAULT_PALETTE[0];
   const axis = dark ? "#a1a1aa" : "#71717a";
   const split = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
   const tooltipBg = dark ? "#18181b" : "#ffffff";
   const tooltipText = dark ? "#e4e4e7" : "#18181b";
 
   const base: EChartsOption = {
-    color: PALETTE,
+    color: [...pal],
     textStyle: { color: axis, fontFamily: "inherit" },
     tooltip: {
       backgroundColor: tooltipBg,
@@ -160,7 +175,7 @@ export function buildOption(
         width: "100%", height: "100%", top: 4, left: 4, right: 4, bottom: 4,
         label: { show: true, formatter: "{b}", color: "#fff", fontSize: 11 },
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, gapWidth: 2 },
-        data: rows.map((r, i) => ({ name: str(r[spec.x]), value: num(r[y0]), itemStyle: { color: PALETTE[i % PALETTE.length] } })) }],
+        data: rows.map((r, i) => ({ name: str(r[spec.x]), value: num(r[y0]), itemStyle: { color: pc(i) } })) }],
     } as EChartsOption;
   }
 
@@ -181,12 +196,12 @@ export function buildOption(
     const max = spec.target && spec.target > 0 ? spec.target : niceMax(v);
     return { ...base, grid: undefined,
       series: [{ type: "gauge", startAngle: 210, endAngle: -30, min: 0, max, radius: "92%", center: ["50%", "56%"],
-        progress: { show: true, width: 12, itemStyle: { color: PALETTE[0] } },
+        progress: { show: true, width: 12, itemStyle: { color: pc(0) } },
         axisLine: { lineStyle: { width: 12, color: [[1, split]] } },
         axisTick: { show: false }, splitLine: { length: 8, lineStyle: { color: axis } },
         axisLabel: { color: axis, fontSize: 9, distance: 12, formatter: (x: number) => fmtCompact(x) },
-        pointer: { width: 4, itemStyle: { color: PALETTE[0] } },
-        anchor: { show: true, size: 8, itemStyle: { color: PALETTE[0] } },
+        pointer: { width: 4, itemStyle: { color: pc(0) } },
+        anchor: { show: true, size: 8, itemStyle: { color: pc(0) } },
         detail: { valueAnimation: true, formatter: (x: number) => fmtInt(x), color: axis, fontSize: 22, offsetCenter: [0, "70%"] },
         title: { show: false }, data: [{ value: v }] }],
     } as EChartsOption;
@@ -240,8 +255,8 @@ export function buildOption(
       xAxis: catAxis(cat), yAxis: valAxis(),
       series: [
         { type: "bar", stack: "wf", itemStyle: { color: "transparent" }, emphasis: { itemStyle: { color: "transparent" } }, data: pad },
-        { name: "naik", type: "bar", stack: "wf", data: up, itemStyle: { color: PALETTE[2], borderRadius: [3, 3, 0, 0] } },
-        { name: "turun", type: "bar", stack: "wf", data: down, itemStyle: { color: PALETTE[4], borderRadius: [3, 3, 0, 0] } },
+        { name: "naik", type: "bar", stack: "wf", data: up, itemStyle: { color: pc(2), borderRadius: [3, 3, 0, 0] } },
+        { name: "turun", type: "bar", stack: "wf", data: down, itemStyle: { color: pc(4), borderRadius: [3, 3, 0, 0] } },
       ],
     } as EChartsOption;
   }
@@ -281,7 +296,7 @@ export function buildOption(
         lineStyle: { color: "gradient", curveness: 0.5, opacity: dark ? 0.35 : 0.3 },
         // Left side indigo, right side sky — the console palette, not
         // ECharts' default per-node colours.
-        data: nodes.map((n) => ({ name: n.name, itemStyle: { color: n.name.startsWith("a:") ? PALETTE[0] : PALETTE[1] } })), links }],
+        data: nodes.map((n) => ({ name: n.name, itemStyle: { color: n.name.startsWith("a:") ? pc(0) : pc(1) } })), links }],
     } as EChartsOption;
   }
 
@@ -323,8 +338,8 @@ export function buildOption(
       // and the axis says so, so the spacing is not read as linear.
       yAxis: log ? { ...valAxis("log scale"), type: "log" as const, logBase: 10 } : valAxis(),
       series: [
-        { type: "boxplot", data, itemStyle: { color: dark ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.15)", borderColor: PALETTE[0] } },
-        ...(flat.length ? [{ type: "scatter" as const, data: flat, symbolSize: 9, itemStyle: { color: PALETTE[0] } }] : []),
+        { type: "boxplot", data, itemStyle: { color: dark ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.15)", borderColor: pc(0) } },
+        ...(flat.length ? [{ type: "scatter" as const, data: flat, symbolSize: 9, itemStyle: { color: pc(0) } }] : []),
       ],
     } as EChartsOption;
   }
@@ -495,32 +510,125 @@ export function buildOption(
 
 export { fmtInt };
 
-/** A reference line with its value resolved by the server (`BI-11`). */
-export type ReferenceLine = { value: number; label?: string };
+/** A reference line as the server resolved it (`BI-11`, `BI-17`). */
+export type ReferenceLine = ResolvedReferenceLine;
+
+/**
+ * What the computed reference lines need of the tile (`BI-17` part A, D2): the
+ * values on screen, how to write a number, and whether the result was cut off.
+ */
+export type LineContext = {
+  /** The values of a result column, in the order the chart shows them; `undefined` names the first value. */
+  values: (measure?: string) => number[];
+  /** How a number of that value is written. */
+  format?: (measure: string | undefined, v: number) => string;
+  /** Set when the result was cut off: computed labels then say "of the N shown" (decision 9). */
+  cutOff?: boolean;
+};
+
+const LINE_NAME: Record<string, string> = { average: "Average", median: "Median", min: "Min", max: "Max", trend: "Trend" };
+
+/** The statistic a computed line draws, or `null` when there is nothing to compute it from. */
+export function computedValue(kind: string, values: readonly number[]): number | null {
+  const v = values.filter(Number.isFinite);
+  if (!v.length) return null;
+  switch (kind) {
+    case "average": return v.reduce((a, b) => a + b, 0) / v.length;
+    case "median": {
+      const s = [...v].sort((a, b) => a - b);
+      const mid = s.length >> 1;
+      return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+    }
+    case "min": return Math.min(...v);
+    case "max": return Math.max(...v);
+    default: return null;
+  }
+}
+
+/** Least-squares line over the points `0..n-1`: its value at the first and the last point. */
+export function trendEnds(values: readonly number[]): [number, number] | null {
+  const n = values.length;
+  if (n < 2 || !values.every(Number.isFinite)) return null;
+  const mx = (n - 1) / 2;
+  const my = values.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  values.forEach((y, x) => { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; });
+  const slope = sxy / sxx;
+  return [my - slope * mx, my + slope * (n - 1 - mx)];
+}
 
 /**
  * Draw `lines` on the value axis of a bar, hbar, line, area, stacked or combo
- * option: one dashed line each, labelled with its label and value (numbers via
- * `lib/chart-axis`). The value axis is widened to reach the highest line, since a
- * target far above the data would otherwise be drawn outside the chart. The
- * option is returned as it is when there are no lines or no series.
+ * option: one dashed line each, labelled with its label and value. The value
+ * axis is widened to reach the highest line, since a target far above the data
+ * would otherwise be drawn outside the chart. The option is returned as it is
+ * when there are no lines or no series.
+ *
+ * `BI-17` (D2): a line may also be the average, median, minimum or maximum of
+ * the values on screen, a linear trend over them, or a band between two
+ * values (a shaded area). Computed lines need `ctx`; when the result was cut
+ * off their label ends with "of the N shown", because they describe the rows
+ * on screen, not every row of the table.
  */
-export function withReferenceLines(option: EChartsOption, lines: readonly ReferenceLine[] | undefined, horizontal: boolean, dark: boolean): EChartsOption {
-  const drawn = (lines ?? []).filter((l) => Number.isFinite(l.value));
+export function withReferenceLines(option: EChartsOption, lines: readonly ReferenceLine[] | undefined, horizontal: boolean, dark: boolean, ctx?: LineContext): EChartsOption {
   const series = Array.isArray(option.series) ? option.series : [];
-  if (!drawn.length || !series.length) return option;
-  const color = dark ? "#fbbf24" : "#d97706";
-  const top = Math.max(...drawn.map((l) => l.value));
+  if (!lines?.length || !series.length) return option;
+  const fallback = dark ? "#fbbf24" : "#d97706";
+  const write = (measure: string | undefined, v: number) => ctx?.format?.(measure, v) ?? formatNumber(v, decimalsFor([v]));
+  const shown = ctx ? ctx.values().length : 0;
+  const suffix = ctx?.cutOff ? ` of the ${shown} shown` : "";
+  const lineData: object[] = [];
+  const areaData: object[] = [];
+  const reach: number[] = [];
+  for (const l of lines) {
+    const color = l.color ?? fallback;
+    // Only a line with a colour of its own overrides the shared style, so a plain line stays {yAxis, name}.
+    const paint = l.color ? { lineStyle: { color }, label: { color } } : {};
+    const kind = l.kind ?? "value";
+    const name = l.label ?? "";
+    const at = (v: number) => (horizontal ? { xAxis: v } : { yAxis: v });
+    if (kind === "value" && l.value !== undefined && Number.isFinite(l.value)) {
+      lineData.push({ ...at(l.value), name, ...paint });
+      reach.push(l.value);
+    } else if (kind === "band" && l.value !== undefined && l.to !== undefined && Number.isFinite(l.value) && Number.isFinite(l.to)) {
+      areaData.push([{ ...at(Math.min(l.value, l.to)), name, itemStyle: { color, opacity: 0.14 }, ...(l.color ? { label: { color } } : {}) }, at(Math.max(l.value, l.to))]);
+      reach.push(l.value, l.to);
+    } else if (kind === "trend" && ctx) {
+      const ends = trendEnds(ctx.values(l.measure));
+      if (!ends) continue;
+      const last = ctx.values(l.measure).length - 1;
+      // The result of a horizontal bar chart is drawn bottom-up, so point i sits at index last - i.
+      const point = (i: number, v: number) => ({ coord: horizontal ? [v, last - i] : [i, v] });
+      lineData.push([
+        { ...point(0, ends[0]), name: `${name || LINE_NAME.trend}${suffix}`, ...paint },
+        point(last, ends[1]),
+      ]);
+      reach.push(ends[0], ends[1]);
+    } else if (ctx && LINE_NAME[kind]) {
+      const v = computedValue(kind, ctx.values(l.measure));
+      if (v === null) continue;
+      lineData.push({ ...at(v), name: `${name || LINE_NAME[kind]}${suffix}`, ...paint });
+      reach.push(v);
+    }
+  }
+  if (!lineData.length && !areaData.length) return option;
+  const top = Math.max(...reach);
   const markLine = {
     silent: true,
     symbol: "none",
-    lineStyle: { type: "dashed" as const, width: 1.5, color },
+    lineStyle: { type: "dashed" as const, width: 1.5, color: fallback },
     label: {
-      color, fontSize: 11, position: "insideEndTop" as const,
-      formatter: (p: { name?: string; value?: unknown }) => `${p.name ? `${p.name} ` : ""}${formatNumber(Number(p.value ?? 0), decimalsFor([Number(p.value ?? 0)]))}`,
+      color: fallback, fontSize: 11, position: "insideEndTop" as const,
+      formatter: (p: { name?: string; value?: unknown }) => {
+        // A trend line has two ends and no single value to write.
+        const v = typeof p.value === "number" ? write(undefined, p.value) : "";
+        return `${p.name ? `${p.name} ` : ""}${v}`.trim();
+      },
     },
-    data: drawn.map((l) => (horizontal ? { xAxis: l.value, name: l.label ?? "" } : { yAxis: l.value, name: l.label ?? "" })),
+    data: lineData,
   };
+  const markArea = { silent: true, label: { position: "insideTopLeft" as const, fontSize: 11 }, data: areaData };
   const widen = (axis: unknown) => {
     if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
     return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
@@ -528,7 +636,7 @@ export function withReferenceLines(option: EChartsOption, lines: readonly Refere
   const widenAll = (axis: unknown) => (Array.isArray(axis) ? axis.map((a, i) => (i === 0 ? widen(a) : a)) : widen(axis));
   return {
     ...option,
-    series: series.map((s, i) => (i === 0 ? { ...s, markLine } : s)),
+    series: series.map((s, i) => (i === 0 ? { ...s, ...(lineData.length ? { markLine } : {}), ...(areaData.length ? { markArea } : {}) } : s)),
     ...(horizontal ? { xAxis: widenAll(option.xAxis) } : { yAxis: widenAll(option.yAxis) }),
   } as EChartsOption;
 }

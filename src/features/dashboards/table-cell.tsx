@@ -1,7 +1,12 @@
 "use client";
 
 import * as React from "react";
-import { cellContent } from "@/lib/cell-format";
+import { asNumber, cellContent } from "@/lib/cell-format";
+import type { CondRule, ValueFormat } from "@/lib/chart-style";
+import { conditionalStyle, type Domains } from "@/lib/conditional-format";
+import { decimalsFor } from "@/lib/chart-axis";
+import { formatValue } from "@/lib/value-format";
+import { useReporting } from "./reporting-context";
 import { cn } from "@/lib/utils";
 import type { ColumnSetting } from "@/lib/table-types";
 
@@ -11,8 +16,14 @@ import type { ColumnSetting } from "@/lib/table-types";
  * loaded only from https, sends no referrer and has a fixed maximum height;
  * everything else is text (`lib/cell-format`).
  */
-export function CellValue({ value, setting }: { readonly value: unknown; readonly setting?: ColumnSetting }) {
-  const c = cellContent(value, setting);
+export function CellValue({ value, setting, format }: { readonly value: unknown; readonly setting?: ColumnSetting; readonly format?: ValueFormat }) {
+  const { numberLocale } = useReporting();
+  // BI-17: the chart's number format reaches a number the column setting leaves to `auto`.
+  const auto = !setting?.format || setting.format === "auto";
+  if (format && auto && typeof value === "number" && asNumber(value) !== null) {
+    return <>{formatValue(value, format, numberLocale, setting?.decimals ?? decimalsFor([value]))}</>;
+  }
+  const c = cellContent(value, setting, numberLocale);
   if (c.kind === "link") {
     return <a href={c.href} target="_blank" rel="noopener noreferrer" className="text-primary underline-offset-2 hover:underline">{c.text}</a>;
   }
@@ -30,4 +41,11 @@ export function columnStyle(setting?: ColumnSetting): React.CSSProperties | unde
 
 export function cellClass(setting?: ColumnSetting, extra?: string): string {
   return cn("px-2 py-1 tabular-nums", setting?.wrap ? "whitespace-normal break-words" : "whitespace-nowrap", extra);
+}
+
+/** The inline style a conditional rule gives one cell (`BI-17` part A); `column` is `null` for a KPI. */
+export function conditionalCss(rules: readonly CondRule[] | undefined, column: string | null, value: unknown, domains?: Domains): React.CSSProperties | undefined {
+  const st = conditionalStyle(rules, column, value, domains);
+  if (!st) return undefined;
+  return { ...(st.background ? { backgroundColor: st.background } : {}), ...(st.color ? { color: st.color } : {}) };
 }

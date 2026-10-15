@@ -1,5 +1,5 @@
 import { formatCompactNumber, formatNumber } from "./chart-axis"
-import type { DateFormat, ValueFormat } from "./chart-style"
+import type { DateFormat, StyleFields, ValueFormat } from "./chart-style"
 
 /**
  * The one formatter every number and date on a chart goes through (`BI-17`
@@ -197,4 +197,37 @@ export function formatDateValue(value: unknown, fmt: DateFormat | undefined, loc
     hour12: fmt?.hour12 ?? false,
   }).format(at)
   return `${day} ${plainSpaces(time)}`
+}
+
+/**
+ * The format a metric's saved hint stands for (`BI-17`, D4). The hint is a
+ * short word the metric's author typed (`MetricDef.format`), with no list
+ * behind it, so only the words that are exactly a style here are honoured; any
+ * other hint is left unread rather than guessed at ("unsupported, honestly").
+ */
+export function formatFromHint(hint: string | undefined): ValueFormat | undefined {
+  switch ((hint ?? "").trim().toLowerCase()) {
+    case "number": return { style: "number" }
+    case "percent": return { style: "percent" }
+    case "compact": return { style: "compact" }
+    case "scientific": return { style: "scientific" }
+    default: return undefined
+  }
+}
+
+/**
+ * A chart's style with its metrics' hints as the lowest default: a metric's
+ * format applies to its value unless the chart has a format of its own or the
+ * value has one (decision 1 and D4). Returns `style` itself when nothing is
+ * added.
+ */
+export function withMetricFormats(style: StyleFields | undefined, hints: Record<string, string> | undefined): StyleFields | undefined {
+  if (!hints || style?.format) return style
+  const fromHints: Record<string, ValueFormat> = {}
+  for (const [name, hint] of Object.entries(hints)) {
+    const f = formatFromHint(hint)
+    if (f) fromHints[name] = f
+  }
+  if (!Object.keys(fromHints).length) return style
+  return { ...style, valueFormats: { ...fromHints, ...style?.valueFormats } }
 }

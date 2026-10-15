@@ -87,3 +87,23 @@ export const MAX_AXIS_TITLE_LEN = 60
 export const MAX_NOTE_LEN = 140
 export const MAX_ANNOTATIONS = 20
 export const MAX_CONDITIONAL_RULES = 20
+
+/** What a reference line marks; mirrors `lakehouse_bi::params::LineKind`. */
+export type ReferenceLineKind = "value" | "average" | "median" | "min" | "max" | "trend" | "band"
+
+/**
+ * A reference line as the server sends it with a tile's rows, parameters
+ * already resolved (`referenceLines` of the dashboard payload). `kind` is left
+ * out for a plain line; `value` is absent on a computed one, which the console
+ * works out from the rows on screen (`withReferenceLines`).
+ */
+export type ResolvedReferenceLine = {
+  kind?: ReferenceLineKind
+  value?: number
+  /** A band's upper edge. */
+  to?: number
+  label?: string
+  color?: string
+  /** The value a computed line describes, by result name; absent is the first. */
+  measure?: string
+}

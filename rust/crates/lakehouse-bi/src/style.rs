@@ -534,6 +534,20 @@ fn takes_second_axis(kind: ChartKind) -> bool {
     )
 }
 
+/// Kinds whose tooltip lists every value at one category (axis trigger), the
+/// ones a tooltip can be limited to chosen fields.
+fn takes_tooltip_fields(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Bar
+            | ChartKind::Hbar
+            | ChartKind::Line
+            | ChartKind::Area
+            | ChartKind::Stacked
+            | ChartKind::Combo
+    )
+}
+
 /// Kinds a notes can be pinned to: a category or date axis.
 fn takes_notes(kind: ChartKind) -> bool {
     matches!(
@@ -765,8 +779,11 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
         }
     }
     if let Some(tooltip) = &style.tooltip {
-        if !is_chart(kind) {
-            return Err(wrong("tooltip fields", "charts"));
+        if !takes_tooltip_fields(kind) {
+            return Err(wrong(
+                "tooltip fields",
+                "a bar, line, area, stacked or combo chart",
+            ));
         }
         if tooltip.fields.len() > MAX_ENTRIES {
             return Err(format!("at most {MAX_ENTRIES} tooltip fields."));
@@ -1000,6 +1017,8 @@ mod tests {
         assert!(refused(&json!({"annotations": twenty_one})).contains("at most 20 notes"));
         let long = json!([{"x": "Bali", "text": "x".repeat(141)}]);
         assert!(refused(&json!({"annotations": long})).contains("1 to 140"));
+        let e = refused(&json!({"kind": "pie", "tooltip": {"fields": ["visitors"]}}));
+        assert!(e.contains("tooltip fields is only for"), "{e}");
         let e = refused(&json!({"kind": "pie", "annotations": [note(1)]}));
         assert!(e.contains("a note is only for"), "{e}");
     }

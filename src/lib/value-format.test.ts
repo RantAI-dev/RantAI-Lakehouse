@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { decimalsFor, formatCompactNumber, formatNumber } from "./chart-axis"
 import { cellContent } from "./cell-format"
-import { formatAxisValue, formatCompactCurrency, formatDateValue, formatValue } from "./value-format"
+import { formatAxisValue, formatCompactCurrency, formatDateValue, formatFromHint, formatValue, withMetricFormats } from "./value-format"
 
 describe("formatValue", () => {
   test("a compact rupiah amount in id-ID reads Rp 1,23 M", () => {
@@ -114,5 +114,24 @@ describe("cellContent with a locale and a currency code", () => {
   test("a number column follows the locale and ten decimals are allowed", () => {
     expect(cellContent(1234.5, { format: "number" }, "id-ID")).toEqual({ kind: "text", text: "1.234,5" })
     expect(cellContent(0.5, { format: "number", decimals: 10 })).toEqual({ kind: "text", text: "0.5000000000" })
+  })
+})
+
+describe("a metric's format hint", () => {
+  test("only a hint that is exactly a style is read", () => {
+    expect(formatFromHint("Percent")).toEqual({ style: "percent" })
+    expect(formatFromHint("compact")).toEqual({ style: "compact" })
+    expect(formatFromHint("currency")).toBeUndefined()
+    expect(formatFromHint(undefined)).toBeUndefined()
+  })
+
+  test("it is the lowest default: below the chart's format and a per-value one", () => {
+    const hints = { rate: "percent", total: "compact", odd: "whatever" }
+    expect(withMetricFormats(undefined, hints)?.valueFormats).toEqual({ rate: { style: "percent" }, total: { style: "compact" } })
+    expect(withMetricFormats({ valueFormats: { rate: { style: "number" } } }, hints)?.valueFormats?.rate).toEqual({ style: "number" })
+    const own = { format: { style: "scientific" } } as const
+    expect(withMetricFormats(own, hints)).toBe(own)
+    const none = { colors: { palette: "muted" } }
+    expect(withMetricFormats(none, undefined)).toBe(none)
   })
 })
