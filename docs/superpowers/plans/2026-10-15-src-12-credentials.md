@@ -115,6 +115,34 @@ beyond what part A needs.
 
 *(developer)*
 
+### Part A (developer)
+
+**Commits** (branch `feat/phase-1-rest`, not pushed): `f0fe3cd4` A1 encryption in the API; `068eb062` A2 orchestrator opens sealed files; `9f743fce` A3 compose, config, CI keys, gitleaks; `0ed44de8` A4 the key-change command reaches the binary; `e0a4e0e4` SRC-11 gate fix (review 3 SHOULD-FIX 1: step d waits for its Dagster run to be final); `6209593e` A6 gate (`g6-credentials`); `90d2c020` A5 console. This handoff is the commit after.
+
+**Where things are.** The key-change command itself (`rotate-secrets-key` in `main.rs`, `ConnectorSecretStore::reseal_all`) landed with A1 because the start-up pass shares the file walk; A4 only lets it be run (`rust/entrypoint.api.sh` passes a command to the binary). Format, keys and errors: `lakehouse-api/src/secret_crypto.rs`. The managed refs are read in `state.rs` through the new `FileSecretResolver::read_confined` (lakehouse-core), so the confinement rule is not duplicated. `main` refuses to serve without a usable key, then runs the start-up pass (seals plain managed files, removes `.connector_managed_*.tmp|bak` leftovers, logs names only).
+
+**Commands run and outcomes.**
+- `cargo fmt --check` (workspace): clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` (includes lakehouse-core): clean, on the final Rust state. Earlier A1 run for api+core: clean after fixing two lints.
+- `(cd dagster && pytest dispar_orchestrate -q -m "not loader")`: 927 passed (run after A2); `test_secret_resolver.py` 25 passed.
+- `bun run typecheck`: clean. `bun test src/features/connectors`: 268 pass, 0 fail. `bun run lint`: 0 errors, 6 warnings, none in touched files.
+- `bash scripts/ci/tests/test_required_gate.sh`: 46 passed, 0 failed.
+- `ops/lint/check_*.py` all four: ok. YAML loads: `docker-compose.yml`, `ci.yml`, `deploy-staging.yml`, `ops/g6/docker-compose.src12.override.yml`; TOML load of `.gitleaks.toml`; `sh -n rust/entrypoint.api.sh`; `py_compile` of both gate files.
+
+**Not run.** `cargo test` (any crate): the new Rust tests (secret_crypto, connector_secret_store, state resolver, store `credential_source_of_ref`, the two integration tests that now read sealed files) compile under clippy `--all-targets` but were never executed. No docker: `docker compose config`/`up` for the changed compose file and for `ops/g6/docker-compose.src12.override.yml`, and the `g6-credentials` gate, never ran. `cargo deny`, `gitleaks`, `cargo build --locked` not run (the lockfile only gained the `lakehouse-api` -> `aes-gcm` edge; `aes-gcm 0.10.3` was already locked via `iceberg`). `cryptography==50.0.2` was found in the local venv, not checked as installable in the image.
+
+**Shared test vector.** `rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json`, written once with Python `cryptography`'s `AESGCM` (key = bytes 0..31, nonce = bytes 100..111, associated data = file name), version byte 0x01 prepended. Opened by `secret_crypto.rs` tests (including "does not open under another file name") and by `test_secret_resolver.py`.
+
+**CI keys.** CI `.env` key = base64 of the 32 ASCII characters `ci-connector-key-not-real-000000` (`Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=`), in all 14 "Write CI-only .env" steps and in the new job; the job's "new" key = base64 of `ci-connector-key-rotated-0000000`; the API integration tests' key = base64 of 32 bytes of 0x2a (`tests/common/mod.rs`, default for every test app unless overridden). All three plus the vector key are allowlisted in `.gitleaks.toml` by exact literal with the reason (gitleaks not run here; the allowlist is the cautious route). `deploy-staging.yml` now requires repository secret `STAGING_CONNECTOR_SECRETS_KEY` by name.
+
+**Tests added or changed.** New: `secret_crypto` (vector, wrong key, other name, previous key, flipped byte, not-a-seal, key checks), store (start-up pass seals and removes leftovers, unknown-key file left, `reseal_all`, no key means no write, copied file does not open), state (managed file opened, fail closed), Python (vector, previous key, malformed/missing key, plain file refused, end to end), store `credential_source_of_ref`, console detail/edit page text. Changed: store tests now read through the key; `connector_repoint.rs` and `connector_not_testable.rs` read the stored file sealed; `tests/common` gives every test app a key.
+
+**Decisions of mine to check.** (1) Unsealed managed files fail closed in both resolvers, so between a first start with the key and the API's start-up pass an orchestrator read of an old plain file is refused. (2) A sealed file under an unknown key is reported (`unreadable`) and left alone; "looks sealed" = first byte 0x01 and at least 29 bytes. (3) Open failures surface to a user as the existing "resolved to nothing" plus a fixed log line (decision 12 text, ref name only); no new `SecretError` variant. (4) `reseal_all` compares inode, size and mtime just before rename and reports a changed file as failed; a small race remains if a credential is saved during the command, so run it while none is. (5) `docker compose run` of the API passes through `depends_on` of the stack. (6) A6 is a new job (`g6-credentials`, limit 25): `g6-ops` already has limit 30. The g6 override makes `/run/secrets` read-only in the API, so a second override gives the API the writable volume (compose merges `volumes` by mount path; this is the part most likely to need a CI iteration).
+
+**Most likely CI failures.** (a) `g6-credentials`: the volume-merge override, the `run ... g6-ops-test-runner "<command>"` form (entrypoint `/bin/sh -c`), `pip install` of `requests`, the `credential.primary` field in the create response for a managed credential, timing of `up --force-recreate`. (b) Any job I missed that runs `docker compose` without the key now fails at config time with the new `:?` message (all 14 `.env` writers and the staging deploy were updated). (c) `cargo deny`/gitleaks on the new dependency edge and key literals. (d) Rust unit/integration tests never run locally. (e) `dagster` image build if `cryptography==50.0.2` does not resolve for python 3.12-slim.
+
+**Planner items (A7 and docs).** `docs/OPERATIONS.md` has no key-change how-to yet (command in the A4 commit message); the feature page and `CHANGELOG.md`; `STAGING_CONNECTOR_SECRETS_KEY` must exist before the next staging deploy (others' job); the README/quick-start `cp .env.example .env` now needs a generated key.
+
 ## Review
 
 *(planner)*
