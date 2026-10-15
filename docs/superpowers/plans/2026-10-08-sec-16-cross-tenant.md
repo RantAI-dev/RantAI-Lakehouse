@@ -424,7 +424,7 @@ list them in the handoff and the planner files backlog items.
     - Failure name: `state::tests::connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag` (known pre-existing environment failure, documented in spec)
   - `Running tests/sec11_guard.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
   - `Doc-tests lakehouse_api`: `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
-- `bun test src/services/clients`: `4 pass, 0 fail, 4 expect() calls, ran 4 tests across 1 files [40.00ms]`
+- `bun test src/services/clients`: 18 pass, 0 fail, 23 expect() calls across 7 files (including 4 pass in `uploads.test.ts`)
 - `gitleaks`: `No leaks found. 2226 commits scanned.`
 
 **Known Issues:**
