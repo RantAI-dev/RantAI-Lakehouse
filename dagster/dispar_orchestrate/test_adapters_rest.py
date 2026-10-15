@@ -219,3 +219,36 @@ def test_build_source_accepts_a_positional_source_objects_argument():
         resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
     )
     assert list(result.source) == [{"id": 1}]
+
+
+def _two_endpoint_spec():
+    return {
+        "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
+        "pagination": {"type": "none"},
+        "endpoints": [{"path": "/orders", "recordsPath": "orders"}, {"path": "/users", "recordsPath": "users"}],
+    }
+
+
+def _fake_get(url, **_):
+    return {"orders": [{"o": 1}]} if url.endswith("/orders") else {"users": [{"u": 1}]}
+
+
+def test_an_object_that_names_a_declared_endpoint_loads_that_endpoint_only():
+    # SRC-13 decision D3.
+    result = build_source(
+        _two_endpoint_spec(), {"token": "t"}, [{"name": "/users", "target": "users"}],
+        http_get=_fake_get,
+        resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
+    )
+    assert list(result.source) == [{"u": 1}]
+
+
+def test_an_object_saved_before_src_13_still_loads_every_endpoint():
+    # SRC-13 decision D3: a `name` that is a target, not an endpoint path, keeps
+    # today's behaviour.
+    result = build_source(
+        _two_endpoint_spec(), {"token": "t"}, [{"name": "orders_table", "target": "orders_table"}],
+        http_get=_fake_get,
+        resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
+    )
+    assert list(result.source) == [{"o": 1}, {"u": 1}]

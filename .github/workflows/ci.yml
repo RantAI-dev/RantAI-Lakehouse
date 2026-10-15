@@ -1776,6 +1776,109 @@ jobs:
         if: always()
         run: docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster down -v
 
+  # ── SRC-13 (table discovery, decisions D9 and D12): a PostgreSQL schema of
+  # 10,000 tables is listed through the API within two minutes and one table
+  # is found by a search; the seconds are printed and the step fails above 120.
+  # Own job, so no existing connector gate grows: it needs only the API and the
+  # PostgreSQL the API's seeded `conn-pg-lakehouse` connector points at (no
+  # Dagster, no MySQL, no Iceberg writer), plus the API's own dependencies
+  # (ClickHouse, oidc-mock). The first CI runs are its measurement; the estimate
+  # is 8 to 12 minutes (image load, the API stack, about a minute for the
+  # tables, a few seconds for the calls). `ops/g6/docker-compose.g6.override.yml`
+  # supplies the gate-only SSRF opt-in that lets the API dial the `postgres`
+  # service, and its `${VAR:?}` fixtures need the same fake `.env` values as
+  # `g6-ops`. Scope gate as g6-ingest. ──
+  g6-discovery-scale:
+    name: Rust · SRC-13 discovery of 10,000 tables
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Images from the `images` job; see `g3a-dagster`'s download step. The
+      # Dagster image is the runner's only (it holds `requests` and psycopg2).
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        # Obviously fake values of a throwaway stack. The mysql/mssql/mariadb/
+        # sftp/mongo values are only here because the g6 override interpolates
+        # `${VAR:?}` for every service, started or not.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          UPLOAD_S3_ACCESS_KEY=rustfsadmin
+          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          EOF
+
+      - name: Build the oidc-mock fixture image
+        run: >
+          docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile src13-scale build oidc-mock
+
+      - name: Bring up the API and its PostgreSQL
+        # Explicit service list: the API starts its own `depends_on` (postgres,
+        # clickhouse, oidc-mock) and nothing else.
+        run: >
+          docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile src13-scale up -d --no-build lakehouse-api
+
+      - name: Run the SRC-13 discovery scale gate inside the compose network
+        shell: bash
+        run: |
+          docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+            --profile src13-scale run --rm -T --no-deps src13-scale-test-runner 2>&1 | tee "$RUNNER_TEMP/src13-run.log"
+
+      - name: Add the measured seconds to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/src13-run.log" ]; then
+            {
+              echo '### SRC-13 discovery of 10,000 tables (limit 120 s)'
+              echo '```'
+              grep -E '^\[src13\]' "$RUNNER_TEMP/src13-run.log" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile src13-scale logs
+
+      - name: Tear down the project
+        if: always()
+        run: docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile src13-scale down -v
+
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
   # ClickHouse and appends it to the `gold` Iceberg namespace through
@@ -2064,6 +2167,7 @@ jobs:
       - g6-alerts
       - g6-ops
       - g6-credentials
+      - g6-discovery-scale
       - gold-export
       - g8-governance
       - g8-time-travel
@@ -2108,6 +2212,7 @@ jobs:
           G6_ALERTS_RESULT: ${{ needs.g6-alerts.result }}
           G6_OPS_RESULT: ${{ needs.g6-ops.result }}
           G6_CREDENTIALS_RESULT: ${{ needs.g6-credentials.result }}
+          G6_DISCOVERY_SCALE_RESULT: ${{ needs.g6-discovery-scale.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
           G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}

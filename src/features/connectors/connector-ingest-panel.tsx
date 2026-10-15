@@ -9,7 +9,6 @@ import {
   LoaderIcon,
   PlayIcon,
   PlusIcon,
-  SearchIcon,
   TableIcon,
   XIcon,
 } from "lucide-react"
@@ -22,11 +21,14 @@ import { Label } from "@/components/ui/label"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
+import { specWithTopic } from "@/lib/connectors/kafka-topic"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { notifySuccess, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import { TableActionsMenu } from "./connector-table-actions"
+import { FINDER_WORDS, finderKind, TableFinder } from "./table-finder"
+import { useColumnPreviews, type PreviewEntry } from "./use-discovery"
 import type {
   ConnectorRun,
   Dial,
@@ -208,8 +210,10 @@ export function loadModeProblem(selected: {
 
 /**
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
- * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle follows with
- * `SRC-13`; files, REST, MongoDB, Kafka and SFTP have no column list to choose from.
+ * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle is listed by
+ * `SRC-13` but the API refuses `excludedColumns` for it (`validate_excluded_columns`), so it is not offered here;
+ * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. The columns come from the
+ * preview route (`useColumnPreviews`), also for a table saved in an earlier visit.
  */
 export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
   const driver = typeof dial?.driver === "string" ? dial.driver : ""
@@ -370,7 +374,12 @@ function IngestEditor({
   const adapter = spec.adapter ?? ""
   const isCdc = adapter === "cdc"
   const isStream = adapter === "kafka"
-  const canDiscover = adapter === "sql" || adapter === "cdc"
+  // SRC-13 D1 to D8: every type but Google Sheets has a Find flow; Kafka's picks its one topic (D4).
+  const finder = finderKind(adapter, spec.dial)
+  // Typed names stay possible next to a list that is cut or incomplete (and are the only way for a type
+  // that cannot list); a SQL source and Kafka take no typed name.
+  const manualAdd = finder !== "sql" && finder !== "kafka"
+  const previews = useColumnPreviews(connectorId)
   const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
   const runState = useIngestRunState(connectorId)
@@ -386,13 +395,7 @@ function IngestEditor({
   )
   const cron = cronChoice === "custom" ? customCron.trim() : cronChoice
 
-  const [schema, setSchema] = React.useState(() => defaultDiscoverSchema(spec.dial))
-  const [filter, setFilter] = React.useState("")
   const [manualName, setManualName] = React.useState("")
-
-  const discover = useServiceAction((signal, id: string, s: string) =>
-    connectorService.discoverConnector(id, s, signal)
-  )
   const save = useServiceAction(
     withNotify({ success: "Tables and schedule saved", error: "Could not save tables" }, (signal) =>
       connectorService.setIngestSpec(
@@ -424,11 +427,26 @@ function IngestEditor({
   const canSave =
     dirty && problems.every((p) => p === null) && modeProblems.every((p) => p === null) && scheduleProblem === null
 
-  const found = discover.data?.supported ? discover.data.objects : []
-  // The columns of the tables found so far, to pick a cursor column from.
-  const columnsOf = new Map(found.map((o) => [o.name, o.columns.map((c) => c.name)]))
-  // The key each found table declares at the source (SQL drivers); absent when it declares none.
-  const keysOf = new Map(found.filter((o) => (o.primaryKey ?? []).length > 0).map((o) => [o.name, o.primaryKey]))
+  // The columns of the tables read through the preview route, to pick a cursor column from (SRC-13 D6).
+  const columnsOf = new Map<string, string[]>()
+  // The key each of them declares at the source (SQL drivers); absent when it declares none.
+  const keysOf = new Map<string, string[]>()
+  for (const [name, entry] of previews.entries) {
+    if (entry.status !== "done" || entry.columns.length === 0) continue
+    columnsOf.set(name, entry.columns.map((c) => c.name))
+    if (entry.primaryKey.length > 0) keysOf.set(name, entry.primaryKey)
+  }
+  // Whether the columns of a table of this connector are read ahead, for a key or a cursor to pick from:
+  // only where the API answers a preview in the call itself (SQL), so ticking a table does not start a job.
+  const readsColumnsAhead = finder === "sql"
+  const wantsColumns = (s: Selected) => s.loadMode !== "replace" && s.loadMode !== "append"
+  // SRC-13 D6: the columns of a SQL table are read when it is ticked or its mode needs them, one request
+  // at a time; `ensure` asks for a name once.
+  React.useEffect(() => {
+    if (!readsColumnsAhead) return
+    for (const s of selection) if (wantsColumns(s)) previews.ensure(s.name)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readsColumnsAhead, selection, previews.ensure])
 
   function toggle(name: string) {
     setSelection((current) =>
@@ -436,6 +454,17 @@ function IngestEditor({
         ? current.filter((s) => s.name !== name)
         : [...current, newTable(name)]
     )
+    // A ticked SQL table's key comes with its columns; the mode switch below fills it in (SRC-10 decision 3).
+    if (readsColumnsAhead && !selectedNames.has(name)) previews.ensure(name)
+  }
+
+  /** Tick or untick every one of `names`: the button over the shown rows of the list. */
+  function setMany(names: string[], on: boolean) {
+    setSelection((current) => {
+      if (!on) return current.filter((s) => !names.includes(s.name))
+      const have = new Set(current.map((s) => s.name))
+      return [...current, ...names.filter((n) => !have.has(n)).map((n) => newTable(n))]
+    })
   }
 
   /** A ticked table: one copy of the source per run, with the key the source declares when it declares one. */
@@ -472,9 +501,14 @@ function IngestEditor({
     setManualName("")
   }
 
-  const needle = filter.trim().toLowerCase()
-  const shown = needle ? found.filter((o) => o.name.toLowerCase().includes(needle)) : found
-  const allShownSelected = shown.length > 0 && shown.every((o) => selectedNames.has(o.name))
+  // SRC-13 D3: the endpoints a REST connector declares, to tell a table that names one from one saved before.
+  const declaredEndpoints = Array.isArray(spec.dial.endpoints)
+    ? spec.dial.endpoints.flatMap((e: unknown) =>
+        e && typeof e === "object" && typeof (e as { path?: unknown }).path === "string"
+          ? [(e as { path: string }).path]
+          : []
+      )
+    : []
 
   /** Why a table cannot be refreshed or cleared now, or `null` (SRC-10 decision 5). */
   function tableActionBlock(name: string): string | null {
@@ -503,6 +537,7 @@ function IngestEditor({
     </>
   )
 
+  const words = finder ? FINDER_WORDS[finder] : null
   const tablesBody = !isStream ? (
     <>
       {/* Selected tables: the list that is saved. */}
@@ -512,7 +547,7 @@ function IngestEditor({
         </p>
         {selection.length === 0 ? (
           <p className="rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
-            No tables selected yet.{canDiscover ? " Find tables below and tick the ones to copy." : ""}
+            No tables selected yet.{words ? ` Find ${words.many} below and tick the ones to copy.` : ""}
           </p>
         ) : (
           <>
@@ -581,9 +616,13 @@ function IngestEditor({
                 {columnChoice ? (
                   <ColumnChoice
                     selected={s}
-                    columns={columnsOf.get(s.name) ?? null}
+                    preview={previews.entries.get(s.name)}
+                    onOpen={() => previews.ensure(s.name)}
                     onChange={(excludedColumns) => change(s.name, { excludedColumns })}
                   />
+                ) : null}
+                {adapter === "rest" && !declaredEndpoints.includes(s.name) ? (
+                  <p className="text-xs text-muted-foreground">{REST_OLD_OBJECT_NOTE}</p>
                 ) : null}
               </li>
             ))}
@@ -592,104 +631,21 @@ function IngestEditor({
         )}
       </div>
 
-      {/* Finding tables. */}
-      {canDiscover ? (
-        <div className="space-y-2 rounded-md border border-border p-3">
-          <div className="flex items-end gap-2">
-            <div className={cn("min-w-0 flex-1 space-y-1", page && "max-w-xs")}>
-              <Label htmlFor="discover-schema" className="text-xs">
-                Schema
-              </Label>
-              <Input
-                id="discover-schema"
-                value={schema}
-                onChange={(e) => setSchema(e.target.value)}
-                className="h-8"
-                autoComplete="off"
-              />
-            </div>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={discover.status === "pending" || schema.trim() === ""}
-              onClick={() => discover.run(connectorId, schema.trim())}
-            >
-              <SearchIcon data-icon="inline-start" />
-              {discover.status === "pending" ? "Finding…" : "Find tables"}
-            </Button>
-          </div>
-          {discover.status === "error" ? <ErrorState error={discover.error} /> : null}
-          {discover.data && !discover.data.supported ? (
-            <p className="text-xs text-muted-foreground">Cannot list tables · {discover.data.reason}</p>
-          ) : null}
-          {discover.data?.supported && found.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No tables in schema &ldquo;{schema.trim()}&rdquo;. Check the schema name.
-            </p>
-          ) : null}
-          {found.length > 0 ? (
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                {found.length > 8 ? (
-                  <Input
-                    aria-label="Filter tables"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                    placeholder={`Filter ${found.length} tables`}
-                    className={cn("h-7 text-xs", page && "max-w-xs")}
-                    autoComplete="off"
-                  />
-                ) : (
-                  <span className="flex-1 text-xs text-muted-foreground">{found.length} tables found</span>
-                )}
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  className="shrink-0"
-                  onClick={() =>
-                    setSelection((current) => {
-                      if (allShownSelected) return current.filter((s) => !shown.some((o) => o.name === s.name))
-                      const missing = shown.filter((o) => !current.some((s) => s.name === o.name))
-                      return [
-                        ...current,
-                        ...missing.map((o) => newTable(o.name)),
-                      ]
-                    })
-                  }
-                >
-                  {allShownSelected ? "Clear shown" : "Select shown"}
-                </Button>
-              </div>
-              <ul className="max-h-64 space-y-0.5 overflow-y-auto">
-                {shown.map((object) => {
-                  const id = `discover-${object.name}`
-                  return (
-                    <li key={object.name}>
-                      <label
-                        htmlFor={id}
-                        className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/50"
-                      >
-                        <input
-                          id={id}
-                          type="checkbox"
-                          checked={selectedNames.has(object.name)}
-                          onChange={() => toggle(object.name)}
-                        />
-                        <span className="min-w-0 flex-1 truncate font-mono text-xs">{object.name}</span>
-                        <span className="shrink-0 text-xs text-muted-foreground">
-                          {object.columns.length} cols
-                        </span>
-                      </label>
-                    </li>
-                  )
-                })}
-              </ul>
-            </div>
-          ) : null}
-        </div>
-      ) : (
+      {/* Finding tables (SRC-13): one flow for every type that can list. */}
+      {finder ? (
+        <TableFinder
+          connectorId={connectorId}
+          adapter={adapter}
+          dial={spec.dial}
+          defaultSchema={defaultDiscoverSchema(spec.dial)}
+          previews={previews}
+          selectedNames={selectedNames}
+          onToggle={toggle}
+          onSetMany={setMany}
+          wide={page}
+        />
+      ) : null}
+      {manualAdd ? (
         <div className="space-y-1.5">
           <Label htmlFor="manual-object" className="text-xs">
             Add by name
@@ -705,7 +661,15 @@ function IngestEditor({
                   addManual()
                 }
               }}
-              placeholder={adapter === "sftp" || adapter === "files" ? "orders.csv" : "object name"}
+              placeholder={
+                adapter === "sftp" || adapter === "files"
+                  ? "orders.csv"
+                  : finder === "oracle"
+                    ? "SCHEMA.TABLE"
+                    : adapter === "rest"
+                      ? "/orders"
+                      : "object name"
+              }
               className="h-8 font-mono text-xs"
               autoComplete="off"
             />
@@ -715,11 +679,53 @@ function IngestEditor({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            This connector type cannot list its objects, so type each one as the source names it.
+            {finder === null
+              ? "This connector type cannot list its objects, so type each one as the source names it."
+              : finder === "oracle"
+                ? "Or type SCHEMA.TABLE as Oracle names it, for a table the list does not show."
+                : adapter === "rest"
+                  ? "Or type the path of an endpoint this connector declares."
+                  : "Or type a name the list does not show."}
           </p>
         </div>
-      )}
+      ) : null}
     </>
+  ) : null
+
+  // SRC-13 D4: Kafka reads one topic, the dial's `topic`. Picking one from the broker's list saves the
+  // spec with only that field changed (`specWithTopic`); the connector reads it at its next run.
+  const topic = typeof spec.dial.topic === "string" ? spec.dial.topic : ""
+  const pickTopic = useServiceAction(
+    withNotify({ success: "Topic saved", error: "Could not save the topic" }, (signal, name: string) =>
+      connectorService.setIngestSpec(connectorId, specWithTopic(spec, name), signal)
+    )
+  )
+  const topicBody = isStream ? (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Topic:{" "}
+        <span className="font-mono text-foreground" data-testid="kafka-topic">
+          {topic || "none chosen"}
+        </span>
+      </p>
+      <TableFinder
+        connectorId={connectorId}
+        adapter={adapter}
+        dial={spec.dial}
+        defaultSchema=""
+        previews={previews}
+        selectedNames={new Set(topic ? [topic] : [])}
+        onToggle={async (name) => {
+          const result = await pickTopic.run(name)
+          if (result) onSaved(result)
+        }}
+        onSetMany={() => {}}
+        single
+        busy={pickTopic.status === "pending"}
+        wide={page}
+      />
+      {pickTopic.status === "error" ? <p className="text-xs text-destructive">{pickTopic.error.message}</p> : null}
+    </div>
   ) : null
 
   // Schedule. CDC streams on its own and has none.
@@ -828,6 +834,7 @@ function IngestEditor({
               {isStream ? <p className="text-sm text-muted-foreground">{tablesIntro}</p> : null}
               {cdcNotes}
               {tablesBody}
+              {topicBody}
               {isCdc ? saveRow : null}
             </div>
           </SectionCard>
@@ -856,6 +863,7 @@ function IngestEditor({
       </div>
       {cdcNotes}
       {tablesBody}
+      {topicBody}
       {scheduleBlock}
       {saveRow}
       {runs}
@@ -967,27 +975,42 @@ function LoadModeFields({
 export const NO_COLUMN_CHOICE_NOTE = "Column choice is not available for this source type."
 
 /**
+ * `SRC-13` decision D3: a REST table now loads the one endpoint it names. A table saved before names a target,
+ * not an endpoint, and the loader keeps reading every endpoint for it until it is picked again.
+ */
+export const REST_OLD_OBJECT_NOTE =
+  "Saved before endpoints could be picked: this table loads every endpoint of the connector. Pick one endpoint in Find endpoints to load only that one."
+
+/**
  * Which columns of a table a load reads (`SRC-11` decisions 9 to 11). Opened per table; the columns come from
- * discovery, so a table not found in this visit says to find it first. Unticking adds the column to
- * `excludedColumns`. A key column of a table that deduplicates or keeps history, and the cursor column, are
- * ticked and locked with the reason. A column left out earlier that discovery no longer lists still shows,
- * so it can be ticked again.
+ * the preview route (`SRC-13`), read when the section is opened, so a table saved in an earlier visit lists them
+ * too. Unticking adds the column to `excludedColumns`. A key column of a table that deduplicates or keeps
+ * history, and the cursor column, are ticked and locked with the reason. A column left out earlier that the
+ * source no longer lists still shows, so it can be ticked again.
  */
 function ColumnChoice({
   selected,
-  columns,
+  preview,
+  onOpen,
   onChange,
 }: {
   selected: Selected
-  columns: string[] | null
+  /** What the preview route said about this table's columns, or `undefined` before they were asked for. */
+  preview: PreviewEntry | undefined
+  /** Asks for the columns (once): called when the section is opened. */
+  onOpen: () => void
   onChange: (excluded: string[]) => void
 }) {
   const locked = lockedColumns(selected)
   const excluded = effectiveExcluded(selected)
+  const columns = preview?.status === "done" && preview.columns.length > 0 ? preview.columns.map((c) => c.name) : null
   const shown = columns ? [...columns, ...excluded.filter((c) => !columns.includes(c))] : null
   return (
     <details className="group">
-      <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+      <summary
+        onClick={onOpen}
+        className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden"
+      >
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-open:rotate-90" />
         Columns
         {excluded.length > 0 ? ` · ${excluded.length} left out` : ""}
@@ -996,7 +1019,11 @@ function ColumnChoice({
         {shown === null ? (
           <p className="text-xs text-muted-foreground">
             {excluded.length > 0 ? `Left out: ${excluded.join(", ")}. ` : ""}
-            Find this table above to list its columns.
+            {preview === undefined || preview.status === "loading"
+              ? "Reading the columns…"
+              : preview.status === "failed"
+                ? `Cannot read the columns · ${preview.reason}`
+                : "The source reports no columns for this table."}
           </p>
         ) : (
           <>

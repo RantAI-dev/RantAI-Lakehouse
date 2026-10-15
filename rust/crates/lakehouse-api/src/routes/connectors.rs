@@ -1770,9 +1770,8 @@ pub async fn set_credential(
     }))
 }
 
-/// `?schema=` query for `POST /api/connectors/{id}/discover`. Required
-/// only for a `sql`/`cdc` adapter connector — see
-/// `crate::connector_discover::discover`'s doc comment.
+/// `?schema=` query of [`discover`]. Required only for a `sql`/`cdc` adapter
+/// connector — see `crate::connector_discover::discover`'s doc comment.
 #[derive(Debug, Deserialize)]
 pub struct DiscoverQuery {
     /// The schema to list tables/columns from. Bound as a query
@@ -1782,9 +1781,17 @@ pub struct DiscoverQuery {
     schema: Option<String>,
 }
 
-/// `POST /api/connectors/{id}/discover` — list a connector's source
-/// tables and columns, for a `sql`/`cdc` adapter connector against the
-/// `?schema=` query parameter. Every other adapter (`files`/`rest`/
+/// List a connector's source tables and columns, for a `sql`/`cdc` adapter
+/// connector against the `?schema=` query parameter.
+///
+/// `SRC-13`: this is NO LONGER A ROUTE (`POST /api/connectors/{id}/discover` and its
+/// policy row were removed when the console moved to `discovery/{kind}`, which lists
+/// every type and previews columns on demand). The handler stays only because the
+/// assistant's `discover_source` tool (`routes::ai::tools::ingest`) calls it in-process
+/// with a schema; moving that tool to the new listing is the AI team's change, since it
+/// alters the tool's answer shape and `tests/fixtures/tool_schemas.json`. Do not mount it again.
+///
+/// Every other adapter (`files`/`rest`/
 /// `sheets`) or a connector with no ingest-spec adapter set yet answers
 /// with an honest `supported: false` — see
 /// `crate::connector_discover`'s module doc comment for exactly what is

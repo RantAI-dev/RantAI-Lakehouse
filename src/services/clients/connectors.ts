@@ -11,7 +11,7 @@ import type {
   CreateConnectorInput,
   CreateConnectorResponse,
   DebeziumProperties,
-  DiscoverResult,
+  DiscoveryAnswer,
   IngestibleConnector,
   IngestRunResult,
   IngestSpec,
@@ -124,12 +124,15 @@ export const postgresConnectorService: ConnectorService = {
   listIngestible(signal) {
     return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });
   },
-  discoverConnector(id, schema, signal) {
-    return postJson<DiscoverResult>(
-      `/api/connectors/${encodeURIComponent(id)}/discover?schema=${encodeURIComponent(schema)}`,
-      undefined,
+  startDiscovery(id, kind, request, signal) {
+    return postJson<DiscoveryAnswer>(
+      `/api/connectors/${encodeURIComponent(id)}/discovery/${kind}`,
+      request,
       signal
     );
+  },
+  getDiscovery(id, kind, signal) {
+    return getJson<DiscoveryAnswer>(`/api/connectors/${encodeURIComponent(id)}/discovery/${kind}`, { signal });
   },
   runIngest(id, signal, table) {
     return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, table, signal);

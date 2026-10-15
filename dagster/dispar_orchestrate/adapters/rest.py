@@ -219,18 +219,22 @@ def build_source(
     resolve_checked=ssrf_guard.resolve_checked,
     http_get: Callable | None = None,
 ) -> AdapterBuildResult:
-    # WS3 plan review Z6: `source_objects` is accepted (and ignored) so
-    # ingest_factory.py's ONE call shape (`adapter.build_source(dial,
-    # secrets, [obj])`) works uniformly across sql/files/rest -- a REST
-    # connector's "objects" are its `dial.endpoints`, declared in the
-    # dial itself, not a separate `source_objects` list the way sql/files
-    # need one; the parameter exists here purely for call-site arity, not
-    # because this adapter reads it.
-    del source_objects
+    # SRC-13 decision D3: a source object that NAMES a declared endpoint (its
+    # `name` is that endpoint's `path`, which is what the console's Find flow
+    # writes) loads that endpoint only. Any other object -- one saved before
+    # SRC-13, whose `name` was a target name -- keeps the old behaviour and loads
+    # every declared endpoint, so a saved connector does not change what it reads
+    # until the object is picked again (the console says so on such a row).
+    # The positional argument is still the ONE call shape ingest_factory.py uses
+    # for every adapter (WS3 plan review Z6).
+    names = {obj.get("name") for obj in (source_objects or [])}
+    endpoints = [e for e in spec["endpoints"] if e["path"] in names]
+    if not endpoints:
+        endpoints = list(spec["endpoints"])
     headers, get, resolved = _prepare(spec, secrets, resolve_checked=resolve_checked, http_get=http_get)
 
     def _rows():
-        for endpoint in spec["endpoints"]:
+        for endpoint in endpoints:
             yield from _paginate(spec["baseUrl"], endpoint, spec["pagination"], headers, get)
 
     return AdapterBuildResult(source=_rows(), resolved=resolved)

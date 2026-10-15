@@ -577,20 +577,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Rewrites which credential reference the connector dials with next
     // (probe-first — see `routes::connectors::rotate_secret`'s doc
     // comment) — a MUTATING action over the same credential-adjacent
-    // surface `/test`/`/discover` already gate on `connector:manage`,
+    // surface `/test` and `/discovery/{kind}` already gate on `connector:manage`,
     // not a new, narrower permission.
     ("PUT",  "/api/connectors/{id}/secret", Policy::RequiresPermission("connector:manage")),
     // ADR 0002 Addendum 4: the user-supplied credential write path — same
     // permission as every other connector mutation (probe-first too, see
     // `routes::connectors::set_credential`'s doc comment).
     ("PUT",  "/api/connectors/{id}/credential", Policy::RequiresPermission("connector:manage")),
-    // Reads a connector's live schema (tables/columns), same sensitivity
-    // class as `/test` (opens a real, credentialed connection to the
-    // connector's own target) — not a new permission, matching every
-    // other read-shaped connector route above (WS3 item 14).
-    ("POST", "/api/connectors/{id}/discover", Policy::RequiresPermission("connector:manage")),
     // `SRC-13` (D11): list and preview a source's tables, files, endpoints, topics
-    // and collections, the same audience as the connection test and `/discover`.
+    // and collections, the same audience as the connection test. It replaced
+    // `POST /api/connectors/{id}/discover` (WS3 item 14), which read a SQL
+    // source's live schema with the same sensitivity as `/test` (a real,
+    // credentialed connection to the connector's own target) and so gated on the
+    // same permission; the console moved to these routes and that route is gone.
     // The tenant gate is the route layer.
     ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),

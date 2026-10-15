@@ -699,47 +699,88 @@ export type ConnectorType = {
 }
 
 /**
- * One discovered column. Mirrors Rust `DiscoveredColumn`
- * (`rust/crates/lakehouse-api/src/connector_discover.rs`) exactly —
- * note the field is `typeName`, not `type`, and this array is never
- * `null` (only ever empty), matching that struct's plain `Vec`.
+ * Table discovery (`SRC-13`): what a connector's source holds, listed and previewed
+ * before anything is chosen to load. Mirrors the store's `connector_discovery::Answer`
+ * (`rust/crates/lakehouse-store/src/connector_discovery.rs`, camelCase) and the
+ * routes in `rust/crates/lakehouse-api/src/routes/connector_discovery.rs`.
  */
-export type DiscoveredColumn = {
+export type DiscoveryKind = "list" | "preview"
+
+/** `running` only for the sources the orchestrator reads; the console polls until it ends. */
+export type DiscoveryState = "running" | "done" | "failed"
+
+/**
+ * Why a listing failed, from the closed list the API words (decision D10). The widening
+ * keeps a class a newer API adds from breaking the type; the console words an unknown
+ * one by the `reason` the API sent.
+ */
+export type DiscoveryErrorClass =
+  | "unreachable"
+  | "sign_in_refused"
+  | "address_refused"
+  | "no_permission"
+  | "timeout"
+  | "too_many_objects"
+  | "not_supported"
+  | "failed"
+  | string
+
+/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic or a MongoDB collection. */
+export type DiscoveryObjectKind = "schema" | "table" | "file" | "endpoint" | "topic" | "collection" | string
+
+/**
+ * One listed object. `name` is what a source object's `name` is in the ingest spec:
+ * `schema.table` for SQL, the key for a file, the path for an endpoint. `size` (bytes)
+ * and `modifiedAt` (RFC 3339) are present for files only.
+ */
+export type DiscoveryObject = {
+  name: string
+  kind: DiscoveryObjectKind
+  size?: number
+  modifiedAt?: string
+}
+
+/** One column of a preview; `inferred` is true when `typeName` was guessed from a sample (D6). */
+export type DiscoveryColumn = {
   name: string
   typeName: string
+  inferred: boolean
 }
 
 /**
- * One discovered table (or future non-SQL equivalent object). Mirrors
- * Rust `DiscoveredObject` exactly — `columns` is a plain array, never
- * nullable, and there is no `sample` field: this route reports schema
- * only, never a data preview.
+ * The answer of every discovery route. A finished list has `objects` (and `truncated`);
+ * a finished preview has `columns` (and `primaryKey` for SQL); a failure has `errorClass`
+ * and a fixed `reason`, never the source's own text. An empty `columns` is an empty
+ * topic, collection or file, not a failure.
  */
-export type DiscoveredObject = {
-  name: string
-  columns: DiscoveredColumn[]
-  /**
-   * `SRC-10`: the columns of the table's primary key as the source declares it,
-   * in key order; `[]` when the source declares none. SQL drivers only; read from
-   * the source's own catalog views, so it is the source's word, not a guess.
-   */
-  primaryKey: string[]
-}
-
-/**
- * The response body for `POST /api/connectors/{id}/discover`. Mirrors
- * Rust `DiscoverResult` exactly (same module). `reason` is populated
- * whenever `supported` is `false`, omitted (not `null`) otherwise — the
- * Rust field is `Option<String>` with no `skip_serializing_if`, but every
- * other `Option<String>` reason field on this route follows the same
- * "absent means not applicable" convention as `AlertRule`'s optional
- * fields (`contracts/alerts.ts`), so this widens with `?` rather than
- * `| null` for consistency; either reads a missing key the same way.
- */
-export type DiscoverResult = {
-  objects: DiscoveredObject[]
-  supported: boolean
+export type DiscoveryAnswer = {
+  kind: DiscoveryKind
+  state: DiscoveryState
+  /** What a list was narrowed by (the schema or the glob), when it was. */
+  scope?: string
+  /** The object a preview is about. */
+  object?: string
+  objects?: DiscoveryObject[]
+  truncated?: boolean
+  columns?: DiscoveryColumn[]
+  primaryKey?: string[]
+  errorClass?: DiscoveryErrorClass
   reason?: string
+  startedAt?: string
+  endedAt?: string
+}
+
+/**
+ * The body of `POST /api/connectors/{id}/discovery/{kind}`; every field optional.
+ * `schema` empty on a SQL list asks for the schemas; `object` is required for a
+ * preview and refused for a list; `limit` is 1 to 10,000.
+ */
+export type DiscoveryRequest = {
+  schema?: string
+  glob?: string
+  search?: string
+  limit?: number
+  object?: string
 }
 
 /**
@@ -917,9 +958,14 @@ export interface ConnectorService {
    */
   listTypes(signal?: AbortSignal): Promise<ConnectorType[]>
   listIngestible(signal?: AbortSignal): Promise<IngestibleConnector[]>
-  /** `schema` is required for a `sql`/`cdc` connector: the server lists
-   * only that schema's tables (bound, never interpolated). */
-  discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
+  /**
+   * `POST /api/connectors/{id}/discovery/{kind}` (`SRC-13`): ask for a listing or a preview.
+   * SQL sources, object storage and the REST endpoint list answer in this call; the
+   * sources only the orchestrator reads answer `running`, and `getDiscovery` is polled.
+   */
+  startDiscovery(id: string, kind: DiscoveryKind, request: DiscoveryRequest, signal?: AbortSignal): Promise<DiscoveryAnswer>
+  /** `GET /api/connectors/{id}/discovery/{kind}`: the latest answer of that kind (404 when none was asked for). */
+  getDiscovery(id: string, kind: DiscoveryKind, signal?: AbortSignal): Promise<DiscoveryAnswer>
   /** With `table`, a run of that one table with an action (`SRC-10`); without, every table. */
   runIngest(id: string, signal?: AbortSignal, table?: IngestTableRequest): Promise<IngestRunResult>
   /** `GET /api/connectors/{id}/runs` (`SRC-11`): the newest 50 runs from the product's own run record. */
