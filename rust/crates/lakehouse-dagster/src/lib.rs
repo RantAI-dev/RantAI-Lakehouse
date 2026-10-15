@@ -172,7 +172,21 @@ pub enum DgError {
     /// logger) can still record the real cause/URL server-side.
     #[error("fetch failed")]
     Transport(#[source] reqwest::Error),
-    /// `Dagster` responded with a non-2xx status or a GraphQL error.
+    /// `Dagster` answered with a non-2xx HTTP status, carrying that status
+    /// code.
+    ///
+    /// Typed rather than folded into [`DgError::Server`] because the number
+    /// is the whole point: a `5xx` is an orchestrator that answered without
+    /// being able to serve (worth retrying), a `4xx` is one that refused this
+    /// request (retrying gets the same refusal), and a caller cannot tell
+    /// them apart from the text alone without parsing `"Dagster HTTP 500"`
+    /// back out (`PR #105 review SHOULD-FIX 5`). The `Display` is the same
+    /// `"Dagster HTTP {n}"` the pre-typed code produced, so a log line reads
+    /// exactly as it did before.
+    #[error("Dagster HTTP {0}")]
+    Status(u16),
+    /// `Dagster` responded with a GraphQL error, or with a response this
+    /// client could not read (a body that is not `JSON`, a missing field).
     ///
     /// When the failure is a GraphQL `errors` array, the message is the
     /// `JSON.stringify`-equivalent of that array, truncated to 300
@@ -1030,9 +1044,9 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status or
-    /// a GraphQL `errors` array.
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array.
     pub async fn list_runs(&self, limit: u32) -> Result<Vec<DgRun>, DgError> {
         // F1.5 (PR #55/#56 review BLOCKER): `limit` is caller-supplied, so
         // it travels as a GraphQL variable — every value crossing the
@@ -1154,7 +1168,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: Value =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -1284,11 +1298,12 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status,
-    /// a GraphQL `errors` array, or `pipelineOrError.__typename` is not
-    /// `Pipeline` (e.g. `PipelineNotFoundError` — the job doesn't exist in
-    /// this repository/location).
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array, or
+    /// when `pipelineOrError.__typename` is not `Pipeline` (e.g.
+    /// `PipelineNotFoundError` — the job doesn't exist in this
+    /// repository/location).
     pub async fn job_graph(&self, job_name: &str) -> Result<JobGraph, DgError> {
         let query = "query($sel: PipelineSelector!) { pipelineOrError(params: $sel) { \
                       __typename ... on Pipeline { solidHandles { solid { name \
@@ -1344,9 +1359,9 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status or
-    /// a GraphQL `errors` array.
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` responds with a non-2xx status, or
+    /// [`DgError::Server`] when it answers with a GraphQL `errors` array.
     pub async fn launch_run(&self, job_name: &str) -> Result<LaunchOutcome, DgError> {
         let query = "mutation($sel: JobOrPipelineSelector!) { \
                       launchRun(executionParams: { selector: $sel, mode: \"default\" }) { \
@@ -2320,7 +2335,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: Value =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -2390,7 +2405,7 @@ impl DgClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+            return Err(DgError::Status(status.as_u16()));
         }
         let parsed: GqlResponse<T> =
             serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
@@ -2996,6 +3011,27 @@ mod tests {
         assert!(!rendered.contains(&addr.port().to_string()), "{rendered}");
     }
 
+    /// `PR #105 review SHOULD-FIX 5`: a non-2xx is typed, not folded into
+    /// `DgError::Server`, so a caller can retry a `5xx` without parsing the
+    /// message. The `Display` is unchanged (`"Dagster HTTP {n}"`), which is
+    /// what every log line and string comparison from before the variant
+    /// still sees.
+    #[tokio::test]
+    async fn a_non_2xx_answer_is_a_typed_status_with_the_same_display() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client.list_runs(25).await.unwrap_err();
+
+        assert!(matches!(err, DgError::Status(503)), "got {err:?}");
+        assert_eq!(err.to_string(), "Dagster HTTP 503");
+    }
+
     #[tokio::test]
     async fn launch_run_success_returns_run_id() {
         let server = MockServer::start().await;
@@ -3475,8 +3511,8 @@ mod tests {
     /// variables object containing the value. If the implementation
     /// regresses to `format!`, the body won't include the constant
     /// substring, no mock matches, wiremock returns 404, the client
-    /// surfaces `DgError::Server("Dagster HTTP 404")`, and the `unwrap`
-    /// here fails — that's the mutation-evidence red.
+    /// surfaces `DgError::Status(404)`, and the `unwrap` here fails — that's
+    /// the mutation-evidence red.
     #[tokio::test]
     async fn list_runs_for_job_job_name_travels_as_a_graphql_variable() {
         use wiremock::matchers::{body_partial_json, body_string_contains};

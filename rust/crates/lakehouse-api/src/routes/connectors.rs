@@ -3207,7 +3207,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// the ingest run"` (F2.7: Dagster's own text was logged at the
 /// dagster crate boundary), except that a job the orchestrator has not
 /// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
-/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// (`PR #105 CI fix`); `Err(err)` becomes a retryable 503 or a 502,
 /// see below.
 ///
 /// # Errors
@@ -3218,7 +3218,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
 /// queued or running (see [`ingest_run_history`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
-/// on a `Dagster` transport failure; 503/500 as above for the database pool.
+/// or 502 on a `Dagster` call, as below; 503/500 as above for the database
+/// pool.
 ///
 /// Two `503` answers carry a stable `code` beside the fixed `error`
 /// sentence and a `Retry-After`, so a client retries on the code and never
@@ -3230,11 +3231,16 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 ///   location is still loading. It was a `422` before; `503` is the
 ///   route's status for "backing service not ready", the console treats
 ///   any non-2xx the same, and nothing else depends on the `422`.
-/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
-///   with a protocol failure, on the run list or the launch.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached, or answered
+///   `5xx`, on the run list or the launch — the two failures that mean the
+///   same request will work shortly (`PR #105 review SHOULD-FIX 5` narrowed
+///   this code to them; a GraphQL error, an unreadable body or a `4xx` is a
+///   `502` with no code, because repeating the request unchanged gets the
+///   same answer).
 ///
 /// Every other launch failure stays the generic `422` with a reference id
-/// and no code.
+/// and no code, and a `Dagster` answer this service cannot use is the `502`
+/// above.
 ///
 /// # A run of one table (`SRC-10` decision 5)
 ///
