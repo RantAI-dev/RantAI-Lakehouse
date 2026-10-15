@@ -14,8 +14,9 @@
 #
 # Env the caller sets (all optional except LLM_KEY):
 #   LLM_KEY         required; no model, no run
-#   LLM_URL         model endpoint (default: compose's)
-#   LLM_MODEL       model name    (default: compose's)
+#   LLM_URL         model endpoint; forwarded only when set here, otherwise
+#                   compose resolves it from .env or its own default
+#   LLM_MODEL       model name; forwarded only when set here, as LLM_URL
 #   API_HOST_PORT   default 27080; CH_HTTP_HOST_PORT 27123;
 #   CH_NATIVE_HOST_PORT 27900; POSTGRES_HOST_PORT 27432
 # Any AI_* variable (AI_EVAL_TIMEOUT_S and so on) is passed to the harness.
@@ -101,7 +102,12 @@ dc() { docker compose -p "$PROJECT" "$@"; }
 export API_HOST_PORT CH_HTTP_HOST_PORT CH_NATIVE_HOST_PORT POSTGRES_HOST_PORT
 export AUTH_BOOTSTRAP_EMAIL="$ADMIN_EMAIL" AUTH_BOOTSTRAP_PASSWORD="$ADMIN_PASSWORD"
 export CH_USER CH_PASSWORD
-export LLM_URL="${LLM_URL:-https://api.minimax.io/v1}" LLM_MODEL="${LLM_MODEL:-MiniMax-M3}" LLM_KEY
+# Compose resolves LLM_URL and LLM_MODEL itself, from the caller's .env or its
+# own default. An exported variable outranks .env in compose, so export them
+# only when the caller set them; never write a default here (S1).
+if [ -n "${LLM_URL:-}" ]; then export LLM_URL; fi
+if [ -n "${LLM_MODEL:-}" ]; then export LLM_MODEL; fi
+export LLM_KEY
 
 echo "run_dashboard_eval: starting $PROJECT (api :$API_HOST_PORT)" >&2
 if [ -n "$IMAGE" ]; then
