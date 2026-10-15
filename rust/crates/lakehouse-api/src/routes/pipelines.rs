@@ -4385,9 +4385,11 @@ mod tests {
     /// A logged-in human principal — mirrors `routes::query`/
     /// `routes::agents`/`routes::connectors`'s own test fixture of the
     /// same name.
+    pub(super) const SEED_USER: &str = "33333333-3333-4333-8333-000000000001";
+
     pub(super) fn fixture_user_principal() -> Principal {
         Principal {
-            id: PrincipalId::User(Uuid::from_u128(1)),
+            id: PrincipalId::User(Uuid::parse_str(SEED_USER).unwrap()),
             tenant_ids: Vec::new(),
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("pipeline:write"),
