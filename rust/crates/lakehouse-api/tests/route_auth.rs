@@ -301,7 +301,10 @@ async fn assigning_a_pipelines_author_is_denied_without_identity_write() {
         request_with_cookie_and_body(&router, "PUT", "/api/pipelines/pl-x/run-as", &admin, body)
             .await;
     assert!(
-        !matches!(allowed.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
         "a Platform Admin must pass the auth gate on this route, got {}",
         allowed.status()
     );

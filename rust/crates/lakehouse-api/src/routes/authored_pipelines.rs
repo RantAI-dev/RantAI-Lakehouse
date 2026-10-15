@@ -24,6 +24,11 @@
 //! the same rule the shared catalog applies). Anyone else reading it would
 //! see other tenants' pipelines.
 //!
+//! [`enforce_pipeline_sql`] is under the same rule for a stronger reason:
+//! it answers with the rewrite a pipeline's author is allowed to run, so
+//! reaching it as an ordinary reader would expose both another tenant's
+//! governed schema and the fact of its obligations.
+//!
 //! # What reaches a response
 //!
 //! A reload failure is the orchestrator's own text (often a Python
@@ -900,6 +905,133 @@ pub async fn runnable(
     let pool = crate::routes::pipelines::pool(&state)?;
     let list = pipelines::list_runnable_pipelines(pool).await?;
     Ok(ApiJson(json!({ "pipelines": list })))
+}
+
+/// The refusal D2 fixes for every pipeline that has no usable author, in
+/// both its cases (no `run_as` at all; an author who is deactivated). One
+/// constant for both, because the fix is the same and an operator reading
+/// a run log should not have to tell which case it was: someone has to
+/// assign an author before this pipeline can read anything.
+pub const NO_AUTHOR_REASON: &str =
+    "this pipeline has no author to read as; an administrator must assign one";
+
+/// `POST /api/pipelines/runnable/{id}/enforce` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnforceBody {
+    /// The `SELECT` the op wants to run.
+    sql: String,
+}
+
+/// `POST /api/pipelines/runnable/{id}/enforce` — rewrite `sql` as the
+/// pipeline's author, so the orchestrator runs what its author is allowed
+/// to read (BLD-1 / D3).
+///
+/// # Why the API does the rewriting and not the orchestrator
+///
+/// The masking and row-filter rewrite lives in one place
+/// ([`crate::policy_engine::rewrite_sql_for_roles`], the same function
+/// Query Studio, dashboards, embeds, alerts and the Gold export go
+/// through), and it decides what a principal may read from Postgres
+/// policies. A second implementation inside the Dagster code location would
+/// be a second answer to the same question, free to drift, and would have
+/// to be given the run token's own privileges to read the policies at all.
+/// So the orchestrator asks, and runs what comes back.
+///
+/// The principal is the pipeline's AUTHOR
+/// (`pipeline_definition.run_as`), resolved through the same
+/// [`lakehouse_auth::repository::load_principal_for_user`] a session
+/// principal is built from — so a pipeline's reads are governed by the
+/// author's real roles and tenant list, live, not by a copy taken when the
+/// pipeline was created. A user who loses a role loses it here too, on the
+/// next run.
+///
+/// # Who may call it
+///
+/// The same rule as [`runnable`]: a service identity or a Platform Admin,
+/// nobody else. Anyone who could reach it could ask the API to reveal how
+/// any tenant's governed table rewrites, for any pipeline, without holding
+/// that pipeline's tenant.
+///
+/// # Errors
+///
+/// 403 for anyone but a service identity or a Platform Admin; 404 for an
+/// unknown pipeline id (and for another tenant's, so the id space is not
+/// probeable across tenants); 409 with [`NO_AUTHOR_REASON`] when the
+/// pipeline has no author or its author is deactivated; 422 with
+/// [`crate::policy_engine::enforcement_error_message`] when the rewrite is
+/// refused; 400 for a malformed body; 503 if no pool is configured; 500 on
+/// any other database failure. No error body ever carries the rewriter's,
+/// the policy engine's or `ClickHouse`'s text (`AGENTS.md` rule 4).
+pub async fn enforce_pipeline_sql(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity enforces a pipeline's queries".to_owned(),
+        )
+        .into());
+    }
+    let EnforceBody { sql } = crate::routes::pipelines::parse_body(&body)?;
+    let pool = crate::routes::pipelines::pool(&state)?;
+    let pipeline = pipelines::get_pipeline(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+
+    // D2, fail closed: no author, or an author who cannot log in any more.
+    // Both refuse rather than run the query unrewritten, and neither is
+    // retryable from the orchestrator's side -- what changes the answer is
+    // an administrator assigning an author, not another attempt.
+    let Some(run_as) = pipeline.run_as else {
+        return Err(ApiError::Conflict(NO_AUTHOR_REASON.to_owned()).into());
+    };
+    match lakehouse_store::identity::user_status(pool, run_as).await? {
+        // `ON DELETE SET NULL` means a deleted author reads as NULL above;
+        // this covers the row that is still there but is not active.
+        Some(status) if status == "active" => {}
+        _ => return Err(ApiError::Conflict(NO_AUTHOR_REASON.to_owned()).into()),
+    }
+    let author = lakehouse_auth::repository::load_principal_for_user(
+        pool,
+        run_as,
+        "local".to_owned(),
+        false,
+    )
+    .await
+    .map_err(|err| match err {
+        // Raced with a delete between the two reads above. The same
+        // refusal as "no author", because it now IS no author.
+        lakehouse_auth::AuthError::NotFound => ApiError::Conflict(NO_AUTHOR_REASON.to_owned()),
+        other => ApiError::Internal(other.to_string()),
+    })?;
+
+    // The placeholders are the AUTHOR's, exactly as Query Studio builds
+    // them for a session principal (`routes::query::
+    // rewrite_sql_for_principal_inner`): a row filter or a mask that names
+    // `{principal_id}` or `{tenant_ids}` resolves to whoever the pipeline
+    // reads as.
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(author.id.uuid().to_string()),
+        principal_tenant_ids: author.tenant_ids.iter().map(ToString::to_string).collect(),
+    };
+    let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(&state);
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        &author.role_names,
+        &placeholders,
+        &obligations_source,
+    )
+    .await
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })?;
+    Ok(ApiJson(json!({ "sql": rewritten })))
 }
 
 /// `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields.

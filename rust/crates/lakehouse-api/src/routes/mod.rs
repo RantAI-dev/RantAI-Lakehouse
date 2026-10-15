@@ -182,6 +182,26 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
 /// purely to keep that function under `clippy::too_many_lines` — it merges
 /// straight back in, with no separate middleware/state of its own.
+// BLD-1 / D3's single route, split out so `pipelines_router` stays
+/// inside clippy's line budget for a one-line addition.
+fn pipeline_enforce_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/enforce",
+        axum::routing::post(authored_pipelines::enforce_pipeline_sql),
+    )
+}
+
+/// The authored-pipeline (orchestrator-only) routes: the definitions the
+/// job factory loads, and the rewrite it asks for before it runs one.
+///
+/// `pipelines_router` merges this rather than growing another four lines:
+/// every route here is orchestrator-only in the handler as well as in
+/// [`crate::policy`], and keeping them together makes that pairing the
+/// thing a reader sees first.
+fn authored_pipelines_router() -> Router<AppState> {
+    pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+}
+
 fn pipelines_router() -> Router<AppState> {
     Router::new()
         .route(
@@ -193,7 +213,7 @@ fn pipelines_router() -> Router<AppState> {
             axum::routing::post(pipelines::generate),
         )
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
-        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .merge(authored_pipelines_router())
         .route(
             "/api/pipelines/{id}",
             get(pipelines::detail)
