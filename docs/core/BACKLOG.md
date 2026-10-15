@@ -40,6 +40,13 @@ changed only in the base.
 - **Source**: where the item comes from, so it can be checked. "PRODUCT §2"
   is the coverage table in `PRODUCT.md`.
 
+**Who does what** is held in the base (Owner for a Feature, Assignee for a
+Task), never here (public repo, `DEC-12`). Every open item has one. Work is
+spread by weight, not by count: a spec's size S = 1, M = 3, L = 6; an item
+with no spec counts 1 (Task) or 3 (Feature). The planner balanced the
+Lakehouse team to within about 10 of each other on 2026-10-15 (product
+owner's request) and keeps new items in line when it adds them.
+
 **Blocked by** (was "Waits for"). An item that cannot start until another
 merges says so in its text: **Blocked by `BI-18`**, or for one part of it,
 **Blocked by `QS-5` (variables part)**, so the rest can start. Only open
@@ -205,7 +212,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Blocked by `DEC-9`, `SRC-12` (OAuth sign-in)** | Data | P3 | Planned |  | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. **Blocked by `DATA-19`** | Build | P3 | Todo |  | `DATA-19` plan, section 5 |
-| `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | Planned |  | PRODUCT §2; [spec](specs/bld-2.md) |
+| `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | Building |  | PRODUCT §2; [spec](specs/bld-2.md) |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
 | `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
@@ -288,7 +295,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `BLD-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-1`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-16`, `SEC-17`, `SEC-18`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-27`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-36`, `SEC-4`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-1`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-16`, `SEC-17`, `SEC-18`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-27`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-36`, `SEC-4`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -331,6 +338,14 @@ set by the product owner and are left empty until they are.
 | `SEC-6` | | 2026-10-15 | |
 | `SEC-29` | | 2026-10-15 | |
 | `DATA-2` | 2026-10-14 | 2026-10-15 | |
+| `BI-8` | | 2026-10-15 | |
+| `BI-9` | | 2026-10-15 | |
+| `AI-3` | | 2026-10-15 | |
+| `AI-4` | | 2026-10-15 | |
+| `SEC-31` | | 2026-10-15 | |
+| `DATA-19` | 2026-10-14 | | |
+| `BLD-1` | 2026-10-15 | | |
+| `BLD-2` | 2026-10-15 | | |
 
 ## Decide
 
