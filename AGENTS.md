@@ -89,9 +89,11 @@ part of the plan and of the diff. This covers the assistant's work for
 dashboards only (backlog `AI-1` to `AI-15`); the AI team plans the
 assistant's other work itself.
 
-**Waits for.** A backlog item that cannot start until another merges says
-so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
-merged; the planner checks this before writing its plan.
+**Blocked by** (was "Waits for"). A backlog item that cannot start until
+another merges says so in its text: **Blocked by `BI-9`**, or for one part,
+**Blocked by `QS-5` (variables part)**. Nobody starts it (or that part)
+before the blocker is merged; the planner checks this before writing its
+plan. `docs/core/BACKLOG.md` lists both directions under Dependencies.
 
 ## Five principles
 

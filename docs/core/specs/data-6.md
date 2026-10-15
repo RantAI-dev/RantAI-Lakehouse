@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `DATA-2` |
+| Blocked by | Nothing open (was: DATA-2, shipped) |
 
 ## Why
 
