@@ -3562,6 +3562,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
                 out.push(("grain", json!(grain)));
             }
             push_table_fields(def, &mut out);
+            push_type_fields(def, &mut out);
             push_shape_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
@@ -3603,6 +3604,21 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
         "axis",
     ];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
+        return;
+    };
+    for name in NAMES {
+        if let Some(value) = fields.get(name) {
+            out.push((name, value.clone()));
+        }
+    }
+}
+
+/// The `BI-16` part B fields of a definition (goal, bands, histogram ranges,
+/// the address and description of an image or web card), present only on the
+/// charts that carry them.
+fn push_type_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
+    const NAMES: [&str; 5] = ["goal", "bands", "histogram", "url", "alt"];
+    let Ok(Value::Object(fields)) = serde_json::to_value(&def.types) else {
         return;
     };
     for name in NAMES {
@@ -6535,6 +6551,12 @@ mod join_rewrite;
 #[cfg(test)]
 #[path = "bin_rewrite.rs"]
 mod bin_rewrite;
+
+// BI-16 part B: the role rewrite on the progress, histogram and bullet
+// statements; reuses the governed table and helpers of `bin_rewrite` above.
+#[cfg(test)]
+#[path = "type_b_rewrite.rs"]
+mod type_b_rewrite;
 
 // BI-11: the role rewrite on the three ways a parameter's value reaches a
 // statement; see `chart_shapes_rewrite` above.

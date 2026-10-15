@@ -325,3 +325,105 @@ async fn content_sites_are_saved_normalised_kept_by_a_later_save_and_refused_whe
     .await;
     assert_eq!(cleared["contentSites"], json!([]));
 }
+
+async fn post_chart(
+    app: &axum::Router,
+    cookie: &str,
+    verb: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(verb)
+                .uri("/api/dashboard/specs")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn an_image_or_web_card_is_saved_only_for_a_site_the_administrator_listed() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let admin = create_principal_with_permissions(&pool, "settings:write").await;
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let editor = create_principal_with_permissions(&pool, "dashboard:write, dashboard:read").await;
+    let cookie = session_cookie_for_user(&pool, editor).await;
+    let image = |url: &str| json!({"title": "Logo", "kind": "image", "url": url, "alt": "A logo"});
+
+    // Nothing is listed: nothing can be saved (fail closed).
+    let (status, body) = post_chart(
+        &router,
+        &cookie,
+        "POST",
+        &image("https://img.example/a.png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
+    );
+
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &admin_cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","contentSites":["https://img.example"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_chart(
+        &router,
+        &cookie,
+        "POST",
+        &image("https://img.example/a.png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chart"]["kind"], json!("image"));
+
+    for bad in [
+        "https://other.example/a.png",
+        "http://img.example/a.png",
+        "https://img.example@evil.example/a.png",
+    ] {
+        let (status, body) = post_chart(&router, &cookie, "POST", &image(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert_eq!(message, lakehouse_bi::types_b::CONTENT_SITE_REFUSED);
+        assert!(
+            !message.contains(bad),
+            "the address is not echoed: {message}"
+        );
+    }
+    // A web card takes the same list.
+    let (status, _) = post_chart(
+        &router,
+        &cookie,
+        "POST",
+        &json!({"title": "Status", "kind": "web", "url": "https://img.example/status"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_chart(
+        &router,
+        &cookie,
+        "POST",
+        &json!({"title": "Status", "kind": "web", "url": "https://nope.example/status"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

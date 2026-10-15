@@ -66,6 +66,10 @@ use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upstream_error;
 
+/// What the person is told when `contentSites` is not a list of sites.
+const CONTENT_SITES_REFUSED: &str = "contentSites must be at most 50 sites, each written \
+https://host or https://host:port, with no wildcard, path or user name.";
+
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
 \"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
@@ -200,8 +204,11 @@ fn checked_formatting(
         None => current.fonts.clone(),
     };
     let content_sites = match &parsed.content_sites {
+        // A fixed sentence: the validator names the first bad entry, and an
+        // entry is the administrator's own text, but a response never echoes
+        // text built by a validator (SEC-11's guard reads this line).
         Some(sites) => validate_content_sites(sites)
-            .map_err(|why| ApiError::BadRequest(format!("contentSites: {why}")))?,
+            .map_err(|_| ApiError::BadRequest(CONTENT_SITES_REFUSED.to_owned()))?,
         None => current.content_sites.clone(),
     };
     Ok(FormatSettings {
@@ -235,6 +242,9 @@ pub(crate) async fn time_context(state: &AppState) -> Result<TimeContext, ApiErr
     let week_start = WeekStart::parse(&saved.week_start);
     week_start
         .and_then(|w| TimeContext::new(&saved.time_zone, w).ok())
+        // BI-16 part B: the content sites ride in the context every chart
+        // save already receives (see `TimeContext`).
+        .map(|ctx| ctx.with_content_sites(saved.content_sites.clone()))
         .ok_or_else(|| ApiError::Internal("The reporting settings are invalid.".to_owned()))
 }
 
@@ -441,7 +451,7 @@ mod tests {
             &FormatSettings::default(),
         )
         .unwrap_err();
-        assert!(matches!(&wildcard, ApiError::BadRequest(m) if m.starts_with("contentSites:")));
+        assert!(matches!(&wildcard, ApiError::BadRequest(m) if m == CONTENT_SITES_REFUSED));
         let thirteen: Vec<String> = (0..13).map(|_| "\"#000000\"".to_owned()).collect();
         let extra = format!(r#","companyPalette":[{}]"#, thirteen.join(","));
         assert!(checked_formatting(&body(&extra), &FormatSettings::default()).is_err());

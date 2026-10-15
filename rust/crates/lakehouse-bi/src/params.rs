@@ -951,6 +951,11 @@ fn takes_param_slots(def: &ChartInput) -> bool {
             | ChartKind::Heading
             | ChartKind::Divider
             | ChartKind::Section
+            | ChartKind::Image
+            | ChartKind::Web
+            | ChartKind::Progress
+            | ChartKind::Histogram
+            | ChartKind::Bullet
     ) && def.shape.steps.is_none()
         && def.shape.groupings.is_none()
         && !def.tables.is_rows_mode(def.kind)

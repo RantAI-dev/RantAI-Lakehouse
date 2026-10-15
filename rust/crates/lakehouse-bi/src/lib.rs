@@ -31,4 +31,5 @@ pub mod store;
 pub mod style;
 pub mod tables;
 pub mod trash;
+pub mod types_b;
 pub mod versions;

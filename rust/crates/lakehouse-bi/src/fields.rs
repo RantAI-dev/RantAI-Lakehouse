@@ -615,15 +615,21 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
         // BI-2: a comparing KPI takes a metric, whose number is the whole
         // aggregate the trend statement computes per period.
         ChartKind::Kpi => !def.tables.compares_to_previous(kind) || def.measures.has_metrics(),
-        ChartKind::Gauge => true,
+        // BI-16 part B: a progress bar and a bullet graph read their value (and
+        // goal) through the KPI builder or the grouped one, both of which take an
+        // aggregate field's expression.
+        ChartKind::Gauge | ChartKind::Progress | ChartKind::Bullet => true,
         ChartKind::Boxplot
+        | ChartKind::Histogram
         | ChartKind::Pointmap
         | ChartKind::Geoheat
         | ChartKind::Pivot
         | ChartKind::Text
         | ChartKind::Heading
         | ChartKind::Divider
-        | ChartKind::Section => false,
+        | ChartKind::Section
+        | ChartKind::Image
+        | ChartKind::Web => false,
         _ => !def.tables.is_rows_mode(kind),
     }
 }

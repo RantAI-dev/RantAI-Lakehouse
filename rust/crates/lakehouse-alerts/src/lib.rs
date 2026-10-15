@@ -1372,6 +1372,10 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         on_board.len()
     )];
     for chart in on_board {
+        // BI-16 part B: a progress bar and a bullet graph are deliberately not
+        // digest tiles. Their row is a value and a goal (`v`, `g`), and a digest
+        // line is one number with its title; alerts are rules on metrics, not on
+        // tiles, so no alert is offered on them either.
         let is_kpi_or_gauge = matches!(
             chart.spec.kind,
             lakehouse_bi::specs::ChartKind::Kpi | lakehouse_bi::specs::ChartKind::Gauge

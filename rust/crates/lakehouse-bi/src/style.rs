@@ -576,7 +576,11 @@ fn is_chart(kind: ChartKind) -> bool {
     !kind.is_static()
         && !matches!(
             kind,
-            ChartKind::Table | ChartKind::Pivot | ChartKind::Kpi | ChartKind::Gauge
+            ChartKind::Table
+                | ChartKind::Pivot
+                | ChartKind::Kpi
+                | ChartKind::Gauge
+                | ChartKind::Progress
         )
 }
 
@@ -713,7 +717,7 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
     }
     let kind = def.kind;
     if kind.is_static() {
-        return Err("a text, heading, divider or section tile has nothing to format.".to_owned());
+        return Err("a tile without data has nothing to format.".to_owned());
     }
     let wrong = |field: &str, kinds: &str| format!("{field} is only for {kinds}.");
     if let Some(f) = &style.format {

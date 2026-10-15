@@ -410,6 +410,7 @@ pub fn layer_input(
             ..ShapeFields::default()
         },
         style: crate::style::StyleFields::default(),
+        types: Box::default(),
     }
 }
 

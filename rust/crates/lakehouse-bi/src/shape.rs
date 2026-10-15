@@ -599,6 +599,14 @@ fn is_grouped_kind(kind: ChartKind) -> bool {
             | ChartKind::Heading
             | ChartKind::Divider
             | ChartKind::Section
+            | ChartKind::Image
+            | ChartKind::Web
+            // BI-16 part B: these three have statements of their own (a count
+            // per range, a value and a goal), so no sort, "Other", steps or
+            // own-aggregate measure applies.
+            | ChartKind::Progress
+            | ChartKind::Histogram
+            | ChartKind::Bullet
             | ChartKind::Kpi
             | ChartKind::Gauge
             | ChartKind::Boxplot

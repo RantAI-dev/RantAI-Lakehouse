@@ -27,7 +27,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::access::Viewer;
-use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
+use crate::builder::{QueryBuilder, Relation};
 use crate::click::ClickAction;
 use crate::embed_access::{self, EmbedAccess};
 use crate::fields::{self, FieldDef, SourceKind};
@@ -79,12 +79,17 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Calendar,
     ChartKind::Kpi,
     ChartKind::Gauge,
+    ChartKind::Progress,
+    ChartKind::Histogram,
+    ChartKind::Bullet,
     ChartKind::Table,
     ChartKind::Pivot,
     ChartKind::Text,
     ChartKind::Heading,
     ChartKind::Divider,
     ChartKind::Section,
+    ChartKind::Image,
+    ChartKind::Web,
 ];
 
 /// Kinds allowed to carry a breakdown (2nd dimension). `heatmap`, `sankey`
@@ -362,6 +367,11 @@ pub struct ChartInput {
     /// absent on a chart saved before they existed.
     #[serde(flatten)]
     pub style: crate::style::StyleFields,
+    /// Goal, bands, histogram ranges and the address of an image or web card
+    /// (`BI-16` part B), flat on the wire and all absent on a chart saved
+    /// before they existed.
+    #[serde(flatten)]
+    pub types: Box<crate::types_b::TypeFields>,
 }
 
 impl ChartInput {
@@ -2535,6 +2545,7 @@ fn empty_chart_input() -> ChartInput {
         tables: TableFields::default(),
         shape: ShapeFields::default(),
         style: crate::style::StyleFields::default(),
+        types: Box::default(),
     }
 }
 
@@ -2626,7 +2637,7 @@ struct KpiCtx<'a> {
 /// exact.
 fn kpi_sql(
     from: &Relation,
-    measure: &Ident,
+    (measure, goal): (&Ident, Option<&Ident>),
     agg: Aggregate,
     compare: Option<&ComparePlan>,
     time: &TimeContext,
@@ -2637,15 +2648,35 @@ fn kpi_sql(
                 BiError::Validation("this period does not fit the date column.".to_owned())
             })
         }
-        _ => Ok(build_kpi_sql(from, measure, agg, &[])),
+        // BI-16 part B: without a goal that is a value this is `build_kpi_sql`.
+        _ => Ok(crate::builder::build_progress_sql(
+            from,
+            measure,
+            goal,
+            agg,
+            &[],
+        )),
     }
 }
 
-/// The one measure of a KPI. BI-2 review fix (BLOCKER) R1: a KPI on a metric
-/// stays a metric in its stored definition.
-fn kpi_measure(input: &ChartInput, column: &str) -> MeasureList {
-    MeasureList::from_pairs(vec![(column.to_owned(), None)])
-        .keeping_metrics_of(&input.measures, None)
+/// The measures of a single-row tile: the one value of a KPI, plus the goal
+/// of a progress bar or a bullet graph measured against a value (`BI-16`
+/// part B). BI-2 review fix (BLOCKER) R1: a KPI on a metric stays a metric in
+/// its stored definition.
+fn kpi_measure(input: &ChartInput, columns: &[String]) -> MeasureList {
+    let keep = if input.types.goal_measure().is_some() {
+        2
+    } else {
+        1
+    };
+    MeasureList::from_pairs(
+        columns
+            .iter()
+            .take(keep)
+            .map(|c| (c.clone(), None))
+            .collect(),
+    )
+    .keeping_metrics_of(&input.measures, None)
 }
 
 /// Assemble the `kpi`/`gauge` branch of `specFromInput` (single number, no
@@ -2695,7 +2726,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
-        measures: kpi_measure(input, &m),
+        measures: kpi_measure(input, &measures),
         breakdown: None,
         map: None,
         lat: None,
@@ -2717,12 +2748,21 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         },
         shape: stored_shape(input),
         style: input.style.clone(),
+        types: input.types.clone(),
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
+    let goal_ident = input
+        .types
+        .goal_measure()
+        .map(|g| {
+            Ident::new(g)
+                .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))
+        })
+        .transpose()?;
     let sql = kpi_sql(
         &from,
-        &measure_ident,
+        (&measure_ident, goal_ident.as_ref()),
         Aggregate::from_str_lossy(&agg),
         compare.as_ref(),
         time,
@@ -2736,7 +2776,11 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         sql_source,
         sql,
         x: String::new(),
-        y: ChartY::Single("v".to_owned()),
+        y: if goal_ident.is_some() {
+            ChartY::Multi(vec!["v".to_owned(), "g".to_owned()])
+        } else {
+            ChartY::Single("v".to_owned())
+        },
         series: None,
         map: None,
         lat: None,
@@ -2785,7 +2829,9 @@ const SECTION_TEXT_MAX_CHARS: usize = 120;
 fn static_tile_text(kind: ChartKind, raw: Option<&str>) -> Result<String, BiError> {
     let text = raw.unwrap_or_default().trim().to_owned();
     match kind {
-        ChartKind::Divider => Ok(String::new()),
+        // An image or web card keeps its address in `url`; nothing is shown
+        // as text (BI-16 part B).
+        ChartKind::Divider | ChartKind::Image | ChartKind::Web => Ok(String::new()),
         ChartKind::Heading | ChartKind::Section => {
             if text.is_empty() {
                 return Err(BiError::Validation("heading text is required.".to_owned()));
@@ -2850,6 +2896,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         tables: TableFields::default(),
         shape: ShapeFields::default(),
         style: crate::style::StyleFields::default(),
+        types: Box::new(crate::types_b::stored_card_fields(input)),
     };
     let spec = ChartSpec {
         id: new_id,
@@ -3356,6 +3403,7 @@ fn spec_from_chart_input(
         },
         shape: stored_shape(input),
         style: input.style.clone(),
+        types: input.types.clone(),
     };
 
     let sql = if is_point_kind(kind) {
@@ -3670,6 +3718,7 @@ fn spec_before_relation(
     source: ChartSource,
     created_by: &str,
     id: Option<String>,
+    time: &TimeContext,
 ) -> Result<Stage, BiError> {
     let common = derive_common_fields(input, id)?;
     let geo = geo_fields(common.kind, input)?;
@@ -3678,6 +3727,13 @@ fn spec_before_relation(
     // the names they use are checked once the relation's columns are known.
     crate::style::check_style(input).map_err(BiError::Validation)?;
     crate::params::check_reference_lines(input).map_err(BiError::Validation)?;
+    // BI-16 part B: which of goal, bands, histogram, url and alt the kind
+    // takes; an image or web address must be on an allowed content site. The
+    // list rides in `time` (loaded from the settings by the route), so the
+    // console and the assistant cannot save a card around it, and a context
+    // that carries none (a test, an embed) refuses every such card.
+    crate::types_b::check_fields(input).map_err(BiError::Validation)?;
+    crate::types_b::check_content_url(input, time.content_sites()).map_err(BiError::Validation)?;
     shape::check_kind_fields(
         &input.measures,
         &input.shape,
@@ -3820,7 +3876,7 @@ async fn spec_from_input_base(
 ) -> Result<StoredChartSpec, BiError> {
     let click = validated_click(input)?;
     let grain = validated_grain(input)?;
-    let (common, geo) = match spec_before_relation(input, source, created_by, id)? {
+    let (common, geo) = match spec_before_relation(input, source, created_by, id, time)? {
         Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
@@ -4041,7 +4097,7 @@ pub fn spec_from_inline_sql(
         ));
     }
     let grain = validated_grain(input)?;
-    let (common, geo) = match spec_before_relation(input, source, created_by, None)? {
+    let (common, geo) = match spec_before_relation(input, source, created_by, None, time)? {
         Stage::Done(spec) => return Ok(with_click(*spec, click)),
         Stage::NeedsRelation(common, geo) => (common, geo),
     };
@@ -4076,6 +4132,11 @@ fn check_measures(
     measures: &[String],
     cols: &std::collections::HashSet<String>,
 ) -> Result<(), BiError> {
+    // BI-16 part B: a histogram counts the rows of its dimension; it has no
+    // measure (`types_b::check_fields` refused any).
+    if kind == ChartKind::Histogram {
+        return Ok(());
+    }
     if kind == ChartKind::Pivot || input.tables.is_rows_mode(kind) {
         if !measures.is_empty() || !input.dimension.is_empty() || input.breakdown.is_some() {
             return Err(BiError::Validation(format!(
@@ -4260,6 +4321,11 @@ fn add_joined_columns(
 /// The part of [`spec_from_input`] that follows relation resolution, shared
 /// by the stored and the inline path so a chart is validated and its SQL
 /// built by one piece of code whichever way its rows are named.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch over the kinds that destructures the resolved relation once; \
+              BI-16 part B added the single-row and histogram arms to the list"
+)]
 fn spec_from_resolved(
     input: &ChartInput,
     source: ChartSource,
@@ -4319,8 +4385,11 @@ fn spec_from_resolved(
         .uses_shaping()
         .then(|| (from.clone(), kinds.clone(), catalog));
 
-    // ── KPI / GAUGE — single number (no dimension) ──────────────────
-    if kind == ChartKind::Kpi || kind == ChartKind::Gauge {
+    // ── KPI / GAUGE / PROGRESS / one BULLET — a single row (no dimension) ──
+    if kind == ChartKind::Kpi
+        || kind == ChartKind::Gauge
+        || crate::types_b::is_single_row_kind(kind, input)
+    {
         let spec = spec_from_kpi_input(
             input,
             KpiCtx {
@@ -4369,7 +4438,9 @@ fn spec_from_resolved(
         grain,
         time,
     };
-    let spec = if kind == ChartKind::Pivot {
+    let spec = if kind == ChartKind::Histogram {
+        spec_from_histogram_input(input, ctx)
+    } else if kind == ChartKind::Pivot {
         spec_from_pivot_input(input, ctx)
     } else if input.tables.is_rows_mode(kind) {
         spec_from_rows_input(input, ctx)
@@ -4460,6 +4531,109 @@ fn finish_shaping(
     Ok(spec)
 }
 
+/// Assemble a `histogram` (`BI-16` part B): how many rows fall in each range
+/// of one number column. The column is the `dimension`; the statement is
+/// `BI-10`'s binned path with a count ([`crate::builder`]), so it counts the
+/// rows the viewer may see, after the dashboard's filters, and the tile gets
+/// the ranges' width, minimum and maximum with its rows.
+fn spec_from_histogram_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let column = input.dimension.clone();
+    if !IDENT_ALLOWED(&column) || !ctx.cols.contains(&column) {
+        return Err(BiError::Validation(format!(
+            "invalid or missing dimension column '{column}'."
+        )));
+    }
+    if ctx.kinds.get(&column) != Some(&ColumnKind::Number) {
+        return Err(BiError::Validation(format!(
+            "'{column}' is not a number column; a histogram counts the rows of a number."
+        )));
+    }
+    let mode = match &input.types.histogram {
+        Some(bins) => bins.mode().map_err(BiError::Validation)?,
+        None => crate::bin::BinMode::Count(crate::types_b::AUTO_HISTOGRAM_BINS),
+    };
+    // As for BI-10's bins: a SQL source's rows are cut at a fixed cap, so a
+    // range read from the cut result would be wrong.
+    if ctx.from.is_sql_source() && !matches!(mode, crate::bin::BinMode::Width(_)) {
+        return Err(BiError::Validation(
+            "automatic and counted ranges need a table; for a SQL source choose a width."
+                .to_owned(),
+        ));
+    }
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: column.clone(),
+        measures: MeasureList::default(),
+        breakdown: None,
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields::default(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::new(crate::types_b::TypeFields {
+            histogram: input.types.histogram.clone(),
+            ..crate::types_b::TypeFields::default()
+        }),
+    };
+    let sql = crate::builder::histogram_stored_sql(&def, &ctx.from)
+        .ok_or_else(|| BiError::Validation("this histogram cannot be built.".to_owned()))?;
+    crate::style::check_style_names(input, &ctx.cols).map_err(BiError::Validation)?;
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x: column,
+        y: ChartY::Single(crate::builder::HISTOGRAM_COUNT.to_owned()),
+        series: None,
+        map: None,
+        lat: None,
+        lon: None,
+        format: Some(NumFmt::Int),
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    };
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
 /// The stored definition shared by a raw table and a pivot: no dimension,
 /// measures or breakdown, the `BI-16` part A fields as given.
 fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> ChartInput {
@@ -4488,6 +4662,7 @@ fn tables_def(input: &ChartInput, ctx: &ChartCtx<'_>, grain: Option<Grain>) -> C
         tables: input.tables.clone(),
         shape: stored_shape(input),
         style: input.style.clone(),
+        types: Box::default(),
     }
 }
 
@@ -4569,6 +4744,7 @@ fn spec_from_groupings_input(
         },
         shape: stored_shape(input),
         style: input.style.clone(),
+        types: Box::default(),
     };
     let y = ChartY::Multi(ctx.measures.clone());
     let (source, board, has_year, created_by) = (
@@ -4832,6 +5008,7 @@ impl StoredChartSpec {
                 tables: TableFields::default(),
                 shape: ShapeFields::default(),
                 style: crate::style::StyleFields::default(),
+                types: Box::default(),
             },
             has_year: false,
             created_by: Some("ui".to_owned()),
@@ -7080,5 +7257,225 @@ mod tests {
             },
         );
         assert_eq!(plan.charts[0].spec.id, "u_1");
+    }
+
+    // ── BI-16 part B: progress, histogram, bullet, image and web ────────
+
+    fn save_b(extra: &serde_json::Value) -> Result<StoredChartSpec, BiError> {
+        save_b_with(extra, &DEFAULT_TIME)
+    }
+
+    fn save_b_with(
+        extra: &serde_json::Value,
+        time: &TimeContext,
+    ) -> Result<StoredChartSpec, BiError> {
+        let cols = source_columns(&[
+            ("place", "String"),
+            ("visitors", "UInt64"),
+            ("target", "UInt64"),
+            ("price", "Float64"),
+        ]);
+        let mut base = serde_json::json!({"title": "t"});
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let input: ChartInput = serde_json::from_value(base).unwrap();
+        super::spec_from_inline_sql(
+            &input,
+            InlineSql {
+                sql: "SELECT place, visitors, target, price FROM serving.mart_x",
+                columns: &cols,
+            },
+            ChartSource::Ui,
+            "ui",
+            time,
+        )
+    }
+
+    fn refused_b(extra: &serde_json::Value) -> String {
+        match save_b(extra) {
+            Err(BiError::Validation(why)) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_progress_bar_is_saved_as_a_single_row_and_keeps_its_goal() {
+        let fixed = save_b(&serde_json::json!({
+            "kind": "progress", "measures": ["visitors"], "goal": 1_000_000
+        }))
+        .unwrap();
+        assert_eq!(fixed.spec.y, ChartY::Single("v".to_owned()));
+        assert!(
+            fixed
+                .spec
+                .sql
+                .starts_with("SELECT round(sum(visitors)) AS v FROM")
+        );
+        assert_eq!(
+            fixed.def.types.goal,
+            Some(crate::types_b::Goal::Fixed(1_000_000.0))
+        );
+        let value = save_b(&serde_json::json!({
+            "kind": "progress", "measures": ["visitors", "target"],
+            "goal": {"measure": "target"}
+        }))
+        .unwrap();
+        assert_eq!(
+            value.spec.y,
+            ChartY::Multi(vec!["v".to_owned(), "g".to_owned()])
+        );
+        assert!(
+            value
+                .spec
+                .sql
+                .starts_with("SELECT __m0 AS v, __m1 AS g FROM")
+        );
+        assert_eq!(value.def.measures.len(), 2);
+        // A goal that is a column the source does not have is the measure check.
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "progress", "measures": ["visitors", "nope"], "goal": {"measure": "nope"}
+            }))
+            .contains("measure")
+        );
+    }
+
+    #[test]
+    fn fields_for_another_kind_are_refused_at_save_not_stored_and_ignored() {
+        assert_eq!(
+            refused_b(&serde_json::json!({
+                "kind": "bar", "dimension": "place", "measures": ["visitors"], "goal": 5
+            })),
+            "goal is only for a progress bar and a bullet graph."
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place", "measures": ["visitors"],
+                "bands": [1, 2, 3, 4]
+            }))
+            .contains("1 to 3 bands")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place", "measures": ["visitors"], "bands": [3, 2]
+            }))
+            .contains("must go up")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "price", "histogram": {"count": 101}
+            }))
+            .contains("1 to 100 ranges")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "price", "histogram": {"count": 5, "width": 2}
+            }))
+            .contains("not both")
+        );
+    }
+
+    #[test]
+    fn a_bullet_without_a_category_is_one_row_and_with_one_it_is_a_grouped_chart() {
+        let one = save_b(&serde_json::json!({
+            "kind": "bullet", "measures": ["visitors"], "goal": 10, "bands": [5, 15]
+        }))
+        .unwrap();
+        assert_eq!(one.spec.y, ChartY::Single("v".to_owned()));
+        let by_place = save_b(&serde_json::json!({
+            "kind": "bullet", "dimension": "place", "measures": ["visitors", "target"],
+            "goal": {"measure": "target"}, "bands": [5, 15]
+        }))
+        .unwrap();
+        assert_eq!(
+            by_place.spec.y,
+            ChartY::Multi(vec!["visitors".to_owned(), "target".to_owned()])
+        );
+        assert!(
+            by_place.spec.sql.contains("GROUP BY place"),
+            "{}",
+            by_place.spec.sql
+        );
+        assert_eq!(by_place.def.types.bands, Some(vec![5.0, 15.0]));
+        // No sort, no own aggregate on these kinds.
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "bullet", "dimension": "place",
+                "measures": [{"column": "visitors", "aggregate": "avg"}]
+            }))
+            .contains("takes the chart's aggregate")
+        );
+    }
+
+    #[test]
+    fn a_histogram_over_a_sql_source_needs_a_width_and_a_number_column() {
+        let ok = save_b(&serde_json::json!({
+            "kind": "histogram", "dimension": "price", "histogram": {"width": 10}
+        }))
+        .unwrap();
+        assert_eq!(ok.spec.x, "price");
+        assert_eq!(ok.spec.y, ChartY::Single("__count".to_owned()));
+        assert!(
+            ok.spec.sql.contains("count() AS __count"),
+            "{}",
+            ok.spec.sql
+        );
+        assert!(
+            refused_b(&serde_json::json!({"kind": "histogram", "dimension": "price"}))
+                .contains("choose a width")
+        );
+        assert!(
+            refused_b(&serde_json::json!({
+                "kind": "histogram", "dimension": "place", "histogram": {"width": 10}
+            }))
+            .contains("not a number column")
+        );
+        assert!(refused_b(&serde_json::json!({
+            "kind": "histogram", "dimension": "price", "grain": "month", "histogram": {"width": 10}
+        }))
+        .contains("cannot group dates"));
+    }
+
+    fn sites_time() -> TimeContext {
+        TimeContext::default().with_content_sites(vec!["https://img.example".to_owned()])
+    }
+
+    #[test]
+    fn an_image_or_web_card_is_saved_only_for_an_address_on_an_allowed_site() {
+        let card = |kind: &str, url: &str| serde_json::json!({"kind": kind, "url": url, "alt": if kind == "image" {"A logo"} else {""}});
+        let time = sites_time();
+        let image = save_b_with(&card("image", "https://img.example/logo.png"), &time).unwrap();
+        assert_eq!(image.spec.sql, "");
+        assert_eq!(
+            image.def.types.url.as_deref(),
+            Some("https://img.example/logo.png")
+        );
+        assert_eq!(image.def.types.alt.as_deref(), Some("A logo"));
+        let mut web = card("web", "https://img.example/status");
+        web.as_object_mut().unwrap().remove("alt");
+        let web = save_b_with(&web, &time).unwrap();
+        assert_eq!(web.def.types.alt, None);
+        for bad in [
+            "https://other.example/logo.png",
+            "http://img.example/logo.png",
+            "https://img.example@evil.example/logo.png",
+            "javascript:alert(1)",
+        ] {
+            let Err(BiError::Validation(why)) = save_b_with(&card("image", bad), &time) else {
+                panic!("{bad} was saved");
+            };
+            assert_eq!(why, crate::types_b::CONTENT_SITE_REFUSED);
+            assert!(!why.contains(bad), "{why}");
+        }
+        // With no site on the list (the default context) nothing is saved.
+        assert!(save_b(&card("image", "https://img.example/logo.png")).is_err());
+        // An image tile takes no filter or click.
+        let mut filtered = card("image", "https://img.example/logo.png");
+        filtered["filters"] = serde_json::json!([{"column": "place", "values": ["a"]}]);
+        assert!(save_b_with(&filtered, &time).is_err());
+        let mut clicked = card("image", "https://img.example/logo.png");
+        clicked["click"] = serde_json::json!({"kind": "url", "url": "https://img.example/{value}"});
+        assert!(save_b_with(&clicked, &time).is_err());
     }
 }

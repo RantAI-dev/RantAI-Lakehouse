@@ -917,14 +917,7 @@ pub fn build_kpi_sql(
     agg: Aggregate,
     where_clauses: &[String],
 ) -> String {
-    let val = if let Some(field) = from.aggregate_field(measure.as_str()) {
-        // BI-8: an aggregate calculated field is the number itself.
-        field.sql.clone()
-    } else if agg == Aggregate::Count {
-        "count()".to_owned()
-    } else {
-        format!("round({agg}({measure}))")
-    };
+    let val = kpi_value(from, measure, agg);
     let where_sql = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -935,6 +928,114 @@ pub fn build_kpi_sql(
         from.render(),
         from.settings()
     )
+}
+
+/// The number a single-row statement computes for `measure`.
+fn kpi_value(from: &Relation, measure: &Ident, agg: Aggregate) -> String {
+    if let Some(field) = from.aggregate_field(measure.as_str()) {
+        // BI-8: an aggregate calculated field is the number itself.
+        field.sql.clone()
+    } else if agg == Aggregate::Count {
+        "count()".to_owned()
+    } else {
+        format!("round({agg}({measure}))")
+    }
+}
+
+/// The statement of a progress bar, or a bullet graph without a category
+/// (`BI-16` part B): the value as `v` and, when the goal is a second value,
+/// the goal as `g`, in one row so one filter narrows both.
+///
+/// With a goal the two aggregates are computed under `__m0` and `__m1` in an
+/// inner select and renamed outside: `round(sum(x)) AS v, round(sum(v)) AS g`
+/// would read the second `v` as the first alias (engine error 184, the same
+/// clash [`QueryBuilder`] avoids for its measures). Without a goal it is
+/// exactly [`build_kpi_sql`].
+#[must_use]
+pub fn build_progress_sql(
+    from: &Relation,
+    measure: &Ident,
+    goal: Option<&Ident>,
+    agg: Aggregate,
+    where_clauses: &[String],
+) -> String {
+    let Some(goal) = goal else {
+        return build_kpi_sql(from, measure, agg, where_clauses);
+    };
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+    format!(
+        "SELECT __m0 AS v, __m1 AS g FROM (SELECT {} AS __m0, {} AS __m1 FROM {}{where_sql}{})",
+        kpi_value(from, measure, agg),
+        kpi_value(from, goal, agg),
+        from.render(),
+        from.settings()
+    )
+}
+
+/// A progress bar, or a bullet graph without a category, reads its value and,
+/// for a goal that is a value, the goal in one row (`BI-16` part B).
+fn single_row_sql(
+    def: &ChartInput,
+    from: &Relation,
+    agg: Aggregate,
+    where_clauses: &[String],
+) -> Option<String> {
+    let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+    let goal = def
+        .types
+        .goal_measure()
+        .map(|g| Ident::new(g.to_owned()))
+        .transpose()
+        .ok()?;
+    Some(build_progress_sql(
+        from,
+        &measure,
+        goal.as_ref(),
+        agg,
+        where_clauses,
+    ))
+}
+
+/// The most rows (ranges) a histogram's statement returns.
+const HISTOGRAM_LIMIT: u32 = 100;
+
+/// The name of a histogram's count column. Not the column's own name (the
+/// range's lower edge carries that) and not one a table is likely to have.
+pub const HISTOGRAM_COUNT: &str = "__count";
+
+/// The statement of a histogram (`BI-16` part B): how many rows fall in each
+/// range of one number column, in range order. It is `BI-10`'s binned path
+/// with a count: the predicates sit under the bins on the raw rows, the
+/// column's range is read inside the same statement, and the role rewrite
+/// substitutes the governed projection at every read. `None` when the
+/// definition no longer checks out.
+fn histogram_sql(def: &ChartInput, from: &Relation, where_clauses: Vec<String>) -> Option<String> {
+    let layers = binned::chart_layers(def)?;
+    let column = layers.first()?.column.clone();
+    let relation = binned::binned(from, where_clauses, &layers, &[column.to_string()]);
+    let count = Ident::new(HISTOGRAM_COUNT).ok()?;
+    Some(
+        QueryBuilder::over(relation)
+            .dimension(column.clone())
+            .aggregate(Aggregate::Count)
+            .order("none")
+            .limit(HISTOGRAM_LIMIT)
+            .measure_list(vec![Measure {
+                column,
+                alias: count,
+                aggregate: Some(Aggregate::Count),
+            }])
+            .build(),
+    )
+}
+
+/// The statement a histogram is saved with (no dashboard filter).
+pub(crate) fn histogram_stored_sql(def: &ChartInput, from: &Relation) -> Option<String> {
+    histogram_sql(def, from, Vec::new())
 }
 
 /// Boxplot SQL: per `dimension`, the five-number summary of `measure`
@@ -1277,6 +1378,9 @@ where
     let kind = spec.spec.kind;
     let rebuilds = def.grain.is_some()
         || kind == crate::specs::ChartKind::Pivot
+        // BI-16 part B: a histogram reads the bins' widths, so it is always
+        // rebuilt (the tile carries them), like a binned chart.
+        || kind == crate::specs::ChartKind::Histogram
         || def.tables.is_rows_mode(kind)
         || def.tables.compares_to_previous(kind)
         || def.uses_shaping()
@@ -2038,6 +2142,13 @@ fn result_aliases(
 ) -> Vec<String> {
     match kind {
         crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v".to_owned()],
+        crate::specs::ChartKind::Progress => vec!["v".to_owned(), "g".to_owned()],
+        crate::specs::ChartKind::Bullet if def.dimension.is_empty() => {
+            vec!["v".to_owned(), "g".to_owned()]
+        }
+        crate::specs::ChartKind::Histogram => {
+            vec![def.dimension.clone(), HISTOGRAM_COUNT.to_owned()]
+        }
         crate::specs::ChartKind::Boxplot => def
             .measures
             .first()
@@ -2063,6 +2174,10 @@ fn rebuild_chart<H: std::hash::BuildHasher>(
     grained: Option<&Grained>,
 ) -> Option<String> {
     let def: &ChartInput = &spec.def;
+    // BI-16 part B: a histogram has its own statement over its bins.
+    if spec.spec.kind == crate::specs::ChartKind::Histogram {
+        return histogram_sql(def, from, where_clauses);
+    }
     // BI-10: a chart whose dimension or breakdown is binned reads a relation
     // in which that column already is its bin, with the predicates under it on
     // the raw rows. Everything after this (sort, "Other", steps) is the
@@ -2134,6 +2249,9 @@ fn rebuild_chart_over<H: std::hash::BuildHasher>(
     ) {
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
         return Some(build_kpi_sql(from, &measure, agg, &where_clauses));
+    }
+    if crate::types_b::is_single_row_kind(spec.spec.kind, def) {
+        return single_row_sql(def, from, agg, &where_clauses);
     }
 
     if matches!(
