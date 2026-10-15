@@ -147,7 +147,44 @@ run it per directory and say so. Rust tests and gates are proven by CI on
 
 ## Handoff
 
-*(developer)*
+### Tasks 1 to 4 (developer)
+
+Branch `feat/phase-1-src-13`, base `1c3efd25`. Commits: `42f09344` (task 1, store and contract), `07d0f5f1` (task 2, API listings), `307f1e38` (task 3, orchestrator launch and result route), `7a0ee689` (task 4, `discover_job`). Migration `0075_connector_discovery.sql`.
+
+**Commands run (outcomes).**
+- `cargo clippy --locked --offline -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` (shared target, jobs 2): finished clean on the final Rust tree (after fixing 4 rustdoc list-indent errors and a `Debug` bound in a test it found).
+- `rustfmt --edition 2024 --check` on every touched Rust file: clean.
+- `(cd dagster && python -m pytest dispar_orchestrate -q -m "not loader")`: 968 passed (53 of them `test_discover.py`).
+- `check_intra_package_imports.py`, `check_bare_iceberg_count.py`: OK.
+
+**Not run.** `cargo test` (forbidden here): every Rust test, including the `sqlx::test` and route tests, is unproven locally; CI is the proof. Test gates, console, compose: not touched.
+
+**Tests added.** `lakehouse-store/tests/connector_discovery.rs` (9), unit tests in `connector_listing.rs` (globs, LIKE escape, type inference, class mapping, dispatch, live PostgreSQL schemas/tables/columns), `routes/connector_discovery.rs` (bodies, kinds, result contradictions), `routes/mod.rs` (130 s timeout), `connector_discover.rs` (views gone, fixed sentence), `tests/connector_discovery_routes.rs` (6), `tests/connector_discovery_launch.rs` (3, wiremock Dagster), `route_auth.rs` (+1, both directions), `dagster/.../test_discover.py`.
+
+**Wire shapes (the console and gates build on these).**
+- `POST /api/connectors/{id}/discovery/{kind}`, `kind` = `list` | `preview`; `GET` same path reads the latest answer (404 if none; a `running` request older than 300 s reads as `failed`/`timeout`). `connector:manage`, own tenant. Body (all optional; `deny_unknown_fields`): `{schema, glob, search, limit (1..10000, default 10000), object}`; `object` required for preview, refused for list; strings <= 256 chars, no control chars; 400 otherwise.
+  - SQL list: no `schema` -> schemas (`kind: "schema"`); with `schema` -> base tables named `schema.table` (`kind: "table"`). Preview `object` = `schema.table`: columns with source types (`inferred:false`) and `primaryKey`.
+  - Files (S3 with `endpoint`): list by `glob` against the FULL key (`*` not across `/`, `**` across, `?`), narrowed by the connector `prefix`; `kind: "file"`, `size`, `modifiedAt`; CSV (head, 1,000 rows, types inferred) and Parquet (footer, declared types, <= 64 MiB) preview; JSON preview `not_supported`; no `endpoint` -> `not_supported`.
+  - REST: list = dial endpoint paths (`kind: "endpoint"`), answered inline; preview goes to the orchestrator.
+  - MongoDB, Kafka, SFTP, Oracle (and REST preview): answer `{"kind","state":"running"[,"scope","object"]}`; poll with GET.
+- Answer (all routes): `{kind, state: running|done|failed, scope?, object?, objects?: [{name, kind: schema|table|file|endpoint|topic|collection, size?, modifiedAt?}], truncated?, columns?: [{name, typeName, inferred}], primaryKey?, errorClass?, reason?, startedAt?, endedAt?}`. `reason` is a fixed sentence for the class, or "Only the first 10,000 are shown..." when `truncated`. Failures are HTTP 200 with `state: "failed"`.
+- Closed `errorClass` list: `unreachable`, `sign_in_refused`, `address_refused`, `no_permission`, `timeout`, `too_many_objects`, `not_supported`, `failed`. D10 names six; `address_refused` and `failed` are added (a refused address is actionable; an unclassified failure is said as one). Needs the planner's confirmation.
+- Orchestrator: `POST /api/connectors/{id}/discovery-results` (`ingest:read` + service identity/unrestricted admin; body limit 4 MiB): `{requestId, kind, state: done|failed, errorClass?, objects?, truncated?, columns?, primaryKey?}`; answer `{recorded: bool}`. Run config of `discover_job`: `{"ops":{"run_discover":{"config":{connector_id, request_id, kind, object, schema, glob, search, limit}}}}`.
+- Bounds: 10,000 objects, 2,000 columns, 3 MiB JSON (orchestrator posts <= 2.5 MB), 100 samples, 1,000 CSV rows, S3 scan 100,000 keys (then `too_many_objects`), SFTP directory 100,000 entries. Listing call limit 120 s; the route timeout for the two discovery paths is 130 s.
+
+**Deviations and decisions for the planner.**
+1. Two classes added to D10's six (above).
+2. A preview with nothing to sample (empty topic/collection/file) is `columns: []` (D6 "never invented"), not a failure.
+3. The old `POST /discover?schema=` stays; it lost views (D8) and its wrong texts (D10). Oracle/other types get fixed sentences pointing at the new routes.
+4. `futures = "0.3"` added to `lakehouse-api` (already in `Cargo.lock`; one line added to that crate's dependency list in the lockfile) to stop a bucket listing at its bound.
+5. MongoDB `code 18` now counts as a sign-in refusal in `ingest_errors.is_authentication_refusal`, so a load with a wrong Mongo password is no longer retried (behaviour change for loads).
+6. Adapters refactored to share connection code (`mongodb.connect`, `sftp.resolve_host/open_session`, `oracle.connection_parts`, `kafka.check_brokers`, `rest._prepare`); load behaviour unchanged, existing tests pass.
+7. S3 wrong secret key surfaces as `no_permission` (object_store reports 403 for both); S3 keys over 256 characters are not listed.
+8. Kafka preview uses a per-request group id `lakehouse-discover-<requestId>` with manual assignment and no commit.
+9. Oracle listing tables other than the login's own are listed, but the loader (`oracle.py`) loads `name.split(".")[-1]` without schema; tasks 5-8 should know.
+10. A second click launches a second job (no de-duplication); latest request wins.
+
+**Most likely to fail in CI.** (a) `sqlx::test`/route tests never run locally: the seed `INSERT` in `connector_discovery_routes.rs` (`CASE WHEN $4::text ...`) and the `connector` CHECK constraints for `ingest_mode`/`type`; (b) `route_auth` loops over the new `{kind}` routes; (c) MySQL/SQL Server listing queries are untested live (g6 gates later); `ESCAPE '\'` on MySQL/MSSQL; (d) PostgreSQL `ILIKE ... ESCAPE` typing of `$1 = ''`; (e) `cargo deny`/`--locked` on the hand-edited `Cargo.lock` line; (f) the g6 discover steps for files/REST/Kafka check `supported:false` on the OLD route, whose words changed.
 
 ## Review
 
