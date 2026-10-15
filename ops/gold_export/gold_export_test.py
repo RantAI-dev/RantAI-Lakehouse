@@ -37,8 +37,18 @@ CH_PASSWORD = os.environ.get("CH_PASSWORD", "")
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 RUSTFS_ENDPOINT = os.environ.get("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000")
-S3_ACCESS_KEY = os.environ.get("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin")
-S3_SECRET_KEY = os.environ.get("CONNECTOR_S3_SECRET_KEY", "rustfsadmin")
+class GoldExportFailure(Exception):
+    pass
+
+
+# DATA-2 review BLOCKER 2: credentials passed via env (no default in docker-compose.yml)
+S3_ACCESS_KEY = os.environ.get("CONNECTOR_S3_ACCESS_KEY", "").strip()
+S3_SECRET_KEY = os.environ.get("CONNECTOR_S3_SECRET_KEY", "").strip()
+if not S3_ACCESS_KEY or not S3_SECRET_KEY:
+    raise GoldExportFailure(
+        "set CONNECTOR_S3_ACCESS_KEY and CONNECTOR_S3_SECRET_KEY: the gate has no default credential (DATA-2 review BLOCKER 2)"
+    )
+
 S3_BUCKET = os.environ.get("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse")
 LAKEKEEPER_BASE_URI = os.environ.get("LAKEKEEPER_BASE_URI", "http://lakekeeper:8181")
 LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
@@ -46,16 +56,16 @@ GOLD_SOURCE_SCHEMA = os.environ.get("GOLD_SOURCE_SCHEMA", "serving")
 GOLD_EXPORT_RUN_TOKEN = os.environ.get("GOLD_EXPORT_RUN_TOKEN", "")
 MART_NAME = os.environ.get("GOLD_MART_NAME", "gold_export_smoke")
 ROW_COUNT = int(os.environ.get("GOLD_EXPORT_ROW_COUNT", "7"))
-AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
-AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
+AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "").strip()
+AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "").strip()
+if not AUTH_EMAIL or not AUTH_PASSWORD:
+    raise GoldExportFailure(
+        "set AUTH_BOOTSTRAP_EMAIL and AUTH_BOOTSTRAP_PASSWORD: the gate has no default credential (DATA-2 review BLOCKER 2)"
+    )
 
 API = requests.Session()
 if GOLD_EXPORT_RUN_TOKEN:
     API.headers["x-run-token"] = GOLD_EXPORT_RUN_TOKEN
-
-
-class GoldExportFailure(Exception):
-    pass
 
 
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None:

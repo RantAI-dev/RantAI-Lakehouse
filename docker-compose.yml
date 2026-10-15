@@ -1342,8 +1342,9 @@ services:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       DAGSTER_URL: ${DAGSTER_URL:-http://dagster-webserver:3000/graphql}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-rustfsadmin}
-      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-rustfsadmin}
+      # DATA-2 review BLOCKER 2: no default credentials in compose (AGENTS rule 5)
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       LAKEKEEPER_BASE_URI: http://lakekeeper:8181
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
@@ -1352,8 +1353,8 @@ services:
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
       GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
-      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-ci@example.com}
-      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-ci-password-not-real-123}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests boto3 && python gold_export_test.py"
