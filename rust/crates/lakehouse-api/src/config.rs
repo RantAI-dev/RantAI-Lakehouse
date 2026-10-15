@@ -61,6 +61,11 @@ pub enum ConfigError {
     /// quietly keep refusing the internal webhook target the operator listed.
     #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
     MalformedWebhookAllowedCidrs(String),
+    /// `SECRET_MANAGER` or the settings of the manager it names are unusable
+    /// (`SRC-12` part B). Fails config resolution: an operator who named a
+    /// manager must not get an installation that quietly has none.
+    #[error("{0}")]
+    SecretManager(#[from] crate::secret_manager::SettingsError),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -221,6 +226,11 @@ pub struct Config {
     /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
     /// never seals.
     pub connector_secrets_key_previous: Option<String>,
+    /// The installation's secret manager and how to sign in to it
+    /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
+    /// sign-in settings are secrets: this field's `Debug` prints the manager
+    /// only.
+    pub secret_manager: crate::secret_manager::SecretManagerSettings,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -916,6 +926,7 @@ impl std::fmt::Debug for Config {
                     .as_ref()
                     .map(|_| REDACTED),
             )
+            .field("secret_manager", &self.secret_manager)
             .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
@@ -1232,6 +1243,7 @@ impl Config {
             ),
             connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
             connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
+            secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),

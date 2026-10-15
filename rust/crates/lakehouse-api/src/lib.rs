@@ -50,6 +50,7 @@ pub mod policy_engine;
 pub mod routes;
 pub mod rustfs_client;
 pub mod secret_crypto;
+pub mod secret_manager;
 pub mod sql_guard;
 pub mod sql_rewrite;
 pub mod state;

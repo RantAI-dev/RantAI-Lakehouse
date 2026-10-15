@@ -34,6 +34,7 @@ mod policy_engine;
 mod routes;
 mod rustfs_client;
 mod secret_crypto;
+mod secret_manager;
 mod sql_guard;
 mod sql_rewrite;
 mod state;

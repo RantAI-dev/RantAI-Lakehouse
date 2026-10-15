@@ -29,6 +29,7 @@ use crate::config::Config;
 use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
+use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -398,11 +399,21 @@ struct ConnectorSecretResolver {
     /// Opens the managed files (`SRC-12` decision 4); operator `file:`s and
     /// `env:` values are not sealed and never go through it.
     keyring: SharedKeyring,
+    /// The installation's secret manager, when `SECRET_MANAGER` names one
+    /// (`SRC-12` part B). A manager scheme with none configured is
+    /// unsupported here; the allowlist already refuses it before this point.
+    manager: Option<ManagerResolver>,
 }
 
 impl ConnectorSecretResolver {
-    fn new(env: EnvSecretResolver, dir: &std::path::Path, keyring: SharedKeyring) -> Self {
+    fn new(
+        env: EnvSecretResolver,
+        dir: &std::path::Path,
+        keyring: SharedKeyring,
+        manager: Option<ManagerResolver>,
+    ) -> Self {
         Self {
+            manager,
             env,
             // A fixed base directory, never caller-supplied — see
             // `FileSecretResolver`'s doc comment for why that matters.
@@ -479,6 +490,14 @@ impl SecretResolver for ConnectorSecretResolver {
                 }
                 _ => self.file.resolve(&self.located(secret_ref)).await,
             }
+        } else if SecretManagerKind::of_ref(secret_ref).is_some() {
+            match &self.manager {
+                Some(manager) => manager.resolve(secret_ref).await,
+                None => Err(SecretError::UnsupportedRef {
+                    secret_ref: secret_ref.to_owned(),
+                    resolver: "secret-manager",
+                }),
+            }
         } else {
             Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -501,14 +520,33 @@ fn connector_secret_resolver(
     env: EnvSecretResolver,
     dir: &std::path::Path,
     keyring: SharedKeyring,
+    settings: &SecretManagerSettings,
 ) -> Arc<dyn DynSecretResolver> {
     Arc::new(AllowlistedSecretResolver::new(
-        ConnectorSecretResolver::new(env, dir, keyring),
-        CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-            .iter()
-            .map(|s| (*s).to_owned()),
+        ConnectorSecretResolver::new(env, dir, keyring, ManagerResolver::from_settings(settings)),
+        connector_allowed_patterns(settings.kind),
         "connector-allowlist",
     ))
+}
+
+/// The allowlist for an installation whose secret manager is `manager`
+/// (`SRC-12` part B, decision 1): the fixed credential-suffix patterns
+/// above, plus the one scheme of the configured manager — and none when
+/// `SECRET_MANAGER` is unset, so a `vault:` reference cannot even be named
+/// where Vault is not set up. Which strings under that scheme are real
+/// references is [`crate::secret_manager::refs`]'s grammar, checked when
+/// the reference is read and when it is saved.
+///
+/// `dagster/dispar_orchestrate/secret_manager.py`'s `allowed_patterns` is
+/// the twin; `tests/fixtures/secret_manager_refs.json` is the list both
+/// test suites check.
+#[must_use]
+pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> Vec<String> {
+    CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .chain(manager.map(SecretManagerKind::allowed_pattern))
+        .collect()
 }
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
@@ -627,6 +665,7 @@ impl AppState {
         )
         .map(Arc::new);
         let secrets_dir = config.connector_secrets_dir.clone();
+        let secret_manager = config.secret_manager.clone();
         // SRC-12 decision 4: one keyring for the store (seals) and the
         // resolver (opens). A missing or malformed key is kept as its
         // error, not dropped: `main` refuses to start on it, and any
@@ -651,6 +690,7 @@ impl AppState {
                 EnvSecretResolver::new(),
                 &secrets_dir,
                 secrets_keyring.clone(),
+                &secret_manager,
             ),
             connector_secret_store: Arc::new(ConnectorSecretStore::new(
                 secrets_dir,
@@ -709,8 +749,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // An operator's file (`connector_conn_…`), plain by design (D10).
         std::fs::write(dir.path().join("connector_conn_x_password"), "pw\n").unwrap();
-        let resolver =
-            ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), test_keyring());
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
         let value = resolver
             .resolve("file:/run/secrets/connector_conn_x_password")
             .await
@@ -739,8 +783,12 @@ mod tests {
         )
         .unwrap();
 
-        let resolver =
-            ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), test_keyring());
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
         let value = resolver
             .resolve("file:/run/secrets/connector_managed_conn_x_password")
             .await
@@ -783,7 +831,7 @@ mod tests {
             ),
         ] {
             let resolver =
-                ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), keyring);
+                ConnectorSecretResolver::new(EnvSecretResolver::new(), dir.path(), keyring, None);
             let err = resolver
                 .resolve("file:/run/secrets/connector_managed_conn_x_password")
                 .await
@@ -800,6 +848,7 @@ mod tests {
             EnvSecretResolver::new(),
             std::path::Path::new(CONNECTOR_SECRETS_DIR),
             test_keyring(),
+            None,
         );
         let secret_ref = "file:/run/secrets/connector_managed_conn_x_password";
         assert_eq!(resolver.located(secret_ref), secret_ref);
@@ -890,6 +939,7 @@ mod tests {
             lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::new()),
             std::path::Path::new(CONNECTOR_SECRETS_DIR),
             test_keyring(),
+            &SecretManagerSettings::default(),
         );
 
         for admitted in [
@@ -966,5 +1016,61 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// `SRC-12` part B, decision 1: both allowlists admit only the
+    /// configured manager's scheme, and only when `SECRET_MANAGER` is set.
+    /// The list is the one the orchestrator's tests read
+    /// (`tests/fixtures/secret_manager_refs.json`), so the two cannot drift.
+    #[test]
+    fn the_allowlist_admits_only_the_configured_managers_scheme() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/secret_manager_refs.json"))
+                .unwrap();
+        let admits = |manager: Option<SecretManagerKind>, secret_ref: &str| {
+            connector_allowed_patterns(manager)
+                .iter()
+                .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, secret_ref))
+        };
+        for secret_ref in fixture["base_allowed"].as_array().unwrap() {
+            for manager in [None, Some(SecretManagerKind::Vault)] {
+                assert!(admits(manager, secret_ref.as_str().unwrap()));
+            }
+        }
+        for secret_ref in fixture["base_refused"].as_array().unwrap() {
+            for manager in SecretManagerKind::ALL.map(Some) {
+                assert!(!admits(manager, secret_ref.as_str().unwrap()));
+            }
+        }
+        let cases = fixture["allowlist"].as_array().unwrap();
+        assert!(cases.len() >= 14);
+        for case in cases {
+            let manager = case["setting"]
+                .as_str()
+                .map(|name| SecretManagerKind::from_setting(name).unwrap());
+            let secret_ref = case["ref"].as_str().unwrap();
+            assert_eq!(
+                admits(manager, secret_ref),
+                case["allowed"].as_bool().unwrap(),
+                "{manager:?} {secret_ref}"
+            );
+        }
+    }
+
+    /// With no client for the configured manager, or none configured, a
+    /// reference of a manager scheme is unsupported, never an empty value.
+    #[tokio::test]
+    async fn a_manager_reference_without_a_manager_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = ConnectorSecretResolver::new(
+            EnvSecretResolver::new(),
+            dir.path(),
+            test_keyring(),
+            None,
+        );
+        assert!(matches!(
+            resolver.resolve("vault:secret/a#k").await,
+            Err(SecretError::UnsupportedRef { .. })
+        ));
     }
 }

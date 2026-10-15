@@ -55,6 +55,7 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from dispar_orchestrate import secret_manager
 from dispar_orchestrate.secret_map import secret_field_names
 
 # Ported verbatim from rust/crates/lakehouse-api/src/state.rs's
@@ -159,6 +160,20 @@ def open_managed_credential(file_name: str, sealed: bytes) -> str:
     raise SecretRefRejected(_WRONG_KEY)
 
 
+def _read_from_manager(secret_ref: str, manager: str) -> str:
+    """A reference to the installation's secret manager (`SRC-12` part B):
+    parsed by the shared grammar, then read now -- no cache, no fallback
+    (decision 1). Failures carry only the fixed texts (decision 12)."""
+    try:
+        parsed = secret_manager.parse_ref(manager, secret_ref)
+        value = secret_manager.read_secret(manager, parsed)
+    except secret_manager.RefError:
+        raise SecretRefRejected(f"secretRef {secret_ref!r} is not a reference this build can read") from None
+    except secret_manager.ManagerFailure as exc:
+        raise SecretRefRejected(f"secretRef {secret_ref!r}: {exc}") from None
+    return value.strip()
+
+
 def resolve_secret_ref(secret_ref: str | None) -> str:
     """Resolve one `secretRef` string to its credential value.
 
@@ -169,7 +184,9 @@ def resolve_secret_ref(secret_ref: str | None) -> str:
     """
     if not secret_ref:
         raise SecretRefRejected("no secretRef configured")
-    if not any(_pattern_matches(p, secret_ref) for p in CONNECTOR_ALLOWED_SECRET_REF_PATTERNS):
+    manager = secret_manager.configured_kind()
+    patterns = CONNECTOR_ALLOWED_SECRET_REF_PATTERNS + secret_manager.allowed_patterns(manager)
+    if not any(_pattern_matches(p, secret_ref) for p in patterns):
         raise SecretRefRejected(f"secretRef {secret_ref!r} is not an allowlisted credential-shaped name")
     if secret_ref.startswith("env:"):
         name = secret_ref[len("env:") :]
@@ -199,6 +216,8 @@ def resolve_secret_ref(secret_ref: str | None) -> str:
             except SecretRefRejected as exc:
                 raise SecretRefRejected(f"secretRef {secret_ref!r}: {exc}") from None
         return target.read_text().strip()
+    if manager is not None and secret_manager.kind_of_ref(secret_ref) == manager:
+        return _read_from_manager(secret_ref, manager)
     raise SecretRefRejected(f"secretRef {secret_ref!r} has an unsupported scheme")
 
 
