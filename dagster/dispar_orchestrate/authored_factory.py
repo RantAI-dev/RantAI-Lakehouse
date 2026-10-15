@@ -24,7 +24,14 @@ all tenants) and builds, per pipeline:
   keeps the sensor's RUNNING/STOPPED state across a code-location
   reload, so the `paused` branch has to skip the sensor AND the API
   `authored_status` route has to stop the stored sensor next to the
-  schedule (F1.2).
+  schedule (F1.2);
+* an `authored__<id>_lag` sensor when the pipeline has a time-based target lag
+  (`targetLag.kind == 'lag'`) AND its status is `ready` (BLD-2 D3/D6). A target lag
+  replaces both the cron schedule and the dependency `_after` sensor while set (D3).
+  The sensor evaluates `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds
+  (`minimum_interval_seconds=30`), balancing responsive freshness for pipelines with short
+  targets (down to 1 minute) against the database cost of querying input snapshot tokens
+  and ClickHouse content fingerprints across authored pipelines (D6).
 
 The API asks the webserver to reload this code location whenever a
 pipeline becomes ready, is edited, paused, resumed or deleted
@@ -81,6 +88,7 @@ DagsterRunStatus,
     job,
     op,
     run_status_sensor,
+    sensor,
 )
 
 from dispar_orchestrate import authored_transforms, op_metadata
@@ -609,6 +617,10 @@ def build_authored_schedule(pipeline: dict[str, Any], authored_job: Any) -> Sche
     `"On demand"`, ...) or its cron is one Dagster refuses. A refused cron
     is logged and skipped rather than raised: one bad row must not take
     down every job in this code location."""
+    # BLD-2 D3: A target lag (either kind) replaces the cron schedule while it is set.
+    # The schedule string stays stored, so clearing the target lag restores the schedule (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     cron = pipeline.get("schedule")
     if not _is_five_field_cron(cron):
         return None
@@ -768,6 +780,10 @@ def build_authored_dependency_sensor(
     `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
     Verified against dagster 1.13.20's `run_status_sensor` signature.
     """
+    # BLD-2 D3: A target lag (either kind) replaces the dependency (_after) sensor while it is set.
+    # The dependsOn list stays stored, so clearing the target lag restores the chain sensor (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
         return None
@@ -903,8 +919,105 @@ def build_authored_dependency_sensor(
 # Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
 # names statically) sees all four names `definitions.py` imports.
+def build_authored_lag_sensor(
+    pipeline: dict[str, Any],
+    authored_job: Any,
+    cfg: AuthoredPipelineConfig | None = None,
+) -> Any | None:
+    """BLD-2 D6: one sensor per authored pipeline with a time-based target lag
+    (`targetLag.kind == 'lag'`). Downstream lag pipelines (`targetLag.kind == 'downstream'`)
+    do not poll: their refresh is requested when an upstream pipeline's check runs.
+
+    A `paused` pipeline gets no sensor at all (as with the dependency sensor, F1.2 #57):
+    the orchestrator preserves a sensor's RUNNING state across reloads, so a paused
+    pipeline must not continue checking lag in the background.
+
+    `minimum_interval_seconds=30`: checks run at most every 30 seconds to balance
+    freshness responsiveness for short lag targets against the query cost of input tokens
+    and ClickHouse content fingerprints across authored pipelines.
+    """
+    target_lag = pipeline.get("targetLag")
+    if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+        return None
+
+    if pipeline.get("status") == "paused":
+        return None
+
+    pipeline_id = pipeline.get("id", "")
+    safe_id = _dagster_safe_name(pipeline_id)
+    sensor_name = f"authored__{safe_id}_lag"
+
+    @sensor(
+        name=sensor_name,
+        job=authored_job,
+        minimum_interval_seconds=30,
+        default_status=DefaultSensorStatus.RUNNING,
+    )
+    def _lag_sensor(context: Any) -> Any:
+        cfg_ = cfg or AuthoredPipelineConfig.from_env()
+        if not cfg_.run_token:
+            return None
+
+        url = f"{cfg_.api_url}/api/pipelines/runnable/{pipeline_id}/lag-check"
+        try:
+            resp = requests.post(
+                url,
+                headers=_headers(cfg_),
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            # D6: transport error is skipped for this tick (next tick asks again); never raises.
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} transport failure ({exc}); skipping tick"
+            )
+            return None
+
+        if 400 <= resp.status_code < 500:
+            # D6: 4xx is logged and skipped
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned {resp.status_code} ({resp.text}); skipping tick"
+            )
+            return None
+
+        if resp.status_code >= 500:
+            # D6: 5xx is skipped for this tick
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned server error {resp.status_code}; skipping tick"
+            )
+            return None
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned non-JSON response ({exc}); skipping tick"
+            )
+            return None
+
+        decision = body.get("decision")
+        if decision == "run":
+            run_key = body.get("runKey")
+            yield RunRequest(run_key=run_key, job_name=authored_job.name)
+
+    return _lag_sensor
+
+
+def build_authored_lag_sensors(
+    pipeline_jobs: list[tuple[dict[str, Any], Any]],
+    cfg: AuthoredPipelineConfig | None = None,
+) -> list[Any]:
+    """One lag sensor per authored pipeline with a time-based target lag."""
+    sensors: list[Any] = []
+    for pipeline, authored_job in pipeline_jobs:
+        sensor_ = build_authored_lag_sensor(pipeline, authored_job, cfg)
+        if sensor_ is not None:
+            sensors.append(sensor_)
+    return sensors
+
+
 _authored_jobs_and_schedules_and_deps = build_authored_definitions()
 authored_jobs = _authored_jobs_and_schedules_and_deps[0]
 authored_schedules = _authored_jobs_and_schedules_and_deps[1]
 _authored_pipeline_jobs = _authored_jobs_and_schedules_and_deps[2]
 authored_dependency_sensors = build_authored_dependency_sensors(_authored_pipeline_jobs)
+authored_lag_sensors = build_authored_lag_sensors(_authored_pipeline_jobs)

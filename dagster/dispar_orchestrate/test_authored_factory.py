@@ -602,6 +602,16 @@ class AuthoredScheduleTest(unittest.TestCase):
         schedule = authored_factory.build_authored_schedule(pipeline, self._job(pipeline))
         self.assertEqual(schedule.default_status, DefaultScheduleStatus.STOPPED)
 
+    def test_pipeline_with_target_lag_builds_no_schedule(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no schedule,
+        even when its schedule is a valid cron expression. Removing the lag
+        returns the pipeline to the schedule."""
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": lag}
+            self.assertIsNone(authored_factory.build_authored_schedule(pipeline, self._job(pipeline)))
+        restored = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": None}
+        self.assertIsNotNone(authored_factory.build_authored_schedule(restored, self._job(restored)))
+
     def test_an_on_demand_pipeline_gets_no_schedule(self) -> None:
         for label in ("manual", "On demand", "", None):
             pipeline = {**_ready_pipeline(), "schedule": label}
@@ -746,6 +756,18 @@ class TestDependencySensor:
     """Sensor-body tests for R3 plan 2a. Plain pytest class (no
     `unittest.TestCase`) so the per-test asserts render with pytest's
     own introspection instead of `self.assertEqual`'s."""
+
+    def test_returns_none_when_target_lag_is_set(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no dependency sensor,
+        even when dependsOn is populated. Removing target lag restores the sensor."""
+        @job(name="authored__pl_lag_dep")
+        def _job() -> None:
+            return None
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": lag}
+            assert build_authored_dependency_sensor(pipeline, _job) is None
+        restored = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": None}
+        assert build_authored_dependency_sensor(restored, _job) is not None
 
     def test_returns_none_when_depends_on_is_empty(self) -> None:
         """A pipeline with `depends_on=[]` produces NO `run_status_sensor`:
@@ -1191,6 +1213,99 @@ class TestDependencySensor:
         # Same key for both ticks = one daemon-decided downstream run.
         assert out_a[0].run_key == out_b[0].run_key
         assert out_a[0].run_key == "authored-deps:upstream-a-1,upstream-b-1"
+
+
+class TestLagSensor:
+    """BLD-2 D3 + D6: target-lag sensor tests."""
+
+    @job(name="authored__pl_lag_order")
+    def _order_job() -> None:
+        return None
+
+    def test_returns_none_when_target_lag_is_absent_or_not_lag_kind(self) -> None:
+        """Pipelines without targetLag or with kind='downstream' build no lag sensor."""
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-none", "targetLag": None}, self._order_job) is None
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-down", "targetLag": {"kind": "downstream"}}, self._order_job) is None
+
+    def test_returns_none_when_pipeline_is_paused(self) -> None:
+        """A paused pipeline gets no lag sensor."""
+        pipeline = {
+            "id": "pl-paused",
+            "status": "paused",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        assert authored_factory.build_authored_lag_sensor(pipeline, self._order_job) is None
+
+    def test_builds_running_sensor_with_30s_interval_when_ready(self) -> None:
+        """A ready pipeline with kind='lag' gets a sensor named authored__<safe_id>_lag with 30s interval."""
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job)
+        assert sensor is not None
+        assert sensor.name == "authored__pl_lag_order_lag"
+        assert sensor.minimum_interval_seconds == 30
+        assert sensor.default_status == authored_factory.DefaultSensorStatus.RUNNING
+        assert sensor.job.name == "authored__pl_lag_order"
+
+    def _eval_sensor(self, response_mock: Any) -> list[Any]:
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        with mock.patch.object(authored_factory.requests, "post", response_mock):
+            return list(sensor(build_sensor_context()))
+
+    def test_sensor_yields_one_run_request_on_run_decision(self) -> None:
+        """Decision 'run' yields one RunRequest with the given run key and job."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__pl_lag_order",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-abc"
+        assert req.job_name == "authored__pl_lag_order"
+
+    def test_sensor_yields_nothing_on_wait_decision(self) -> None:
+        """Decision 'wait' yields nothing."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "wait",
+            "reason": "inputs unchanged",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_4xx_without_raising(self) -> None:
+        """4xx is logged and skipped, yields nothing, never raises."""
+        resp = mock.Mock(status_code=404, text="Pipeline not found")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_5xx_without_raising(self) -> None:
+        """5xx is skipped for this tick, yields nothing, never raises."""
+        resp = mock.Mock(status_code=503, text="Service Unavailable")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_transport_error_without_raising(self) -> None:
+        """Transport error is skipped for this tick, yields nothing, never raises."""
+        requests_ = self._eval_sensor(mock.Mock(side_effect=requests.ConnectionError("unreachable")))
+        assert len(requests_) == 0
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

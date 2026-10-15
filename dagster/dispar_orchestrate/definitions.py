@@ -15,6 +15,7 @@ from dispar_orchestrate.assets import bronze_ingest_job
 from dispar_orchestrate.authored_factory import (
     authored_dependency_sensors,
     authored_jobs,
+    authored_lag_sensors,
     authored_schedules,
 )
 from dispar_orchestrate.capacity_snapshot import (
@@ -128,5 +129,8 @@ defs = Definitions(
         # module doc for the ALL-semantics and run_key = upstream run id
         # design choices.
         *authored_dependency_sensors,
+        # BLD-2 D6: one lag sensor per authored pipeline with a time-based target lag
+        # (named authored__<safe_id>_lag, running every 30 seconds).
+        *authored_lag_sensors,
     ],
 )
