@@ -319,6 +319,24 @@ console's manual publish (D1), Silver (`DATA-4`).
     - Raised `timeout-minutes` from 20 to 31 (measured acceptance test execution time: 327s / ~6 minutes, + 5m slack = 11m raise).
 - **Local Verification**: Clean compose stack (`-p data2test`) run under `flock /home/shiro/rantai/.heavy.lock` passed in 327 seconds. All containers and volumes torn down cleanly.
 
+### Task T6: Changelog and Documentation
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - Merged `origin/main` (PR #162 at commit `224b776f1cba`), eliminating inherited gitleaks finding in `docs/superpowers/plans/2026-10-14-bld-3-bronze-pipeline-source.md:623`.
+  - Ran working-tree gitleaks scan: `sg docker -c "docker run --rm -v /home/shiro/rantai/wt-data-2:/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact -v"` confirming 0 leaks found across the entire repository.
+  - Documented DATA-2 in `CHANGELOG.md`: Iceberg copy retention (7 copies kept default), PyIceberg row delete and snapshot expiry, ClickHouse `remove_orphan_files` cleanup, `console.gold_trim_run` audit trail, publication API `trim` summary, and console UI indicator.
+  - Added module docstrings in `dagster/dispar_orchestrate/gold_export.py` and `rust/crates/lakehouse-api/src/gold_export_history.rs`.
+  - Ran full test suite & linting checks:
+    - Docker compose config validation: `docker compose --profile '*' config --quiet` passed.
+    - Ops lint scripts: `check_bare_iceberg_count.py`, `check_compose_init_readiness.py`, `check_intra_package_imports.py`, and `test_check_connector_gate_coverage.py` all passed.
+    - Python unit tests: `pytest` 86 passed in 7.16s.
+    - Frontend unit tests: 1,292 passed, 0 failed, 2 skipped.
+    - TypeScript type check: `bun x tsc --noEmit` clean with 0 errors.
+    - Frontend lint: `bun run lint` clean with 0 errors.
+    - Rust format & clippy: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets` clean with 0 warnings.
+    - Rust unit & integration tests: `cargo test -p lakehouse-api` 86 upload routes + 13 gold publication tests passed.
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`

@@ -606,7 +606,6 @@ async fn if_changed_exports_when_the_last_export_is_unknown() {
     assert!(body.get("skipped").is_none(), "{body}");
 }
 
-
 async fn seed_trim_run(
     ch: &ChClient,
     mart: &str,
@@ -623,14 +622,8 @@ async fn seed_trim_run(
         || "NULL".to_owned(),
         |ms| format!("fromUnixTimestamp64Milli({ms})"),
     );
-    let reason_sql = reason.map_or_else(
-        || "NULL".to_owned(),
-        |r| format!("'{r}'"),
-    );
-    let copies_sql = copies_kept.map_or_else(
-        || "NULL".to_owned(),
-        |cp| cp.to_string(),
-    );
+    let reason_sql = reason.map_or_else(|| "NULL".to_owned(), |r| format!("'{r}'"));
+    let copies_sql = copies_kept.map_or_else(|| "NULL".to_owned(), |cp| cp.to_string());
     ch.exec(
         &format!(
             "INSERT INTO console.gold_trim_run              (id, mart, status, copies_kept, oldest_kept_exported_at,               copies_removed, snapshots_expired, files_removed, reason,               started_at, finished_at) VALUES              ('{id}', '{mart}', '{status}', {copies_sql}, {oldest_sql},               0, 0, 0, {reason_sql}, fromUnixTimestamp64Milli({finished_ms}),               fromUnixTimestamp64Milli({finished_ms}))",
@@ -658,7 +651,10 @@ async fn publication_detail_reports_trim_null_when_never_trimmed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["trim"].is_null(), "expected trim to be null, got: {body}");
+    assert!(
+        body["trim"].is_null(),
+        "expected trim to be null, got: {body}"
+    );
 }
 
 #[tokio::test]

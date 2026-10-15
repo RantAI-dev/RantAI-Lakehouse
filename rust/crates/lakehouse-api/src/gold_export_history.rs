@@ -22,6 +22,14 @@
 //! (the console's "Export now" button and the Dagster schedule) through
 //! the one HTTP handler both call, rather than recording only
 //! Dagster-triggered runs.
+//!
+//! # Copy retention and trim history (DATA-2)
+//!
+//! `console.gold_trim_run` records each trim operation executed by Dagster's
+//! `trim_gold_mart` op, capturing status, copies kept, oldest kept timestamp,
+//! copies removed, snapshots expired, files removed, and fixed failure reasons.
+//! [`last_trim`] reads the latest trim record per mart for inclusion in
+//! `GET /api/gold/export/{mart}/publication`.
 
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
@@ -483,6 +491,7 @@ pub struct GoldTrimSummary {
 }
 
 /// Convert unix epoch milliseconds to an RFC 3339 UTC string.
+#[must_use]
 pub fn millis_to_rfc3339(ms: i64) -> Option<String> {
     time::OffsetDateTime::from_unix_timestamp(ms / 1000)
         .ok()
@@ -571,8 +580,14 @@ mod tests {
         let mut row = serde_json::Map::new();
         row.insert("status".to_owned(), Value::String("success".to_owned()));
         row.insert("copies_kept".to_owned(), Value::Number(7.into()));
-        row.insert("oldest_kept_ms".to_owned(), Value::String("1700000000000".to_owned()));
-        row.insert("finished_ms".to_owned(), Value::String("1700000010000".to_owned()));
+        row.insert(
+            "oldest_kept_ms".to_owned(),
+            Value::String("1700000000000".to_owned()),
+        );
+        row.insert(
+            "finished_ms".to_owned(),
+            Value::String("1700000010000".to_owned()),
+        );
         row.insert("reason".to_owned(), Value::Null);
 
         let summary = row_to_trim_summary(&row);
@@ -589,8 +604,14 @@ mod tests {
         row.insert("status".to_owned(), Value::String("failed".to_owned()));
         row.insert("copies_kept".to_owned(), Value::Null);
         row.insert("oldest_kept_ms".to_owned(), Value::Null);
-        row.insert("finished_ms".to_owned(), Value::String("1700000010000".to_owned()));
-        row.insert("reason".to_owned(), Value::String("delete_failed".to_owned()));
+        row.insert(
+            "finished_ms".to_owned(),
+            Value::String("1700000010000".to_owned()),
+        );
+        row.insert(
+            "reason".to_owned(),
+            Value::String("delete_failed".to_owned()),
+        );
 
         let summary = row_to_trim_summary(&row);
         assert_eq!(summary.status, "failed");
@@ -598,7 +619,6 @@ mod tests {
         assert_eq!(summary.oldest_kept_exported_at, None);
         assert_eq!(summary.reason, Some("delete_failed".to_owned()));
     }
-
 
     #[test]
     fn insert_sql_escapes_every_string_field() {

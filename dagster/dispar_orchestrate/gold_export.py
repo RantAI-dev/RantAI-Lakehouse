@@ -54,7 +54,19 @@ content fingerprint distinguishes genuine data changes from storage churn,
 preventing spurious re-exports — recorded as `skipped_verbs=["unchanged"]`
 with no `AssetMaterialization`, since nothing was written — and the empty union
 runs a zero-step job that still succeeds, which is the honest shape of
-"nothing is published." """
+"nothing is published."
+
+# Copy retention and trimming (DATA-2)
+
+Each exported Gold mart retains the last N distinct copies (default 7,
+configured via `GOLD_KEEP_COPIES`). Following `export_gold_mart`, the mapped
+op `trim_gold_mart` prunes older copies via PyIceberg delete matching
+`_exported_at < cutoff` and snapshot expiry, followed by ClickHouse
+`EXECUTE remove_orphan_files` through `icecat_gold_export` with
+`iceberg_orphan_files_older_than_seconds = 0` to delete unreferenced Parquet
+files from object storage. Every trim operation records its result (status,
+copies kept, oldest kept timestamp, copies removed, snapshots expired,
+files removed, and fixed failure reasons) in `console.gold_trim_run`."""
 
 from __future__ import annotations
 

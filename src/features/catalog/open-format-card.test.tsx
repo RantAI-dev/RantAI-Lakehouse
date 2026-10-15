@@ -160,7 +160,7 @@ describe("OpenFormatCard", () => {
     // error message routes through the service action state so the test
     // can assert the server's actual message appears in the DOM.
     let putCalled = false
-    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+    global.fetch = mock(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/publication")) {
         if (putCalled) {
