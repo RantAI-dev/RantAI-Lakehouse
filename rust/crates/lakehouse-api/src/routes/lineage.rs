@@ -806,6 +806,24 @@ mod tests {
         let tenant_1 = uuid::Uuid::from_u128(1);
         let tenant_2 = uuid::Uuid::from_u128(2);
 
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant_1)
+        .bind("Tenant 1")
+        .bind("tenant-1")
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, $2, $3, 'Standard', 'US')",
+        )
+        .bind(tenant_2)
+        .bind("Tenant 2")
+        .bind("tenant-2")
+        .execute(pool)
+        .await?;
+
         // Tenant 1
         sqlx::query(
             "INSERT INTO connector (id, tenant_id, name, type, direction, host, secret_ref, environment, tenant, adapter, ingest_mode, dial, source_objects)              VALUES ($1, $2, $3, 'PostgreSQL', 'source', 'unused', 'env:SECRET', 'production', 't1', 'sql', 'batch', '{}'::jsonb, $4::jsonb)",
