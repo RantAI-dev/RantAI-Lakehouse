@@ -142,4 +142,32 @@ bdb0ab2a549d5d4e567e92ca0f9c1f95c47b3739	refs/heads/fix/sec-36-gitleaks-scope
 
 ## 7. Review
 
-(planner)
+Reviewed 2026-10-15 at `bdb0ab2a`, the whole diff of T1–T3 against the plan.
+
+No `BLOCKER`. No `SHOULD-FIX`.
+
+Checked and found right:
+
+- `history-scan` no longer fetches every branch and passes `--log-opts="HEAD"`;
+  the handoff quotes `gitleaks` v8.30.1 `sources/git.go`: with `--log-opts`
+  the command is `git log -p -U0 <opts>`, without it `--all` is added. So
+  the scan no longer depends on what `actions/checkout` fetched. The job
+  name is unchanged.
+- `security-all-branches.yml`: `schedule` and `workflow_dispatch` only, no
+  `push`/`pull_request`, `contents: read`, the same pinned `gitleaks`, no
+  `continue-on-error`.
+- `docs/CI.md` and `CHANGELOG.md` say what each scan covers; the merge-commit
+  note is true (`git log -p` shows no diff for a merge without `-m`/`-c`/`--cc`).
+
+Notes:
+
+- The handoff's `--all` count (25) came from a clone of the local checkout,
+  which has local-only branches; 3 of the 25 (`rantai-internal-lan-host`)
+  are on `backup-pre-rewrite`, which exists only on the build machine
+  (`git ls-remote origin` has no such ref). On GitHub the daily scan sees
+  #144's 22 findings, so it is red until #144 merges with its own
+  `.gitleaksignore` entries. That is the scan working, not a defect.
+- Dropping gitleaks' default `--diff-filter=tuxdb` with `--log-opts` changes
+  nothing that matters: gitleaks reads added lines only.
+- The PR's own `history-scan` run is the AC1 evidence; read from CI before
+  merge.
