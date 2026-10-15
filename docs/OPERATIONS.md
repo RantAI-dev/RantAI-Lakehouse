@@ -758,6 +758,27 @@ What the operator needs to know:
   viewer's browser; it does not replace the token. No other console page sends
   a framing header.
 
+### Connector credentials from a secret manager (`SRC-12`, ADR 0002 addendum 6)
+
+Instead of typing a password, a connector can reference a secret in the
+installation's secret manager. One manager per installation:
+
+- `SECRET_MANAGER` = `vault`, `aws`, `gcp` or `azure`, plus that manager's
+  sign-in for the API and the orchestrator (`.env.example` lists each:
+  Vault address and token or AppRole; AWS region and role or keys; a
+  Google service-account file, mounted into both services, or the
+  platform identity; Azure tenant and client, or a managed identity).
+- **`SECRET_MANAGER_ALLOWED_PREFIXES` is required for references to work.**
+  It lists the paths connectors may reference, for example
+  `vault:secret/lakehouse/{tenant}/`; `{tenant}` is the connector's tenant.
+  With a manager set and no prefixes, every reference is refused. Give the
+  product's manager identity a policy no wider than these prefixes.
+- A reference is read at every test and every run, never cached: changing
+  the secret in the manager takes effect at the next run, and a manager
+  that cannot be reached fails that run with a fixed message.
+- `CONNECTOR_TYPED_CREDENTIALS=false` hides the "type a credential" option
+  when every credential should come from the manager.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
