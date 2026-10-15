@@ -1,4 +1,4 @@
-"""Unit tests for `dagster/dispar_orchestrate/backup_job.py` (WS5 item G2).
+"""Unit tests for `dagster/dispar_orchestrate/backup_job.py` (OPS-7).
 
 No network: `S3FileSystem` and `subprocess.run` are monkeypatched with
 fakes, matching `test_capacity_snapshot.py`'s own no-network testing rule
@@ -10,12 +10,17 @@ Run with:
 
 from __future__ import annotations
 
+import io
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from dagster import Failure
 
 from dispar_orchestrate.backup_job import (
     DATABASES,
     BackupConfig,
+    WarehouseMirrorStats,
+    mirror_warehouse,
     pg_dump_argv,
     resolve_secret_ref,
     run_backups,
@@ -29,6 +34,14 @@ def _set_backup_env(monkeypatch) -> None:
     monkeypatch.setenv("BACKUP_S3_SECRET_KEY_SECRET_REF", "env:BACKUP_SECRET_KEY")
     monkeypatch.setenv("BACKUP_ACCESS_KEY", "ak")
     monkeypatch.setenv("BACKUP_SECRET_KEY", "sk")
+    monkeypatch.setenv(
+        "BACKUP_WAREHOUSE_ACCESS_KEY_SECRET_REF", "env:BACKUP_WH_ACCESS_KEY"
+    )
+    monkeypatch.setenv(
+        "BACKUP_WAREHOUSE_SECRET_KEY_SECRET_REF", "env:BACKUP_WH_SECRET_KEY"
+    )
+    monkeypatch.setenv("BACKUP_WH_ACCESS_KEY", "wak")
+    monkeypatch.setenv("BACKUP_WH_SECRET_KEY", "wsk")
 
 
 def test_backup_config_reads_all_required_fields_from_env(monkeypatch):
@@ -39,6 +52,10 @@ def test_backup_config_reads_all_required_fields_from_env(monkeypatch):
     assert cfg.access_key == "ak"
     assert cfg.secret_key == "sk"
     assert cfg.retention_days == 30  # unset -- the one field allowed a default
+    assert cfg.warehouse_endpoint == "http://rustfs:9000"
+    assert cfg.warehouse_bucket == "lakehouse-warehouse"
+    assert cfg.warehouse_access_key == "wak"
+    assert cfg.warehouse_secret_key == "wsk"
 
 
 def test_backup_config_honors_a_caller_supplied_retention_days(monkeypatch):
@@ -47,10 +64,23 @@ def test_backup_config_honors_a_caller_supplied_retention_days(monkeypatch):
     assert BackupConfig.from_env().retention_days == 7
 
 
-def test_backup_config_raises_failure_when_a_required_field_is_missing(monkeypatch):
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "BACKUP_S3_ENDPOINT",
+        "BACKUP_S3_BUCKET",
+        "BACKUP_S3_ACCESS_KEY_SECRET_REF",
+        "BACKUP_S3_SECRET_KEY_SECRET_REF",
+        "BACKUP_WAREHOUSE_ACCESS_KEY_SECRET_REF",
+        "BACKUP_WAREHOUSE_SECRET_KEY_SECRET_REF",
+    ],
+)
+def test_backup_config_raises_failure_when_a_required_field_is_missing(
+    monkeypatch, env_var
+):
     _set_backup_env(monkeypatch)
-    monkeypatch.delenv("BACKUP_S3_BUCKET", raising=False)
-    with pytest.raises(Failure):
+    monkeypatch.delenv(env_var, raising=False)
+    with pytest.raises(Failure, match="must all be set"):
         BackupConfig.from_env()
 
 
@@ -60,14 +90,6 @@ def test_resolve_secret_ref_rejects_anything_but_the_env_scheme():
 
 
 def test_resolve_secret_ref_config_rejections_mark_the_failure_non_retryable():
-    """PART D witness: `backup_job.resolve_secret_ref`'s config-shape
-    rejections (unsupported scheme, unset env var) raise
-    `Failure(allow_retries=False)` so a future wiring of this script
-    as a Dagster op inherits the canonical non-retryable contract
-    without a separate patch. `pg_dump` failures stay retryable
-    (default `allow_retries=True`) -- a transient database-side
-    problem, not a config rejection. `backup_job.py:158` is left
-    alone for that reason (see the in-file PART D comment)."""
     with pytest.raises(Failure) as ctx:
         resolve_secret_ref("vault:some/path")
     assert ctx.value.allow_retries is False
@@ -76,20 +98,12 @@ def test_resolve_secret_ref_config_rejections_mark_the_failure_non_retryable():
 def test_backup_config_from_env_missing_required_envs_marks_the_failure_non_retryable(
     monkeypatch,
 ):
-    """PART D witness: `backup_job.BackupConfig.from_env` (lines 135-138)
-    raises `Failure(allow_retries=False)` when ANY of the four required
-    env vars is missing -- a deployment-config problem the operator
-    must fix out-of-band, not a transient condition. This is a
-    DIFFERENT raise site from `resolve_secret_ref` (lines 91, 101):
-    it fires when `BACKUP_S3_ENDPOINT` / `BACKUP_S3_BUCKET` /
-    `BACKUP_S3_ACCESS_KEY_SECRET_REF` / `BACKUP_S3_SECRET_KEY_SECRET_REF`
-    are unset, before `resolve_secret_ref` is ever called. The two
-    sites share the canonical `Failure(allow_retries=False)` shape but
-    sit on different code paths, so each gets its own witness."""
     monkeypatch.delenv("BACKUP_S3_ENDPOINT", raising=False)
     monkeypatch.delenv("BACKUP_S3_BUCKET", raising=False)
     monkeypatch.delenv("BACKUP_S3_ACCESS_KEY_SECRET_REF", raising=False)
     monkeypatch.delenv("BACKUP_S3_SECRET_KEY_SECRET_REF", raising=False)
+    monkeypatch.delenv("BACKUP_WAREHOUSE_ACCESS_KEY_SECRET_REF", raising=False)
+    monkeypatch.delenv("BACKUP_WAREHOUSE_SECRET_KEY_SECRET_REF", raising=False)
     with pytest.raises(Failure, match="must all be set") as ctx:
         BackupConfig.from_env()
     assert ctx.value.allow_retries is False
@@ -107,8 +121,6 @@ def test_resolve_secret_ref_reads_the_referenced_env_var(monkeypatch):
 
 
 def test_databases_lists_exactly_the_four_compose_created_databases():
-    # docker-compose.yml:32,358-359,410-411,1341-1342 -- the exact four
-    # databases this compose stack creates, not a guess.
     assert DATABASES == (
         ("POSTGRES_DB", "lakehouse"),
         ("LAKEKEEPER_PG_DB", "lakekeeper"),
@@ -118,17 +130,25 @@ def test_databases_lists_exactly_the_four_compose_created_databases():
 
 
 @pytest.mark.parametrize("db_env,db_default", DATABASES)
-def test_pg_dump_argv_never_embeds_the_password_on_the_command_line(db_env, db_default, monkeypatch):
+def test_pg_dump_argv_never_embeds_the_password_on_the_command_line(
+    db_env, db_default, monkeypatch
+):
     monkeypatch.setenv(db_env, db_default)
-    argv = pg_dump_argv(db_env_var=db_env, db_default=db_default, dest_path="/tmp/out.dump")
+    argv = pg_dump_argv(
+        db_env_var=db_env, db_default=db_default, dest_path="/tmp/out.dump"
+    )
     assert "--format=custom" in argv
-    assert not any("PGPASSWORD" in a for a in argv), "password must travel via PGPASSWORD env, never argv"
+    assert not any(
+        "PGPASSWORD" in a for a in argv
+    ), "password must travel via PGPASSWORD env, never argv"
     assert f"--dbname={db_default}" in argv
 
 
 def test_pg_dump_argv_uses_the_env_override_over_the_default(monkeypatch):
     monkeypatch.setenv("POSTGRES_DB", "renamed-app-db")
-    argv = pg_dump_argv(db_env_var="POSTGRES_DB", db_default="lakehouse", dest_path="/tmp/out.dump")
+    argv = pg_dump_argv(
+        db_env_var="POSTGRES_DB", db_default="lakehouse", dest_path="/tmp/out.dump"
+    )
     assert "--dbname=renamed-app-db" in argv
 
 
@@ -139,8 +159,8 @@ class _FakeCompletedProcess:
 
 
 class _FakeS3FileSystem:
-    """Records every `put`/`rm`; `find` returns a fixed, caller-set
-    listing so retention pruning can be exercised without a real bucket."""
+    """Records every `put`/`rm`/`open`; `find` returns a fixed, caller-set
+    listing so retention pruning and mirroring can be exercised without a real bucket."""
 
     instances: list["_FakeS3FileSystem"] = []
 
@@ -149,6 +169,8 @@ class _FakeS3FileSystem:
         self.put_calls: list[tuple[str, str]] = []
         self.rm_calls: list[str] = []
         self.find_result: dict = {}
+        self.files: dict[str, bytes] = {}
+        self.open_calls: list[tuple[str, str]] = []
         _FakeS3FileSystem.instances.append(self)
 
     def put(self, local_path, remote_path):
@@ -156,24 +178,162 @@ class _FakeS3FileSystem:
 
     def find(self, path, detail=True):
         assert detail is True
-        return self.find_result
+        if not path:
+            return self.find_result
+        # Match exact path or prefix matches under path
+        prefix = path.rstrip("/") + "/"
+        return {
+            k: v
+            for k, v in self.find_result.items()
+            if k == path or k.startswith(prefix)
+        }
 
     def rm(self, path):
         self.rm_calls.append(path)
 
+    def open(self, path: str, mode: str = "rb"):
+        self.open_calls.append((path, mode))
+        if "w" in mode:
+            storage = self.files
 
-def test_run_backups_dumps_every_database_and_uploads_to_the_dedicated_bucket(monkeypatch, tmp_path):
-    """The dedicated bucket, not the shared warehouse bucket -- see
-    backup_job.py's module doc for why sharing that bucket's access
-    domain with the identity database's dump is a privilege-escalation
-    path."""
+            class _Writer(io.BytesIO):
+                def __exit__(writer_self, exc_type, exc_val, exc_tb):
+                    storage[path] = writer_self.getvalue()
+                    return super().__exit__(exc_type, exc_val, exc_tb)
+
+                def close(writer_self):
+                    storage[path] = writer_self.getvalue()
+                    super().close()
+
+            return _Writer()
+        data = self.files.get(path, b"")
+        return io.BytesIO(data)
+
+
+def test_warehouse_mirror_copies_a_new_object():
+    src_fs = _FakeS3FileSystem()
+    dst_fs = _FakeS3FileSystem()
+
+    src_fs.find_result = {
+        "lakehouse-warehouse/data/001.parquet": {"size": 1024, "type": "file"}
+    }
+    src_fs.files["lakehouse-warehouse/data/001.parquet"] = b"parquet-bytes-001"
+    dst_fs.find_result = {}
+
+    stats = mirror_warehouse(
+        src_fs, dst_fs, src_bucket="lakehouse-warehouse", dst_bucket="lakehouse-backups"
+    )
+
+    assert stats.copied_count == 1
+    assert stats.copied_bytes == 1024
+    assert stats.skipped_count == 0
+    assert stats.skipped_bytes == 0
+    assert "lakehouse-backups/warehouse/data/001.parquet" in dst_fs.files
+    assert dst_fs.files["lakehouse-backups/warehouse/data/001.parquet"] == b"parquet-bytes-001"
+
+
+def test_warehouse_mirror_skips_one_already_there_with_the_same_size():
+    src_fs = _FakeS3FileSystem()
+    dst_fs = _FakeS3FileSystem()
+
+    src_fs.find_result = {
+        "lakehouse-warehouse/data/001.parquet": {"size": 1024, "type": "file"}
+    }
+    src_fs.files["lakehouse-warehouse/data/001.parquet"] = b"parquet-bytes-001"
+    dst_fs.find_result = {
+        "lakehouse-backups/warehouse/data/001.parquet": {"size": 1024, "type": "file"}
+    }
+
+    stats = mirror_warehouse(
+        src_fs, dst_fs, src_bucket="lakehouse-warehouse", dst_bucket="lakehouse-backups"
+    )
+
+    assert stats.copied_count == 0
+    assert stats.copied_bytes == 0
+    assert stats.skipped_count == 1
+    assert stats.skipped_bytes == 1024
+    assert not any("w" in mode for _, mode in dst_fs.open_calls)
+
+
+def test_warehouse_mirror_copies_one_whose_size_differs():
+    src_fs = _FakeS3FileSystem()
+    dst_fs = _FakeS3FileSystem()
+
+    src_fs.find_result = {
+        "lakehouse-warehouse/metadata/v2.metadata.json": {"size": 2048, "type": "file"}
+    }
+    src_fs.files["lakehouse-warehouse/metadata/v2.metadata.json"] = b"new-metadata-2048"
+    dst_fs.find_result = {
+        "lakehouse-backups/warehouse/metadata/v2.metadata.json": {"size": 1024, "type": "file"}
+    }
+    dst_fs.files["lakehouse-backups/warehouse/metadata/v2.metadata.json"] = b"old-metadata-1024"
+
+    stats = mirror_warehouse(
+        src_fs, dst_fs, src_bucket="lakehouse-warehouse", dst_bucket="lakehouse-backups"
+    )
+
+    assert stats.copied_count == 1
+    assert stats.copied_bytes == 2048
+    assert stats.skipped_count == 0
+    assert (
+        dst_fs.files["lakehouse-backups/warehouse/metadata/v2.metadata.json"]
+        == b"new-metadata-2048"
+    )
+
+
+def test_warehouse_mirror_reports_count_and_bytes():
+    src_fs = _FakeS3FileSystem()
+    dst_fs = _FakeS3FileSystem()
+
+    src_fs.find_result = {
+        "lakehouse-warehouse/data/new.parquet": {"size": 500, "type": "file"},
+        "lakehouse-warehouse/data/same.parquet": {"size": 1000, "type": "file"},
+        "lakehouse-warehouse/data/changed.parquet": {"size": 2500, "type": "file"},
+        "lakehouse-warehouse/dir/": {"size": 0, "type": "directory"},
+    }
+    src_fs.files["lakehouse-warehouse/data/new.parquet"] = b"new-data"
+    src_fs.files["lakehouse-warehouse/data/same.parquet"] = b"same-data"
+    src_fs.files["lakehouse-warehouse/data/changed.parquet"] = b"changed-data-2500"
+
+    dst_fs.find_result = {
+        "lakehouse-backups/warehouse/data/same.parquet": {"size": 1000, "type": "file"},
+        "lakehouse-backups/warehouse/data/changed.parquet": {"size": 1200, "type": "file"},
+    }
+
+    stats = mirror_warehouse(
+        src_fs, dst_fs, src_bucket="lakehouse-warehouse", dst_bucket="lakehouse-backups"
+    )
+
+    assert isinstance(stats, WarehouseMirrorStats)
+    assert stats.copied_count == 2
+    assert stats.copied_bytes == 3000  # 500 + 2500
+    assert stats.skipped_count == 1
+    assert stats.skipped_bytes == 1000
+    assert stats.duration_seconds >= 0.0
+
+
+def test_warehouse_mirror_raises_failure_when_source_listing_fails():
+    src_fs = _FakeS3FileSystem()
+    dst_fs = _FakeS3FileSystem()
+
+    def _fail_find(*a, **k):
+        raise ConnectionError("s3 unavailable")
+
+    src_fs.find = _fail_find
+    with pytest.raises(Failure, match="warehouse backup failed: could not list source bucket"):
+        mirror_warehouse(
+            src_fs, dst_fs, src_bucket="lakehouse-warehouse", dst_bucket="lakehouse-backups"
+        )
+
+
+def test_run_backups_dumps_every_database_and_uploads_to_the_dedicated_bucket(
+    monkeypatch, tmp_path
+):
     _set_backup_env(monkeypatch)
     _FakeS3FileSystem.instances.clear()
     monkeypatch.setattr("dispar_orchestrate.backup_job.S3FileSystem", _FakeS3FileSystem)
 
     def _fake_run(argv, capture_output, text, check):
-        # Simulate pg_dump writing its dump file, so `os.remove` below
-        # has something real to clean up.
         dest = argv[argv.index("--file") + 1]
         with open(dest, "wb") as f:
             f.write(b"fake-dump")
@@ -187,16 +347,17 @@ def test_run_backups_dumps_every_database_and_uploads_to_the_dedicated_bucket(mo
     fake_fs = _FakeS3FileSystem.instances[-1]
     assert fake_fs.kwargs["key"] == "ak"
     assert fake_fs.kwargs["secret"] == "sk"
-    assert fake_fs.kwargs["client_kwargs"]["endpoint_url"] == "http://backup-store.internal:9000"
+    assert (
+        fake_fs.kwargs["client_kwargs"]["endpoint_url"]
+        == "http://backup-store.internal:9000"
+    )
     assert len(fake_fs.put_calls) == len(DATABASES)
     for (_, remote_path), (db_env, db_default) in zip(fake_fs.put_calls, DATABASES):
-        db_name = db_default  # env unset in this test, so the default applies
+        db_name = db_default
         assert remote_path.startswith(f"lakehouse-backups/{db_name}/")
 
 
 def test_run_backups_raises_failure_and_stops_on_the_first_pg_dump_failure(monkeypatch):
-    """A failed pg_dump must surface as a failed Dagster run, never a
-    silently-reported success for a partial backup."""
     _set_backup_env(monkeypatch)
     _FakeS3FileSystem.instances.clear()
     monkeypatch.setattr("dispar_orchestrate.backup_job.S3FileSystem", _FakeS3FileSystem)
@@ -208,13 +369,10 @@ def test_run_backups_raises_failure_and_stops_on_the_first_pg_dump_failure(monke
     with pytest.raises(Failure, match="pg_dump failed"):
         run_backups()
 
-    # No upload was attempted for the database whose dump failed.
     assert not _FakeS3FileSystem.instances[-1].put_calls
 
 
 def test_prune_expired_deletes_only_objects_older_than_retention_days(monkeypatch):
-    from datetime import datetime, timedelta, timezone
-
     from dispar_orchestrate.backup_job import _prune_expired
 
     _set_backup_env(monkeypatch)
@@ -226,6 +384,7 @@ def test_prune_expired_deletes_only_objects_older_than_retention_days(monkeypatc
     fs.find_result = {
         "lakehouse-backups/lakehouse/old.dump": {"LastModified": now - timedelta(days=40)},
         "lakehouse-backups/lakehouse/recent.dump": {"LastModified": now - timedelta(days=1)},
+        "lakehouse-backups/warehouse/old.parquet": {"LastModified": now - timedelta(days=40)},
     }
 
     _prune_expired(fs, cfg)
