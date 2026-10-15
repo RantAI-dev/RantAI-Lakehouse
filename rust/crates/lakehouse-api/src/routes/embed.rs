@@ -550,6 +550,16 @@ fn board_body(
         // page labels them the same way.
         "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
     });
+    // BI-17 part A (D13): the theme and font apply wherever the dashboard is
+    // shown, so a public link and a signed embed carry them.
+    if let Some(board_obj) = body["board"].as_object_mut() {
+        if let Some(theme) = &board.theme {
+            board_obj.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = &board.font {
+            board_obj.insert("font".to_owned(), json!(font));
+        }
+    }
     if let Some(map) = body.as_object_mut() {
         if let Some(tabs) = board.tabs.as_ref().filter(|t| !t.is_empty()) {
             map.insert("tabs".to_owned(), json!(tabs));
@@ -801,6 +811,8 @@ mod typed_filters {
             params: None,
             tabs: None,
             phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -946,6 +958,8 @@ mod typed_filters {
                 id: "c2".to_owned(),
                 h: 5,
             }]),
+            theme: Some("dark".to_owned()),
+            font: Some("inter".to_owned()),
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -967,6 +981,9 @@ mod typed_filters {
         assert_eq!(body["tabs"][1]["id"], "t_b");
         assert_eq!(body["phoneLayout"][0], json!({ "id": "c2", "h": 5 }));
         assert_eq!(body["layout"]["c2"]["tab"], "t_b");
+        // BI-17 part A (D13): the theme and font go out with the embed.
+        assert_eq!(body["board"]["theme"], "dark");
+        assert_eq!(body["board"]["font"], "inter");
         let sent: Vec<String> = server
             .received_requests()
             .await
@@ -1045,6 +1062,8 @@ mod typed_filters {
             params: None,
             tabs: None,
             phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -1140,6 +1159,8 @@ mod typed_filters {
             params: None,
             tabs: None,
             phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,

@@ -99,6 +99,14 @@ pub struct BoardState {
     /// Phone layout.
     #[serde(default)]
     pub phone_layout: Vec<PhoneTile>,
+    /// Saved theme, `""` for the console's (`BI-17` part A). Left out of the
+    /// stored document when empty, so a version of a dashboard that never had
+    /// one reads and writes as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub theme: String,
+    /// Saved font, `""` for the console's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font: String,
     /// Every chart on the dashboard.
     #[serde(default)]
     pub charts: Vec<StateChart>,
@@ -189,6 +197,8 @@ pub async fn capture(ch: &ChClient, id: &str) -> Result<Option<BoardState>, ChEr
         params: b.and_then(|b| b.params.clone()).unwrap_or_default(),
         tabs: b.and_then(|b| b.tabs.clone()).unwrap_or_default(),
         phone_layout: b.and_then(|b| b.phone_layout.clone()).unwrap_or_default(),
+        theme: b.and_then(|b| b.theme.clone()).unwrap_or_default(),
+        font: b.and_then(|b| b.font.clone()).unwrap_or_default(),
         charts,
     }))
 }
@@ -411,6 +421,9 @@ pub fn describe_change(before: Option<&BoardState>, now: &BoardState) -> String 
     if before.tabs != now.tabs {
         parts.push("tabs".to_owned());
     }
+    if before.theme != now.theme || before.font != now.font {
+        parts.push("theme".to_owned());
+    }
     if before.refresh_seconds != now.refresh_seconds
         || before.grain != now.grain
         || before.params != now.params
@@ -462,6 +475,8 @@ mod tests {
             params: Vec::new(),
             tabs: Vec::new(),
             phone_layout: Vec::new(),
+            theme: String::new(),
+            font: String::new(),
             charts: charts
                 .iter()
                 .map(|(id, n)| StateChart {
@@ -489,6 +504,23 @@ mod tests {
             describe_change(Some(&before), &now),
             "2 charts added, 1 chart removed, 1 chart edited"
         );
+    }
+
+    /// `BI-17` part A (D6): a change of theme or font is named, and a state
+    /// stored before the fields existed reads as the console's own.
+    #[test]
+    fn a_change_of_theme_or_font_is_named_theme() {
+        let before = state("A", &[]);
+        let mut now = before.clone();
+        now.theme = "dark".to_owned();
+        assert_eq!(describe_change(Some(&before), &now), "Theme");
+        now.font = "inter".to_owned();
+        now.name = "B".to_owned();
+        assert_eq!(describe_change(Some(&before), &now), "Renamed, theme");
+        let old: BoardState = serde_json::from_str(r#"{"v":1,"name":"A"}"#).unwrap();
+        assert_eq!((old.theme.as_str(), old.font.as_str()), ("", ""));
+        let json = serde_json::to_string(&before).unwrap();
+        assert!(!json.contains("theme") && !json.contains("font"), "{json}");
     }
 
     #[test]

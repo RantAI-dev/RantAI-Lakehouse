@@ -894,6 +894,8 @@ fn one_chart_state(dimension: &str, measure: &str) -> lakehouse_bi::versions::Bo
         params: Vec::new(),
         tabs: Vec::new(),
         phone_layout: Vec::new(),
+        theme: String::new(),
+        font: String::new(),
         charts: vec![lakehouse_bi::versions::StateChart {
             id: "c1".to_owned(),
             title: "Hotels".to_owned(),
@@ -1040,6 +1042,116 @@ async fn going_back_writes_the_charts_then_the_board_and_keeps_the_sharing_state
             .count(),
         1
     );
+}
+
+/// `BI-17` part A (D6): going back restores the theme and the font with the
+/// rest of the dashboard's content, in the same single save.
+#[tokio::test]
+async fn going_back_restores_the_theme_and_the_font() {
+    let mut state = one_chart_state("provinsi", "hotels");
+    state.theme = "dark".to_owned();
+    state.font = "jetbrains-mono".to_owned();
+    let server = history_server(history_rules(
+        &state,
+        vec![
+            json!({ "name": "provinsi", "type": "String" }),
+            json!({ "name": "hotels", "type": "UInt32" }),
+        ],
+    ))
+    .await;
+    if let Err(response) = revert_to(&server, 2).await {
+        panic!("not restored: {}", text_of(response).await);
+    }
+    let written = writes(&server).await;
+    let board = written
+        .iter()
+        .find(|s| s.contains("INTO console.bi_board ("))
+        .unwrap();
+    assert!(board.contains("theme, font"), "{board}");
+    assert!(board.contains("'dark', 'jetbrains-mono'"), "{board}");
+}
+
+async fn edit_board(server: &MockServer, body: Value) -> Result<Value, axum::response::Response> {
+    boards_update(
+        State(state_for(server)),
+        Extension(person(ME, "dashboard:write")),
+        body.to_string().into(),
+    )
+    .await
+    .map(|ok| ok.0)
+    .map_err(axum::response::IntoResponse::into_response)
+}
+
+fn board_edit_rules() -> Vec<(&'static [&'static str], Vec<Value>)> {
+    vec![
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![board_row("b1", "")],
+        ),
+    ]
+}
+
+/// A theme outside the three, and a font the console does not ship (so no
+/// administrator can have allowed it), are refused before anything is written.
+#[tokio::test]
+async fn a_board_edit_refuses_an_unknown_theme_and_a_font_that_is_not_allowed() {
+    let server = engine(board_edit_rules()).await;
+    for (body, why) in [
+        (json!({ "id": "b1", "theme": "sepia" }), "theme must be"),
+        (
+            json!({ "id": "b1", "font": "comic-sans" }),
+            "not one an administrator allows",
+        ),
+    ] {
+        let response = edit_board(&server, body).await.unwrap_err();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let message = text_of(response).await;
+        assert!(
+            message["error"].as_str().unwrap().contains(why),
+            "{message}"
+        );
+    }
+    assert!(
+        writes(&server).await.is_empty(),
+        "{:?}",
+        writes(&server).await
+    );
+}
+
+#[tokio::test]
+async fn a_board_edit_saves_the_theme_and_the_font_in_one_full_row_and_snapshots_a_version() {
+    let server = engine(board_edit_rules()).await;
+    edit_board(
+        &server,
+        json!({ "id": "b1", "theme": "dark", "font": "source-serif" }),
+    )
+    .await
+    .unwrap();
+    let written = writes(&server).await;
+    let board = written
+        .iter()
+        .find(|s| s.contains("INTO console.bi_board ("))
+        .expect("the board row is written");
+    assert!(board.contains("'dark', 'source-serif'"), "{board}");
+    // `auto` and the console's own font clear both columns.
+    edit_board(&server, json!({ "id": "b1", "theme": "auto", "font": "" }))
+        .await
+        .unwrap();
+    let all = writes(&server).await;
+    let cleared = all
+        .iter()
+        .rfind(|s| s.contains("INTO console.bi_board ("))
+        .unwrap();
+    assert!(cleared.contains("'', '', "), "{cleared}");
+    // The built-in dashboard takes neither.
+    let refused = edit_board(&server, json!({ "id": "default", "theme": "dark" }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.status(), axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

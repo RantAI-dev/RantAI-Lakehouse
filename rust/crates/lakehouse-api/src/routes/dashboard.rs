@@ -1134,6 +1134,13 @@ struct BoardEditBody {
     /// empty list goes back to the computed stacking.
     #[serde(default, rename = "phoneLayout")]
     phone_layout: Option<Vec<lakehouse_bi::layout::PhoneTile>>,
+    /// The dashboard's theme (`BI-17` part A): `auto`, `light` or `dark`.
+    #[serde(default)]
+    theme: Option<String>,
+    /// The dashboard's font (`BI-17` part A): `""` for the console's own, or
+    /// one of the fonts an administrator allows in Admin > Settings.
+    #[serde(default)]
+    font: Option<String>,
 }
 
 impl BoardEditBody {
@@ -1149,6 +1156,8 @@ impl BoardEditBody {
             || self.params.is_some()
             || self.tabs.is_some()
             || self.phone_layout.is_some()
+            || self.theme.is_some()
+            || self.font.is_some()
     }
 }
 
@@ -1170,6 +1179,10 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 // for a copy that can have tabs. Its phone layout is a
                 // layout, so it is accepted.
                 && body.tabs.is_none()
+                // BI-17 part A: a theme and a font are the dashboard's own,
+                // and the built-in board is code, not a saved dashboard.
+                && body.theme.is_none()
+                && body.font.is_none()
         }
         Some(_) => true,
     }
@@ -1249,6 +1262,36 @@ async fn check_tab_rules(ch: &ChClient, id: &str, parsed: &BoardEditBody) -> Res
     Ok(())
 }
 
+/// The theme and the font of a board edit (`BI-17` part A, D6), checked before
+/// the first write: the theme is one of the three, and the font is one the
+/// administrator allows (Admin > Settings), so a font removed from the list
+/// cannot be chosen again. An empty font (the console's own) is always
+/// allowed.
+///
+/// # Errors
+///
+/// 400 with our sentence; a classified error when the settings cannot be read.
+async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(theme) = &parsed.theme
+        && !store::BOARD_THEMES.contains(&theme.as_str())
+    {
+        return Err(ApiError::BadRequest(
+            "theme must be auto, light or dark.".to_owned(),
+        ));
+    }
+    let Some(font) = parsed.font.as_deref().filter(|f| !f.is_empty()) else {
+        return Ok(());
+    };
+    let allowed = crate::routes::settings::format_settings(state).await?.fonts;
+    if allowed.iter().any(|f| f == font) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "That font is not one an administrator allows for dashboards.".to_owned(),
+        ))
+    }
+}
+
 /// The tabs and the phone layout of a board edit (`BI-18` part C), both
 /// already checked by [`check_tab_rules`].
 async fn save_tabs_and_phone_layout(
@@ -1263,6 +1306,12 @@ async fn save_tabs_and_phone_layout(
     }
     if let Some(phone) = &parsed.phone_layout {
         store::update_board_phone_layout(ch, id, phone)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-17 part A: the theme and font ride with the other presentation saves.
+    if parsed.theme.is_some() || parsed.font.is_some() {
+        store::update_board_theme(ch, id, parsed.theme.as_deref(), parsed.font.as_deref())
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
@@ -1355,6 +1404,12 @@ async fn file_in_folder(
 ///
 /// 400 when `id` is missing, when `"default"` is sent anything but a
 /// layout, or on a validation/`ClickHouse` failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered pipeline (check everything, then write, then snapshot); the \
+              BI-17 theme check pushed it one line over and splitting it would scatter \
+              the order that keeps a bad save from leaving a board half-edited"
+)]
 pub async fn boards_update(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1385,6 +1440,7 @@ pub async fn boards_update(
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
     check_tab_rules(ch, &id, &parsed).await?;
+    check_theme_and_font(&state, &parsed).await?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;

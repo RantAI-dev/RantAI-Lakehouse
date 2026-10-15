@@ -473,6 +473,15 @@ pub struct Board {
     /// the reading order of [`Self::layout`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phone_layout: Option<Vec<crate::layout::PhoneTile>>,
+    /// `light` or `dark` when an editor fixed the dashboard's theme
+    /// (`BI-17` part A, D6); `None` follows the console (`auto`), which is
+    /// also what a board saved before the column reads as.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub theme: Option<String>,
+    /// The id of the font an editor chose (one of
+    /// [`crate::formatting::SHIPPED_FONTS`]); `None` is the console's own.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub font: Option<String>,
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
@@ -670,6 +679,19 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // BI-17 part A (D6): the theme and the font of a dashboard, `''` meaning
+    // "follow the console" and "the console's own font". Same idiom: a
+    // constant default, so a board saved before reads as following the
+    // console, and no Postgres migration because boards live in ClickHouse.
+    for column in ["theme", "font"] {
+        ch.exec(
+            &format!(
+                "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
+            ),
+            None,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -930,7 +952,7 @@ async fn ensure_organise_tables(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id, toString(created_at) AS created_at";
 
 /// The `bi_board` columns a row keeps through the trash: everything but
 /// `created_at` (the version, set by the insert) and the trash columns.
@@ -938,7 +960,7 @@ const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filter
 const PERSONAL_NOT_SHAREABLE: &str =
     "A dashboard in the personal space cannot be shared. Move it to a folder first.";
 
-pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id";
+pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -1005,6 +1027,8 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         ))
         .ok()
         .filter(|t| !t.is_empty()),
+        theme: Some(row_str(row, "theme").to_owned()).filter(|t| !t.is_empty()),
+        font: Some(row_str(row, "font").to_owned()).filter(|f| !f.is_empty()),
         created_at: Some(stamp.clone()),
         updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
@@ -1159,6 +1183,8 @@ pub async fn create_board(
         params: None,
         tabs: None,
         phone_layout: None,
+        theme: None,
+        font: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1186,6 +1212,7 @@ async fn upsert_board(
     refresh_seconds: u32,
     (grain, params): (&str, &[crate::params::BoardParam]),
     (tabs, phone_layout): (&[crate::layout::Tab], &[crate::layout::PhoneTile]),
+    (theme, font): (&str, &str),
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
@@ -1197,8 +1224,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -1222,6 +1249,9 @@ async fn upsert_board(
         // reason: every save is a full-row INSERT.
         SqlLiteral::from(serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned())),
         SqlLiteral::from(serde_json::to_string(phone_layout).unwrap_or_else(|_| "[]".to_owned())),
+        // And the theme and font (BI-17 part A), for the same reason.
+        SqlLiteral::from(theme),
+        SqlLiteral::from(font),
         // The personal space: carried on every save like the rest, or an
         // unrelated edit would make a private draft public.
         SqlLiteral::from(owner_id),
@@ -1294,6 +1324,8 @@ async fn save_board_patch(
         .phone_layout
         .or(board.phone_layout.as_deref())
         .unwrap_or_default();
+    let theme = patch.theme.or(board.theme.as_deref()).unwrap_or("");
+    let font = patch.font.or(board.font.as_deref()).unwrap_or("");
     upsert_board(
         ch,
         &board.id,
@@ -1309,6 +1341,7 @@ async fn save_board_patch(
         refresh_seconds,
         (grain, params),
         (tabs, phone_layout),
+        (theme, font),
     )
     .await
 }
@@ -1332,6 +1365,8 @@ struct BoardPatch<'a> {
     params: Option<&'a [crate::params::BoardParam]>,
     tabs: Option<&'a [crate::layout::Tab]>,
     phone_layout: Option<&'a [crate::layout::PhoneTile]>,
+    theme: Option<&'a str>,
+    font: Option<&'a str>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -1439,6 +1474,8 @@ fn shell_board(id: &str) -> Board {
         params: None,
         tabs: None,
         phone_layout: None,
+        theme: None,
+        font: None,
         created_at: None,
         updated_at: None,
         public_token: None,
@@ -1719,6 +1756,62 @@ pub async fn drop_tile_of_deleted_chart(
     Ok(())
 }
 
+/// The themes a dashboard can fix; `auto` (or empty) follows the console.
+pub const BOARD_THEMES: [&str; 3] = ["auto", "light", "dark"];
+
+/// Save the theme and the font a dashboard shows its tiles in (`BI-17` part A,
+/// D6). `theme` is `auto`, `light` or `dark` (`auto` is stored as empty);
+/// `font` is empty for the console's own or one of
+/// [`crate::formatting::SHIPPED_FONTS`]. A value left as `None` is kept.
+///
+/// Whether the font is one the administrator allows (Admin > Settings) is the
+/// caller's check: the allowed list is a Postgres setting and this crate has
+/// no Postgres.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] for a theme or a font outside those lists,
+/// or [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn update_board_theme(
+    ch: &ChClient,
+    id: &str,
+    theme: Option<&str>,
+    font: Option<&str>,
+) -> Result<(), BiError> {
+    let theme = theme.map(|t| if t == "auto" { "" } else { t });
+    if let Some(t) = theme
+        && !t.is_empty()
+        && !BOARD_THEMES.contains(&t)
+    {
+        return Err(BiError::Validation(
+            "theme must be auto, light or dark.".to_owned(),
+        ));
+    }
+    if let Some(f) = font
+        && !f.is_empty()
+        && !crate::formatting::SHIPPED_FONTS.contains(&f)
+    {
+        return Err(BiError::Validation(
+            "font must be one of the fonts the console ships.".to_owned(),
+        ));
+    }
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            theme,
+            font,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// The content of a board that a version holds, borrowed for
 /// [`restore_board_fields`].
 pub struct BoardFields<'a> {
@@ -1740,6 +1833,10 @@ pub struct BoardFields<'a> {
     pub tabs: &'a [crate::layout::Tab],
     /// Phone layout.
     pub phone_layout: &'a [crate::layout::PhoneTile],
+    /// Saved theme, `""` for the console's.
+    pub theme: &'a str,
+    /// Saved font, `""` for the console's own.
+    pub font: &'a str,
 }
 
 /// Write back the content a version holds in ONE full-row save (`BI-18` part
@@ -1782,6 +1879,8 @@ pub async fn restore_board_fields(
             params: Some(fields.params),
             tabs: Some(fields.tabs),
             phone_layout: Some(fields.phone_layout),
+            theme: Some(fields.theme),
+            font: Some(fields.font),
             ..Default::default()
         },
     )
@@ -2237,6 +2336,8 @@ pub async fn duplicate_board(
             params: src.params.as_deref(),
             tabs: src.tabs.as_deref(),
             phone_layout: Some(&new_phone),
+            theme: src.theme.as_deref(),
+            font: src.font.as_deref(),
             folder_id: Some(&folder_id),
             owner_id: Some(&owner_id),
             ..Default::default()
@@ -2252,6 +2353,8 @@ pub async fn duplicate_board(
         params: src.params,
         tabs: src.tabs,
         phone_layout: Some(new_phone).filter(|p| !p.is_empty()),
+        theme: src.theme,
+        font: src.font,
         folder_id: Some(folder_id),
         ..new_board
     })
@@ -4853,9 +4956,11 @@ mod tests {
         // 35 = those 26 plus part 2: three trash/owner columns on `bi_board`,
         // three on `bi_chart`, `bi_folder.owner_id`, and the
         // `console.bi_board_version` and `console.bi_user_item` tables.
+        // 38 = those 36 plus the BI-17 part A `bi_board.theme` and
+        // `bi_board.font` columns.
         assert_eq!(
-            first_call_requests, 36,
-            "first call should issue all 36 DDL statements"
+            first_call_requests, 38,
+            "first call should issue all 38 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -5227,6 +5332,8 @@ mod tests {
             params: None,
             tabs: None,
             phone_layout: None,
+            theme: None,
+            font: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
@@ -6812,6 +6919,35 @@ mod tests {
         // A damaged column reads as none, not as a failed board.
         let bad = row_to_board(&row(serde_json::json!({ "tabs_json": "nope" })));
         assert!(bad.tabs.is_none());
+    }
+
+    /// `BI-17` part A (D6): a row from before the columns reads as following
+    /// the console, and the theme and font read back and serialise.
+    #[test]
+    fn a_boards_theme_and_font_read_back_and_an_old_row_has_neither() {
+        let row = |extra: Value| {
+            let mut v = serde_json::json!({ "id": "b_1", "name": "N", "layout_json": "{}" });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v.as_object().unwrap().clone()
+        };
+        let old = row_to_board(&row(serde_json::json!({})));
+        assert!(old.theme.is_none() && old.font.is_none());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("theme").is_none() && json.get("font").is_none());
+        let empty = row_to_board(&row(serde_json::json!({ "theme": "", "font": "" })));
+        assert!(empty.theme.is_none() && empty.font.is_none());
+        let set = row_to_board(&row(
+            serde_json::json!({ "theme": "dark", "font": "inter" }),
+        ));
+        assert_eq!(set.theme.as_deref(), Some("dark"));
+        assert_eq!(set.font.as_deref(), Some("inter"));
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            (json["theme"].as_str(), json["font"].as_str()),
+            (Some("dark"), Some("inter"))
+        );
     }
 
     fn stored(id: &str, board: &str) -> StoredChartSpec {

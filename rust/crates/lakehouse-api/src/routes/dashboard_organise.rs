@@ -620,6 +620,8 @@ pub async fn revert(
             params: &plan.params,
             tabs: &stored.tabs,
             phone_layout: &plan.phone_layout,
+            theme: &stored.theme,
+            font: &stored.font,
         },
     )
     .await
