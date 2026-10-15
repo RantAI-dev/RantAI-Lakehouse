@@ -645,6 +645,31 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
+
+A credential typed in the console is stored on the `connector_secrets`
+volume encrypted with AES-256-GCM. The key is `CONNECTOR_SECRETS_KEY`: 32
+random bytes, base64. The API and the orchestrator both need it, and
+compose refuses to start either without it.
+
+- **Make one, once:** `openssl rand -base64 32`. Keep it with the
+  installation's other secrets. **Losing it loses every typed credential**:
+  they cannot be decrypted and have to be entered again.
+- **First start with a key on an older install:** the API encrypts every
+  plain credential file at start-up and removes the plain copies. Until the
+  API has done so, the orchestrator refuses a plain file instead of reading
+  it.
+- **Changing the key:**
+  1. Set the new key as `CONNECTOR_SECRETS_KEY` and the current one as
+     `CONNECTOR_SECRETS_KEY_PREVIOUS`.
+  2. Run `docker compose run --rm lakehouse-api rotate-secrets-key` while
+     nobody is saving a credential. It re-encrypts every stored credential
+     with the new key and lists any file it could not.
+  3. Remove `CONNECTOR_SECRETS_KEY_PREVIOUS` and restart the API and the
+     orchestrator. The old key no longer opens anything.
+- Credentials given as an environment variable or an operator's file are
+  not encrypted by the product; they are the operator's to protect.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

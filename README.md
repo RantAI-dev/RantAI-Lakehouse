@@ -104,7 +104,10 @@ bun install
 #    minimum) AUTH_BOOTSTRAP_EMAIL / AUTH_BOOTSTRAP_PASSWORD — without
 #    those there is deliberately no way to log in. Every other variable
 #    has a safe local default; see .env.example and the Configuration
-#    table below.
+#    table below. CONNECTOR_SECRETS_KEY is required too (SRC-12): the key
+#    stored connector credentials are encrypted with. Generate it once
+#    with `openssl rand -base64 32` and keep it: without it, every stored
+#    credential has to be entered again (docs/OPERATIONS.md).
 cp .env.example .env
 $EDITOR .env
 
