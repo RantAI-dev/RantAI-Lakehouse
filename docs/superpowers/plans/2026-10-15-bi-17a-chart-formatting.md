@@ -273,4 +273,66 @@ scoped set once more plus `bun run build`; the full workspace run is CI's
 
 ## 7. Handoff (developer appends)
 
+### BI-17 part A and AI-8, slice 1 (T1 to T9)
+
+Branch `feat/bi-phase-3`, from `ea3e034e`. Developer: Claude Sonnet. Nothing pushed, no PR.
+
+**Commits** (one per task, each body cites its task):
+
+| Task | Commit | What it became |
+| --- | --- | --- |
+| T1 | `db19f436` | Migration `0072_reporting_formatting.sql` (`number_locale`, `company_palette`, `fonts`), `lakehouse_bi::formatting` (closed lists, `is_hex_color`), store `ReportingSettings` with the three fields, `put_reporting` with optional new fields (a field not sent keeps the stored value) and its sentences, `reporting` object of the dashboard, embed and public payloads carries them, Admin > Settings sections Numbers, Company palette, Fonts. |
+| T2 | `770b35f7` | `lakehouse_bi::style` (`StyleFields` flattened in `ChartInput`, `check_style`, `check_style_names`, ISO 4217 list), `ReferenceLine` with `kind`/`to`/`color`/`measure` (`value` is now optional, absent on a computed line), `check_reference_lines` now runs on every chart, `ColumnSetting.decimals` 0..=10 and `currency`, TS mirrors (`chart-style.ts`, reference line draft helpers). |
+| T3 | `0da344e0` | `Board.theme`/`font` (ClickHouse columns, upsert, patch, trash keep list, duplicate, version state and its "Theme" diff, revert), `PUT /api/dashboard/boards` takes `theme`/`font` (font checked against the administrator's list), dashboard payload (top-level `theme`/`font`) and embed/public payload (`board.theme`/`board.font`). |
+| T4 | `03c57859` | `src/lib/value-format.ts` (`formatValue`, `formatAxisValue`, `formatCompactCurrency`, `formatDateValue`, `formatFromHint`, `withMetricFormats`); `chart-axis` and `cell-format` take a locale; a currency code with the compact style is a compact amount. |
+| T5 | `828b9fa2` | Renderer: `buildOption` formats and palette, `style-option.ts` post-pass (axes, second axis, colours per series and by value, labels, notes, tooltip fields, log-axis message), reference lines per D2, conditional colours on grouped/raw tables, pivots and KPIs, layered charts and maps take formats/palette, `metricFormats` on the tile payload (D4). |
+| T6 | `797883c0` | `dashboardLook`, `next/font` families, `theme-light` tokens, dashboard container/public/embed apply theme and font, "Theme and font..." dialog. |
+| T7 | `a8f4ff51` | Builder section 5 "Format" (`format-section.tsx`, `style-draft.ts`), reference lines editor moved there and extended, conditional editor, "Add note..." in the click menu. |
+| T8 | `7600cd33` | `format_chart`, `set_dashboard_theme` (`tools/look.rs`), `style_properties` shared by the three chart tools, prompt, domain words, gate summaries, fixture regenerated, tool count 93, `capabilities.ts`. |
+| T9 | `59e0ad4f` | CHANGELOG entry. |
+
+**Checks run** (all in the foreground, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2`, on the final code before the T9 and handoff commits, which touch only Markdown):
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings`: no warnings.
+- `cargo test -p lakehouse-bi -- --test-threads=4`: 490 passed, 3 ignored, 0 failed (lib), plus `specs_match_typescript` 1 passed.
+- `cargo test -p lakehouse-store -- --test-threads=4`: every test binary ok, 0 failed (`reporting_settings` 5 passed). The store tests start their own Postgres through `lakehouse-test-support` (testcontainers), so no `DATABASE_URL` was set or needed.
+- `cargo test -p lakehouse-api --lib -- --test-threads=4 settings dashboard ai:: embed`: 522 passed, 4 ignored, 0 failed.
+- `cargo test -p lakehouse-api --test route_auth -- --test-threads=2`: 38 passed. `--test sec11_guard`: 4 passed. `--test reporting_settings_route`: 8 passed. `--test ai_tool`: 9 passed. (Each integration file on its own.)
+- `write_tool_schema_fixture` (ignored writer test) was run once; `tests/fixtures/tool_schemas.json` regenerated (+1327 lines, 18 lines replaced: the reference line schema).
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, 6 warnings (the same 6 as on `ea3e034e`). `bun run test`: 1913 pass, 1 skip, 0 fail (198 files).
+- `bun --bun next build --webpack`: compiled successfully, including `next/font` downloading the four fonts at build time.
+
+**Not verified**
+
+- `bun run build` as written (Turbopack) fails here before compiling anything: `Symlink node_modules is invalid, it points out of the filesystem root`, because the worktree's `node_modules` is a symlink to `/home/hv/lakehouse-uiux/node_modules`. It is the environment, not this diff; `next build --webpack` passes on the same tree. CI, which has a real `node_modules`, is the check for the Turbopack build.
+- The full workspace run (`cargo clippy --workspace`, `cargo test --workspace`), the other integration test files of `lakehouse-api` and the other lib filters: CI. `route_auth` with `--test-threads=4` failed 9 tests once (transient, same tests pass alone and at 2 threads); at 2 threads it passed.
+- A browser: nothing was rendered in a real browser. The ECharts options are asserted as JSON, the tiles and the builder under happy-dom. Not seen with eyes: the palettes' look, the `theme-light` tokens inside a dark console (the `dark:` variant override in `globals.css`), fonts actually loading, the log axis, the markArea band, the pin notes, the second Y axis, the Format section's layout.
+- The assistant through a model (`AI-8-AC1`): the request is tested as a `format_chart` argument set (`the_request_of_ai_8_ac1_applies_all_three_changes`), not as a conversation.
+- Python, compose and the Dagster tests: not touched, not run.
+- Migration `0072` against the dev database: only through the `sqlx::test` databases.
+
+**Where the plan was wrong against the code (or I deviated)**
+
+1. `check_chart_shape` (`params.rs`) is called only on the parameter path (`spec_from_param_chart`), not for every chart, so reference lines of an ordinary chart were never validated. I extracted `check_reference_lines` and call it from `spec_before_relation` (every chart) as well as from `check_chart_shape`; `check_style` is called there too. Names are checked in `spec_from_resolved`'s chart path (`check_style_names`) unless the chart uses a parameter (its columns change). So the signature is `check_style(&ChartInput)` plus `check_style_names(&ChartInput, &cols)`, not `check_style(kind, &StyleFields, &Columns)`.
+2. Feature decision 6 says all five palettes pass the contrast check in both themes. The current default palette (kept, so no saved chart changes colour) does not: `#0ea5e9`, `#f59e0b`, `#84cc16`, `#f97316` and others are under 3:1 on the white card (sky is 2.77). The four new palettes pass 3:1 on `#ffffff` and `#18181b` (`chart-palettes.test.ts`); the test says the default is excluded and why. The owner decides whether the default should change.
+3. `AI-15` has no request-set file: `docs/core/specs/ai-15.md` says "None today". I added no file; `AI-8-AC1` is pinned as a Rust test (`look.rs`) and the planner decides where the standard set lives.
+4. D5 says "migration 0072 ... If 0072 is taken on main when the PR is opened, the planner renumbers": 0072 is free here (last is 0071).
+5. The theme `light` inside a dark console is not possible with the existing `dark` class alone. I added `.theme-light` to the selector list of the light tokens in `design-system/tokens/colors.css` (one line, a comment says it is ours) and a `@custom-variant dark` override in `src/app/globals.css` that stops `dark:` matching under `.theme-light`. The design system folder is a copy in this repo; if it is meant to stay identical to its upstream, move the selector into `globals.css` instead.
+6. D4 says a metric's `MetricDef.format` is the default of its value. That field is a free word (<= 20 alphanumerics) with no list behind it; only `number`, `percent`, `compact` and `scientific` are read (`formatFromHint`), any other hint is ignored, not guessed (`currency` is not honoured: it has no code). The tile payload carries `metricFormats` for this. Metric entries now store the hint in the catalog entry body.
+7. Feature decision 15 says the two tools do not "wait for approval". They are `WriteLow` like `update_chart` (the plan says copy it), so they wait for the chat's confirmation (`needs_confirmation`) and need no approval.
+8. `ReferenceLine.value` became `Option<LineValue>` (absent on a computed line); stored JSON of plain lines is unchanged (tested with a fixture, numbers stay `f64` on both sides as before).
+9. Existing builder tests that expected reference lines in "More options" now expect them in Format (the plan moves the editor); `moreOptionsUsed` lost its `referenceLines` field; `SectionNumber` stays 1 to 4. The "four sections" test is "five sections". `PreviewInputs` gained `style`.
+10. The dashboard payload carries `theme`/`font` at the top level, because its `board` field is the id string; the embed and public payloads carry them in `board`.
+11. `format_chart` keeps the chart's `source` and author (it does not relabel a manual chart as `ai`); a field given replaces the whole field (including `colors`, so a `colors` with only `series` drops a stored `palette`); it reads nothing from the call outside the ten fields.
+12. Tooltip fields are limited by the server to bar, hbar, line, area, stacked and combo (the kinds with an axis tooltip); on the other kinds a tooltip selection would be ignored, so it is refused. Colour by value on maps applies to `geomap` and to `pointmap` symbols.
+
+**Smaller things worth a look in review**
+
+- `Add note...` writes the clicked point's label as the note's `x`; for a grained axis that is the label ("Mar 2026"), which is what the axis data holds.
+- Layered charts (`BI-13`): per-value formats and second-axis choices there are keyed by the series' names, not by result columns (`StyleInput.columns`).
+- The per-value `Format of` select, the series-colour name field and the note fields are plain inputs with a datalist; no visual design pass was done.
+- Hidden notes ("N notes not shown") are shown under the tile for charts and layered charts, not for a chart in the expanded dialog (it uses the same `TileBody`, so it shows there too).
+- `cargo test -p lakehouse-api --lib` at the filters above was run once more after the last Rust edit; the full lib suite was not run.
+
 ## 8. Review (planner appends)
