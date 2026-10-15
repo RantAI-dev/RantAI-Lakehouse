@@ -483,9 +483,7 @@ mod tests {
     #[tokio::test]
     async fn no_key_file_and_no_metadata_service_is_may_not_sign_in() {
         let server = MockServer::start().await;
-        let nobody = MockServer::start().await;
-        let dead = nobody.uri().trim_start_matches("http://").to_owned();
-        drop(nobody);
+        let dead = crate::secret_manager::dead_address();
         assert_eq!(
             backend_with(&server, None, Some(&dead))
                 .read(&reference(REF))

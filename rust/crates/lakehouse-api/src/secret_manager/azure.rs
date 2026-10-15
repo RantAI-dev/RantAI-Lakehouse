@@ -209,13 +209,17 @@ mod tests {
     const REF: &str = "azure-kv:corp-vault/orders-db";
 
     fn backend(server: &MockServer, extra: &[(&str, &str)]) -> AzureBackend {
+        backend_at(&server.uri(), extra)
+    }
+
+    fn backend_at(base: &str, extra: &[(&str, &str)]) -> AzureBackend {
         let mut env: HashMap<String, String> = extra
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         env.insert("SECRET_MANAGER".to_owned(), "azure".to_owned());
         let settings = SecretManagerSettings::from_map(&env).unwrap();
-        AzureBackend::from_settings(&settings).with_endpoints(&server.uri(), &server.uri())
+        AzureBackend::from_settings(&settings).with_endpoints(base, base)
     }
 
     fn registration(server: &MockServer) -> Vec<(&'static str, String)> {
@@ -480,9 +484,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_registration_and_no_identity_service_is_may_not_sign_in() {
-        let nobody = MockServer::start().await;
-        let backend = backend(&nobody, &[]);
-        drop(nobody);
+        let backend = backend_at(
+            &format!("http://{}", crate::secret_manager::dead_address()),
+            &[],
+        );
         assert_eq!(
             backend.read(&reference(REF)).await.unwrap_err(),
             SecretFailure::ManagerSignIn

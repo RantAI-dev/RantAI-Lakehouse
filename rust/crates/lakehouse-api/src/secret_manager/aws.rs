@@ -472,13 +472,20 @@ mod tests {
     }
 
     fn backend(server: &MockServer, extra: &[(&str, &str)]) -> AwsBackend {
+        backend_at(&server.uri(), extra)
+    }
+
+    fn backend_at(endpoint: &str, extra: &[(&str, &str)]) -> AwsBackend {
         let mut env: HashMap<String, String> = extra
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         env.insert("SECRET_MANAGER".to_owned(), "aws".to_owned());
         env.insert("AWS_REGION".to_owned(), "eu-west-1".to_owned());
-        env.insert("AWS_ENDPOINT_URL_SECRETS_MANAGER".to_owned(), server.uri());
+        env.insert(
+            "AWS_ENDPOINT_URL_SECRETS_MANAGER".to_owned(),
+            endpoint.to_owned(),
+        );
         let settings = SecretManagerSettings::from_map(&env).unwrap();
         AwsBackend::from_settings(&settings)
     }
@@ -744,9 +751,7 @@ mod tests {
     #[tokio::test]
     async fn no_keys_and_no_metadata_service_is_may_not_sign_in() {
         let server = MockServer::start().await;
-        let nobody = MockServer::start().await;
-        let dead = nobody.uri();
-        drop(nobody);
+        let dead = format!("http://{}", crate::secret_manager::dead_address());
         assert_eq!(
             backend(
                 &server,
@@ -762,9 +767,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_nobody_answers_is_unreachable() {
-        let server = MockServer::start().await;
-        let backend = backend(&server, &KEYS);
-        drop(server);
+        // `SRC-12 review B2 BLOCKER 2`: a port nobody listens on; a dropped
+        // `wiremock` server stays up in its pool and answers 404.
+        let backend = backend_at(
+            &format!("http://{}", crate::secret_manager::dead_address()),
+            &KEYS,
+        );
         let err = backend
             .read(&reference("aws-sm:prod/orders-db"))
             .await

@@ -395,6 +395,20 @@ impl SecretResolver for ManagerResolver {
     }
 }
 
+/// An address on which nothing listens: bind a port, take it, drop the
+/// listener (`SRC-12 review B2 BLOCKER 2`). A dropped `wiremock` server is not
+/// that: its pool keeps the server running and it answers 404.
+#[cfg(test)]
+pub(crate) fn dead_address() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|_| unreachable!());
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|_| unreachable!())
+        .to_string();
+    drop(listener);
+    addr
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -138,14 +138,15 @@ mod tests {
     use crate::secret_manager::SecretManagerKind;
 
     fn backend(server: &MockServer, extra: &[(&str, &str)]) -> VaultBackend {
-        let mut env: HashMap<String, String> = [
-            ("SECRET_MANAGER", "vault"),
-            ("VAULT_ADDR", server.uri().as_str()),
-        ]
-        .iter()
-        .chain(extra)
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
+        backend_at(&server.uri(), extra)
+    }
+
+    fn backend_at(addr: &str, extra: &[(&str, &str)]) -> VaultBackend {
+        let mut env: HashMap<String, String> = [("SECRET_MANAGER", "vault"), ("VAULT_ADDR", addr)]
+            .iter()
+            .chain(extra)
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
         env.insert("SECRET_MANAGER".to_owned(), "vault".to_owned());
         let settings = SecretManagerSettings::from_map(&env).unwrap();
         VaultBackend::from_settings(&settings).unwrap()
@@ -335,9 +336,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_address_nobody_answers_is_unreachable_and_the_text_shows_no_address() {
-        let server = MockServer::start().await;
-        let backend = backend(&server, &[("VAULT_TOKEN", "t")]);
-        drop(server);
+        // `SRC-12 review B2 BLOCKER 2`: a port nobody listens on. A dropped
+        // `wiremock` server stays up in its pool and answers 404.
+        let backend = backend_at(
+            &format!("http://{}", crate::secret_manager::dead_address()),
+            &[("VAULT_TOKEN", "t")],
+        );
         let err = backend.read(&reference()).await.unwrap_err();
         assert_eq!(err, SecretFailure::ManagerUnreachable);
         assert!(!err.to_string().contains("127.0.0.1"));
