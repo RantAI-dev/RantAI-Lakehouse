@@ -106,6 +106,67 @@ per table, which is stricter and needs no mapping).
 
 (Developer appends here, task by task.)
 
+### Section 5 answers (verified against the pinned `dagster==1.13.20` before T1)
+
+**5.1 Two bounded instance calls, intersecting on `run_id`.** The newest
+SUCCESS run of `ingest_job` that materialized the pipeline's Bronze table
+is found by `instance.fetch_materializations(asset_key, limit)` followed by
+`instance.get_run_records(...)`:
+
+- `DagsterInstance.fetch_materializations(records_filter: Union[AssetKey,
+  AssetRecordsFilter], limit: int, cursor: str | None = None,
+  ascending: bool = False) -> EventRecordsResult` -- verified by printing
+  `inspect.signature(DagsterInstance.fetch_materializations)` in the pinned
+  venv. `ascending=False` is the default, so `EventRecordsResult.records`
+  is NEWEST FIRST; each element is an `EventLogRecord` carrying
+  `storage_id`, `event_log_entry`, `.run_id`, `.timestamp`, `.asset_key`,
+  `.asset_materialization`. Proven by a scripted `execute_in_process`
+  session against `instance_for_test()`: three runs of a job that logs
+  `AssetMaterialization`, the newest being a FAILED one, returned
+  `[(<failed run>, t3), (<success run>, t1)]` for `limit=20`.
+- The call filters by asset key ONLY -- `AssetRecordsFilter` has no
+  `job_name` and no status field -- so the RUN's status comes from the run
+  side: `instance.get_run_records(filters=RunsFilter(job_name="ingest_job",
+  statuses=[DagsterRunStatus.SUCCESS]), limit=<window>)`. The anchor is the
+  newerst materialization record whose `run_id` is one of those SUCCESS
+  run records. In that same script the anchor resolved to the SUCCESS run
+  that loaded `bronze.orders`, NOT to the newer run that loaded
+  `bronze.invoices` and NOT to the newer run that FAILED.
+- REJECTED, `instance.get_event_records(EventRecordsFilter(event_type=...,
+  asset_key=...))`: `EventRecordsFilter` (`dagster._core.event_api`,
+  dumped in full) has no job/status field either, so it would still need
+  the run-side join, AND the method is deprecated in 1.13.20 -- calling it
+  prints `UserWarning: Use fetch_materializations instead of
+  get_event_records to fetch materialization events`.
+- REJECTED, `instance.get_run_record_by_id(run_id)` per materialization:
+  that turns ONE bounded window into up to `FILE_INGEST_SCAN_LIMIT`
+  instance calls per tick, for a piece of information the one SUCCESS-run
+  query already carries.
+
+**5.2 `AssetMaterialization(asset_key="bronze.orders")` is a TWO-component
+key.** On the real classes: `AssetMaterialization(asset_key="bronze.orders")
+.asset_key` is `AssetKey(['bronze', 'orders'])`; `to_string()` is
+`["bronze", "orders"]`, `to_user_string()` is `bronze/orders`. So the
+filter is built as `AssetKey(["bronze", <sourceTable>])`; the one-component
+`AssetKey(["bronze.orders"])` matches nothing, and `AssetKey.from_user_string
+("bronze.orders")` is the inverse (slash-joined) form and is NOT used. Pinned
+by `TestIngestMaterializationKeyTest` in
+`dagster/dispar_orchestrate/test_authored_factory.py` (T1), which asserts
+against the real `AssetKey`/`AssetMaterialization` classes and then proves
+the two shapes against a real event log.
+
+**5.3 Yes, a materialization from a mapped step survives a later step's
+failure.** The event log is append-only per step: a job whose FIRST mapped
+step logs `AssetMaterialization(asset_key="bronze.orders")` and whose LATER
+step raises still has that materialization in the log
+(`instance.fetch_materializations(AssetKey(["bronze","orders"]), limit=5)`
+returns the record), while the run's status is `DagsterRunStatus.FAILURE`
+and `get_run_records(statuses=[SUCCESS])` is empty. This is exactly why D1
+reads the RUN's status and not only the event: the anchor for that chain is
+`None`. Proven on the real classes with the job built in the real
+`.map(...)` shape `ingest_factory.ingest_job` uses (T1's
+`TestIngestMaterializationKeyTest`).
+
 ## 7. Review
 
 (Reviewer.)
