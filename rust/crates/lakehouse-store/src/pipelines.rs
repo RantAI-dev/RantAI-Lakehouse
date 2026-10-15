@@ -106,6 +106,84 @@ pub struct Pipeline {
     /// every other `skip_serializing_if` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    /// BLD-2: how fresh this pipeline's output must be (migration `0077`),
+    /// derived from the `target_lag_seconds`/`target_lag_downstream`
+    /// column pair. `None` = no target lag: the pipeline runs on its
+    /// `schedule`/`depends_on` exactly as before.
+    ///
+    /// Deliberately NOT `skip_serializing_if`: the list and detail payloads
+    /// report `targetLag: null` for a pipeline with no lag rather than
+    /// omitting the field, so a client reads one shape on every row (the
+    /// same reason `last_run_at`/`freshness_lag_seconds` report an honest
+    /// `null` instead of disappearing).
+    pub target_lag: Option<TargetLag>,
+}
+
+/// BLD-2: how fresh a pipeline's output must be (migration `0077`). The
+/// wire form is plan D2's internally tagged union: `null`, or
+/// `{"kind":"lag","minutes":N}` for `1..=10080` whole minutes, or
+/// `{"kind":"downstream"}` for Snowflake's `DOWNSTREAM` (refresh only when
+/// a pipeline that reads this one needs it).
+///
+/// Minutes, not seconds, because the floor is one minute and both the
+/// console and the assistant speak minutes; the column stores seconds
+/// (`minutes * 60`) because that is what a comparison against a duration
+/// wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TargetLag {
+    /// A maximum age, in whole minutes.
+    Lag {
+        /// The target, in whole minutes, `1..=10080` (1 minute to 7 days).
+        minutes: i32,
+    },
+    /// Snowflake's `DOWNSTREAM`: this pipeline's own inputs decide, but a
+    /// pipeline that has no target lag only refreshes when a pipeline that
+    /// reads it needs the refresh.
+    Downstream,
+}
+
+impl TargetLag {
+    /// The column pair this value stores: `(target_lag_seconds,
+    /// target_lag_downstream)`. `Downstream` is `(None, true)`, `Lag` is
+    /// `(Some(minutes * 60), false)`, and no value is
+    /// `(Some(_), true)` — the table CHECK refuses that pair
+    /// (`pipeline_definition_target_lag_kind_check`).
+    #[must_use]
+    pub fn columns(self) -> (Option<i32>, bool) {
+        match self {
+            Self::Lag { minutes } => {
+                // `saturating_mul` on an `i64` copy keeps a caller that
+                // skipped the route's 1..=10080 validation from wrapping
+                // into a value the column CHECK would reject for the wrong
+                // reason; the CHECK is still the real boundary.
+                let seconds = i64::from(minutes).saturating_mul(60);
+                let seconds = seconds.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "clamped to the i32 range immediately above, so the cast is exact"
+                )]
+                (Some(seconds as i32), false)
+            }
+            Self::Downstream => (None, true),
+        }
+    }
+
+    /// The inverse of [`Self::columns`], for reading a stored row. `None`
+    /// when the row has neither: no target lag. The `(Some(_), true)` pair
+    /// cannot exist (table CHECK); it is reported as `None` rather than
+    /// preferring one half of a contradiction.
+    #[must_use]
+    pub fn from_columns(seconds: Option<i32>, downstream: bool) -> Option<Self> {
+        if downstream {
+            return (seconds.is_none()).then_some(Self::Downstream);
+        }
+        // The CHECK bounds `target_lag_seconds` to 60..604800, so the
+        // division is exact whole minutes and stays inside `i32`.
+        seconds.map(|seconds| Self::Lag {
+            minutes: seconds / 60,
+        })
+    }
 }
 
 /// The full stored shape of an authored pipeline's definition, returned by
@@ -165,6 +243,12 @@ struct PipelineRow {
     /// needs the value, but exposing it on the public type would be a
     /// new wire field that no current caller wants.
     tenant_id: Option<Uuid>,
+    /// BLD-2 (migration `0077`): the two columns behind
+    /// [`Pipeline::target_lag`]. Read raw and combined by
+    /// [`TargetLag::from_columns`] so no row shape has to know the wire
+    /// union.
+    target_lag_seconds: Option<i32>,
+    target_lag_downstream: bool,
 }
 
 /// A row shape for [`get_definition`], carrying the three columns migration
@@ -216,13 +300,17 @@ impl From<PipelineRow> for Pipeline {
             // to the pre-F2.3 shape (see `tenant_id`'s `skip_serializing_if`
             // on the struct).
             tenant_id: row.tenant_id,
+            // BLD-2: the two stored columns become one wire value here,
+            // the only place that knows the pair means a union.
+            target_lag: TargetLag::from_columns(row.target_lag_seconds, row.target_lag_downstream),
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
-freshness_lag_seconds, max_retries, description, depends_on, tenant_id";
+freshness_lag_seconds, max_retries, description, depends_on, tenant_id, \
+     target_lag_seconds, target_lag_downstream";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -233,7 +321,7 @@ freshness_lag_seconds, max_retries, description, depends_on, tenant_id";
 const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
-     transforms, fbic_enabled, tenant_id";
+     transforms, fbic_enabled, tenant_id, target_lag_seconds, target_lag_downstream";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -454,6 +542,10 @@ struct FullPipelineRow {
     /// value, and threading it as a separate query at write time would
     /// race against the live row's own tenant reassignment.
     tenant_id: Option<Uuid>,
+    /// BLD-2 (migration `0077`); see [`PipelineRow`]'s own doc comment on
+    /// the same pair.
+    target_lag_seconds: Option<i32>,
+    target_lag_downstream: bool,
 }
 
 impl From<FullPipelineRow> for Pipeline {
@@ -483,6 +575,9 @@ impl From<FullPipelineRow> for Pipeline {
             // "Option::is_none"`) so the wire shape is unchanged for
             // every pre-0055 caller.
             tenant_id: row.tenant_id,
+            // BLD-2: the two stored columns become one wire value here,
+            // the only place that knows the pair means a union.
+            target_lag: TargetLag::from_columns(row.target_lag_seconds, row.target_lag_downstream),
         }
     }
 }
@@ -773,6 +868,11 @@ pub struct CreatePipelineInput {
     /// itself via [`crate::pipelines::slug_id`], so existing callers
     /// (tests, internal callers) keep working unchanged.
     pub id: Option<String>,
+    /// BLD-2 (migration `0077`): the target lag this pipeline is created
+    /// with, or `None` for none. The route layer validates the range
+    /// (`1..=10080` minutes) before calling, and the column CHECK is the
+    /// database-level backstop.
+    pub target_lag: Option<TargetLag>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -817,11 +917,17 @@ pub async fn create_pipeline(
     // source — there is no per-row "explicitly defaulted" distinction
     // worth preserving).
     let max_retries = input.max_retries.unwrap_or(2);
+    // BLD-2 (migration `0077`): the one wire value becomes the two stored
+    // columns here, and nowhere else.
+    let (target_lag_seconds, target_lag_downstream) =
+        input.target_lag.map_or((None, false), TargetLag::columns);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
 schedule, description, incremental_column, fbic_enabled, transforms, \
-         max_retries, tenant_id, depends_on, connector_id) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+         max_retries, tenant_id, depends_on, connector_id, target_lag_seconds, \
+         target_lag_downstream) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+         $16, $17) \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
@@ -841,6 +947,8 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(input.tenant_id)
         .bind(&input.depends_on)
         .bind(&input.connector_id)
+        .bind(target_lag_seconds)
+        .bind(target_lag_downstream)
         .fetch_one(&mut *tx)
         .await?;
     let snapshot = PipelineDefinitionSnapshot::from(&row);
@@ -1102,6 +1210,21 @@ pub async fn delete_pipeline(
     Ok(true)
 }
 
+/// The columns [`list_runnable_pipelines`] reads in one query, before it
+/// fetches each row's definition separately.
+#[derive(Debug, FromRow)]
+struct RunnableRow {
+    id: String,
+    name: String,
+    status: String,
+    schedule: String,
+    depends_on: Vec<String>,
+    /// BLD-2 (migration `0077`), carried to the factory so it can apply
+    /// plan D3 (a target lag replaces the schedule while it is set).
+    target_lag_seconds: Option<i32>,
+    target_lag_downstream: bool,
+}
+
 /// One authored pipeline the orchestrator should build a job for.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1126,6 +1249,12 @@ pub struct RunnablePipeline {
     /// docstring on "every way this degrades to empty lists without
     /// raising" for why a second fetch would defeat that.
     pub depends_on: Vec<String>,
+    /// BLD-2 (migration `0077`): the pipeline's target lag, so the
+    /// orchestrator's factory can decide (plan D3/D6) that neither the cron
+    /// schedule nor the `_after` sensor applies while it is set. `None` for
+    /// every pipeline written before this migration — which is exactly the
+    /// "use the schedule" case the factory already implements.
+    pub target_lag: Option<TargetLag>,
 }
 
 /// Every authored pipeline in status `ready` or `paused`, across all
@@ -1138,23 +1267,28 @@ pub struct RunnablePipeline {
 ///
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
-    let rows: Vec<(String, String, String, String, Vec<String>)> = sqlx::query_as(
-        "SELECT id, name, status, schedule, depends_on FROM pipeline_definition \
-         WHERE status IN ('ready', 'paused') ORDER BY created_at",
+    let rows: Vec<RunnableRow> = sqlx::query_as(
+        "SELECT id, name, status, schedule, depends_on, target_lag_seconds, \
+             target_lag_downstream FROM pipeline_definition \
+             WHERE status IN ('ready', 'paused') ORDER BY created_at",
     )
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
-    for (id, name, status, schedule, depends_on) in rows {
+    for row in rows {
         // A row deleted between the two reads simply drops out.
-        if let Some(definition) = get_definition(pool, &id).await? {
+        if let Some(definition) = get_definition(pool, &row.id).await? {
             out.push(RunnablePipeline {
-                id,
-                name,
-                status,
-                schedule,
+                id: row.id,
+                name: row.name,
+                status: row.status,
+                schedule: row.schedule,
                 definition,
-                depends_on,
+                depends_on: row.depends_on,
+                target_lag: TargetLag::from_columns(
+                    row.target_lag_seconds,
+                    row.target_lag_downstream,
+                ),
             });
         }
     }
@@ -1443,6 +1577,263 @@ pub async fn get_definition_version(
     Ok(Some(snapshot))
 }
 
+// ── BLD-2: `pipeline_lag_state` (migration `0077`) ──────────────────────
+
+/// One pipeline's lag state: what it last consumed, what is pending, the
+/// run this pipeline was last asked to make, and the check that last ran.
+///
+/// Deliberately NOT `Serialize`: this is the decision-maker's private state
+/// (plan D5), never a payload. The API builds its own `lag: { status,
+/// lagSeconds, lastCheckAt, reason }` view from it (plan D8) so the wire
+/// shape cannot drift with a column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineLagState {
+    /// The pipeline this state belongs to.
+    pub pipeline_id: String,
+    /// Copied from `pipeline_definition.tenant_id` on insert; `None` for an
+    /// unassigned pipeline (invisible to every tenant-scoped read, same
+    /// rule as the pipeline rows themselves).
+    pub tenant_id: Option<Uuid>,
+    /// The input tokens the last SUCCESSFUL lag run read, as the JSON
+    /// object `{"<zone>.<table>": "<token>"}` the token reader produced
+    /// (plan D4). `None` = never consumed anything: a pipeline that has not
+    /// yet run under its lag, which plan D5 treats as "run, and behind until
+    /// it succeeds" — never as an empty comparison that reports "met".
+    pub consumed_tokens: Option<serde_json::Value>,
+    /// When the consuming run started.
+    pub consumed_at: Option<OffsetDateTime>,
+    /// When the first check saw tokens differ from `consumed_tokens`;
+    /// `None` once a check found them equal again.
+    pub pending_since: Option<OffsetDateTime>,
+    /// The `Dagster` run key of the outstanding request, and the tokens
+    /// that request was made to consume. Both `None` when no run is
+    /// outstanding; the table CHECK refuses one without the other.
+    pub requested_run_key: Option<String>,
+    /// See [`Self::requested_run_key`].
+    pub requested_tokens: Option<serde_json::Value>,
+    /// When a lag check last ran for this pipeline.
+    pub last_check_at: Option<OffsetDateTime>,
+    /// `"met" | "behind" | "not_measured"`; `None` before the first check.
+    pub last_status: Option<String>,
+    /// Consecutive checks that ended `"behind"`. The alert fires when this
+    /// EQUALS [`BEHIND_STREAK_ALERT_AFTER`] (plan D9), the same "once per
+    /// streak" shape as `connectors.rs`'s repeated-failure streak.
+    pub behind_streak: i32,
+}
+
+/// BLD-2 plan D9: how many consecutive checks behind their target a
+/// pipeline must be before the alert fires. Signed as feature-page decision
+/// 3 ("3 checks in a row"), matching `docs/core/features/
+/// pipeline-target-lag.md`. A check runs every 30 s (plan D6), so this is
+/// about 1.5 minutes behind — see the plan's note 2 for the owner.
+pub const BEHIND_STREAK_ALERT_AFTER: i32 = 3;
+
+/// The full row one lag check writes. The handler composes the whole state
+/// and hands it over in ONE statement (`upsert_lag_state`), so "a run was
+/// requested" and "the status that justified the request" can never be
+/// written apart by a half-finished check.
+#[derive(Debug, Clone)]
+pub struct LagStateUpdate {
+    /// The pipeline the check ran for.
+    pub pipeline_id: String,
+    /// The pipeline's tenant, copied from its definition row.
+    pub tenant_id: Option<Uuid>,
+    /// See [`PipelineLagState::consumed_tokens`].
+    pub consumed_tokens: Option<serde_json::Value>,
+    /// See [`PipelineLagState::consumed_at`].
+    pub consumed_at: Option<OffsetDateTime>,
+    /// See [`PipelineLagState::pending_since`].
+    pub pending_since: Option<OffsetDateTime>,
+    /// See [`PipelineLagState::requested_run_key`].
+    pub requested_run_key: Option<String>,
+    /// See [`PipelineLagState::requested_tokens`].
+    pub requested_tokens: Option<serde_json::Value>,
+    /// See [`PipelineLagState::last_check_at`].
+    pub last_check_at: OffsetDateTime,
+    /// See [`PipelineLagState::last_status`].
+    pub last_status: String,
+    /// See [`PipelineLagState::behind_streak`].
+    pub behind_streak: i32,
+}
+
+#[derive(Debug, FromRow)]
+struct LagStateRow {
+    pipeline_id: String,
+    tenant_id: Option<Uuid>,
+    consumed_tokens: Option<serde_json::Value>,
+    consumed_at: Option<OffsetDateTime>,
+    pending_since: Option<OffsetDateTime>,
+    requested_run_key: Option<String>,
+    requested_tokens: Option<serde_json::Value>,
+    last_check_at: Option<OffsetDateTime>,
+    last_status: Option<String>,
+    behind_streak: i32,
+}
+
+const LAG_STATE_COLUMNS: &str = "pipeline_id, tenant_id, consumed_tokens, consumed_at, \
+     pending_since, requested_run_key, requested_tokens, last_check_at, last_status, \
+     behind_streak";
+
+impl From<LagStateRow> for PipelineLagState {
+    fn from(row: LagStateRow) -> Self {
+        Self {
+            pipeline_id: row.pipeline_id,
+            tenant_id: row.tenant_id,
+            consumed_tokens: row.consumed_tokens,
+            consumed_at: row.consumed_at,
+            pending_since: row.pending_since,
+            requested_run_key: row.requested_run_key,
+            requested_tokens: row.requested_tokens,
+            last_check_at: row.last_check_at,
+            last_status: row.last_status,
+            behind_streak: row.behind_streak,
+        }
+    }
+}
+
+/// Read one pipeline's lag state, or `None` when no check has ever looked
+/// at it. `None` is the honest "never measured" answer the API turns into
+/// `status: "not_measured"` (plan D8) — never a default zero.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_lag_state(
+    pool: &PgPool,
+    pipeline_id: &str,
+) -> Result<Option<PipelineLagState>, StoreError> {
+    let sql = format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = $1");
+    let row: Option<LagStateRow> = sqlx::query_as(&sql)
+        .bind(pipeline_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(PipelineLagState::from))
+}
+
+/// Read the lag state of many pipelines in one query — the list and detail
+/// routes' shape (plan D8). Pipelines with no state row are simply absent
+/// from the returned map, and the route reports `not_measured` for them.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_lag_states(
+    pool: &PgPool,
+    pipeline_ids: &[&str],
+) -> Result<std::collections::HashMap<String, PipelineLagState>, StoreError> {
+    if pipeline_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let sql =
+        format!("SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1)");
+    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+        .bind(pipeline_ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let state = PipelineLagState::from(row);
+            (state.pipeline_id.clone(), state)
+        })
+        .collect())
+}
+
+/// Write one lag check's whole outcome, inserting the row on the first
+/// check. Idempotent per check: the same [`LagStateUpdate`] written twice
+/// leaves the same state, which is what a sensor retry needs (the check
+/// itself is decided by the caller, not by this function).
+///
+/// The `pipeline_id` is bound, never interpolated; every value is bound.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails, including the
+/// `pipeline_definition` foreign key when no such pipeline exists and the
+/// table CHECK when `last_status` is outside its fixed vocabulary or a
+/// request carries only one half of its pair.
+pub async fn upsert_lag_state(
+    pool: &PgPool,
+    update: &LagStateUpdate,
+) -> Result<PipelineLagState, StoreError> {
+    let sql = format!(
+        "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id, consumed_tokens, \
+         consumed_at, pending_since, requested_run_key, requested_tokens, last_check_at, \
+         last_status, behind_streak) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         ON CONFLICT (pipeline_id) DO UPDATE SET \
+            tenant_id = EXCLUDED.tenant_id, \
+            consumed_tokens = EXCLUDED.consumed_tokens, \
+            consumed_at = EXCLUDED.consumed_at, \
+            pending_since = EXCLUDED.pending_since, \
+            requested_run_key = EXCLUDED.requested_run_key, \
+            requested_tokens = EXCLUDED.requested_tokens, \
+            last_check_at = EXCLUDED.last_check_at, \
+            last_status = EXCLUDED.last_status, \
+            behind_streak = EXCLUDED.behind_streak \
+         RETURNING {LAG_STATE_COLUMNS}"
+    );
+    let row: LagStateRow = sqlx::query_as(&sql)
+        .bind(&update.pipeline_id)
+        .bind(update.tenant_id)
+        .bind(&update.consumed_tokens)
+        .bind(update.consumed_at)
+        .bind(update.pending_since)
+        .bind(&update.requested_run_key)
+        .bind(&update.requested_tokens)
+        .bind(update.last_check_at)
+        .bind(&update.last_status)
+        .bind(update.behind_streak)
+        .fetch_one(pool)
+        .await?;
+    Ok(PipelineLagState::from(row))
+}
+
+/// Set (or clear, with `None`) a pipeline's target lag — the store half of
+/// `PUT /api/pipelines/{id}/target-lag` (plan D8). Returns the updated
+/// pipeline, or `None` when no pipeline with `id` exists (the route's 404).
+///
+/// A `None` target lag clears BOTH columns, which is what makes plan D3's
+/// "removing the lag returns the pipeline to its schedule" true: the stored
+/// `schedule`/`depends_on` were never touched while the lag was set.
+///
+/// Deliberately NOT writing a `pipeline_definition_version` row, unlike
+/// [`update_pipeline`]: that snapshot type has no target-lag field, so
+/// stamping one would record a definition it cannot restore — a restore
+/// would silently keep (or drop) a lag the snapshot never carried. The
+/// change is recorded by the route's audit event instead
+/// (`pipeline.target_lag.set`, plan D8), which names what changed without
+/// claiming the history is a complete definition. Adding the field to
+/// [`PipelineDefinitionSnapshot`] (and to the COALESCE-based
+/// [`UpdatePipelineInput`], whose "absent means unchanged" convention
+/// cannot express "restore to no lag") is a separate decision, not one to
+/// smuggle in here.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any failure, including the CHECK
+/// constraint rejecting a lag outside `1..=10080` minutes when a caller
+/// bypassed the route's own validation.
+pub async fn set_target_lag(
+    pool: &PgPool,
+    id: &str,
+    target_lag: Option<TargetLag>,
+) -> Result<Option<Pipeline>, StoreError> {
+    let (seconds, downstream) = target_lag.map_or((None, false), TargetLag::columns);
+    let sql = format!(
+        "UPDATE pipeline_definition \
+         SET target_lag_seconds = $2, target_lag_downstream = $3 \
+         WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
+    );
+    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(seconds)
+        .bind(downstream)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(Pipeline::from))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1475,6 +1866,9 @@ mod tests {
             // keeps `tenantId` out of the wire payload, matching the
             // pre-F2.3 assertion that only the listed fields appear.
             tenant_id: None,
+            // BLD-2: the no-lag case, which still serializes as an
+            // explicit `targetLag: null` (see `Pipeline::target_lag`).
+            target_lag: None,
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [
@@ -1491,6 +1885,9 @@ mod tests {
             "freshnessLagSeconds",
             "dependsOn",
             "maxRetries",
+            // BLD-2: always present, `null` when the pipeline has no
+            // target lag — one shape on every row.
+            "targetLag",
         ] {
             assert!(value.get(key).is_some(), "Pipeline is missing `{key}`");
         }
@@ -1529,6 +1926,9 @@ mod tests {
             // `None` here matches the "never been assigned a tenant"
             // fixture this test stands for.
             tenant_id: None,
+            // BLD-2: a row with neither lag column set.
+            target_lag_seconds: None,
+            target_lag_downstream: false,
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, None);
@@ -1574,6 +1974,10 @@ mod tests {
             // serialization path; `serialized_field_names_match_…` above
             // exercises the `None` / no-serialization path.
             tenant_id: Some(uuid::Uuid::from_u128(42)),
+            // BLD-2: the row here stores a 10-minute target, which must
+            // come back as the wire union, not as raw seconds.
+            target_lag_seconds: Some(600),
+            target_lag_downstream: false,
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, Some(iso_millis(ran_at)));
@@ -1585,6 +1989,7 @@ mod tests {
             vec!["pl-up".to_owned(), "ingest_job".to_owned()],
             "depends_on must round-trip the text[] column verbatim",
         );
+        assert_eq!(pipeline.target_lag, Some(TargetLag::Lag { minutes: 10 }));
     }
 
     #[test]

@@ -55,6 +55,9 @@ fn input() -> CreatePipelineInput {
         // here want the default `slug_id` derivation, which is exactly
         // what `id: None` triggers in `create_pipeline`.
         id: None,
+        // BLD-2: the default fixture has no target lag; the tests below
+        // that are about one set it explicitly.
+        target_lag: None,
     }
 }
 
@@ -1795,5 +1798,371 @@ async fn baseline_backfill_is_idempotent_under_rerun(pool: PgPool) -> sqlx::Resu
         count, 1,
         "the backfill must skip pipelines that already have a version row"
     );
+    Ok(())
+}
+
+// ── BLD-2: target lag (migration `0077`) ────────────────────────────────
+
+/// The wire value round-trips through the two stored columns, in both
+/// kinds, on the read paths the list, the detail and the orchestrator's
+/// factory all use.
+#[sqlx::test(migrations = "../../migrations")]
+async fn target_lag_round_trips_through_create_and_reads(pool: PgPool) -> sqlx::Result<()> {
+    let mut with_lag = input();
+    with_lag.name = "lagged-orders".to_owned();
+    with_lag.target_lag = Some(pipelines::TargetLag::Lag { minutes: 10 });
+    let created = pipelines::create_pipeline(&pool, &with_lag, None)
+        .await
+        .expect("create_pipeline should succeed");
+
+    assert_eq!(
+        created.target_lag,
+        Some(pipelines::TargetLag::Lag { minutes: 10 })
+    );
+    let read = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("get_pipeline should succeed")
+        .expect("pipeline should exist");
+    assert_eq!(
+        read.target_lag,
+        Some(pipelines::TargetLag::Lag { minutes: 10 })
+    );
+    // The wire form is plan D2's internally tagged union.
+    let wire = serde_json::to_value(&read).expect("serialize Pipeline");
+    assert_eq!(wire["targetLag"]["kind"], "lag");
+    assert_eq!(wire["targetLag"]["minutes"], 10);
+
+    let mut downstream = input();
+    downstream.name = "downstream-orders".to_owned();
+    downstream.target_lag = Some(pipelines::TargetLag::Downstream);
+    let created = pipelines::create_pipeline(&pool, &downstream, None)
+        .await
+        .expect("create_pipeline should succeed");
+    assert_eq!(created.target_lag, Some(pipelines::TargetLag::Downstream));
+    let wire = serde_json::to_value(&created).expect("serialize Pipeline");
+    assert_eq!(wire["targetLag"]["kind"], "downstream");
+
+    // A pipeline created without a lag reports an honest `null`, not a
+    // missing field (the console reads one shape on every row).
+    let plain = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+    assert_eq!(plain.target_lag, None);
+    let wire = serde_json::to_value(&plain).expect("serialize Pipeline");
+    assert!(wire["targetLag"].is_null());
+    Ok(())
+}
+
+/// The orchestrator's factory round-trip carries the lag too: a pipeline
+/// with a lag must be recognizable as one from `GET
+/// /api/pipelines/runnable`, or the factory cannot apply plan D3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn runnable_pipelines_carry_their_target_lag(pool: PgPool) -> sqlx::Result<()> {
+    let mut with_lag = input();
+    with_lag.name = "runnable-lagged".to_owned();
+    with_lag.target_lag = Some(pipelines::TargetLag::Lag { minutes: 5 });
+    let created = pipelines::create_pipeline(&pool, &with_lag, None)
+        .await
+        .expect("create should succeed");
+    pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .expect("mark ready")
+        .expect("row should come back");
+
+    let list = pipelines::list_runnable_pipelines(&pool)
+        .await
+        .expect("list_runnable_pipelines should succeed");
+    let row = list
+        .iter()
+        .find(|p| p.id == created.id)
+        .expect("the ready pipeline is runnable");
+    assert_eq!(
+        row.target_lag,
+        Some(pipelines::TargetLag::Lag { minutes: 5 })
+    );
+    Ok(())
+}
+
+/// The store-wide floor and ceiling, and the whole-minute rule, are
+/// enforced by the column CHECK — the route refuses out-of-range bodies
+/// with a 400 first, but the database is the boundary that no caller can
+/// route around.
+#[sqlx::test(migrations = "../../migrations")]
+async fn target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+
+    for accepted in [60_i32, 604_800] {
+        sqlx::query("UPDATE pipeline_definition SET target_lag_seconds = $2 WHERE id = $1")
+            .bind(&created.id)
+            .bind(accepted)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{accepted} seconds must be accepted: {e}"));
+    }
+    // 59 s is under the 1-minute floor, 604801 over the 7-day ceiling, and
+    // 90 s is inside the range but not a whole number of minutes — the
+    // wire format has no way to ask for it.
+    for refused in [59_i32, 90, 604_801] {
+        let result =
+            sqlx::query("UPDATE pipeline_definition SET target_lag_seconds = $2 WHERE id = $1")
+                .bind(&created.id)
+                .bind(refused)
+                .execute(&pool)
+                .await;
+        assert!(
+            result.is_err(),
+            "{refused} seconds must be refused by the CHECK"
+        );
+    }
+    Ok(())
+}
+
+/// `downstream` AND a number of minutes is a contradiction; the table
+/// CHECK refuses the pair whichever caller writes it (a route-level check
+/// would not).
+#[sqlx::test(migrations = "../../migrations")]
+async fn target_lag_downstream_and_seconds_cannot_both_be_set(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+    let result = sqlx::query(
+        "UPDATE pipeline_definition SET target_lag_seconds = 600, target_lag_downstream = true \
+         WHERE id = $1",
+    )
+    .bind(&created.id)
+    .execute(&pool)
+    .await;
+    assert!(result.is_err(), "both kinds set at once must be refused");
+
+    // `downstream` alone, and a number alone, are both fine.
+    sqlx::query("UPDATE pipeline_definition SET target_lag_downstream = true WHERE id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await
+        .expect("downstream alone is a valid kind");
+    Ok(())
+}
+
+/// `set_target_lag` clears both columns when the pipeline goes back to no
+/// lag, which is what makes plan D3's AC8 ("remove the target lag, the
+/// pipeline goes back to its schedule") true: the stored `schedule` was
+/// never touched while the lag was set.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_target_lag_clears_both_columns_and_leaves_the_schedule_alone(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+    assert_eq!(created.schedule, "manual");
+
+    let set = pipelines::set_target_lag(
+        &pool,
+        &created.id,
+        Some(pipelines::TargetLag::Lag { minutes: 7 }),
+    )
+    .await
+    .expect("set_target_lag should succeed")
+    .expect("the pipeline should come back");
+    assert_eq!(
+        set.target_lag,
+        Some(pipelines::TargetLag::Lag { minutes: 7 })
+    );
+    assert_eq!(set.schedule, "manual", "the stored schedule is untouched");
+
+    let cleared = pipelines::set_target_lag(&pool, &created.id, None)
+        .await
+        .expect("clearing should succeed")
+        .expect("the pipeline should come back");
+    assert_eq!(cleared.target_lag, None);
+    let stored: (Option<i32>, bool) = sqlx::query_as(
+        "SELECT target_lag_seconds, target_lag_downstream FROM pipeline_definition WHERE id = $1",
+    )
+    .bind(&created.id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored, (None, false));
+
+    // An unknown id is `None`, the route's 404 — never a silent insert.
+    assert!(
+        pipelines::set_target_lag(&pool, "pl-nope", None)
+            .await
+            .expect("an unknown id is a query miss, not an error")
+            .is_none()
+    );
+    Ok(())
+}
+
+/// `pipeline_lag_state` carries the pipeline's tenant on insert, so a
+/// tenant-scoped read is one indexed lookup, and the row disappears with
+/// the pipeline it describes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lag_state_stamps_the_tenant_and_is_deleted_with_the_pipeline(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_id: Uuid = create_tenant(&pool, &tenant_input("lag-tenant"))
+        .await
+        .unwrap_or_else(|e| panic!("create tenant: {e}"))
+        .id
+        .parse()
+        .unwrap_or_else(|e| panic!("tenant id is a uuid: {e}"));
+    let mut owned = input();
+    owned.name = "lag-owned".to_owned();
+    owned.tenant_id = Some(tenant_id);
+    let created = pipelines::create_pipeline(&pool, &owned, None)
+        .await
+        .expect("create_pipeline should succeed");
+
+    // Postgres `timestamptz` stores microseconds, so the fixture clock is
+    // truncated to microseconds before it is compared on the way back —
+    // otherwise the assertion would fail on precision the column cannot
+    // keep rather than on a wrong value.
+    let wall = time::OffsetDateTime::now_utc();
+    let nanos = u32::try_from(wall.nanosecond() / 1_000 * 1_000)
+        .expect("microseconds fit in u32 by construction");
+    let now = wall
+        .replace_nanosecond(nanos)
+        .expect("a microsecond count is always in range");
+    let update = pipelines::LagStateUpdate {
+        pipeline_id: created.id.clone(),
+        tenant_id: Some(tenant_id),
+        consumed_tokens: None,
+        consumed_at: None,
+        pending_since: Some(now),
+        requested_run_key: Some("lag:pl-x:abc".to_owned()),
+        requested_tokens: Some(serde_json::json!({"bronze.orders": "iceberg:1"})),
+        last_check_at: now,
+        last_status: "behind".to_owned(),
+        behind_streak: 2,
+    };
+    let written = pipelines::upsert_lag_state(&pool, &update)
+        .await
+        .expect("the first check inserts");
+    assert_eq!(written.tenant_id, Some(tenant_id));
+    assert_eq!(written.last_status.as_deref(), Some("behind"));
+    assert_eq!(written.behind_streak, 2);
+    assert_eq!(written.requested_run_key.as_deref(), Some("lag:pl-x:abc"));
+
+    let read = pipelines::get_lag_state(&pool, &created.id)
+        .await
+        .expect("get_lag_state should succeed")
+        .expect("the row exists after a check");
+    assert_eq!(read.requested_tokens, update.requested_tokens);
+
+    // A second check overwrites rather than duplicating.
+    let again = pipelines::LagStateUpdate {
+        last_status: "met".to_owned(),
+        behind_streak: 0,
+        pending_since: None,
+        requested_run_key: None,
+        requested_tokens: None,
+        consumed_tokens: Some(serde_json::json!({"bronze.orders": "iceberg:1"})),
+        consumed_at: Some(now),
+        ..update
+    };
+    pipelines::upsert_lag_state(&pool, &again)
+        .await
+        .expect("the second check updates");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM pipeline_lag_state WHERE pipeline_id = $1",
+    )
+    .bind(&created.id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 1, "one row per pipeline, however many checks");
+    let after = pipelines::get_lag_state(&pool, &created.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(after.last_status.as_deref(), Some("met"));
+    assert!(after.requested_run_key.is_none());
+    assert_eq!(after.consumed_at, Some(now));
+
+    // `ON DELETE CASCADE` (migration 0077): no orphan measurement.
+    assert!(
+        pipelines::delete_pipeline(&pool, &created.id, None)
+            .await
+            .expect("delete_pipeline should succeed")
+    );
+    let gone = pipelines::get_lag_state(&pool, &created.id)
+        .await
+        .expect("get_lag_state should succeed");
+    assert!(gone.is_none(), "the lag state dies with its pipeline");
+    Ok(())
+}
+
+/// The list read used by the list and detail routes (plan D8) returns every
+/// requested pipeline's state in one query, and says nothing about the
+/// ones that have never been checked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_lag_states_returns_one_entry_per_checked_pipeline(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+    let now = time::OffsetDateTime::now_utc();
+    pipelines::upsert_lag_state(
+        &pool,
+        &pipelines::LagStateUpdate {
+            pipeline_id: created.id.clone(),
+            tenant_id: None,
+            consumed_tokens: None,
+            consumed_at: None,
+            pending_since: None,
+            requested_run_key: None,
+            requested_tokens: None,
+            last_check_at: now,
+            last_status: "met".to_owned(),
+            behind_streak: 0,
+        },
+    )
+    .await
+    .expect("first check");
+
+    let map = pipelines::list_lag_states(&pool, &[created.id.as_str(), "pl-unchecked"])
+        .await
+        .expect("list_lag_states should succeed");
+    assert_eq!(map.len(), 1);
+    assert_eq!(
+        map.get(&created.id).and_then(|s| s.last_status.clone()),
+        Some("met".to_owned())
+    );
+    assert!(
+        pipelines::list_lag_states(&pool, &[])
+            .await
+            .expect("an empty id list is not a query")
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// `last_status` is a fixed vocabulary: a check that wrote anything else
+/// (a typo, a new kind nobody taught the page) is refused at the column
+/// rather than surfacing as a status no client knows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lag_state_last_status_check_refuses_an_unknown_status(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create_pipeline should succeed");
+    let result = pipelines::upsert_lag_state(
+        &pool,
+        &pipelines::LagStateUpdate {
+            pipeline_id: created.id.clone(),
+            tenant_id: None,
+            consumed_tokens: None,
+            consumed_at: None,
+            pending_since: None,
+            requested_run_key: None,
+            requested_tokens: None,
+            last_check_at: time::OffsetDateTime::now_utc(),
+            last_status: "mostly-fine".to_owned(),
+            behind_streak: 0,
+        },
+    )
+    .await;
+    assert!(result.is_err(), "an unknown status must be refused");
     Ok(())
 }
