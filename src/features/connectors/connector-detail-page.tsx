@@ -30,6 +30,7 @@ import { connectorService } from "@/services"
 import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOAuthPanel, oauthSignIn } from "./connector-oauth-panel"
 import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
@@ -220,6 +221,10 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // What this installation offers for a credential. A failed read only means
   // the "Secret manager" fact is left out; nothing else on the page needs it.
   const credentialSettings = useService((s) => connectorService.getCredentialSettings(s), [])
+  // Only a connector that signs in with OAuth shows the Sign in panel
+  // (`SRC-12` part C); its ingest spec says which one that is.
+  const ingestSpec = useService((s) => connectorService.getIngestSpec(id, s), [id])
+  const oauth = ingestSpec.status === "success" ? oauthSignIn(ingestSpec.data) : null
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -358,7 +363,9 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         onDeleted={() => router.push("/connectors")}
+        oauth={oauth}
       />
+      {oauth ? <ConnectorOAuthPanel connectorId={id} onChanged={state.reload} /> : null}
       {testAction.data ? <TestNotice result={testAction.data} /> : null}
       <div ref={tabsRootRef}>
         <Tabs value={tab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">

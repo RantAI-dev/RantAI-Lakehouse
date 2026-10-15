@@ -225,6 +225,58 @@ describe("ConnectorDetailPage", () => {
     expect(screen.queryByText("Secret manager")).toBeNull()
   })
 
+  /** `SRC-12` part C: a REST connector that signs in with OAuth gets the Sign in panel; no other connector does. */
+  const OAUTH_SPEC = {
+    ...SPEC,
+    adapter: "rest",
+    dial: {
+      baseUrl: "https://api.example.com",
+      auth: {
+        type: "oauth2_authorization_code",
+        clientId: "app-1",
+        authorizeUrl: "https://login.example.com/authorize",
+        tokenUrl: "https://login.example.com/token",
+        scopes: [],
+      },
+      pagination: { type: "none" },
+      endpoints: [{ path: "/items", recordsPath: null }],
+    },
+  }
+
+  it("shows the Sign in panel for a connector that signs in with OAuth, and asks for its status", async () => {
+    const { count } = stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(OAUTH_SPEC),
+      "GET /api/connectors/conn-a/oauth": () =>
+        json({ signedIn: false, callbackUrl: "https://console.test/api/connectors/oauth/callback", revocationConfigured: false }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    expect(await screen.findByText("Not signed in")).toBeDefined()
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDefined()
+    expect(count("GET /api/connectors/conn-a/oauth")).toBeGreaterThan(0)
+  })
+
+  it("shows no Sign in panel, and never asks for OAuth status, for any other connector", async () => {
+    const { count } = stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    await settle()
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull()
+    expect(count("GET /api/connectors/conn-a/oauth")).toBe(0)
+  })
+
+  it("tells the person, before deleting an OAuth connector, whether the provider can be told", async () => {
+    stubFetch({
+      "GET /api/connectors/conn-a/ingest-spec": () => json(OAUTH_SPEC),
+      "GET /api/connectors/conn-a/oauth": () =>
+        json({ signedIn: true, callbackUrl: null, revocationConfigured: false }),
+    })
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByText("Signed in")
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText(/the token stays valid there until it expires/)).toBeDefined()
+  })
+
   it("marks a paused connector in the header and holds Run now back with the reason", async () => {
     url.search = "?tab=ingest"
     stubFetch({}, {

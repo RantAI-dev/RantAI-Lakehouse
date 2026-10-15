@@ -653,6 +653,23 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // holds; a user can hold it too (Data Engineer), so the handler adds
     // `schema_changes::require_orchestrator`, as the run reports above do.
     ("POST", "/api/connectors/{id}/discovery-results", Policy::RequiresPermission("ingest:read")),
+    // `SRC-12` part C: signing a REST connector in with `OAuth2`. A person
+    // reads the sign-in status, starts a sign-in and signs out; the tenant gate
+    // is the route layer.
+    ("GET",  "/api/connectors/{id}/oauth", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/oauth/start", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/oauth/sign-out", Policy::RequiresPermission("connector:manage")),
+    // The provider's redirect carries the person's session cookie and nothing
+    // else, so it needs a signed-in user and no more here: it names no connector.
+    // The handler consumes the one-time `state`, then requires that user to be
+    // the one who started the sign-in, to belong to the connector's tenant and to
+    // hold `connector:manage` (tests/connector_oauth_flow.rs).
+    ("GET",  "/api/connectors/oauth/callback", Policy::RequiresAuth),
+    // The orchestrator reports a refresh token the provider rotated.
+    // `ingest:read` is the one permission its service identity holds; a user can
+    // hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("POST", "/api/connectors/{id}/oauth/refresh-token", Policy::RequiresPermission("ingest:read")),
     // A person reads what changed at the source and approves what waits
     // (`SRC-8` decision D6). The tenant gate is the route layer.
     ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),

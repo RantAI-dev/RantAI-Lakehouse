@@ -86,6 +86,12 @@ export type CredentialSlot = {
    * secret, even though it is stored like one). */
   plain?: boolean
   placeholder?: string
+  /**
+   * The value is not typed: it arrives when the person signs in at the
+   * provider, from the connector page (`SRC-12` part C: the OAuth refresh
+   * token). The form shows no field for it and sends no value for it.
+   */
+  signIn?: boolean
 }
 
 export type CredentialSlots = { primary: CredentialSlot; secondary: CredentialSlot | null }
@@ -137,6 +143,13 @@ export function credentialSlotsFor(adapter: string | null, dial: Record<string, 
           return {
             primary: { kind: "access_key", label: "Client ID", plain: true },
             secondary: { kind: "secret_key", label: "Client secret" },
+          }
+        case "oauth2_authorization_code":
+          // The client id is part of the connection settings; the client secret
+          // is typed, the refresh token comes from signing in.
+          return {
+            primary: { kind: "secret_key", label: "Client secret" },
+            secondary: { kind: "token", label: "Refresh token", signIn: true },
           }
         default:
           return { primary: { kind: "api_key", label: "API key" }, secondary: null }
@@ -191,6 +204,7 @@ export function DialFormFor({
   typeName,
   dial,
   onChange,
+  oauthCallbackUrl,
 }: {
   adapter: string | null
   /** `selectedType.name` — needed alongside `adapter` because Oracle
@@ -201,6 +215,8 @@ export function DialFormFor({
   typeName: string | null
   dial: Record<string, unknown> | null
   onChange: (next: Record<string, unknown>) => void
+  /** `CredentialSettings.oauthCallbackUrl`: shown by the REST form's OAuth sign-in fields. */
+  oauthCallbackUrl?: string | null
 }) {
   // Oracle is the one type whose dial form is picked by NAME, not by
   // `adapter` alone -- see this function's `typeName` doc comment above.
@@ -241,6 +257,7 @@ export function DialFormFor({
         <RestDialForm
           value={dial as unknown as RestDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          oauthCallbackUrl={oauthCallbackUrl}
         />
       )
     case "sheets":
@@ -308,20 +325,22 @@ export function credentialProblems({
   referenceManager?: CredentialSettings["secretManager"]
 }): { primary: string | null; secondary: string | null } {
   if (noCredential) return { primary: null, secondary: null }
-  const nothingTyped = primaryValue === "" && (!slots.secondary || secondaryValue === "")
+  // A slot filled by signing in is never typed, so it is never a problem here.
+  const typedSecondary = slots.secondary && !slots.secondary.signIn ? slots.secondary : null
+  const nothingTyped = primaryValue === "" && (!typedSecondary || secondaryValue === "")
   if (optional && nothingTyped) return { primary: null, secondary: null }
   if (referenceManager) {
     const check = (reference: string) =>
       reference === "" ? "Required." : referenceProblem(referenceManager, reference)
     return {
       primary: check(primaryValue),
-      secondary: slots.secondary ? check(secondaryValue) : null,
+      secondary: typedSecondary ? check(secondaryValue) : null,
     }
   }
   return {
     primary: credentialValueProblem(normalizedCredential(slots.primary, primaryValue)),
-    secondary: slots.secondary
-      ? credentialValueProblem(normalizedCredential(slots.secondary, secondaryValue))
+    secondary: typedSecondary
+      ? credentialValueProblem(normalizedCredential(typedSecondary, secondaryValue))
       : null,
   }
 }
@@ -373,7 +392,8 @@ export function CredentialFields({
   // With a secret manager set up, the form offers "Reference a secret"; the
   // operator can turn typing a value off, which leaves only the reference.
   const showReference = manager !== null && referenceMode
-  const pair = slots.secondary !== null && !slots.primary.multiline && !slots.secondary.multiline
+  const typedSecondary = slots.secondary && !slots.secondary.signIn ? slots.secondary : null
+  const pair = typedSecondary !== null && !slots.primary.multiline && !typedSecondary.multiline
   const field = (id: string, slot: CredentialSlot, value: string, onChange: (value: string) => void) =>
     showReference ? (
       <SecretReferenceField key={`${id}-${credentialSlotsKey(slots)}`} manager={manager} idPrefix={id} onChange={onChange} />
@@ -419,14 +439,20 @@ export function CredentialFields({
       >
         {field("credential-primary", slots.primary, primaryValue, onPrimaryValueChange)}
       </Field>
-      {slots.secondary ? (
+      {typedSecondary ? (
         <Field
-          label={showReference ? `${slots.secondary.label} (reference)` : slots.secondary.label}
+          label={showReference ? `${typedSecondary.label} (reference)` : typedSecondary.label}
           htmlFor={showReference ? undefined : "credential-secondary"}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
-          {field("credential-secondary", slots.secondary, secondaryValue, onSecondaryValueChange)}
+          {field("credential-secondary", typedSecondary, secondaryValue, onSecondaryValueChange)}
         </Field>
+      ) : null}
+      {slots.secondary?.signIn ? (
+        <p className="text-xs text-muted-foreground">
+          The {slots.secondary.label.toLowerCase()} is not entered here: you get it by signing in at the
+          provider, from the connector page, once the connector is saved.
+        </p>
       ) : null}
       <p className={cn("text-xs text-muted-foreground", pair && "sm:col-span-2")}>
         {showReference

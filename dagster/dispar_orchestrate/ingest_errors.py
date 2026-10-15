@@ -63,6 +63,7 @@ from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
 from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
+from dispar_orchestrate.adapters import rest as rest_adapter
 from dispar_orchestrate.adapters.sink import UnsupportedLoadMode
 from dispar_orchestrate.column_gate import UnsupportedColumnType
 from dispar_orchestrate.secret_resolver import SecretRefRejected
@@ -412,6 +413,11 @@ def _classify_one(exc: BaseException) -> str | None:
         return SETTING_REJECTED
     if isinstance(exc, ssrf_guard.SsrfBlocked):
         return ADDRESS_REFUSED
+    # SRC-12 part C: the provider refused the refresh token, or nobody has
+    # signed in. The same word as a refused password: not retried, and the
+    # connector page offers Sign in.
+    if isinstance(exc, rest_adapter.OAuthSignInRefused):
+        return SIGN_IN_REFUSED
     if isinstance(
         exc,
         (UnsupportedColumnType, UnsupportedLoadMode, dedup_adapter.DedupRefused, UnsupportedKafkaAuth),

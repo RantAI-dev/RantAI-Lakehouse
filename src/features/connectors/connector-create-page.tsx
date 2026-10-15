@@ -33,6 +33,7 @@ import { DIRECTION_LABEL } from "./connectors-columns"
 import { connectionReviewItems } from "./connector-review"
 import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOAuthPanel } from "./connector-oauth-panel"
 import { ConnectorTypePicker, DirectionPicker, SelectedTypeSummary } from "./connector-type-picker"
 
 // Only 4 pre-creation steps, not the 5 this file used to have: the old
@@ -121,6 +122,10 @@ export function ConnectorCreatePage() {
   // A value typed for one layout never carries into another.
   const slots = credentialSlotsFor(adapter, dial)
   const slotsKey = credentialSlotsKey(slots)
+  // OAuth authorization code (`SRC-12` part C): the refresh token comes from
+  // signing in, so the create request carries no values and the client secret
+  // is saved right after, like a reference.
+  const signInConnector = Boolean(slots.secondary?.signIn)
   React.useEffect(() => {
     setPrimaryValue("")
     setSecondaryValue("")
@@ -151,19 +156,30 @@ export function ConnectorCreatePage() {
     )
   )
 
-  const setReference = useServiceAction(
+  // A credential that cannot go in the create request is set once the
+  // connector exists, by the same probe-first route as an edit: a REFERENCE
+  // (named after the connector is created), or, for a sign-in connector, the
+  // client secret (the create request needs both slots or none, and the
+  // refresh token only comes from signing in).
+  const setCredentialAfterCreate = useServiceAction(
     withNotify(
       {
-        success: "Secret reference saved",
-        error: "The connector was created, but the secret reference was not saved",
+        success: referenceMode ? "Secret reference saved" : "Client secret saved",
+        error: referenceMode
+          ? "The connector was created, but the secret reference was not saved"
+          : "The connector was created, but the client secret was not saved",
       },
       (signal, input: { id: string; primary: string; secondary: string }) =>
         connectorService.setCredential(
           input.id,
-          {
-            primary: { reference: input.primary },
-            ...(slots.secondary ? { secondary: { reference: input.secondary } } : {}),
-          },
+          referenceMode
+            ? {
+                primary: { reference: input.primary },
+                ...(slots.secondary && !slots.secondary.signIn
+                  ? { secondary: { reference: input.secondary } }
+                  : {}),
+              }
+            : { primary: { kind: slots.primary.kind, value: normalizedCredential(slots.primary, input.primary) } },
           signal
         )
     )
@@ -196,7 +212,7 @@ export function ConnectorCreatePage() {
       ...(slots.secondary ? { secondary: slots.secondary.kind } : {}),
       // A reference is not a value to store: it is set once the connector
       // exists, by the same probe-first route as an edit (below).
-      ...(usesNoCredential || referenceMode
+      ...(usesNoCredential || referenceMode || signInConnector
         ? {}
         : {
             values: {
@@ -235,8 +251,8 @@ export function ConnectorCreatePage() {
       // credential and says so: the same reference can be set from its edit
       // page.
       const referenced =
-        saved && referenceMode && !usesNoCredential
-          ? await setReference.run({
+        saved && (referenceMode || signInConnector) && !usesNoCredential
+          ? await setCredentialAfterCreate.run({
               id: result.id,
               primary: primaryValue,
               secondary: secondaryValue,
@@ -328,6 +344,8 @@ export function ConnectorCreatePage() {
           </div>
         </SectionCard>
 
+        {signInConnector && !testSkipped ? <ConnectorOAuthPanel connectorId={createdId} /> : null}
+
         {!testSkipped ? (
           <SectionCard title="What to ingest" description="Pick the tables this connector copies into Bronze, then run it.">
             <ConnectorIngestPanel connectorId={createdId} connectorName={name.trim()} />
@@ -399,7 +417,13 @@ export function ConnectorCreatePage() {
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
-              <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} />
+              <DialFormFor
+                adapter={adapter}
+                typeName={selectedType?.name ?? null}
+                dial={dial}
+                onChange={setDial}
+                oauthCallbackUrl={credentialSettings?.oauthCallbackUrl}
+              />
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading

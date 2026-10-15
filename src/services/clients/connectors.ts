@@ -16,6 +16,9 @@ import type {
   IngestRunResult,
   IngestSpec,
   IngestSpecInput,
+  OAuthSignOut,
+  OAuthStart,
+  OAuthStatus,
   ProbeHistoryResponse,
   ResumeConnectorResponse,
   RotateConnectorSecretRequest,
@@ -124,6 +127,15 @@ export const postgresConnectorService: ConnectorService = {
   },
   getCredentialSettings(signal) {
     return getJson<CredentialSettings>("/api/connectors/credential-settings", { signal });
+  },
+  getOAuthStatus(id, signal) {
+    return getJson<OAuthStatus>(`/api/connectors/${encodeURIComponent(id)}/oauth`, { signal });
+  },
+  startOAuth(id, signal) {
+    return postJson<OAuthStart>(`/api/connectors/${encodeURIComponent(id)}/oauth/start`, undefined, signal);
+  },
+  signOutOAuth(id, signal) {
+    return postJson<OAuthSignOut>(`/api/connectors/${encodeURIComponent(id)}/oauth/sign-out`, undefined, signal);
   },
   listIngestible(signal) {
     return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });

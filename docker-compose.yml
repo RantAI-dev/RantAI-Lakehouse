@@ -401,6 +401,18 @@ services:
       # connectors can only reference a secret in the secret manager. Anything
       # else keeps typing possible. Read by `lakehouse-api` only.
       CONNECTOR_TYPED_CREDENTIALS: ${CONNECTOR_TYPED_CREDENTIALS:-}
+      # SRC-12 part C: the address the OAuth provider sends the person's
+      # browser back to (this product's own callback, `/api/connectors/oauth/
+      # callback` on the console's address). Operator-set and never taken from
+      # a request; empty refuses OAuth sign-in with a message naming this
+      # setting. Read by `lakehouse-api` only.
+      CONNECTOR_OAUTH_REDIRECT_URI: ${CONNECTOR_OAUTH_REDIRECT_URI:-}
+      # SRC-12 part C, GATE ONLY: `true` admits an `http://` OAuth token,
+      # revocation and sign-in address (the acceptance gate runs its own
+      # provider without a certificate). Empty (off) is the only value a real
+      # installation uses: those addresses carry a client secret or a refresh
+      # token. The private-address refusal applies either way.
+      CONNECTOR_OAUTH_ALLOW_HTTP: ${CONNECTOR_OAUTH_ALLOW_HTTP:-}
 
       # SEC-10: alert and digest webhooks refuse the same private/internal
       # addresses as the connector tests above, never follow a redirect, and
@@ -1855,6 +1867,10 @@ services:
       # (see the block there), read by `secret_manager.py` when a run starts.
       SECRET_MANAGER: ${SECRET_MANAGER:-}
       SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
+      # SRC-12 part C, GATE ONLY: the same switch as `lakehouse-api`'s, read by
+      # `adapters/rest.py` before a token request. Empty (off) on a real
+      # installation: a client secret and a refresh token go to that address.
+      CONNECTOR_OAUTH_ALLOW_HTTP: ${CONNECTOR_OAUTH_ALLOW_HTTP:-}
       VAULT_ADDR: ${VAULT_ADDR:-}
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}

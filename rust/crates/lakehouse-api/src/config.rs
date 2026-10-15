@@ -246,6 +246,22 @@ pub struct Config {
     /// "reference a secret in the secret manager" as the only way to give a
     /// connector a credential (`SRC-12` decision 2).
     pub connector_typed_credentials: bool,
+    /// The address of this product's own OAuth callback as the provider and the
+    /// person's browser reach it (`CONNECTOR_OAUTH_REDIRECT_URI`, for example
+    /// `https://console.example.com/api/connectors/oauth/callback`; `SRC-12`
+    /// part C). Operator-set, never taken from a request (the same open-redirect
+    /// reasoning as `oidc_redirect_uri`). Unset: starting an OAuth sign-in is
+    /// refused with a message that names this setting. It is also the address the
+    /// connector form shows, to be copied into the provider's app settings.
+    pub connector_oauth_redirect_uri: Option<String>,
+    /// Gate-only switch (`CONNECTOR_OAUTH_ALLOW_HTTP`, default off; only the exact
+    /// word `true` turns it on): admit `http://` token, revocation and sign-in
+    /// addresses of an `OAuth2` connector. Every address the product dials for
+    /// `OAuth2` carries a client secret or a refresh token, so `https` is the
+    /// rule; this exists so the acceptance gate (`ops/g6`) can run its own
+    /// provider on a private network without a certificate. Never set it on a
+    /// real installation. The address check (`resolve_checked`) applies either way.
+    pub connector_oauth_allow_http: bool,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -947,6 +963,14 @@ impl std::fmt::Debug for Config {
                 &self.connector_typed_credentials,
             )
             .field(
+                "connector_oauth_redirect_uri",
+                &self.connector_oauth_redirect_uri,
+            )
+            .field(
+                "connector_oauth_allow_http",
+                &self.connector_oauth_allow_http,
+            )
+            .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
@@ -1268,6 +1292,10 @@ impl Config {
                 "CONNECTOR_TYPED_CREDENTIALS",
                 ConfigError::UnsupportedConnectorTypedCredentials,
             )?,
+            connector_oauth_redirect_uri: truthy(env, "CONNECTOR_OAUTH_REDIRECT_URI"),
+            connector_oauth_allow_http: env
+                .get("CONNECTOR_OAUTH_ALLOW_HTTP")
+                .is_some_and(|v| v == "true"),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -1423,6 +1451,15 @@ impl Config {
         crate::internal_hosts::InternalHosts {
             allow_all: self.connector_probe_allow_internal_hosts,
             allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
+
+    /// What an `OAuth2` connector may dial (`SRC-12` part C): `https` only,
+    /// unless the gate-only switch admits `http`.
+    #[must_use]
+    pub fn oauth_settings(&self) -> crate::connector_oauth::OAuthSettings {
+        crate::connector_oauth::OAuthSettings {
+            allow_http: self.connector_oauth_allow_http,
         }
     }
 
@@ -2330,6 +2367,35 @@ mod tests {
         assert_eq!(
             Config::from_map(&typo).unwrap_err(),
             ConfigError::UnsupportedConnectorTypedCredentials("no".to_owned())
+        );
+    }
+
+    /// `SRC-12` part C: the callback address is the operator's; the gate-only
+    /// `http` switch is off unless the operator says exactly `true`.
+    #[test]
+    fn the_oauth_callback_is_the_operators_and_http_is_off_unless_exactly_true() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_oauth_redirect_uri, None);
+        assert!(!cfg.connector_oauth_allow_http);
+        for off in ["", "TRUE", "1", "yes", "false"] {
+            let env = HashMap::from([("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), off.to_owned())]);
+            assert!(
+                !Config::from_map(&env).unwrap().connector_oauth_allow_http,
+                "{off:?} must not turn it on"
+            );
+        }
+        let on = HashMap::from([
+            ("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), "true".to_owned()),
+            (
+                "CONNECTOR_OAUTH_REDIRECT_URI".to_owned(),
+                "https://console.example.com/api/connectors/oauth/callback".to_owned(),
+            ),
+        ]);
+        let cfg = Config::from_map(&on).unwrap();
+        assert!(cfg.connector_oauth_allow_http);
+        assert_eq!(
+            cfg.connector_oauth_redirect_uri.as_deref(),
+            Some("https://console.example.com/api/connectors/oauth/callback")
         );
     }
 

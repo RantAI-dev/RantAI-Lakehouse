@@ -220,10 +220,10 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
       // A reference names a place and is sent as it is; the server reads it
       // once and tests the connection before saving it.
       values.primary = { reference: primaryValue }
-      if (slots.secondary) values.secondary = { reference: secondaryValue }
+      if (slots.secondary && !slots.secondary.signIn) values.secondary = { reference: secondaryValue }
     } else if (credentialTyped) {
       values.primary = { kind: slots.primary.kind, value: normalizedCredential(slots.primary, primaryValue) }
-      if (slots.secondary) {
+      if (slots.secondary && !slots.secondary.signIn) {
         values.secondary = {
           kind: slots.secondary.kind,
           value: normalizedCredential(slots.secondary, secondaryValue),
@@ -453,7 +453,13 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
-              <DialFormFor adapter={adapter} typeName={detail.type} dial={dial} onChange={setDial} />
+              <DialFormFor
+                adapter={adapter}
+                typeName={detail.type}
+                dial={dial}
+                onChange={setDial}
+                oauthCallbackUrl={settings.oauthCallbackUrl}
+              />
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading

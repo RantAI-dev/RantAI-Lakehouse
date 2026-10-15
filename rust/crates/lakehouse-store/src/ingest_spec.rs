@@ -177,7 +177,43 @@ pub enum RestAuth {
     #[serde(rename = "oauth2_client_credentials")]
     Oauth2ClientCredentials {
         /// The token endpoint URL to exchange credentials at.
+        ///
+        /// `SRC-12` part C: the wire name is `tokenUrl`, the one the console
+        /// and `adapters/rest.py` use. The enum-level `rename_all` renames
+        /// variants, not the fields of a variant, so without this rename the
+        /// field only parsed as `token_url` and a dial written by the console
+        /// was refused. `token_url` stays accepted for a row written that way.
+        #[serde(rename = "tokenUrl", alias = "token_url")]
         token_url: String,
+    },
+    /// `OAuth2` authorization-code grant with PKCE (`S256`; `SRC-12` part C,
+    /// decision 6). A person signs in at the provider once; the refresh token
+    /// the provider returns is the connector's secondary credential (sealed,
+    /// part A) and the client secret its primary one (`secret_field_names`).
+    ///
+    /// Every address here is configuration, not a secret. `token_url` and
+    /// `revocation_url` are dialled by the product and receive the client
+    /// secret and the refresh token, so they are part of the target identity
+    /// ([`Dial::target_identity`]); `authorize_url` is only handed to the
+    /// person's browser.
+    #[serde(rename = "oauth2_authorization_code")]
+    Oauth2AuthorizationCode {
+        /// The app's client id (public by the protocol's definition).
+        #[serde(rename = "clientId")]
+        client_id: String,
+        /// The provider's sign-in page. Opened by the browser, never dialled
+        /// by the product.
+        #[serde(rename = "authorizeUrl")]
+        authorize_url: String,
+        /// The provider's token endpoint.
+        #[serde(rename = "tokenUrl")]
+        token_url: String,
+        /// The provider's revocation endpoint (RFC 7009), when it has one.
+        #[serde(rename = "revocationUrl", default)]
+        revocation_url: Option<String>,
+        /// The scopes asked for, each one a single token.
+        #[serde(default)]
+        scopes: Vec<String>,
     },
     /// HTTP Basic authentication.
     Basic,
@@ -193,6 +229,7 @@ impl RestAuth {
             RestAuth::ApiKey { .. } => "api_key",
             RestAuth::Bearer => "bearer",
             RestAuth::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
+            RestAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
             RestAuth::Basic => "basic",
         }
     }
@@ -507,7 +544,11 @@ impl Dial {
                 Ok(Dial::Sftp(dial))
             }
             "files" => Ok(Dial::Files(parse_dial(adapter, raw)?)),
-            "rest" => Ok(Dial::Rest(parse_dial(adapter, raw)?)),
+            "rest" => {
+                let dial: RestDial = parse_dial(adapter, raw)?;
+                validate_rest_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::Rest(dial))
+            }
             "sheets" => Ok(Dial::Sheets(parse_dial(adapter, raw)?)),
             other => Err(IngestSpecError::UnknownAdapter {
                 adapter: other.to_owned(),
@@ -657,7 +698,33 @@ impl Dial {
                 ],
             ),
             Dial::Rest(rest) => {
-                TargetIdentity::new("rest", vec![("baseUrl", origin_key(&rest.base_url))])
+                let mut parts = vec![("baseUrl", origin_key(&rest.base_url))];
+                // `SRC-12` part C: the token and revocation addresses receive
+                // the client secret and the refresh token, so moving either to
+                // another host is a re-point exactly as moving `baseUrl` is
+                // (`SEC-14`). A client-credentials connector's `tokenUrl` was
+                // not compared before; it is now, for the same reason.
+                match &rest.auth {
+                    RestAuth::Oauth2ClientCredentials { token_url } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                    }
+                    RestAuth::Oauth2AuthorizationCode {
+                        token_url,
+                        revocation_url,
+                        ..
+                    } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                        parts.push((
+                            "revocationUrl",
+                            revocation_url
+                                .as_deref()
+                                .map(origin_key)
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+                }
+                TargetIdentity::new("rest", parts)
             }
             Dial::Mongo(mongo) => TargetIdentity::new(
                 "mongodb",
@@ -883,6 +950,95 @@ fn split_host_port<'a>(
             )),
         }),
     }
+}
+
+/// The longest `OAuth2` address, client id or scope accepted.
+const MAX_OAUTH_FIELD_LEN: usize = 2048;
+/// The most scopes a dial may ask for.
+const MAX_OAUTH_SCOPES: usize = 50;
+
+/// Whether `value` is an `http(s)://` address with a host, no user name or
+/// password and no whitespace or control character. The scheme is not
+/// narrowed to `https` here: the store does not know the installation's
+/// settings. The API refuses `http` unless the operator's gate-only switch
+/// allows it (`routes::connectors::check_dial_ssrf`), and the orchestrator
+/// applies the same rule when it dials.
+fn is_plain_http_address(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+        && value.len() <= MAX_OAUTH_FIELD_LEN
+}
+
+/// Post-deserialize validation for a [`RestDial`]: the `OAuth2` addresses and
+/// names serde cannot check (`SRC-12` part C).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for an `OAuth2` address that is
+/// not a plain `http(s)` address, an empty or oversized client id, or a scope
+/// that is not a single token.
+fn validate_rest_dial_post_parse(adapter: &str, dial: &RestDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message.to_owned()),
+    };
+    match &dial.auth {
+        RestAuth::Oauth2ClientCredentials { token_url } => {
+            if !is_plain_http_address(token_url) {
+                return Err(refuse(
+                    "auth.tokenUrl must be an http(s):// address with a host and no user name or password",
+                ));
+            }
+        }
+        RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            authorize_url,
+            token_url,
+            revocation_url,
+            scopes,
+        } => {
+            if client_id.trim().is_empty()
+                || client_id.len() > MAX_OAUTH_FIELD_LEN
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(refuse("auth.clientId must be a non-empty name"));
+            }
+            for (field, value) in [
+                ("auth.authorizeUrl", Some(authorize_url)),
+                ("auth.tokenUrl", Some(token_url)),
+                ("auth.revocationUrl", revocation_url.as_ref()),
+            ] {
+                if value.is_some_and(|v| !is_plain_http_address(v)) {
+                    return Err(refuse(&format!(
+                        "{field} must be an http(s):// address with a host and no user name or password"
+                    )));
+                }
+            }
+            if scopes.len() > MAX_OAUTH_SCOPES
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || scope.len() > MAX_OAUTH_FIELD_LEN
+                        || scope
+                            .chars()
+                            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+                })
+            {
+                return Err(refuse(
+                    "auth.scopes must be a short list of single-word scopes",
+                ));
+            }
+        }
+        RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+    }
+    Ok(())
 }
 
 /// Post-deserialize application-level validation for an [`SqlDial`]:
@@ -1654,6 +1810,10 @@ pub fn secret_field_names(
         ("rest", Some("bearer")) => Some(&["token"]),
         ("rest", Some("basic")) => Some(&["username", "password"]),
         ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
+        // `SRC-12` part C: the client id is configuration in the dial, so the
+        // two secrets are the client secret (primary, typed or referenced)
+        // and the refresh token (secondary, written by the sign-in callback).
+        ("rest", Some("oauth2_authorization_code")) => Some(&["clientSecret", "refreshToken"]),
         ("kafka", Some("none")) => Some(&[]),
         ("sftp", Some("public_key")) => Some(&["privateKey"]),
         ("sheets", _) => Some(&["serviceAccountJson"]),
@@ -3280,5 +3440,167 @@ mod target_identity_tests {
         )
         .expect("valid");
         assert_eq!(without.excluded_columns, None);
+    }
+}
+
+/// `SRC-12` part C: the `OAuth2` dial shapes, their addresses, and what moves
+/// the target identity.
+#[cfg(test)]
+mod oauth_dial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{Dial, RestAuth, secret_field_names};
+    use serde_json::{Value, json};
+
+    fn rest(auth: &Value) -> Value {
+        json!({
+            "baseUrl": "https://api.example.com",
+            "auth": auth,
+            "pagination": { "type": "none" },
+            "endpoints": [{ "path": "/items" }],
+        })
+    }
+
+    fn code_auth() -> Value {
+        json!({
+            "type": "oauth2_authorization_code",
+            "clientId": "app-1",
+            "authorizeUrl": "https://login.example.com/authorize",
+            "tokenUrl": "https://login.example.com/token",
+            "revocationUrl": "https://login.example.com/revoke",
+            "scopes": ["read", "offline_access"],
+        })
+    }
+
+    #[test]
+    fn an_authorization_code_dial_parses_with_its_camel_case_names() {
+        let Dial::Rest(dial) = Dial::parse("rest", &rest(&code_auth())).expect("valid") else {
+            panic!("a rest dial");
+        };
+        let RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            revocation_url,
+            scopes,
+            ..
+        } = dial.auth
+        else {
+            panic!("an authorization-code auth");
+        };
+        assert_eq!(client_id, "app-1");
+        assert_eq!(
+            revocation_url.as_deref(),
+            Some("https://login.example.com/revoke")
+        );
+        assert_eq!(scopes, vec!["read", "offline_access"]);
+    }
+
+    #[test]
+    fn the_revocation_address_and_scopes_are_optional() {
+        let mut auth = code_auth();
+        auth.as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        auth.as_object_mut().expect("object").remove("scopes");
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+    }
+
+    #[test]
+    fn an_authorization_code_dial_needs_the_client_secret_and_the_refresh_token() {
+        assert_eq!(
+            secret_field_names("rest", Some("oauth2_authorization_code")),
+            Some(["clientSecret", "refreshToken"].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_client_credentials_token_address_parses_under_the_name_the_console_sends() {
+        let auth = json!({ "type": "oauth2_client_credentials", "tokenUrl": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+        // The name an earlier build accepted still parses.
+        let old = json!({ "type": "oauth2_client_credentials", "token_url": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&old)).is_ok());
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_plain_http_address_is_refused() {
+        for bad in [
+            "javascript:alert(1)",
+            "ftp://login.example.com/token",
+            "https://user:pw@login.example.com/token",
+            "https://",
+            "https://login.example.com/to ken",
+            "login.example.com/token",
+        ] {
+            for field in ["authorizeUrl", "tokenUrl", "revocationUrl"] {
+                let mut auth = code_auth();
+                auth[field] = json!(bad);
+                assert!(
+                    Dial::parse("rest", &rest(&auth)).is_err(),
+                    "{field} = {bad:?} must be refused"
+                );
+            }
+        }
+        let cc = json!({ "type": "oauth2_client_credentials", "tokenUrl": "file:///etc/passwd" });
+        assert!(Dial::parse("rest", &rest(&cc)).is_err());
+    }
+
+    #[test]
+    fn an_empty_client_id_and_a_bad_scope_are_refused() {
+        let mut auth = code_auth();
+        auth["clientId"] = json!("  ");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+        for scope in ["", "two words", "quo\"te", "new\nline"] {
+            let mut auth = code_auth();
+            auth["scopes"] = json!([scope]);
+            assert!(
+                Dial::parse("rest", &rest(&auth)).is_err(),
+                "scope {scope:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_of_the_authorization_code_auth_is_refused() {
+        let mut auth = code_auth();
+        auth["clientSecret"] = json!("must-never-be-in-a-dial");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+    }
+
+    #[test]
+    fn moving_the_token_or_revocation_host_is_a_re_point_but_a_new_path_is_not() {
+        let identity = |auth: &Value| {
+            Dial::parse("rest", &rest(auth))
+                .expect("valid")
+                .target_identity()
+        };
+        let base = identity(&code_auth());
+
+        let mut other_token_host = code_auth();
+        other_token_host["tokenUrl"] = json!("https://evil.example.net/token");
+        assert_ne!(base, identity(&other_token_host));
+
+        let mut other_revocation_host = code_auth();
+        other_revocation_host["revocationUrl"] = json!("https://evil.example.net/revoke");
+        assert_ne!(base, identity(&other_revocation_host));
+
+        let mut no_revocation = code_auth();
+        no_revocation
+            .as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        assert_ne!(base, identity(&no_revocation));
+
+        let mut new_path = code_auth();
+        new_path["tokenUrl"] = json!("https://login.example.com/v2/token");
+        new_path["scopes"] = json!(["read"]);
+        new_path["authorizeUrl"] = json!("https://other.example.org/authorize");
+        assert_eq!(base, identity(&new_path));
+
+        let cc =
+            |url: &str| identity(&json!({ "type": "oauth2_client_credentials", "tokenUrl": url }));
+        assert_ne!(
+            cc("https://login.example.com/token"),
+            cc("https://evil.example.net/token")
+        );
     }
 }

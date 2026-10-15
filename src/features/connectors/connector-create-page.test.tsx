@@ -44,20 +44,23 @@ function json(body: unknown, status = 200) {
 
 type Call = { url: string; method: string; body: unknown }
 
+const DEFAULT_TYPES = [
+  { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
+  { name: "Kafka", adapter: null, supported: false, docsUrl: null, unsupportedReason: null },
+]
+
 /** Routes every fetch the wizard issues; records them in order. */
-function stubFetch(extra: (url: string, method: string) => Response | null = () => null): Call[] {
+function stubFetch(
+  extra: (url: string, method: string) => Response | null = () => null,
+  types: unknown[] = DEFAULT_TYPES
+): Call[] {
   const calls: Call[] = []
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? "GET"
     calls.push({ url, method, body: init?.body ? JSON.parse(init.body as string) : undefined })
     if (url.includes("/api/auth/me")) return json(ME)
-    if (url.endsWith("/api/connectors/types")) {
-      return json([
-        { name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null },
-        { name: "Kafka", adapter: null, supported: false, docsUrl: null, unsupportedReason: null },
-      ])
-    }
+    if (url.endsWith("/api/connectors/types")) return json(types)
     const handled = extra(url, method)
     if (handled) return handled
     throw new Error(`unexpected fetch: ${method} ${url}`)
@@ -313,6 +316,130 @@ describe("ConnectorCreatePage", () => {
     expect(credentialIndex).toBeGreaterThan(specIndex)
     expect(testIndex).toBeGreaterThan(credentialIndex)
     expect(calls[credentialIndex].body).toEqual({ primary: { reference: "vault:secret/connectors/orders#password" } })
+  })
+
+  /**
+   * `SRC-12` part C: a REST connector that signs in with OAuth authorization
+   * code asks for the client secret only (the refresh token comes from signing
+   * in). The create request carries no values (it needs both slots or none);
+   * the client secret is saved right after the connection settings, probe-first,
+   * and the created page offers Sign in.
+   */
+  it("creates an OAuth sign-in connector: the client secret is saved after the settings and Sign in is offered", async () => {
+    const calls = stubFetch(
+      (url, method) => {
+        if (url.endsWith("/api/connectors/credential-settings")) {
+          return json({
+            secretManager: null,
+            typedCredentials: true,
+            oauthCallbackUrl: "https://console.test/api/connectors/oauth/callback",
+          })
+        }
+        if (url.endsWith("/api/connectors") && method === "POST") {
+          return json(
+            {
+              id: "conn-crm-k3x9",
+              name: "crm",
+              type: "REST API",
+              direction: "source",
+              health: "unknown",
+              environment: "production",
+              tenant: "Acme Co",
+              lastTestAt: null,
+              lastActivityAt: null,
+              lastRunSuccessAt: null,
+              lastRunFailureAt: null,
+              failureStreak: 0,
+              schemaChangePolicy: "apply_non_breaking",
+              pausedReason: null,
+              pausedAt: null,
+              capabilities: [],
+              owner: "Current user",
+              credential: {
+                primary: "file:/run/secrets/connector_managed_conn_crm_k3x9_secret_key",
+                secondary: "file:/run/secrets/connector_managed_conn_crm_k3x9_token",
+              },
+              credentialStored: false,
+            },
+            201
+          )
+        }
+        if (url.includes("/ingest-spec")) {
+          return json({ adapter: "rest", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+        }
+        if (url.endsWith("/credential") && method === "PUT") {
+          return json({ saved: true, slots: ["primary"], verified: false, message: "not signed in" })
+        }
+        if (url.endsWith("/test")) {
+          return json({
+            ok: false,
+            supported: false,
+            latencyMs: null,
+            message: "Nobody has signed in to this connector yet, so the connection cannot be tested.",
+            testedAt: null,
+          })
+        }
+        if (url.endsWith("/oauth")) {
+          return json({
+            signedIn: false,
+            callbackUrl: "https://console.test/api/connectors/oauth/callback",
+            revocationConfigured: false,
+          })
+        }
+        if (url.endsWith("/runs")) return json({ runs: [] })
+        return null
+      },
+      [{ name: "REST API", adapter: "rest", supported: true, docsUrl: null, unsupportedReason: null }]
+    )
+    const page = renderPage()
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: /REST API/ }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "crm" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Base URL"))
+    fireEvent.change(page.getByLabelText("Base URL"), { target: { value: "https://api.example.com" } })
+    fireEvent.change(page.getByLabelText("Auth type"), { target: { value: "oauth2_authorization_code" } })
+    fireEvent.change(page.getByLabelText("Client ID"), { target: { value: "app-1" } })
+    fireEvent.change(page.getByLabelText("Sign-in URL"), { target: { value: "https://login.example.com/authorize" } })
+    fireEvent.change(page.getByLabelText("Token URL"), { target: { value: "https://login.example.com/token" } })
+    // The address to give the provider is on the form, before anything is saved.
+    await waitFor(() =>
+      expect(page.getByText("https://console.test/api/connectors/oauth/callback")).toBeDefined()
+    )
+    // Only the client secret is asked for.
+    expect(page.getByLabelText("Client secret")).toBeDefined()
+    expect(page.queryByLabelText("Refresh token")).toBeNull()
+    fireEvent.change(page.getByLabelText("Client secret"), { target: { value: "s3cret-value" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+    await waitFor(() => expect(page.getByRole("button", { name: "Sign in" })).toBeDefined())
+
+    const create = calls.find((c) => c.url.endsWith("/api/connectors") && c.method === "POST")
+    // No values at create: both slots or none, and the refresh token is not typed.
+    expect((create?.body as { credential: unknown }).credential).toEqual({
+      source: "managed",
+      primary: "secret_key",
+      secondary: "token",
+    })
+    const order = (match: (c: Call) => boolean) => calls.findIndex(match)
+    const specIndex = order((c) => c.url.includes("/ingest-spec") && c.method === "PUT")
+    const credentialIndex = order((c) => c.url.endsWith("/credential") && c.method === "PUT")
+    const testIndex = order((c) => c.url.endsWith("/test"))
+    expect(credentialIndex).toBeGreaterThan(specIndex)
+    expect(testIndex).toBeGreaterThan(credentialIndex)
+    expect(calls[credentialIndex].body).toEqual({ primary: { kind: "secret_key", value: "s3cret-value" } })
+    const spec = calls[specIndex].body as { dial: { auth: unknown } }
+    expect(spec.dial.auth).toEqual({
+      type: "oauth2_authorization_code",
+      clientId: "app-1",
+      authorizeUrl: "https://login.example.com/authorize",
+      tokenUrl: "https://login.example.com/token",
+      scopes: [],
+    })
   })
 
   /**
