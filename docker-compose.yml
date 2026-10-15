@@ -1726,7 +1726,7 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
-      - ./dagster/dispar_orchestrate:/opt/dagster/app/dispar_orchestrate:ro
+      # DATA-2 review BLOCKER 3: no source bind-mount in deployment template (image carries code)
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
       - type: volume
