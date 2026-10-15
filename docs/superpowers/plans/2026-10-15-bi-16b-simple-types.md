@@ -245,3 +245,28 @@ Branch `feat/bi-phase-3`, from `27c51dfe`. Developer: Claude Sonnet. Nothing pus
 - `HistogramBins` accepts a number or a numeric string for `width` and `count` (the assistant's model sometimes sends text); a fraction or a negative count is kept out of range so the sentence "a histogram has 1 to 100 ranges." answers it.
 
 ## 8. Review (planner appends)
+
+### Planner's review (T1 to T6), 2026-10-16
+
+Accepted deviations: the site list rides in `TimeContext`, filled by the one
+`routes::settings::time_context` every route already calls, so no save path
+can skip it, and `TimeContext::default()` carries no site (fail closed);
+`Goal::Value` names the second measure's column; no change to `bin.rs`
+(`BinMode::Count(20)`); the histogram's refusals and the 100-range cut-off
+note; `ChartInput.types` boxed for clippy's `large_futures`; progress and
+bullet left out of the board digest on purpose; four rows of the feature
+page's coverage table corrected from the code.
+
+Consequence to tell the owner at QA: going back to a version that holds an
+image or web card whose site has since been removed from the allowed list
+is refused (the card would not show anyway).
+
+- **R1 SHOULD-FIX (open)** — the assistant's draft card
+  (`chart-draft-card.tsx`) renders `TileBody` outside a `ReportingProvider`,
+  so an image or web draft would read "This site is no longer allowed" in
+  the chat. Fixed after the owner's QA together with whatever the QA finds.
+
+Not verified by anyone yet: the new statements on a real ClickHouse (the
+dev API rebuild and the owner's QA run them), the browser, the assistant
+through a model. The reviewer's own re-run was skipped at the owner's
+request.
