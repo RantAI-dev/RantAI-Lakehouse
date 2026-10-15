@@ -181,4 +181,67 @@ As in the BI-17 A plan, section 6 (same cargo environment and rules), plus
 
 ## 7. Handoff (developer appends)
 
+### BI-16 part B and AI-5, slice 1 (T1 to T6)
+
+Branch `feat/bi-phase-3`, from `27c51dfe`. Developer: Claude Sonnet. Nothing pushed, no PR.
+
+**Commits** (one per task, each body cites its task):
+
+| Task | Commit | What it became |
+| --- | --- | --- |
+| T1 | `48485be1` | Migration `0073_reporting_content_sites.sql` (`content_sites TEXT[]`, empty by default, CHECK for shape and the 50 limit), store field, `embed_access::validate_content_sites` (calls the same `normalize_origin` as `validate_origins`, https only, max 50) and `https_origin_of`, the settings route's optional `contentSites` (kept when not sent), the `reporting` object of the dashboard, embed and public payloads, Admin > Settings "Allowed content sites". |
+| T2 | `16619d2c` | Five `ChartKind`s (`image` and `web` static); `lakehouse_bi::types_b` (`TypeFields`, `Goal`, `HistogramBins`, `check_fields`, `check_content_url`, `CONTENT_SITE_REFUSED`); the content-site check in `spec_before_relation`; progress and single-bullet statement (`build_progress_sql`), histogram statement (`histogram_sql` over the BI-10 binned relation), per-category bullet through the grouped statement; every kind match site of section 2; YAML export; `routes/type_b_rewrite.rs` (real `enforce`). |
+| T3 | `29469e8d` | `lib/type-b.ts`, `progress-card.tsx`, `content-cards.tsx` (image, web), `type-b-option.ts` (histogram, bullet), `type-b-fields.tsx`, `TileBody` branches, builder wiring, kind registration in every TS rule. |
+| T4 | `8215c335` | `src/lib/chart-coverage.test.ts` reading the feature page's table; four rows of the page corrected (below). |
+| T5 | `6626e70d` | `chart_kind_enum` + `with_type_properties` on `create_chart` / `update_chart`, prompt sentence, fixture regenerated (ignored writer test), tool-argument tests for the two standard requests and the refusals. |
+| T6 | `f01f0741` | CHANGELOG entry. |
+| fix | `22968c9a` | A histogram result as long as the server's cap (100 ranges) says it may have been cut (found while writing the handoff: see item 5 below). |
+
+**Checks run** (foreground, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2`, on the final Rust code; the last commit touches TS only):
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api -p lakehouse-alerts --all-targets -- -D warnings`: no warnings.
+- `cargo test -p lakehouse-bi -- --test-threads=4`: 511 passed, 3 ignored, 0 failed (lib), `specs_match_typescript` 1 passed.
+- `cargo test -p lakehouse-alerts -- --test-threads=4`: 90 passed, 1 ignored, 0 failed.
+- `cargo test -p lakehouse-store -- --test-threads=4`: 199 lib tests and every integration binary ok, 0 failed (`reporting_settings` 6 passed, among them the new CHECK test; own Postgres through testcontainers).
+- `cargo test -p lakehouse-api --lib -- --test-threads=4 settings dashboard ai:: embed organise rewrite`: 615 passed, 17 ignored, 0 failed (includes `type_b_rewrite` 4, the new tool tests, the tool schema snapshot).
+- `cargo test -p lakehouse-api --test route_auth -- --test-threads=2`: 38 passed. `--test sec11_guard`: 4 passed. `--test reporting_settings_route`: 10 passed. `--test ai_tool`: 9 passed. `--test dashboard_export`: 6 passed. (Each file on its own.)
+- `write_tool_schema_fixture` (ignored writer test) run once; `tests/fixtures/tool_schemas.json` +120 lines (the five kinds, `goal`, `bands`, `histogram`, `url`, `alt` on the two tools). `tool_schemas().len()` is still 93.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors, the same 6 warnings as before. `bun run test`: 1961 pass, 1 skip, 0 fail (202 files) before the last commit; 1962 pass after it (the new test).
+- `bun --bun next build --webpack`: compiled successfully (`bun run build` / Turbopack fails in this worktree because `node_modules` is a symlink; the webpack build is the check here). It ran before the last, small commit.
+
+**Not verified**
+
+- Nothing was rendered in a browser: the ECharts options and the tiles are asserted as JSON and under happy-dom. Not seen with eyes: the bullet bands and target marks, the histogram's touching bars, the progress bar, an image or a frame actually loading, the builder layout of the new controls, "Open in a new tab".
+- The new statements were never run on a real ClickHouse. They are asserted as text and through the real `sql_rewrite::enforce` (row filter and mask: every read of the table becomes its governed projection), not executed. The engine behaviour of the nested `__m0`/`__m1` select and of `count()` under the bins is the same shape as BI-10's and the KPI's, but unmeasured here. Set `BIN_STATEMENTS_OUT`/`BIN_REWRITE_OUT` to dump `type_b_rewrite`'s statements, as for BI-10, to run them by hand.
+- The assistant through a model: `AI-5` is pinned as tool-argument tests, not as a conversation.
+- Migration `0073` against the dev database: only through the `sqlx::test` databases.
+- `bun run build` under Turbopack (see above), the full workspace run and the other integration test files of `lakehouse-api`: CI.
+- Python, compose and Dagster: not touched, not run.
+- The copilot's chart draft card (`features/copilot/chart-draft-card.tsx`) renders `TileBody` outside a `ReportingProvider`, so an image or web draft would show "This site is no longer allowed" in the card (default list empty); saving it goes through the server's check. Not changed, not tested.
+
+**Where the plan was wrong against the code, or I deviated**
+
+1. **D4 "the store path gets the list from the route".** `spec_from_input` is called from nine places (console create and update, preview, version revert, the assistant's `create_chart` / `update_chart` / `format_chart`, inline SQL). Adding an argument to each would leave any one that was missed saving a card around the list. I put the list in `TimeContext` (`with_content_sites` / `content_sites()`, loaded by `settings::time_context`), which every one of them already receives, and check in `spec_before_relation`. `TimeContext::default()` carries no site, so a context without a list refuses every card (fail closed). It is documented on the struct, next to BI-11's parameter values that ride there for the same reason. The check function is `lakehouse_bi::types_b::check_content_url`, not in the API crate; the console route, the assistant tools and a version revert reach it through `spec_from_input`, and both are tested (route test, tool tests). A consequence to decide on: reverting a dashboard version that holds an image card whose site has since left the list is refused with the sentence ("no longer works").
+2. **D2 `Goal::Value(String)` "a second measure alias".** It is the second measure's **column name**, which must be the second entry of `measures` (`goal: {"measure": "<column>"}`, `measures: [value, column]`); the result alias is read from `y` (`["v", "g"]` on a single row, the measure names on a grouped bullet). A fixed goal needs exactly one measure; a progress bar needs a goal, a bullet does not.
+3. **D3 "add a target-count parameter to the automatic width".** Not needed: `BinMode::Count(n)` already takes any `n`; the 10/50/100 list lives in `BinSpec::mode()`, so `bin.rs` is untouched. A histogram uses `BinMode::Count(20)` (`AUTO_HISTOGRAM_BINS`) when no width or count is given, `Count(n)` for 1 to 100, `Width(w)` otherwise. It does not go through `shape.bin`; `binned::chart_layers` returns the layer for kind `histogram` from `types.histogram`, so `FilteredSql.bins` and `annotate_bins` work unchanged.
+4. **Histogram shape.** The definition has the number column as `dimension` and no measures; the statement is `histogram_sql` (the BI-10 binned relation, `count() AS __count`, ordered by range, `LIMIT 100`); `limit`, `order`, `aggregate` other than `count`, a breakdown and a grain are refused with a sentence (beyond the plan, because they would be stored and ignored). A SQL source takes a width only (as for BI-10 bins).
+5. **At most 100 ranges are returned.** A width that gives more than 100 non-empty ranges is cut to the first 100 (in range order) by the statement's limit. The tile says so when the result is exactly the cap (`22968c9a`); the plan did not mention it. A width that would need more than 500 bars between the first and last range is refused by the tile with a sentence instead of filling zeros.
+6. **Bullet.** With no category it is one row (the progress statement); with one it is the grouped statement with the goal as its second measure, `order` desc and a `limit` of 1 to 100 (default 20). The tile draws the first 20 and says "N more not shown" where N counts the rows the limit returned. A fixed target is a `markLine`; a target that is a second value is one scatter tick per row (a mark line cannot differ per row). No sort control, no click, no "Other", no steps (`is_grouped_kind` is false for the three data kinds; the server refuses `sort`, own aggregates and so on with the existing sentences).
+7. **Progress / histogram / bullet / image / web are in `NO_VALUE_KINDS`** (no click setting, no drill menu). A click on a histogram bar to filter by its range is not built; the plan did not ask for it.
+8. **`ChartInput.types` is a `Box<TypeFields>`.** A bare copy pushed the assistant loop's future past clippy's `large_futures` limit (16 384 bytes; `agents.rs` `run_headless_loop` came out at 16 416). Serde, `Default` and `Clone` are unaffected.
+9. **Alerts.** The only kind match is the board digest, which lists KPI and gauge tiles. I left progress and bullet out on purpose (a digest line is one number; alerts are rules on metrics, not tiles) and said so in a comment at the match; no sentence is needed because no alert can be put on a tile.
+10. **sec11_guard.** `format!("contentSites: {why}")` was flagged, correctly; the route answers a fixed sentence instead of the validator's text (which names the first bad entry).
+11. **Feature page, section "Coverage against Metabase", four rows corrected** after checking the code: Detail is not a tile kind (it is the one-record view with Previous / Next in the record list, `drill.tsx`), Metabase's row chart is our `hbar`, pie and donut are one kind (`pie`, drawn as a donut), Maps names the three kinds. The page now says the TS test reads the table.
+12. **`AI-15`** still has no request-set file; the two requests are tool-argument tests next to the tool tests (`the_request_for_a_progress_bar_against_a_goal_of_a_million_creates_one`, `the_request_to_show_how_prices_are_spread_creates_a_histogram`). The planner decides where the standard set lives.
+13. **The builder** previews an image or a web card locally (nothing to ask the server), builds the goal's second measure into `measures` at save and reads it back out of the measure rows (`measureRowsOf`), and labels the missing fields "Goal number", "Goal column", "Target number", "Band limits, rising", "Number of ranges", "Range width", "Address", "Description" (not "Goal": `missingSection("Goal")` is the KPI comparison's, in More options).
+14. **Tests that log.** The web-card tests switch happy-dom's iframe page loading off so no test touches the network; happy-dom logs "Iframe page loading is disabled" for each frame. The tests pass.
+
+**Smaller things worth a look in review**
+
+- `https_origin_of` (Rust) and `httpsOrigin` (TS) are two implementations of one rule; the TS test uses the Rust test's cases (and more). Whether to add a shared corpus is the planner's call.
+- `typePayload` sends `image` / `alt` trimmed; the server stores them trimmed (`stored_card_fields`).
+- The Rust bullet check allows a `goal` of any finite number, zero and negative included (the tile says "No goal to compare with" for a progress bar; a bullet just draws no target at or below zero's edge).
+- `HistogramBins` accepts a number or a numeric string for `width` and `count` (the assistant's model sometimes sends text); a fraction or a negative count is kept out of range so the sentence "a histogram has 1 to 100 ranges." answers it.
+
 ## 8. Review (planner appends)
