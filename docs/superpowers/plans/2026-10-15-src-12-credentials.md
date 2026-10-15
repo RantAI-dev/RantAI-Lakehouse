@@ -340,6 +340,14 @@ Known limit, said at the sites: the resolver (API at use, orchestrator) does not
 
 **Commands.** `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` after touching all sources: clean (exit 0, 3 min). `cargo fmt --check`: clean. `pytest dispar_orchestrate -q -m "not loader"`: 1143 passed. `bun run typecheck`: clean; `bun test src/features/connectors src/lib/connectors`: 342 pass, 0 fail. `test_required_gate.sh`: 48 passed. `ops/lint/check_*.py`: ok. YAML (`ci.yml`, `docker-compose.yml`, the override) and TOML (`.gitleaks.toml`) load. **Not run:** `cargo test` (new unit tests in `refs.rs`, `secret_manager/mod.rs`, `routes/connectors.rs`, the integration test `connector_secret_reference.rs` with its new prefix test), docker, the gate, the scanner.
 
+### Fix round after CI fb816a61 (developer)
+
+1. `SRC-12 review B2 BLOCKER 1` (SigV4 vector, `aws.rs:466`): the signer was right, the vector wrong. The botocore constant was made over `json.dumps`' spaced payload `{"SecretId": "prod/x"}`; the Rust test signs serde_json's compact one. Recomputed with botocore (already in the Dagster venv, nothing installed): the Python signer equals botocore for both payloads (spaced `...e1e88`, compact `7e592597...5a6b`). Both clients now send the compact bytes (Python `separators=(",", ":")`), both tests assert the compact constant.
+2. `SRC-12 review B2 BLOCKER 2` (`vault.rs:342`, `aws.rs:769`): cause was the tests, not the classification: a dropped `wiremock` MockServer returns to a pool and keeps answering (404 = not found, correctly). New `dead_address()` (bind, take port, drop) in `secret_manager/mod.rs` replaces it in those tests and in the four others meaning "no service" (they passed only because a 404 also meant may-not-sign-in). Assertions unchanged. The Python twins raise `ConnectionError` from the fake and map only a 404 answer to not found: no change.
+3. `SRC-12 review B2 BLOCKER 3` (gate step 1b): the `..` reference in the same loop is refused by the grammar, not the prefix rule. Now two checks: a valid reference outside the prefixes must give 400 with the exact prefix text; `..` must give the grammar's "not a valid". The rest of the gate read for the same mistake: none found (not run).
+
+Checks: clippy workspace (all targets, all features, `--locked`, `-D warnings`, after touching all sources) clean; fmt clean; pytest `-m "not loader"` 1143 passed. Not run: cargo test, docker, the gate.
+
 ## Review
 
 *(planner)*
