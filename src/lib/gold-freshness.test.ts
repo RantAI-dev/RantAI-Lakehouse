@@ -10,6 +10,7 @@ const basePublication: GoldPublication = {
   lastExportedAt: "2026-10-14T10:00:00Z",
   changedSinceExport: false,
   canEdit: true,
+  trim: null,
 }
 
 describe("gold-freshness", () => {

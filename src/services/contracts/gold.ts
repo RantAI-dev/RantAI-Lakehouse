@@ -81,6 +81,18 @@ export type GoldConsumers = {
  * `lastExportedAt` are RFC 3339 strings (UTC, seconds granularity) or
  * `null` when not measurable.
  */
+/**
+ * Trim summary for a published Gold mart (DATA-2 D6).
+ * From the newest `console.gold_trim_run` row; `null` means never trimmed.
+ */
+export type GoldTrimSummary = {
+  status: "success" | "failed" | "nothing_to_trim" | string
+  copiesKept: number | null
+  oldestKeptExportedAt: string | null
+  finishedAt: string
+  reason: string | null
+}
+
 export type GoldPublication = {
   mart: string
   enabled: boolean
@@ -89,6 +101,7 @@ export type GoldPublication = {
   lastExportedAt: string | null
   changedSinceExport: boolean | null
   canEdit: boolean
+  trim?: GoldTrimSummary | null
 }
 
 export interface GoldService {
