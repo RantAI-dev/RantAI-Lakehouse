@@ -20,7 +20,7 @@ import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell"
 import { domainsOf } from "@/lib/conditional-format";
 import { decimalsFor } from "@/lib/chart-axis";
 import type { StyleFields } from "@/lib/chart-style";
-import { formatValue, withMetricFormats } from "@/lib/value-format";
+import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-format";
 import { styleOption } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
@@ -28,6 +28,11 @@ import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
+import { MAX_BULLETS, type TypeDefFields } from "@/lib/type-b";
+import { ProgressCard } from "./progress-card";
+import { ImageCard, WebCard } from "./content-cards";
+import { bulletOption, histogramOption } from "./type-b-option";
+import { resolvePalette } from "@/lib/chart-palettes";
 
 type Cell = Rows | TileFailure;
 function hasRows(c: Cell | undefined): c is Rows {
@@ -62,7 +67,7 @@ export function TileBody({
   const reporting = useReporting();
   // `def` is the stored definition (typed `unknown` on the shared spec): the
   // fields of raw tables, pivots and KPI comparisons are read from it (BI-16 part A).
-  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields & StyleFields) | undefined, spec.resolved);
+  const def = withResolvedSlots(spec.def as (TableDefFields & ShapeDefFields & StyleFields & TypeDefFields) | undefined, spec.resolved);
   // BI-6: "avg of stay" for a measure with its own aggregate, or one that takes the chart's (phase 2 QA R7).
   const measureLabels = tileMeasureLabels(def?.measures, spec.y, def?.steps, hasRows(cell) ? cell.metricLabels : undefined, def?.aggregate);
   // BI-10: a binned grouping arrives as the bin's lower edge; the tile says "500 – 1,000".
@@ -70,6 +75,9 @@ export function TileBody({
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
   }
+  // BI-16 part B: an image and a web page are static like a note: no rows, no failure of a statement.
+  if (spec.kind === "image") return <ImageCard def={def} title={spec.title} />;
+  if (spec.kind === "web") return <WebCard def={def} title={spec.title} />;
   if (cell && "error" in cell) {
     return (
       <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">
@@ -93,6 +101,13 @@ export function TileBody({
         {spec.caption ? <p className="mt-1 text-xs text-muted-foreground">{spec.caption}</p> : null}
       </div>
     );
+  }
+
+  if (spec.kind === "progress" || spec.kind === "histogram" || spec.kind === "bullet") {
+    if (!hasRows(cell) || (cell.rows.length === 0 && spec.kind !== "progress")) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+    }
+    return <TypeBBody spec={spec} cell={cell} def={def} bins={bins} measureLabels={measureLabels} dark={dark} />;
   }
 
   if (spec.kind === "table") {
@@ -173,6 +188,78 @@ export function TileBody({
     );
   }
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data.</p>;
+}
+
+/**
+ * The progress bar, the histogram and the bullet graph (`BI-16` part B). They
+ * take the dashboard's filters like any chart and the number formats of
+ * `BI-17`: the value's own format, else the chart's, else the metric's.
+ */
+function TypeBBody({
+  spec, cell, def, bins, measureLabels, dark,
+}: {
+  spec: ChartRenderSpec & { caption?: string };
+  cell: Rows;
+  def: (TableDefFields & ShapeDefFields & StyleFields & TypeDefFields) | undefined;
+  bins: ReturnType<typeof binsOfTile>;
+  measureLabels: Record<string, string>;
+  dark: boolean;
+}) {
+  const reporting = useReporting();
+  const locale = reporting.numberLocale ?? "en-US";
+  const style = withMetricFormats(def, cell.metricFormats);
+  const yCols = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const fmtOf = (column?: string) => style?.valueFormats?.[column ?? ""] ?? style?.format;
+  if (spec.kind === "progress") {
+    const metricFormat = fmtOf(yCols[0]) ?? (cell.metricFormats ? withMetricFormats(undefined, cell.metricFormats)?.valueFormats?.[Object.keys(cell.metricFormats)[0] ?? ""] : undefined);
+    return <ProgressCard def={def ?? {}} cell={cell} format={metricFormat} caption={spec.caption} />;
+  }
+  const color = resolvePalette(def?.colors, reporting.companyPalette)[0];
+  if (spec.kind === "histogram") {
+    const countColumn = yCols[0] ?? "";
+    const counts = cell.rows.map((r) => Number(r[countColumn] ?? 0));
+    const decimals = decimalsFor(counts);
+    const drawn = histogramOption({
+      rows: cell.rows, column: spec.x, countColumn, width: bins[spec.x]?.width, dark, color,
+      format: (v) => formatValue(v, fmtOf(countColumn), locale, decimals),
+      formatEdge: (v) => formatValue(v, undefined, locale, decimalsFor([v])),
+      showLabels: def?.labels?.show,
+    });
+    if ("message" in drawn) {
+      return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+    }
+    return <EChart option={drawn.option} height="100%" />;
+  }
+  const valueColumn = yCols[0] ?? "v";
+  const goalColumn = def?.goal && typeof def.goal === "object" ? (yCols[1] ?? "g") : undefined;
+  const all = cell.rows.flatMap((r) => [Number(r[valueColumn] ?? 0), ...(goalColumn ? [Number(r[goalColumn] ?? 0)] : [])]);
+  const decimals = decimalsFor(all);
+  const drawn = bulletOption({
+    rows: cell.rows, category: spec.x || undefined, valueColumn, goalColumn,
+    goal: typeof def?.goal === "number" ? def.goal : undefined, bands: def?.bands ?? [],
+    singleLabel: measureLabels[valueColumn] ?? firstMeasureLabel(def?.measures) ?? spec.title,
+    dark, color,
+    format: (v) => formatValue(v, fmtOf(valueColumn), locale, decimals),
+    axisFormat: (v) => formatAxisValue(v, fmtOf(valueColumn), locale, decimals),
+  });
+  if ("message" in drawn) {
+    return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
+  }
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+      {drawn.more > 0 ? (
+        <p className="px-1 pt-1 text-[11px] text-muted-foreground">{drawn.more} more not shown (the first {MAX_BULLETS} are drawn)</p>
+      ) : null}
+    </div>
+  );
+}
+
+/** The first measure's name as a label, for the one bullet of a graph without a category. */
+function firstMeasureLabel(measures: ShapeDefFields["measures"]): string | undefined {
+  const first = measures?.[0];
+  if (first === undefined) return undefined;
+  return displayColumn(typeof first === "string" ? first : "metric" in first ? first.metric : first.column);
 }
 
 /**

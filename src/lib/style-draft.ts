@@ -35,7 +35,7 @@ const SECOND_AXIS_KINDS = ["bar", "line", "area", "combo"]
 export const NOTE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo", "waterfall"]
 const TOOLTIP_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
 const BY_VALUE_KINDS = ["bar", "hbar", "pie", "treemap", "geomap"]
-const NOT_CHARTS = ["table", "pivot", "kpi", "gauge"]
+const NOT_CHARTS = ["table", "pivot", "kpi", "gauge", "progress"]
 export const LINE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
 
 export function formatRules(s: FormatState): FormatRules {

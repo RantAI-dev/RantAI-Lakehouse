@@ -62,7 +62,7 @@ function showSummary(i: SummaryInput): string {
     if (i.pivot.rows.length) parts.push(`rows ${list(i.pivot.rows)}`)
     if (i.pivot.columns.length) parts.push(`columns ${list(i.pivot.columns)}`)
     if (i.pivot.values.length) parts.push(`values ${list(i.pivot.values)}`)
-  } else if (i.kind === "kpi" || i.kind === "gauge") {
+  } else if (i.kind === "kpi" || i.kind === "gauge" || i.kind === "progress") {
     parts.push(...measures)
   } else if (i.kind === "geomap") {
     if (i.mapLabel) parts.push(i.mapLabel)
@@ -72,7 +72,7 @@ function showSummary(i: SummaryInput): string {
     if (i.mapLabel) parts.push(i.mapLabel)
     if (i.lat && i.lon) parts.push(`${displayColumn(i.lat)}, ${displayColumn(i.lon)}`)
     parts.push(...measures)
-  } else if (i.kind !== "text") {
+  } else if (i.kind !== "text" && i.kind !== "image" && i.kind !== "web") {
     if (i.dimension) {
       const by = i.grain ? ` by ${GRAIN_LABELS[i.grain as Grain]?.toLowerCase() ?? i.grain}` : ""
       parts.push(`${displayColumn(i.dimension)}${by}`)

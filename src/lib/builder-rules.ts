@@ -34,6 +34,8 @@ export type BuilderState = {
   limitHasEffect: boolean
   /** A data source is chosen (or a new SQL source is being written). */
   hasSource: boolean
+  /** A category column is chosen: a bullet graph then has one bullet per category and a limit (BI-16 part B). */
+  hasDimension?: boolean
 }
 
 export type SortControl = "choice" | "by-date" | "by-category" | "none"
@@ -58,7 +60,8 @@ export type BuilderRules = {
 }
 
 const LINE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
-const SINGLE_KINDS = ["kpi", "gauge"]
+// BI-16 part B: a progress bar is one row like a KPI; a histogram counts per range in range order, so neither sorts nor limits.
+const SINGLE_KINDS = ["kpi", "gauge", "progress", "histogram"]
 const POINT_KINDS = ["pointmap", "geoheat"]
 
 export function builderRules(s: BuilderState): BuilderRules {
@@ -66,7 +69,8 @@ export function builderRules(s: BuilderState): BuilderRules {
   const text = isStaticKind(s.kind)
   const ownColumns = s.kind === "pivot" || (s.kind === "table" && s.rowsMode)
   const noSortOrLimit = text || SINGLE_KINDS.includes(s.kind) || POINT_KINDS.includes(s.kind) || ownColumns
-  const sort: SortControl = noSortOrLimit ? "none" : s.kind === "boxplot" ? "by-category" : s.kind === "calendar" ? "by-date" : "choice"
+  // A bullet graph keeps its default order (the largest values first); only its limit is the person's.
+  const sort: SortControl = noSortOrLimit || s.kind === "bullet" ? "none" : s.kind === "boxplot" ? "by-category" : s.kind === "calendar" ? "by-date" : "choice"
   const otherApplies = takesOther(s.kind, s.rowsMode) && !s.grained && !s.multiGrouped && s.limitHasEffect
   const stepsApply = takesSteps(s.kind, s.rowsMode)
   const layersApply = takesLayers(s.kind) && !s.rowsMode
@@ -79,7 +83,7 @@ export function builderRules(s: BuilderState): BuilderRules {
   return {
     sections: { data: !text, show: !text, sortAndFilter: !text, moreOptions: !text },
     sort,
-    limit: !noSortOrLimit && s.limitHasEffect,
+    limit: !noSortOrLimit && s.limitHasEffect && (s.kind !== "bullet" || !!s.hasDimension),
     filters: !text,
     other: { shown: !text && otherApplies, disabled: otherBlocked, hint },
     steps: stepsApply && !s.grained && !s.breakdown && !s.other && s.layers === 0,

@@ -18,7 +18,7 @@ export const TAB_TITLE_MAX = 60
 /** Below this width the tiles stack in one column (px). */
 export const PHONE_MAX_WIDTH = 640
 
-const STATIC_KINDS: ReadonlySet<string> = new Set(["text", "heading", "divider", "section"])
+const STATIC_KINDS: ReadonlySet<string> = new Set(["text", "heading", "divider", "section", "image", "web"])
 
 /** A tile that carries no data: it has no statement and takes no filter. Mirrors `ChartKind::is_static`. */
 export function isStaticKind(kind: ChartKind | string): boolean {

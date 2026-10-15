@@ -1,6 +1,7 @@
 import type { ChartKind, ChartSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { TableDefFields } from "@/lib/table-types";
 import type { StyleFields } from "@/lib/chart-style";
+import type { TypeDefFields } from "@/lib/type-b";
 
 /**
  * Shared BI/dashboard types.
@@ -42,7 +43,8 @@ export type ChartInput = {
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
 } & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
-  & StyleFields; // number formats, colours, axes, notes, conditional colours (BI-17 part A)
+  & StyleFields // number formats, colours, axes, notes, conditional colours (BI-17 part A)
+  & TypeDefFields; // goal, bands, histogram ranges, address of an image or web card (BI-16 part B)
 
 /** Tile position on the grid canvas (12 columns). Key = chartId. */
 export type TileBox = {
