@@ -52,3 +52,42 @@ c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rant
 # `commit`. The working-tree copy now quotes 12 characters; this entry
 # covers the one historical commit that still holds the full line.
 ee0d663df87af4fb1e3ebfa9a3a857489d340a8c:docs/superpowers/plans/2026-10-14-bld-3-bronze-pipeline-source.md:generic-api-key:623
+
+# SEC-36: CI-only and test-vector connector keys on `feat/phase-1-rest`
+# (#144, SRC-12). The history scan runs `git fetch --all`, so it reads every
+# branch and these commits turned it red on main and on every PR. Proof, per
+# value (decoded from the scanner's own output, 2026-10-15): none protects
+# anything and none was ever deployed.
+#  - base64 of the 32 ASCII characters "ci-connector-key-not-real-000000":
+#    the key written into the throwaway `.env` of the CI jobs in ci.yml
+#    (20 findings in 6 commits). It lived only on ephemeral runners;
+#    deploy-staging.yml reads the staging key from the repository secret
+#    STAGING_CONNECTOR_SECRETS_KEY, never from the repository.
+#  - base64 of the 32 ASCII characters "ci-connector-key-rotated-0000000":
+#    the "new" key of the g6-credentials rotation step (1 finding), same job.
+#  - base64 of the 32 bytes 0x00..0x1f: the key of the shared AES test vector
+#    (1 finding), whose sealed text is a fixed test string.
+# Current HEAD generates the CI keys at run time (openssl rand) and describes
+# the vector key as bytes, so no new finding appears. Exact fingerprints only.
+5b9951949209f8e0efebb261e413811599b6718c:.github/workflows/ci.yml:generic-api-key:1832
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1652
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1711
+6209593e88664cadcbf64ce5c8923dff648758b0:.github/workflows/ci.yml:generic-api-key:1713
+84a2f212d3914122a4636009cb084e4cbd2430f1:.github/workflows/ci.yml:generic-api-key:2045
+9bfaf58a893783372ef25cb10f0913cc55fd8a79:.github/workflows/ci.yml:generic-api-key:1792
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1075
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1225
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1317
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1412
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1541
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1654
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1717
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:1839
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:397
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:435
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:619
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:731
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:808
+9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:936
+cfa800f4940fefbdcd66c0e78f3a3f451768eeac:.github/workflows/ci.yml:generic-api-key:1957
+f0fe3cd464cc5f115c92cc18d1b629a4681c670e:rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json:generic-api-key:4

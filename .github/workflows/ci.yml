@@ -394,9 +394,10 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # `docker compose run` honors `depends_on` conditions for whatever
       # it's given, so this single command brings up the whole RustFS →
@@ -432,9 +433,10 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Bring up SeaweedFS + its warehouse registration
         run: >
@@ -616,7 +618,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # dagster-code-location's `dlt` SSRF guard fail-closed refuses
@@ -655,6 +656,8 @@ jobs:
           # real commit (`ops/g7/g7_pipeline_test.py`'s module doc).
           G7_SOURCE_PROVENANCE=unavailable
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture images are not shared artifacts: `oidc-mock` is a tiny
       # image of its own, built from source in seconds. `up --no-build`
@@ -728,7 +731,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's own .env above: `ops/g3/g3_test.py`
@@ -737,6 +739,8 @@ jobs:
           # SSRF guard against this compose network's own `postgres`.
           INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
@@ -805,7 +809,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
@@ -829,6 +832,8 @@ jobs:
           OIDC_JIT_PROVISIONING=true
           OIDC_ROLE_MAP=lakehouse-analysts=Analyst
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
@@ -933,7 +938,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -947,6 +951,8 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       # This half starts the SQL fixtures only (profile `g6-sql`), so
@@ -1079,7 +1085,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1093,6 +1098,8 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture images, built here rather than shared; see `g3a-dagster`.
       # `oidc-mock` (every stack that starts `lakehouse-api`) and
@@ -1236,7 +1243,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           ORACLE_G6_PASSWORD=CiOracleSysNotReal123
           CONNECTOR_ORACLE_PASSWORD=CiOracleConnectorNotReal123
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
@@ -1244,6 +1250,8 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       # `oracle-g6` is a pinned upstream image (pulled, not built) and
@@ -1335,7 +1343,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # lakehouse-api has no default upload credential (unset, every
@@ -1349,6 +1356,8 @@ jobs:
           UPLOAD_S3_ACCESS_KEY=rustfsadmin
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
@@ -1430,7 +1439,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1446,6 +1454,8 @@ jobs:
           UPLOAD_S3_ACCESS_KEY=rustfsadmin
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       # `mysql-g6` is a pinned upstream image and `g6-alerts-test-runner`
@@ -1566,7 +1576,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1584,6 +1593,8 @@ jobs:
           INGEST_RETRY_DELAYS_SECONDS=5,10,20
           CONNECTOR_AUTO_DISABLE_AFTER=3
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g6-alerts`.
       # `g6-ops-test-runner` uses the shared Dagster image, so `oidc-mock`
@@ -1684,7 +1695,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1701,6 +1711,8 @@ jobs:
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           CONNECTOR_AUTO_DISABLE_AFTER=3
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Decision 4: compose refuses to be read without the key, and says
       # which variable. An empty value in the shell beats `.env`, and `:?`
@@ -1743,9 +1755,12 @@ jobs:
       - name: Change the key
         shell: bash
         run: |
-          NEW_KEY=Y2ktY29ubmVjdG9yLWtleS1yb3RhdGVkLTAwMDAwMDA=
+          # SEC-36: the "old" key is the one the job's `.env` already holds
+          # (generated at the start of the run); the "new" one is generated now.
+          OLD_KEY=$(sed -n 's/^CONNECTOR_SECRETS_KEY=//p' .env)
+          NEW_KEY=$(openssl rand -base64 32)
           sed -i '/^CONNECTOR_SECRETS_KEY=/d' .env
-          printf 'CONNECTOR_SECRETS_KEY=%s\nCONNECTOR_SECRETS_KEY_PREVIOUS=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=\n' "$NEW_KEY" >> .env
+          printf 'CONNECTOR_SECRETS_KEY=%s\nCONNECTOR_SECRETS_KEY_PREVIOUS=%s\n' "$NEW_KEY" "$OLD_KEY" >> .env
           docker compose -p src12ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster run --rm -T --no-deps lakehouse-api rotate-secrets-key 2>&1 | tee "$RUNNER_TEMP/src12-rotate.log"
           grep -q ' 0 failed' "$RUNNER_TEMP/src12-rotate.log"
           sed -i '/^CONNECTOR_SECRETS_KEY_PREVIOUS=/d' .env
@@ -1829,7 +1844,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1854,6 +1868,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY=testing
           AWS_ENDPOINT_URL_SECRETS_MANAGER=http://moto-g6:5000
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the oidc-mock fixture image
         run: $COMPOSE build oidc-mock
@@ -1954,7 +1970,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -1973,6 +1988,8 @@ jobs:
           CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback
           CONNECTOR_OAUTH_ALLOW_HTTP=true
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the oidc-mock fixture image
         run: $COMPOSE build oidc-mock
@@ -2056,7 +2073,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
           CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
@@ -2071,6 +2087,8 @@ jobs:
           UPLOAD_S3_ACCESS_KEY=rustfsadmin
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       - name: Build the oidc-mock fixture image
         run: >
@@ -2155,7 +2173,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           DAGSTER_URL=http://dagster-webserver:3000/graphql
@@ -2165,6 +2182,8 @@ jobs:
           # DATA-2 review BLOCKER 1: CI runs with age 0 to allow immediate orphan cleanup in gate test (no other writer runs here)
           GOLD_ORPHAN_MIN_AGE_SECONDS=0
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
@@ -2226,8 +2245,9 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
@@ -2283,8 +2303,10 @@ jobs:
       # value every other job writes into its `.env`; the start-up check stays.
       - name: Run container
         run: |
+          # SEC-36: generated for this run; no key-shaped literal in the repository.
+          CONNECTOR_SECRETS_KEY="$(openssl rand -base64 32)"
           docker run -d --name lakehouse-api -p 8080:8080 \
-            -e CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA= \
+            -e CONNECTOR_SECRETS_KEY \
             rantai-lakehouse-api:ci
           for i in $(seq 1 30); do
             if docker inspect -f '{{.State.Running}}' lakehouse-api 2>/dev/null | grep -q true; then
@@ -2354,7 +2376,6 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
-          CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's .env: bronze_ingest_job dials this compose
@@ -2362,6 +2383,8 @@ jobs:
           # the gate opts in for itself.
           INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image

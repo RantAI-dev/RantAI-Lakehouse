@@ -50,16 +50,23 @@ const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
 /// `SRC-12` decision 4: the installation key every test app is given unless
 /// a test overrides `CONNECTOR_SECRETS_KEY`: base64 of 32 bytes of `0x2a`.
 /// Not a secret; it protects nothing outside a test's temporary directory.
-pub const TEST_CONNECTOR_SECRETS_KEY: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+/// SEC-36: encoded at run time, so the repository holds no key-shaped literal
+/// for the `generic-api-key` rule to match.
+pub fn test_connector_secrets_key() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+}
 
 /// The credential the API stored in `dir` under `file_name`, opened with
-/// [`TEST_CONNECTOR_SECRETS_KEY`]. Panics if the file is not a seal under
+/// [`test_connector_secrets_key`]. Panics if the file is not a seal under
 /// that key (which is what a test asserting "stored encrypted" wants).
 pub fn stored_credential(dir: &std::path::Path, file_name: &str) -> String {
     let bytes = std::fs::read(dir.join(file_name)).unwrap();
-    let ring =
-        lakehouse_api::secret_crypto::Keyring::from_values(Some(TEST_CONNECTOR_SECRETS_KEY), None)
-            .unwrap();
+    let ring = lakehouse_api::secret_crypto::Keyring::from_values(
+        Some(&test_connector_secrets_key()),
+        None,
+    )
+    .unwrap();
     String::from_utf8(ring.open(file_name, &bytes).unwrap().plaintext).unwrap()
 }
 
@@ -152,7 +159,7 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert(
         "CONNECTOR_SECRETS_KEY".to_owned(),
-        TEST_CONNECTOR_SECRETS_KEY.to_owned(),
+        test_connector_secrets_key(),
     );
     for (k, v) in overrides {
         env.insert(k.clone(), v.clone());

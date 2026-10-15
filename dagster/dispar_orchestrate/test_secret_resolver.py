@@ -11,6 +11,7 @@ import base64
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -140,8 +141,18 @@ _VECTOR_PATH = (
 )
 
 
-def _vector() -> dict[str, str]:
+def _vector() -> dict[str, Any]:
     return json.loads(_VECTOR_PATH.read_text())
+
+
+def _vector_key(vector: dict[str, Any]) -> str:
+    """The vector's key, base64, built from its description (SEC-36).
+
+    The fixture stores `key_length`, `key_start` and `key_step`, not the key
+    text, so no key-shaped literal sits in the repository for a secret scanner.
+    """
+    key = bytes((vector["key_start"] + i * vector["key_step"]) % 256 for i in range(vector["key_length"]))
+    return base64.b64encode(key).decode()
 
 
 def _other_key() -> str:
@@ -150,7 +161,7 @@ def _other_key() -> str:
 
 def test_the_shared_vector_written_by_the_api_format_opens_here(monkeypatch: pytest.MonkeyPatch) -> None:
     vector = _vector()
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", vector["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
     monkeypatch.delenv("CONNECTOR_SECRETS_KEY_PREVIOUS", raising=False)
     sealed = base64.b64decode(vector["sealed_base64"])
     assert open_managed_credential(vector["file_name"], sealed) == vector["plaintext"]
@@ -158,7 +169,7 @@ def test_the_shared_vector_written_by_the_api_format_opens_here(monkeypatch: pyt
 
 def test_a_sealed_file_copied_under_another_connectors_name_does_not_open(monkeypatch: pytest.MonkeyPatch) -> None:
     vector = _vector()
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", vector["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
     sealed = base64.b64decode(vector["sealed_base64"])
     with pytest.raises(SecretRefRejected, match="cannot be decrypted with this installation's key"):
         open_managed_credential(vector["other_file_name"], sealed)
@@ -170,7 +181,7 @@ def test_the_previous_key_opens_a_file_sealed_before_a_key_change(monkeypatch: p
     sealed = base64.b64decode(vector["sealed_base64"])
     with pytest.raises(SecretRefRejected, match="cannot be decrypted"):
         open_managed_credential(vector["file_name"], sealed)
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY_PREVIOUS", vector["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY_PREVIOUS", _vector_key(vector))
     assert open_managed_credential(vector["file_name"], sealed) == vector["plaintext"]
 
 
@@ -197,7 +208,7 @@ def test_a_missing_key_is_refused_with_the_fixed_text_and_the_setting_goes_to_th
 
 
 def test_bytes_that_are_not_a_seal_are_refused_not_read_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector()["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(_vector()))
     for not_sealed in (b"", b"plain-password", bytes([1]) * 5, bytes([9]) * 40):
         with pytest.raises(SecretRefRejected, match="not in a format this build reads"):
             open_managed_credential("connector_managed_conn_x_password", not_sealed)
@@ -218,7 +229,7 @@ def test_resolve_secret_ref_opens_a_managed_file_and_reads_an_operator_file_as_b
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     vector = _vector()
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", vector["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(vector))
     _point_secrets_dir_at(monkeypatch, tmp_path)
     (tmp_path / vector["file_name"]).write_bytes(base64.b64decode(vector["sealed_base64"]))
     (tmp_path / "connector_conn_ops_password").write_text("operator-pass\n")
@@ -230,7 +241,7 @@ def test_resolve_secret_ref_opens_a_managed_file_and_reads_an_operator_file_as_b
 def test_resolve_secret_ref_refuses_a_plain_file_under_a_managed_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector()["key_base64"])
+    monkeypatch.setenv("CONNECTOR_SECRETS_KEY", _vector_key(_vector()))
     _point_secrets_dir_at(monkeypatch, tmp_path)
     (tmp_path / "connector_managed_conn_old_password").write_text("plain-password")
     with pytest.raises(SecretRefRejected) as excinfo:

@@ -92,39 +92,3 @@ paths = [
 [[allowlists]]
 description = "historical SeaweedFS STS signing key, removed from HEAD but still present in commit b2ad885"
 regexes = ['''cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0''']
-
-# SRC-12 (decision 4): `CONNECTOR_SECRETS_KEY` must be valid base64 of 32
-# bytes, so the CI-only values below look like keys to the generic rule.
-# None protects anything: the first is the CI `.env` key in
-# `.github/workflows/ci.yml` (base64 of the 32 ASCII characters
-# "ci-connector-key-not-real-000000"), the second is the key of the shared
-# test vector `rust/crates/lakehouse-api/tests/fixtures/
-# connector_secret_vector.json` (bytes 0 to 31), the third the key the API's
-# integration tests use (32 bytes of 0x2a), the fourth the "new" key the
-# `g6-credentials` job switches to (the 32 characters
-# "ci-connector-key-rotated-0000000"). Exact literals, so any other key
-# is still scanned.
-[[allowlists]]
-description = "SRC-12 CI-only and test-fixture connector secrets keys (not real)"
-regexes = [
-  '''Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=''',
-  '''AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=''',
-  '''KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=''',
-  '''Y2ktY29ubmVjdG9yLWtleS1yb3RhdGVkLTAwMDAwMDA=''',
-]
-
-# SRC-12 review B1 SHOULD-FIX 1: the CI-only token of the Vault development
-# server in the `g6-secret-managers` job (`.github/workflows/ci.yml`,
-# `ops/g6/docker-compose.src12-managers.override.yml`) and of the `wiremock`
-# stand-in in `rust/crates/lakehouse-api/tests/connector_secret_reference.rs`.
-# Their entropy (about 3.8 and 3.5 bits per character) is high enough for the
-# generic rule's threshold although they are words ("not-real"); the dev
-# server is in-memory and protects nothing. Exact literals, so any other token
-# is still scanned. The job's other values (`testing` for the AWS stand-in,
-# entropy 2.5) are below the threshold and need no entry.
-[[allowlists]]
-description = "SRC-12 CI-only Vault development-server token (not real)"
-regexes = [
-  '''ci-vault-token-not-real-123''',
-  '''ci-vault-token-not-real''',
-]

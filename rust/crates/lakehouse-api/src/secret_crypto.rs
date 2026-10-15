@@ -231,12 +231,28 @@ mod tests {
 
     use super::*;
 
-    /// 32 bytes, base64: `0..31`, the key of the shared vector.
     const VECTOR: &str = include_str!("../tests/fixtures/connector_secret_vector.json");
 
     fn vector_field(name: &str) -> String {
         let json: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
         json[name].as_str().unwrap().to_owned()
+    }
+
+    fn vector_number(name: &str) -> usize {
+        let json: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
+        usize::try_from(json[name].as_u64().unwrap()).unwrap()
+    }
+
+    /// The key of the shared vector, base64, built from the fixture's
+    /// description (`key_length`, `key_start`, `key_step`: bytes `0..31`).
+    /// SEC-36: the fixture holds no key-shaped literal, so the gitleaks
+    /// `generic-api-key` rule has nothing to match and no allowlist is needed.
+    fn vector_key() -> String {
+        let (start, step) = (vector_number("key_start"), vector_number("key_step"));
+        let bytes: Vec<u8> = (0..vector_number("key_length"))
+            .map(|i| u8::try_from(start + i * step).unwrap())
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
     fn decode(b64: &str) -> Vec<u8> {
@@ -253,7 +269,7 @@ mod tests {
     /// what proves the two implementations agree (decision 4's test).
     #[test]
     fn the_shared_vector_written_by_python_opens_here() {
-        let ring = Keyring::from_values(Some(&vector_field("key_base64")), None).unwrap();
+        let ring = Keyring::from_values(Some(&vector_key()), None).unwrap();
         let opened = ring
             .open(
                 &vector_field("file_name"),
@@ -269,7 +285,7 @@ mod tests {
 
     #[test]
     fn the_shared_vector_does_not_open_under_another_file_name() {
-        let ring = Keyring::from_values(Some(&vector_field("key_base64")), None).unwrap();
+        let ring = Keyring::from_values(Some(&vector_key()), None).unwrap();
         let err = ring
             .open(
                 &vector_field("other_file_name"),
@@ -299,7 +315,7 @@ mod tests {
     fn a_wrong_key_is_named_as_such_and_never_opens() {
         let writer = Keyring::from_values(Some(&other_key()), None).unwrap();
         let blob = writer.seal("connector_managed_a_password", b"v").unwrap();
-        let stranger = Keyring::from_values(Some(&vector_field("key_base64")), None).unwrap();
+        let stranger = Keyring::from_values(Some(&vector_key()), None).unwrap();
         assert_eq!(
             stranger
                 .open("connector_managed_a_password", &blob)
@@ -322,7 +338,7 @@ mod tests {
     #[test]
     fn a_previous_key_opens_but_the_current_key_is_the_one_that_seals() {
         let old = other_key();
-        let new = vector_field("key_base64");
+        let new = vector_key();
         let old_ring = Keyring::from_values(Some(&old), None).unwrap();
         let sealed = old_ring.seal("connector_managed_a_password", b"v").unwrap();
 
