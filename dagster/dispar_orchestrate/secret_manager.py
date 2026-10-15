@@ -232,6 +232,7 @@ def text_value(value: Any) -> str:
 # its place; `_MODULES` is what a build ships.
 _MODULES: dict[str, str] = {
     "vault": "dispar_orchestrate.secret_manager_vault",
+    "aws": "dispar_orchestrate.secret_manager_aws",
 }
 _READERS: dict[str, Callable[[Mapping[str, str | None], Mapping[str, str]], str]] = {}
 

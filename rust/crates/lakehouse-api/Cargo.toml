@@ -29,6 +29,9 @@ lakehouse-auth = { path = "../lakehouse-auth" }
 # cookie's payload is base64url-encoded JSON — both need these directly,
 # not routed through `lakehouse-auth::token` (whose hashing is SHA-256 of a
 # bearer token for storage, a different job).
+# `secret_manager::aws`: the SigV4 signer's HMAC-SHA256 (already in the
+# workspace for `lakehouse-embed`; written here instead of the AWS SDK).
+hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`

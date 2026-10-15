@@ -2633,6 +2633,7 @@ dependencies = [
  "chrono",
  "croner",
  "futures",
+ "hmac 0.13.0",
  "iceberg",
  "ipnet",
  "jsonwebtoken",

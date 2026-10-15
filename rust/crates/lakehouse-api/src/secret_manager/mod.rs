@@ -41,6 +41,7 @@
 //! followed, so a manager (or something answering as one) cannot send the
 //! sign-in token on to another server.
 
+mod aws;
 pub mod refs;
 mod vault;
 
@@ -298,7 +299,14 @@ impl ManagerResolver {
                     backend: Arc::new(backend),
                 })
             }
-            SecretManagerKind::Aws | SecretManagerKind::Gcp | SecretManagerKind::Azure => None,
+            SecretManagerKind::Aws => {
+                let backend = aws::AwsBackend::from_settings(settings);
+                Some(Self {
+                    kind: SecretManagerKind::Aws,
+                    backend: Arc::new(backend),
+                })
+            }
+            SecretManagerKind::Gcp | SecretManagerKind::Azure => None,
         }
     }
 
