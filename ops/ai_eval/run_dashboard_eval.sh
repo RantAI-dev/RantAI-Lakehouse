@@ -49,6 +49,13 @@ if [ -z "${LLM_KEY:-}" ]; then
     exit 2
 fi
 
+for tool in docker curl jq python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "run_dashboard_eval: $tool is required and was not found on PATH" >&2
+        exit 2
+    fi
+done
+
 PROJECT="ai-eval-$(date +%s)"
 API_HOST_PORT="${API_HOST_PORT:-27080}"
 CH_HTTP_HOST_PORT="${CH_HTTP_HOST_PORT:-27123}"
@@ -78,11 +85,13 @@ ADMIN_EMAIL="ai-eval@eval.example.com"
 ADMIN_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
 CH_USER="ai_eval"
 CH_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
+COOKIE_JAR=""
 
 cleanup() {
     local code=$?
     echo "run_dashboard_eval: tearing down $PROJECT" >&2
     COMPOSE_PROJECT_NAME="$PROJECT" docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
+    if [ -n "$COOKIE_JAR" ]; then rm -f "$COOKIE_JAR"; fi
     exit "$code"
 }
 trap cleanup EXIT INT TERM
@@ -101,8 +110,31 @@ else
     dc up -d --wait postgres clickhouse oidc-mock lakehouse-api
 fi
 
+# Compose's ClickHouse healthcheck pings HTTP :8123, but the seed script connects
+# on the native :9000, which can still be binding while :8123 already answers --
+# under load the two are not up together. Wait for the port the seed actually
+# uses, with the credentials the seed will use, so a slow native listener is a
+# wait rather than a failed run.
+echo "run_dashboard_eval: waiting for ClickHouse's native port" >&2
+ch_native_ready=0
+for _ in $(seq 1 60); do
+    if dc exec -T clickhouse clickhouse-client --user "$CH_USER" --password "$CH_PASSWORD" \
+        --query "SELECT 1" >/dev/null 2>&1; then
+        ch_native_ready=1
+        break
+    fi
+    sleep 2
+done
+if [ "$ch_native_ready" -ne 1 ]; then
+    echo "run_dashboard_eval: ClickHouse never answered on its native port" >&2
+    exit 2
+fi
+
 echo "run_dashboard_eval: seeding ClickHouse" >&2
-COMPOSE_PROJECT="$PROJECT" scripts/seed-clickhouse.sh
+if ! COMPOSE_PROJECT="$PROJECT" scripts/seed-clickhouse.sh; then
+    echo "run_dashboard_eval: seeding ClickHouse failed; nothing to score" >&2
+    exit 2
+fi
 
 # Wait for the API's own liveness route (unauthenticated) to answer.
 echo "run_dashboard_eval: waiting for the API" >&2
@@ -117,10 +149,37 @@ if ! curl -fsS "http://127.0.0.1:${API_HOST_PORT}/health" >/dev/null 2>&1; then
     exit 2
 fi
 
-# The harness logs in as the bootstrap admin and calls ClickHouse directly for
-# the ground truth; the seed's credentials and ports are passed through.
-export AI_EVAL_EMAIL="$ADMIN_EMAIL" AI_EVAL_PASSWORD="$ADMIN_PASSWORD"
-export AI_EVAL_API_URL="http://127.0.0.1:${API_HOST_PORT}"
+# The bootstrap admin is seeded with a pending password rotation, and the API
+# refuses every route except change-password, logout and /api/auth/me until that
+# rotation is done -- a Platform Admin cannot route around its own with `*:*`.
+# So on a throwaway stack nobody but the bootstrap admin exists to log in as, and
+# until this runs every route the set needs answers 403. Rotate it here, then
+# give the harness the new password: the rotation revokes every live session,
+# including the one that made it.
+API="http://127.0.0.1:${API_HOST_PORT}"
+EVAL_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
+COOKIE_JAR="$(mktemp)"
+
+echo "run_dashboard_eval: rotating the throwaway admin's password" >&2
+if ! curl -fsS -c "$COOKIE_JAR" -X POST "$API/api/auth/login" \
+    -H 'Content-Type: application/json' \
+    --data "$(jq -n --arg email "$ADMIN_EMAIL" --arg password "$ADMIN_PASSWORD" \
+        '{email: $email, password: $password}')" >/dev/null; then
+    echo "run_dashboard_eval: could not log in as the throwaway admin" >&2
+    exit 2
+fi
+if ! curl -fsS -b "$COOKIE_JAR" -X POST "$API/api/auth/change-password" \
+    -H 'Content-Type: application/json' \
+    --data "$(jq -n --arg newPassword "$EVAL_PASSWORD" '{newPassword: $newPassword}')" >/dev/null; then
+    echo "run_dashboard_eval: could not complete the admin's password rotation" >&2
+    exit 2
+fi
+rm -f "$COOKIE_JAR"
+
+# The harness logs in as that admin and calls ClickHouse directly for the ground
+# truth; the seed's credentials and ports are passed through.
+export AI_EVAL_EMAIL="$ADMIN_EMAIL" AI_EVAL_PASSWORD="$EVAL_PASSWORD"
+export AI_EVAL_API_URL="$API"
 export AI_EVAL_CH_URL="http://127.0.0.1:${CH_HTTP_HOST_PORT}"
 
 set -- --cases "$SCRIPT_DIR/dashboard_cases.json" --repeat 3 --need 2 --label "dashboard"
