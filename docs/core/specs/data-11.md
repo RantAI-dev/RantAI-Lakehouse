@@ -24,7 +24,7 @@ Find a table by a column name, a description or a tag, from anywhere.
 | Capability | Today | Target |
 | --- | --- | --- |
 | What is searched | Data Explorer: id, name, namespace, description, owner. The ⌘K box: name, id, description, tags. Column names and column descriptions: nowhere | Names, descriptions, column names, column descriptions, tag keys and values (Databricks' list). A tag is one word until `DATA-12` gives tags keys and values |
-| Filters | Data Explorer filters on type, layer, tier, name, namespace, freshness and size. The API also accepts owner; the page does not offer it. No tag filter. Certification does not exist | Type, owner, layer (Bronze/Silver/Gold), tag, certification. The certification filter **Waits for `DATA-12`**, which creates the mark |
+| Filters | Data Explorer filters on type, layer, tier, name, namespace, freshness and size. The API also accepts owner; the page does not offer it. No tag filter. Certification does not exist | Type, owner, layer (Bronze/Silver/Gold), tag, certification. The certification filter **Blocked by `DATA-12`**, which creates the mark |
 | Matching | The whole typed text as one substring, any letter case. No ranking | Tolerant: any word order, one-typo tolerance, ranked by relevance and use |
 | Where | Data Explorer, and a ⌘K / Ctrl+K box on every signed-in page. By reading the code, the ⌘K box hides a table matched only by its description or tag (not run) | A search box reachable from every page (keyboard shortcut), showing every match and why it matched |
 | Speed | Not measured. Every search rebuilds the whole catalog from six ClickHouse queries | Results within 500 ms for a catalog of 10,000 tables *(proposed)* |

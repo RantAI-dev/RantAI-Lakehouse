@@ -36,7 +36,7 @@ at `c338862` on 2026-10-09; evidence is in the plan, section 2.
 ## Not included
 
 - A certification filter. Certification does not exist yet; the filter comes
-  with `DATA-12`. **Waits for `DATA-12`.**
+  with `DATA-12`. **Blocked by `DATA-12`.**
 - Tags with a key and a value. Tags are single words until `DATA-12`; search
   matches them as they are.
 - Hiding single tables from single users. The product has no per-table

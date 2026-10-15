@@ -10,7 +10,7 @@
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `BLD-3`**. |
+| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` (PR #165). Nothing open blocks it (`BLD-3` shipped). |
 | Started | |
 | Shipped | |
 | Evidence | |

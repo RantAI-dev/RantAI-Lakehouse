@@ -10,7 +10,7 @@
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `BLD-3`, `DATA-10`**. |
+| Plan | `docs/superpowers/plans/2026-10-15-bld-2-target-lag.md` (branch `feat/bld-2-target-lag`) |
 | Started | |
 | Shipped | |
 | Evidence | |
@@ -47,6 +47,7 @@ The AI team reviews that part.
 | 2 | Smallest target lag | 1 minute (Snowflake's); measured before it is claimed, raised if not met | Product owner, 2026-10-14 |
 | 3 | Alert after behind *(proposed)* | 3 checks in a row | Product owner, 2026-10-14 |
 | 4 | Assistant | Same PR | Product owner, 2026-10-14 |
+| 5 | How `BLD-2-AC4` is tested | Runs that fail while inputs change, not a stopped orchestrator: the orchestrator makes the lag checks, so with it stopped nothing is checked and the page shows "not measured" (`BLD-2-AC5`) | Product owner, 2026-10-15 |
 
 ## Limits to tell a customer
 
@@ -60,7 +61,7 @@ The AI team reviews that part.
 | `BLD-2-AC1` | Set a 5-minute target on a Bronze-to-Silver pipeline; load new rows into the Bronze table | The Silver table has them within 5 minutes | Not run |
 | `BLD-2-AC2` | Leave the inputs unchanged for an hour | No run happens; status shows "met" | Not run |
 | `BLD-2-AC3` | Set a downstream pipeline to "Downstream" | Its upstream refreshes only when the downstream needs it | Not run |
-| `BLD-2-AC4` | (operator) Stop the orchestrator long enough to miss the target | An alert is raised after 3 checks; the page shows "behind" | Not run |
+| `BLD-2-AC4` | Make the pipeline's runs fail (for example, drop its source table) while its inputs keep changing | After 3 checks in a row an alert is raised; the page shows "behind" | Not run |
 | `BLD-2-AC5` | Open a pipeline whose lag cannot be measured (orchestrator down) | Shown as not measured, never as met | Not run |
 | `BLD-2-AC6` | Ask the assistant to keep a table at most 10 minutes behind | The target lag is set | Not run |
 | `BLD-2-AC7` | As a user without `pipeline:write`, set a target lag | Refused with an honest message | Not run |
