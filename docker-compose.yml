@@ -351,6 +351,15 @@ services:
       # gate sets a small number so it need not run 30 failures
       # (`ops/g6/src11_connector_operations_test.py`). Not a credential.
       CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}
+      # SRC-12 decision 4 (ADR 0002 addendum 5): the key managed connector
+      # credentials are sealed with (AES-256-GCM). Required, no default
+      # anywhere: compose refuses to start without it, and so does the API.
+      # Losing it loses every stored credential; back it up apart from the
+      # `lakehouse_connector_secrets` volume. `CONNECTOR_SECRETS_KEY_PREVIOUS`
+      # is set only during a key change (decision 5, `lakehouse-api
+      # rotate-secrets-key`): it opens files, it never seals.
+      CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
+      CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
@@ -1765,6 +1774,12 @@ services:
       # process, which this service launches, so the daemon needs none. A
       # gate shortens it (`ops/g6/src11_connector_operations_test.py`).
       INGEST_RETRY_DELAYS_SECONDS: ${INGEST_RETRY_DELAYS_SECONDS:-}
+      # SRC-12 decision 4: opens the sealed `connector_managed_*` files on the
+      # read-only volume above (`secret_resolver.open_managed_credential`).
+      # Same required key as `lakehouse-api`, same single value, no default;
+      # the previous key only during a key change.
+      CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
+      CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}

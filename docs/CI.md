@@ -186,6 +186,14 @@ secret in a new commit, or any new secret, is **not** baselined and turns
 first; only then decide whether it may be added to `.gitleaksignore` (with a
 comment saying why, the date, and the item ID).
 
+`.gitleaks.toml` also allowlists, by exact literal, the three non-secret
+`CONNECTOR_SECRETS_KEY` values `SRC-12` needs: the CI `.env` key (base64 of the
+32 characters `ci-connector-key-not-real-000000`), the shared test vector's
+key and the API integration tests' key. Every CI job that starts the stack
+writes that CI key into its `.env`, because `docker-compose.yml` refuses to be
+read without `CONNECTOR_SECRETS_KEY`; a new job that runs `docker compose`
+needs the same line.
+
 `.gitleaksignore` is read from `--source` (and the working directory);
 blank lines and full-line `#` comments are skipped (gitleaks v8.30.1,
 `detect/detect.go`, `AddGitleaksIgnore`).

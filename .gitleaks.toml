@@ -92,3 +92,20 @@ paths = [
 [[allowlists]]
 description = "historical SeaweedFS STS signing key, removed from HEAD but still present in commit b2ad885"
 regexes = ['''cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0''']
+
+# SRC-12 (decision 4): `CONNECTOR_SECRETS_KEY` must be valid base64 of 32
+# bytes, so the CI-only values below look like keys to the generic rule.
+# None protects anything: the first is the CI `.env` key in
+# `.github/workflows/ci.yml` (base64 of the 32 ASCII characters
+# "ci-connector-key-not-real-000000"), the second is the key of the shared
+# test vector `rust/crates/lakehouse-api/tests/fixtures/
+# connector_secret_vector.json` (bytes 0 to 31), the third the key the API's
+# integration tests use (32 bytes of 0x2a). Exact literals, so any other key
+# is still scanned.
+[[allowlists]]
+description = "SRC-12 CI-only and test-fixture connector secrets keys (not real)"
+regexes = [
+  '''Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=''',
+  '''AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=''',
+  '''KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=''',
+]
