@@ -11,6 +11,11 @@
 # runtime, only for the build.
 
 FROM oven/bun:1-alpine AS builder
+# PR #170 review round 1, SHOULD-FIX 1:
+# `next build` runs under Node because Bun's Turbopack runtime fails with
+# "Expected CommonJS module to have a function wrapper" (`REL-8`, this plan);
+# the image's own `node` is a symlink to Bun; the runtime stage is unchanged
+# (`node:22-alpine`).
 RUN apk add --no-cache nodejs
 WORKDIR /app
 
