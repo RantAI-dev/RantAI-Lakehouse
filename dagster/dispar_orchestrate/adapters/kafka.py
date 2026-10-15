@@ -114,6 +114,15 @@ def _advertised_brokers(consumer) -> BrokerMetadata:
     return BrokerMetadata(brokers=[(b.host, b.port) for b in brokers])
 
 
+def check_brokers(consumer, *, resolve_checked=ssrf_guard.resolve_checked) -> None:
+    """Resolve-and-check every broker the cluster has advertised to `consumer`
+    (`ssrf_guard_kafka.check_all_advertised_brokers`), raising `SsrfBlocked` on the
+    first blocked address. The first of the two SSRF layers in this module's
+    docstring; shared by `consume_one_batch` and the table discovery (`discover.py`,
+    SRC-13), whose reads also run inside `ssrf_guard.checking_resolver()`."""
+    check_all_advertised_brokers(_advertised_brokers(consumer), resolve_checked=resolve_checked)
+
+
 def consume_one_batch(
     consumer: KafkaConsumer,
     *,
@@ -136,9 +145,7 @@ def consume_one_batch(
     why that is the caller's job, done only after a successful sink
     write.
     """
-    check_all_advertised_brokers(
-        _advertised_brokers(consumer), resolve_checked=resolve_checked
-    )
+    check_brokers(consumer, resolve_checked=resolve_checked)
 
     rows: list[dict] = []
     offsets: dict[int, int] = {}

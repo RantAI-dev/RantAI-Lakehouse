@@ -93,21 +93,26 @@ class AdapterBuildResult:
     resolved: ssrf_guard.ResolvedAddress
 
 
-def build_source(
+def connection_parts(
     spec: dict,
     secrets: dict[str, str],
-    source_objects: list[dict],
     *,
     resolve_checked=ssrf_guard.resolve_checked,
-    table_adapter_callback=None,
-) -> AdapterBuildResult:
-    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
-    calls it with each reflected table while the source is built, which is
-    below, inside `checking_resolver()` and over the checked IP literal -- the
-    observation reads the columns from that reflection and opens no
-    connection of its own."""
+) -> tuple[dict[str, Any], dict[str, Any], ssrf_guard.ResolvedAddress]:
+    """The SQLAlchemy `credentials` and `engine_kwargs` for this dial, and the
+    address `resolve_checked` approved: everything about the connection that the
+    module docstring's SSRF and TLS paragraphs describe, in one place. Shared by
+    `build_source` and the table discovery (`discover.py`, SRC-13), so a listing
+    dials exactly as a load does: the checked IP literal, the service name, the
+    operator's certificate DN. The caller opens the connection inside
+    `ssrf_guard.checking_resolver()`.
+
+    # Errors
+
+    `OracleTlsConfigError` when `sslMode` requires TLS and `sslServerCertDn` is
+    unset; whatever `resolve_checked` raises for a blocked host.
+    """
     resolved = resolve_checked(spec["host"], spec["port"])
-    table_names = [obj["name"].split(".")[-1] for obj in source_objects]
 
     tls_required = bool(spec.get("sslMode")) and spec["sslMode"] != "disable"
     engine_kwargs: dict[str, Any] = {}
@@ -140,6 +145,25 @@ def build_source(
         # `database` stays unset because the dialect refuses both together.
         "query": {"service_name": spec["database"]},
     }
+    return credentials, engine_kwargs, resolved
+
+
+def build_source(
+    spec: dict,
+    secrets: dict[str, str],
+    source_objects: list[dict],
+    *,
+    resolve_checked=ssrf_guard.resolve_checked,
+    table_adapter_callback=None,
+) -> AdapterBuildResult:
+    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
+    calls it with each reflected table while the source is built, which is
+    below, inside `checking_resolver()` and over the checked IP literal -- the
+    observation reads the columns from that reflection and opens no
+    connection of its own."""
+    credentials, engine_kwargs, resolved = connection_parts(spec, secrets, resolve_checked=resolve_checked)
+    table_names = [obj["name"].split(".")[-1] for obj in source_objects]
+
     with ssrf_guard.checking_resolver():
         extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
         source = sql_database(

@@ -198,6 +198,8 @@ _PG_REFUSAL_WORDING = "password authentication failed"
 # `pymysql.constants.ER.ACCESS_DENIED_ERROR` / Oracle `ORA-01017`.
 _MYSQL_ACCESS_DENIED = 1045
 _ORACLE_LOGON_DENIED = "ORA-01017"
+# MongoDB's `AuthenticationFailed`.
+_MONGO_AUTH_FAILED = 18
 
 # MySQL / MariaDB: 2002 "can't connect (socket)", 2003 "can't connect", 2006
 # "server has gone away", 2013 "lost connection", 2055 "lost connection".
@@ -261,6 +263,10 @@ def _is_refusal_element(exc: BaseException) -> bool:
         return _PG_REFUSAL_WORDING in str(exc)
     if root == "kafka" and _class_names(exc) & {"AuthenticationFailedError", "SaslAuthenticationFailedError"}:
         return True
+    # SRC-13: MongoDB's `AuthenticationFailed` (code 18), what a wrong user or
+    # password answers. The same answer every time, so a load does not retry it either.
+    if root == "pymongo" and getattr(exc, "code", None) == _MONGO_AUTH_FAILED:
+        return True
     return root == "paramiko" and "AuthenticationException" in _class_names(exc)
 
 
@@ -280,8 +286,48 @@ def is_authentication_refusal(exc: BaseException) -> bool:
     - `psycopg2` (postgres): SQLSTATE `28P01` or `28000` when the error has
       one, else the fixed server wording.
     - `kafka` SASL and `paramiko` SSH authentication failures.
+    - `pymongo`: `OperationFailure.code == 18` (`AuthenticationFailed`).
     """
     return any(_is_refusal_element(e) for e in _chain(exc))
+
+
+# `ORA-01031`: insufficient privileges. MongoDB's `Unauthorized` error code.
+_ORACLE_INSUFFICIENT_PRIVILEGES = "ORA-01031"
+_MONGO_UNAUTHORIZED = 13
+# Kafka's ACL refusals: the credential works, the ACL does not allow the read.
+_KAFKA_NOT_AUTHORIZED = frozenset(
+    {"TopicAuthorizationFailedError", "ClusterAuthorizationFailedError", "GroupAuthorizationFailedError"}
+)
+
+
+def _is_permission_element(exc: BaseException) -> bool:
+    """Whether this one exception (not what it wraps) is a source saying the
+    credential is VALID but may not do this. See `is_permission_refusal`."""
+    root = _root(exc)
+    if root == "oracledb":
+        return getattr(_first_arg(exc), "full_code", None) == _ORACLE_INSUFFICIENT_PRIVILEGES
+    if root == "pymongo":
+        return getattr(exc, "code", None) == _MONGO_UNAUTHORIZED
+    if root == "kafka":
+        return bool(_class_names(exc) & _KAFKA_NOT_AUTHORIZED)
+    # An SFTP server's "permission denied" arrives as `IOError(EACCES)`, which
+    # Python builds as `PermissionError`.
+    return isinstance(exc, PermissionError)
+
+
+def is_permission_refusal(exc: BaseException) -> bool:
+    """Whether `exc`, or anything it wraps, is the source saying the credential
+    is accepted but not ALLOWED to read what was asked (`SRC-13` decision D10:
+    "no permission at the source"), as opposed to refusing the credential itself
+    (`is_authentication_refusal`). Decided by the driver's exception TYPE and
+    error CODE, never by message text; nothing of the message is read.
+
+    - `oracledb`: first argument's `full_code == "ORA-01031"`.
+    - `pymongo`: `OperationFailure.code == 13` (`Unauthorized`).
+    - `kafka`: a topic, cluster or group authorisation failure.
+    - SFTP: a `PermissionError`.
+    """
+    return any(_is_permission_element(e) for e in _chain(exc))
 
 
 # --- classification ----------------------------------------------------------

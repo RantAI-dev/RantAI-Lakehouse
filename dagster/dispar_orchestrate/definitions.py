@@ -21,6 +21,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
+from dispar_orchestrate.discover import discover_job
 from dispar_orchestrate.file_ingest import file_ingest_job
 from dispar_orchestrate.gold_export import (
     gold_export_after_authored_sensor,
@@ -89,6 +90,12 @@ from dispar_orchestrate.replication_metrics import (
 # `POST /api/uploads/{id}/ingest`, with a run config naming the file, so it
 # has no schedule and no sensor: there is no such thing as "the" uploaded
 # file to run it on.
+#
+# `discover_job` (SRC-13, docs/superpowers/plans/2026-10-15-src-13-table-discovery.md)
+# lists what a MongoDB, Kafka, SFTP or Oracle source holds, and previews the
+# columns of one object (also a REST endpoint), for the console's table picker. It
+# is launched only by `POST /api/connectors/{id}/discovery/{kind}` and posts its
+# answer back to the API; it has no schedule and no sensor, and it never loads.
 defs = Definitions(
     jobs=[
         bronze_ingest_job,
@@ -100,6 +107,7 @@ defs = Definitions(
         capacity_snapshot_job,
         ingest_job,
         file_ingest_job,
+        discover_job,
         *authored_jobs,
     ],
     schedules=[
