@@ -1,0 +1,23 @@
+-- SRC-17 F2 (delivery review 2026-10-12): a connector run is counted once
+-- and its alerts are handed over once, as two separate steps.
+--
+-- Before, the dedupe row of a run was written, then the alert rules were
+-- read, and a rule-store failure answered 503 AFTER the row existed: the
+-- orchestrator's retry was skipped as "already recorded" and the alert was
+-- lost, silently. The report now writes the `<kind>` row together with the
+-- connector's health facts (one transaction), and a second `<kind>_alerted`
+-- row only after the rules were read, so a retry finds what is missing:
+--
+--   * rules unreadable, retry: `<kind>` exists, `<kind>_alerted` does not,
+--     so the retry delivers and counts nothing again;
+--   * everything done, retry: both exist, so it does nothing.
+--
+-- The retry of a failed run must still know whether THAT run was the third
+-- in a row (the "3 failures in a row" rule fires on the third and only
+-- then), and the connector's current streak may have moved on. So the
+-- streak the run produced is kept on its `<kind>` row. NULL on every row
+-- written before this migration and on every row that is not a connector
+-- run's: those fire no repeated-failure alert on a retry (an unknown streak
+-- is never guessed).
+ALTER TABLE pipeline_run_event
+    ADD COLUMN failure_streak INTEGER;

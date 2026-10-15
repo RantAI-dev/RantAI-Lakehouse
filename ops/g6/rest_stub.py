@@ -27,6 +27,18 @@ _PAGE_SIZE = 2
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         parsed = urlparse(self.path)
+        if parsed.path == "/":
+            # SRC-9 task 2: the API's connection test (`connector_probe::
+            # probe_rest`) sends one GET to the connector's `baseUrl` itself,
+            # and anything but a 2xx is "rejected". Answer it, so the gate can
+            # see a passing REST connection test; `/items` is unchanged.
+            body = json.dumps({"status": "ok"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path != "/items":
             self.send_response(404)
             self.end_headers()

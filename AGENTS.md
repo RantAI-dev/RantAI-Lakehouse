@@ -70,6 +70,11 @@ The loop, per feature:
    dependencies must not merge with a dependency check red. The developer never opens or merges a PR. Nobody
    pushes to `main` directly or force-pushes it; `main` only moves through
    a merged PR.
+   After merging, the reviewer sets the item's **Status**, **PR** and
+   Shipped date in `BACKLOG.md` (a Feature becomes In Acceptance, never
+   Released, until the owner's checklist passes; a Task becomes Done) and
+   updates the base row to match. The base mirrors the repo; it is never the only place a
+   status, PR or module changes.
 7. **Done.** Merged is not Done. The product owner runs the acceptance
    checklist on the feature page, and the planner updates
    `docs/core/PRODUCT.md` and `docs/core/BACKLOG.md`.
@@ -84,9 +89,11 @@ part of the plan and of the diff. This covers the assistant's work for
 dashboards only (backlog `AI-1` to `AI-15`); the AI team plans the
 assistant's other work itself.
 
-**Waits for.** A backlog item that cannot start until another merges says
-so in its text: **Waits for `BI-9`**. Nobody starts it before that item is
-merged; the planner checks this before writing its plan.
+**Blocked by** (was "Waits for"). A backlog item that cannot start until
+another merges says so in its text: **Blocked by `BI-9`**, or for one part,
+**Blocked by `QS-5` (variables part)**. Nobody starts it (or that part)
+before the blocker is merged; the planner checks this before writing its
+plan. `docs/core/BACKLOG.md` lists both directions under Dependencies.
 
 ## Five principles
 
@@ -108,8 +115,13 @@ merged; the planner checks this before writing its plan.
 Comments and commit messages are in English. Going around a choke point
 (`apiFetch`, `POLICY_TABLE`, `ApiJson`, `_assert_or_create_schema`, the
 allowlisted resolver) is allowed only with a comment at the site saying why.
-Known gap: `ApiError::Internal(err.to_string())` leaks upstream text in
-fourteen Phase-1 handlers — do not add another.
+Upstream error text never reaches a response (SEC-11, closed): the
+"fourteen Phase-1 handlers" gap is gone, and `lakehouse-clickhouse` has no
+`From<ChError> for ApiError` any more, so a `?` on a `ChError` in a route does
+not compile. Report an upstream error with `upstream_error` (the raw text to
+the log under a reference id, a fixed message and the id to the caller);
+`tests/sec11_guard.rs` fails when a route line puts an error's own text in a
+response, and an allowlist entry there needs a reason.
 
 ## Vocabulary you will see and must use correctly
 

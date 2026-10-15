@@ -84,6 +84,18 @@ export type AlertItem = {
   firedAt?: string
   /** Set once this alert (and its rule) is silenced, ISO 8601. */
   silencedUntil?: string
+  /**
+   * Whether the rule's webhook or e-mail arrived (`SRC-17`). Absent when it
+   * is not known (alerts saved before the outcome was kept): never read an
+   * absent value as "delivered" or as "failed".
+   */
+  delivered?: boolean
+  /**
+   * Why a delivery did not happen: one of the API's fixed sentences, never
+   * text from the webhook or the mail server. Present only when
+   * `delivered` is `false`.
+   */
+  deliveryReason?: string
 }
 
 export interface OverviewService {

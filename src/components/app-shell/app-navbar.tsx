@@ -90,7 +90,7 @@ export function AppNavbar() {
               readOnly
               onClick={() => openCommandPalette()}
               onFocus={() => openCommandPalette()}
-              placeholder="Search pages, actions… (⌘K)"
+              placeholder="Search pages, tables, columns… (⌘K)"
               className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
               aria-label="Open command palette"
             />

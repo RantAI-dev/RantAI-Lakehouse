@@ -7,13 +7,20 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
     groups:
+      # arrow and parquet must move with the iceberg crate: iceberg 0.10.1
+      # pins arrow 58, so arrow 60 alone fails to compile with two arrow
+      # versions in the graph (#139, #140, #142). One group keeps them in one
+      # pull request; it goes green when iceberg supports the new arrow
+      # (backlog REL-7). Listed before the patch/minor group so it wins.
+      arrow-parquet-iceberg:
+        patterns: ["arrow*", "parquet", "iceberg*"]
       cargo-patch-and-minor:
         update-types: ["patch", "minor"]
     commit-message:
       prefix: "chore(deps)"
 
   # Frontend (package.json, bun.lock)
-  - package-ecosystem: "npm"
+  - package-ecosystem: "bun"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -21,6 +28,16 @@ updates:
     groups:
       npm-patch-and-minor:
         update-types: ["patch", "minor"]
+    # Major versions that need a planned migration, not a lockfile bump
+    # (dependabot triage 2026-10-14). Each has a backlog item; remove the
+    # entry when that item is planned.
+    ignore:
+      - dependency-name: "typescript"          # REL-4
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eslint"              # REL-5
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@tanstack/react-table"  # REL-6
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "chore(deps)"
 

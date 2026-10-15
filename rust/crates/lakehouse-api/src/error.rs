@@ -3,7 +3,8 @@
 //! Every route handler returns [`ApiResult<T>`], and the `?` operator
 //! converts any `Into<ApiError>` failure (a `ClickHouse` `ChError`, for
 //! instance) into an [`ApiRejection`] automatically. The wire contract is
-//! `{"error": "<message>"}` at the error's status code — verified against
+//! `{"error": "<message>"}` at the error's status code (plus a `code` field
+//! for [`ApiError::NotReady`] only) — verified against
 //! `src/app/api/query/run/route.ts:78` and
 //! `src/app/api/embed/data/route.ts:43`.
 
@@ -35,6 +36,11 @@ impl<E: Into<ApiError>> From<E> for ApiRejection {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+    /// Stable machine-readable condition, present only for the errors that
+    /// have one ([`lakehouse_core::ApiError::NotReady`]). Clients and gates
+    /// branch on this, never on `error`'s text (`PR #105 CI fix`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl IntoResponse for ApiRejection {
@@ -48,10 +54,17 @@ impl IntoResponse for ApiRejection {
             StatusCode::from_u16(self.0.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = ErrorBody {
             error: self.0.to_string(),
+            code: match &self.0 {
+                lakehouse_core::ApiError::NotReady { code, .. } => Some(code),
+                _ => None,
+            },
         };
         // login throttling (SEC-2): a 429 carries an integer Retry-After
         // header so the browser and the console can show how long to wait.
         if let lakehouse_core::ApiError::TooManyRequests {
+            retry_after_secs, ..
+        }
+        | lakehouse_core::ApiError::NotReady {
             retry_after_secs, ..
         } = &self.0
         {
@@ -246,6 +259,27 @@ mod tests {
         );
     }
 
+    /// `PR #105 CI fix`: a not-ready error is a 503 whose body carries the
+    /// stable `code` beside the fixed message, with a `Retry-After`.
+    #[tokio::test]
+    async fn not_ready_renders_503_with_a_code_and_retry_after() {
+        let resp = ApiRejection(ApiError::NotReady {
+            message: "later".to_owned(),
+            code: "orchestrator_job_not_loaded",
+            retry_after_secs: 5,
+        })
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "5"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "later", "code": "orchestrator_job_not_loaded"})
+        );
+    }
+
     #[tokio::test]
     async fn too_many_requests_carries_retry_after_header() {
         let resp = ApiRejection(ApiError::TooManyRequests {
@@ -259,14 +293,19 @@ mod tests {
         );
     }
 
-    /// End-to-end path every data route depends on: a `ClickHouse` failure
-    /// converts through `?` into a 422 rejection with the `ClickHouse`
-    /// message intact.
+    /// SEC-11: the end-to-end path a data route takes for a `ClickHouse`
+    /// failure. It used to convert through `?` into a 422 with the
+    /// database's own message intact (`Code: 47. Unknown identifier: nope`,
+    /// asserted here); that asserted the bug. There is no `From<ChError>` any
+    /// more, so the route reports it explicitly and the body carries only the
+    /// fixed message and a reference.
     #[tokio::test]
-    async fn ch_error_converts_through_question_mark_to_422_rejection() {
+    async fn ch_error_reaches_the_body_as_a_fixed_message_with_a_reference() {
         fn handler() -> Result<(), ApiRejection> {
-            Err(ChError::Server(
-                "Code: 47. Unknown identifier: nope".to_owned(),
+            let err = ChError::Server("Code: 47. Unknown identifier: planted-marker".to_owned());
+            Err(crate::upstream_error::ch_error(
+                &crate::upstream_error::DATABASE,
+                &err,
             ))?;
             Ok(())
         }
@@ -274,10 +313,10 @@ mod tests {
         let rejection = handler().unwrap_err();
         let resp = rejection.into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            body_json(resp).await,
-            json!({"error": "Code: 47. Unknown identifier: nope"})
-        );
+        let body = body_json(resp).await;
+        let message = body["error"].as_str().unwrap();
+        assert!(message.starts_with("The database request failed. Reference: "));
+        assert!(!message.contains("planted-marker"));
     }
 
     /// `OpenfgaError::Rejected` (Lakekeeper reached, our request refused)

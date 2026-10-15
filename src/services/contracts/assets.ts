@@ -78,6 +78,17 @@ export type Asset = {
    */
   steward?: string | null
   tags?: string[]
+  /**
+   * Why a search returned this asset (`DATA-11`): present only on a result
+   * of a search with a term, and absent when every word matched the name.
+   * With several words it explains the first word, in typed order, that the
+   * name does not (`DATA-11` review `SHOULD-FIX 8`).
+   * `field` is `"id"`, `"namespace"`, `"tag"`, `"column"`, `"owner"`,
+   * `"description"` or `"columnDescription"`; `value` is the tag or column
+   * name and `""` for the rest; `approximate` is true when the match
+   * forgave a typo.
+   */
+  matchedOn?: { field: string; value: string; approximate: boolean }
 }
 
 /** What `PUT /api/catalog/{id}/annotation` stores; `null` clears a field. */
@@ -94,6 +105,13 @@ export type AssetColumn = {
   description?: string
   masked?: boolean
   classification?: Classification
+  /**
+   * When the connector that loads this Bronze table found the column gone
+   * from its source (`SRC-8`): the column and its old values are kept.
+   * `null` for a column the source still has. Absent on tables that no
+   * connector loads (Silver, Serving), which carry no such fact.
+   */
+  inactiveSince?: string | null
 }
 
 export type AssetDetail = Asset & {

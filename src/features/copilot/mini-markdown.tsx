@@ -29,7 +29,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
       case "text":
         return tok.content;
       case "bold":
-        return <strong key={key}>{tok.content}</strong>;
+        return <strong key={key}>{renderInline(tok.content, key)}</strong>;
       case "code":
         return (
           <code key={key} className="rounded-md border border-border/70 bg-muted/70 px-1.5 py-px font-mono text-[0.85em] text-foreground">
@@ -37,7 +37,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
           </code>
         );
       case "italic":
-        return <em key={key}>{tok.content}</em>;
+        return <em key={key}>{renderInline(tok.content, key)}</em>;
       case "link":
         return (
           <a

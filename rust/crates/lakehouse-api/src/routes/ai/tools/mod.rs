@@ -5,9 +5,12 @@
 //!   `get_lineage`, `get_quality`, `describe_mart`.
 //! - [`ask`] — `ask_user`, the question with options the console shows as
 //!   buttons.
+//! - [`propose`] — `propose_sql`, a corrected statement checked for the
+//!   caller and shown to the person, never run.
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
@@ -21,6 +24,7 @@
 
 mod alerts;
 mod ask;
+mod calc_fields;
 mod connectors;
 mod dashboards;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
@@ -34,6 +38,7 @@ mod ingest;
 mod lakehouse;
 mod ops;
 mod pipelines;
+mod propose;
 mod queries;
 
 use axum::response::{IntoResponse, Response};
@@ -109,10 +114,16 @@ pub(in crate::routes) async fn run_tool(
     if name == registry::ASK_USER && !state.config.ai_ask_back {
         return json!({ "error": "asking the user is switched off" });
     }
+    // Same shape as the refusal above: `propose_sql` is hidden from the list
+    // when `AI_SQL_HELP` is off, and this refuses a call the model makes anyway.
+    if name == registry::PROPOSE_SQL && !state.config.ai_sql_help {
+        return json!({ "error": "SQL help is switched off" });
+    }
     let ch = &state.clickhouse;
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
         "ask_user" => ask::ask_user(args),
+        "propose_sql" => propose::propose_sql(state, principal, args).await,
         "list_datasets" => data::list_datasets(ch, args).await,
         "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,
@@ -121,30 +132,47 @@ pub(in crate::routes) async fn run_tool(
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(ch, args).await,
-        "create_chart" => dashboards::create_chart(ch, args, None).await,
-        "update_chart" => dashboards::update_chart(ch, args).await,
+        "create_chart" | "update_chart" => {
+            // BI-9: a chart's SQL is built with the report time zone, which
+            // is a deployment setting.
+            let Ok(time) = crate::routes::settings::time_context(state).await else {
+                // The cause was logged under a reference by `time_context`.
+                return json!({ "error": "The reporting settings could not be read." });
+            };
+            if name == "create_chart" {
+                dashboards::create_chart(ch, args, None, &time).await
+            } else {
+                dashboards::update_chart(ch, args, &time).await
+            }
+        }
         "create_board" => dashboards::create_board(ch, args).await,
         "list_boards" => dashboards::list_boards(ch).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
         "list_sql_sources" => dashboards::list_sql_sources(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
-        "list_alert_rules" => alerts::list_alert_rules(ch).await,
-        "create_alert_rule" => alerts::create_alert_rule(ch, args).await,
-        "update_alert_rule" => alerts::update_alert_rule(ch, args).await,
-        "delete_alert_rule" => alerts::delete_alert_rule(ch, args).await,
+        "list_formula_functions"
+        | "list_calculated_fields"
+        | "validate_formula"
+        | "create_calculated_field"
+        | "update_calculated_field"
+        | "delete_calculated_field" => calc_fields::run(state, principal, name, args).await,
+        "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
+        "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
+        "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,
+        "delete_alert_rule" => alerts::delete_alert_rule(state, principal, args).await,
         "run_alert_rule" => alerts::run_alert_rule(state, args).await,
         "list_connectors" => connectors::list_connectors(state, principal).await,
         "create_connector" => connectors::create_connector(state, principal, args).await,
         "test_connector" => connectors::test_connector(state, principal, args).await,
         "delete_connector" => connectors::delete_connector(state, principal, args).await,
         "list_pipelines" => pipelines::list_pipelines(state, principal).await,
-        "list_pipeline_runs" => pipelines::list_pipeline_runs(state, args).await,
+        "list_pipeline_runs" => pipelines::list_pipeline_runs(state, principal, args).await,
         "trigger_pipeline" => pipelines::trigger_pipeline(state, principal, args).await,
-        "retry_pipeline_run" => pipelines::retry_pipeline_run(state, args).await,
+        "retry_pipeline_run" => pipelines::retry_pipeline_run(state, principal, args).await,
         "pause_pipeline" => pipelines::pause_pipeline(state, principal, args).await,
         "resume_pipeline" => pipelines::resume_pipeline(state, principal, args).await,
-        "cancel_pipeline_run" => pipelines::cancel_pipeline_run(state, args).await,
+        "cancel_pipeline_run" => pipelines::cancel_pipeline_run(state, principal, args).await,
         "save_query" => queries::save_query(state, args).await,
         "list_saved_queries" => queries::list_saved_queries(state).await,
         "run_saved_query" => queries::run_saved_query(state, principal, args).await,
@@ -183,6 +211,31 @@ pub(in crate::routes) async fn run_tool(
             )
         }
     }
+}
+
+/// Checks a chart call before the gate offers it as a draft (plan 18). `None`
+/// when the call is not a chart call, or when the draft can be built; the
+/// error otherwise, so a draft on a mart or column that does not exist is
+/// refused rather than offered. Writes nothing.
+///
+/// When the reporting settings cannot be read, this returns the same error
+/// the dispatch arm returns, instead of skipping the check.
+///
+/// `confirmed` is dropped during parse because `ChartInput` and its flattened `TableFields` lack
+/// `deny_unknown_fields` (`Compare` has it; adding it here would refuse drafts the Confirm path accepts).
+pub(crate) async fn check_draft(
+    state: &AppState,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<Value> {
+    if name != "create_chart" && name != "update_chart" {
+        return None;
+    }
+    let Ok(time) = crate::routes::settings::time_context(state).await else {
+        return Some(json!({ "error": "The reporting settings could not be read." }));
+    };
+    let id = (name == "update_chart").then(|| arg_str(args, "id"));
+    dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await
 }
 
 /// Reads `args[key]` as a string, matching `String(args[key] ?? "")`: a

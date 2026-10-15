@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `BI-7` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Dashboards |
-| Who builds it | Dashboards |
-| When | Next |
+| Module | Dashboards |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -37,10 +35,9 @@ Metabase joins: inner, left, right, full, several joins and conditions, all plan
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] Joining visits to hotels by province gives the same numbers as the equivalent SQL
-- [ ] A masked column in the joined table stays masked
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `BI-7-AC1` Joining visits to hotels by province gives the same numbers as the equivalent SQL
+- `BI-7-AC2` A masked column in the joined table stays masked
+- `BI-7-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

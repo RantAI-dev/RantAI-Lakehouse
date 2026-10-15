@@ -19,9 +19,11 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use lakehouse_store::StoreError;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, create_connector,
-    get_ingest_spec,
+    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
+    SecretRefSwap, SecretSlot, create_connector, get_ingest_spec, repoint_ingest_spec,
+    set_ingest_spec,
 };
 use sqlx::PgPool;
 
@@ -294,5 +296,288 @@ async fn bronze_meta_ingest_offset_exists_with_the_documented_shape(
         duplicate.is_err(),
         "PRIMARY KEY (connector_id, topic, partition_id) must reject a duplicate row"
     );
+    Ok(())
+}
+
+// ── SEC-14: a change of target needs the credentials in the same write ───
+
+/// The seeded `conn-pg-lakehouse` row, as `0034` left it: `sql`/`postgres`,
+/// host `postgres`, port 5432, database `lakehouse`.
+fn seeded_pg_spec(host: &str, user: &str) -> IngestSpecInput {
+    IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "postgres", "host": host, "port": 5432,
+            "database": "lakehouse", "user": user,
+        }),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    }
+}
+
+async fn refs_of(pool: &PgPool, id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT secret_ref, secret_ref_secondary FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// SEC-14: the guard in `set_ingest_spec` is what stops every other caller
+/// (the assistant's tool, a future route) from re-pointing a connector that
+/// keeps its stored credential. Nothing is written when it refuses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_refuses_a_change_of_host_and_writes_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let before = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = set_ingest_spec(
+        &pool,
+        "conn-pg-lakehouse",
+        &seeded_pg_spec("elsewhere.example.internal", "lakehouse"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    let after = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before, "a refused re-point must leave the row alone");
+    Ok(())
+}
+
+/// A change that is not a change of target (user, objects, schedule, a host
+/// written in another case) still goes through `set_ingest_spec`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_accepts_a_save_that_keeps_the_target(pool: PgPool) -> sqlx::Result<()> {
+    let mut spec = seeded_pg_spec("POSTGRES", "someone_else");
+    spec.source_objects = serde_json::json!([{"name": "public.orders", "target": "orders"}]);
+    spec.schedule_cron = Some("0 * * * *".to_owned());
+    set_ingest_spec(&pool, "conn-pg-lakehouse", &spec)
+        .await
+        .unwrap();
+
+    let read = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.dial, spec.dial);
+    assert_eq!(read.schedule_cron.as_deref(), Some("0 * * * *"));
+    Ok(())
+}
+
+/// The first-configuration boundary: a connector that has never had an
+/// ingest spec (`adapter` NULL, `dial` `{}`) takes its first dial through
+/// `set_ingest_spec`, whatever the host; it has no target to move away from.
+/// A second save to a different host is then a re-point and is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_first_dial_of_a_new_connector_is_not_a_re_point(pool: PgPool) -> sqlx::Result<()> {
+    let (created, _names) = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            name: "sec14 first configuration".to_owned(),
+            kind: "PostgreSQL".to_owned(),
+            direction: "source".to_owned(),
+            host: "unused".to_owned(),
+            credential: CredentialSpec {
+                source: CredentialSource::Env,
+                primary: CredentialKind::Password,
+                secondary: None,
+            },
+            environment: "staging".to_owned(),
+            tenant: "Meridian Group".to_owned(),
+            residency: "in-region".to_owned(),
+            capabilities: vec![],
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    set_ingest_spec(
+        &pool,
+        &created.id,
+        &seeded_pg_spec("first.example.internal", "u"),
+    )
+    .await
+    .expect("the first dial is saved without credentials");
+
+    let err = set_ingest_spec(
+        &pool,
+        &created.id,
+        &seeded_pg_spec("second.example.internal", "u"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+    Ok(())
+}
+
+/// `repoint_ingest_spec` writes the spec and the new ref together.
+#[sqlx::test(migrations = "../../migrations")]
+async fn repoint_ingest_spec_writes_the_spec_and_the_ref_together(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (old_primary, _) = refs_of(&pool, "conn-pg-lakehouse").await;
+    let new_ref = "file:/run/secrets/connector_managed_conn_pg_lakehouse_password";
+
+    let spec = seeded_pg_spec("elsewhere.example.internal", "lakehouse");
+    let written = repoint_ingest_spec(
+        &pool,
+        "conn-pg-lakehouse",
+        &spec,
+        &[SecretRefSwap {
+            slot: SecretSlot::Primary,
+            expected_old: Some(old_primary.as_str()),
+            new_ref,
+        }],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(written.dial, spec.dial);
+    assert_eq!(written.secret_refs.primary, new_ref);
+    let (stored_primary, _) = refs_of(&pool, "conn-pg-lakehouse").await;
+    assert_eq!(stored_primary, new_ref);
+    Ok(())
+}
+
+/// A caller that skips the route-level check and passes no swaps still
+/// cannot re-point: the store refuses and leaves the row as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn repoint_ingest_spec_without_the_credential_slot_is_a_conflict(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let before = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = repoint_ingest_spec(
+        &pool,
+        "conn-pg-lakehouse",
+        &seeded_pg_spec("elsewhere.example.internal", "lakehouse"),
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    let after = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+    Ok(())
+}
+
+/// A swap whose `expected_old` is stale fails the whole write: the spec is
+/// not written either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn repoint_ingest_spec_with_a_stale_ref_rolls_everything_back(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let before = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let err = repoint_ingest_spec(
+        &pool,
+        "conn-pg-lakehouse",
+        &seeded_pg_spec("elsewhere.example.internal", "lakehouse"),
+        &[SecretRefSwap {
+            slot: SecretSlot::Primary,
+            expected_old: Some("env:SOMEONE_ELSE_CHANGED_THIS"),
+            new_ref: "file:/run/secrets/connector_managed_conn_pg_lakehouse_password",
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    let after = get_ingest_spec(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, before);
+    Ok(())
+}
+
+/// A connector that reads two credentials (the seeded S3 one: access key and
+/// secret key) needs both in a re-point: one of two is a conflict, and the
+/// first swap does not stay behind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn repoint_ingest_spec_needs_every_slot_the_new_dial_reads(pool: PgPool) -> sqlx::Result<()> {
+    let (primary, secondary) = refs_of(&pool, "conn-s3-warehouse").await;
+    let secondary = secondary.expect("the seeded S3 connector has two refs");
+    let before = get_ingest_spec(&pool, "conn-s3-warehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "files".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "protocol": "s3", "endpoint": "http://elsewhere.example.internal:9000",
+            "bucket": "lakehouse-warehouse", "format": "csv",
+        }),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    let new_primary = "file:/run/secrets/connector_managed_conn_s3_warehouse_access_key";
+    let new_secondary = "file:/run/secrets/connector_managed_conn_s3_warehouse_secret_key";
+
+    let err = repoint_ingest_spec(
+        &pool,
+        "conn-s3-warehouse",
+        &spec,
+        &[SecretRefSwap {
+            slot: SecretSlot::Primary,
+            expected_old: Some(primary.as_str()),
+            new_ref: new_primary,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+    assert_eq!(
+        get_ingest_spec(&pool, "conn-s3-warehouse")
+            .await
+            .unwrap()
+            .unwrap(),
+        before,
+        "one slot of two must change nothing"
+    );
+
+    repoint_ingest_spec(
+        &pool,
+        "conn-s3-warehouse",
+        &spec,
+        &[
+            SecretRefSwap {
+                slot: SecretSlot::Primary,
+                expected_old: Some(primary.as_str()),
+                new_ref: new_primary,
+            },
+            SecretRefSwap {
+                slot: SecretSlot::Secondary,
+                expected_old: Some(secondary.as_str()),
+                new_ref: new_secondary,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let (stored_primary, stored_secondary) = refs_of(&pool, "conn-s3-warehouse").await;
+    assert_eq!(stored_primary, new_primary);
+    assert_eq!(stored_secondary.as_deref(), Some(new_secondary));
     Ok(())
 }

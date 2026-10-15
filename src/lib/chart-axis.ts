@@ -21,12 +21,40 @@ export function monthlyAxisLabel(categories: string[]): {
   }
 }
 
-/** Compact number for axes: 1.2K, 3.5M, 2B. */
-export function formatCompactNumber(v: number): string {
+/**
+ * BI-8 review fix (SHOULD-FIX) R4: how many decimals the numbers of a chart
+ * need, read from the data it draws. Whole numbers keep the look they always
+ * had (0). Fractions get enough to tell axis ticks and tooltips apart: a share
+ * between 0 and 1 (0.23 against 0.18) needs three, values from 1 to 100 two,
+ * from 100 to 1,000 one; from 1,000 up the compact form (1.2K) already carries one.
+ * Chosen from the values, not from the column's type, because a calculated
+ * field's type is only known as "number" and a plain `avg` is fractional too.
+ */
+export function decimalsFor(values: readonly number[]): number {
+  let max = 0
+  let fractional = false
+  for (const v of values) {
+    if (!Number.isFinite(v)) continue
+    if (!Number.isInteger(v)) fractional = true
+    max = Math.max(max, Math.abs(v))
+  }
+  if (!fractional || max >= 1000) return 0
+  if (max >= 100) return 1
+  if (max >= 1) return 2
+  return 3
+}
+
+/** `v` with at most `decimals` decimals (none trailing), thousands separated. */
+export function formatNumber(v: number, decimals = 0): string {
+  return v.toLocaleString("en-US", { maximumFractionDigits: decimals })
+}
+
+/** Compact number for axes: 1.2K, 3.5M, 2B; below 1,000 up to `decimals` decimals. */
+export function formatCompactNumber(v: number, decimals = 0): string {
   const a = Math.abs(v)
   const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 })
   if (a >= 1_000_000_000) return `${fmt(v / 1_000_000_000)}B`
   if (a >= 1_000_000) return `${fmt(v / 1_000_000)}M`
   if (a >= 1_000) return `${fmt(v / 1_000)}K`
-  return Math.round(v).toLocaleString("en-US")
+  return formatNumber(v, decimals)
 }
