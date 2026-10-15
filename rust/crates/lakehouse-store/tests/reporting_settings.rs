@@ -11,6 +11,25 @@ use lakehouse_test_support as _;
 use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
+/// Settings with the formatting defaults of migration `0072`.
+fn settings(zone: &str, week: &str) -> ReportingSettings {
+    ReportingSettings {
+        time_zone: zone.to_owned(),
+        week_start: week.to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: SHIPPED.iter().map(|f| (*f).to_owned()).collect(),
+    }
+}
+
+const SHIPPED: [&str; 5] = [
+    "inter",
+    "ibm-plex-sans",
+    "source-serif",
+    "jetbrains-mono",
+    "system",
+];
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_deployment_that_never_saved_has_no_row(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(get(&pool).await.expect("get"), None);
@@ -21,19 +40,13 @@ async fn a_deployment_that_never_saved_has_no_row(pool: PgPool) -> sqlx::Result<
 async fn a_save_round_trips_and_a_second_save_replaces_the_one_row(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let first = upsert(&pool, "Europe/Berlin", "sunday", "user-a")
+    let first = upsert(&pool, &settings("Europe/Berlin", "sunday"), "user-a")
         .await
         .expect("upsert");
-    assert_eq!(
-        first,
-        ReportingSettings {
-            time_zone: "Europe/Berlin".to_owned(),
-            week_start: "sunday".to_owned()
-        }
-    );
+    assert_eq!(first, settings("Europe/Berlin", "sunday"));
     assert_eq!(get(&pool).await.expect("get"), Some(first));
 
-    upsert(&pool, "Asia/Jakarta", "monday", "user-b")
+    upsert(&pool, &settings("Asia/Jakarta", "monday"), "user-b")
         .await
         .expect("upsert again");
     let (rows, who): (i64, String) =
@@ -59,8 +72,66 @@ async fn the_table_refuses_a_third_week_start_and_a_zone_that_is_not_shaped_like
         ("Asia//Jakarta", "monday"),
     ] {
         assert!(
-            upsert(&pool, zone, week, "u").await.is_err(),
+            upsert(&pool, &settings(zone, week), "u").await.is_err(),
             "{zone:?} {week:?} should be refused by the table's CHECKs"
+        );
+    }
+    assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_the_defaults(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // A row as migration 0070 wrote it: the three new columns take their defaults.
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start) \
+         VALUES (TRUE, 'UTC', 'monday')",
+    )
+    .execute(&pool)
+    .await?;
+    assert_eq!(
+        get(&pool).await.expect("get"),
+        Some(settings("UTC", "monday"))
+    );
+
+    let mut chosen = settings("UTC", "monday");
+    chosen.number_locale = "id-ID".to_owned();
+    chosen.company_palette = vec!["#1a2b3c".to_owned(), "#FFAA00".to_owned()];
+    chosen.fonts = vec!["inter".to_owned(), "system".to_owned()];
+    assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
+    assert_eq!(get(&pool).await.expect("get"), Some(chosen));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_a_third_locale_a_bad_palette_and_a_font_it_does_not_ship(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let mut cases = Vec::new();
+    for locale in ["fr-FR", ""] {
+        let mut s = settings("UTC", "monday");
+        s.number_locale = locale.to_owned();
+        cases.push(s);
+    }
+    for palette in [
+        vec!["#123456".to_owned()],
+        vec!["#123456".to_owned(), "red".to_owned()],
+        vec!["#123456".to_owned(), "#12345;".to_owned()],
+        (0..13).map(|i| format!("#00000{}", i % 10)).collect(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.company_palette = palette;
+        cases.push(s);
+    }
+    let mut s = settings("UTC", "monday");
+    s.fonts = vec!["comic-sans".to_owned()];
+    cases.push(s);
+    for case in cases {
+        assert!(
+            upsert(&pool, &case, "u").await.is_err(),
+            "{case:?} should be refused by the table's CHECKs"
         );
     }
     assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");

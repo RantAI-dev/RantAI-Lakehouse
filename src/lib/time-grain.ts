@@ -178,8 +178,18 @@ export function bucketListsRecords(grain: Grain): boolean {
 /** The sentence the tile menu gives for a part of the date, which offers neither. */
 export const PART_NO_CLICK_REASON = "A part of the date, such as a weekday, spans many days, so it has no rows to list or range to filter."
 
-/** The Settings the console reads with the dashboard (`reporting`). */
-export type ReportingContext = { timeZone: string; weekStart: WeekStart | string }
+/**
+ * The Settings the console reads with the dashboard (`reporting`). The
+ * formatting fields (`BI-17` part A) are absent from a payload an older
+ * server sent, so a reader falls back to the defaults of `formatting-settings`.
+ */
+export type ReportingContext = {
+  timeZone: string
+  weekStart: WeekStart | string
+  numberLocale?: string
+  companyPalette?: string[]
+  fonts?: string[]
+}
 
 /** Calendar first day for ECharts (`firstDay`: 0 is Sunday, 1 is Monday). */
 export function calendarFirstDay(weekStart: string | undefined): 0 | 1 {

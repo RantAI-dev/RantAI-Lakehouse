@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReportingContext } from "@/lib/time-grain";
 import * as React from "react";
 import { useTheme } from "next-themes";
 import Image from "next/image";
@@ -22,8 +23,8 @@ type Payload = {
   phoneLayout?: PhoneTile[];
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
-  /** The zone and first weekday the buckets were cut with (BI-9). */
-  reporting?: { timeZone: string; weekStart: string };
+  /** The zone and first weekday the buckets were cut with (BI-9), and the formatting settings (BI-17). */
+  reporting?: ReportingContext;
 };
 
 /**

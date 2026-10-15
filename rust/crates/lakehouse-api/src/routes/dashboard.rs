@@ -166,6 +166,12 @@ pub async fn get(
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts go out in the
+    // payload's `reporting` object next to the zone.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let obligations = PolicyEngineObligations::from_state(&state);
     // BI-18 part C, part 2: a board in the trash or in somebody else's
     // personal space reads as a board that does not exist.
@@ -181,7 +187,10 @@ pub async fn get(
     )
     .await
     {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(BodyError::Params(err)) => crate::error::ApiRejection(err).into_response(),
         Err(BodyError::Store(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,

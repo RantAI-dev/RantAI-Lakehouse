@@ -23,6 +23,23 @@ use tower::ServiceExt;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...]}";
+
+/// What a deployment that never saved formatting reads back.
+fn formatting_defaults(mut body: Value) -> Value {
+    body["numberLocale"] = json!("en-US");
+    body["companyPalette"] = json!([]);
+    body["fonts"] = json!([
+        "inter",
+        "ibm-plex-sans",
+        "source-serif",
+        "jetbrains-mono",
+        "system"
+    ]);
+    body
+}
+
 async fn call(app: &axum::Router, verb: &str, cookie: &str, body: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -68,7 +85,9 @@ async fn with_nothing_saved_a_signed_in_reader_gets_the_defaults() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
-        json!({"timeZone": "Asia/Jakarta", "weekStart": "monday", "saved": false})
+        formatting_defaults(
+            json!({"timeZone": "Asia/Jakarta", "weekStart": "monday", "saved": false})
+        )
     );
 }
 
@@ -95,14 +114,8 @@ async fn a_bad_body_a_third_week_start_and_a_malformed_zone_are_400_with_a_fixed
     let user = create_principal_with_permissions(&pool, "settings:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
     let cases = [
-        (
-            "not json",
-            "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\"}",
-        ),
-        (
-            r#"{"timeZone":"UTC"}"#,
-            "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\"}",
-        ),
+        ("not json", BODY_SHAPE),
+        (r#"{"timeZone":"UTC"}"#, BODY_SHAPE),
         (
             r#"{"timeZone":"UTC","weekStart":"friday"}"#,
             "weekStart must be monday or sunday.",
@@ -110,6 +123,22 @@ async fn a_bad_body_a_third_week_start_and_a_malformed_zone_are_400_with_a_fixed
         (
             r#"{"timeZone":"UTC' OR 1=1 --","weekStart":"monday"}"#,
             "Unknown time zone.",
+        ),
+        (
+            r#"{"timeZone":"UTC","weekStart":"monday","numberLocale":"fr-FR"}"#,
+            "numberLocale must be en-US or id-ID.",
+        ),
+        (
+            r##"{"timeZone":"UTC","weekStart":"monday","companyPalette":["#112233"]}"##,
+            "The company palette needs 2 to 12 colours, or none.",
+        ),
+        (
+            r##"{"timeZone":"UTC","weekStart":"monday","companyPalette":["#112233","blue"]}"##,
+            "Every company palette colour must look like #1a2b3c.",
+        ),
+        (
+            r#"{"timeZone":"UTC","weekStart":"monday","fonts":["comic-sans"]}"#,
+            "fonts must be chosen from the fonts the console ships.",
         ),
     ];
     for (body, message) in cases {
@@ -152,7 +181,9 @@ async fn a_known_zone_is_saved_and_read_back_with_the_saved_flag() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({"timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true})
+        formatting_defaults(
+            json!({"timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true})
+        )
     );
     let reader = create_zero_permission_principal(&pool).await;
     let cookie = session_cookie_for_user(&pool, reader).await;
@@ -178,4 +209,60 @@ async fn an_engine_failure_is_reported_without_its_own_text() {
     let text = body.to_string();
     assert!(!text.contains("127.0.0.1"), "{text}");
     assert!(text.contains("Reference:"), "{text}");
+}
+
+#[tokio::test]
+async fn the_number_locale_palette_and_fonts_are_saved_and_a_later_save_without_them_keeps_them() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let writer = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r##"{"timeZone":"UTC","weekStart":"monday","numberLocale":"id-ID",
+            "companyPalette":["#AABBCC","#112233"],"fonts":["system","inter"]}"##,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberLocale"], json!("id-ID"));
+    assert_eq!(body["companyPalette"], json!(["#aabbcc", "#112233"]));
+    assert_eq!(body["fonts"], json!(["inter", "system"]));
+
+    // The BI-9 form sends only the zone and the first day.
+    let (status, again) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"Europe/Berlin","weekStart":"sunday"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["numberLocale"], body["numberLocale"]);
+    assert_eq!(again["companyPalette"], body["companyPalette"]);
+    assert_eq!(again["fonts"], body["fonts"]);
+
+    // An empty palette clears the company palette.
+    let (_, cleared) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","companyPalette":[]}"#,
+    )
+    .await;
+    assert_eq!(cleared["companyPalette"], json!([]));
+}
+
+#[tokio::test]
+async fn every_shipped_font_and_locale_passes_the_tables_checks() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let writer = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    for locale in lakehouse_bi::formatting::NUMBER_LOCALES {
+        let fonts = json!(lakehouse_bi::formatting::SHIPPED_FONTS);
+        let body = json!({"timeZone": "UTC", "weekStart": "monday", "numberLocale": locale, "fonts": fonts});
+        let (status, got) = call(&router, "PUT", &cookie, &body.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{locale}: {got}");
+        assert_eq!(got["fonts"], fonts);
+    }
 }

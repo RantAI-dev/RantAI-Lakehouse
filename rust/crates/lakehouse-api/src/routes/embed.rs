@@ -152,6 +152,13 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts ride in the
+    // payload's `reporting` object like the zone, so an embed formats as the
+    // console does.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let payload = render_board_payload(
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
@@ -162,7 +169,10 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     )
     .await;
     match payload {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -393,6 +403,13 @@ pub async fn public_dashboard(
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts ride in the
+    // payload's `reporting` object like the zone, so an embed formats as the
+    // console does.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let payload = render_board_payload(
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
@@ -403,7 +420,10 @@ pub async fn public_dashboard(
     )
     .await;
     match payload {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),

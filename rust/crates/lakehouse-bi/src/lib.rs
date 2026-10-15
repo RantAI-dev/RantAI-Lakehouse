@@ -12,6 +12,7 @@ pub mod embed_access;
 pub mod fields;
 pub mod filters;
 pub mod folders;
+pub mod formatting;
 pub mod formula;
 pub mod grain;
 pub mod groups;
