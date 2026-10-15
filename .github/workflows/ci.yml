@@ -2023,20 +2023,22 @@ jobs:
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # DATA-2: raised from 20 by measured acceptance test execution time
+    # (327s, ~6 minutes) plus 5 minutes of slack (11 minutes total raise).
+    timeout-minutes: 31
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # The API image comes from the `images` job, built once per run; this
-      # job never compiles it. This job starts no Dagster service, so it
-      # does not download the (larger) Dagster image.
-      - name: Download image artifact (lakehouse-api)
+      # Images from the `images` job; see `g3a-dagster`'s download step.
+      - name: Download image artifacts (lakehouse-api + dagster)
         uses: actions/download-artifact@v8
         with:
-          name: image-lakehouse-api
+          pattern: image-lakehouse-*
+          merge-multiple: true
           path: ${{ runner.temp }}/images
 
       - name: Load images
@@ -2053,17 +2055,25 @@ jobs:
           CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA=
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # DATA-2 review BLOCKER 2: credentials in CI-only .env matching g9-upload
+          CONNECTOR_S3_ACCESS_KEY=rustfsadmin
+          CONNECTOR_S3_SECRET_KEY=rustfsadmin
+          # DATA-2 review BLOCKER 1: CI runs with age 0 to allow immediate orphan cleanup in gate test (no other writer runs here)
+          GOLD_ORPHAN_MIN_AGE_SECONDS=0
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.
       - name: Build the oidc-mock fixture image
-        run: docker compose -p goldci build oidc-mock
+        run: docker compose -p goldci --profile dagster build oidc-mock
 
-      - name: Bring up lakehouse-api (and its full Lakekeeper/authz chain)
-        run: docker compose -p goldci up -d --no-build lakehouse-api
+      - name: Bring up lakehouse-api + Dagster (and the full Lakekeeper/authz chain)
+        run: >
+          docker compose -p goldci --profile dagster up -d --no-build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the Gold export acceptance test inside the compose network
-        run: docker compose -p goldci --profile test run --rm gold-export-test-runner
+        run: docker compose -p goldci --profile dagster run --rm gold-export-test-runner
 
       - name: Compose logs (on failure)
         if: failure()

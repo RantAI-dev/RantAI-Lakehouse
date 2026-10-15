@@ -1377,7 +1377,7 @@ services:
   #   docker compose -p <project> up -d --build lakehouse-api
   #   docker compose -p <project> --profile test run --rm gold-export-test-runner
   gold-export-test-runner:
-    profiles: ["test"]
+    profiles: ["dagster"]
     image: python:3.12-slim
     working_dir: /work
     volumes:
@@ -1399,6 +1399,8 @@ services:
     depends_on:
       lakehouse-api:
         condition: service_started
+      dagster-webserver:
+        condition: service_healthy
       lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
@@ -1406,6 +1408,12 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: ${DAGSTER_URL:-http://dagster-webserver:3000/graphql}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # DATA-2 review BLOCKER 2: no default credentials in compose (AGENTS rule 5)
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       LAKEKEEPER_BASE_URI: http://lakekeeper:8181
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEKEEPER_TOKENS_DIR: /tokens
@@ -1413,9 +1421,11 @@ services:
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
       GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "pip install -q requests && python gold_export_test.py"
+      - "pip install -q requests boto3 && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -1785,6 +1795,7 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
+      # DATA-2 review BLOCKER 3: no source bind-mount in deployment template (image carries code)
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
       - type: volume
@@ -1800,6 +1811,13 @@ services:
       - type: volume
         source: lakehouse_connector_secrets
         target: /run/secrets
+        read_only: true
+      # DATA-2 (D2): read-only subpath mount for the gold-export principal token
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
         read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
@@ -1905,6 +1923,8 @@ services:
       # so there is no step to interpolate a file into an env var before
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
+      # DATA-2 (D2): the gold-export principal pre-minted token path
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
       # static-credential fallback path, used because dlt writes Parquet
@@ -1948,6 +1968,10 @@ services:
       LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
       GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # DATA-2 (D4): number of Gold export copies to keep per mart (default 7)
+      GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}
+      # DATA-2 review BLOCKER 1: minimum orphan age in seconds before removal (default 3600)
+      GOLD_ORPHAN_MIN_AGE_SECONDS: ${GOLD_ORPHAN_MIN_AGE_SECONDS:-3600}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the
