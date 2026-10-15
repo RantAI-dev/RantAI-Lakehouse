@@ -127,8 +127,9 @@ pub fn is_write_high_pending(value: &Value) -> bool {
 fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
+        // BI-18 part C, part 2: a deleted chart goes to the trash, not away.
         "delete_chart" => format!(
-            "Menghapus chart {} dari dashboard secara permanen.",
+            "Memindahkan chart {} dari dashboard ke tempat sampah; bisa dipulihkan selama 30 hari.",
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),

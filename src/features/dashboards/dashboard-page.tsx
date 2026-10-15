@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Lock, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -39,6 +39,9 @@ import { BoardSwitcher } from "./board-switcher";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
+import { labelledFolders } from "@/lib/dashboard-organise";
+import { FavouriteButton } from "./favourite-button";
+import { VersionHistoryDialog } from "./version-history-dialog";
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { GrainMarkers } from "./grain-marker";
 import { OwnFiltersMarker } from "./filters/own-filters-marker";
@@ -62,7 +65,7 @@ import { downloadTableExport, exportNotice } from "./table-export";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
-type BoardOpt = { id: string; name: string; folderId?: string | null };
+type BoardOpt = { id: string; name: string; folderId?: string | null; ownerId?: string };
 /** `resolved`: the columns a chart's parameter slots took in this response (BI-11). */
 type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef; resolved?: { dimension?: string; breakdown?: string | null } };
 type Payload = {
@@ -166,7 +169,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // board until an editor presses "Save as default".
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const { hasPermission } = useAuth();
+  const { hasPermission, user } = useAuth();
   const fParam = searchParams.get(FILTER_PARAM);
   // The dashboard's grain switch lives in the address beside the filters.
   const gChoice: GrainChoice = readGrainParam(searchParams.get(GRAIN_PARAM));
@@ -183,8 +186,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // Folders only group the title switcher here. Managing them and filing
   // a dashboard are on the dashboard list (`dashboard-list-page.tsx`).
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
-  const folders = foldersState.data ?? [];
+  const folders = React.useMemo(() => labelledFolders(foldersState.data ?? [], user?.id), [foldersState.data, user?.id]);
   const [shareOpen, setShareOpen] = React.useState(false);
+  const [historyOpen, setHistoryOpen] = React.useState(false);
+  // BI-18 part C, part 2: favourites, and "recent" noted once per dashboard opened.
+  const shortcuts = useService((signal) => dashboardService.shortcuts(signal), []);
+  const reloadShortcuts = shortcuts.reload;
+  const isFavourite = shortcuts.status === "success" && shortcuts.data.favourites.some((f) => f.kind === "board" && f.id === board);
+  React.useEffect(() => { void dashboardService.touchRecent("board", board).catch(() => undefined); }, [board]);
   const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
   // Auto-refresh starts from the board's saved interval; a viewer's change is
@@ -513,6 +522,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   async function deleteDashboard() {
     if (isDefault) return;
     await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
+    notifySuccess("Dashboard moved to the trash", "Restore it from Trash on the dashboard list for 30 days.");
     notifyDashboardsChanged();
     // Lupakan sebelum pergi, kalau tidak `/dashboards` menuntun balik ke sini.
     forgetLastBoard(board);
@@ -534,6 +544,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   const boards = data?.boards ?? [{ id: "default", name: "Main" }];
   const dashName = boards.find((b) => b.id === board)?.name ?? "Dashboards";
+  const ownerId = boards.find((b) => b.id === board)?.ownerId;
   // Stable empty fallbacks: a fresh `[]` each render re-ran the Copilot
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
@@ -920,8 +931,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
               {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
             </Button>
+            {!isDefault ? (
+              <FavouriteButton
+                on={isFavourite}
+                name={dashName}
+                onToggle={() => {
+                  void dashboardService.setFavourite("board", board, !isFavourite).then(reloadShortcuts).catch(() => undefined);
+                }}
+              />
+            ) : null}
+            {ownerId ? (
+              <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Only you and administrators can see this dashboard.">
+                <Lock className="size-3.5" aria-hidden /> Private
+              </span>
+            ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
+              isPrivate={Boolean(ownerId)}
+              onHistory={() => setHistoryOpen(true)}
               loading={loading}
               fullscreen={fullscreen}
               autoSec={String(autoSec)}
@@ -1087,7 +1114,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         open={removing !== null}
         onOpenChange={(o) => { if (!o) setRemoving(null); }}
         title="Delete chart?"
-        description={`"${removing?.title ?? ""}" will be removed from this dashboard.`}
+        description={`"${removing?.title ?? ""}" goes to the trash. You can restore it for 30 days.`}
         confirmLabel="Delete chart"
         destructive
         confirming={removeBusy}
@@ -1140,6 +1167,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
       ) : null}
 
+      {historyOpen ? (
+        <VersionHistoryDialog
+          boardId={board}
+          canWrite={hasPermission("dashboard:write")}
+          onOpenChange={setHistoryOpen}
+          onReverted={() => { notifyDashboardsChanged(); void load(); }}
+        />
+      ) : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />

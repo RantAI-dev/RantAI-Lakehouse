@@ -6,12 +6,14 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database,
+  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database, Star,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
-import { assetService } from "@/services";
+import { assetService, dashboardService } from "@/services";
 import { isServiceError } from "@/services/errors";
 import type { Asset } from "@/services/contracts/assets";
+import type { ShortcutItem } from "@/services/contracts/dashboards";
+import { itemHref } from "@/lib/dashboard-organise";
 import { capPaletteAssetResults, matchedOnLabel } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
@@ -67,6 +69,12 @@ export function CommandPalette() {
   // The line to show for it: a refusal, a `supported: false` reason, or the
   // outage text (DATA-11 review SHOULD-FIX 4). Null when the search worked.
   const [searchFailed, setSearchFailed] = React.useState<string | null>(null);
+  // BI-18 part C, part 2: dashboards and charts by name for a typed term; the
+  // caller's favourites and recent dashboards when nothing is typed.
+  const [dashHits, setDashHits] = React.useState<ShortcutItem[]>([]);
+  const [dashFavourites, setDashFavourites] = React.useState<ShortcutItem[]>([]);
+  const [dashRecent, setDashRecent] = React.useState<ShortcutItem[]>([]);
+  const [dashFailed, setDashFailed] = React.useState(false);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
@@ -109,6 +117,42 @@ export function CommandPalette() {
       controller.abort();
     };
   }, [search]);
+
+  // Dashboards and charts, by name (BI-18 part C, part 2). The server decides
+  // who may see what, so a private draft or a deleted item is never in the
+  // answer; a caller without `dashboard:read` gets a refusal and sees no group.
+  // Debounced like the catalog search, and abortable for the same reason.
+  React.useEffect(() => {
+    if (!open) return;
+    const term = search.trim();
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      const work = term
+        ? dashboardService.searchItems(term, controller.signal).then((hits) => ({ hits, favourites: [] as ShortcutItem[], recent: [] as ShortcutItem[] }))
+        : dashboardService.shortcuts(controller.signal).then((s) => ({ hits: [] as ShortcutItem[], ...s }));
+      work
+        .then((found) => {
+          if (cancelled) return;
+          setDashFailed(false);
+          setDashHits(found.hits.slice(0, 8));
+          setDashFavourites(found.favourites.slice(0, 5));
+          setDashRecent(found.recent.slice(0, 5));
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setDashHits([]);
+          setDashFavourites([]);
+          setDashRecent([]);
+          setDashFailed(!(isServiceError(err) && err.code === "permission_denied"));
+        });
+    }, CATALOG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, search]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
@@ -158,7 +202,7 @@ export function CommandPalette() {
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Command.Input
           autoFocus
-          placeholder="Search pages, actions, or catalog assets…"
+          placeholder="Search pages, actions, dashboards or catalog assets…"
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           value={search}
           onValueChange={setSearch}
@@ -178,6 +222,43 @@ export function CommandPalette() {
           <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
             {searchFailed}
           </div>
+        ) : null}
+        {dashFailed && search.trim() ? (
+          <div role="alert" className="px-3 py-2 text-sm text-muted-foreground">
+            Dashboard search is unavailable
+          </div>
+        ) : null}
+
+        {/* Dashboards and charts by name. forceMount: the server already
+            decided these match, so cmdk's own filter must not hide them. */}
+        {dashHits.length ? (
+          <Command.Group forceMount heading="Dashboards and charts" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashHits.map((h) => (
+              <PaletteItem
+                key={`${h.kind}:${h.id}`}
+                forceMount
+                icon={h.kind === "board" ? LayoutGrid : BarChart3}
+                label={h.name}
+                detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null}
+                value={`dashitem ${h.kind} ${h.id} ${h.name}`}
+                onSelect={() => go(itemHref(h))}
+              />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashFavourites.length ? (
+          <Command.Group heading="Favourites" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashFavourites.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Star} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`favourite ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
+        ) : null}
+        {!search.trim() && dashRecent.length ? (
+          <Command.Group heading="Recent dashboards" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {dashRecent.map((h) => (
+              <PaletteItem key={`${h.kind}:${h.id}`} icon={Clock} label={h.name} detail={h.kind === "chart" && h.boardName ? `on ${h.boardName}` : null} value={`recent dashboard ${h.kind} ${h.id} ${h.name}`} onSelect={() => go(itemHref(h))} />
+            ))}
+          </Command.Group>
         ) : null}
 
         {/* Quick actions */}

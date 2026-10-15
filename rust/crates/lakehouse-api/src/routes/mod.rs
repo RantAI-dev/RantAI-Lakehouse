@@ -20,6 +20,7 @@ mod catalog_source;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
+pub(crate) mod dashboard_organise;
 mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
@@ -823,6 +824,39 @@ pub fn router(state: AppState) -> Router {
                 .post(dashboard_folders::create)
                 .put(dashboard_folders::update)
                 .delete(dashboard_folders::delete),
+        )
+        .route(
+            "/api/dashboard/personal",
+            axum::routing::post(dashboard_folders::personal),
+        )
+        .route(
+            "/api/dashboard/versions",
+            get(dashboard_organise::versions_list),
+        )
+        .route(
+            "/api/dashboard/versions/revert",
+            axum::routing::post(dashboard_organise::revert),
+        )
+        .route("/api/dashboard/trash", get(dashboard_organise::trash_list))
+        .route(
+            "/api/dashboard/trash/restore",
+            axum::routing::post(dashboard_organise::trash_restore),
+        )
+        .route(
+            "/api/dashboard/shortcuts",
+            get(dashboard_organise::shortcuts),
+        )
+        .route(
+            "/api/dashboard/favourites",
+            axum::routing::put(dashboard_organise::favourite_set),
+        )
+        .route(
+            "/api/dashboard/recent",
+            axum::routing::post(dashboard_organise::recent_touch),
+        )
+        .route(
+            "/api/dashboard/search",
+            get(dashboard_organise::search_names),
         )
         .route(
             "/api/dashboard/sources",

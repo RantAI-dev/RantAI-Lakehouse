@@ -170,10 +170,16 @@ fn equals(column: &str, value: &str) -> Result<FilterDef, String> {
 ///
 /// 400 for a body that is not a drill request or a level that does not follow,
 /// 404 for an unknown chart, a fixed 422/503 for a database failure.
-pub async fn drill_input(ch: &ChClient, raw: Value) -> Result<ChartInput, ApiError> {
+pub async fn drill_input(
+    ch: &ChClient,
+    raw: Value,
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Result<ChartInput, ApiError> {
     let req: DrillRequest = serde_json::from_value(raw)
         .map_err(|_bad| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
-    let saved = store::list_stored_charts(ch)
+    // A chart in the trash, or on another user's personal board, is "chart not
+    // found" (BI-18 part C, part 2).
+    let saved = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|failure| classify_ch(&failure))?
         .into_iter()

@@ -174,7 +174,10 @@ impl Respond for EmbedClickhouse {
         if sql.starts_with("CREATE") || sql.starts_with("ALTER") {
             return ResponseTemplate::new(200);
         }
-        if sql.contains("FROM console.bi_board") {
+        // A chart read names the boards table too (its sub-selects keep another
+        // user's personal board and a deleted board out, BI-18 part C part 2),
+        // so a statement that reads charts is not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             return rows(json!({
                 "id": "b_embed", "name": "Embedded", "description": "", "created_by": "t",
                 "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "1",
@@ -265,7 +268,10 @@ impl Respond for CombinedEmbedClickhouse {
         if sql.starts_with("CREATE") || sql.starts_with("ALTER") {
             return ResponseTemplate::new(200);
         }
-        if sql.contains("FROM console.bi_board") {
+        // A chart read names the boards table too (its sub-selects keep another
+        // user's personal board and a deleted board out, BI-18 part C part 2),
+        // so a statement that reads charts is not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             return rows(vec![json!({
                 "id": "b_embed", "name": "Embedded", "description": "", "created_by": "t",
                 "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "1",

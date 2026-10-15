@@ -113,6 +113,8 @@ export type Board = {
   createdBy?: string;
   /** Folder this board is filed in; empty or null = no folder. */
   folderId?: string | null;
+  /** The principal whose personal space holds this board (BI-18 part C, part 2); absent when it is shared. */
+  ownerId?: string;
   layout?: LayoutMap;
   filters?: FilterDef[];
   /** BI-18 part C: absent when the dashboard has no tabs. */

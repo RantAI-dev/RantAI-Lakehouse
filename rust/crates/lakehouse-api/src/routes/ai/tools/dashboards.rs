@@ -2,14 +2,38 @@
 //! `create_board`, `list_boards`, `list_charts`, `suggest_dashboard`.
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
+use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, ChartInput};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
+use crate::routes::dashboard_organise::{
+    Gate, require_chart_board, require_editable_chart, snapshot_as, viewer_of,
+    visible_live_chart_board,
+};
 use crate::routes::support::is_numeric_type;
 use crate::upstream_error;
+
+/// Who the tools read as: the signed-in person, or nobody in particular when
+/// none is attached (fail closed: no personal space, nothing in the trash).
+fn viewer_for(principal: Option<&Principal>) -> Viewer {
+    principal.map_or_else(Viewer::anonymous, viewer_of)
+}
+
+/// The tool's error for a refused dashboard or chart: the route's own
+/// sentence, or, for a store that could not be read, the fixed message with
+/// its reference id (never the database's text).
+fn refused(gate: Gate) -> Value {
+    match gate {
+        Gate::Missing(sentence) => json!({ "error": sentence }),
+        Gate::Store(cause) => {
+            upstream_error::report_ch(&upstream_error::DATABASE, &cause).to_json()
+        }
+    }
+}
 
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
@@ -20,6 +44,7 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
 
 pub(super) async fn create_chart(
     ch: &ChClient,
+    principal: Option<&Principal>,
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
@@ -28,9 +53,17 @@ pub(super) async fn create_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
+    // else's personal space.
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer_for(principal)).await
+    {
+        return refused(err);
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => json!({
+            Ok(()) => {
+                snapshot_as(ch, &spec.board, principal).await;
+                json!({
                 "created": true,
                 "id": spec.spec.id,
                 "title": spec.spec.title,
@@ -39,7 +72,8 @@ pub(super) async fn create_chart(
                 "board": spec.board,
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
-            }),
+                })
+            }
             Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
@@ -48,6 +82,7 @@ pub(super) async fn create_chart(
 
 pub(super) async fn update_chart(
     ch: &ChClient,
+    principal: Option<&Principal>,
     args: &Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
@@ -59,22 +94,42 @@ pub(super) async fn update_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    // BI-18 part C, part 2: a chart in the trash or on somebody else's
+    // personal board cannot be edited, nor moved onto such a board.
+    let viewer = viewer_for(principal);
+    let old_board = match require_editable_chart(ch, &id, &viewer).await {
+        Ok(board) => board,
+        Err(err) => return refused(err),
+    };
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
+        return refused(err);
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => json!({
-                "updated": true,
-                "id": spec.spec.id,
-                "title": spec.spec.title,
-                "kind": spec.spec.kind,
-                "mart": spec.spec.mart,
-            }),
+            Ok(()) => {
+                if let Some(old) = old_board.filter(|b| *b != spec.board) {
+                    snapshot_as(ch, &old, principal).await;
+                }
+                snapshot_as(ch, &spec.board, principal).await;
+                json!({
+                    "updated": true,
+                    "id": spec.spec.id,
+                    "title": spec.spec.title,
+                    "kind": spec.spec.kind,
+                    "mart": spec.spec.mart,
+                })
+            }
             Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn create_board(
+    ch: &ChClient,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     // `created_by` is left empty: the assistant is not a person, and naming
     // it as the author would put a non-account into a column the UI shows
     // as an owner.
@@ -86,16 +141,19 @@ pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Va
     )
     .await
     {
-        Ok(board) => json!({
-            "created": true, "id": board.id, "name": board.name,
-            "note": "Pakai id ini di create_chart.board.",
-        }),
+        Ok(board) => {
+            snapshot_as(ch, &board.id, principal).await;
+            json!({
+                "created": true, "id": board.id, "name": board.name,
+                "note": "Pakai id ini di create_chart.board.",
+            })
+        }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn list_boards(ch: &ChClient) -> Value {
-    match store::list_boards(ch).await {
+pub(super) async fn list_boards(ch: &ChClient, principal: Option<&Principal>) -> Value {
+    match store::list_boards(ch, &viewer_for(principal)).await {
         Ok(boards) => {
             let mut out = vec![json!({ "id": "default", "name": "Main" })];
             // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
@@ -159,8 +217,8 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
     json!({ "marts": out })
 }
 
-pub(super) async fn list_charts(ch: &ChClient) -> Value {
-    match store::list_stored_charts(ch).await {
+pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) -> Value {
+    match store::list_stored_charts(ch, &viewer_for(principal)).await {
         Ok(charts) => {
             let out: Vec<Value> = charts
                 .iter()
@@ -246,13 +304,29 @@ pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
     }
 }
 
-pub(super) async fn delete_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn delete_chart(
+    ch: &ChClient,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    match store::delete_chart(ch, &id).await {
-        Ok(()) => json!({ "deleted": true, "id": id }),
+    // BI-18 part C, part 2: a chart the person cannot see is answered like one
+    // that does not exist, and nothing is deleted. A deleted chart goes to the
+    // trash, restorable for 30 days.
+    let board = match visible_live_chart_board(ch, &id, &viewer_for(principal)).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return json!({ "deleted": true, "id": id }),
+        Err(err) => return refused(err),
+    };
+    let by = principal.map_or("Assistant", |p| p.display_name.as_str());
+    match store::delete_chart(ch, &id, by).await {
+        Ok(()) => {
+            snapshot_as(ch, &board, principal).await;
+            json!({ "deleted": true, "id": id })
+        }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
@@ -280,10 +354,10 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
 
         for result in [
-            list_boards(&ch).await,
-            list_charts(&ch).await,
+            list_boards(&ch, None).await,
+            list_charts(&ch, None).await,
             suggest_dashboard(&ch).await,
-            delete_chart(&ch, &{
+            delete_chart(&ch, None, &{
                 let mut a = Map::new();
                 a.insert("id".to_owned(), json!("c1"));
                 a
@@ -295,5 +369,181 @@ mod tests {
             assert!(!text.contains("version 0.0.0"), "{text}");
             assert!(result["errorId"].is_string(), "{text}");
         }
+    }
+
+    // ── BI-18 part C, part 2: the personal space and the trash ──────────────
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::matchers::body_string_contains;
+
+    fn person(n: u128) -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(n)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("dashboard:read, dashboard:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    async fn rows(server: &MockServer, needle: &str, data: Vec<Value>) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(needle))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn rest(server: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn sent(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn writes(sent: &[String]) -> Vec<&String> {
+        sent.iter()
+            .filter(|s| s.trim_start().starts_with("INSERT"))
+            .collect()
+    }
+
+    /// The assistant reads as the person it acts for; with nobody attached it
+    /// reads as nobody in particular, which sees no personal space.
+    #[tokio::test]
+    async fn the_assistant_lists_boards_and_charts_as_the_person_it_acts_for() {
+        let server = MockServer::start().await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let me = person(7);
+        let id = uuid::Uuid::from_u128(7).to_string();
+        let _ = list_boards(&ch, Some(&me)).await;
+        let _ = list_charts(&ch, Some(&me)).await;
+        let _ = list_boards(&ch, None).await;
+        let all = sent(&server).await;
+        let boards: Vec<&String> = all
+            .iter()
+            .filter(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
+            .collect();
+        assert!(
+            boards[0].contains(&format!("(owner_id = '' OR owner_id = '{id}')")),
+            "{}",
+            boards[0]
+        );
+        assert!(
+            boards[1].contains("(owner_id = '' OR owner_id = '')"),
+            "{}",
+            boards[1]
+        );
+        let charts: Vec<&String> = all
+            .iter()
+            .filter(|s| s.contains("FROM console.bi_chart FINAL"))
+            .collect();
+        assert!(
+            charts[0].contains(&format!("owner_id != '' AND owner_id != '{id}'")),
+            "{}",
+            charts[0]
+        );
+        assert!(charts[0].contains("is_deleted = 2"), "{}", charts[0]);
+    }
+
+    /// A chart the person cannot see is answered like one that does not exist,
+    /// and nothing is deleted.
+    #[tokio::test]
+    async fn the_assistant_cannot_delete_a_chart_on_somebody_elses_private_board() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "b_draft" })],
+        )
+        .await;
+        rows(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "someone-else" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_private"));
+        let _ = delete_chart(&ch, Some(&person(7)), &args).await;
+        let all = sent(&server).await;
+        assert!(writes(&all).is_empty(), "{:?}", writes(&all));
+    }
+
+    #[tokio::test]
+    async fn the_assistant_moves_a_chart_to_the_trash_under_the_persons_name() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "default" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_mine"));
+        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        assert_eq!(reply["deleted"], json!(true));
+        let all = sent(&server).await;
+        let copy = writes(&all)
+            .into_iter()
+            .find(|s| s.contains("INTO console.bi_chart"))
+            .unwrap();
+        assert!(copy.contains(", 2, now(), 'Rina', ''"), "{copy}");
+    }
+
+    #[tokio::test]
+    async fn the_assistant_cannot_put_a_chart_on_a_dashboard_in_the_trash() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 2, "owner_id": "" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        for (k, v) in [
+            ("title", json!("t")),
+            ("kind", json!("bar")),
+            ("mart", json!("m")),
+            ("dimension", json!("d")),
+            ("measures", json!(["x"])),
+            ("board", json!("b_gone")),
+        ] {
+            args.insert(k.to_owned(), v);
+        }
+        let reply = create_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["error"], json!("dashboard not found."));
+        assert!(writes(&sent(&server).await).is_empty());
     }
 }

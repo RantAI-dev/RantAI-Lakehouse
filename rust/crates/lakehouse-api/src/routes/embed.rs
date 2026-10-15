@@ -12,6 +12,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
@@ -116,7 +117,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         return token_refused();
     };
 
-    let board = match store::get_board(&state.clickhouse, &board_id).await {
+    let board = match store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await {
         Ok(b) => b,
         Err(err) => {
             return (
@@ -222,7 +223,7 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
         let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
             return Ok(Vec::new());
         };
-        let board = store::get_board(&state.clickhouse, &board_id).await?;
+        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await?;
         return Ok(board
             .filter(|b| {
                 b.embed_enabled.unwrap_or(false)
@@ -554,7 +555,9 @@ async fn render_board_payload(
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
-    let stored = store::list_stored_charts(ch).await?;
+    // An embed or a public link is read by nobody in particular: a chart in the
+    // trash or on a personal board is not in it (BI-18 part C, part 2).
+    let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
     let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
@@ -783,6 +786,7 @@ mod typed_filters {
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
@@ -812,6 +816,7 @@ mod typed_filters {
             .iter()
             .find(|s| s.contains("FROM serving.mart_a WHERE"))
             .unwrap_or_else(|| panic!("tile query not sent: {sent:?}"));
+        assert_chart_read_as_nobody(&sent);
         assert!(
             tile.contains("(visitors >= 100 AND visitors <= 900)"),
             "{tile}"
@@ -820,6 +825,18 @@ mod typed_filters {
             tile.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub') > 0"),
             "{tile}"
         );
+    }
+
+    /// BI-18 part C, part 2: an embed reads as nobody in particular, so the chart
+    /// read leaves out a personal board's charts and the trash.
+    fn assert_chart_read_as_nobody(sent: &[String]) {
+        let read = sent
+            .iter()
+            .find(|s| s.contains("FROM console.bi_chart FINAL"))
+            .expect("the charts were read");
+        assert!(read.contains("owner_id != '' AND owner_id != ''"), "{read}");
+        assert!(read.contains("is_deleted = 0"), "{read}");
+        assert!(read.contains("is_deleted = 2"), "{read}");
     }
 
     /// Two charts, `c1` on `mart_a` and `c2` on `mart_b`, both with `kab` and
@@ -914,6 +931,7 @@ mod typed_filters {
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
         let body = render_board_payload(
@@ -1012,6 +1030,7 @@ mod typed_filters {
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
         let locked: Vec<FilterDef> =
@@ -1106,6 +1125,7 @@ mod typed_filters {
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
         let time = lakehouse_bi::grain::TimeContext::new(

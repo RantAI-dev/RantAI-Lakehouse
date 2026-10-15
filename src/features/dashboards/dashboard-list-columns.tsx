@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Copy, FolderInput, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
+import { Copy, FolderInput, Lock, MoreHorizontal, Pencil, Star, Trash2 } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { Pill } from "@/components/patterns/status-badge"
@@ -23,6 +23,9 @@ export type BoardRowActions = {
   onDelete: (board: Board) => void
   /** Absent when the viewer may not file dashboards (`dashboard:write`). */
   onMove?: (board: Board) => void
+  /** BI-18 part C, part 2: whether the caller marked the board as a favourite. */
+  isFavourite?: (board: Board) => boolean
+  onToggleFavourite?: (board: Board) => void
 }
 
 /**
@@ -57,6 +60,12 @@ export function BoardActionsMenu({
         <DropdownMenuItem onClick={() => actions.onRename(b)}>
           <Pencil className="size-4" /> Rename
         </DropdownMenuItem>
+        {actions.onToggleFavourite ? (
+          <DropdownMenuItem onClick={() => actions.onToggleFavourite?.(b)}>
+            <Star className="size-4" />
+            {actions.isFavourite?.(b) ? "Remove from favourites" : "Add to favourites"}
+          </DropdownMenuItem>
+        ) : null}
         {actions.onMove ? (
           <DropdownMenuItem onClick={() => actions.onMove?.(b)}>
             <FolderInput className="size-4" /> Move to folder…
@@ -84,9 +93,15 @@ export function BoardActionsMenu({
  */
 export function ShareBadges({ board }: { readonly board: Board }) {
   const isPublic = Boolean(board.publicToken)
-  if (!isPublic && !board.embedEnabled) return null
+  const isPrivate = Boolean(board.ownerId)
+  if (!isPublic && !board.embedEnabled && !isPrivate) return null
   return (
     <span className="flex flex-wrap gap-1">
+      {isPrivate ? (
+        <Pill tone="neutral">
+          <Lock className="size-3" aria-hidden /> Private
+        </Pill>
+      ) : null}
       {isPublic ? <Pill tone="warning">Public</Pill> : null}
       {board.embedEnabled ? <Pill tone="neutral">Embed</Pill> : null}
     </span>

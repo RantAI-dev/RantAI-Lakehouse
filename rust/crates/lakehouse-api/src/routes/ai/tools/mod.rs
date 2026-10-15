@@ -142,17 +142,17 @@ pub(in crate::routes) async fn run_tool(
                 return json!({ "error": "The reporting settings could not be read." });
             };
             if name == "create_chart" {
-                dashboards::create_chart(ch, args, None, &time).await
+                dashboards::create_chart(ch, principal, args, None, &time).await
             } else {
-                dashboards::update_chart(ch, args, &time).await
+                dashboards::update_chart(ch, principal, args, &time).await
             }
         }
-        "create_board" => dashboards::create_board(ch, args).await,
-        "list_boards" => dashboards::list_boards(ch).await,
+        "create_board" => dashboards::create_board(ch, principal, args).await,
+        "list_boards" => dashboards::list_boards(ch, principal).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
-        "list_charts" => dashboards::list_charts(ch).await,
+        "list_charts" => dashboards::list_charts(ch, principal).await,
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
-        "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,

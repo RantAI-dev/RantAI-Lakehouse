@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::access::Viewer;
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
 use crate::click::ClickAction;
 use crate::embed_access::{self, EmbedAccess};
@@ -492,6 +493,12 @@ pub struct Board {
     /// a board value built in code before it is saved.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folder_id: Option<String>,
+    /// The principal id of the user whose personal space the board is in
+    /// (`BI-18` part C, part 2), `None` for every other board. Only its owner
+    /// and a principal with `identity:write` ever read a board that has one
+    /// ([`crate::access::Viewer`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub owner_id: Option<String>,
     /// Signed-embed access state (`SEC-12`): what has been withdrawn and
     /// which sites may frame the embed. Never serialised: the list of
     /// withdrawn token ids is not for a dashboard listing, and it is read
@@ -822,6 +829,82 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     )
     .await?;
     ensure_field_tables(ch).await?;
+    ensure_organise_tables(ch).await?;
+    Ok(())
+}
+
+/// The columns and tables behind the trash, the personal space, the version
+/// history and the favourites (`BI-18` part C, part 2). Split out of
+/// [`ensure_bi_table_uncached`] for the line limit. Same idiom as everything
+/// above: `ALTER ... ADD COLUMN IF NOT EXISTS` with a constant default, so a
+/// row written before the column existed reads as "not deleted, nobody's
+/// private board"; no Postgres migration, because dashboards live in
+/// `ClickHouse`.
+async fn ensure_organise_tables(ch: &ChClient) -> Result<(), ChError> {
+    // The personal space: a board in a folder that belongs to a user carries
+    // that user's principal id (`crate::access`). `''` is every other board.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // The trash: a deleted board or chart keeps its row with `is_deleted = 2`
+    // (so every read for `is_deleted = 0` already leaves it out), the instant
+    // it was deleted and the display name of who did it. `toDateTime(0)` is a
+    // constant, stable for rows written before the column existed.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS deleted_at DateTime DEFAULT toDateTime(0)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS deleted_by String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_at DateTime DEFAULT toDateTime(0)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_by String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // The board whose delete took this chart to the trash with it (`''` for a
+    // chart deleted on its own): restoring the board brings those back.
+    ch.exec(
+        "ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS deleted_with String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_folder ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    // Version history (`crate::versions`): the same versioned-insert shape,
+    // so keeping the last 15 and removing a purged board's history are both
+    // tombstone inserts, never a mutation.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_board_version (\n\
+           board String, version UInt32, state_json String DEFAULT '{}',\n\
+           author_id String DEFAULT '', author_name String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY (board, version)",
+        None,
+    )
+    .await?;
+    // Favourites and recent items per user (`crate::items`).
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_user_item (\n\
+           user_id String, list String, kind String, item_id String,\n\
+           at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(at) ORDER BY (user_id, list, kind, item_id)",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -835,7 +918,15 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id, toString(created_at) AS created_at";
+
+/// The `bi_board` columns a row keeps through the trash: everything but
+/// `created_at` (the version, set by the insert) and the trash columns.
+/// Said when sharing is turned on for a board in the personal space.
+const PERSONAL_NOT_SHAREABLE: &str =
+    "A dashboard in the personal space cannot be shared. Move it to a folder first.";
+
+pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -907,6 +998,7 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
         folder_id: Some(row_str(row, "folder_id").to_owned()),
+        owner_id: Some(row_str(row, "owner_id").to_owned()).filter(|o| !o.is_empty()),
         embed_access: EmbedAccess::from_stored(
             row_u64(row, "embed_revoked_before"),
             row_str(row, "embed_revoked_jti_json"),
@@ -915,7 +1007,9 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
     }
 }
 
-/// List every non-deleted user board, oldest first. Ports `listBoards`.
+/// List every live user board `viewer` may see, oldest first. Ports
+/// `listBoards`. A board in the trash (`is_deleted = 2`) and another user's
+/// personal board are not in it.
 ///
 /// Excludes the [`DEFAULT_BOARD_ID`] layout row; read that with
 /// [`get_board`].
@@ -923,13 +1017,14 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn list_boards(ch: &ChClient) -> Result<Vec<Board>, ChError> {
+pub async fn list_boards(ch: &ChClient, viewer: &Viewer) -> Result<Vec<Board>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
             &format!(
-                "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id != {} ORDER BY created_at",
-                SqlLiteral::from(DEFAULT_BOARD_ID)
+                "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id != {}{} ORDER BY created_at",
+                SqlLiteral::from(DEFAULT_BOARD_ID),
+                viewer.owner_clause()
             ),
             None,
         )
@@ -937,16 +1032,74 @@ pub async fn list_boards(ch: &ChClient) -> Result<Vec<Board>, ChError> {
     Ok(rows.iter().map(row_to_board).collect())
 }
 
-/// Fetch a board by id. Ports `getBoard`.
+/// What the store holds for a board id, whatever its state: the latest row's
+/// `is_deleted` and `owner_id`. `None` when the id never had a row.
+///
+/// For the checks that decide whether a WRITE may touch a board (the personal
+/// space and the trash both change that answer), which need to tell "does not
+/// exist", "in the trash" and "somebody else's" apart from the board being
+/// live and visible. A caller must not reveal which of the refusals it was.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board(ch: &ChClient, id: &str) -> Result<Option<Board>, ChError> {
+pub async fn board_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT is_deleted, owner_id FROM console.bi_board FINAL WHERE id = {} LIMIT 1",
+                SqlLiteral::from(id)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.first().map(|r| {
+        (
+            u8::try_from(row_u64(r, "is_deleted")).unwrap_or(0),
+            row_str(r, "owner_id").to_owned(),
+        )
+    }))
+}
+
+/// The same for a chart id: its latest row's `is_deleted` and the board it is
+/// on. `None` when the id never had a row.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn chart_row_state(ch: &ChClient, id: &str) -> Result<Option<(u8, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT is_deleted, board FROM console.bi_chart FINAL WHERE id = {} LIMIT 1",
+                SqlLiteral::from(id)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.first().map(|r| {
+        (
+            u8::try_from(row_u64(r, "is_deleted")).unwrap_or(0),
+            row_str(r, "board").to_owned(),
+        )
+    }))
+}
+
+/// Fetch a live board by id, if `viewer` may see it. Ports `getBoard`. A
+/// deleted board, and one in somebody else's personal space, are `None`: the
+/// same answer as a board that never existed, so an id guess learns nothing.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn get_board(ch: &ChClient, id: &str, viewer: &Viewer) -> Result<Option<Board>, ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={} LIMIT 1",
-        SqlLiteral::from(id)
+        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id={}{} LIMIT 1",
+        SqlLiteral::from(id),
+        viewer.owner_clause()
     );
     let rows = ch.rows(&sql, None).await?;
     Ok(rows.first().map(row_to_board))
@@ -999,6 +1152,7 @@ pub async fn create_board(
         public_token: None,
         embed_enabled: None,
         folder_id: None,
+        owner_id: None,
         embed_access: EmbedAccess::default(),
     })
 }
@@ -1015,7 +1169,7 @@ async fn upsert_board(
     filters: &[FilterDef],
     public_token: &str,
     embed_enabled: bool,
-    folder_id: &str,
+    (folder_id, owner_id): (&str, &str),
     embed_access: &EmbedAccess,
     refresh_seconds: u32,
     (grain, params): (&str, &[crate::params::BoardParam]),
@@ -1031,8 +1185,8 @@ async fn upsert_board(
     let origins_json =
         serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, owner_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -1056,6 +1210,9 @@ async fn upsert_board(
         // reason: every save is a full-row INSERT.
         SqlLiteral::from(serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned())),
         SqlLiteral::from(serde_json::to_string(phone_layout).unwrap_or_else(|_| "[]".to_owned())),
+        // The personal space: carried on every save like the rest, or an
+        // unrelated edit would make a private draft public.
+        SqlLiteral::from(owner_id),
     );
     ch.exec(&sql, None).await
 }
@@ -1100,6 +1257,7 @@ async fn save_board_patch(
     // folder must carry the current one forward or the board would fall
     // back to the root.
     let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
+    let owner_id = patch.owner_id.or(board.owner_id.as_deref()).unwrap_or("");
     let embed_access = patch.embed_access.unwrap_or(&board.embed_access);
     let refresh_seconds = patch
         .refresh_seconds
@@ -1121,7 +1279,7 @@ async fn save_board_patch(
         filters,
         public_token,
         embed_enabled,
-        folder_id,
+        (folder_id, owner_id),
         embed_access,
         refresh_seconds,
         (grain, params),
@@ -1142,6 +1300,7 @@ struct BoardPatch<'a> {
     public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
+    owner_id: Option<&'a str>,
     embed_access: Option<&'a EmbedAccess>,
     refresh_seconds: Option<u32>,
     grain: Option<&'a str>,
@@ -1163,7 +1322,7 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     if clean.is_empty() {
         return Err(BiError::Validation("name is required.".to_owned()));
     }
-    if let Some(board) = get_board(ch, id).await? {
+    if let Some(board) = get_board(ch, id, &Viewer::system()).await? {
         save_board_patch(
             ch,
             &board,
@@ -1186,7 +1345,7 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
 pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
     let clean = description.trim();
-    if let Some(board) = get_board(ch, id).await? {
+    if let Some(board) = get_board(ch, id, &Viewer::system()).await? {
         save_board_patch(
             ch,
             &board,
@@ -1201,22 +1360,38 @@ pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Resul
 }
 
 /// Move a board into folder `folder_id` (`""` = root). The caller has
-/// already checked that the folder exists.
+/// already checked that the folder exists and that its viewer may use it.
+///
+/// A folder that is somebody's personal space makes the board theirs
+/// (`owner_id`); any other folder makes it nobody's. A board with a public
+/// link or signed embeds on cannot go into the personal space: a draft that
+/// is shared is not a draft, and the link would keep working for everyone
+/// else, so the move is refused until sharing is turned off.
 ///
 /// # Errors
 ///
-/// Returns [`BiError::Validation`] if the board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+/// Returns [`BiError::Validation`] if the board does not exist or is shared
+/// and the folder is a personal space, or [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
 pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    let owner = crate::folders::folder_owner(ch, folder_id).await?;
+    let shared = board.embed_enabled == Some(true)
+        || board.public_token.as_deref().is_some_and(|t| !t.is_empty());
+    if !owner.is_empty() && shared {
+        return Err(BiError::Validation(
+            "Turn off sharing before moving a dashboard to the personal space.".to_owned(),
+        ));
+    }
     save_board_patch(
         ch,
         &board,
         BoardPatch {
             folder_id: Some(folder_id),
+            owner_id: Some(&owner),
             ..Default::default()
         },
     )
@@ -1244,6 +1419,7 @@ fn shell_board(id: &str) -> Board {
         public_token: None,
         embed_enabled: None,
         folder_id: None,
+        owner_id: None,
         embed_access: EmbedAccess::default(),
     }
 }
@@ -1260,7 +1436,9 @@ pub async fn update_board_layout(
     layout: &LayoutMap,
 ) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1284,7 +1462,9 @@ pub async fn update_board_filters(
     filters: &[FilterDef],
 ) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1307,7 +1487,9 @@ pub async fn update_board_filters(
 pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Result<(), BiError> {
     crate::click::validate_refresh_seconds(seconds).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1336,7 +1518,9 @@ pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<
         ));
     }
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1363,7 +1547,9 @@ pub async fn update_board_params(
     params: &[crate::params::BoardParam],
 ) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1394,7 +1580,9 @@ pub async fn update_board_tabs(
 ) -> Result<(), BiError> {
     crate::layout::validate_tabs(tabs).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
@@ -1422,12 +1610,78 @@ pub async fn update_board_phone_layout(
 ) -> Result<(), BiError> {
     crate::layout::validate_phone_layout(phone).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id).await?.unwrap_or_else(|| shell_board(id));
+    let board = get_board(ch, id, &Viewer::system())
+        .await?
+        .unwrap_or_else(|| shell_board(id));
     save_board_patch(
         ch,
         &board,
         BoardPatch {
             phone_layout: Some(phone),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The content of a board that a version holds, borrowed for
+/// [`restore_board_fields`].
+pub struct BoardFields<'a> {
+    /// Display name.
+    pub name: &'a str,
+    /// One-line purpose.
+    pub description: &'a str,
+    /// Tile layout.
+    pub layout: &'a LayoutMap,
+    /// Dashboard filters.
+    pub filters: &'a [FilterDef],
+    /// Saved auto-refresh in seconds, `None` for off.
+    pub refresh_seconds: Option<u32>,
+    /// Saved grain, `""` for each chart's own.
+    pub grain: &'a str,
+    /// Shown parameters with their saved values.
+    pub params: &'a [crate::params::BoardParam],
+    /// Tabs.
+    pub tabs: &'a [crate::layout::Tab],
+    /// Phone layout.
+    pub phone_layout: &'a [crate::layout::PhoneTile],
+}
+
+/// Write back the content a version holds in ONE full-row save (`BI-18` part
+/// C, part 2): everything a version covers, nothing it does not. The public
+/// link, the signed-embed state, the folder, the owner and the author are
+/// carried from the live row, so going back never re-opens a link that was
+/// turned off or moves a dashboard.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not live, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn restore_board_fields(
+    ch: &ChClient,
+    id: &str,
+    fields: &BoardFields<'_>,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = match get_board(ch, id, &Viewer::system()).await? {
+        Some(board) => board,
+        None if id == DEFAULT_BOARD_ID => shell_board(id),
+        None => return Err(BiError::Validation("dashboard not found.".to_owned())),
+    };
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            name: Some(fields.name),
+            description: Some(fields.description),
+            layout: Some(fields.layout),
+            filters: Some(fields.filters),
+            refresh_seconds: Some(fields.refresh_seconds.unwrap_or(0)),
+            grain: Some(fields.grain),
+            params: Some(fields.params),
+            tabs: Some(fields.tabs),
+            phone_layout: Some(fields.phone_layout),
             ..Default::default()
         },
     )
@@ -1446,9 +1700,12 @@ pub async fn update_board_phone_layout(
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<String, BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    if enable && board.owner_id.is_some() {
+        return Err(BiError::Validation(PERSONAL_NOT_SHAREABLE.to_owned()));
+    }
     let token = if enable {
         let existing = board.public_token.clone().unwrap_or_default();
         if existing.is_empty() {
@@ -1479,9 +1736,12 @@ pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<S
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bool, BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    if enable && board.owner_id.is_some() {
+        return Err(BiError::Validation(PERSONAL_NOT_SHAREABLE.to_owned()));
+    }
     save_board_patch(
         ch,
         &board,
@@ -1509,7 +1769,7 @@ pub async fn set_board_embed_origins(
 ) -> Result<Vec<String>, BiError> {
     let origins = embed_access::validate_origins(origins).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let access = EmbedAccess {
@@ -1542,7 +1802,7 @@ pub async fn revoke_all_embed_tokens(
     now_unix_seconds: u64,
 ) -> Result<u64, BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let access = board.embed_access.clone().revoke_all(now_unix_seconds);
@@ -1577,7 +1837,7 @@ pub async fn withdraw_embed_token(
     tolerance_secs: u64,
 ) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id)
+    let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let access = board
@@ -1609,33 +1869,57 @@ pub async fn get_board_by_token(ch: &ChClient, token: &str) -> Result<Option<Boa
     if t.is_empty() {
         return Ok(None);
     }
+    // A public link is read by nobody in particular, so a board in the
+    // personal space is out of reach even if a link was issued before it was
+    // moved there (`move_board` refuses that move; this is the second lock).
     let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token={} LIMIT 1",
-        SqlLiteral::from(t)
+        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token={}{} LIMIT 1",
+        SqlLiteral::from(t),
+        Viewer::anonymous().owner_clause()
     );
     let rows = ch.rows(&sql, None).await?;
     Ok(rows.first().map(row_to_board))
 }
 
-/// Soft-delete a board (tombstone), then soft-delete every chart on it.
-/// Ports `deleteBoard`.
+/// Move a board and every chart on it to the trash (`BI-18` part C, part 2).
+/// Replaces the tombstone of `deleteBoard`: the rows keep their content with
+/// `is_deleted = 2`, `deleted_at` and `deleted_by`, so
+/// [`crate::trash::restore_board`] can bring them back and
+/// [`crate::trash::purge_expired`] removes them after 30 days.
+///
+/// The charts go first-class with the board: each one records the board that
+/// took it (`deleted_with`), so restoring the board restores exactly them and
+/// not a chart that was deleted earlier on its own. Both statements copy the
+/// live row with `INSERT ... SELECT`, so nothing is rebuilt in Rust and the
+/// embed state, folder and owner travel with the row.
+///
+/// The caller has checked that its viewer may see the board. The built-in
+/// board is never deleted (the route refuses it).
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
+pub async fn delete_board(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
-    let sql = format!(
-        "INSERT INTO console.bi_board (id, name, is_deleted) VALUES ({}, '', 1)",
-        SqlLiteral::from(id)
+    // Charts first: if the board's statement then fails, the board is still
+    // live and a retry trashes it; the other order could leave live charts on
+    // a deleted board.
+    let charts = format!(
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted, deleted_at, deleted_by, deleted_with) \
+         SELECT id, title, spec_json, board, created_by, 2, now(), {by}, {board} \
+         FROM console.bi_chart FINAL WHERE is_deleted = 0 AND board = {board}",
+        by = SqlLiteral::from(deleted_by),
+        board = SqlLiteral::from(id),
     );
-    ch.exec(&sql, None).await?;
-    // Delete charts inside it via tombstone (consistent, not an async mutation).
-    let charts = list_stored_charts(ch).await?;
-    for c in charts.iter().filter(|c| c.board == id) {
-        delete_chart(ch, &c.spec.id).await?;
-    }
-    Ok(())
+    ch.exec(&charts, None).await?;
+    let board = format!(
+        "INSERT INTO console.bi_board ({BOARD_KEEP_COLS}, is_deleted, deleted_at, deleted_by) \
+         SELECT {BOARD_KEEP_COLS}, 2, now(), {by} \
+         FROM console.bi_board FINAL WHERE is_deleted = 0 AND id = {board}",
+        by = SqlLiteral::from(deleted_by),
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&board, None).await
 }
 
 /// The built-in board's fixed tiles as saved charts, so the built-in board
@@ -1797,10 +2081,16 @@ fn plan_duplicate(
 ///
 /// Returns [`BiError::Validation`] if the source board does not exist, or
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Result<Board, BiError> {
+pub async fn duplicate_board(
+    ch: &ChClient,
+    id: &str,
+    created_by: &str,
+    viewer: &Viewer,
+) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
-    // The built-in board has a row only once its layout was first saved.
-    let src = match get_board(ch, id).await? {
+    // The built-in board has a row only once its layout was first saved. A
+    // board `viewer` may not see is "not found", like one that never was.
+    let src = match get_board(ch, id, viewer).await? {
         Some(board) => board,
         None if id == DEFAULT_BOARD_ID => Board {
             name: "Main".to_owned(),
@@ -1808,7 +2098,7 @@ pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Resul
         },
         None => return Err(BiError::Validation("dashboard not found.".to_owned())),
     };
-    let stored = list_stored_charts(ch).await?;
+    let stored = list_stored_charts(ch, viewer).await?;
     let charts: Vec<_> = stored.into_iter().filter(|c| c.board == id).collect();
     // The copy carries the original's description — it describes the same
     // thing — but is authored by whoever pressed Duplicate, not by the
@@ -1830,8 +2120,11 @@ pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Resul
         insert_chart(ch, chart).await?;
     }
     let (new_layout, new_phone) = (plan.layout, plan.phone_layout);
-    // The copy lands next to the original, not at the root.
+    // The copy lands next to the original, not at the root. In the personal
+    // space it is private to the same owner; the caller moves it into the
+    // duplicating user's own space when that is someone else.
     let folder_id = src.folder_id.clone().unwrap_or_default();
+    let owner_id = src.owner_id.clone().unwrap_or_default();
     // One full-row write for everything the copy inherits.
     save_board_patch(
         ch,
@@ -1845,11 +2138,13 @@ pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Resul
             tabs: src.tabs.as_deref(),
             phone_layout: Some(&new_phone),
             folder_id: Some(&folder_id),
+            owner_id: Some(&owner_id),
             ..Default::default()
         },
     )
     .await?;
     Ok(Board {
+        owner_id: Some(owner_id).filter(|o| !o.is_empty()),
         layout: Some(new_layout),
         filters: src.filters,
         refresh_seconds: src.refresh_seconds,
@@ -1923,18 +2218,27 @@ struct StoredPayload<'a> {
     has_year: bool,
 }
 
-/// List stored specs (live, latest per id). Ports `listStoredCharts`.
+/// List stored specs (live, latest per id) that `viewer` may see. Ports
+/// `listStoredCharts`. A chart in the trash, a chart on a board in the trash
+/// and a chart on another user's personal board are not in it
+/// ([`Viewer::chart_clause`]).
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure. A row whose `spec_json` is
 /// corrupt is silently skipped, matching the TS `catch { /* skip */ }`.
-pub async fn list_stored_charts(ch: &ChClient) -> Result<Vec<StoredChartSpec>, ChError> {
+pub async fn list_stored_charts(
+    ch: &ChClient,
+    viewer: &Viewer,
+) -> Result<Vec<StoredChartSpec>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
-            "SELECT id, spec_json, board, created_by, toString(created_at) AS created_at\n\
-               FROM console.bi_chart FINAL WHERE is_deleted = 0 ORDER BY created_at",
+            &format!(
+                "SELECT id, spec_json, board, created_by, toString(created_at) AS created_at\n\
+                   FROM console.bi_chart FINAL WHERE is_deleted = 0{} ORDER BY created_at",
+                viewer.chart_clause()
+            ),
             None,
         )
         .await?;
@@ -1976,6 +2280,30 @@ pub async fn list_stored_charts(ch: &ChClient) -> Result<Vec<StoredChartSpec>, C
         });
     }
     Ok(out)
+}
+
+/// A stored chart rebuilt from its stored document (`{ spec, def, hasYear }`)
+/// exactly as it was, with no validation: for a chart that is a fixed
+/// statement (the tiles copied from the built-in dashboard), which has no
+/// definition to rebuild it from. `None` when the document does not parse.
+#[must_use]
+pub fn stored_from_document(doc: &Value, board: &str, created_by: &str) -> Option<StoredChartSpec> {
+    let parsed: StoredEnvelope = serde_json::from_value(doc.clone()).ok()?;
+    let mut def = parsed.def.unwrap_or_else(empty_chart_input);
+    def.board = Some(board.to_owned());
+    Some(StoredChartSpec {
+        spec: parsed.spec,
+        source: if created_by == "ai" {
+            ChartSource::Ai
+        } else {
+            ChartSource::Ui
+        },
+        board: board.to_owned(),
+        def,
+        has_year: parsed.has_year.unwrap_or(false),
+        created_by: Some(created_by.to_owned()),
+        created_at: None,
+    })
 }
 
 fn empty_chart_input() -> ChartInput {
@@ -4140,10 +4468,33 @@ fn spec_from_pivot_input(
 /// Returns [`ChError`] if the SQL smoke test or the `INSERT` fails.
 pub async fn insert_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
+    smoke_test_chart(ch, spec).await?;
+    insert_chart_unchecked(ch, spec).await
+}
+
+/// The smoke test of [`insert_chart`] on its own: runs the chart's statement
+/// and fails if it does not execute. Skipped for a tile with no SQL. The
+/// version revert runs it for every chart before it writes any of them.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the statement fails.
+pub async fn smoke_test_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
     if !spec.spec.sql.is_empty() {
         // Smoke test — throws if the SQL fails to execute (skipped for text).
         ch.query(&spec.spec.sql, None).await?;
     }
+    Ok(())
+}
+
+/// [`insert_chart`] without the smoke test: for a chart whose statement the
+/// caller has just run.
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the `INSERT` fails.
+pub async fn insert_chart_unchecked(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), ChError> {
+    ensure_bi_table(ch).await?;
     let payload = StoredPayload {
         spec: &spec.spec,
         def: &spec.def,
@@ -4170,18 +4521,23 @@ pub async fn insert_chart(ch: &ChClient, spec: &StoredChartSpec) -> Result<(), C
     ch.exec(&sql, None).await
 }
 
-/// Soft-delete (tombstone); `ReplacingMergeTree` picks up the latest
-/// version. Ports `deleteChart`.
+/// Move a chart to the trash (`BI-18` part C, part 2): its row is copied with
+/// `is_deleted = 2`, `deleted_at` and `deleted_by`, so
+/// [`crate::trash::restore_chart`] can bring it back. Replaces the tombstone
+/// of `deleteChart`; a chart that is not live (unknown, or already deleted)
+/// is a no-op, the same answer the tombstone gave.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn delete_chart(ch: &ChClient, id: &str) -> Result<(), ChError> {
+pub async fn delete_chart(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
-        "INSERT INTO console.bi_chart (id, title, spec_json, created_by, is_deleted) VALUES \
-         ({}, '', '{{}}', 'system', 1)",
-        SqlLiteral::from(id)
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted, deleted_at, deleted_by, deleted_with) \
+         SELECT id, title, spec_json, board, created_by, 2, now(), {by}, '' \
+         FROM console.bi_chart FINAL WHERE is_deleted = 0 AND id = {id}",
+        by = SqlLiteral::from(deleted_by),
+        id = SqlLiteral::from(id),
     );
     ch.exec(&sql, None).await
 }
@@ -4372,9 +4728,12 @@ mod tests {
         // 24 = those 22 plus the BI-2 `console.bi_metric` and
         // `console.bi_segment` tables. 26 = those 24 plus the BI-18 part C
         // `bi_board.tabs_json` and `bi_board.phone_layout_json` columns.
+        // 35 = those 26 plus part 2: three trash/owner columns on `bi_board`,
+        // three on `bi_chart`, `bi_folder.owner_id`, and the
+        // `console.bi_board_version` and `console.bi_user_item` tables.
         assert_eq!(
-            first_call_requests, 26,
-            "first call should issue all 26 DDL statements"
+            first_call_requests, 35,
+            "first call should issue all 35 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -4751,6 +5110,7 @@ mod tests {
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
             folder_id: Some("f_1".to_owned()),
+            owner_id: None,
             embed_access: EmbedAccess::default(),
         };
         let json = serde_json::to_value(&board).unwrap();
@@ -4761,6 +5121,8 @@ mod tests {
         assert_eq!(json.get("publicToken").unwrap(), "p_abc");
         assert_eq!(json.get("embedEnabled").unwrap(), true);
         assert_eq!(json.get("folderId").unwrap(), "f_1");
+        // A board nobody owns carries no owner key (BI-18 part C, part 2).
+        assert!(json.get("ownerId").is_none());
         assert!(json.get("created_at").is_none());
         assert!(json.get("updated_at").is_none());
         assert!(json.get("created_by").is_none());

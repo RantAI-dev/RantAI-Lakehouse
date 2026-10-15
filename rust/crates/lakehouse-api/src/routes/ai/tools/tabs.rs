@@ -18,14 +18,17 @@
 //! The database's text never reaches the model: a failed save is the route's
 //! own fixed sentence.
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
+use lakehouse_auth::Principal;
 use lakehouse_bi::layout::{self, Tab};
 use lakehouse_bi::store::{self, Board};
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
 use crate::routes::dashboard;
+use crate::routes::dashboard_organise::viewer_of;
 use crate::state::AppState;
 use crate::upstream_error;
 
@@ -38,23 +41,42 @@ pub(super) fn handles(name: &str) -> bool {
 }
 
 /// Dispatch one of the five tools by name.
-pub(super) async fn run(state: &AppState, name: &str, args: &Map<String, Value>) -> Value {
-    let board = match load_board(state, args).await {
+pub(super) async fn run(
+    state: &AppState,
+    principal: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
+    // BI-18 part C, part 2: the save below is the console route's own handler,
+    // which reads the board as the caller (the personal space, the trash). With
+    // nobody attached there is no caller to act as, so nothing is changed.
+    let Some(principal) = principal else {
+        return json!({ "error": "the tab tools change a dashboard as the signed-in person, and there is none." });
+    };
+    let board = match load_board(state, principal, args).await {
         Ok(board) => board,
         Err(err) => return err,
     };
+    let who = (state, principal);
     match name {
-        "create_tab" => create_tab(state, board, args).await,
-        "rename_tab" => rename_tab(state, board, args).await,
-        "move_charts_to_tab" => move_charts_to_tab(state, board, args).await,
-        "move_tab" => move_tab(state, board, args).await,
-        "delete_tab" => delete_tab(state, board, args).await,
+        "create_tab" => create_tab(who, board, args).await,
+        "rename_tab" => rename_tab(who, board, args).await,
+        "move_charts_to_tab" => move_charts_to_tab(who, board, args).await,
+        "move_tab" => move_tab(who, board, args).await,
+        "delete_tab" => delete_tab(who, board, args).await,
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
 }
 
+/// The application state and the person the tool acts as.
+type Who<'a> = (&'a AppState, &'a Principal);
+
 /// The board the call names, or the error to hand back.
-async fn load_board(state: &AppState, args: &Map<String, Value>) -> Result<Board, Value> {
+async fn load_board(
+    state: &AppState,
+    principal: &Principal,
+    args: &Map<String, Value>,
+) -> Result<Board, Value> {
     let id = arg_str(args, "board");
     if id.is_empty() {
         return Err(json!({ "error": "board is required (an id from list_boards)." }));
@@ -64,7 +86,7 @@ async fn load_board(state: &AppState, args: &Map<String, Value>) -> Result<Board
             "error": "the built-in dashboard has no tabs; duplicate it first, or use another dashboard."
         }));
     }
-    match store::get_board(&state.clickhouse, &id).await {
+    match store::get_board(&state.clickhouse, &id, &viewer_of(principal)).await {
         Ok(Some(board)) => Ok(board),
         Ok(None) => Err(json!({ "error": "dashboard not found." })),
         Err(err) => Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -72,12 +94,14 @@ async fn load_board(state: &AppState, args: &Map<String, Value>) -> Result<Board
 }
 
 /// Save through the console route and fold its answer into the tool's.
-async fn save(state: &AppState, board: &str, changes: Value, ok: Value) -> Value {
+async fn save((state, principal): Who<'_>, board: &str, changes: Value, ok: Value) -> Value {
     let mut body = changes;
     body["id"] = json!(board);
     let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-    let result =
-        api_result_to_value(dashboard::boards_update(State(state.clone()), bytes).await).await;
+    let result = api_result_to_value(
+        dashboard::boards_update(State(state.clone()), Extension(principal.clone()), bytes).await,
+    )
+    .await;
     if result.get("error").is_some() {
         return result;
     }
@@ -106,7 +130,7 @@ fn no_such_tab(board: &Board, key: &str) -> Value {
     })
 }
 
-async fn create_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+async fn create_tab(who: Who<'_>, board: Board, args: &Map<String, Value>) -> Value {
     let tabs = tabs_of(&board);
     let layout = board.layout.clone().unwrap_or_default();
     let id = layout::new_tab_id();
@@ -127,7 +151,7 @@ async fn create_tab(state: &AppState, board: Board, args: &Map<String, Value>) -
         "tabs": next, "note": note,
     });
     save(
-        state,
+        who,
         &board.id,
         json!({ "tabs": next, "layout": layout }),
         ok,
@@ -135,7 +159,7 @@ async fn create_tab(state: &AppState, board: Board, args: &Map<String, Value>) -
     .await
 }
 
-async fn rename_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+async fn rename_tab(who: Who<'_>, board: Board, args: &Map<String, Value>) -> Value {
     let tabs = tabs_of(&board);
     let key = arg_str(args, "tab");
     let Some(tab) = layout::find_tab(&tabs, &key) else {
@@ -146,10 +170,10 @@ async fn rename_tab(state: &AppState, board: Board, args: &Map<String, Value>) -
         Err(message) => return json!({ "error": message }),
     };
     let ok = json!({ "renamed": true, "board": board.id, "id": tab.id, "tabs": next });
-    save(state, &board.id, json!({ "tabs": next }), ok).await
+    save(who, &board.id, json!({ "tabs": next }), ok).await
 }
 
-async fn move_charts_to_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+async fn move_charts_to_tab(who: Who<'_>, board: Board, args: &Map<String, Value>) -> Value {
     let tabs = tabs_of(&board);
     let key = arg_str(args, "tab");
     let Some(tab) = layout::find_tab(&tabs, &key) else {
@@ -169,14 +193,17 @@ async fn move_charts_to_tab(state: &AppState, board: Board, args: &Map<String, V
         return json!({ "error": "chartIds is required: the ids from list_charts." });
     }
     // Only charts that are on this dashboard; a stray id is named, not guessed at.
-    let on_board: Vec<String> = match store::list_stored_charts(&state.clickhouse).await {
-        Ok(all) => all
-            .into_iter()
-            .filter(|c| c.board == board.id)
-            .map(|c| c.spec.id)
-            .collect(),
-        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
-    };
+    let on_board: Vec<String> =
+        match store::list_stored_charts(&who.0.clickhouse, &viewer_of(who.1)).await {
+            Ok(all) => all
+                .into_iter()
+                .filter(|c| c.board == board.id)
+                .map(|c| c.spec.id)
+                .collect(),
+            Err(err) => {
+                return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json();
+            }
+        };
     if let Some(stray) = wanted.iter().find(|id| !on_board.contains(id)) {
         return json!({ "error": format!("chart {stray} is not on this dashboard.") });
     }
@@ -188,13 +215,13 @@ async fn move_charts_to_tab(state: &AppState, board: Board, args: &Map<String, V
     let ok = json!({
         "moved": true, "board": board.id, "tab": tab.id, "title": tab.title, "chartIds": wanted,
     });
-    save(state, &board.id, json!({ "layout": moved }), ok).await
+    save(who, &board.id, json!({ "layout": moved }), ok).await
 }
 
 /// Reorder the tabs: `tabs` lists every tab in the new order, or `tab` goes to
 /// `position` (1 is first). Both end in `layout::reorder_tabs`, the check
 /// `PUT /api/dashboard/boards` runs again on save.
-async fn move_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+async fn move_tab(who: Who<'_>, board: Board, args: &Map<String, Value>) -> Value {
     let tabs = tabs_of(&board);
     let listed: Vec<String> = args
         .get("tabs")
@@ -234,10 +261,10 @@ async fn move_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> 
         Err(message) => return json!({ "error": message }),
     };
     let ok = json!({ "moved": true, "board": board.id, "tabs": next });
-    save(state, &board.id, json!({ "tabs": next }), ok).await
+    save(who, &board.id, json!({ "tabs": next }), ok).await
 }
 
-async fn delete_tab(state: &AppState, board: Board, args: &Map<String, Value>) -> Value {
+async fn delete_tab(who: Who<'_>, board: Board, args: &Map<String, Value>) -> Value {
     let tabs = tabs_of(&board);
     let key = arg_str(args, "tab");
     let Some(tab) = layout::find_tab(&tabs, &key) else {
@@ -258,5 +285,91 @@ async fn delete_tab(state: &AppState, board: Board, args: &Map<String, Value>) -
         "deleted": true, "board": board.id, "id": tab.id, "title": tab.title,
         "note": "Its charts moved to the first remaining tab.",
     });
-    save(state, &board.id, changes, ok).await
+    save(who, &board.id, changes, ok).await
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::Config;
+
+    async fn state_on(server: &MockServer) -> AppState {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+        let env = HashMap::from([("CH_URL".to_owned(), server.uri())]);
+        AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    fn person() -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(7)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("dashboard:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    fn args() -> Map<String, Value> {
+        let mut a = Map::new();
+        a.insert("board".to_owned(), json!("b_draft"));
+        a.insert("title".to_owned(), json!("Maps"));
+        a
+    }
+
+    /// The save is the console route's own handler, which needs the person it
+    /// acts as: with nobody attached nothing is read or written.
+    #[tokio::test]
+    async fn the_tab_tools_do_nothing_without_a_person_to_act_as() {
+        let server = MockServer::start().await;
+        let state = state_on(&server).await;
+        let reply = run(&state, None, "create_tab", &args()).await;
+        assert!(
+            reply["error"].as_str().unwrap().contains("signed-in"),
+            "{reply}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A dashboard the person cannot see (private to somebody else, or in the
+    /// trash) is read with the owner restriction and reported as not found;
+    /// nothing is written.
+    #[tokio::test]
+    async fn the_tab_tools_find_only_dashboards_the_person_may_see() {
+        let server = MockServer::start().await;
+        let state = state_on(&server).await;
+        let reply = run(&state, Some(&person()), "create_tab", &args()).await;
+        assert_eq!(reply["error"], json!("dashboard not found."));
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let read = sent
+            .iter()
+            .find(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
+            .expect("the board was read");
+        assert!(
+            read.contains("(owner_id = '' OR owner_id = '00000000-0000-0000-0000-000000000007')"),
+            "{read}"
+        );
+        assert!(sent.iter().all(|s| !s.trim_start().starts_with("INSERT")));
+    }
 }

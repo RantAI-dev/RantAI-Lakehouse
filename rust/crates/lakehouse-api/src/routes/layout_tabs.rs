@@ -7,6 +7,7 @@
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store;
 use lakehouse_core::ApiError;
 use serde_json::{Value, json};
@@ -125,6 +126,7 @@ async fn dashboard(server: &MockServer, filters: &str) -> Value {
         (
             &lakehouse_bi::grain::TimeContext::default(),
             GrainRequest::Saved,
+            &Viewer::system(),
         ),
     )
     .await
@@ -416,7 +418,9 @@ async fn a_records_list_or_export_of_a_tile_drops_the_filters_tied_to_other_tabs
     )
     .await;
     let ch = client(&server);
-    let stored = store::list_stored_charts(&ch).await.unwrap();
+    let stored = store::list_stored_charts(&ch, &Viewer::system())
+        .await
+        .unwrap();
     let chart = |id: &str| stored.iter().find(|c| c.spec.id == id).unwrap();
     let tied: Vec<_> = parse_filters_param(Some(&format!(
         r#"[{DAY_RANGE},{{"column":"visitors","op":"between","min":"1"}}]"#
@@ -447,7 +451,11 @@ async fn a_records_list_or_export_of_a_tile_drops_the_filters_tied_to_other_tabs
 async fn a_board_that_cannot_be_read_leaves_every_filter_on_the_tile() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(body_string_contains("FROM console.bi_board FINAL"))
+        // The board read; the chart read's sub-selects ask `is_deleted = 2` and
+        // `owner_id != ''` of the same table and must still be answered.
+        .and(body_string_contains(
+            "FROM console.bi_board FINAL WHERE is_deleted = 0",
+        ))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom: secret detail"))
         .mount(&server)
         .await;
@@ -460,7 +468,9 @@ async fn a_board_that_cannot_be_read_leaves_every_filter_on_the_tile() {
     .await;
     answer_rest(&server).await;
     let ch = client(&server);
-    let stored = store::list_stored_charts(&ch).await.unwrap();
+    let stored = store::list_stored_charts(&ch, &Viewer::system())
+        .await
+        .unwrap();
     let chart = &stored[0];
     let filters = parse_filters_param(Some(&format!("[{DAY_RANGE}]")))
         .unwrap()
@@ -625,6 +635,7 @@ mod verify {
             (
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
+                &Viewer::system(),
             ),
         )
         .await
@@ -679,9 +690,10 @@ mod verify {
     async fn duplicate_of_the_built_in_board_returns_the_same_numbers() {
         let store = Arc::new(Mutex::new(Store::default()));
         let (_server, ch) = mounted(&store).await;
-        let copy = store::duplicate_board(&ch, store::DEFAULT_BOARD_ID, "verify")
-            .await
-            .unwrap();
+        let copy =
+            store::duplicate_board(&ch, store::DEFAULT_BOARD_ID, "verify", &Viewer::system())
+                .await
+                .unwrap();
         let copies = register_writes(&store);
         let builtin: Vec<String> = lakehouse_bi::specs::kpis()
             .iter()
@@ -727,14 +739,14 @@ mod verify {
             writes: Vec::new(),
         }));
         let (_server, ch) = mounted(&store).await;
-        let originals: Vec<String> = store::list_stored_charts(&ch)
+        let originals: Vec<String> = store::list_stored_charts(&ch, &Viewer::system())
             .await
             .unwrap()
             .into_iter()
             .filter(|c| c.board == source)
             .map(|c| c.spec.id)
             .collect();
-        let copy = store::duplicate_board(&ch, &source, "verify")
+        let copy = store::duplicate_board(&ch, &source, "verify", &Viewer::system())
             .await
             .unwrap();
 

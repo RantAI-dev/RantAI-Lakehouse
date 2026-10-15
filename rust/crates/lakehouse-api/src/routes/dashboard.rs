@@ -17,6 +17,7 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::grain::{Grain, TimeContext};
@@ -30,6 +31,10 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
+use crate::routes::dashboard_organise::{
+    require_board, require_chart_board, require_editable_chart, snapshot, viewer_of,
+    visible_live_chart_board,
+};
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
     stored_chart_sql, strip_non_ident,
@@ -162,6 +167,9 @@ pub async fn get(
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
     let obligations = PolicyEngineObligations::from_state(&state);
+    // BI-18 part C, part 2: a board in the trash or in somebody else's
+    // personal space reads as a board that does not exist.
+    let viewer = viewer_of(&principal);
     match get_body(
         &state.clickhouse,
         &q,
@@ -169,7 +177,7 @@ pub async fn get(
         &principal.role_names,
         &placeholders,
         &obligations,
-        (&time, requested),
+        (&time, requested, &viewer),
     )
     .await
     {
@@ -197,7 +205,7 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain): (&TimeContext, GrainRequest),
+    (time, requested_grain, viewer): (&TimeContext, GrainRequest, &Viewer),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -208,19 +216,21 @@ async fn get_body(
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
     let mut store_error: Option<String> = None;
-    let (stored, boards) =
-        match tokio::try_join!(store::list_stored_charts(ch), store::list_boards(ch)) {
-            Ok(v) => v,
-            Err(err) => {
-                store_error =
-                    Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
-                (Vec::new(), Vec::new())
-            }
-        };
+    let (stored, boards) = match tokio::try_join!(
+        store::list_stored_charts(ch, viewer),
+        store::list_boards(ch, viewer)
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            store_error =
+                Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
+            (Vec::new(), Vec::new())
+        }
+    };
 
     // The built-in board's layout row is kept out of `list_boards`.
     let default_row = if board == store::DEFAULT_BOARD_ID {
-        store::get_board(ch, store::DEFAULT_BOARD_ID)
+        store::get_board(ch, store::DEFAULT_BOARD_ID, viewer)
             .await
             .unwrap_or_else(|err| {
                 store_error.get_or_insert_with(|| {
@@ -611,8 +621,11 @@ pub(crate) fn layout_to_json(layout: &LayoutMap) -> Value {
 // ── /api/dashboard/specs ────────────────────────────────────────────────
 
 /// `GET /api/dashboard/specs` — every stored chart, in render shape.
-pub async fn specs_list(State(state): State<AppState>) -> Response {
-    match store::list_stored_charts(&state.clickhouse).await {
+pub async fn specs_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    match store::list_stored_charts(&state.clickhouse, &viewer_of(&principal)).await {
         Ok(stored) => {
             let charts: Vec<Value> = stored.iter().map(render_stored_chart).collect();
             (StatusCode::OK, ApiJson(json!({ "charts": charts }))).into_response()
@@ -646,8 +659,16 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 ///
 /// 400 on an unparseable body or a `lakehouse_bi` validation/`ClickHouse`
 /// failure, matching the `TypeScript`'s single `catch` around both.
-pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_create(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_chart_input(&body)?;
+    // BI-18 part C, part 2: a chart cannot be put on a dashboard that is in
+    // the trash or in somebody else's personal space.
+    let viewer = viewer_of(&principal);
+    require_chart_board(&state.clickhouse, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -668,6 +689,7 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
                 upstream_error::FailedAs::BadRequest,
             )
         })?;
+    snapshot(&state.clickhouse, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -696,7 +718,7 @@ pub async fn specs_preview(
     // a value that does not fit is a 400.
     let sent_params = raw.as_object_mut().and_then(|o| o.remove("params"));
     let input = if raw.get("drillOf").is_some() {
-        crate::routes::drill::drill_input(&state.clickhouse, raw).await?
+        crate::routes::drill::drill_input(&state.clickhouse, raw, &viewer_of(&principal)).await?
     } else {
         serde_json::from_value(raw)
             .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?
@@ -813,7 +835,11 @@ pub async fn specs_preview(
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
 /// failure.
-pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_update(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
@@ -826,26 +852,29 @@ pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResu
     };
     let input: ChartInput = serde_json::from_value(raw)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
+    // BI-18 part C, part 2: an edit may not reach a chart in the trash (it
+    // would bring it back without a restore) or on somebody else's personal
+    // board, nor move a chart onto such a board.
+    let viewer = viewer_of(&principal);
+    let ch = &state.clickhouse;
+    let old_board = require_editable_chart(ch, &id, &viewer).await?;
+    require_chart_board(ch, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
-    let spec = store::spec_from_input(
-        &state.clickhouse,
-        &input,
-        ChartSource::Ui,
-        "ui",
-        Some(id),
-        &time,
-    )
-    .await
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(&state.clickhouse, &spec)
+    let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::BadRequest,
-            )
-        })?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    store::insert_chart(ch, &spec).await.map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::BadRequest,
+        )
+    })?;
+    // The board it left changed too, when the edit moved it.
+    if let Some(old) = old_board.filter(|b| *b != spec.board) {
+        snapshot(ch, &old, &principal).await;
+    }
+    snapshot(ch, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -867,12 +896,19 @@ pub struct IdQuery {
 /// [`ApiError::Internal`] on a `ClickHouse` failure.
 pub async fn specs_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
-    store::delete_chart(&state.clickhouse, &id)
+    // A chart the caller may not see is answered like one that does not exist:
+    // `ok`, and nothing is deleted (BI-18 part C, part 2).
+    let ch = &state.clickhouse;
+    let Some(board) = visible_live_chart_board(ch, &id, &viewer_of(&principal)).await? else {
+        return Ok(ApiJson(json!({ "ok": true })));
+    };
+    store::delete_chart(ch, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -881,6 +917,7 @@ pub async fn specs_delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
+    snapshot(ch, &board, &principal).await;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -893,19 +930,25 @@ pub async fn specs_delete(
 /// and would go stale the moment a chart is added, moved between boards, or
 /// deleted. The built-in board's count comes from the compiled-in specs,
 /// which is where its tiles actually come from.
-pub async fn boards_list(State(state): State<AppState>) -> Response {
+pub async fn boards_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
     let ch = &state.clickhouse;
-    let (boards, stored) =
-        match tokio::try_join!(store::list_boards(ch), store::list_stored_charts(ch)) {
-            Ok(pair) => pair,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-                )
-                    .into_response();
-            }
-        };
+    let viewer = viewer_of(&principal);
+    let (boards, stored) = match tokio::try_join!(
+        store::list_boards(ch, &viewer),
+        store::list_stored_charts(ch, &viewer)
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
+    };
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for c in &stored {
         *counts.entry(c.board.as_str()).or_default() += 1;
@@ -970,6 +1013,11 @@ pub async fn boards_create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // Fail closed: with nobody attached (the assistant's tool surface does not
+    // come through here) the caller is anonymous and sees no personal space.
+    let viewer = principal
+        .as_ref()
+        .map_or_else(Viewer::anonymous, |Extension(p)| viewer_of(p));
     let parsed: BoardCreateBody = if body.is_empty() {
         BoardCreateBody::default()
     } else {
@@ -978,10 +1026,12 @@ pub async fn boards_create(
     };
     let author = author_name(principal.as_ref());
     let folder_id = parsed.folder_id.unwrap_or_default().trim().to_owned();
-    // Checked first, so an unknown folder creates nothing.
-    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
+    // Checked first, so an unknown folder creates nothing. A personal space
+    // takes only its owner's dashboards.
+    crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
+        .await?;
     let mut board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup, &author).await
+        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer).await
     } else {
         store::create_board(
             &state.clickhouse,
@@ -997,6 +1047,22 @@ pub async fn boards_create(
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
         board.folder_id = Some(folder_id);
+    } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
+        // An administrator duplicating somebody else's draft: the copy is the
+        // administrator's own draft, not a second one in the other user's
+        // space.
+        let mine =
+            lakehouse_bi::folders::ensure_personal_folder(&state.clickhouse, viewer.id(), &author)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+        store::move_board(&state.clickhouse, &board.id, &mine.id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        board.folder_id = Some(mine.id);
+        board.owner_id = Some(viewer.id().to_owned());
+    }
+    if let Some(Extension(p)) = principal.as_ref() {
+        snapshot(&state.clickhouse, &board.id, p).await;
     }
     Ok(ApiJson(json!({ "ok": true, "board": board })))
 }
@@ -1051,6 +1117,22 @@ struct BoardEditBody {
     /// empty list goes back to the computed stacking.
     #[serde(default, rename = "phoneLayout")]
     phone_layout: Option<Vec<lakehouse_bi::layout::PhoneTile>>,
+}
+
+impl BoardEditBody {
+    /// Whether the body changes what a version holds (`BI-18` part C, part 2):
+    /// everything but sharing, the folder and the embed state.
+    fn changes_content(&self) -> bool {
+        self.name.is_some()
+            || self.description.is_some()
+            || self.layout.is_some()
+            || self.filters.is_some()
+            || self.refresh_seconds.is_some()
+            || self.grain.is_some()
+            || self.params.is_some()
+            || self.tabs.is_some()
+            || self.phone_layout.is_some()
+    }
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -1125,7 +1207,9 @@ async fn check_tab_rules(ch: &ChClient, id: &str, parsed: &BoardEditBody) -> Res
     if parsed.tabs.is_none() && !layout_names_tab && !filters_tie {
         return Ok(());
     }
-    let stored = store::get_board(ch, id)
+    // The caller was checked against this board before the first read
+    // (`boards_update`); the tabs and ties are judged against what is stored.
+    let stored = store::get_board(ch, id, &Viewer::system())
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let tabs = match (&parsed.tabs, &stored) {
@@ -1230,6 +1314,20 @@ async fn save_grain_and_params(
     Ok(())
 }
 
+/// File board `id` in `folder_id` (`""` = the root), if `viewer` may use that
+/// folder: another user's personal space is refused (`BI-18` part C, part 2).
+async fn file_in_folder(
+    ch: &ChClient,
+    id: &str,
+    folder_id: &str,
+    viewer: &Viewer,
+) -> Result<(), ApiError> {
+    crate::routes::dashboard_folders::ensure_folder_usable(ch, folder_id, viewer).await?;
+    store::move_board(ch, id, folder_id)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
+}
+
 /// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
 /// board.
 ///
@@ -1242,6 +1340,7 @@ async fn save_grain_and_params(
 /// layout, or on a validation/`ClickHouse` failure.
 pub async fn boards_update(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: BoardEditBody = if body.is_empty() {
@@ -1255,6 +1354,14 @@ pub async fn boards_update(
     }
     let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
+    // BI-18 part C, part 2: only a live board the caller may see can be
+    // edited. Without this a layout save for a deleted board would write a
+    // blank live row over its trash entry, and an edit by id could reach
+    // another user's draft.
+    let viewer = viewer_of(&principal);
+    if id != store::DEFAULT_BOARD_ID {
+        require_board(ch, &id, &viewer).await?;
+    }
     // Before the first write, so a bad filter list does not leave a board
     // half-edited (BI-18).
     if let Some(filters) = &parsed.filters {
@@ -1313,11 +1420,12 @@ pub async fn boards_update(
             })?;
     }
     if let Some(folder_id) = &parsed.folder_id {
-        let folder_id = folder_id.trim();
-        crate::routes::dashboard_folders::ensure_folder_exists(ch, folder_id).await?;
-        store::move_board(ch, &id, folder_id)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
+    }
+    // BI-18 part C, part 2: one version per request that changed the content.
+    let changes_content = parsed.changes_content();
+    if changes_content {
+        snapshot(ch, &id, &principal).await;
     }
     // SEC-12. Merged into whichever response below is returned, so a body
     // that also sets `public` or `embed` still reports them.
@@ -1354,13 +1462,18 @@ pub async fn boards_update(
 /// 400 when `id` is missing/`"default"`; 500 on a `ClickHouse` failure.
 pub async fn boards_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
-    store::delete_board(&state.clickhouse, &id)
+    // BI-18 part C, part 2: deleting moves to the trash, and only a board the
+    // caller may see can be deleted. An unknown, already deleted or private
+    // board is "not found" alike.
+    require_board(&state.clickhouse, &id, &viewer_of(&principal)).await?;
+    store::delete_board(&state.clickhouse, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -1884,7 +1997,7 @@ pub async fn records(
     records_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -2063,7 +2176,9 @@ pub(crate) async fn filters_for_chart_tab(
     {
         return filters;
     }
-    let board = match store::get_board(ch, &chart.board).await {
+    // `chart` was found through a viewer-scoped read by the caller, so its board
+    // is one that viewer may see; the board is read here only for its tabs.
+    let board = match store::get_board(ch, &chart.board, &Viewer::system()).await {
         Ok(Some(board)) => board,
         Ok(None) => return filters,
         Err(err) => {
@@ -2087,6 +2202,7 @@ async fn chart_own_filters(
     ch: &ChClient,
     q: &RecordsQuery,
     dashboard_filters: Vec<FilterDef>,
+    viewer: &Viewer,
 ) -> Result<TileFilters, ApiError> {
     let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
         return Ok(TileFilters {
@@ -2095,7 +2211,9 @@ async fn chart_own_filters(
             dashboard: dashboard_filters,
         });
     };
-    let stored = store::list_stored_charts(ch)
+    // A tile in the trash, or on another user's personal board, is "this tile
+    // does not exist" (BI-18 part C, part 2).
+    let stored = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let chart = stored
@@ -2315,7 +2433,7 @@ fn records_value<'a>(
 async fn records_for_roles(
     ch: &ChClient,
     q: RecordsQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
@@ -2333,7 +2451,7 @@ async fn records_for_roles(
         own,
         joins,
         dashboard: dashboard_filters,
-    } = chart_own_filters(ch, &q, dashboard_filters).await?;
+    } = chart_own_filters(ch, &q, dashboard_filters, viewer).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -2713,7 +2831,7 @@ pub async fn table_export(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let stored = store::list_stored_charts(ch)
+    let stored = store::list_stored_charts(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let chart = stored
@@ -2870,7 +2988,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -2933,12 +3051,11 @@ fn values_statement(selects: &[String], settings: &str) -> String {
 async fn board_value_selects(
     ch: &ChClient,
     board: &str,
-    column: &str,
-    search: Option<&str>,
+    (column, search): (&str, Option<&str>),
     other_filters: &[FilterDef],
-    time: &TimeContext,
+    (time, viewer): (&TimeContext, &Viewer),
 ) -> Result<(Vec<String>, bool), ApiError> {
-    let charts = store::list_stored_charts(ch)
+    let charts = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let on_board: Vec<&StoredChartSpec> = charts
@@ -3009,7 +3126,7 @@ async fn board_value_selects(
 async fn values_for_roles(
     ch: &ChClient,
     q: ValuesQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
@@ -3030,7 +3147,7 @@ async fn values_for_roles(
     let (selects, settings) = if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let (selects, has_source) =
-            board_value_selects(ch, board, &column, search, &others, time).await?;
+            board_value_selects(ch, board, (&column, search), &others, (time, viewer)).await?;
         let settings = if has_source {
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         } else {
@@ -3098,11 +3215,17 @@ async fn values_for_roles(
 /// # Errors
 ///
 /// 500 (`ApiError::Internal`) if either `ClickHouse` listing fails.
-pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
+pub async fn export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<Response> {
+    // The file is the caller's view of the dashboards: no deleted board or
+    // chart, and no other user's personal space (BI-18 part C, part 2).
+    let viewer = viewer_of(&principal);
     let (charts, boards, default_row) = tokio::try_join!(
-        store::list_stored_charts(&state.clickhouse),
-        store::list_boards(&state.clickhouse),
-        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID)
+        store::list_stored_charts(&state.clickhouse, &viewer),
+        store::list_boards(&state.clickhouse, &viewer),
+        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID, &viewer)
     )
     .map_err(|err| {
         upstream_error::ch_error_as(
@@ -3470,6 +3593,7 @@ pub struct EmbedInfoQuery {
 /// exist; 500 on any other `ClickHouse` failure.
 pub async fn embed_info(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<EmbedInfoQuery>,
 ) -> Response {
     let id = q.board.unwrap_or_default();
@@ -3480,7 +3604,7 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id).await {
+    match embed_info_body(&state, &id, &viewer_of(&principal)).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -3498,8 +3622,9 @@ pub async fn embed_info(
 async fn embed_info_body(
     state: &AppState,
     id: &str,
+    viewer: &Viewer,
 ) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
-    let Some(board) = store::get_board(&state.clickhouse, id).await? else {
+    let Some(board) = store::get_board(&state.clickhouse, id, viewer).await? else {
         return Ok(None);
     };
     let enabled = board.embed_enabled.unwrap_or(false);
@@ -4000,7 +4125,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4093,7 +4221,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             q,
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4138,7 +4269,7 @@ mod records_enforcement {
         let err = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4242,7 +4373,10 @@ mod values_enforcement {
                 column: Some("email".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4337,7 +4471,10 @@ mod values_enforcement {
                 q: Some("secret".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4608,6 +4745,7 @@ mod typed_filters {
             (
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
             ),
         )
         .await
@@ -4842,7 +4980,7 @@ mod typed_filters {
         values_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -5162,7 +5300,7 @@ mod records_pages {
         records_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -5758,7 +5896,11 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (time, requested.into()),
+            (
+                time,
+                requested.into(),
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -5830,7 +5972,11 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), super::GrainRequest::Own),
+            (
+                &TimeContext::default(),
+                super::GrainRequest::Own,
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .unwrap();
@@ -5933,7 +6079,15 @@ mod time_grain {
     ) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
-        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations, time).await
+        records_for_roles(
+            &ch,
+            q,
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            time,
+        )
+        .await
     }
 
     fn bucket_query(column: &str, value: &str, grain: &str) -> RecordsQuery {
@@ -6208,7 +6362,11 @@ mod table_tiles {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), GrainRequest::Saved),
+            (
+                &TimeContext::default(),
+                GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -6308,3 +6466,8 @@ mod param_rewrite;
 #[cfg(test)]
 #[path = "layout_tabs.rs"]
 mod layout_tabs;
+
+// BI-18 part C, part 2: what every read and write path does about the trash and
+// the personal space; the ignored tests check the clauses on the real engine.
+#[path = "organise_paths.rs"]
+mod organise_paths;
