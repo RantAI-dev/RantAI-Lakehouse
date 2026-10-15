@@ -1,4 +1,5 @@
 import type { EngineCategory, EntityStatus, WorkloadClass } from "@/lib/status"
+import type { Asset } from "./assets"
 
 /**
  * The query-execution engine, chosen by the user in Query Studio (WS2 §4).
@@ -71,6 +72,19 @@ export type QueryEstimate = {
   /** No policy engine exists yet — WS7 builds one. */
   policyObligations: string[] | null
   sources: string[]
+  /**
+   * `DATA-12` part 3: the certified or deprecated mark of each table a
+   * ClickHouse query reads, by the name in `sources` (`silver.orders`). Only a
+   * marked source has an entry; absent when none is. Same field names as an
+   * asset's, so the same notice renders them.
+   */
+  sourceMarks?: Record<
+    string,
+    Pick<
+      Asset,
+      "certification" | "certificationNote" | "replacementAssetId" | "replacementName"
+    >
+  >
   /**
    * WS1 task 1.6: the old plan marked stages that had not run as
    * `status: "completed"`. Null until a real plan exists.
