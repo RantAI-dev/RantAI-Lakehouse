@@ -3,6 +3,8 @@
 import type { ReportingContext } from "@/lib/time-grain";
 import * as React from "react";
 import { useTheme } from "next-themes";
+import { cn } from "@/lib/utils";
+import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
@@ -16,7 +18,7 @@ import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
-  board: { id: string; name: string };
+  board: { id: string; name: string; theme?: string; font?: string };
   layout: LayoutMap;
   /** BI-18 part C: only when the board has them. */
   tabs?: BoardTab[];
@@ -36,8 +38,11 @@ type Payload = {
  */
 export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: string; chartId?: string }) {
   const { resolvedTheme } = useTheme();
-  const dark = resolvedTheme === "dark";
+  const appDark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
+  // BI-17 part A (D13): the dashboard's own theme and font apply in an embed too.
+  const look = dashboardLook(data?.board, appDark, data?.reporting?.fonts);
+  const dark = look.dark;
   const [tabId, setTabId] = React.useState<string | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
   // SEC-12: what a refused signed token reads. The public link keeps the
@@ -95,7 +100,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     }
     return (
       <ReportingProvider reporting={data?.reporting}>
-      <div className="flex h-screen flex-col overflow-hidden bg-transparent p-2">
+      <div className={cn("flex h-screen flex-col overflow-hidden bg-transparent p-2", look.className)} style={look.style}>
         <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card">
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
             <p className="min-w-0 flex-1 truncate text-sm font-semibold">{spec?.title ?? "…"}</p>
@@ -128,7 +133,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
 
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className="min-h-screen bg-transparent p-2">
+    <div className={cn("min-h-screen bg-transparent p-2", look.className)} style={look.style}>
       {state === "loading" ? (
         <div className="grid gap-3 sm:grid-cols-2">
           {[0, 1, 2, 3].map((i) => <div key={i} className="h-40 animate-pulse rounded-xl bg-muted/50" />)}

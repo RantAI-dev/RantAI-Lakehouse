@@ -536,6 +536,14 @@ async fn get_body(
         {
             map.insert("phoneLayout".to_owned(), json!(phone));
         }
+        // BI-17 part A (D6): left off when the board follows the console, so
+        // a board saved before themes has the payload it always had.
+        if let Some(theme) = board_obj.and_then(|b| b.theme.as_ref()) {
+            map.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = board_obj.and_then(|b| b.font.as_ref()) {
+            map.insert("font".to_owned(), json!(font));
+        }
     }
     Ok(body)
 }

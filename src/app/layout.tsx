@@ -7,6 +7,7 @@ import { AppFrame } from "@/components/app-shell/app-frame";
 import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
+import { dashboardFontVariables } from "./fonts";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -43,7 +44,7 @@ export default function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${geist.variable} ${geistMono.variable} font-sans antialiased`}
+      className={`${geist.variable} ${geistMono.variable} ${dashboardFontVariables} font-sans antialiased`}
     >
       <head>
         <meta name="theme-color" content="#050A30" />

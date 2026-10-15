@@ -239,6 +239,29 @@ async fn the_payload_carries_the_tabs_the_tile_tabs_and_the_phone_layout() {
 }
 
 #[tokio::test]
+async fn the_payload_carries_the_theme_and_font_only_when_the_board_has_them() {
+    let server = MockServer::start().await;
+    let mut row = board_row(&json!({}), &json!([]), &json!([]));
+    row["theme"] = json!("dark");
+    row["font"] = json!("source-serif");
+    mount(&server, row, Vec::new()).await;
+    let body = dashboard(&server, "[]").await;
+    assert_eq!(
+        (body["theme"].as_str(), body["font"].as_str()),
+        (Some("dark"), Some("source-serif"))
+    );
+    let plain = MockServer::start().await;
+    mount(
+        &plain,
+        board_row(&json!({}), &json!([]), &json!([])),
+        Vec::new(),
+    )
+    .await;
+    let body = dashboard(&plain, "[]").await;
+    assert!(body.get("theme").is_none() && body.get("font").is_none());
+}
+
+#[tokio::test]
 async fn a_layout_saved_before_tabs_is_served_without_a_tab_key() {
     let server = MockServer::start().await;
     let layout = json!({ "c_a": { "x": 0, "y": 0, "w": 6, "h": 4 } });

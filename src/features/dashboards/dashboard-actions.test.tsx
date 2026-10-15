@@ -47,6 +47,19 @@ describe("DashboardActionsMenu auto-refresh", () => {
   })
 })
 
+describe("DashboardActionsMenu theme and font", () => {
+  it("offers Theme and font on a user dashboard and not on the built-in one", async () => {
+    const onTheme = mock(() => {})
+    renderMenu({ onTheme })
+    fireEvent.click(await screen.findByText("Theme and font…"))
+    expect(onTheme).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ isDefault: true, onTheme })
+    await screen.findByText("Manual")
+    expect(screen.queryByText("Theme and font…")).toBeNull()
+  })
+})
+
 describe("DashboardActionsMenu history and personal space", () => {
   it("offers the version history on a user dashboard and not on the built-in one", async () => {
     const onHistory = mock(() => {})

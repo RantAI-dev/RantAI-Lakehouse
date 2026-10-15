@@ -128,6 +128,9 @@ export type Board = {
    * 1800, 3600). Absent when none was saved; BI-18·B.
    */
   refreshSeconds?: number;
+  /** BI-17 part A: the dashboard's own theme (`light` or `dark`) and font id; absent follows the console. */
+  theme?: string;
+  font?: string;
   createdAt?: string;
   /**
    * Kapan board terakhir ditulis.

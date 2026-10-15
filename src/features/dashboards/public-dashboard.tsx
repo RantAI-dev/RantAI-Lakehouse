@@ -4,6 +4,8 @@ import type { ReportingContext } from "@/lib/time-grain";
 import * as React from "react";
 import { useTheme } from "next-themes";
 import Image from "next/image";
+import { cn } from "@/lib/utils";
+import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
@@ -16,7 +18,7 @@ import type { TileFailure } from "@/services/contracts/dashboards";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
-  board: { id: string; name: string };
+  board: { id: string; name: string; theme?: string; font?: string };
   layout: LayoutMap;
   /** BI-18 part C: only when the board has them. */
   tabs?: BoardTab[];
@@ -37,8 +39,12 @@ export function PublicDashboard({ token }: { token: string }) {
   const { resolvedTheme, setTheme } = useTheme();
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
-  const dark = resolvedTheme === "dark";
+  const appDark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
+  // BI-17 part A (D13): the dashboard's own theme and font apply on a public link too.
+  const look = dashboardLook(data?.board, appDark, data?.reporting?.fonts);
+  const dark = look.dark;
+  const fixedTheme = look.className !== "";
   const [tabId, setTabId] = React.useState<string | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
 
@@ -93,7 +99,7 @@ export function PublicDashboard({ token }: { token: string }) {
 
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className="min-h-screen bg-muted/25">
+    <div className={cn("min-h-screen bg-muted/25", look.className)} style={look.style}>
       {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
         <span className="relative block h-6 w-[116px] shrink-0">
@@ -105,14 +111,15 @@ export function PublicDashboard({ token }: { token: string }) {
           <p className="truncate text-sm font-semibold leading-tight">{data?.board.name ?? "Dashboard"}</p>
           <p className="text-[11px] text-muted-foreground">Shared dashboard · read-only</p>
         </div>
-        <button
+        {/* An editor who fixed the theme has chosen how this dashboard reads; the viewer's toggle would undo it. */}
+        {fixedTheme ? null : <button
           type="button"
           suppressHydrationWarning
-          onClick={() => setTheme(dark ? "light" : "dark")}
+          onClick={() => setTheme(appDark ? "light" : "dark")}
           className="rounded-md border border-border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
         >
-          {mounted ? (dark ? "Light" : "Dark") : "Theme"}
-        </button>
+          {mounted ? (appDark ? "Light" : "Dark") : "Theme"}
+        </button>}
       </header>
 
       <main className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6">

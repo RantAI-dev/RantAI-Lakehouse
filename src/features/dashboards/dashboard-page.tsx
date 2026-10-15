@@ -39,6 +39,9 @@ import { BoardSwitcher } from "./board-switcher";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
+import { ThemeFontDialog } from "./theme-font-dialog";
+import { dashboardLook, type DashboardTheme } from "@/lib/dashboard-look";
+import { SHIPPED_FONT_IDS } from "@/lib/formatting-settings";
 import { labelledFolders } from "@/lib/dashboard-organise";
 import { FavouriteButton } from "./favourite-button";
 import { FilterRow } from "./filter-row";
@@ -84,6 +87,8 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
+  theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
   params?: ParamControl[]; defaultParams?: Record<string, ParamValue>; appliedParams?: Record<string, ParamValue>;
   filterColumns: string[]; filterFields?: FilterField[];
@@ -185,6 +190,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
+  const [themeOpen, setThemeOpen] = React.useState(false);
+  const [savingTheme, setSavingTheme] = React.useState(false);
+  const [themeError, setThemeError] = React.useState<string | null>(null);
   // Folders only group the title switcher here. Managing them and filing
   // a dashboard are on the dashboard list (`dashboard-list-page.tsx`).
   const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
@@ -207,7 +215,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // mount so the server-rendered page and the first client render agree.
   const [fsDark, setFsDark] = React.useState(false);
   React.useEffect(() => { setFsDark(readFullscreenDark()); }, []);
-  const dark = themeDark || (fullscreen && fsDark);
+  const appDark = themeDark || (fullscreen && fsDark);
+  // BI-17 part A (D6): the dashboard's own theme and font win over the console's.
+  const look = dashboardLook(data ?? undefined, appDark, data?.reporting?.fonts);
+  const dark = look.dark;
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
   const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; tileId?: string }) | null>(null);
   const [records, setRecords] = React.useState<RecordsRequest | null>(null);
@@ -444,6 +455,29 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setSavingRefresh(false);
     }
   }, [board, autoSec]);
+
+  // BI-17 part A (D6): the theme and font are written through the board write path
+  // (`dashboard:write`); a font the administrator does not allow comes back as the server's sentence.
+  const saveThemeAndFont = React.useCallback(async (choice: { theme: DashboardTheme; font: string }) => {
+    setSavingTheme(true);
+    setThemeError(null);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: board, theme: choice.theme, font: choice.font }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not save the theme and font");
+      }
+      setData((prev) => (prev ? { ...prev, theme: choice.theme === "auto" ? undefined : choice.theme, font: choice.font || undefined } : prev));
+      setThemeOpen(false);
+    } catch (e) {
+      setThemeError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingTheme(false);
+    }
+  }, [board]);
 
   // Cross-filter: toggle a value in a column → filters EVERY tile with that column.
   const crossFilter = React.useCallback((column: string, value: string) => {
@@ -910,7 +944,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // console, and anything portalled out of this element, keeps its theme.
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", fullscreen && fsDark && "dark")}>
+    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"))} style={look.style}>
       <PageHeader
         title={
           <span className="flex min-w-0 items-center gap-2">
@@ -949,6 +983,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               isDefault={isDefault}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
+              onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
               loading={loading}
               fullscreen={fullscreen}
               autoSec={String(autoSec)}
@@ -1181,6 +1216,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         />
       ) : null}
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
+      {themeOpen ? (
+        <ThemeFontDialog open={themeOpen} onOpenChange={setThemeOpen} theme={data?.theme} font={data?.font}
+          allowedFonts={data?.reporting?.fonts ?? SHIPPED_FONT_IDS} saving={savingTheme} error={themeError} onSave={(c) => void saveThemeAndFont(c)} />
+      ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
       ) : null}
