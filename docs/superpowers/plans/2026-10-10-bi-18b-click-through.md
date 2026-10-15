@@ -271,3 +271,14 @@ No open `BLOCKER`. No `SHOULD-FIX` raised against the developer's diff.
 **Defaults the product owner has not confirmed**
 
 - 50 records per page; the full-screen Dark switch is remembered per browser, not per user.
+
+### AI team review of the assistant parts (recorded by the planner, 2026-10-15)
+
+PR #104 review BLOCKER 3. The product owner confirmed on 2026-10-15 that
+the AI team has reviewed this plan's assistant changes (`registry.rs`,
+`tests/fixtures/tool_schemas.json`, `capabilities.ts`) and takes the
+follow-ups into its own plans. Their notes are not copied here; open
+follow-ups the planner found are backlog `AI-20` (the grain override is not
+in the dashboard's page context) and `AI-15` (the standard request set does
+not exist yet, so `AI-3-AC1` and `AI-4-AC1` were checked by hand and
+`AI-5-AC1` not at all).

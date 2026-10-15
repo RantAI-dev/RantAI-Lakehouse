@@ -294,3 +294,14 @@ No open `BLOCKER`. R1 to R6 are closed.
 - The `AI-3` entry in the `AI-15` request set, when that set exists.
 - Migration `0066` (now `0070`, see above): `0062` to `0065` are taken by open PR #101, so the number is free only while that holds.
 - The built-in Main board cannot save a grain default (it accepts layout changes only).
+
+### AI team review of the assistant parts (recorded by the planner, 2026-10-15)
+
+PR #104 review BLOCKER 3. The product owner confirmed on 2026-10-15 that
+the AI team has reviewed this plan's assistant changes (`registry.rs`,
+`tests/fixtures/tool_schemas.json`, `capabilities.ts`) and takes the
+follow-ups into its own plans. Their notes are not copied here; open
+follow-ups the planner found are backlog `AI-20` (the grain override is not
+in the dashboard's page context) and `AI-15` (the standard request set does
+not exist yet, so `AI-3-AC1` and `AI-4-AC1` were checked by hand and
+`AI-5-AC1` not at all).
