@@ -696,16 +696,39 @@ BRONZE_OF = {
     "g6-files": "g6_files_orders", "g6-mongo": "g6_mongo_orders", "g6-kafka": "g6_kafka_events",
     "g6-rest": "g6_rest_items",
 }
-# What `POST .../discover` must list for the types the product can discover:
-# `(schema, "<schema>.<table>", columns)`. The fixtures: `ingest_demo.orders`
-# (docker-compose.yml, g3a-source-init), and the `orders` table the seeders
-# above create in `g6_ingest` (MySQL) and in `dbo` of `g6_ingest` (SQL Server).
+# What the discovery routes (`POST .../discovery/{list,preview}`, SRC-13) must
+# show for every type: a known object and its columns. Keys: `schema` (SQL: the
+# schema that must be among the schemas and is listed), `glob` (files), `object`
+# (the name the list must hold, which is also what a source object is called),
+# `kind` (what the list calls it), `columns` (the names the preview must show,
+# at least) and `inferred` (whether the preview's types are guessed from a
+# sample, D6). The fixtures: `ingest_demo.orders` (docker-compose.yml,
+# g3a-source-init), the `orders` table the seeders above create in `g6_ingest`
+# (MySQL) and in `dbo` of `g6_ingest` (SQL Server), `landing/orders.csv` on the
+# warehouse bucket, `orders.csv` in the SFTP fixture's `upload` directory, the
+# `orders` collection of `g6_ingest`, the Kafka topic the run reads (its
+# messages are `{"id", "amount"}`), and the REST stub's `/items` endpoint.
 DISCOVER_FIXTURES = {
-    "PostgreSQL": ("ingest_demo", "ingest_demo.orders", {"id", "customer", "amount", "created_at"}),
-    "MySQL": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
-    "MariaDB": ("g6_ingest", "g6_ingest.orders", {"id", "amount"}),
-    "SQL Server": ("dbo", "dbo.orders", {"id", "amount"}),
+    "PostgreSQL": {"schema": "ingest_demo", "object": "ingest_demo.orders", "kind": "table",
+                   "columns": {"id", "customer", "amount", "created_at"}, "inferred": False},
+    "MySQL": {"schema": "g6_ingest", "object": "g6_ingest.orders", "kind": "table",
+              "columns": {"id", "amount"}, "inferred": False},
+    "MariaDB": {"schema": "g6_ingest", "object": "g6_ingest.orders", "kind": "table",
+                "columns": {"id", "amount"}, "inferred": False},
+    "SQL Server": {"schema": "dbo", "object": "dbo.orders", "kind": "table",
+                   "columns": {"id", "amount"}, "inferred": False},
+    "Object storage": {"glob": "landing/*.csv", "object": "landing/orders.csv", "kind": "file",
+                       "columns": {"id", "customer", "amount"}, "inferred": True},
+    "SFTP": {"object": "orders.csv", "kind": "file", "columns": {"id", "name", "amount"}, "inferred": True},
+    "MongoDB": {"object": "orders", "kind": "collection", "columns": {"id", "amount"}, "inferred": True},
+    "Kafka": {"object": "g6-events", "kind": "topic", "columns": {"id", "amount"}, "inferred": True},
+    "REST API": {"object": "/items", "kind": "endpoint", "columns": {"id", "name"}, "inferred": True},
 }
+# How long the gate waits for a listing that runs on the orchestrator (MongoDB,
+# Kafka, SFTP, Oracle, and the previews of REST, MongoDB, Kafka, SFTP): a
+# Dagster run launched by the API, polled. The API itself ends a request that
+# runs for five minutes.
+DISCOVERY_WAIT_S = 240.0
 # SRC-9 decision 9: the gate runs as two CI jobs, because one job took 22 to
 # 23 minutes (13 of them bringing the stack up). `G6_GROUP` selects the half:
 # `sql` is the SQL sources (PostgreSQL, MySQL, MariaDB, SQL Server) and the
@@ -721,6 +744,8 @@ GROUP_MEMBERS = {
     "other": ("g6-files", "g6-rest", "g6-mongo", "g6-kafka", "g6-sftp"),
 }
 JOB_OF_GROUP = {"sql": "g6-ingest", "other": "g6-ingest-other"}
+# The connectors whose discovery the API answers in the request itself (SQL, object storage).
+API_DISCOVERED = ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-mssql", "g6-files")
 
 
 def _active(name: str) -> bool:
@@ -852,51 +877,104 @@ def _check_connect(name: str, connector_id: str) -> None:
         )
 
 
-def _check_discover(name: str, connector_id: str) -> None:
-    """SRC-9 task 2, step `discover`: `POST .../discover` (`?schema=` is
-    required for sql/cdc connectors and ignored for the rest).
+def discovery_answer(connector_id: str, kind: str, body: dict) -> dict:
+    """`POST .../discovery/{kind}`, then `GET` while the answer is `running` (the
+    sources only the orchestrator reads; SRC-13 D1). A preview whose `object` is
+    not the one asked for was replaced by another request and is an error.
 
-    `real`: `supported: true` and the fixture's table is listed with its
-    columns. `refused`: `supported: false` and a non-empty `reason`."""
+    # Errors
+
+    `G6Failure` for an HTTP error, an answer that is not JSON, or a request still
+    running after `DISCOVERY_WAIT_S`."""
+    url = f"{API_URL}/api/connectors/{connector_id}/discovery/{kind}"
+    try:
+        resp = API.post(url, json=body, timeout=135)
+        if not resp.ok:
+            raise G6Failure(f"POST .../discovery/{kind} answered {resp.status_code} {resp.text[:200]}")
+        answer = resp.json()
+        deadline = time.time() + DISCOVERY_WAIT_S
+        while answer.get("state") == "running":
+            if time.time() > deadline:
+                raise G6Failure(f"{kind} {body} still running after {DISCOVERY_WAIT_S:.0f}s")
+            time.sleep(2)
+            resp = API.get(url, timeout=30)
+            if not resp.ok:
+                raise G6Failure(f"GET .../discovery/{kind} answered {resp.status_code} {resp.text[:200]}")
+            answer = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise G6Failure(f"POST .../discovery/{kind} did not answer cleanly ({type(exc).__name__})") from exc
+    if kind == "preview" and answer.get("object") != body.get("object"):
+        raise G6Failure(f"the preview answered for {answer.get('object')!r}, asked for {body.get('object')!r}")
+    return answer
+
+
+def check_discovery(type_name: str, connector_id: str, fixture: dict) -> str:
+    """The real discovery of one type (SRC-13 D12): the schemas hold the fixture's
+    schema (SQL), the list holds the known object, and its preview shows the known
+    columns, with types marked inferred exactly where D6 says they are guessed.
+
+    # Errors
+
+    `G6Failure` naming what was missing."""
+    if "schema" in fixture:
+        schemas = discovery_answer(connector_id, "list", {})
+        names = [o.get("name") for o in schemas.get("objects") or [] if o.get("kind") == "schema"]
+        if schemas.get("state") != "done" or fixture["schema"] not in names:
+            raise G6Failure(f"expected the schemas to hold {fixture['schema']!r}, got state={schemas.get('state')!r} {names[:20]}")
+    request = {"schema": fixture["schema"]} if "schema" in fixture else ({"glob": fixture["glob"]} if "glob" in fixture else {})
+    listing = discovery_answer(connector_id, "list", request)
+    objects = listing.get("objects") or []
+    obj = next((o for o in objects if o.get("name") == fixture["object"]), None)
+    if listing.get("state") != "done" or obj is None or obj.get("kind") != fixture["kind"]:
+        raise G6Failure(
+            f"expected a {fixture['kind']} {fixture['object']!r} in the list, got state={listing.get('state')!r} "
+            f"errorClass={listing.get('errorClass')!r} reason={listing.get('reason')!r} objects={[o.get('name') for o in objects][:20]}"
+        )
+    if fixture["kind"] == "file" and not (isinstance(obj.get("size"), int) and obj["size"] > 0):
+        raise G6Failure(f"expected the listed file {fixture['object']!r} to carry its size, got {obj}")
+    # D8: only base tables are listed, so an object is never a view; the kind check above says so for tables.
+    preview = discovery_answer(connector_id, "preview", {"object": fixture["object"]})
+    if preview.get("state") != "done":
+        raise G6Failure(
+            f"expected the columns of {fixture['object']!r}, got state={preview.get('state')!r} "
+            f"errorClass={preview.get('errorClass')!r} reason={preview.get('reason')!r}"
+        )
+    columns = preview.get("columns") or []
+    found = {c.get("name") for c in columns}
+    if not fixture["columns"] <= found:
+        raise G6Failure(f"{fixture['object']!r} is missing columns {sorted(fixture['columns'] - found)}, has {sorted(found)}")
+    inferred = {c.get("name"): c.get("inferred") for c in columns if c.get("name") in fixture["columns"]}
+    if any(v is not fixture["inferred"] for v in inferred.values()):
+        raise G6Failure(f"expected the types of {fixture['object']!r} to be inferred={fixture['inferred']}, got {inferred}")
+    return f"{fixture['object']} with {len(found)} columns"
+
+
+def _check_discover(name: str, connector_id: str) -> None:
+    """SRC-9 task 2 / SRC-13 D12, step `discover`.
+
+    `real`: the type's known object is listed and its columns previewed
+    (`check_discovery`). `refused`: a list answers `failed` with the class
+    `not_supported` and a non-empty fixed reason, never a source's text."""
     type_name = TYPE_OF[name]
     expected = _expectation(type_name, "discover")
     if expected is None:
         return
     fixture = DISCOVER_FIXTURES.get(type_name)
-    params = {"schema": fixture[0]} if fixture else None
     try:
-        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params=params, timeout=30)
-        if not resp.ok:
-            _record_fail(type_name, "discover", f"POST .../discover answered {resp.status_code} {resp.text[:200]}")
+        if expected == "refused":
+            body = discovery_answer(connector_id, "list", {})
+            reason = body.get("reason")
+            if body.get("state") == "failed" and body.get("errorClass") == "not_supported" and isinstance(reason, str) and reason.strip():
+                _record(type_name, "discover", "refused-as-expected", "state=failed, not_supported, with a reason")
+            else:
+                _record_fail(type_name, "discover", f"expected state=failed with errorClass not_supported and a reason, got {body}")
             return
-        body = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        _record_fail(type_name, "discover", f"POST .../discover did not answer cleanly ({type(exc).__name__})")
-        return
-    if expected == "refused":
-        reason = body.get("reason")
-        if body.get("supported") is False and isinstance(reason, str) and reason.strip():
-            _record(type_name, "discover", "refused-as-expected", "supported=false with a reason")
-        else:
-            _record_fail(type_name, "discover", f"expected supported=false with a reason, got {body}")
-        return
-    if fixture is None:
-        _record_fail(type_name, "discover", "the gate has no discovery fixture for a type the registry calls real")
-        return
-    _, table_name, columns = fixture
-    table = next((o for o in body.get("objects") or [] if o.get("name") == table_name), None)
-    if body.get("supported") is not True or table is None:
-        listed = [o.get("name") for o in body.get("objects") or []]
-        _record_fail(
-            type_name, "discover",
-            f"expected supported=true listing {table_name!r}, got supported={body.get('supported')!r} objects={listed[:20]}",
-        )
-        return
-    found = {c.get("name") for c in table.get("columns") or []}
-    if not columns <= found:
-        _record_fail(type_name, "discover", f"{table_name!r} is missing columns {sorted(columns - found)}, has {sorted(found)}")
-        return
-    _record(type_name, "discover", "pass", f"{table_name} with {len(found)} columns")
+        if fixture is None:
+            _record_fail(type_name, "discover", "the gate has no discovery fixture for a type the registry calls real")
+            return
+        _record(type_name, "discover", "pass", check_discovery(type_name, connector_id, fixture))
+    except G6Failure as exc:
+        _record_fail(type_name, "discover", str(exc))
 
 
 def _produce_kafka_reload_batch(topic: str, group_id: str) -> int | None:
@@ -1063,6 +1141,8 @@ def step_ingest_matrix() -> None:
         # "offset" branch `RestPagination` never admitted). See
         # ops/g6/rest_stub.py's module docstring for the fixture this
         # exercises against.
+        # SRC-13 D3: the source object is named by the endpoint's path, so the load reads
+        # that endpoint only (before, the name was a target and every endpoint was read).
         # sourceObjects has ONE entry -- verification correction: the
         # original script set this to `[]`. `ingest_factory.py::run_ingest`
         # does `for obj in connector.get("sourceObjects", []):
@@ -1084,7 +1164,7 @@ def step_ingest_matrix() -> None:
          {"baseUrl": "http://rest-stub-g6:8080", "auth": {"type": "api_key", "header": "X-Api-Key"},
           "pagination": {"type": "page", "param": "page"},
           "endpoints": [{"path": "/items", "recordsPath": "items"}]},
-         [{"name": "items", "target": "g6_rest_items"}]),
+         [{"name": "/items", "target": "g6_rest_items"}]),
         # username="g6_reader" (database-scoped, created by
         # _seed_mongo_fixture), never the admin-scoped root user -- see
         # that function's docstring for why authSource=database (this
@@ -1159,11 +1239,16 @@ def step_ingest_matrix() -> None:
     # SRC-9 task 2: `connect` and `discover` for the other connectors, while
     # their first runs are in flight. Both are quick, read-only calls (a
     # supported test stamps this connector's `health`; see `_check_connect`).
+    # SRC-13 D12: only the types whose listing the API answers itself are
+    # discovered here (SQL and object storage). MongoDB, SFTP and the REST
+    # preview are Dagster runs of their own; they are asked once the loads have
+    # ended (below), so they do not queue behind the loads for a run slot.
     for name in ("conn-pg-lakehouse", "g6-mysql", "g6-mariadb", "g6-sftp", "g6-mssql", "g6-rest", "g6-mongo", "g6-files"):
         if name in connector_ids:
             if name != "g6-files":
                 _check_connect(name, connector_ids[name])
-            _check_discover(name, connector_ids[name])
+            if name in API_DISCOVERED:
+                _check_discover(name, connector_ids[name])
 
     # kafka: ingestMode="stream" (widened by 0043_ingest_tier2_adapters.sql
     # -- `ingest_factory.py::run_ingest` dispatches "stream" to
@@ -1188,8 +1273,8 @@ def step_ingest_matrix() -> None:
     if kafka_run_id:
         run_ids["g6-kafka"] = kafka_run_id
         # SRC-9 task 2: before the producer below, which blocks until the run ends.
+        # Its `discover` waits for the topic to hold messages (SRC-13, below).
         _check_connect("g6-kafka", connector_ids["g6-kafka"])
-        _check_discover("g6-kafka", connector_ids["g6-kafka"])
         # Produced AFTER the run launches (see _produce_kafka_fixture's
         # own docstring for why "before" would race kafka-python's
         # default "latest" auto_offset_reset).
@@ -1201,6 +1286,12 @@ def step_ingest_matrix() -> None:
         except G6Failure as exc:
             _record_fail(TYPE_OF[name], "load", str(exc))
             raise
+
+    # SRC-13 D12: the types the orchestrator lists. Run now, with the loads ended: the Kafka topic exists and
+    # holds the messages produced above (its preview reads the last 100), and no load holds a run slot.
+    for name in ("g6-sftp", "g6-rest", "g6-mongo", "g6-kafka"):
+        if name in connector_ids:
+            _check_discover(name, connector_ids[name])
 
     first_counts: dict[str, int] = {}
     for name, bronze_table in [
@@ -1745,15 +1836,17 @@ def step_load_modes() -> None:
 
     put_spec("history")
 
-    # a. key detection (decision 3): the MySQL primary-key query, against a real MySQL.
-    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params={"schema": SRC10_DB}, timeout=30)
-    if not resp.ok:
-        raise G6Failure(f"SRC-10 a (key detection): discover answered {resp.status_code} {resp.text[:300]}")
-    listed = {o.get("name"): o for o in resp.json().get("objects") or []}
-    keys = {t: (listed.get(f"{SRC10_DB}.{t}") or {}).get("primaryKey") for t in SRC10_TABLES}
+    # a. key detection (decision 3): the MySQL primary-key query, against a real MySQL. SRC-13: the key comes
+    # with a table's preview, one call per table (the list holds names only).
+    keys = {}
+    for t in SRC10_TABLES:
+        answer = discovery_answer(connector_id, "preview", {"object": f"{SRC10_DB}.{t}"})
+        if answer.get("state") != "done":
+            raise G6Failure(f"SRC-10 a (key detection): preview of {SRC10_DB}.{t} answered {answer}")
+        keys[t] = answer.get("primaryKey")
     if any(k != ["id"] for k in keys.values()):
         raise G6Failure(f"SRC-10 a (key detection): expected primaryKey ['id'] for all three tables, got {keys!r}")
-    print(f"[g6] SRC-10 a (key detection): discover reports primaryKey {keys}")
+    print(f"[g6] SRC-10 a (key detection): preview reports primaryKey {keys}")
 
     # b/c, first run
     _src10_run(connector_id, "run 1 (baseline)")

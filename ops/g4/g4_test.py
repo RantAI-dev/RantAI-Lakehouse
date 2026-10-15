@@ -34,8 +34,8 @@ copies into its summary:
 - `connect`, `discover`: the demo CDC source is registered in the connector
   registry as the console would (type `PostgreSQL CDC`, adapter `cdc`, the
   slot and publication names this stack really has), then `POST .../test`
-  and `POST .../discover?schema=p5_cdc` must answer for real, as they do for
-  its SQL twin. A failed one is recorded and the gate goes on.
+  and the discovery routes (`POST .../discovery/{list,preview}`, schema `p5_cdc`) must answer for real,
+  as they do for its SQL twin. A failed one is recorded and the gate goes on.
 - `load`: the first copy. Debezium's initial snapshot reaches Bronze and holds
   the rows `g4-source-init` seeded.
 - `reload`: the insert, update and delete arriving within the latency budget.
@@ -187,7 +187,7 @@ GATE_TENANT_SLUG = "meridian-group"
 CDC_SLOT_NAME = "p5cdc_slot"
 CDC_PUBLICATION_NAME = "p5cdc_pub"
 CDC_SCHEMA = "p5_cdc"
-# What `POST .../discover?schema=p5_cdc` must list: `g4-source-init`'s table.
+# What the discovery of schema `p5_cdc` must list: `g4-source-init`'s table.
 CDC_DISCOVER_TABLE = "p5_cdc.orders"
 CDC_DISCOVER_COLUMNS = {"id", "customer", "amount", "updated_at"}
 # `g4-source-init` seeds this many rows; the snapshot must deliver all of them.
@@ -800,28 +800,38 @@ def _check_connect(connector_id: str) -> None:
         )
 
 
+def _discovery(connector_id: str, kind: str, body: dict) -> dict:
+    """`POST .../discovery/{kind}` (SRC-13). A PostgreSQL CDC source is read by the API itself, so the
+    answer comes in the call (`state` `done` or `failed`), with no polling."""
+    resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discovery/{kind}", json=body, timeout=135)
+    if not resp.ok:
+        raise G4Failure(f"POST .../discovery/{kind} answered {resp.status_code} {resp.text[:200]}")
+    return resp.json()
+
+
 def _check_discover(connector_id: str) -> None:
-    """`discover`: `POST .../discover?schema=p5_cdc` lists `p5_cdc.orders`
-    with its columns (`real` branch of `ops/g6`'s `_check_discover`)."""
+    """`discover`: the schemas hold `p5_cdc`, its tables hold `p5_cdc.orders`, and the preview of
+    that table shows its columns (`real` branch of `ops/g6`'s `_check_discover`, SRC-13 routes)."""
     if not _expects_real("discover"):
         return
     try:
-        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params={"schema": CDC_SCHEMA}, timeout=30)
-        if not resp.ok:
-            _record("discover", "fail", f"POST .../discover answered {resp.status_code} {resp.text[:200]}")
+        schemas = _discovery(connector_id, "list", {})
+        names = [o.get("name") for o in schemas.get("objects") or [] if o.get("kind") == "schema"]
+        if schemas.get("state") != "done" or CDC_SCHEMA not in names:
+            _record("discover", "fail", f"expected the schemas to hold {CDC_SCHEMA!r}, got state={schemas.get('state')!r} {names[:20]}")
             return
-        body = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        _record("discover", "fail", f"POST .../discover did not answer cleanly ({type(exc).__name__})")
+        listing = _discovery(connector_id, "list", {"schema": CDC_SCHEMA})
+        preview = _discovery(connector_id, "preview", {"object": CDC_DISCOVER_TABLE})
+    except (requests.RequestException, ValueError, G4Failure) as exc:
+        _record("discover", "fail", f"the discovery routes did not answer cleanly ({type(exc).__name__}: {str(exc)[:200]})")
         return
-    table = next((o for o in body.get("objects") or [] if o.get("name") == CDC_DISCOVER_TABLE), None)
-    if body.get("supported") is not True or table is None:
-        listed = [o.get("name") for o in body.get("objects") or []]
-        _record("discover", "fail", f"expected supported=true listing {CDC_DISCOVER_TABLE!r}, got supported={body.get('supported')!r} objects={listed[:20]}")
+    listed = [o.get("name") for o in listing.get("objects") or []]
+    if listing.get("state") != "done" or CDC_DISCOVER_TABLE not in listed:
+        _record("discover", "fail", f"expected state=done listing {CDC_DISCOVER_TABLE!r}, got state={listing.get('state')!r} objects={listed[:20]}")
         return
-    found = {c.get("name") for c in table.get("columns") or []}
-    if not CDC_DISCOVER_COLUMNS <= found:
-        _record("discover", "fail", f"{CDC_DISCOVER_TABLE!r} is missing columns {sorted(CDC_DISCOVER_COLUMNS - found)}, has {sorted(found)}")
+    found = {c.get("name") for c in preview.get("columns") or []}
+    if preview.get("state") != "done" or not CDC_DISCOVER_COLUMNS <= found:
+        _record("discover", "fail", f"{CDC_DISCOVER_TABLE!r} preview: state={preview.get('state')!r}, missing columns {sorted(CDC_DISCOVER_COLUMNS - found)}, has {sorted(found)}")
         return
     _record("discover", "pass", f"{CDC_DISCOVER_TABLE} with {len(found)} columns")
 

@@ -381,3 +381,41 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests && python src11_connector_operations_test.py"]
+
+  # SRC-13 task 8 (decisions D9 and D12): the runner of `ops/g6/src13_discovery_scale_test.py`,
+  # which creates a PostgreSQL schema of 10,000 tables, lists it through the API, searches one and
+  # prints the seconds (it fails above 120). A job of its own (`g6-discovery-scale`), so no other
+  # gate job grows. It needs only the API and the PostgreSQL the API's own `conn-pg-lakehouse`
+  # connector points at (both started by `lakehouse-api`'s `depends_on`): no Dagster, because
+  # PostgreSQL is listed by the API itself. The shared Dagster image only because it already holds
+  # `requests` and `psycopg2-binary` and the `images` job has built it; see `g6-ops-test-runner`.
+  # The PG* settings are the compose defaults of the `postgres` service (`${POSTGRES_USER:-lakehouse}`
+  # and the like), so a `.env` that sets them for the stack sets them here too.
+  src13-scale-test-runner:
+    profiles: ["src13-scale"]
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests psycopg2-binary && python src13_discovery_scale_test.py"]
