@@ -574,7 +574,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The connector's own ingest runs, read from Dagster: the same
     // audience as the per-table results (`/api/governance/ingest-runs`)
     // and the probe history above.
-    ("GET",  "/api/connectors/{id}/ingest/runs", Policy::RequiresPermission("connector:manage")),
     // `SRC-8`: the orchestrator reports a source table's columns before it
     // loads the table and obeys the answer. `ingest:read` is the one
     // permission its ingest identity holds (`main::bootstrap_ingest_run_service`,

@@ -496,10 +496,6 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run_request),
         )
-        .route(
-            "/api/connectors/{id}/ingest/runs",
-            get(connectors::ingest_run_history),
-        )
         // `SRC-11` decisions D4, D5, D7, D8: the run history, a run's log and
         // Resume, for a person with `connector:manage` on a connector of their
         // own tenant.

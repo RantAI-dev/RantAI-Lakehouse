@@ -31,7 +31,7 @@ use axum::response::Response;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
-use lakehouse_dagster::{DgConfiguredRun, iso_from_unix_seconds, map_run_status};
+use lakehouse_dagster::{DgConfiguredRun, map_run_status};
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
@@ -3231,7 +3231,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// or the body names a table the connector does not load; 400 for a body that
 /// is not `{object, action}` together (see below); 409 if the connector is
 /// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
-/// queued or running (see [`ingest_run_history`]), or if the table named waits
+/// queued or running (see [`connector_runs`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
 /// on a `Dagster` transport failure; 503/500 as above for the database pool.
 ///
@@ -3495,27 +3495,21 @@ pub(super) const INGEST_JOB: &str = "ingest_job";
 /// are searched for one connector's runs.
 const RECENT_INGEST_RUNS: u32 = 100;
 
-/// How many of one connector's runs [`ingest_run_history`] returns.
+/// How many of one connector's runs [`connector_runs`] keeps.
 const CONNECTOR_RUN_HISTORY: usize = 20;
 
-/// One `ingest_job` run of one connector.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// One `ingest_job` run of one connector, as far as the one-run-at-a-time
+/// guard in [`ingest_run_request`] needs it. The run list the console shows
+/// is the product's own record (`SRC-11`, `routes::connector_runs`); the old
+/// `GET /api/connectors/{id}/ingest/runs` that returned this is gone
+/// (`SRC-11 review 2 SHOULD-FIX 1`, plan D7).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConnectorIngestRun {
     /// `Dagster`'s run id.
     pub run_id: String,
     /// `queued | running | completed | failed | cancelled | unknown`
     /// ([`map_run_status`], the vocabulary the pipelines pages use).
     pub status: &'static str,
-    /// ISO-8601, `None` until the run starts.
-    pub started_at: Option<String>,
-    /// ISO-8601, `None` until the run ends.
-    pub ended_at: Option<String>,
-    /// The one table a run of a single table named (`SRC-10` decision 5), from
-    /// the run's config; `None` for a run of every table.
-    pub object: Option<String>,
-    /// `refresh_keep | refresh_remove | clear` for such a run, else `None`.
-    pub action: Option<String>,
 }
 
 impl ConnectorIngestRun {
@@ -3523,14 +3517,6 @@ impl ConnectorIngestRun {
     fn is_active(&self) -> bool {
         matches!(self.status, "queued" | "running")
     }
-}
-
-/// A text field of a run's `ops.run_ingest.config`, or `None`.
-fn run_config_text(run: &DgConfiguredRun, field: &str) -> Option<String> {
-    run.run_config
-        .pointer(&format!("/ops/run_ingest/config/{field}"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 /// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
@@ -3548,36 +3534,8 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
         .map(|run| ConnectorIngestRun {
             run_id: run.run_id.clone(),
             status: map_run_status(&run.status),
-            started_at: run.start_time.map(iso_from_unix_seconds),
-            ended_at: run.end_time.map(iso_from_unix_seconds),
-            object: run_config_text(run, "object"),
-            action: run_config_text(run, "action"),
         })
         .collect()
-}
-
-/// `GET /api/connectors/{id}/ingest/runs` — this connector's recent
-/// `ingest_job` runs, newest first, with their status.
-///
-/// The per-table results (`GET /api/governance/ingest-runs`) are written
-/// only once a run reaches a table, so a run that fails before that — an
-/// unreachable API, a refused credential — leaves no result at all. This
-/// is the list that still shows it, and the one the console watches to
-/// know a run is still going.
-///
-/// # Errors
-///
-/// 503 when `Dagster` cannot be reached.
-pub async fn ingest_run_history(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<Vec<ConnectorIngestRun>>> {
-    let runs = state
-        .dagster
-        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
-        .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
-    Ok(ApiJson(connector_runs(&runs, &id)))
 }
 
 #[cfg(test)]
@@ -3610,13 +3568,8 @@ mod tests {
         );
         assert_eq!(mine[0].status, "running");
         assert!(mine[0].is_active());
-        assert_eq!(mine[0].ended_at, None);
         assert_eq!(mine[1].status, "completed");
         assert!(!mine[1].is_active());
-        assert_eq!(
-            mine[1].started_at.as_deref(),
-            Some("2026-09-29T08:21:51.000Z")
-        );
     }
 
     #[test]
