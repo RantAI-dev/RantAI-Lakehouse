@@ -53,6 +53,14 @@ use time::OffsetDateTime;
 /// (plan D8).
 pub const CHECK_INTERVAL_SECONDS: i64 = 30;
 
+/// How old a recorded check may be and still be believed (plan D8): three
+/// check intervals. Past that the orchestrator has stopped asking — the
+/// row then describes when it last worked, not how fresh the pipeline is —
+/// so the payload says `not_measured` instead of repeating a stale "met"
+/// (`BLD-2-AC5`). Derived from the interval, because the two must move
+/// together.
+pub const STALE_AFTER_SECONDS: i64 = 3 * CHECK_INTERVAL_SECONDS;
+
 /// The run budget's fallback: how long a pipeline is assumed to take when
 /// it has never run successfully and there is no measurement to use
 /// (plan D5 step 4).
@@ -1154,6 +1162,143 @@ fn reason_for(status: LagStatus, never_consumed: bool) -> &'static str {
         (LagStatus::Met, _) => "within the target lag",
     }
 }
+
+/// BLD-2 plan D9: does THIS check raise the behind-target alert?
+///
+/// The streak grows by one per check that ends `behind` and is reset to
+/// zero by any other outcome, so "exactly 3" fires once per streak and
+/// never again while the streak continues — the same once-per-streak shape
+/// as `connectors.rs`'s repeated-failure alert, with no second table to
+/// dedupe against. The number is the store's, not a local copy: the
+/// `pipeline_lag_state` column, this predicate and the alert kind's doc
+/// must not be able to disagree.
+#[must_use]
+pub const fn behind_alert_due(behind_streak: i32) -> bool {
+    behind_streak == pipelines::BEHIND_STREAK_ALERT_AFTER
+}
+
+/// The `downstream` pipelines in `pipelines` that no lag pipeline reads —
+/// plan D7's honest note ("Downstream: no pipeline with a target lag reads
+/// this table"), as a set of ids.
+///
+/// Two queries whatever the list holds, because a list route that asks
+/// the store once per row turns a page into N round trips: the readers of
+/// all the candidates' targets in one, and the `depends_on` targets of
+/// those readers in one. The error is the caller's, never a silent zero
+/// (a swallowed failure would report every downstream pipeline as having
+/// no reader).
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if either query fails.
+pub async fn downstream_without_readers(
+    pool: &PgPool,
+    candidates: &[Pipeline],
+) -> Result<std::collections::HashSet<String>, StoreError> {
+    let candidates: Vec<&Pipeline> = candidates
+        .iter()
+        .filter(|p| p.target_lag == Some(TargetLag::Downstream))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let targets: Vec<String> = candidates.iter().map(|p| p.target.clone()).collect();
+    let readers = pipelines::lag_pipelines_reading(pool, &targets).await?;
+    let upstream_ids: Vec<String> = readers
+        .iter()
+        .flat_map(|r| r.depends_on.iter().cloned())
+        .collect();
+    let upstream_targets = pipelines::targets_for(pool, &upstream_ids).await?;
+    let mut without = std::collections::HashSet::new();
+    for candidate in candidates {
+        let read_by_anybody = readers.iter().any(|reader| {
+            reader.id != candidate.id
+                && (reader.source == candidate.target
+                    || upstream_targets
+                        .get(&reader.id)
+                        .is_some_and(|t| *t == candidate.target))
+        });
+        if !read_by_anybody {
+            without.insert(candidate.id.clone());
+        }
+    }
+    Ok(without)
+}
+
+/// BLD-2 plan D8: compute the `lag: { status, lagSeconds, lastCheckAt,
+/// reason }` object for the pipeline list and detail payloads.
+///
+/// `null` for a pipeline with no target lag: the two fields are a pair,
+/// and a `lag` next to no `targetLag` would claim a measurement nobody
+/// makes. Everything else is `not_measured` until a check has run within
+/// the last three check intervals (90 s) — the orchestrator is what checks
+/// the lag, so a stale row means the orchestrator stopped asking and
+/// nothing is known (`BLD-2-AC5`), which is never reported as `met`.
+#[must_use]
+pub fn lag_json(
+    target_lag: Option<TargetLag>,
+    state: Option<&pipelines::PipelineLagState>,
+    now: OffsetDateTime,
+    downstream_no_readers: bool,
+) -> serde_json::Value {
+    if target_lag.is_none() {
+        return serde_json::Value::Null;
+    }
+    let not_measured = |reason: String| {
+        serde_json::json!({
+            "status": LagStatus::NotMeasured.as_str(),
+            "lagSeconds": serde_json::Value::Null,
+            "lastCheckAt": serde_json::Value::Null,
+            "reason": reason,
+        })
+    };
+    let Some(st) = state else {
+        return not_measured("no lag check has run for this pipeline".to_owned());
+    };
+    let Some(last_check) = st.last_check_at else {
+        return not_measured("no lag check has run for this pipeline".to_owned());
+    };
+    let last_check_iso = last_check
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
+    let stale_read = |reason: String| {
+        serde_json::json!({
+            "status": LagStatus::NotMeasured.as_str(),
+            "lagSeconds": serde_json::Value::Null,
+            "lastCheckAt": last_check_iso,
+            "reason": reason,
+        })
+    };
+    if (now - last_check).whole_seconds() > STALE_AFTER_SECONDS {
+        return stale_read(format!(
+            "no check recorded in the last {STALE_AFTER_SECONDS} seconds"
+        ));
+    }
+    if target_lag == Some(TargetLag::Downstream) && downstream_no_readers {
+        return stale_read("Downstream: no pipeline with a target lag reads this table".to_owned());
+    }
+    let status = match st.last_status.as_deref() {
+        Some("met") => LagStatus::Met,
+        Some("behind") => LagStatus::Behind,
+        // The three words are a CHECK constraint on the column, so this arm
+        // is only reachable for a row written before a check ever ran.
+        _ => LagStatus::NotMeasured,
+    };
+    let lag_seconds = if status == LagStatus::NotMeasured {
+        None
+    } else {
+        st.pending_since.map(|ps| (now - ps).whole_seconds().max(0))
+    };
+    let reason = reason_for(status, st.consumed_tokens.is_none());
+    serde_json::json!({
+        "status": status.as_str(),
+        "lagSeconds": lag_seconds,
+        "lastCheckAt": last_check_iso,
+        "reason": reason,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2019,6 +2164,280 @@ mod tests {
         assert_eq!(
             outcome.reason.as_deref(),
             Some("Downstream: no pipeline with a target lag reads this table")
+        );
+    }
+
+    /// A `pipeline_lag_state` row, for the payload tests that only care
+    /// about what the row says, not about who wrote it.
+    fn lag_state(
+        last_check_at: Option<OffsetDateTime>,
+        last_status: &str,
+    ) -> pipelines::PipelineLagState {
+        pipelines::PipelineLagState {
+            pipeline_id: "pl-x".to_owned(),
+            tenant_id: None,
+            consumed_tokens: Some(serde_json::json!({"bronze.orders": "iceberg:1"})),
+            consumed_at: Some(at(100)),
+            pending_since: None,
+            requested_run_key: None,
+            requested_tokens: None,
+            last_check_at,
+            last_status: Some(last_status.to_owned()),
+            behind_streak: 0,
+        }
+    }
+
+    /// Without a target lag there is nothing to report, and the field is
+    /// absent rather than a null that looks like a measurement.
+    #[test]
+    fn lag_json_is_null_when_the_pipeline_has_no_target_lag() {
+        let now = at(1_000);
+        assert_eq!(lag_json(None, None, now, false), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lag_json_is_not_measured_before_the_first_check() {
+        let now = at(1_000);
+        for state in [None, Some(lag_state(None, "met"))] {
+            let res = lag_json(
+                Some(TargetLag::Lag { minutes: 5 }),
+                state.as_ref(),
+                now,
+                false,
+            );
+            assert_eq!(res["status"], "not_measured");
+            assert_eq!(res["lagSeconds"], serde_json::Value::Null);
+            assert_eq!(res["lastCheckAt"], serde_json::Value::Null);
+            assert_eq!(res["reason"], "no lag check has run for this pipeline");
+        }
+    }
+
+    /// `BLD-2-AC5`: a check that stopped happening is not a check that
+    /// says "met". Three intervals old is the boundary, and one second
+    /// past it is already `not_measured`.
+    #[test]
+    fn lag_json_is_not_measured_once_the_last_check_is_older_than_three_intervals() {
+        let now = at(1_000);
+        let fresh = lag_state(
+            Some(now - time::Duration::seconds(STALE_AFTER_SECONDS)),
+            "met",
+        );
+        assert_eq!(
+            lag_json(
+                Some(TargetLag::Lag { minutes: 5 }),
+                Some(&fresh),
+                now,
+                false
+            )["status"],
+            "met",
+            "a check exactly three intervals old is still believed"
+        );
+        let stale = lag_state(
+            Some(now - time::Duration::seconds(STALE_AFTER_SECONDS + 1)),
+            "met",
+        );
+        let res = lag_json(
+            Some(TargetLag::Lag { minutes: 5 }),
+            Some(&stale),
+            now,
+            false,
+        );
+        assert_eq!(res["status"], "not_measured");
+        assert_eq!(
+            res["reason"],
+            format!("no check recorded in the last {STALE_AFTER_SECONDS} seconds")
+        );
+        assert!(
+            !res["lastCheckAt"].is_null(),
+            "the page still shows when the last check ran"
+        );
+    }
+
+    /// The lag in seconds is `now - pending_since`, and it is reported only
+    /// for a status that was measured; a `not_measured` row carries no lag
+    /// rather than a stale one.
+    #[test]
+    fn lag_json_reports_the_pending_seconds_behind_only_when_measured() {
+        let now = at(1_000);
+        let mut state = lag_state(Some(now - time::Duration::seconds(10)), "behind");
+        state.pending_since = Some(now - time::Duration::seconds(125));
+        let res = lag_json(
+            Some(TargetLag::Lag { minutes: 5 }),
+            Some(&state),
+            now,
+            false,
+        );
+        assert_eq!(res["status"], "behind");
+        assert_eq!(res["lagSeconds"], 125);
+        assert_eq!(res["reason"], "past the target lag");
+
+        state.last_status = Some("not_measured".to_owned());
+        let unmeasured = lag_json(
+            Some(TargetLag::Lag { minutes: 5 }),
+            Some(&state),
+            now,
+            false,
+        );
+        assert_eq!(unmeasured["status"], "not_measured");
+        assert_eq!(unmeasured["lagSeconds"], serde_json::Value::Null);
+    }
+
+    /// A pipeline that has never run under its lag is not "within the
+    /// target lag" — it is behind, and says why.
+    #[test]
+    fn lag_json_says_a_never_consumed_pipeline_is_waiting_for_its_first_run() {
+        let now = at(1_000);
+        let mut state = lag_state(Some(now - time::Duration::seconds(5)), "behind");
+        state.consumed_tokens = None;
+        let res = lag_json(
+            Some(TargetLag::Lag { minutes: 5 }),
+            Some(&state),
+            now,
+            false,
+        );
+        assert_eq!(
+            res["reason"],
+            "waiting for this pipeline's first successful run"
+        );
+    }
+
+    /// Plan D7's note: a `downstream` pipeline nobody reads cannot report
+    /// a lag, because nothing asks it to move.
+    #[test]
+    fn lag_json_reports_the_downstream_note_for_a_pipeline_with_no_readers() {
+        let now = at(1_000);
+        let state = lag_state(Some(now - time::Duration::seconds(10)), "met");
+        let res = lag_json(Some(TargetLag::Downstream), Some(&state), now, true);
+        assert_eq!(res["status"], "not_measured");
+        assert_eq!(
+            res["reason"],
+            "Downstream: no pipeline with a target lag reads this table"
+        );
+        assert_eq!(res["lagSeconds"], serde_json::Value::Null);
+
+        let read = lag_json(Some(TargetLag::Downstream), Some(&state), now, false);
+        assert_eq!(
+            read["status"], "met",
+            "a downstream pipeline somebody reads reports what its own check measured"
+        );
+    }
+
+    /// Plan D9: the alert fires on the check that completes the streak, so
+    /// once per streak and never twice for it.
+    #[test]
+    fn the_behind_target_alert_fires_exactly_at_the_third_check() {
+        for streak in 0..=2 {
+            assert!(!behind_alert_due(streak), "streak {streak} must not alert");
+        }
+        assert!(behind_alert_due(3), "the third check in a row alerts");
+        for streak in 4..=9 {
+            assert!(
+                !behind_alert_due(streak),
+                "streak {streak} must not alert again for the same streak"
+            );
+        }
+        assert!(
+            !behind_alert_due(0),
+            "a met check resets the streak, so this never wraps into an alert"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn downstream_without_readers_names_only_the_table_nobody_reads(pool: PgPool) {
+        let reader = seed_pipeline(&pool, "pl-reader", 5).await;
+        let created_orphan = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "pl-orphan".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "upstream_table".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "orphan_table".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-orphan".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+            },
+            None,
+        )
+        .await
+        .expect("seed the downstream pipeline");
+        let created_wanted = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "pl-wanted".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "reader_source".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "wanted_table".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-wanted".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+            },
+            None,
+        )
+        .await
+        .expect("seed the second downstream pipeline");
+        // The reader now reads the wanted table, so only the orphan is
+        // without one.
+        pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "pl-consumer".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "wanted_table".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "consumer_out".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-consumer".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 5 }),
+            },
+            None,
+        )
+        .await
+        .expect("seed the pipeline that reads the wanted table");
+
+        let candidates = vec![
+            reader.clone(),
+            created_orphan.clone(),
+            created_wanted.clone(),
+        ];
+        let without = downstream_without_readers(&pool, &candidates)
+            .await
+            .expect("read the downstream readers");
+        assert_eq!(
+            without,
+            std::collections::HashSet::from([created_orphan.id.clone()]),
+            "only the pipeline nothing reads is without readers"
         );
     }
 }

@@ -51,6 +51,15 @@ describe("alertRuleFormFields", () => {
       ...NO_LOAD_FIELDS,
     })
   })
+
+  it("shows no mart/measure, board, or freshness target for pipeline_behind_target", () => {
+    expect(alertRuleFormFields("pipeline_behind_target")).toEqual({
+      martMeasure: false,
+      board: false,
+      freshnessTarget: false,
+      ...NO_LOAD_FIELDS,
+    })
+  })
 })
 
 const NONE = { martMeasure: false, board: false, freshnessTarget: false }
@@ -151,6 +160,23 @@ describe("alertRuleSaveInput", () => {
     expect(body.type).toBe("upload_failure")
   })
 
+  it("sends a pipeline_behind_target rule with pipeline wildcard when none is given", () => {
+    expect(
+      alertRuleSaveInput({
+        ...FORM,
+        type: "pipeline_behind_target",
+        connector: undefined,
+      })
+    ).toEqual({
+      name: "Load failed",
+      type: "pipeline_behind_target",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      pipeline: "*",
+    })
+  })
+
   it("sends the form unchanged for the older kinds", () => {
     const alert = { ...FORM, type: "alert", connector: undefined }
     expect(alertRuleSaveInput(alert)).toBe(alert)
@@ -167,6 +193,7 @@ describe("the rules table's labels and scope", () => {
     expect(ruleKindLabel("connector_schema_change")).toBe("Connector schema changed")
     expect(ruleKindLabel("connector_success")).toBe("Connector run succeeded")
     expect(ruleKindLabel("upload_failure")).toBe("Upload failed")
+    expect(ruleKindLabel("pipeline_behind_target")).toBe("Pipeline behind target lag")
   })
 
   it("shows the connector's name when known, its id otherwise, All connectors for *, Uploads for uploads", () => {
@@ -174,6 +201,9 @@ describe("the rules table's labels and scope", () => {
     expect(ruleScope({ type: "connector_failure", connector: "conn-z" }, connectors)).toBe("conn-z")
     expect(ruleScope({ type: "connector_failure", connector: "*" }, connectors)).toBe("All connectors")
     expect(ruleScope({ type: "upload_failure", connector: "*" }, connectors)).toBe("Uploads")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "pl-x" }, connectors)).toBe("pl-x")
+    expect(ruleScope({ type: "pipeline_behind_target", pipeline: "*" }, connectors)).toBe("All pipelines")
+    expect(ruleScope({ type: "pipeline_behind_target" }, connectors)).toBe("All pipelines")
     expect(ruleScope({ type: "alert" }, connectors)).toBeNull()
   })
 })

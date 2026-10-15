@@ -163,6 +163,11 @@ pub enum AlertKind {
     /// Evaluated by [`evaluate_pipeline_volume_drop`] from the
     /// `run-finished` event route. Plan 1f.
     PipelineVolumeDrop,
+    /// Fires when a pipeline is behind its target lag for 3 consecutive checks
+    /// (decision 3). Evaluated by [`evaluate_pipeline_behind_target`] from the
+    /// lag-check route.
+    #[serde(rename = "pipeline_behind_target")]
+    PipelineBehindTarget,
     /// Fires when a connector's run fails, scoped to one connector id or
     /// `"*"` for every connector. Evaluated by
     /// [`evaluate_connector_event`] from `routes::pipelines::run_failed_event`
@@ -241,6 +246,7 @@ impl AlertKind {
             Self::PipelineSlow => "pipeline_slow",
             Self::PipelineLate => "pipeline_late",
             Self::PipelineVolumeDrop => "pipeline_volume_drop",
+            Self::PipelineBehindTarget => "pipeline_behind_target",
             Self::ConnectorFailure => "connector_failure",
             Self::ConnectorRepeatedFailure => "connector_repeated_failure",
             Self::ConnectorDisabled => "connector_disabled",
@@ -458,6 +464,7 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         Some("pipeline_slow") => AlertKind::PipelineSlow,
         Some("pipeline_late") => AlertKind::PipelineLate,
         Some("pipeline_volume_drop") => AlertKind::PipelineVolumeDrop,
+        Some("pipeline_behind_target") => AlertKind::PipelineBehindTarget,
         Some(other) => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
         None => AlertKind::Alert,
     };
@@ -514,6 +521,8 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_pipeline_scoped(input, common, "pipeline_late")
     } else if kind == AlertKind::PipelineVolumeDrop {
         normalize_pipeline_scoped(input, common, "pipeline_volume_drop")
+    } else if kind == AlertKind::PipelineBehindTarget {
+        normalize_pipeline_scoped(input, common, "pipeline_behind_target")
     } else if kind.is_connector_scoped() {
         normalize_connector_scoped(input, common)
     } else {
@@ -922,6 +931,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         "pipeline_slow" => AlertKind::PipelineSlow,
         "pipeline_late" => AlertKind::PipelineLate,
         "pipeline_volume_drop" => AlertKind::PipelineVolumeDrop,
+        "pipeline_behind_target" => AlertKind::PipelineBehindTarget,
         other => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
     };
     let channel = if row_str(row, "channel") == "email" {
@@ -1655,6 +1665,45 @@ pub async fn evaluate_pipeline_volume_drop(
     .await
 }
 
+/// BLD-2 plan D9: deliver every enabled [`AlertKind::PipelineBehindTarget`]
+/// rule whose `pipeline` matches `pipeline_id` (or `*`).
+///
+/// Evaluated in the lag-check handler when `behind_streak` becomes exactly 3
+/// (`lakehouse_store::pipelines::BEHIND_STREAK_ALERT_AFTER`), the same "once per streak"
+/// shape as `ConnectorRepeatedFailure`.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g. `ClickHouse` unreachable).
+pub async fn evaluate_pipeline_behind_target(
+    ch: &ChClient,
+    http: &WebhookSender,
+    email: &EmailSender,
+    pipeline_id: &str,
+    lag_seconds: Option<i64>,
+    target_seconds: Option<i32>,
+    silence: Option<&dyn SilenceSource>,
+) -> Result<usize, ChError> {
+    let console_link = format!("/pipelines/{pipeline_id}");
+    let lag_str = lag_seconds.map_or_else(|| "unknown".to_owned(), |s| format!("{s}s"));
+    let target_str = target_seconds.map_or_else(|| "unknown".to_owned(), |s| format!("{s}s"));
+    let text = format!(
+        "Pipeline {pipeline_id} is behind its target lag (lag: {lag_str}, target: {target_str}). View: {console_link}"
+    );
+    let title_prefix = "⚠️ Pipeline behind target";
+    deliver_one_kind(
+        ch,
+        http,
+        email,
+        pipeline_id,
+        silence,
+        AlertKind::PipelineBehindTarget,
+        title_prefix,
+        &text,
+    )
+    .await
+}
+
 /// Shared helper for [`evaluate_pipeline_slow`] and
 /// [`evaluate_pipeline_volume_drop`]: list the enabled rules for the
 /// single `kind`, deliver `text` to each, and count the deliveries.
@@ -2008,7 +2057,9 @@ async fn run_one(
             "pipeline_failure rules are evaluated by the run-failed event route, not run_rules"
                 .to_owned(),
         ),
-        AlertKind::PipelineSlow | AlertKind::PipelineVolumeDrop => skipped(
+        AlertKind::PipelineSlow
+        | AlertKind::PipelineVolumeDrop
+        | AlertKind::PipelineBehindTarget => skipped(
             rule,
             "pipeline_slow / pipeline_volume_drop rules are evaluated by the run-finished \
              event route, not run_rules"
@@ -4345,5 +4396,210 @@ mod tests {
         .await
         .unwrap();
         assert!(delivered.is_empty());
+    }
+
+    // ── AlertKind::PipelineBehindTarget (BLD-2 plan D9) ──────────────────
+
+    #[test]
+    fn pipeline_behind_target_kind_as_str_round_trips() {
+        assert_eq!(
+            AlertKind::PipelineBehindTarget.as_str(),
+            "pipeline_behind_target"
+        );
+    }
+
+    #[test]
+    fn row_to_rule_maps_pipeline_behind_target_type_and_pipeline_column() {
+        let mut row = Map::new();
+        row.insert("id".to_owned(), Value::String("al_pbt1".to_owned()));
+        row.insert("name".to_owned(), Value::String("Behind target".to_owned()));
+        row.insert(
+            "type".to_owned(),
+            Value::String("pipeline_behind_target".to_owned()),
+        );
+        row.insert("mart".to_owned(), Value::String(String::new()));
+        row.insert("measure".to_owned(), Value::String(String::new()));
+        row.insert("agg".to_owned(), Value::String(String::new()));
+        row.insert("op".to_owned(), Value::String(String::new()));
+        row.insert("threshold".to_owned(), Value::String("0".to_owned()));
+        row.insert("board".to_owned(), Value::String(String::new()));
+        row.insert("channel".to_owned(), Value::String("webhook".to_owned()));
+        row.insert("target".to_owned(), Value::String("t".to_owned()));
+        row.insert("enabled".to_owned(), Value::String("1".to_owned()));
+        row.insert("created_at".to_owned(), Value::String(String::new()));
+        row.insert("severity".to_owned(), Value::String(String::new()));
+        row.insert("pipeline".to_owned(), Value::String("pl-orders".to_owned()));
+
+        let rule = row_to_rule(&row);
+        assert_eq!(rule.kind, AlertKind::PipelineBehindTarget);
+        assert_eq!(rule.pipeline.as_deref(), Some("pl-orders"));
+    }
+
+    #[test]
+    fn normalize_input_accepts_a_pipeline_behind_target_rule_with_star() {
+        let input = AlertRuleInput {
+            name: Some("Any pipeline behind target".to_owned()),
+            kind: Some("pipeline_behind_target".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: Some("*".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.kind, AlertKind::PipelineBehindTarget);
+        assert_eq!(normalized.pipeline, "*");
+    }
+
+    #[test]
+    fn normalize_input_accepts_a_pipeline_behind_target_rule_with_pipeline_id() {
+        let input = AlertRuleInput {
+            name: Some("Orders behind target".to_owned()),
+            kind: Some("pipeline_behind_target".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: Some("pl-orders".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.kind, AlertKind::PipelineBehindTarget);
+        assert_eq!(normalized.pipeline, "pl-orders");
+    }
+
+    #[test]
+    fn normalize_input_rejects_a_pipeline_behind_target_rule_with_no_pipeline() {
+        let input = AlertRuleInput {
+            name: Some("Orders behind target".to_owned()),
+            kind: Some("pipeline_behind_target".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: None,
+            ..AlertRuleInput::default()
+        };
+        let err = normalize_input(&input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pipeline_behind_target requires a pipeline id or"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_pipeline_behind_target_delivers_a_message_naming_pipeline_and_lag() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/behind", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/behind"))
+            .and(body_string_contains(
+                "Pipeline pl-orders is behind its target lag (lag: 300s, target: 120s)",
+            ))
+            .and(body_string_contains("View: /pipelines/pl-orders"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let rule_json = serde_json::json!({
+            "meta": [],
+            "data": [{
+                "id": "al_pbt1",
+                "name": "Orders lag alert",
+                "type": "pipeline_behind_target",
+                "mart": "",
+                "measure": "",
+                "agg": "",
+                "op": "",
+                "threshold": "0",
+                "board": "",
+                "channel": "webhook",
+                "target": webhook,
+                "enabled": "1",
+                "created_at": "",
+                "severity": "",
+                "pipeline": "pl-orders",
+                "connector": ""
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rule_json))
+            .mount(&server)
+            .await;
+
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_behind_target(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(300),
+            Some(120),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
+    }
+
+    #[tokio::test]
+    async fn evaluate_pipeline_behind_target_does_not_deliver_a_silenced_rule() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/behind_silenced", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/behind_silenced"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let rule_json = serde_json::json!({
+            "meta": [],
+            "data": [{
+                "id": "al_pbt_quiet",
+                "name": "Silenced lag alert",
+                "type": "pipeline_behind_target",
+                "mart": "",
+                "measure": "",
+                "agg": "",
+                "op": "",
+                "threshold": "0",
+                "board": "",
+                "channel": "webhook",
+                "target": webhook,
+                "enabled": "1",
+                "created_at": "",
+                "severity": "",
+                "pipeline": "pl-orders",
+                "connector": ""
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rule_json))
+            .mount(&server)
+            .await;
+
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_behind_target(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(300),
+            Some(120),
+            Some(&AlwaysSilenced),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 0, "silenced rule must not be delivered");
     }
 }

@@ -368,6 +368,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
+    ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),
     ("DELETE", "/api/pipelines/{id}",                  Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}/schedule-ticks",     Policy::RequiresPermission("pipeline:read")),
     // Every tenant's authored definitions, for the orchestrator's job

@@ -1443,3 +1443,42 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// BLD-2 (T4): the target-lag route needs `pipeline:write` and nothing less.
+/// Asserted both ways: a principal holding `pipeline:write` gets past the gate,
+/// one holding only `pipeline:read` is refused with 403.
+#[tokio::test]
+async fn the_target_lag_route_needs_pipeline_write_and_not_pipeline_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "PUT" && *p == "/api/pipelines/{id}/target-lag")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:write"))
+    );
+    let writer = common::create_principal_with_permissions(&pool, "pipeline:write").await;
+    let cookie = common::session_cookie_for_user(&pool, writer).await;
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/pipelines/00000000-0000-0000-0000-000000000001/target-lag",
+        &cookie,
+    )
+    .await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a pipeline writer must get past the gate, got {}",
+        resp.status()
+    );
+    let reader = common::create_principal_with_permissions(&pool, "pipeline:read").await;
+    let cookie = common::session_cookie_for_user(&pool, reader).await;
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/pipelines/00000000-0000-0000-0000-000000000001/target-lag",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
