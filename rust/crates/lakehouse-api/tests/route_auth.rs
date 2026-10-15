@@ -782,6 +782,35 @@ async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_i
     }
 }
 
+/// `SRC-13` (decision D11): the discovery routes are a person's
+/// (`connector:manage`), both ways. A `connector:manage`-only principal passes
+/// the gate (the handler answers 400 for the body it was sent, or 404 for an
+/// answer nobody asked for); an `ingest:read`-only principal is refused by the
+/// gate. The table-driven loops above cover the zero-permission and
+/// Platform-Admin directions for both entries.
+#[tokio::test]
+async fn discovery_routes_need_connector_manage() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse/discovery";
+    // A preview with no object is a 400 before any dial; a poll with nothing
+    // requested is a 404. Neither touches a source.
+    let routes = [
+        ("POST", format!("{base}/preview"), StatusCode::BAD_REQUEST),
+        ("GET", format!("{base}/list"), StatusCode::NOT_FOUND),
+    ];
+    for (method, path, reached) in &routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), *reached, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
 /// The six upload routes (ADR 0014, decision 6) are gated by the existing
 /// `connector:manage`, with no new permission: a seeded Data Engineer
 /// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst

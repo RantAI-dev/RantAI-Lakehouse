@@ -2631,6 +2631,7 @@ dependencies = [
  "calamine",
  "chrono",
  "croner",
+ "futures",
  "iceberg",
  "ipnet",
  "jsonwebtoken",

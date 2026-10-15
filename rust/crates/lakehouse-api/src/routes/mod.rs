@@ -16,6 +16,7 @@ mod catalog_profile;
 mod catalog_query;
 mod catalog_search;
 mod catalog_source;
+mod connector_discovery;
 mod connector_runs;
 mod connectors;
 mod dashboard;
@@ -137,8 +138,25 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
+/// listing call's own limit is 120 seconds (`connector_listing::LIST_TIMEOUT`), so
+/// the request that carries it may take a few seconds more to answer. The route
+/// does a bounded amount of work (one connection, one or two queries, a bounded
+/// bucket scan), so the longer deadline is not an open door.
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Whether `path` is `/api/connectors/{id}/discovery/list` or `.../preview`.
+fn is_discovery_path(path: &str) -> bool {
+    path.strip_prefix("/api/connectors/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, tail)| {
+            !id.is_empty() && matches!(tail, "discovery/list" | "discovery/preview")
+        })
 }
 
 /// `/api/ai/chat`'s timeout: `AI_CHAT_TIMEOUT_SECS` when set, else 120s.
@@ -483,6 +501,13 @@ fn per_connector_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/discover",
             axum::routing::post(connectors::discover),
+        )
+        // `SRC-13`: list and preview what a connector's source holds, for a
+        // person with `connector:manage` on a connector of their own tenant (D11).
+        // `{kind}` is `list` or `preview`; POST asks, GET reads the latest answer.
+        .route(
+            "/api/connectors/{id}/discovery/{kind}",
+            axum::routing::post(connector_discovery::start).get(connector_discovery::poll),
         )
         .route(
             "/api/connectors/{id}/debezium-properties",
@@ -999,6 +1024,28 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// `SRC-13` decision D9: the discovery routes carry a listing call of up to
+    /// 120 s, so they get 130 s, and only they do.
+    #[test]
+    fn the_discovery_routes_take_130_seconds_and_nothing_else_under_connectors_does() {
+        for path in [
+            "/api/connectors/conn-1/discovery/list",
+            "/api/connectors/conn-1/discovery/preview",
+        ] {
+            assert_eq!(route_timeout(path), Duration::from_secs(130), "{path}");
+        }
+        for path in [
+            "/api/connectors/conn-1",
+            "/api/connectors/conn-1/test",
+            "/api/connectors/conn-1/discovery/other",
+            "/api/connectors//discovery/list",
+            "/api/connectors/discovery/list",
+            "/api/other/conn-1/discovery/list",
+        ] {
+            assert_eq!(route_timeout(path), DEFAULT_REQUEST_TIMEOUT, "{path}");
+        }
     }
 
     /// `POST /api/uploads` receives up to 50 MB: it gets the longer bound

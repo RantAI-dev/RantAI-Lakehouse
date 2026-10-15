@@ -550,6 +550,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // connector's own target) — not a new permission, matching every
     // other read-shaped connector route above (WS3 item 14).
     ("POST", "/api/connectors/{id}/discover", Policy::RequiresPermission("connector:manage")),
+    // `SRC-13` (D11): list and preview a source's tables, files, endpoints, topics
+    // and collections, the same audience as the connection test and `/discover`.
+    // The tenant gate is the route layer.
+    ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
