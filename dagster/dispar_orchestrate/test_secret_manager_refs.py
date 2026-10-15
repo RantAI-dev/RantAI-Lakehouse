@@ -95,6 +95,7 @@ def test_a_manager_without_a_reader_in_this_build_is_refused_not_answered(
     monkeypatch.setattr(secret_manager, "_READERS", {})
     monkeypatch.setattr(secret_manager, "_MODULES", {})
     monkeypatch.setenv("SECRET_MANAGER", "vault")
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "vault:")
     with pytest.raises(SecretRefRejected, match="not a reference this build can read"):
         resolve_secret_ref("vault:secret/a#k")
 
@@ -108,6 +109,7 @@ def test_a_failure_reaches_the_caller_as_its_fixed_text_and_nothing_else(
 
         monkeypatch.setattr(secret_manager, "_READERS", {"vault": reader})
         monkeypatch.setenv("SECRET_MANAGER", "vault")
+        monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "vault:")
         with pytest.raises(SecretRefRejected) as excinfo:
             resolve_secret_ref("vault:secret/a#k")
         assert str(excinfo.value).endswith(text)
@@ -117,5 +119,57 @@ def test_a_manager_value_is_trimmed_and_read_at_every_call(monkeypatch: pytest.M
     answers = iter([" first \n", "second"])
     monkeypatch.setattr(secret_manager, "_READERS", {"vault": lambda parsed, environ: next(answers)})
     monkeypatch.setenv("SECRET_MANAGER", "vault")
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "vault:")
     assert resolve_secret_ref("vault:secret/a#k") == "first"
     assert resolve_secret_ref("vault:secret/a#k") == "second"
+
+
+# ── SRC-12 review B1 BLOCKER 1: SECRET_MANAGER_ALLOWED_PREFIXES ─────────────
+
+
+def _tenant_of(value: str | None) -> str | None:
+    return value  # "*" = any one segment, a string = exact, None = no tenant
+
+
+@pytest.mark.parametrize("case", _FIXTURE["prefix_cases"], ids=lambda c: f"{c['prefixes']}|{c['ref']}|{c['tenant']}")
+def test_every_shared_prefix_case_is_decided_as_listed(case: dict) -> None:
+    prefixes = secret_manager.parse_prefixes(case["manager"], case["prefixes"])
+    assert secret_manager.reference_allowed(case["ref"], prefixes, _tenant_of(case["tenant"])) == case["allowed"]
+
+
+@pytest.mark.parametrize("case", _FIXTURE["prefix_refused"], ids=lambda c: c["prefixes"])
+def test_every_shared_bad_prefix_setting_is_refused(case: dict) -> None:
+    with pytest.raises(secret_manager.RefError):
+        secret_manager.parse_prefixes(case["manager"], case["prefixes"])
+
+
+def test_the_policy_texts_are_the_shared_ones() -> None:
+    assert secret_manager.POLICY_TEXTS == _FIXTURE["policy_texts"]
+
+
+def test_with_a_manager_but_no_prefixes_no_reference_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[object] = []
+    monkeypatch.setattr(secret_manager, "_READERS", {"vault": lambda parsed, environ: reads.append(1) or "x"})
+    monkeypatch.setenv("SECRET_MANAGER", "vault")
+    monkeypatch.delenv("SECRET_MANAGER_ALLOWED_PREFIXES", raising=False)
+    with pytest.raises(SecretRefRejected) as excinfo:
+        resolve_secret_ref("vault:secret/a#k")
+    assert str(excinfo.value) == secret_manager.POLICY_TEXTS["no_prefixes"]
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "vault:secret/../x/")  # unusable: allows nothing
+    with pytest.raises(SecretRefRejected, match="allows no secret-manager references"):
+        resolve_secret_ref("vault:secret/a#k")
+    assert reads == []
+
+
+def test_a_stored_reference_outside_the_prefixes_is_refused_at_use_and_never_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[object] = []
+    monkeypatch.setattr(secret_manager, "_READERS", {"aws": lambda parsed, environ: reads.append(1) or "x"})
+    monkeypatch.setenv("SECRET_MANAGER", "aws")
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "aws-sm:lakehouse/")
+    assert resolve_secret_ref("aws-sm:lakehouse/db#pw") == "x"
+    for outside in ("aws-sm:lakehouse-other/db#pw", "aws-sm:lakehouse/../prod/db#pw", "aws-sm:lakehouse//db"):
+        with pytest.raises(SecretRefRejected):
+            resolve_secret_ref(outside)
+    assert len(reads) == 1

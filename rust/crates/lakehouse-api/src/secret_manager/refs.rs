@@ -143,6 +143,19 @@ fn is_key(s: &str) -> bool {
     is_segment(s) && s.len() <= 128
 }
 
+/// Whether `secret_ref` is free of the tricks that make a prefix check
+/// meaningless (`SRC-12 review B1 BLOCKER 1`): no percent-encoding, and, in
+/// the part before any `#key`, no empty, `.` or `..` segment between `/`s.
+/// Such a reference is refused outright, not normalised.
+fn is_clean(secret_ref: &str) -> bool {
+    if secret_ref.contains('%') {
+        return false;
+    }
+    let path = secret_ref.split('#').next().unwrap_or_default();
+    path.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
 /// Parse `secret_ref` as a reference of `kind`.
 ///
 /// # Errors
@@ -150,7 +163,7 @@ fn is_key(s: &str) -> bool {
 /// [`RefError`] when the scheme is not `kind`'s or the rest does not fit
 /// its grammar.
 pub fn parse(kind: SecretManagerKind, secret_ref: &str) -> Result<ManagerRef, RefError> {
-    if secret_ref.len() > MAX_REF_LEN {
+    if secret_ref.len() > MAX_REF_LEN || !is_clean(secret_ref) {
         return Err(RefError);
     }
     let rest = secret_ref.strip_prefix(kind.scheme()).ok_or(RefError)?;
@@ -253,6 +266,106 @@ fn parse_azure(rest: &str) -> Result<ManagerRef, RefError> {
     })
 }
 
+/// Text of the refusal when `SECRET_MANAGER` is set and no prefix is allowed
+/// (`SRC-12 review B1 BLOCKER 1`; the orchestrator's `secret_manager.py` and
+/// `secret_manager_refs.json` carry the same words).
+pub const NO_PREFIXES_TEXT: &str = "This installation allows no secret-manager references; the operator sets SECRET_MANAGER_ALLOWED_PREFIXES";
+/// Text of the refusal for a reference outside the allowed prefixes.
+pub const OUTSIDE_PREFIXES_TEXT: &str =
+    "That reference is outside the secrets this installation allows connectors to reference";
+
+/// Why `SECRET_MANAGER_ALLOWED_PREFIXES` cannot be used. Carries no value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "SECRET_MANAGER_ALLOWED_PREFIXES: an entry must start with the manager's scheme and be a clean path (no `..`, empty or `.` segment, `%`, `?`, `#` or space; `{{tenant}}` only as a whole segment)"
+)]
+pub struct PrefixError;
+
+/// Parse the operator's comma-separated prefix list for `kind`: each entry
+/// trimmed, empty entries dropped.
+///
+/// A prefix is a path prefix, compared segment by segment (`/`-separated, the
+/// scheme belonging to the first segment), so `aws-sm:lakehouse` allows
+/// `aws-sm:lakehouse/db` and not `aws-sm:lakehouse-other/db`. `{tenant}` is a
+/// whole segment standing for the connector's tenant id. An entry that is
+/// only the scheme allows every clean reference of the manager, which the
+/// operator must write on purpose.
+///
+/// # Errors
+///
+/// [`PrefixError`] for an entry of another scheme or one that is not clean.
+pub fn parse_prefixes(kind: SecretManagerKind, raw: &str) -> Result<Vec<String>, PrefixError> {
+    let mut out = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let rest = entry.strip_prefix(kind.scheme()).ok_or(PrefixError)?;
+        let bad_char = entry
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '%' | '?' | '#'));
+        let trimmed = rest.trim_end_matches('/');
+        let bad_segment = !trimmed.is_empty()
+            && trimmed.split('/').any(|seg| {
+                seg.is_empty()
+                    || seg == "."
+                    || seg == ".."
+                    || (seg.contains("{tenant}") && seg != "{tenant}")
+            });
+        if bad_char || bad_segment {
+            return Err(PrefixError);
+        }
+        out.push(entry.to_owned());
+    }
+    Ok(out)
+}
+
+/// How `{tenant}` in a prefix is matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantMatch<'a> {
+    /// The connector's tenant id (at save time).
+    Exact(&'a str),
+    /// Any one clean segment: the resolver does not know the connector, so at
+    /// use it can only check the shape; the exact tenant was checked at save.
+    AnyOne,
+    /// The connector has no tenant: a prefix with `{tenant}` allows nothing.
+    NoTenant,
+}
+
+/// Whether `secret_ref` is clean and lies under one of `prefixes` (see
+/// [`parse_prefixes`]). No prefixes, nothing allowed.
+#[must_use]
+pub fn reference_allowed(secret_ref: &str, prefixes: &[String], tenant: TenantMatch<'_>) -> bool {
+    if !is_clean(secret_ref) {
+        return false;
+    }
+    let Some(kind) = SecretManagerKind::of_ref(secret_ref) else {
+        return false;
+    };
+    let reference_path = secret_ref.split('#').next().unwrap_or_default();
+    let reference_segments: Vec<&str> = reference_path.split('/').collect();
+    prefixes.iter().any(|prefix| {
+        if prefix == kind.scheme() {
+            return true;
+        }
+        let prefix_segments: Vec<&str> = prefix.trim_end_matches('/').split('/').collect();
+        if reference_segments.len() <= prefix_segments.len() {
+            return false;
+        }
+        prefix_segments
+            .iter()
+            .zip(&reference_segments)
+            .all(|(wanted, got)| {
+                if *wanted == "{tenant}" {
+                    match tenant {
+                        TenantMatch::Exact(id) => *got == id && is_segment(id),
+                        TenantMatch::AnyOne => true,
+                        TenantMatch::NoTenant => false,
+                    }
+                } else {
+                    wanted == got
+                }
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -339,6 +452,43 @@ mod tests {
             ),
             Err(RefError)
         );
+    }
+
+    fn tenant_of(value: &Value) -> TenantMatch<'_> {
+        match value.as_str() {
+            Some("*") => TenantMatch::AnyOne,
+            Some(id) => TenantMatch::Exact(id),
+            None => TenantMatch::NoTenant,
+        }
+    }
+
+    /// `SRC-12 review B1 BLOCKER 1`: the shared prefix cases.
+    #[test]
+    fn the_shared_prefix_cases_are_decided_as_listed() {
+        let fixture = fixture();
+        let cases = fixture["prefix_cases"].as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            let kind = kind_named(case["manager"].as_str().unwrap());
+            let prefixes = parse_prefixes(kind, case["prefixes"].as_str().unwrap()).unwrap();
+            let secret_ref = case["ref"].as_str().unwrap();
+            assert_eq!(
+                reference_allowed(secret_ref, &prefixes, tenant_of(&case["tenant"])),
+                case["allowed"].as_bool().unwrap(),
+                "{case}"
+            );
+        }
+        for case in fixture["prefix_refused"].as_array().unwrap() {
+            let kind = kind_named(case["manager"].as_str().unwrap());
+            assert_eq!(
+                parse_prefixes(kind, case["prefixes"].as_str().unwrap()),
+                Err(PrefixError),
+                "{case}"
+            );
+        }
+        let texts = &fixture["policy_texts"];
+        assert_eq!(texts["no_prefixes"], NO_PREFIXES_TEXT);
+        assert_eq!(texts["outside_prefixes"], OUTSIDE_PREFIXES_TEXT);
     }
 
     #[test]

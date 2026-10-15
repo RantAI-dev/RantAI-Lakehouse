@@ -20,6 +20,8 @@ def _kv2(data: dict) -> dict:
 @pytest.fixture(autouse=True)
 def vault_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECRET_MANAGER", "vault")
+    # SRC-12 review B1 BLOCKER 1: references are accepted only under a prefix.
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "vault:")
     monkeypatch.setenv("VAULT_ADDR", "http://vault.test:8200/")
     monkeypatch.setenv("VAULT_TOKEN", "tok-1")
     monkeypatch.delenv("VAULT_ROLE_ID", raising=False)

@@ -166,6 +166,14 @@ def _read_from_manager(secret_ref: str, manager: str) -> str:
     (decision 1). Failures carry only the fixed texts (decision 12)."""
     try:
         parsed = secret_manager.parse_ref(manager, secret_ref)
+        # `SRC-12 review B1 BLOCKER 1`: checked again at use, in case a stored
+        # reference was written another way than the API's save route. The
+        # tenant is not known here: `{tenant}` matches any one segment.
+        prefixes = secret_manager.configured_prefixes(manager)
+        if not prefixes:
+            raise SecretRefRejected(secret_manager.POLICY_TEXTS["no_prefixes"])
+        if not secret_manager.reference_allowed(secret_ref, prefixes):
+            raise SecretRefRejected(secret_manager.POLICY_TEXTS["outside_prefixes"])
         value = secret_manager.read_secret(manager, parsed)
     except secret_manager.RefError:
         raise SecretRefRejected(f"secretRef {secret_ref!r} is not a reference this build can read") from None

@@ -1846,6 +1846,7 @@ jobs:
           UPLOAD_S3_SECRET_KEY=rustfsadmin
           CONNECTOR_AUTO_DISABLE_AFTER=3
           SECRET_MANAGER=vault
+          SECRET_MANAGER_ALLOWED_PREFIXES=vault:secret/g12/
           VAULT_ADDR=http://vault-g6:8200
           VAULT_TOKEN=ci-vault-token-not-real-123
           AWS_REGION=us-east-1
@@ -1874,6 +1875,8 @@ jobs:
         shell: bash
         run: |
           sed -i 's/^SECRET_MANAGER=.*/SECRET_MANAGER=aws/' .env
+          sed -i 's#^SECRET_MANAGER_ALLOWED_PREFIXES=.*#SECRET_MANAGER_ALLOWED_PREFIXES=aws-sm:g12/#' .env
+          grep -q '^SECRET_MANAGER_ALLOWED_PREFIXES=aws-sm:g12/$' .env
           grep -q '^SECRET_MANAGER=aws$' .env
           $COMPOSE up -d --no-build --force-recreate lakehouse-api dagster-code-location
 

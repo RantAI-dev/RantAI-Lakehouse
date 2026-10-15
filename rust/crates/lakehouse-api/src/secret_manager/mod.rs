@@ -68,6 +68,11 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct SecretManagerSettings {
     /// The chosen manager, or `None` when `SECRET_MANAGER` is unset.
     pub kind: Option<SecretManagerKind>,
+    /// The reference prefixes connectors may use (`SECRET_MANAGER_ALLOWED_PREFIXES`,
+    /// parsed by [`refs::parse_prefixes`]). Empty with a manager set means no
+    /// reference is accepted: `SRC-12 review B1 BLOCKER 1`, a user must not be
+    /// able to make the product read every secret its identity can read.
+    pub allowed_prefixes: Vec<String>,
     /// The operator's environment, restricted to the variables the chosen
     /// manager reads (see [`relevant_variables`]). Held as a map so the
     /// clients read their own settings the way `Config` reads its own, and
@@ -91,6 +96,10 @@ pub enum SettingsError {
     /// `SECRET_MANAGER` is set to something that is not a manager.
     #[error("SECRET_MANAGER must be one of vault, aws, gcp, azure (or unset)")]
     UnknownManager,
+    /// `SECRET_MANAGER_ALLOWED_PREFIXES` holds an entry that is not a clean
+    /// prefix of the chosen manager's references.
+    #[error("{0}")]
+    BadPrefixes(refs::PrefixError),
     /// A setting the chosen manager needs is missing or unusable.
     #[error("SECRET_MANAGER={manager} needs {needs}")]
     Incomplete {
@@ -161,8 +170,15 @@ impl SecretManagerSettings {
                     .map(|v| ((*name).to_owned(), v.to_owned()))
             })
             .collect();
+        let allowed_prefixes = refs::parse_prefixes(
+            kind,
+            env.get("SECRET_MANAGER_ALLOWED_PREFIXES")
+                .map_or("", String::as_str),
+        )
+        .map_err(SettingsError::BadPrefixes)?;
         let settings = Self {
             kind: Some(kind),
+            allowed_prefixes,
             env: kept,
         };
         settings.check_complete(kind)?;
@@ -274,6 +290,9 @@ pub(crate) trait ManagerBackend: fmt::Debug + Send + Sync {
 pub struct ManagerResolver {
     kind: SecretManagerKind,
     backend: Arc<dyn ManagerBackend>,
+    /// `SRC-12 review B1 BLOCKER 1`: checked at every resolve, in case a
+    /// stored reference was written another way than the save route.
+    prefixes: Vec<String>,
 }
 
 impl ManagerResolver {
@@ -293,6 +312,7 @@ impl ManagerResolver {
                 Some(Self {
                     kind: SecretManagerKind::Vault,
                     backend: Arc::new(backend),
+                    prefixes: settings.allowed_prefixes.clone(),
                 })
             }
             SecretManagerKind::Aws => {
@@ -300,6 +320,7 @@ impl ManagerResolver {
                 Some(Self {
                     kind: SecretManagerKind::Aws,
                     backend: Arc::new(backend),
+                    prefixes: settings.allowed_prefixes.clone(),
                 })
             }
             SecretManagerKind::Gcp => {
@@ -307,6 +328,7 @@ impl ManagerResolver {
                 Some(Self {
                     kind: SecretManagerKind::Gcp,
                     backend: Arc::new(backend),
+                    prefixes: settings.allowed_prefixes.clone(),
                 })
             }
             SecretManagerKind::Azure => {
@@ -314,6 +336,7 @@ impl ManagerResolver {
                 Some(Self {
                     kind: SecretManagerKind::Azure,
                     backend: Arc::new(backend),
+                    prefixes: settings.allowed_prefixes.clone(),
                 })
             }
         }
@@ -322,7 +345,21 @@ impl ManagerResolver {
     /// A resolver over a given backend, for tests.
     #[cfg(test)]
     pub(crate) fn with_backend(kind: SecretManagerKind, backend: Arc<dyn ManagerBackend>) -> Self {
-        Self { kind, backend }
+        Self::with_prefixes(kind, backend, vec![kind.scheme().to_owned()])
+    }
+
+    /// The same with explicit allowed prefixes, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_prefixes(
+        kind: SecretManagerKind,
+        backend: Arc<dyn ManagerBackend>,
+        prefixes: Vec<String>,
+    ) -> Self {
+        Self {
+            kind,
+            backend,
+            prefixes,
+        }
     }
 }
 
@@ -333,6 +370,15 @@ impl SecretResolver for ManagerResolver {
                 secret_ref: secret_ref.to_owned(),
                 resolver: "secret-manager",
             })?;
+        // `SRC-12 review B1 BLOCKER 1`: at every use, not only at save. The
+        // connector's tenant is not known here, so `{tenant}` matches any one
+        // segment; the exact tenant was checked when the reference was saved.
+        if !refs::reference_allowed(secret_ref, &self.prefixes, refs::TenantMatch::AnyOne) {
+            return Err(SecretError::NotAllowed {
+                secret_ref: secret_ref.to_owned(),
+                resolver: "secret-manager-prefixes",
+            });
+        }
         self.backend
             .read(&parsed)
             .await
@@ -471,6 +517,70 @@ mod tests {
         }
         let none = SecretManagerSettings::from_map(&env(&[])).unwrap();
         assert!(ManagerResolver::from_settings(&none).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reference_outside_the_allowed_prefixes_is_refused_before_the_manager_is_asked() {
+        let resolver = ManagerResolver::with_prefixes(
+            SecretManagerKind::Vault,
+            Arc::new(Canned(Ok("never-read"))),
+            vec!["vault:secret/lakehouse/".to_owned()],
+        );
+        assert!(resolver.resolve("vault:secret/lakehouse/a#k").await.is_ok());
+        for outside in [
+            "vault:secret/lakehouse-other/a#k",
+            "vault:secret/other/a#k",
+            "vault:secret/lakehouse/../x#k",
+        ] {
+            assert!(
+                matches!(
+                    resolver.resolve(outside).await,
+                    Err(SecretError::NotAllowed { .. } | SecretError::UnsupportedRef { .. })
+                ),
+                "{outside}"
+            );
+        }
+        let none = ManagerResolver::with_prefixes(
+            SecretManagerKind::Vault,
+            Arc::new(Canned(Ok("never-read"))),
+            Vec::new(),
+        );
+        assert!(matches!(
+            none.resolve("vault:secret/lakehouse/a#k").await,
+            Err(SecretError::NotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn the_prefix_setting_is_parsed_per_manager_and_a_bad_one_stops_start_up() {
+        let ok = SecretManagerSettings::from_map(&env(&[
+            ("SECRET_MANAGER", "aws"),
+            ("AWS_REGION", "eu-west-1"),
+            (
+                "SECRET_MANAGER_ALLOWED_PREFIXES",
+                " aws-sm:lakehouse/ , aws-sm:x/{tenant}/ ",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            ok.allowed_prefixes,
+            ["aws-sm:lakehouse/", "aws-sm:x/{tenant}/"]
+        );
+        let none = SecretManagerSettings::from_map(&env(&[
+            ("SECRET_MANAGER", "aws"),
+            ("AWS_REGION", "eu-west-1"),
+        ]))
+        .unwrap();
+        assert!(none.allowed_prefixes.is_empty());
+        for bad in ["vault:secret/a/", "aws-sm:a/../b/"] {
+            let err = SecretManagerSettings::from_map(&env(&[
+                ("SECRET_MANAGER", "aws"),
+                ("AWS_REGION", "eu-west-1"),
+                ("SECRET_MANAGER_ALLOWED_PREFIXES", bad),
+            ]))
+            .unwrap_err();
+            assert!(matches!(err, SettingsError::BadPrefixes(_)), "{bad}");
+        }
     }
 
     /// A backend that answers one canned result and counts nothing else.

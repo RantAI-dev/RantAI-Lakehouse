@@ -67,6 +67,14 @@ TEXTS: dict[str, str] = {
 }
 
 
+# `SRC-12 review B1 BLOCKER 1`: the refusals of the prefix rule, word for word
+# the API's `NO_PREFIXES_TEXT` / `OUTSIDE_PREFIXES_TEXT` (shared fixture).
+POLICY_TEXTS: dict[str, str] = {
+    "no_prefixes": "This installation allows no secret-manager references; the operator sets SECRET_MANAGER_ALLOWED_PREFIXES",
+    "outside_prefixes": "That reference is outside the secrets this installation allows connectors to reference",
+}
+
+
 class ManagerFailure(Exception):
     """A read of the secret manager failed. The message is always one of
     `TEXTS`; `reason` is its key."""
@@ -118,6 +126,79 @@ def allowed_patterns(kind: str | None) -> tuple[str, ...]:
 
 
 _MAX_REF_LEN = 1024
+
+
+def _is_clean(secret_ref: str) -> bool:
+    """No percent-encoding, and no empty, `.` or `..` segment before any
+    `#key`: such a reference is refused outright (`SRC-12 review B1 BLOCKER 1`).
+    Twin of `refs::is_clean`."""
+    if "%" in secret_ref:
+        return False
+    path = secret_ref.split("#", 1)[0]
+    return all(seg not in ("", ".", "..") for seg in path.split("/"))
+
+
+def parse_prefixes(kind: str, raw: str) -> list[str]:
+    """The operator's comma-separated `SECRET_MANAGER_ALLOWED_PREFIXES` for
+    `kind`; raises `RefError` for an entry that is of another scheme or not a
+    clean path. Twin of `refs::parse_prefixes`."""
+    out: list[str] = []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        if not entry.startswith(_SCHEMES[kind]):
+            raise RefError
+        rest = entry[len(_SCHEMES[kind]) :].rstrip("/")
+        if any(c.isspace() or c in "%?#" for c in entry):
+            raise RefError
+        if rest and any(
+            seg in ("", ".", "..") or ("{tenant}" in seg and seg != "{tenant}") for seg in rest.split("/")
+        ):
+            raise RefError
+        out.append(entry)
+    return out
+
+
+def configured_prefixes(kind: str, environ: Mapping[str, str] | None = None) -> list[str]:
+    """The allowed prefixes of the installation; a bad setting allows nothing
+    (the API refuses to start on it, so the two never disagree for long)."""
+    env = os.environ if environ is None else environ
+    try:
+        return parse_prefixes(kind, env.get("SECRET_MANAGER_ALLOWED_PREFIXES", ""))
+    except RefError:
+        _log.warning("SECRET_MANAGER_ALLOWED_PREFIXES is not usable; no secret manager reference is accepted")
+        return []
+
+
+def reference_allowed(secret_ref: str, prefixes: list[str], tenant: str | None = "*") -> bool:
+    """Whether `secret_ref` is clean and lies under one of `prefixes`, compared
+    segment by segment (so `lakehouse` does not allow `lakehouse-other`).
+    `{tenant}` is a whole segment: `tenant` is the connector's tenant id, `"*"`
+    any one segment (a resolver does not know the connector; the API checked
+    the exact tenant at save), `None` no tenant. Twin of `refs::reference_allowed`."""
+    if not _is_clean(secret_ref):
+        return False
+    kind = kind_of_ref(secret_ref)
+    if kind is None:
+        return False
+    ref_segments = secret_ref.split("#", 1)[0].split("/")
+    for prefix in prefixes:
+        if prefix == _SCHEMES[kind]:
+            return True
+        wanted = prefix.rstrip("/").split("/")
+        if len(ref_segments) <= len(wanted):
+            continue
+        ok = True
+        for want, got in zip(wanted, ref_segments):
+            if want == "{tenant}":
+                ok = ok and (
+                    tenant == "*" or (tenant is not None and got == tenant and _is_segment(tenant))
+                )
+            else:
+                ok = ok and want == got
+        if ok:
+            return True
+    return False
 _SEGMENT = r"[A-Za-z0-9_.-]+"
 _KEY_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _SEGMENT_RE = re.compile(_SEGMENT)
@@ -139,7 +220,7 @@ def _is_key(s: str) -> bool:
 def parse_ref(kind: str, secret_ref: str) -> dict[str, str | None]:
     """Parse `secret_ref` as a reference of `kind`; the parts are named as in
     the shared fixture. Raises `RefError` for anything else."""
-    if len(secret_ref) > _MAX_REF_LEN or not secret_ref.startswith(_SCHEMES[kind]):
+    if len(secret_ref) > _MAX_REF_LEN or not _is_clean(secret_ref) or not secret_ref.startswith(_SCHEMES[kind]):
         raise RefError
     rest = secret_ref[len(_SCHEMES[kind]) :]
     if kind == "vault":

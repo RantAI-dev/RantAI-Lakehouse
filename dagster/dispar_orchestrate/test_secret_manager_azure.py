@@ -21,6 +21,8 @@ def azure_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("IDENTITY_ENDPOINT", "IDENTITY_HEADER"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SECRET_MANAGER", "azure")
+    # SRC-12 review B1 BLOCKER 1: references are accepted only under a prefix.
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "azure-kv:")
     monkeypatch.setenv("AZURE_TENANT_ID", "tenant-1")
     monkeypatch.setenv("AZURE_CLIENT_ID", "client-1")
     monkeypatch.setenv("AZURE_CLIENT_SECRET", "client-secret-test")

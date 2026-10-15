@@ -402,6 +402,23 @@ pub async fn connector_in_tenants(
     .await?)
 }
 
+/// The tenant a connector belongs to, or `None` for an unknown id or a
+/// connector with no tenant. Read by the secret-reference check
+/// (`SRC-12 review B1 BLOCKER 1`), which expands `{tenant}` in the operator's
+/// allowed prefixes with it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_tenant_id(pool: &PgPool, id: &str) -> Result<Option<Uuid>, StoreError> {
+    let row: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT tenant_id FROM connector WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.flatten())
+}
+
 /// Which of `ids` are connectors of one of `tenant_ids`: [`connector_in_tenants`]
 /// for many ids in one query, for a caller that filters a list (the alert
 /// rule list, `SRC-7` review BLOCKER 1) and must not pay a round trip per

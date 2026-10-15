@@ -377,7 +377,13 @@ services:
       #           operator mounts into BOTH services), or the platform identity
       #   azure:  AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET, or a
       #           managed identity
+      # SECRET_MANAGER_ALLOWED_PREFIXES (SRC-12 review B1 BLOCKER 1): the
+      # reference prefixes connectors may use, comma-separated, `{tenant}` =
+      # the connector's tenant id. Empty with a manager set: NO reference is
+      # accepted (a user must not make the product read every secret its
+      # identity can read).
       SECRET_MANAGER: ${SECRET_MANAGER:-}
+      SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
       VAULT_ADDR: ${VAULT_ADDR:-}
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
@@ -1830,6 +1836,7 @@ services:
       # SRC-12 part B: the same secret manager settings as `lakehouse-api`
       # (see the block there), read by `secret_manager.py` when a run starts.
       SECRET_MANAGER: ${SECRET_MANAGER:-}
+      SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
       VAULT_ADDR: ${VAULT_ADDR:-}
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}

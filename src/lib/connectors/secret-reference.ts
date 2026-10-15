@@ -77,6 +77,10 @@ export function composeReference(manager: SecretManager, parts: ReferenceParts):
 export function referenceProblem(manager: SecretManager, reference: string): string | null {
   const bad = "Not a valid reference for this secret manager."
   if (reference.length > 1024) return bad
+  // The server refuses these outright (SRC-12 review B1 BLOCKER 1): no
+  // percent-encoding, no empty, "." or ".." segment before any "#key".
+  if (reference.includes("%")) return bad
+  if (reference.split("#")[0].split("/").some((seg) => seg === "" || seg === "." || seg === "..")) return bad
   switch (manager) {
     case "vault": {
       const m = /^vault:([^#]*)#(.*)$/.exec(reference)

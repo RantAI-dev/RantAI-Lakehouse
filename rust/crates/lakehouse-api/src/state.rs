@@ -529,6 +529,17 @@ fn connector_secret_resolver(
     ))
 }
 
+/// `SRC-12 review B1 BLOCKER 1`: with a secret manager set and no allowed
+/// prefix, no reference is accepted (fail closed); say so once at start-up.
+fn warn_if_no_reference_prefixes(settings: &SecretManagerSettings) {
+    if settings.kind.is_some() && settings.allowed_prefixes.is_empty() {
+        tracing::warn!(
+            "SECRET_MANAGER is set but SECRET_MANAGER_ALLOWED_PREFIXES is empty: this \
+             installation allows no secret-manager references until the operator sets it"
+        );
+    }
+}
+
 /// The allowlist for an installation whose secret manager is `manager`
 /// (`SRC-12` part B, decision 1): the fixed credential-suffix patterns
 /// above, plus the one scheme of the configured manager — and none when
@@ -666,6 +677,7 @@ impl AppState {
         .map(Arc::new);
         let secrets_dir = config.connector_secrets_dir.clone();
         let secret_manager = config.secret_manager.clone();
+        warn_if_no_reference_prefixes(&secret_manager);
         // SRC-12 decision 4: one keyring for the store (seals) and the
         // resolver (opens). A missing or malformed key is kept as its
         // error, not dropped: `main` refuses to start on it, and any

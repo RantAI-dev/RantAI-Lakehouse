@@ -1475,31 +1475,41 @@ impl SlotChange {
 /// What a user may do with a credential on this installation (`SRC-12` part
 /// B, decision 2), from the operator's settings.
 #[derive(Debug, Clone, Copy)]
-struct CredentialPolicy {
+struct CredentialPolicy<'a> {
     /// The installation's secret manager; `None` means a reference is
     /// refused.
     manager: Option<SecretManagerKind>,
     /// Whether typing a value is allowed (`CONNECTOR_TYPED_CREDENTIALS`).
     typed_allowed: bool,
+    /// `SRC-12 review B1 BLOCKER 1`: the reference prefixes the operator
+    /// allows (`SECRET_MANAGER_ALLOWED_PREFIXES`). None, no reference.
+    prefixes: &'a [String],
+    /// The connector's tenant id, to expand `{tenant}` in a prefix; `None`
+    /// when the connector has no tenant (then such a prefix allows nothing).
+    tenant: Option<&'a str>,
 }
 
-impl CredentialPolicy {
-    fn of(state: &AppState) -> Self {
+impl<'a> CredentialPolicy<'a> {
+    fn of(state: &'a AppState, tenant: Option<&'a str>) -> Self {
         Self {
             manager: state.config.secret_manager.kind,
             typed_allowed: state.config.connector_typed_credentials,
+            prefixes: &state.config.secret_manager.allowed_prefixes,
+            tenant,
         }
     }
 }
 
 #[cfg(test)]
-impl Default for CredentialPolicy {
+impl Default for CredentialPolicy<'_> {
     /// No secret manager, typing allowed: how every installation was before
     /// part B, and what the older tests assume.
     fn default() -> Self {
         Self {
             manager: None,
             typed_allowed: true,
+            prefixes: &[],
+            tenant: None,
         }
     }
 }
@@ -1612,7 +1622,7 @@ fn slot_changes_with(
     id: &str,
     dial_info: &ConnectorDialInfo,
     body: SetCredentialBody,
-    policy: CredentialPolicy,
+    policy: CredentialPolicy<'_>,
 ) -> Result<Vec<SlotChange>, ApiError> {
     if body.secondary.is_some() && !has_secondary_slot(dial_info) {
         return Err(ApiError::BadRequest(
@@ -1651,13 +1661,31 @@ fn slot_changes_with(
                     .ok_or_else(|| ApiError::BadRequest(NO_SECRET_MANAGER.to_owned()))?;
                 // The same grammar the resolver applies when it reads; a
                 // reference that fits no manager shape never reaches it.
-                manager_refs::parse(manager, &reference).map_err(|err| {
+                manager_refs::parse(manager, &reference).map_err(|_| {
                     ApiError::BadRequest(format!(
-                        "{}: {err} for {}",
+                        "{}: not a valid {} reference",
                         slot.as_str(),
                         manager.as_str()
                     ))
                 })?;
+                // `SRC-12 review B1 BLOCKER 1`: fail closed. A user must not
+                // be able to make the product read any secret its manager
+                // identity can read (the connection test would carry it to a
+                // host the user chose), so only the operator's prefixes pass.
+                if policy.prefixes.is_empty() {
+                    return Err(ApiError::BadRequest(
+                        manager_refs::NO_PREFIXES_TEXT.to_owned(),
+                    ));
+                }
+                let tenant = policy.tenant.map_or(
+                    manager_refs::TenantMatch::NoTenant,
+                    manager_refs::TenantMatch::Exact,
+                );
+                if !manager_refs::reference_allowed(&reference, policy.prefixes, tenant) {
+                    return Err(ApiError::BadRequest(
+                        manager_refs::OUTSIDE_PREFIXES_TEXT.to_owned(),
+                    ));
+                }
                 (reference, Provided::Reference { resolved: None })
             }
             _ => {
@@ -2017,7 +2045,15 @@ pub async fn set_credential(
     };
 
     let pending_dial = body.dial.take();
-    let mut changes = slot_changes_with(&id, &dial_info, body, CredentialPolicy::of(&state))?;
+    let tenant = connectors::connector_tenant_id(pool(&state)?, &id)
+        .await?
+        .map(|tenant| tenant.to_string());
+    let mut changes = slot_changes_with(
+        &id,
+        &dial_info,
+        body,
+        CredentialPolicy::of(&state, tenant.as_deref()),
+    )?;
     let candidate = candidate_dial_info(&dial_info, &changes, pending_dial)?;
     // After the re-point rule, so a refused change makes no call to the
     // secret manager (SEC-14): "refused before any lookup or connection".
@@ -3388,6 +3424,9 @@ async fn save_with_credentials(
     let mut after = stored;
     after.adapter = Some(input.adapter.clone());
     after.dial = input.dial.clone();
+    let tenant = connectors::connector_tenant_id(pool(state)?, id)
+        .await?
+        .map(|tenant| tenant.to_string());
     let mut changes = slot_changes_with(
         id,
         &after,
@@ -3396,7 +3435,7 @@ async fn save_with_credentials(
             secondary: credential.secondary,
             dial: None,
         },
-        CredentialPolicy::of(state),
+        CredentialPolicy::of(state, tenant.as_deref()),
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
@@ -5542,11 +5581,62 @@ mod tests {
     }
     // ── SRC-12 part B: a credential can be a reference ───────────────────
 
-    fn vault_policy(typed_allowed: bool) -> CredentialPolicy {
+    static VAULT_PREFIXES: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec!["vault:secret/".to_owned()]);
+
+    fn vault_policy(typed_allowed: bool) -> CredentialPolicy<'static> {
         CredentialPolicy {
             manager: Some(SecretManagerKind::Vault),
             typed_allowed,
+            prefixes: &VAULT_PREFIXES,
+            tenant: None,
         }
+    }
+
+    /// `SRC-12 review B1 BLOCKER 1`: no prefixes, no reference; outside them,
+    /// none either; `{tenant}` is the connector's own tenant.
+    #[test]
+    fn a_reference_must_lie_under_an_allowed_prefix() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let body = |reference: &str| set_body(json!({ "primary": { "reference": reference } }));
+        let message_of = |result: Result<Vec<SlotChange>, ApiError>| match result {
+            Err(ApiError::BadRequest(message)) => message,
+            _ => panic!("expected 400"),
+        };
+        let mut policy = vault_policy(true);
+        let none: [String; 0] = [];
+        policy.prefixes = &none;
+        assert_eq!(
+            message_of(slot_changes_with(
+                "c",
+                &info,
+                body("vault:secret/a#k"),
+                policy
+            )),
+            manager_refs::NO_PREFIXES_TEXT
+        );
+        let tenant_prefixes = ["vault:secret/tenants/{tenant}/".to_owned()];
+        policy.prefixes = &tenant_prefixes;
+        policy.tenant = Some("t1");
+        assert!(slot_changes_with("c", &info, body("vault:secret/tenants/t1/a#k"), policy).is_ok());
+        for outside in [
+            "vault:secret/tenants/t2/a#k",
+            "vault:secret/tenants/t1/../t2/a#k",
+            "vault:secret/other/a#k",
+        ] {
+            let result = slot_changes_with("c", &info, body(outside), policy);
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{outside}");
+        }
+        policy.tenant = None;
+        assert_eq!(
+            message_of(slot_changes_with(
+                "c",
+                &info,
+                body("vault:secret/tenants/t1/a#k"),
+                policy
+            )),
+            manager_refs::OUTSIDE_PREFIXES_TEXT
+        );
     }
 
     /// A reference is its own ref: nothing is derived, nothing is written, and

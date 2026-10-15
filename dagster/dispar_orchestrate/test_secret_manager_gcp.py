@@ -42,6 +42,8 @@ def _key_file(tmp_path: Path, **overrides: object) -> Path:
 @pytest.fixture(autouse=True)
 def gcp_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SECRET_MANAGER", "gcp")
+    # SRC-12 review B1 BLOCKER 1: references are accepted only under a prefix.
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "gcp-sm:")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(_key_file(tmp_path)))
     monkeypatch.delenv("GCE_METADATA_HOST", raising=False)
 

@@ -12,6 +12,8 @@ and the code location between the two):
      fixed text "does not exist in the secret manager" and none of the
      manager's own words; a reference of another manager's scheme is refused
      (400) as not allowed here.
+     A reference outside `SECRET_MANAGER_ALLOWED_PREFIXES` (and one with `..`)
+     is refused (400, `SRC-12 review B1 BLOCKER 1`).
   2. A connector is created with nothing stored, its password is put in the
      manager, and `PUT .../credential` with the reference is accepted
      (verified: the API read the reference once and the connection worked).
@@ -90,6 +92,9 @@ class VaultStore:
     def other_scheme_ref(self) -> str:
         return "aws-sm:g12/not-this-manager"
 
+    def outside_ref(self) -> str:
+        return f"vault:secret/outside-g12/x#{SECRET_FIELD}"
+
 
 class AwsStore:
     """AWS Secrets Manager, answered by a `moto` server."""
@@ -125,6 +130,9 @@ class AwsStore:
 
     def other_scheme_ref(self) -> str:
         return "vault:secret/g12/not-this-manager#password"
+
+    def outside_ref(self) -> str:
+        return f"aws-sm:outside-g12/x#{SECRET_FIELD}"
 
 
 def store_for(kind: str):
@@ -197,6 +205,17 @@ def run_phase(kind: str) -> None:
     if other.status_code != 400:
         raise ManagerGateFailure(f"another manager's scheme should be refused with 400, got {other.status_code} {other.text[:200]}")
     say(f"1. a reference to nothing is refused with the fixed text; another manager's scheme is refused ({other.status_code})")
+
+    # SRC-12 review B1 BLOCKER 1: the operator's prefixes (`.env`:
+    # SECRET_MANAGER_ALLOWED_PREFIXES, `.../g12/`) are the only places a
+    # reference may point, whatever the manager's identity could read.
+    for outside in (store.outside_ref(), store.ref(f"g12/../outside-g12/{sfx}")):
+        refused = set_reference(connector_id, outside)
+        if refused.status_code != 400 or "outside the secrets" not in refused.text:
+            raise ManagerGateFailure(
+                f"a reference outside the allowed prefixes should be refused with 400, got {refused.status_code} {refused.text[:200]}"
+            )
+    say("1b. a reference outside the operator's allowed prefixes (and one with '..') is refused (400)")
 
     # 2. The reference is accepted: read once, connection tested.
     reference = store.ref(secret_name)

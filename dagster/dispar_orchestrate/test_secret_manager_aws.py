@@ -77,6 +77,8 @@ def aws_env(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SECRET_MANAGER", "aws")
+    # SRC-12 review B1 BLOCKER 1: references are accepted only under a prefix.
+    monkeypatch.setenv("SECRET_MANAGER_ALLOWED_PREFIXES", "aws-sm:")
     monkeypatch.setenv("AWS_REGION", "eu-west-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDTEST")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-access-key-test")

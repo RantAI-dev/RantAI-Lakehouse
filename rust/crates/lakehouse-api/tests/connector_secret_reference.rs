@@ -301,6 +301,66 @@ async fn a_reference_needs_a_secret_manager_and_its_own_scheme() {
     }
 }
 
+/// `SRC-12 review B1 BLOCKER 1`: a user must not be able to make the product
+/// read a secret outside the operator's prefixes, and with no prefixes set no
+/// reference is accepted. Neither makes a call to the manager.
+#[tokio::test]
+async fn a_reference_outside_the_operators_prefixes_is_refused_and_never_read() {
+    let secrets = tempfile::tempdir().unwrap();
+    let vault = vault_with_secret().await;
+    let app = spin_up_with_env(&env(secrets.path(), Some(&vault), &[])).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_oracle(&app).await;
+    for outside in [
+        "vault:secret/other/orders#password",
+        "vault:secret/connectors-other/orders#password",
+        "vault:secret/connectors/../other/orders#password",
+    ] {
+        let (code, body) = send(
+            &app,
+            &cookie,
+            "PUT",
+            &credential_url(),
+            Some(json!({ "primary": { "reference": outside } })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{outside}: {body}");
+    }
+    let (_, body) = send(
+        &app,
+        &cookie,
+        "PUT",
+        &credential_url(),
+        Some(json!({ "primary": { "reference": "vault:secret/other/orders#password" } })),
+    )
+    .await;
+    assert!(body.to_string().contains("outside the secrets"), "{body}");
+
+    let app = spin_up_with_env(&env(
+        secrets.path(),
+        Some(&vault),
+        &[("SECRET_MANAGER_ALLOWED_PREFIXES", "")],
+    ))
+    .await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_oracle(&app).await;
+    let (code, body) = send(
+        &app,
+        &cookie,
+        "PUT",
+        &credential_url(),
+        Some(json!({ "primary": { "reference": REFERENCE } })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("allows no secret-manager references"),
+        "{body}"
+    );
+    assert!(vault.received_requests().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn typing_a_value_can_be_turned_off_and_a_reference_still_works() {
     let secrets = tempfile::tempdir().unwrap();
