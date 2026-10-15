@@ -200,6 +200,9 @@ pub(in crate::routes) async fn run_tool(
         "create_pipeline" => pipelines::create_pipeline(state, principal, args).await,
         "get_pipeline" => pipelines::get_pipeline(state, args).await,
         "mark_pipeline_ready" => pipelines::mark_pipeline_ready(state, args).await,
+        "set_pipeline_target_lag" => {
+            pipelines::set_pipeline_target_lag(state, principal, args).await
+        }
         "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
         "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
         "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,

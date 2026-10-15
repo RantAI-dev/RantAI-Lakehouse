@@ -523,6 +523,63 @@ pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Val
     .await
 }
 
+/// BLD-2 (T5): set or clear an authored pipeline's target lag from an assistant tool call.
+/// Resolves `pipeline` as either an authored id (`pl-…`) or by pipeline name / target table,
+/// then forwards to [`crate::routes::authored_pipelines::apply_set_target_lag`].
+pub(super) async fn set_pipeline_target_lag(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let Some(principal) = principal else {
+        return json!({ "error": "setting pipeline target lag needs a signed-in user" });
+    };
+    let pipeline_arg = arg_str(args, "pipeline");
+    if pipeline_arg.is_empty() {
+        return json!({ "error": "pipeline is required" });
+    }
+    let target_lag: Option<lakehouse_store::pipelines::TargetLag> = match args.get("targetLag") {
+        Some(val) if !val.is_null() => match serde_json::from_value(val.clone()) {
+            Ok(tl) => Some(tl),
+            Err(err) => return json!({ "error": format!("invalid targetLag: {err}") }),
+        },
+        _ => None,
+    };
+    let pool = match crate::routes::pipelines::pool(state) {
+        Ok(pool) => pool,
+        Err(err) => return json!({ "error": err.to_string() }),
+    };
+    let pipeline_id = if pipeline_arg.starts_with("pl-") {
+        pipeline_arg.to_string()
+    } else {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1 LIMIT 1",
+        )
+        .bind(&pipeline_arg)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        match row {
+            Some((id,)) => id,
+            None => pipeline_arg.to_string(),
+        }
+    };
+    let res = crate::routes::authored_pipelines::apply_set_target_lag(
+        state,
+        principal,
+        &pipeline_id,
+        target_lag,
+    )
+    .await;
+    match res {
+        Ok(updated) => {
+            let reloaded = crate::routes::authored_pipelines::reload_orchestrator(state).await;
+            crate::routes::authored_pipelines::with_orchestrator(&updated, reloaded)
+        }
+        Err(err) => api_result_to_value::<()>(Err(err)).await,
+    }
+}
+
 #[cfg(test)]
 mod t1_3_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -967,6 +1024,41 @@ mod t1_3_tests {
             body["id"],
             json!("r-tool-config"),
             "args[\"runConfig\"] must reach the trigger route's launch body unchanged: got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_calls_without_principal() {
+        let state = state();
+        let res = set_pipeline_target_lag(&state, None, &Map::new()).await;
+        assert_eq!(
+            res,
+            json!({ "error": "setting pipeline target lag needs a signed-in user" })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_requires_pipeline_argument() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let res = set_pipeline_target_lag(&state, Some(&principal), &Map::new()).await;
+        assert_eq!(res, json!({ "error": "pipeline is required" }));
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_invalid_target_lag_format() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("pl-test"));
+        args.insert("targetLag".to_owned(), json!("invalid_string"));
+        let res = set_pipeline_target_lag(&state, Some(&principal), &args).await;
+        assert!(
+            res["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid targetLag"),
+            "got {res}"
         );
     }
 }

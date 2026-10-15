@@ -838,6 +838,36 @@ fn get_pipeline_schema() -> Value {
             "required": ["id"] } } })
 }
 
+fn set_pipeline_target_lag_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_pipeline_target_lag",
+        "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (1 to 10080 minutes), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+        "parameters": { "type": "object", "properties": {
+            "pipeline": { "type": "string", "description": "pipeline id (pl-…) or pipeline name" },
+            "targetLag": {
+                "description": "target lag configuration: { kind: \"lag\", minutes } | { kind: \"downstream\" } | null to clear",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["lag"] },
+                            "minutes": { "type": "integer", "minimum": 1, "maximum": 10080 }
+                        },
+                        "required": ["kind", "minutes"]
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["downstream"] }
+                        },
+                        "required": ["kind"]
+                    }
+                ]
+            }
+        },
+        "required": ["pipeline"] } } })
+}
+
 fn mark_pipeline_ready_schema() -> Value {
     json!({ "type": "function", "function": { "name": "mark_pipeline_ready",
         "description": "Move an authored pipeline (pl-…) from draft to ready, so the orchestrator builds a job for it and trigger_pipeline can run it.",
@@ -1335,6 +1365,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "pipeline:write",
     },
     ToolSpec {
+        name: "set_pipeline_target_lag",
+        schema: set_pipeline_target_lag_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
         name: "list_iceberg_tables",
         schema: list_iceberg_tables_schema,
         risk: Risk::Read,
@@ -1441,7 +1477,7 @@ mod tests {
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
         // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
         // `propose_sql` (plan 15).
-        assert_eq!(tool_schemas().len(), 71);
+        assert_eq!(tool_schemas().len(), 72);
     }
 
     #[test]

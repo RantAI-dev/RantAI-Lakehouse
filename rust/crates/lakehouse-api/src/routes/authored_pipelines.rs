@@ -1138,7 +1138,7 @@ fn authored_only(id: &str) -> Result<(), ApiRejection> {
 
 /// The body every authored write returns: the pipeline, plus whether the
 /// orchestrator picked the change up.
-fn with_orchestrator(pipeline: &pipelines::Pipeline, reloaded: bool) -> Value {
+pub(crate) fn with_orchestrator(pipeline: &pipelines::Pipeline, reloaded: bool) -> Value {
     let mut body = serde_json::to_value(pipeline).unwrap_or_else(|_| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("orchestratorReloaded".to_owned(), json!(reloaded));
