@@ -32,6 +32,11 @@ lakehouse-auth = { path = "../lakehouse-auth" }
 # `secret_manager::aws`: the SigV4 signer's HMAC-SHA256 (already in the
 # workspace for `lakehouse-embed`; written here instead of the AWS SDK).
 hmac = { workspace = true }
+# `secret_manager::gcp`: signs the service account's RS256 JWT for the
+# documented token exchange (already a workspace dependency, `rust_crypto`
+# backend, as `lakehouse-auth` uses it); moved here from the dev-dependencies
+# it was only in so far.
+jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
@@ -187,11 +192,11 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `oidc_callback` calls `OidcAuthenticator::authenticate_with_nonce`
 # against a `wiremock` `/jwks` + `/token` pair, the same
 # harness shape `lakehouse-auth/tests/oidc.rs` already uses for that
-# authenticator directly — `jsonwebtoken` is already a workspace
-# dependency (root `Cargo.toml`); `rsa` is not (it is a direct dependency
-# of `lakehouse-auth` only), so it is added here directly too, pinned to
-# the same "0.9" `lakehouse-auth/Cargo.toml` already uses.
-jsonwebtoken = { workspace = true }
+# authenticator directly — `jsonwebtoken` is a normal dependency now (see
+# above, `SRC-12` part B4); `rsa` is not a workspace dependency (it is a
+# direct dependency of `lakehouse-auth` only), so it is added here directly
+# too, pinned to the same "0.9" `lakehouse-auth/Cargo.toml` already uses.
+# `secret_manager::gcp`'s tests also generate a service-account key with it.
 rsa = "0.9"
 
 tempfile = { workspace = true }
