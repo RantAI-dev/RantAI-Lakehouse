@@ -1534,11 +1534,17 @@ mod tests {
     /// `_` and `%` as themselves; the limit cuts and says so.
     #[sqlx::test(migrations = "../../migrations")]
     async fn postgres_tables_are_base_tables_only_and_the_search_is_literal(pool: sqlx::PgPool) {
+        // SRC-13 review 2 BLOCKER 1: `public` of a `sqlx::test` database also holds
+        // every migration's tables (`_sqlx_migrations`, `access_grant`, ...), so the
+        // exact-list assertions below ran against more than their fixtures. The test
+        // lists a schema of its own, which holds exactly the four fixtures.
+        const SCHEMA: &str = "src13_tables_fixture";
         for ddl in [
-            "CREATE TABLE a_b (id INT)",
-            "CREATE TABLE axb (id INT)",
-            "CREATE TABLE c100 (id INT)",
-            "CREATE VIEW a_view AS SELECT 1 AS id",
+            "CREATE SCHEMA src13_tables_fixture",
+            "CREATE TABLE src13_tables_fixture.a_b (id INT)",
+            "CREATE TABLE src13_tables_fixture.axb (id INT)",
+            "CREATE TABLE src13_tables_fixture.c100 (id INT)",
+            "CREATE VIEW src13_tables_fixture.a_view AS SELECT 1 AS id",
         ] {
             sqlx::query(ddl).execute(&pool).await.unwrap();
         }
@@ -1548,7 +1554,7 @@ mod tests {
                 match run_postgres(
                     &pool,
                     &SqlOp::Tables {
-                        schema: "public",
+                        schema: SCHEMA,
                         search,
                         limit,
                     },
@@ -1571,6 +1577,10 @@ mod tests {
         let (names, truncated) = list("", 2).await;
         assert_eq!(names, ["a_b", "axb"]);
         assert!(truncated);
+        sqlx::query("DROP SCHEMA src13_tables_fixture CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[sqlx::test(migrations = "../../migrations")]
