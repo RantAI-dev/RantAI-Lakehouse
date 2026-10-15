@@ -163,9 +163,21 @@ def build_source(
     connection of its own."""
     credentials, engine_kwargs, resolved = connection_parts(spec, secrets, resolve_checked=resolve_checked)
     table_names = [obj["name"].split(".")[-1] for obj in source_objects]
+    # SRC-13 review 1 SHOULD-FIX 1 (D5: the listing offers every schema the user
+    # can read): the object's `SCHEMA.TABLE` names the OWNER to read from. Before,
+    # only the table part was kept and `sql_database` read the login's own schema,
+    # so a table listed from another schema did not load (or loaded a same-named
+    # table of the login's own). `sql_database` takes one `schema` per source, and
+    # a load builds one source per object, so objects of two schemas in one call
+    # are refused rather than half-loaded. A bare `TABLE` keeps the login's schema.
+    schemas = {obj["name"].rpartition(".")[0] for obj in source_objects} - {""}
+    if len(schemas) > 1:
+        raise ValueError("oracle build_source reads one schema per call; got " + ", ".join(sorted(schemas)))
+    schema_kwargs: dict[str, Any] = {"schema": next(iter(schemas))} if schemas else {}
 
     with ssrf_guard.checking_resolver():
         extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+        extra.update(schema_kwargs)
         source = sql_database(
             credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs, **extra
         )
