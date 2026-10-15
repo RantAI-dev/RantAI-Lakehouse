@@ -42,14 +42,20 @@
 //! sign-in token on to another server.
 
 pub mod refs;
+mod vault;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lakehouse_core::secret::{SecretError, SecretFailure, SecretResolver, SecretValue};
 
 pub use refs::{ManagerRef, SecretManagerKind};
+
+/// How long one request to a manager may take. Generous for a cloud API,
+/// short enough that a test or a run start does not hang on a dead address.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What a manager's connection settings looked like when the process
 /// started: the operator's environment, read once.
@@ -172,8 +178,11 @@ impl SecretManagerSettings {
         };
         match kind {
             SecretManagerKind::Vault => {
-                if self.get("VAULT_ADDR").is_none() {
-                    return Err(incomplete("VAULT_ADDR"));
+                if !self
+                    .get("VAULT_ADDR")
+                    .is_some_and(|addr| addr.starts_with("http://") || addr.starts_with("https://"))
+                {
+                    return Err(incomplete("VAULT_ADDR (an http:// or https:// address)"));
                 }
                 let token = self.get("VAULT_TOKEN").is_some();
                 let approle =
@@ -215,6 +224,36 @@ impl SecretManagerSettings {
     }
 }
 
+/// A client for one request to a manager: bounded in time, and never
+/// following a redirect, so a sign-in token cannot be sent on to another
+/// server by whatever answers at the operator's address.
+pub(crate) fn http_client() -> Result<reqwest::Client, SecretFailure> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| SecretFailure::ManagerUnreachable)
+}
+
+/// A request that got no answer: the manager is unreachable. The transport
+/// error is dropped (it names the address and may carry a library's text).
+pub(crate) fn send_failure(_err: reqwest::Error) -> SecretFailure {
+    SecretFailure::ManagerUnreachable
+}
+
+/// What a non-success status means for a read that was signed in already:
+/// 401 the sign-in no longer works, 403 not allowed, 404 not there, and
+/// anything else (including a redirect, 429 and 5xx) is the manager not
+/// answering usefully.
+pub(crate) fn read_stage_failure(status: reqwest::StatusCode) -> SecretFailure {
+    match status.as_u16() {
+        401 => SecretFailure::ManagerSignIn,
+        403 => SecretFailure::ManagerForbidden,
+        404 => SecretFailure::ManagerNotFound,
+        _ => SecretFailure::ManagerUnreachable,
+    }
+}
+
 /// One manager's way of reading a reference. Returns the secret text or the
 /// fixed reason it could not.
 #[async_trait::async_trait]
@@ -252,10 +291,14 @@ impl ManagerResolver {
     #[must_use]
     pub fn from_settings(settings: &SecretManagerSettings) -> Option<Self> {
         match settings.kind? {
-            SecretManagerKind::Vault
-            | SecretManagerKind::Aws
-            | SecretManagerKind::Gcp
-            | SecretManagerKind::Azure => None,
+            SecretManagerKind::Vault => {
+                let backend = vault::VaultBackend::from_settings(settings)?;
+                Some(Self {
+                    kind: SecretManagerKind::Vault,
+                    backend: Arc::new(backend),
+                })
+            }
+            SecretManagerKind::Aws | SecretManagerKind::Gcp | SecretManagerKind::Azure => None,
         }
     }
 

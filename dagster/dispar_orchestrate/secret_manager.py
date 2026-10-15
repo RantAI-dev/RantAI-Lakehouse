@@ -36,6 +36,9 @@ import logging
 import os
 import re
 from collections.abc import Callable, Mapping
+from typing import Any
+
+import requests
 
 _log = logging.getLogger(__name__)
 
@@ -163,10 +166,73 @@ def parse_ref(kind: str, secret_ref: str) -> dict[str, str | None]:
     return {"vault": match[1], "secret": match[2], "version": match[3]}
 
 
+def request_json(
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    json: Any = None,
+    data: Any = None,
+    sign_in: bool = False,
+    timeout: float = REQUEST_TIMEOUT,
+    not_found: tuple[int, ...] = (404,),
+) -> Any:
+    """One request to a manager, answered as parsed JSON or as a fixed failure.
+
+    Every manager's calls go through here: bounded in time, redirects not
+    followed (a sign-in token must not be sent on to another server), and the
+    manager's own error text dropped. `sign_in` marks a call whose refusal
+    means the product may not sign in (a login or token exchange) rather than
+    that it may not read: 400/401/403 are then `manager_sign_in`. `not_found` lists the
+    statuses that mean "no such secret" (a manager may use another besides
+    404). `timeout` is shorter for a platform's metadata service, which must fail fast on a
+    host that has none.
+    """
+    try:
+        response = requests.request(
+            method,
+            url,
+            headers=dict(headers or {}),
+            json=json,
+            data=data,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise ManagerFailure("manager_unreachable") from None
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        raise ManagerFailure(_failure_for_status(response.status_code, sign_in, not_found)) from None
+    if response.status_code >= 300:  # a redirect is not an answer
+        raise ManagerFailure("manager_unreachable")
+    try:
+        return response.json()
+    except ValueError:
+        raise ManagerFailure("manager_unreachable") from None
+
+
+def _failure_for_status(status: int, sign_in: bool, not_found: tuple[int, ...]) -> str:
+    if sign_in:
+        return "manager_sign_in" if status in (400, 401, 403) else "manager_unreachable"
+    if status in not_found:
+        return "manager_not_found"
+    return {401: "manager_sign_in", 403: "manager_forbidden"}.get(status, "manager_unreachable")
+
+
+def text_value(value: Any) -> str:
+    """The secret as a text, or the fixed "not a single text" failure."""
+    if isinstance(value, str):
+        return value
+    raise ManagerFailure("not_single_text")
+
+
 # Each manager's reader lives in its own module (`secret_manager_<kind>.py`)
 # with `read(parsed, environ) -> str`. `_READERS` lets a test put a fake in
 # its place; `_MODULES` is what a build ships.
-_MODULES: dict[str, str] = {}
+_MODULES: dict[str, str] = {
+    "vault": "dispar_orchestrate.secret_manager_vault",
+}
 _READERS: dict[str, Callable[[Mapping[str, str | None], Mapping[str, str]], str]] = {}
 
 

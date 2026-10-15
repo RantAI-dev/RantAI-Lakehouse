@@ -69,3 +69,48 @@ def reports(monkeypatch) -> list:
         classmethod(lambda cls, connector_id, run_id: RecordingReporter(sent, connector_id, run_id)),
     )
     return sent
+
+
+class FakeManagerHttp:
+    """Replaces `secret_manager.requests.request` (`SRC-12` part B): canned
+    answers by method and URL, every call recorded, no network. A request no
+    route matches raises a connection error, so a test that forgot a route
+    sees "unreachable", never a real call."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self._routes: list[dict] = []
+
+    def add(self, method: str, url: str, *, status: int = 200, json=None, text: str | None = None, times=None) -> None:
+        self._routes.append({"method": method, "url": url, "status": status, "json": json, "text": text, "times": times})
+
+    def __call__(self, method, url, **kwargs):
+        import json as jsonlib
+
+        import requests
+
+        self.calls.append({"method": method, "url": url, **kwargs})
+        for route in self._routes:
+            if route["method"] == method and url.split("?")[0] == route["url"].split("?")[0]:
+                if route["times"] is not None:
+                    if route["times"] <= 0:
+                        continue
+                    route["times"] -= 1
+                response = requests.Response()
+                response.status_code = route["status"]
+                if route["text"] is not None:
+                    response._content = route["text"].encode()
+                else:
+                    response._content = jsonlib.dumps(route["json"]).encode()
+                response.url = url
+                return response
+        raise requests.ConnectionError("no route in the fake")
+
+
+@pytest.fixture
+def manager_http(monkeypatch: pytest.MonkeyPatch) -> FakeManagerHttp:
+    from dispar_orchestrate import secret_manager
+
+    fake = FakeManagerHttp()
+    monkeypatch.setattr(secret_manager.requests, "request", fake)
+    return fake
