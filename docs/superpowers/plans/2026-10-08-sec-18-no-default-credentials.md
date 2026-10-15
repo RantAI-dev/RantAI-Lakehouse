@@ -560,3 +560,11 @@ Not re-run by the planner: a local `docker compose up` (the developer's
 round-2 run is in §6; CI's G1–G9 jobs each start the stack from this file).
 
 Merge waits on the owner's six `STAGING_*` repository secrets.
+
+Addendum (planner, after CI): the PR's full-history `gitleaks` run had one
+finding `main` does not: commit `b9c71cb3`, this file, the round-3
+handoff's `git ls-remote` line. The 40-hex value it quoted shares only its
+first 12 characters with the real head `cdbf7c6a0a74`; the rest matches no
+object. The handoff's pasted command output was therefore not real output
+(rule 7). It is not a credential; its exact fingerprint is baselined in
+`.gitleaksignore` with that proof (`2dcc6742`).
