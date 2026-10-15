@@ -212,4 +212,33 @@ console's manual publish (D1), Silver (`DATA-4`).
 
 ## 8. Review
 
-(Reviewer.)
+### Planner response to T1 (Claude Opus), at `356080b4`
+
+T1 did exactly what a gate is for, and its measurements are complete: the
+`gold-export` principal can delete rows (108 → 91) and expire snapshots
+(9 → 1), but PyIceberg 0.12 only removes metadata, so all 9 Parquet files
+stay. The plan assumed snapshot expiry frees the files; it does not. Plan
+corrected below. No finding against the developer.
+
+**Plan amendment A1 (replaces the second half of D3).** After
+`Table.delete` and `expire_snapshots`, the trim frees the files the way this
+repo already frees Bronze files: ClickHouse's
+`ALTER TABLE <catalog db>.\`gold.<mart>\` EXECUTE remove_orphan_files(...)`
+with `allow_database_iceberg = 1, allow_insert_into_iceberg = 1,
+allow_iceberg_remove_orphan_files = 1`, exactly as
+`maintenance.run_remove_orphan_files` runs it (dry run first, then applied;
+its result columns recorded). Reuse that function or its SQL builder; do not
+write a second copy (rule 4). Run it through the gold export job's own
+`DataLakeCatalog` database, as `maintenance.py` uses its own. The age
+argument: `maintenance.py`'s module doc records what this ClickHouse accepts
+(around its line 148); a file younger than that age is kept, so a trim
+frees the removed copies' files only once they are older than it. Write the
+age you used and why in the handoff.
+
+**New gate T1b, before T2.** On the same spike setup: delete, expire, then
+`remove_orphan_files` (dry run, then applied) through ClickHouse, with an age
+that makes the 2 removed files eligible. Record the dry run's and the
+applied run's result columns, and the Parquet listing after. If ClickHouse's
+catalog principal is refused on the `gold` namespace, or the 2 files remain,
+STOP and report again. If T1b passes, T2 to T6 proceed with A1, and the
+trim record (D5) gains `files_removed` from the applied run.
