@@ -2267,6 +2267,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_approval_sentence_in_build_mode_depends_on_a_needs_approval_result() {
+        let text = prompt::SYSTEM_BUILD_SUFFIX;
+        let line = text
+            .lines()
+            .find(|l| l.contains("delete_alert_rule"))
+            .expect("the build prompt lists the approval-gated tools");
+        assert!(
+            line.contains("needs_approval"),
+            "the approval line must name needs_approval as the condition, got: {line}"
+        );
+        assert!(
+            !text.contains("Tell the user the request is waiting in Approvals"),
+            "the approval line must not tell the user the request is waiting unconditionally"
+        );
+    }
+
     #[tokio::test]
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
