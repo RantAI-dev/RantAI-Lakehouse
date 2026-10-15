@@ -34,7 +34,7 @@ certification.
 
 | Control | Status | Source |
 | --- | --- | --- |
-| Classification and masking | In place | Governance module; `docs/FEATURE_COVERAGE.md` |
+| Classification and masking | In place | Governance module; `docs/archive/FEATURE_COVERAGE.md` (archived) |
 | Policies applied to queries, alerts, digests and exports | In place | `routes/alerts.rs` tests; `gold_export.rs` |
 | Read-only guard on user SQL | In place | Sales playbook; `CHANGELOG.md` |
 | Secrets held by reference, never returned by the API | In place | ADR 0002; `AGENTS.md` |
