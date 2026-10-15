@@ -80,7 +80,7 @@ estimate (S, M, L), which the base has no field for.
 | `BLD-3` | Task | A pipeline built in the console cannot read a Bronze table, so Bronze to Silver does not run: the job reads its source as the ClickHouse table `<sourceZone>.<sourceTable>`, and ClickHouse has no `bronze` database; Bronze is Iceberg, readable only through a `DataLakeCatalog` database (`icecat_api`, tables named `bronze.<table>`). The console and the assistant still offer Bronze as a source. Read the source through the job's own `DataLakeCatalog` database, as `maintenance.py` does, with masking and governance still applied; prove it on a running stack, which needs `SRC-20`. Found by reading the code after a user report, not yet reproduced | Build | P1 | Done | #155 | `authored_factory.py` (`_op_for_pipeline`), `scripts/seed-clickhouse.sql` |
 | `SEC-28` | Task | A pipeline built in the console can be read, edited, deleted, restored, run and paused by its ID from another organisation: the per-ID pipeline routes and the run routes do not check the caller's tenant. Also: run settings checked by top-level key only; a restored version is not validated; orchestrator error text in some responses. Fixed on the branch of PR #80, written before this backlog tracked it | Administration & Security | P1 | Done | #80 | PR #59 review (F2); PR #80 review |
 | `SEC-30` | Task | The Security workflow is red on `main`: `rustls` 0.23.45 has four advisories published 2026-10-14 (`RUSTSEC-2026-0346` `Debug` exposes TLS secrets, `-0347` buffered data sent after an ECH rejection, `-0348` certificate decompression can allocate 1 GiB before authentication, `-0349` an unauthenticated ServerHello can downgrade later connections). Update to `rustls` >= 0.23.46. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Done | #159 | CI on `main` at `c9a8d56f`, re-run 2026-10-14; named in the PR #155 review |
-| `SEC-35` | Task | The lineage route shows every tenant's connectors and pipelines to a caller who belongs to no tenant: `tenant_scope::resolve` returns `None` for such a caller, and `lineage::add_tenant_owned` passes it on as "no filter", against `tenant_scope`'s own rule (no tenant means an empty list). Being fixed with `DATA-19` (review BLOCKER 1), which also covers the upload edges it adds; check the other callers of `ConnectorFilter { tenant_id: None }` for the same mistake. **Blocked by `DATA-19` (fixed in its PR)** | Administration & Security | P1 | In Progress |  | `DATA-19` review, round 1 |
+| `SEC-35` | Task | The lineage route shows every tenant's connectors and pipelines to a caller who belongs to no tenant: `tenant_scope::resolve` returns `None` for such a caller, and `lineage::add_tenant_owned` passes it on as "no filter", against `tenant_scope`'s own rule (no tenant means an empty list). Being fixed with `DATA-19` (review BLOCKER 1), which also covers the upload edges it adds; check the other callers of `ConnectorFilter { tenant_id: None }` for the same mistake. Fixed in #165 (`DATA-19` review BLOCKER 1). | Administration & Security | P1 | Done | #165 | `DATA-19` review, round 1 |
 | `SEC-36` | Task | The full-history `gitleaks` scan runs `git fetch --all`, so it scans every branch, not only `main` and the PR: test values pushed on an open branch turn it red on `main` and on every PR. Since 2026-10-15 it is red with 20 `generic-api-key` findings, all on `feat/phase-1-rest` (#144, `SRC-12`/`SRC-13`): `CONNECTOR_SECRETS_KEY=` in `ci.yml` and the AES vector fixture `connector_secret_vector.json`. #144 must either use values the rule does not match or add exact fingerprints with proof (`SEC-1`) before it merges; then decide whether the scan should cover only `main` plus the PR head | Administration & Security | P1 | Done | #172 | `DATA-2` review (PR #164) |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
@@ -159,7 +159,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-25` | Task | Time travel follow-ups from the `DATA-16` review: a past version that does not exist reaches the Query Studio response as ClickHouse's own text (principle 4); the Trino refusal (422) for a past-version query has no route-level test | Data | P2 | Todo |  | PR #100 review |
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | Building | #165 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | In Acceptance | #165 | `reference/competitive-comparison.md` (Data matrix) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. **Blocked by `SEC-21` (full-result download)** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -212,7 +212,7 @@ estimate (S, M, L), which the base has no field for.
 | `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
 | `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Blocked by `DEC-9`, `SRC-12` (OAuth sign-in)** | Data | P3 | Planned |  | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
-| `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. **Blocked by `DATA-19`** | Build | P3 | Todo |  | `DATA-19` plan, section 5 |
+| `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Todo |  | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | Building |  | PRODUCT §2; [spec](specs/bld-2.md) |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
@@ -250,7 +250,6 @@ parity), built after it.
 | `BI-18` | Building | — | `AI-2`, `AI-9` (layout part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
 | `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
 | `BI-10` | Planned | — | `AI-6`, `BI-16` (histogram bins) |
-| `DATA-19` | Building | — | `BLD-4`, `SEC-35` (fixed in its PR) |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part), `BI-11` (parameters in SQL) |
 | `RPT-1` | Planned | `BI-1` (PDF and Excel attachments) | `AI-10`, `BI-19` (digest schedules) |
 | `BI-11` | Planned | `QS-5` (parameters in SQL) | `AI-6` |
@@ -284,18 +283,16 @@ parity), built after it.
 | `AI-7` | Planned | `BI-2` | — |
 | `AI-8` | Planned | `BI-17` | — |
 | `AI-9` | Planned | `BI-18` (layout part) | — |
-| `BLD-4` | Todo | `DATA-19` | — |
 | `DATA-3` | Planned | `DATA-4` | — |
 | `GOV-4` | Todo | `BLD-1` (closed by slice 1) | — |
 | `QS-2` | Planned | `SEC-21` (full-result download) | — |
 | `QS-3` | Planned | `SEC-20` | — |
-| `SEC-35` | In Progress | `DATA-19` (fixed in its PR) | — |
 | `SRC-3` | Planned | `DEC-9`, `SRC-12` (OAuth sign-in) | — |
 | `SRC-4` | Planned | `SRC-11` (column choice), `SEC-14` (credentials) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `BLD-4`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-1`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-5`, `REL-6`, `REL-7`, `REL-8`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -349,9 +346,10 @@ set by the product owner and are left empty until they are.
 | `AI-3` | | 2026-10-15 | |
 | `AI-4` | | 2026-10-15 | |
 | `SEC-31` | | 2026-10-15 | |
-| `DATA-19` | 2026-10-14 | | |
+| `DATA-19` | 2026-10-14 | 2026-10-15 | |
 | `BLD-1` | 2026-10-15 | | |
 | `BLD-2` | 2026-10-15 | | |
+| `SEC-35` | 2026-10-14 | 2026-10-15 | |
 
 ## Decide
 
