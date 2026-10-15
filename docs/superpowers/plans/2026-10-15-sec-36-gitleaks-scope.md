@@ -126,18 +126,18 @@ c8c8662db6ab docs(core): SEC-36 spec and plan; backlog status for SEC-16/17/18/2
 
 4. Repository status:
 ```
-git status --short
+$ git status --short
 (clean)
 
-git log --oneline --abbrev=12 origin/main..HEAD | head
-PENDING_COMMIT_HASH docs(core): handoff for SEC-36 history scan scope
+$ git log --oneline --abbrev=12 origin/main..HEAD | head
+bdb0ab2a549d docs(core): handoff for SEC-36 history scan scope
 aaa2cc4510d5 docs(security): document history-scan HEAD scoping and daily all-branch scan (SEC-36)
 611e3fc5ebc5 ci(security): add daily all-branch history scan workflow (SEC-36)
 60303bb90930 ci(security): scope history-scan to HEAD on main and PRs (SEC-36)
 c8c8662db6ab docs(core): SEC-36 spec and plan; backlog status for SEC-16/17/18/27/36
 
-git ls-remote --heads origin fix/sec-36-gitleaks-scope
-PENDING_REMOTE_REF	refs/heads/fix/sec-36-gitleaks-scope
+$ git ls-remote --heads origin fix/sec-36-gitleaks-scope
+bdb0ab2a549d5d4e567e92ca0f9c1f95c47b3739	refs/heads/fix/sec-36-gitleaks-scope
 ```
 
 ## 7. Review
