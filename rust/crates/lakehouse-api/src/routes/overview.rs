@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::next_run::next_run_at;
-use crate::routes::support::{js_error, num_or_zero, str_col};
+use crate::routes::support::{num_or_zero, str_col, upstream_message};
 use crate::state::AppState;
 use lakehouse_dagster::{
     DgClient, DgError, DgJob, DgRun, DgSchedule, iso_from_unix_seconds, map_run_status,
@@ -48,7 +48,7 @@ pub async fn get(State(state): State<AppState>) -> Response {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -370,7 +370,7 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
         }
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "activity": [], "error": js_error(err) })),
+            ApiJson(json!({ "activity": [], "error": upstream_message(err) })),
         )
             .into_response(),
     }

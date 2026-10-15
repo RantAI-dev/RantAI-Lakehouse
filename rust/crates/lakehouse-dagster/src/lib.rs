@@ -283,6 +283,10 @@ struct LaunchRunResult {
     message: Option<String>,
     #[serde(default)]
     errors: Option<Vec<LaunchRunError>>,
+    /// `PythonError.className`: the Python exception class, selected only
+    /// by the launch mutations that can meet a code location still loading.
+    #[serde(default, rename = "className")]
+    class_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,6 +726,14 @@ pub struct LaunchOutcome {
     /// layer reads the variant to pick a status code and a fixed,
     /// classified response body.
     pub failure: Option<LaunchFailure>,
+    /// Whether the failure is Dagster saying the job (or the code location
+    /// that holds it) is not loaded yet: the typed `PipelineNotFoundError`
+    /// result, or a `PythonError` whose `className` is
+    /// `DagsterUserCodeUnreachableError`. Decided from those typed fields
+    /// only, never from upstream text (none is carried), so a caller may answer a
+    /// retryable "not ready" without ever reading upstream prose
+    /// (`PR #105 CI fix`, `SEC-11`).
+    pub job_not_loaded: bool,
 }
 
 /// Typed classification of a Dagster mutation refusal. The variant
@@ -921,8 +933,12 @@ fn launch_outcome_from(r: LaunchRunResult) -> LaunchOutcome {
         return LaunchOutcome {
             run_id: Some(run.run_id),
             failure: None,
+            job_not_loaded: false,
         };
     }
+    // Typed fields only (`__typename`, `className`): `PR #105 CI fix`.
+    let job_not_loaded = r.typename == JOB_NOT_LOADED_TYPENAME
+        || r.class_name.as_deref() == Some(CODE_LOCATION_UNREACHABLE_CLASS);
     let failure = classify_launch_failure(&r.typename);
     let detail = r
         .message
@@ -947,6 +963,7 @@ fn launch_outcome_from(r: LaunchRunResult) -> LaunchOutcome {
     LaunchOutcome {
         run_id: None,
         failure: Some(failure),
+        job_not_loaded,
     }
 }
 
@@ -960,6 +977,15 @@ fn classify_launch_failure(typename: &str) -> LaunchFailure {
         LaunchFailure::Refused
     }
 }
+
+/// `__typename` of the `launchRun` result when the selector names a job the
+/// loaded repository does not have, which is also what a code location that
+/// is still (re)loading looks like from outside.
+const JOB_NOT_LOADED_TYPENAME: &str = "PipelineNotFoundError";
+
+/// `PythonError.className` Dagster reports when the user-code server (the
+/// code location's gRPC process) cannot be reached, as during a reload.
+const CODE_LOCATION_UNREACHABLE_CLASS: &str = "DagsterUserCodeUnreachableError";
 
 /// HTTP client for `Dagster`'s GraphQL endpoint.
 pub struct DgClient {
@@ -1326,7 +1352,7 @@ impl DgClient {
                       launchRun(executionParams: { selector: $sel, mode: \"default\" }) { \
                       __typename \
                       ... on LaunchRunSuccess { run { runId } } \
-                      ... on PythonError { message } \
+                      ... on PythonError { message className } \
                       ... on RunConfigValidationInvalid { errors { message } } \
                       } }";
         let variables = json!({
@@ -1371,7 +1397,7 @@ impl DgClient {
                       runConfigData: $cfg }) { \
                       __typename \
                       ... on LaunchRunSuccess { run { runId } } \
-                      ... on PythonError { message } \
+                      ... on PythonError { message className } \
                       ... on RunConfigValidationInvalid { errors { message } } \
                       } }";
         let variables = json!({
@@ -1567,6 +1593,7 @@ impl DgClient {
             return Ok(LaunchOutcome {
                 run_id: Some(run.run_id),
                 failure: None,
+                job_not_loaded: false,
             });
         }
         let failure = classify_launch_failure(&r.typename);
@@ -1582,6 +1609,7 @@ impl DgClient {
         Ok(LaunchOutcome {
             run_id: None,
             failure: Some(failure),
+            job_not_loaded: false,
         })
     }
 
@@ -1695,6 +1723,7 @@ impl DgClient {
             return Ok(LaunchOutcome {
                 run_id: None,
                 failure: Some(LaunchFailure::NotFound),
+                job_not_loaded: false,
             });
         }
         let pipeline_name = parent
@@ -3062,6 +3091,55 @@ mod tests {
         assert!(outcome.run_id.is_none());
         // F2.7: upstream "boom" is logged, not surfaced.
         assert_eq!(outcome.failure, Some(LaunchFailure::Refused));
+    }
+
+    /// `PR #105 CI fix`: "the job is not loaded yet" is read from Dagster's
+    /// typed fields (`__typename`, `PythonError.className`), and nothing
+    /// else is mistaken for it, whatever its message says.
+    #[tokio::test]
+    async fn launch_run_with_config_flags_a_job_that_is_not_loaded_from_typed_fields_only() {
+        let cases = [
+            (json!({ "__typename": "PipelineNotFoundError" }), true),
+            (
+                json!({ "__typename": "PythonError", "message": "x",
+                        "className": "DagsterUserCodeUnreachableError" }),
+                true,
+            ),
+            // The words alone are not the signal.
+            (
+                json!({ "__typename": "PythonError",
+                        "message": "PipelineNotFoundError: job not found",
+                        "className": "ValueError" }),
+                false,
+            ),
+            (
+                json!({ "__typename": "PythonError", "message": "boom" }),
+                false,
+            ),
+            (
+                json!({ "__typename": "RunConfigValidationInvalid",
+                        "errors": [ { "message": "bad" } ] }),
+                false,
+            ),
+        ];
+        for (launch_run, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "data": { "launchRun": launch_run } })),
+                )
+                .mount(&server)
+                .await;
+            let client = DgClient::new(format!("{}/graphql", server.uri()));
+            let outcome = client
+                .launch_run_with_config("ingest_job", &json!({}))
+                .await
+                .unwrap();
+            assert!(outcome.run_id.is_none());
+            assert_eq!(outcome.job_not_loaded, expected, "{launch_run}");
+        }
     }
 
     #[tokio::test]

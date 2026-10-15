@@ -1015,6 +1015,13 @@ jobs:
               "$RUNNER_TEMP/g6-run.log" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: API log lines for the references the gate quoted (on failure)
+        # SEC-11 hides an upstream error's text behind a reference id in the
+        # response; the raw text is only in the lakehouse-api log. Print just
+        # those lines ahead of the full dump below (PR #105 CI fix).
+        if: failure()
+        run: bash ops/gates/api_log_for_references.sh "$RUNNER_TEMP/g6-run.log" -p g6ci
+
       - name: Compose logs (on failure)
         if: failure()
         run: docker compose -p g6ci logs
@@ -1118,6 +1125,13 @@ jobs:
             awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
               "$RUNNER_TEMP/g6-other-run.log" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: API log lines for the references the gate quoted (on failure)
+        # SEC-11 hides an upstream error's text behind a reference id in the
+        # response; the raw text is only in the lakehouse-api log. Print just
+        # those lines ahead of the full dump below (PR #105 CI fix).
+        if: failure()
+        run: bash ops/gates/api_log_for_references.sh "$RUNNER_TEMP/g6-other-run.log" -p g6otherci
 
       - name: Compose logs (on failure)
         if: failure()
@@ -1258,6 +1272,13 @@ jobs:
             awk '/^GATE-SUMMARY-BEGIN$/{inside=1; next} /^GATE-SUMMARY-END$/{inside=0} inside' \
               "$RUNNER_TEMP/g6-oracle-run.log" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: API log lines for the references the gate quoted (on failure)
+        # SEC-11 hides an upstream error's text behind a reference id in the
+        # response; the raw text is only in the lakehouse-api log. Print just
+        # those lines ahead of the full dump below (PR #105 CI fix).
+        if: failure()
+        run: bash ops/gates/api_log_for_references.sh "$RUNNER_TEMP/g6-oracle-run.log" -p g6oracleci -f docker-compose.yml -f ops/g6/docker-compose.g6-oracle.override.yml --profile g6-oracle --profile dagster
 
       - name: Compose logs (on failure)
         if: failure()
@@ -1469,6 +1490,13 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: API log lines for the references the gate quoted (on failure)
+        # SEC-11 hides an upstream error's text behind a reference id in the
+        # response; the raw text is only in the lakehouse-api log. Print just
+        # those lines ahead of the full dump below (PR #105 CI fix).
+        if: failure()
+        run: bash ops/gates/api_log_for_references.sh "$RUNNER_TEMP/g6-alerts-run.log" -p g6alertsci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile g6-alerts --profile dagster
 
       - name: Compose logs (on failure)
         if: failure()

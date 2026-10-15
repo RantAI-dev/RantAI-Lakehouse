@@ -29,29 +29,54 @@ import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
 import { dashboardService } from "@/services";
+import type { ChartClick } from "@/services/clients/bi-store";
+import { kindHasClickValue } from "@/lib/chart-click";
+import { clickProblem } from "@/lib/click-destination";
+import { ClickSetting } from "./click-setting";
+import { KpiCompareSection, PivotSection, TableSection, type SourceColumns } from "./table-settings";
+import { draftFromDef, draftPayload, draftProblems, emptyTableDraft, type TableDraft } from "@/lib/table-draft";
+import type { TableDefFields } from "@/lib/table-types";
 import type { SqlSource, SqlSourceColumn } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { filterKindGroups } from "@/lib/chart-kind-search";
+import { previewKey } from "@/lib/preview-key";
+import { withPreviewDef } from "@/lib/preview-spec";
 import { suggestChartTitle } from "@/lib/chart-title";
 import { guessCoordinateColumns, pointLimit } from "@/lib/geo-points";
+import {
+  GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
+} from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { FormulaEditorDialog } from "./formula-editor";
+import type { CalcField } from "@/services/contracts/calc-fields";
 import { TileBody } from "./tile-body";
 import { useSqlSourceDraft } from "./use-sql-source-draft";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
-type Fields = { dimensions: string[]; measures: string[] };
+/** `kinds`: each column's kind, from its type, so the grain picker knows which dimensions are dates (BI-9). */
+type Fields = {
+  dimensions: string[]; measures: string[]; kinds?: Record<string, ColumnKind>;
+  /** The source's own columns, apart from the calculated fields merged into `dimensions` and `measures` (BI-8). */
+  columns?: string[];
+  calculated?: CalcField[];
+};
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
   map?: string; lat?: string; lon?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
-};
+  /** What a click does instead of the drill menu (BI-18·B); absent = the menu. */
+  click?: ChartClick;
+  /** How a date or timestamp dimension is grouped (BI-9); absent = as stored. */
+  grain?: string;
+} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
 type BoardOpt = { id: string; name: string };
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
-  result: { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+  result: { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 };
 
 /**
@@ -101,6 +126,7 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
   ] },
   { group: "Other", items: [
     { value: "table", label: "Data table" },
+    { value: "pivot", label: "Pivot table" },
     { value: "text", label: "Text / note" },
   ] },
 ];
@@ -118,6 +144,28 @@ const ORDER_LABELS: Record<string, string> = {
   desc: "Highest first", asc: "Lowest first", none: "Natural (by dimension)",
 };
 const NO_BREAKDOWN = "__none__";
+const NO_GRAIN = "__no_grain__";
+const GRAIN_ITEMS: Record<string, string> = { [NO_GRAIN]: "No grouping", ...GRAIN_LABELS };
+/** Column name → kind, from the `{ name, type }` list a fields response or a SQL run returns. */
+function kindsOf(columns: readonly { name: string; type: string }[]): Record<string, ColumnKind> {
+  return Object.fromEntries(columns.map((c) => [c.name, columnKindOfType(c.type)]));
+}
+/**
+ * The source's columns plus its calculated fields (BI-8). A per-row number,
+ * an aggregate and a table calculation are offered as measures, any other
+ * per-row field as a dimension; the server refuses the last two anywhere but
+ * a measure, and says why (the preview shows its sentence).
+ */
+function withCalculated(base: Fields, columns: string[], calculated: CalcField[]): Fields {
+  const kinds = { ...base.kinds };
+  const dimensions = [...base.dimensions];
+  const measures = [...base.measures];
+  for (const f of calculated) {
+    kinds[f.name] = f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "datetime" ? "datetime" : "text";
+    (f.level === "aggregate" || f.level === "table" || f.type === "number" ? measures : dimensions).push(f.name);
+  }
+  return { dimensions, measures, kinds, columns, calculated };
+}
 /** Map id → label for the base-ui select (see KIND_LABELS). */
 const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
@@ -152,7 +200,7 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   pointmap: "Plot locations as points sized and coloured by a value",
   geoheat: "Show where locations are concentrated",
   kpi: "Highlight one important number", gauge: "Track a value against a target",
-  table: "Inspect detailed rows and values", text: "Add context, notes, or instructions",
+  table: "Inspect detailed rows and values", pivot: "Cross-tabulate with totals and subtotals", text: "Add context, notes, or instructions",
   sankey: "Show how a total flows from one dimension to another",
   sunburst: "Break each category into its parts, as rings",
   boxplot: "Compare the spread of a measure across categories",
@@ -167,6 +215,8 @@ const KIND_KEYWORDS: Partial<Record<ChartKind, string>> = {
   geomap: "map peta region wilayah choropleth spatial geo",
   pointmap: "map peta points titik lokasi bubble spatial geo",
   geoheat: "map peta heatmap density kepadatan spatial geo",
+  pivot: "pivot cross tab crosstab matrix totals subtotals",
+  table: "table rows raw columns grid",
 };
 function kindIcon(kind: ChartKind): LucideIcon {
   if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
@@ -181,7 +231,7 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (kind === "boxplot") return ChartCandlestick;
   if (kind === "calendar") return CalendarDays;
   if (kind === "kpi" || kind === "gauge") return Gauge;
-  return kind === "table" ? Table2 : Type;
+  return kind === "table" || kind === "pivot" ? Table2 : Type;
 }
 /** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
 const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
@@ -221,6 +271,14 @@ export function ChartBuilder({
   const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
+  // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
+  const [formulaOpen, setFormulaOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<CalcField | undefined>(undefined);
+  const calcNames = React.useMemo(() => new Set((fields?.calculated ?? []).map((f) => f.name)), [fields]);
+  /** A calculated field is marked "fx" wherever a column is picked. */
+  const fieldLabel = (name: string) => calcNames.has(name)
+    ? <span className="flex items-center gap-1.5">{name}<span className="rounded bg-muted px-1 text-[10px] font-medium text-muted-foreground">fx</span></span>
+    : name;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [preview, setPreview] = React.useState<Preview | null>(null);
@@ -256,6 +314,15 @@ export function ChartBuilder({
   const [order, setOrder] = React.useState<"desc" | "asc" | "none">("desc");
   const [limit, setLimit] = React.useState(20);
   const [targetBoard, setTargetBoard] = React.useState(board);
+  // What a click does instead of the drill menu (BI-18·B); undefined = the menu.
+  const [click, setClick] = React.useState<ChartClick | undefined>(undefined);
+  // How a date or timestamp dimension is grouped (BI-9); "" = as stored.
+  const [grain, setGrain] = React.useState<Grain | "">("");
+  // Whether the person (or a saved chart) set the limit, so choosing a grain
+  // only replaces the untouched default (BI-9 review fix R2).
+  const [limitTouched, setLimitTouched] = React.useState(false);
+  // Raw table, pivot and KPI comparison settings (BI-16 part A).
+  const [tableDraft, setTableDraft] = React.useState<TableDraft>(emptyTableDraft);
   const isText = kind === "text";
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
@@ -270,14 +337,45 @@ export function ChartBuilder({
   const effectiveMap = mapId || (isChoropleth ? DEFAULT_CHOROPLETH_MAP : DEFAULT_POINT_MAP);
   const isBoxplot = kind === "boxplot";
   const isCalendar = kind === "calendar";
-  // A calendar is one cell per day, so up to a year of rows.
-  const maxLimit = isCalendar ? 366 : 100;
+  const isPivot = kind === "pivot";
+  // A pivot and a raw table name their columns in their own fields, not as a dimension and measures.
+  const ownColumns = isPivot || (kind === "table" && tableDraft.mode === "rows");
+  const sourceColumns = React.useMemo<SourceColumns>(() => ({
+    all: [...(fields?.dimensions ?? []), ...(fields?.measures ?? [])],
+    dates: Object.entries(fields?.kinds ?? {}).filter(([, k]) => k === "date" || k === "datetime").map(([name]) => name),
+  }), [fields]);
+  // The grains this dimension and chart kind allow; empty hides the picker. A
+  // pivot's grain applies to its first date row or column field.
+  const pivotDateField = isPivot ? [...tableDraft.pivotRows, ...tableDraft.pivotColumns].find((c) => fields?.kinds?.[c] === "date" || fields?.kinds?.[c] === "datetime") : undefined;
+  const dimensionKind = isPivot ? (pivotDateField ? fields?.kinds?.[pivotDateField] : undefined) : fields?.kinds?.[dimension];
+  const grainOptions = React.useMemo(() => grainChoices(kind, dimensionKind), [kind, dimensionKind]);
+  // A calendar on a timestamp groups by day: the server would otherwise keep one value per day silently.
+  const grainRequired = isCalendar && dimensionKind === "datetime";
+  // A calendar is one cell per day, so up to a year of rows; a grouped chart
+  // may show up to a thousand buckets (the server keeps the latest).
+  const maxLimit = grain ? 1000 : isCalendar ? 366 : 100;
   // Switching to a calendar starts from a full year; leaving it brings the
   // Top-N back inside 1–100.
   React.useEffect(() => {
+    if (grain) return;
     if (isCalendar) setLimit((l) => (l === 20 ? 366 : l));
     else setLimit((l) => Math.min(l, 100));
-  }, [isCalendar]);
+  }, [isCalendar, grain]);
+  // A grain the chosen column or chart kind does not allow is dropped; a
+  // calendar on a timestamp is set to day. Waits for the columns to load so
+  // an edit's saved grain is not cleared before its kinds are known.
+  React.useEffect(() => {
+    if (!fields?.kinds) return;
+    if (grainRequired) { setGrain("day"); return; }
+    setGrain((g) => (g && !grainOptions.includes(g) ? "" : g));
+  }, [fields, grainOptions, grainRequired]);
+  function pickGrain(next: Grain | "") {
+    // A grouped chart reads best in date order; the editor can still change it.
+    if (next && !grain && order === "desc") setOrder("none");
+    // BI-9 review fix (SHOULD-FIX) R2: a day-grained chart should not open at 20 days.
+    setLimit((l) => limitAfterGrainPick(next, l, limitTouched));
+    setGrain(next);
+  }
   // Latitude and longitude can be any column the source returns (numbers are
   // listed as measures, but a coordinate stored as text is still pickable).
   const coordinateColumns = React.useMemo(() => [...(fields?.measures ?? []), ...(fields?.dimensions ?? [])], [fields]);
@@ -305,7 +403,7 @@ export function ChartBuilder({
   // Fields and picks follow the columns of the latest successful Run, and a
   // column a re-run no longer returns is dropped rather than kept dangling.
   function applyRunColumns(columns: SqlSourceColumn[]) {
-    const f = fieldsFromColumns(columns);
+    const f: Fields = { ...fieldsFromColumns(columns), kinds: kindsOf(columns) };
     const any = [...f.measures, ...f.dimensions];
     setFields(f);
     setDimension((v) => keepIfOffered(v, f.dimensions));
@@ -332,13 +430,14 @@ export function ChartBuilder({
     ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
     : [
         ...(choice || isNewSql ? [] : ["Data source"]),
-        ...(!isSingle && !isPoints && !dimension ? [dimensionLabel] : []),
+        ...(!isSingle && !isPoints && !ownColumns && !dimension ? [dimensionLabel] : []),
         ...(isPoints && !lat ? ["Latitude"] : []),
         ...(isPoints && !lon ? ["Longitude"] : []),
-        ...(measure ? [] : [mLabels[0]]),
+        ...(ownColumns || measure ? [] : [mLabels[0]]),
         ...(needsM2 && !measure2 ? [mLabels[1] ?? "2nd measure"] : []),
         ...(needsM3 && !measure3 ? [mLabels[2] ?? "3rd measure"] : []),
         ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
+        ...draftProblems(kind, tableDraft),
       ];
   const isEdit = !!editId;
   // Why no chart can be drawn yet while the SQL is new or edited (null = it
@@ -365,7 +464,11 @@ export function ChartBuilder({
     const picked = decodeSourceChoice(value);
     if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
     const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
-    const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
+    const f = withCalculated(
+      { dimensions: j.dimensions ?? [], measures: j.measures ?? [], kinds: kindsOf(j.columns ?? []) },
+      (j.columns ?? []).map((c: { name: string }) => c.name),
+      j.calculated ?? [],
+    );
     setFields(f);
     return f;
   }
@@ -392,7 +495,11 @@ export function ChartBuilder({
       setText(initial.text ?? "");
       setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
       setLimit(initial.limit ?? 20);
+      setLimitTouched(true);
       setTargetBoard(initial.board ?? board);
+      setClick(initial.click);
+      setGrain(isGrain(initial.grain) ? initial.grain : "");
+      setTableDraft(draftFromDef(initial));
       const m = sourceValueFromDef(initial);
       setSource(m);
       if (m) {
@@ -413,8 +520,8 @@ export function ChartBuilder({
     setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setMapId(""); setLat(""); setLon("");
     setAggregate("sum"); setSpan(1);
-    setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
-    setTargetBoard(board); setFields(null); setError(null); setPreview(null); setPreviewError(null);
+    setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20); setLimitTouched(false);
+    setTargetBoard(board); setClick(undefined); setGrain(""); setTableDraft(emptyTableDraft()); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     draft.cancel();
   }
 
@@ -423,6 +530,8 @@ export function ChartBuilder({
     draft.cancel();
     setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
     setLat(""); setLon("");
+    // The columns of a raw table, a pivot or a comparison belong to the old source.
+    setTableDraft((d) => ({ ...emptyTableDraft(), mode: d.mode, totals: d.totals, goodDirection: d.goodDirection, compareKind: d.compareKind }));
     if (value === NEW_SQL_CHOICE) { setFields(null); draft.startNew(); return; }
     if (value) void loadFields(value); else setFields(null);
   }
@@ -452,6 +561,14 @@ export function ChartBuilder({
         title: payloadTitle, kind, ...sourcePayload(withSource), measures: [measure], aggregate, span, board: targetBoard,
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
+        ...draftPayload(kind, tableDraft),
+      };
+    } else if (ownColumns) {
+      // BI-16 part A: no dimension, measures or aggregate; the columns travel in the table's own fields.
+      payload = {
+        title: payloadTitle, ...sourcePayload(withSource), kind, span, board: targetBoard,
+        ...draftPayload(kind, tableDraft),
+        grain: isPivot && grain && grainOptions.includes(grain) ? grain : undefined,
       };
     } else {
       const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
@@ -462,12 +579,29 @@ export function ChartBuilder({
         lat: isPoints ? lat : undefined, lon: isPoints ? lon : undefined,
         // A point map has a fixed cap of its own (lakehouse_bi::builder::POINT_LIMIT) and is not sorted.
         order: isCalendar ? "none" : isPoints ? undefined : order, limit: isPoints ? undefined : Math.min(limit, maxLimit),
+        // Only a grain the column and kind allow is sent (BI-9); the server checks again.
+        grain: grain && grainOptions.includes(grain) ? grain : undefined,
+        ...draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean)),
       };
     }
+    // A chart without marks to click (text, KPI, gauge, table, density map)
+    // has no click setting; one left over from another kind is dropped.
+    const clickable = kindHasClickValue(kind);
+    const problem = clickable ? clickProblem(click) : null;
+    if (problem && !forPreview) throw new Error(problem);
+    if (clickable && click && !problem) payload.click = click;
     if (isEdit) payload.id = editId;
     return payload;
   }
 
+  const previewInputsKey = previewKey({
+    title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon,
+    aggregate, span, caption, target, text, order, limit, targetBoard, grain,
+    // BI-16 part A: every table, pivot and comparison setting reaches the SQL or the render spec.
+    tables: JSON.stringify(draftPayload(kind, tableDraft, [dimension, measure].filter(Boolean))),
+    // BI-8: a changed formula changes the rows a chart over the field returns.
+    calc: JSON.stringify((fields?.calculated ?? []).map((f) => [f.name, f.formula])),
+  });
   React.useEffect(() => {
     if (!open) return;
     if (isText) {
@@ -503,15 +637,16 @@ export function ChartBuilder({
             return json as Preview;
           });
       void request.then((next) => {
-        if (!controller.signal.aborted) setPreview(next);
+        if (!controller.signal.aborted) setPreview({ ...next, spec: withPreviewDef(next.spec, payload) });
       }).catch((e: unknown) => {
         if (!controller.signal.aborted) { setPreview(null); setPreviewError(e instanceof Error ? e.message : String(e)); }
       }).finally(() => { if (!controller.signal.aborted) setPreviewBusy(false); });
     }, 450);
     return () => { window.clearTimeout(timer); controller.abort(); };
-    // Every field below affects the generated SQL or render spec.
+    // BI-9 review fix (BLOCKER) R3: `previewInputsKey` holds every field that affects the
+    // generated SQL or render spec, `grain` included (lib/preview-key.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, title, source, kind, dimension, measure, measure2, measure3, breakdown, mapId, lat, lon, aggregate, span, caption, target, text, order, limit, targetBoard, heldPreview, previewSql]);
+  }, [open, previewInputsKey, heldPreview, previewSql]);
 
   async function save() {
     setError(null);
@@ -577,6 +712,19 @@ export function ChartBuilder({
       setBusy(false);
     }
   }
+
+  const grainPicker = grainOptions.length > 0 ? (
+    <div className="mt-1 grid gap-1.5">
+      <Label>Group by</Label>
+      <Select value={grain || NO_GRAIN} items={GRAIN_ITEMS} onValueChange={(v) => pickGrain(v === NO_GRAIN || !isGrain(v) ? "" : v)}>
+        <SelectTrigger className="w-full" aria-label="Group by"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {grainRequired ? null : <SelectItem value={NO_GRAIN}>No grouping</SelectItem>}
+          {grainOptions.map((g) => <SelectItem key={g} value={g}>{GRAIN_LABELS[g]}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
 
   const formFields = (
     <div className="grid content-start gap-4 px-5 pt-1 pb-5">
@@ -658,9 +806,7 @@ export function ChartBuilder({
             {choice?.kind === "sql" && draft.mode !== "edit" ? (
               canWriteSql ? (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                  <p className="text-xs text-muted-foreground">
-                    Custom SQL source. Drill-down to records is not available for SQL sources yet.
-                  </p>
+                  <p className="text-xs text-muted-foreground">Custom SQL source.</p>
                   <Button
                     type="button" size="sm" variant="outline"
                     disabled={!sqlSources.some((s) => s.id === choice.id)}
@@ -671,11 +817,26 @@ export function ChartBuilder({
                 </div>
               ) : (
                 <p className="text-xs text-muted-foreground">
-                  Custom SQL source. You need the dashboard:sql permission to edit it. Drill-down to records is not available for SQL sources yet.
+                  Custom SQL source. You need the dashboard:sql permission to edit it.
                 </p>
               )
             ) : null}
             {sqlActive ? <SqlSourcePanel draft={draft} onCancelEdit={cancelSqlEdit} /> : null}
+            {fields?.columns && !isNewSql && !isText && choice ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(fields.calculated ?? []).map((f) => (
+                  <Button
+                    key={f.id} type="button" size="sm" variant="outline" className="h-6 gap-1 px-2 font-mono text-xs"
+                    title={f.formula} onClick={() => { setEditing(f); setFormulaOpen(true); }}
+                  >
+                    <span className="text-muted-foreground">fx</span>{f.name}
+                  </Button>
+                ))}
+                <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => { setEditing(undefined); setFormulaOpen(true); }}>
+                  <Plus className="size-3" aria-hidden /> New calculated field
+                </Button>
+              </div>
+            ) : null}
           </div>
 
           {isMap ? (
@@ -693,7 +854,7 @@ export function ChartBuilder({
           ) : null}
 
           {/* Dimensions together, then the measure next to how it is aggregated. */}
-          {!isSingle ? (
+          {!isSingle && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>{dimensionLabel} {isPoints ? <span className="font-normal text-muted-foreground">(optional, shown in the tooltip)</span> : <Req />}</Label>
@@ -702,15 +863,16 @@ export function ChartBuilder({
                     <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "no label" : noFieldsHint} /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value={NO_BREAKDOWN}>— no label —</SelectItem>
-                      {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                      {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 ) : (
                   <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                    <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
+                    <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}</SelectContent>
                   </Select>
                 )}
+                {grainPicker}
               </div>
               {canBreakdown ? (
                 <div className="grid gap-1.5">
@@ -719,7 +881,7 @@ export function ChartBuilder({
                     <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
                       {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
-                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{fieldLabel(d)}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>
@@ -748,12 +910,12 @@ export function ChartBuilder({
             <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
           ) : null}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {ownColumns ? null : <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>{mLabels[0]} <Req /></Label>
               <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
                 <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : noFieldsHint} /></SelectTrigger>
-                <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                <SelectContent>{fields?.measures.filter((m) => !isPoints || (m !== lat && m !== lon)).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             {isBoxplot ? (
@@ -770,15 +932,15 @@ export function ChartBuilder({
                 </Select>
               </div>
             )}
-          </div>
+          </div>}
 
-          {needsM2 ? (
+          {needsM2 && !ownColumns ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5">
                 <Label>{mLabels[1] ?? "2nd measure"} <Req /></Label>
                 <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
                   <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               {needsM3 ? (
@@ -786,18 +948,21 @@ export function ChartBuilder({
                   <Label>{mLabels[2] ?? "3rd measure"} <Req /></Label>
                   <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
                     <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
-                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{fieldLabel(m)}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
               ) : null}
             </div>
           ) : null}
 
-          {isKpi ? (
-            <div className="grid gap-1.5">
-              <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
-              <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
-            </div>
+          {ownColumns ? null : isKpi ? (
+            <>
+              <div className="grid gap-1.5">
+                <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
+                <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
+              </div>
+              <KpiCompareSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
+            </>
           ) : isGauge ? (
             <div className="grid gap-1.5">
               <Label>Target / max <span className="font-normal text-muted-foreground">(optional)</span></Label>
@@ -828,12 +993,22 @@ export function ChartBuilder({
                   </Select>
                 </div>
               )}
-              <div className="grid gap-1.5">
-                <Label>{isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
-                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20)))} />
-              </div>
+              {limitHasEffect(grain, isCalendar ? "none" : order) ? <div className="grid gap-1.5">
+                <Label>{grain ? "Buckets (max 1000, latest kept)" : isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => { setLimitTouched(true); setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20))); }} />
+              </div> : null}
             </div>
           )}
+
+          {kind === "table" ? <TableSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} groupedColumns={[dimension, measure].filter(Boolean)} /> : null}
+          {isPivot ? (
+            <>
+              <PivotSection draft={tableDraft} onChange={setTableDraft} columns={sourceColumns} />
+              {grainPicker}
+            </>
+          ) : null}
+
+          {kindHasClickValue(kind) ? <ClickSetting value={click} onChange={setClick} boards={boardOptions} /> : null}
         </>
       )}
     </div>
@@ -869,7 +1044,7 @@ export function ChartBuilder({
               )}
             </div>
           ) : preview ? (
-            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} year="all" />
+            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} />
           ) : previewBusy ? (
             <div className="h-full animate-pulse rounded-md bg-muted/50" />
           ) : (
@@ -993,6 +1168,26 @@ export function ChartBuilder({
             </DialogFooter>
           </div>
         </div>
+        {fields?.columns && choice ? (
+          <FormulaEditorDialog
+            open={formulaOpen}
+            onOpenChange={setFormulaOpen}
+            source={choice.kind === "mart" ? { mart: choice.name } : { source: choice.id }}
+            columns={fields.columns}
+            fields={fields.calculated ?? []}
+            existing={editing}
+            onSaved={() => { void loadFields(source); }}
+            onDeleted={(gone) => {
+              void loadFields(source).then((f) => {
+                setDimension((v) => (v === gone.name ? "" : keepIfOffered(v, f.dimensions)));
+                setMeasure((v) => keepIfOffered(v, f.measures));
+                setMeasure2((v) => keepIfOffered(v, f.measures));
+                setMeasure3((v) => keepIfOffered(v, f.measures));
+                setBreakdown((v) => keepIfOffered(v, f.dimensions));
+              });
+            }}
+          />
+        ) : null}
       </DialogContent>
     </Dialog>
   );

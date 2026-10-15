@@ -61,7 +61,7 @@ use crate::routes::catalog_query;
 use crate::routes::catalog_search;
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::schema_versions;
-use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
+use crate::routes::support::{js_string, num_or_zero, prettify, str_col, upstream_message};
 use crate::state::AppState;
 
 use crate::tenant::{
@@ -274,7 +274,7 @@ async fn assemble_catalog(state: &AppState) -> Result<(Value, Vec<(String, Strin
 fn list_unavailable(err: ChError) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        ApiJson(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
+        ApiJson(json!({ "error": upstream_message(err), "assets": [], "namespaces": [] })),
     )
         .into_response()
 }
@@ -382,7 +382,7 @@ pub async fn query(
         Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({
-                "error": js_error(err),
+                "error": upstream_message(err),
                 "items": [],
                 "totalItems": 0,
                 "totalPages": 0,
@@ -1993,7 +1993,7 @@ async fn bronze_asset_detail(
         // status: 503 }); }` in `catalog/[id]/route.ts`.
         Err(err) => Ok((
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response()),
     }

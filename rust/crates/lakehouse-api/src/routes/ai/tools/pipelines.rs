@@ -24,6 +24,7 @@ use axum::response::IntoResponse;
 use super::{api_result_to_value, arg_str, response_to_value};
 use crate::routes::pipelines::TriggerBody;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// The Dagster job the demo code location builds the whole lakehouse with.
 /// The product code location (`dagster/dispar_orchestrate`) has no such
@@ -196,7 +197,12 @@ pub(super) async fn get_build_status(dagster: &lakehouse_dagster::DgClient) -> V
                 .collect();
             json!({ "jobs": jobs, "recentRuns": recent })
         }
-        (Err(err), _) | (_, Err(err)) => json!({ "error": err.to_string() }),
+        (Err(err), _) | (_, Err(err)) => upstream_error::report(
+            &upstream_error::SERVICE,
+            upstream_error::Class::Failed,
+            &err,
+        )
+        .to_json(),
     }
 }
 
@@ -224,7 +230,12 @@ pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient
                          dihapus. Cek hasilnya dengan get_maintenance_metrics.",
             })
         }
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report(
+            &upstream_error::SERVICE,
+            upstream_error::Class::Failed,
+            &err,
+        )
+        .to_json(),
     }
 }
 

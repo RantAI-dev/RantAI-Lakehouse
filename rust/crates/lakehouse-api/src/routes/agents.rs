@@ -1139,7 +1139,20 @@ async fn run_headless_loop(
             }
             Err(err) => {
                 step_no += 1;
-                let detail = format!("AI Copilot unavailable: {err}");
+                // SEC-11: this step is stored and shown to whoever opens the run;
+                // the provider's text goes to the log under a reference.
+                let detail = format!(
+                    "AI Copilot unavailable. {}",
+                    crate::upstream_error::report(
+                        &crate::upstream_error::MODEL,
+                        match &err {
+                            lakehouse_llm::LlmError::Transport(_) =>
+                                crate::upstream_error::Class::Unavailable,
+                            lakehouse_llm::LlmError::Api(_) => crate::upstream_error::Class::Failed,
+                        },
+                        &err,
+                    )
+                );
                 append_step(
                     pg,
                     run_id,
