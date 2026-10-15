@@ -1264,13 +1264,17 @@ describe("Sample tab: the data preview", () => {
     it("closes on Escape pressed inside the panel, and gives the focus to the grid", async () => {
       await openPreview()
 
+      // A real press focuses the cell, which moves the grid's tab stop to it; `fireEvent.click`
+      // alone does not, so the focus is given here.
+      cellOf(1, "id").focus()
       fireEvent.click(cellOf(1, "id"))
       const copy = within(inspector() as HTMLElement).getByRole("button", { name: "Copy value" })
       copy.focus()
       fireEvent.keyDown(copy, { key: "Escape" })
       expect(inspector()).toBeNull()
-      // The tab stop is the first cell until the reader moves; here it has moved to the picked one.
-      expect(document.activeElement).toBe(cellOf(1, "id"))
+      // PR #160 CI fix: compared as a boolean. `toBe` on two different happy-dom elements walked
+      // both trees for ~75 s (and the old expectation named a cell the tab stop was not on).
+      expect(document.activeElement === cellOf(1, "id")).toBe(true)
     })
 
     it("drops a picked cell when another size is chosen, and keeps a picked column", async () => {

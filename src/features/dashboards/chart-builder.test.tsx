@@ -1,8 +1,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
+
+import * as realAuth from "@/features/auth/auth-provider"
 
 // The builder reads the signed-in user's permissions; a plain editor without `dashboard:sql` is enough here.
-mock.module("@/features/auth/auth-provider", () => ({ useAuth: () => ({ hasPermission: () => false }) }))
+// PR #160 CI fix: `mock.module` outlives this file in `bun test src`, so the real exports are kept and only
+// `useAuth` is replaced, and the real module is put back in `afterAll`; a bare `{ useAuth }` left
+// `tenant-switcher.test.tsx`, which runs later, without `AuthProvider`.
+const real = { ...realAuth }
+mock.module("@/features/auth/auth-provider", () => ({ ...real, useAuth: () => ({ hasPermission: () => false }) }))
+afterAll(() => {
+  mock.module("@/features/auth/auth-provider", () => real)
+})
 
 import { ChartBuilder, type ChartDef } from "./chart-builder"
 
