@@ -79,6 +79,12 @@ export type Asset = {
   steward?: string | null
   tags?: string[]
   /**
+   * `DATA-12` part 2: governed tags, `key -> value`, each value one the key
+   * allows (`/api/governance/tag-keys`). Beside `tags`, not instead of them.
+   * Absent when the asset has none.
+   */
+  governedTags?: Record<string, string>
+  /**
    * `DATA-12`: the mark a person with `governance:write` set. Absent when
    * the asset has none. `certificationNote` and `replacementAssetId` come
    * only with `"deprecated"`; `certifiedBy` is the display name of whoever
@@ -121,6 +127,13 @@ export type AssetAnnotation = {
   steward: string | null
   tags: string[]
   description: string | null
+  /**
+   * `DATA-12` part 2. Left out of a save, it leaves the asset's governed tags
+   * alone; sent, it replaces the whole set (`{}` clears it). The API checks
+   * each value against its key and refuses with a sentence naming the key and
+   * the allowed values. The detail's `annotation` carries the stored set.
+   */
+  governedTags?: Record<string, string>
 }
 
 export type AssetColumn = {
