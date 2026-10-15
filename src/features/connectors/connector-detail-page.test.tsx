@@ -107,6 +107,7 @@ function stubFetch(
     calls.push({ url: target, method })
     const key = `${method} ${target}`
     if (overrides[key]) return overrides[key]()
+    if (key === "GET /api/connectors/credential-settings") return json({ secretManager: null, typedCredentials: true })
     if (key === "GET /api/connectors/conn-a") return json(detail)
     if (key === "GET /api/connectors/conn-a/ingest-spec") return json(SPEC)
     if (key.startsWith("GET /api/connectors/conn-a/probe-history")) {
@@ -202,6 +203,26 @@ describe("ConnectorDetailPage", () => {
     expect(selected("Ingest")).toBe("false")
     expect(selected("Connection tests")).toBe("false")
     expect(window.history.replaceState).not.toHaveBeenCalled()
+  })
+
+  /** `SRC-12` part B: a reference credential, and the secret manager the installation reads from. */
+  it("says the credential is a reference and names the secret manager, when one is set up", async () => {
+    stubFetch(
+      { "GET /api/connectors/credential-settings": () => json({ secretManager: "gcp", typedCredentials: true }) },
+      { ...DETAIL, credentialSource: "reference", credentialManaged: false }
+    )
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    expect(await screen.findByText(/Reference to a secret in the secret manager/)).toBeDefined()
+    expect(await screen.findByText("Google Secret Manager")).toBeDefined()
+  })
+
+  it("leaves the secret manager fact out when none is set up", async () => {
+    stubFetch()
+    render(<ConnectorDetailPage connectorId="conn-a" />)
+    await screen.findByRole("heading", { level: 1, name: "db demo" })
+    await settle()
+    expect(screen.queryByText("Secret manager")).toBeNull()
   })
 
   it("marks a paused connector in the header and holds Run now back with the reason", async () => {

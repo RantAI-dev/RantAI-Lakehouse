@@ -8,6 +8,7 @@
 
 import * as React from "react"
 import { PencilIcon } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
@@ -20,9 +21,11 @@ import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-for
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
+import { SECRET_MANAGER_LABEL, referenceProblem } from "@/lib/connectors/secret-reference"
 import type {
   CdcDial,
   CredentialKind,
+  CredentialSettings,
   CredentialSource,
   FilesDial,
   KafkaDial,
@@ -34,6 +37,7 @@ import type {
   SqlDriver,
 } from "@/services/contracts/connectors"
 import { CredentialValueInput, credentialValueProblem } from "./credential-value-input"
+import { SecretReferenceField } from "./secret-reference-field"
 
 /**
  * `CreateConnectorInput.host` still exists on the base connector row
@@ -293,16 +297,27 @@ export function credentialProblems({
   slots,
   primaryValue,
   secondaryValue,
+  referenceManager = null,
 }: {
   noCredential: boolean
   optional: boolean
   slots: CredentialSlots
   primaryValue: string
   secondaryValue: string
+  /** Set while the form is in "Reference a secret" mode: the values are references. */
+  referenceManager?: CredentialSettings["secretManager"]
 }): { primary: string | null; secondary: string | null } {
   if (noCredential) return { primary: null, secondary: null }
   const nothingTyped = primaryValue === "" && (!slots.secondary || secondaryValue === "")
   if (optional && nothingTyped) return { primary: null, secondary: null }
+  if (referenceManager) {
+    const check = (reference: string) =>
+      reference === "" ? "Required." : referenceProblem(referenceManager, reference)
+    return {
+      primary: check(primaryValue),
+      secondary: slots.secondary ? check(secondaryValue) : null,
+    }
+  }
   return {
     primary: credentialValueProblem(normalizedCredential(slots.primary, primaryValue)),
     secondary: slots.secondary
@@ -328,6 +343,9 @@ export function CredentialFields({
   secondaryValue,
   onSecondaryValueChange,
   problems,
+  settings = null,
+  referenceMode = false,
+  onReferenceModeChange,
 }: {
   noCredential: boolean
   /** Edit page: blank keeps the current credential. */
@@ -342,41 +360,78 @@ export function CredentialFields({
   secondaryValue: string
   onSecondaryValueChange: (value: string) => void
   problems: { primary: string | null; secondary: string | null }
+  /** What this installation offers (`SRC-12` part B); `null` until loaded. */
+  settings?: CredentialSettings | null
+  /** Whether the credential is a reference to a secret in the secret manager. */
+  referenceMode?: boolean
+  onReferenceModeChange?: (referenceMode: boolean) => void
 }) {
   if (noCredential) {
     return <p className="text-xs text-muted-foreground">This connection authenticates with no credential.</p>
   }
+  const manager = settings?.secretManager ?? null
+  // With a secret manager set up, the form offers "Reference a secret"; the
+  // operator can turn typing a value off, which leaves only the reference.
+  const showReference = manager !== null && referenceMode
   const pair = slots.secondary !== null && !slots.primary.multiline && !slots.secondary.multiline
+  const field = (id: string, slot: CredentialSlot, value: string, onChange: (value: string) => void) =>
+    showReference ? (
+      <SecretReferenceField key={`${id}-${credentialSlotsKey(slots)}`} manager={manager} idPrefix={id} onChange={onChange} />
+    ) : (
+      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} />
+    )
   return (
-    <div className={cn("grid gap-3", pair && "sm:grid-cols-2")}>
+    <div className={cn("grid gap-3", pair && !showReference && "sm:grid-cols-2")}>
+      {manager !== null && onReferenceModeChange ? (
+        <div className={cn("space-y-1", pair && !showReference && "sm:col-span-2")}>
+          <div role="group" aria-label="How the credential is given" className="inline-flex gap-1">
+            {settings?.typedCredentials ? (
+              <Button
+                type="button"
+                size="sm"
+                variant={referenceMode ? "outline" : "default"}
+                aria-pressed={!referenceMode}
+                onClick={() => onReferenceModeChange(false)}
+              >
+                Type a value
+              </Button>
+            ) : null}
+            <Button
+              type="button"
+              size="sm"
+              variant={referenceMode ? "default" : "outline"}
+              aria-pressed={referenceMode}
+              onClick={() => onReferenceModeChange(true)}
+            >
+              Reference a secret
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Secret manager: {SECRET_MANAGER_LABEL[manager]}.
+            {settings?.typedCredentials ? "" : " Typing a value is turned off on this installation."}
+          </p>
+        </div>
+      ) : null}
       <Field
-        label={slots.primary.label}
-        htmlFor="credential-primary"
+        label={showReference ? `${slots.primary.label} (reference)` : slots.primary.label}
+        htmlFor={showReference ? undefined : "credential-primary"}
         error={primaryValue && problems.primary ? problems.primary : undefined}
       >
-        <CredentialValueInput
-          id="credential-primary"
-          slot={slots.primary}
-          value={primaryValue}
-          onChange={onPrimaryValueChange}
-        />
+        {field("credential-primary", slots.primary, primaryValue, onPrimaryValueChange)}
       </Field>
       {slots.secondary ? (
         <Field
-          label={slots.secondary.label}
-          htmlFor="credential-secondary"
+          label={showReference ? `${slots.secondary.label} (reference)` : slots.secondary.label}
+          htmlFor={showReference ? undefined : "credential-secondary"}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
-          <CredentialValueInput
-            id="credential-secondary"
-            slot={slots.secondary}
-            value={secondaryValue}
-            onChange={onSecondaryValueChange}
-          />
+          {field("credential-secondary", slots.secondary, secondaryValue, onSecondaryValueChange)}
         </Field>
       ) : null}
       <p className={cn("text-xs text-muted-foreground", pair && "sm:col-span-2")}>
-        {optional
+        {showReference
+          ? "Only the reference is stored. The product reads the secret from the secret manager at every test and every run, after checking now that it can read it and that the connection works. Changing the secret there takes effect at the next run."
+          : optional
           ? credentialManaged
             ? "Leave blank to keep the current credential. A new one is tested against the source before it replaces the old."
             : credentialSource === "env"

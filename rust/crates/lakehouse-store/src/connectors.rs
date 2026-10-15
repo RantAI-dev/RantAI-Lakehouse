@@ -583,7 +583,19 @@ pub enum CredentialSource {
     /// one: every id begins `conn-`, so a `File` name always begins
     /// `connector_conn_`.
     Managed,
+    /// A reference to a secret in the installation's secret manager
+    /// (`SRC-12` part B): `vault:…`, `aws-sm:…`, `gcp-sm:…` or `azure-kv:…`.
+    /// Only the reference is stored; the product reads the value from the
+    /// manager at every use. Never derived from a connector id (the user
+    /// names the place), so it is set only by `PUT …/credential`, and
+    /// [`derive_secret_ref`] has no real name to give it.
+    Reference,
 }
+
+/// The schemes of the secret-manager references ([`CredentialSource::Reference`]).
+/// `lakehouse-api`'s `SecretManagerKind::scheme` is the authority and a test
+/// there asserts this list equals it; this crate cannot depend on it.
+pub const MANAGER_REF_SCHEMES: [&str; 4] = ["vault:", "aws-sm:", "gcp-sm:", "azure-kv:"];
 
 /// The fixed prefix every [`CredentialSource::Managed`] ref starts with —
 /// see that variant's doc comment.
@@ -608,6 +620,11 @@ pub fn credential_source_of_ref(secret_ref: &str) -> Option<CredentialSource> {
         Some(CredentialSource::Env)
     } else if secret_ref.starts_with("file:") {
         Some(CredentialSource::File)
+    } else if MANAGER_REF_SCHEMES
+        .iter()
+        .any(|scheme| secret_ref.starts_with(scheme))
+    {
+        Some(CredentialSource::Reference)
     } else {
         None
     }
@@ -746,7 +763,12 @@ pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKin
             let key = id.to_ascii_uppercase().replace('-', "_");
             format!("env:CONNECTOR_{key}_{}", kind.suffix())
         }
-        CredentialSource::File => {
+        // A reference is what the user names, not something derived from the
+        // id, so it has no real name to give: callers refuse that source
+        // before asking (`create`, `rotate_secret`). If one ever did not, it
+        // gets the operator-file name of the slot, which nothing provisions:
+        // a read fails closed (not found) and never reads a wrong secret.
+        CredentialSource::File | CredentialSource::Reference => {
             let key = id.replace('-', "_");
             format!(
                 "file:/run/secrets/connector_{key}_{}",
@@ -2721,7 +2743,13 @@ mod tests {
             credential_source_of_ref("file:/run/secrets/connector_managed_conn_x_password"),
             Some(CredentialSource::Managed)
         );
-        assert_eq!(credential_source_of_ref("vault:secret/x"), None);
+        // `SRC-12` part B: a secret-manager reference is its own kind (this
+        // asserted `None` before the references existed).
+        assert_eq!(
+            credential_source_of_ref("vault:secret/x#k"),
+            Some(CredentialSource::Reference)
+        );
+        assert_eq!(credential_source_of_ref("consul:secret/x"), None);
         assert!(!is_managed_secret_ref(
             "file:/run/secrets/connector_pg_password"
         ));

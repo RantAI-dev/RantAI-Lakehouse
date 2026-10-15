@@ -110,6 +110,16 @@ pub enum ConfigError {
         "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiRelevantTables(String),
+    /// `CONNECTOR_TYPED_CREDENTIALS` was set to something other than `"true"`
+    /// or `"false"` (`SRC-12` decision 2).
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiSemanticLayer`]: a typo such as `"no"` would keep
+    /// typed credentials on for an operator who meant to turn them off.
+    #[error(
+        "CONNECTOR_TYPED_CREDENTIALS must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
+    )]
+    UnsupportedConnectorTypedCredentials(String),
     /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` was set to something that is not a
     /// positive whole number (`SEC-12`).
     ///
@@ -231,6 +241,11 @@ pub struct Config {
     /// sign-in settings are secrets: this field's `Debug` prints the manager
     /// only.
     pub secret_manager: crate::secret_manager::SecretManagerSettings,
+    /// Whether a user may type a credential value (`CONNECTOR_TYPED_CREDENTIALS`,
+    /// default on; only the exact word `false` turns it off). Off leaves
+    /// "reference a secret in the secret manager" as the only way to give a
+    /// connector a credential (`SRC-12` decision 2).
+    pub connector_typed_credentials: bool,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -928,6 +943,10 @@ impl std::fmt::Debug for Config {
             )
             .field("secret_manager", &self.secret_manager)
             .field(
+                "connector_typed_credentials",
+                &self.connector_typed_credentials,
+            )
+            .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
@@ -1244,6 +1263,11 @@ impl Config {
             connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
             connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
             secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
+            connector_typed_credentials: parse_switch(
+                env,
+                "CONNECTOR_TYPED_CREDENTIALS",
+                ConfigError::UnsupportedConnectorTypedCredentials,
+            )?,
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -2288,6 +2312,25 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("\"true\""), "{message}");
         assert!(message.contains("\"false\""), "{message}");
+    }
+
+    /// `SRC-12` decision 2: typing a credential value is on unless the
+    /// operator says exactly `false`, and a typo is refused at start-up.
+    #[test]
+    fn typed_credentials_are_on_unless_the_operator_says_false() {
+        for unset in [None, Some(""), Some("true")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), v.to_owned())])
+            });
+            assert!(Config::from_map(&env).unwrap().connector_typed_credentials);
+        }
+        let off = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "false".to_owned())]);
+        assert!(!Config::from_map(&off).unwrap().connector_typed_credentials);
+        let typo = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "no".to_owned())]);
+        assert_eq!(
+            Config::from_map(&typo).unwrap_err(),
+            ConfigError::UnsupportedConnectorTypedCredentials("no".to_owned())
+        );
     }
 
     fn env_with(key: &str, value: &str) -> HashMap<String, String> {

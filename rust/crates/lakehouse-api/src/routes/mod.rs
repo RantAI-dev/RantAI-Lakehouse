@@ -582,6 +582,12 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/types",
             get(connectors::list_types),
         )
+        .route(
+            // `SRC-12` part B: static, so matched ahead of
+            // `/api/connectors/{id}` like `/types`.
+            "/api/connectors/credential-settings",
+            get(connectors::credential_settings),
+        )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(

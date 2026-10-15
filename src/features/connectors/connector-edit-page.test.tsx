@@ -103,6 +103,9 @@ function stubFetch(
     if (key === "GET /api/connectors/types") {
       return json([{ name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null }])
     }
+    if (key === "GET /api/connectors/credential-settings") {
+      return json({ secretManager: null, typedCredentials: true })
+    }
     if (key === "GET /api/connectors/conn-a") return json(detail)
     if (key === "GET /api/connectors/conn-a/ingest-spec") return json(SPEC)
     if (key === "PATCH /api/connectors/conn-a") return json({ ...DETAIL, name: "renamed" })
@@ -483,5 +486,59 @@ describe("ConnectorEditPage", () => {
     next(page)
     fireEvent.click(page.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(page.getByText(/stored without a test/)).toBeDefined())
+  })
+
+  /**
+   * `SRC-12` part B, decision 2: with a secret manager set up the form
+   * offers "Reference a secret"; only the reference is sent, the server
+   * reads it and tests the connection before saving.
+   */
+  it("sends a reference to a secret instead of a value when the secret manager is used", async () => {
+    const calls = stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "vault", typedCredentials: true }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.click(await waitFor(() => page.getByRole("button", { name: "Reference a secret" })))
+    expect(page.getByText(/Secret manager: HashiCorp Vault/)).toBeDefined()
+    // No value box in this mode: the secret stays in the secret manager.
+    expect(page.queryByLabelText("Password")).toBeNull()
+    fireEvent.change(page.getByLabelText("Path in Vault"), { target: { value: "secret/connectors/orders" } })
+    fireEvent.change(page.getByLabelText("Key in the secret"), { target: { value: "password" } })
+    next(page)
+    next(page)
+    expect(page.getByText(/Reference to a secret for the password/)).toBeDefined()
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+    const credentialPut = writes(calls).find((c) => c.url.endsWith("/credential"))
+    expect(credentialPut?.body).toEqual({ primary: { reference: "vault:secret/connectors/orders#password" } })
+  })
+
+  it("holds back a reference that is plainly malformed", async () => {
+    stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "azure", typedCredentials: true }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.click(await waitFor(() => page.getByRole("button", { name: "Reference a secret" })))
+    fireEvent.change(page.getByLabelText("Vault name"), { target: { value: "ab" } })
+    fireEvent.change(page.getByLabelText("Secret name"), { target: { value: "orders-db" } })
+    expect(page.getByText(/Give the vault's name/)).toBeDefined()
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("offers only the reference when the operator turned typing a value off", async () => {
+    stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "aws", typedCredentials: false }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    await waitFor(() => page.getByLabelText("Secret name or ARN"))
+    expect(page.queryByRole("button", { name: "Type a value" })).toBeNull()
+    expect(page.queryByLabelText("Password")).toBeNull()
+    expect(page.getByText(/Typing a value is turned off/)).toBeDefined()
   })
 })

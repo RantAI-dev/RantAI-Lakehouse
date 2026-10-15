@@ -364,6 +364,37 @@ services:
       # rotate-secrets-key`): it opens files, it never seals.
       CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
       CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
+      # SRC-12 part B (decisions 1 and 2): the installation's ONE secret
+      # manager, if any. Unset (empty) means none, and then a connector's
+      # credential is a typed value or an operator's env/file. The sign-in to
+      # the manager is the operator's, here, never set in the console: it is
+      # itself a secret. The same block is on `dagster-code-location`, which
+      # reads the secrets itself at the start of every run. Empty values are
+      # ignored by both services (no default token anywhere, rule 5).
+      #   vault:  VAULT_ADDR, then VAULT_TOKEN or VAULT_ROLE_ID + VAULT_SECRET_ID
+      #   aws:    AWS_REGION and a role or access keys (the AWS_* below)
+      #   gcp:    GOOGLE_APPLICATION_CREDENTIALS (a service-account file the
+      #           operator mounts into BOTH services), or the platform identity
+      #   azure:  AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET, or a
+      #           managed identity
+      SECRET_MANAGER: ${SECRET_MANAGER:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_SECRETS_MANAGER: ${AWS_ENDPOINT_URL_SECRETS_MANAGER:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      # SRC-12 decision 2: `false` turns typing a credential value off, so
+      # connectors can only reference a secret in the secret manager. Anything
+      # else keeps typing possible. Read by `lakehouse-api` only.
+      CONNECTOR_TYPED_CREDENTIALS: ${CONNECTOR_TYPED_CREDENTIALS:-}
 
       # SEC-10: alert and digest webhooks refuse the same private/internal
       # addresses as the connector tests above, never follow a redirect, and
@@ -1796,6 +1827,22 @@ services:
       # the previous key only during a key change.
       CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
       CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
+      # SRC-12 part B: the same secret manager settings as `lakehouse-api`
+      # (see the block there), read by `secret_manager.py` when a run starts.
+      SECRET_MANAGER: ${SECRET_MANAGER:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_SECRETS_MANAGER: ${AWS_ENDPOINT_URL_SECRETS_MANAGER:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}

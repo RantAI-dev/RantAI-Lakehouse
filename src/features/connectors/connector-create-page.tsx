@@ -14,6 +14,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
+import { SECRET_MANAGER_LABEL } from "@/lib/connectors/secret-reference"
 import type { Connector, CredentialSpec } from "@/services/contracts/connectors"
 import {
   CredentialFields,
@@ -60,6 +61,14 @@ export function ConnectorCreatePage() {
   // cleared right after, never rendered back.
   const [primaryValue, setPrimaryValue] = React.useState("")
   const [secondaryValue, setSecondaryValue] = React.useState("")
+  // `SRC-12` part B: with a secret manager set up, the credential may be a
+  // reference to a secret in it instead of a typed value.
+  const settings = useService(connectorService.getCredentialSettings)
+  const [referenceChosen, setReferenceChosen] = React.useState(false)
+  const credentialSettings = settings.status === "success" ? settings.data : null
+  // The operator can turn typing off: then a reference is the only way.
+  const referenceMode =
+    credentialSettings?.secretManager != null && (referenceChosen || !credentialSettings.typedCredentials)
   const [environment, setEnvironment] = React.useState("production")
   const { user, activeTenantId } = useAuth()
   // Defaults to the tenant the user is acting as — the one the connector
@@ -115,7 +124,7 @@ export function ConnectorCreatePage() {
   React.useEffect(() => {
     setPrimaryValue("")
     setSecondaryValue("")
-  }, [slotsKey])
+  }, [slotsKey, referenceMode])
 
   const create = useServiceAction(
     withNotify(
@@ -142,12 +151,31 @@ export function ConnectorCreatePage() {
     )
   )
 
+  const setReference = useServiceAction(
+    withNotify(
+      {
+        success: "Secret reference saved",
+        error: "The connector was created, but the secret reference was not saved",
+      },
+      (signal, input: { id: string; primary: string; secondary: string }) =>
+        connectorService.setCredential(
+          input.id,
+          {
+            primary: { reference: input.primary },
+            ...(slots.secondary ? { secondary: { reference: input.secondary } } : {}),
+          },
+          signal
+        )
+    )
+  )
+
   const problems = credentialProblems({
     noCredential: usesNoCredential,
     optional: false,
     slots,
     primaryValue,
     secondaryValue,
+    referenceManager: referenceMode ? credentialSettings?.secretManager : null,
   })
 
   const canProceed =
@@ -166,7 +194,9 @@ export function ConnectorCreatePage() {
       source: "managed",
       primary: slots.primary.kind,
       ...(slots.secondary ? { secondary: slots.secondary.kind } : {}),
-      ...(usesNoCredential
+      // A reference is not a value to store: it is set once the connector
+      // exists, by the same probe-first route as an edit (below).
+      ...(usesNoCredential || referenceMode
         ? {}
         : {
             values: {
@@ -199,7 +229,20 @@ export function ConnectorCreatePage() {
       // connector without its host/port/user/database and fail for a
       // reason that has nothing to do with the credential.
       const saved = await saveSpec.run(result.id)
-      if (saved) {
+      // A reference is read once and the connection tested before it is
+      // saved (the credential route is probe-first), with the connection
+      // settings just saved. If that fails the connector exists without a
+      // credential and says so: the same reference can be set from its edit
+      // page.
+      const referenced =
+        saved && referenceMode && !usesNoCredential
+          ? await setReference.run({
+              id: result.id,
+              primary: primaryValue,
+              secondary: secondaryValue,
+            })
+          : saved
+      if (referenced) {
         await test.run(result.id)
       } else {
         setTestSkipped(true)
@@ -373,6 +416,9 @@ export function ConnectorCreatePage() {
                 secondaryValue={secondaryValue}
                 onSecondaryValueChange={setSecondaryValue}
                 problems={problems}
+                settings={credentialSettings}
+                referenceMode={referenceMode}
+                onReferenceModeChange={setReferenceChosen}
               />
             </section>
           </div>
@@ -412,7 +458,15 @@ export function ConnectorCreatePage() {
                         ? "None"
                         : `${slots.primary.label}${
                             slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
-                          } · entered, stored by lakehouse`,
+                          } · ${
+                            referenceMode
+                              ? `reference to a secret in ${
+                                  credentialSettings?.secretManager
+                                    ? SECRET_MANAGER_LABEL[credentialSettings.secretManager]
+                                    : "the secret manager"
+                                }, read at every use`
+                              : "entered, stored by lakehouse"
+                          }`,
                     },
                   ],
                 },
@@ -438,7 +492,9 @@ export function ConnectorCreatePage() {
                 <li>
                   {usesNoCredential
                     ? "No credential is stored: this connection authenticates with none."
-                    : "The credential is stored by lakehouse and never shown again."}
+                    : referenceMode
+                      ? "Only the reference to the secret is stored; the secret itself stays in the secret manager."
+                      : "The credential is stored by lakehouse and never shown again."}
                 </li>
                 <li>The connection settings are saved, then the connection is tested. You see the result here.</li>
                 <li>

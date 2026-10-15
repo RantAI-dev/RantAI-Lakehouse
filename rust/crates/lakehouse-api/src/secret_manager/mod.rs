@@ -271,19 +271,13 @@ pub(crate) trait ManagerBackend: fmt::Debug + Send + Sync {
 /// Built once at start-up; it holds the settings and nothing the manager
 /// returned.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "built by the per-manager clients of B2 to B5; until then only tests construct it"
-)]
 pub struct ManagerResolver {
     kind: SecretManagerKind,
     backend: Arc<dyn ManagerBackend>,
 }
 
 impl ManagerResolver {
-    /// The resolver for `settings`, or `None` when no manager is set (or,
-    /// until its client lands, when the chosen manager has none: a
-    /// reference then fails as unsupported at use, never as a value).
+    /// The resolver for `settings`, or `None` when no manager is set.
     ///
     /// Infallible on purpose: every setting is checked by
     /// [`SecretManagerSettings::from_map`] when the configuration is read,
@@ -329,13 +323,6 @@ impl ManagerResolver {
     #[cfg(test)]
     pub(crate) fn with_backend(kind: SecretManagerKind, backend: Arc<dyn ManagerBackend>) -> Self {
         Self { kind, backend }
-    }
-
-    /// The manager this resolver reads.
-    #[must_use]
-    #[allow(dead_code, reason = "used by AppState once a client exists (B2 to B5)")]
-    pub fn kind(&self) -> SecretManagerKind {
-        self.kind
     }
 }
 
@@ -462,6 +449,28 @@ mod tests {
         let shown = format!("{settings:?}");
         assert!(!shown.contains("very-secret"));
         assert!(!shown.contains("v:8200"));
+    }
+
+    /// Every manager the settings can name has a client in this build.
+    #[test]
+    fn each_complete_setting_builds_the_resolver_of_its_manager() {
+        for (name, extra) in [
+            (
+                "vault",
+                vec![("VAULT_ADDR", "http://v:8200"), ("VAULT_TOKEN", "t")],
+            ),
+            ("aws", vec![("AWS_REGION", "eu-west-1")]),
+            ("gcp", vec![]),
+            ("azure", vec![]),
+        ] {
+            let mut pairs = vec![("SECRET_MANAGER", name)];
+            pairs.extend(extra);
+            let settings = SecretManagerSettings::from_map(&env(&pairs)).unwrap();
+            let resolver = ManagerResolver::from_settings(&settings).unwrap();
+            assert_eq!(resolver.kind.as_str(), name);
+        }
+        let none = SecretManagerSettings::from_map(&env(&[])).unwrap();
+        assert!(ManagerResolver::from_settings(&none).is_none());
     }
 
     /// A backend that answers one canned result and counts nothing else.

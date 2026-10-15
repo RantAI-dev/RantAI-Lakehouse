@@ -30,7 +30,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_core::secret::SecretValue;
+use lakehouse_core::secret::{SecretError, SecretValue};
 use lakehouse_dagster::{DgConfiguredRun, map_run_status};
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -49,6 +49,7 @@ use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarg
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::secret_manager::{SecretManagerKind, refs as manager_refs};
 use crate::state::AppState;
 use crate::upstream_error::orchestrator_unreachable;
 
@@ -480,6 +481,37 @@ pub async fn update(
     Ok(ApiJson(updated))
 }
 
+/// What `POST /api/connectors` may carry for a credential, under the
+/// operator's settings (`SRC-12` part B), and the rule that two slots never
+/// name one credential.
+///
+/// # Errors
+///
+/// 400 for the `reference` source — it names a place in the secret manager
+/// that the client chooses, while a new connector's credential names are
+/// derived from its id, so a reference is set after creation, probe-first, by
+/// `PUT …/credential` — for typed values when the operator turned typing off,
+/// and for a primary and a secondary of the same kind.
+fn check_create_credential(
+    state: &AppState,
+    credential: &CredentialSpecBody,
+) -> Result<(), ApiError> {
+    if credential.source == connectors::CredentialSource::Reference {
+        return Err(ApiError::BadRequest(REFERENCE_AFTER_CREATE.to_owned()));
+    }
+    if credential.values.is_some() && !state.config.connector_typed_credentials {
+        return Err(ApiError::BadRequest(TYPED_CREDENTIALS_OFF.to_owned()));
+    }
+    if credential.secondary == Some(credential.primary) {
+        return Err(ApiError::BadRequest(
+            "credential.primary and credential.secondary must be different kinds: both would \
+             name the same credential"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The `POST /api/connectors` body's `credential` field. Mirrors
 /// `CreateConnectorInput["credential"]` in `contracts/connectors.ts`.
 ///
@@ -715,14 +747,7 @@ pub async fn create(
         .into());
     }
     let source = body.credential.source;
-    if body.credential.secondary == Some(body.credential.primary) {
-        return Err(ApiError::BadRequest(
-            "credential.primary and credential.secondary must be different kinds: both would \
-             name the same credential"
-                .to_owned(),
-        )
-        .into());
-    }
+    check_create_credential(&state, &body.credential)?;
     let values = credential_values(
         source,
         body.credential.secondary.is_some(),
@@ -1206,6 +1231,9 @@ pub async fn rotate_secret(
     body: Bytes,
 ) -> ApiResult<ApiJson<RotateSecretResponse>> {
     let body: RotateSecretBody = parse_body(&body)?;
+    if body.source == connectors::CredentialSource::Reference {
+        return Err(ApiError::BadRequest(REFERENCE_AFTER_CREATE.to_owned()).into());
+    }
     // Derived from THIS connector's own id -- see `RotateSecretBody`'s doc
     // comment for why this can never target a reserved, deployment-owned
     // pattern.
@@ -1338,10 +1366,20 @@ pub async fn rotate_secret(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialSlotBody {
-    /// The suffix the managed name ends in.
-    kind: connectors::CredentialKind,
-    /// The credential itself. Write-only; see [`SecretInput`].
-    value: SecretInput,
+    /// The suffix the managed name ends in. Required with `value`; a
+    /// `reference` is not derived from it and ignores it.
+    #[serde(default)]
+    kind: Option<connectors::CredentialKind>,
+    /// The credential itself. Write-only; see [`SecretInput`]. Exactly one of
+    /// `value` and `reference` is sent.
+    #[serde(default)]
+    value: Option<SecretInput>,
+    /// A reference to a secret in the installation's secret manager
+    /// (`vault:…`, `aws-sm:…`, `gcp-sm:…`, `azure-kv:…`; `SRC-12` part B). It
+    /// names a place, never a value: the API reads it once, tests the
+    /// connection with what it read, and stores only the reference.
+    #[serde(default)]
+    reference: Option<String>,
 }
 
 /// The `PUT /api/connectors/{id}/credential` body. Mirrors
@@ -1391,12 +1429,123 @@ pub struct SetCredentialResponse {
     message: String,
 }
 
+/// What a slot's new credential is.
+enum Provided {
+    /// A value the user typed: written, sealed, to the managed store.
+    Typed(SecretValue),
+    /// A reference to a secret in the secret manager: nothing is written. The
+    /// value read from the manager before the probe (`resolved`) is held only
+    /// for that probe and for the request, and is never stored or audited.
+    Reference { resolved: Option<SecretValue> },
+}
+
 /// One slot a [`set_credential`] request changes, validated.
 struct SlotChange {
     slot: connectors::SecretSlot,
+    /// The managed name derived from the connector's id for a typed value,
+    /// or the reference itself.
     new_ref: String,
-    value: SecretValue,
+    provided: Provided,
     old_ref: Option<String>,
+}
+
+impl SlotChange {
+    /// What the probe resolves `new_ref` to: the typed value, or what the
+    /// secret manager returned.
+    fn candidate_value(&self) -> Option<&SecretValue> {
+        match &self.provided {
+            Provided::Typed(value) => Some(value),
+            Provided::Reference { resolved } => resolved.as_ref(),
+        }
+    }
+
+    /// The value to write to the managed store; `None` for a reference.
+    fn value_to_store(&self) -> Option<&SecretValue> {
+        match &self.provided {
+            Provided::Typed(value) => Some(value),
+            Provided::Reference { .. } => None,
+        }
+    }
+
+    fn is_reference(&self) -> bool {
+        matches!(self.provided, Provided::Reference { .. })
+    }
+}
+
+/// What a user may do with a credential on this installation (`SRC-12` part
+/// B, decision 2), from the operator's settings.
+#[derive(Debug, Clone, Copy)]
+struct CredentialPolicy {
+    /// The installation's secret manager; `None` means a reference is
+    /// refused.
+    manager: Option<SecretManagerKind>,
+    /// Whether typing a value is allowed (`CONNECTOR_TYPED_CREDENTIALS`).
+    typed_allowed: bool,
+}
+
+impl CredentialPolicy {
+    fn of(state: &AppState) -> Self {
+        Self {
+            manager: state.config.secret_manager.kind,
+            typed_allowed: state.config.connector_typed_credentials,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for CredentialPolicy {
+    /// No secret manager, typing allowed: how every installation was before
+    /// part B, and what the older tests assume.
+    fn default() -> Self {
+        Self {
+            manager: None,
+            typed_allowed: true,
+        }
+    }
+}
+
+/// The refusals of the credential policy, one text each so the console and
+/// the assistant show the same words.
+const TYPED_CREDENTIALS_OFF: &str = "Typing a credential is turned off on this installation. \
+     Reference a secret in the secret manager instead.";
+const NO_SECRET_MANAGER: &str = "No secret manager is set up on this installation, so a secret \
+     cannot be referenced. Type the credential, or ask an operator to set one up.";
+const REFERENCE_AFTER_CREATE: &str = "A reference to a secret is set after the connector exists, \
+     with PUT /api/connectors/{id}/credential: it is read and the connection tested before it is \
+     saved.";
+
+/// What `GET /api/connectors/credential-settings` answers (`SRC-12` part B):
+/// what the credential form may offer. Nothing here is an address, a sign-in
+/// or a secret.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSettingsResponse {
+    /// The installation's secret manager (`vault`, `aws`, `gcp`, `azure`), or
+    /// `null` when the operator set none up.
+    secret_manager: Option<&'static str>,
+    /// `false` when the operator turned typing a credential off.
+    typed_credentials: bool,
+}
+
+/// `GET /api/connectors/credential-settings` — what this installation offers
+/// for a connector's credential: its secret manager, if any, and whether a
+/// value may be typed (`SRC-12` decision 2). Read by the credential form and
+/// the connector page.
+///
+/// # Errors
+///
+/// None of its own; the policy table already requires `connector:manage`.
+pub async fn credential_settings(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<CredentialSettingsResponse>> {
+    Ok(ApiJson(CredentialSettingsResponse {
+        secret_manager: state
+            .config
+            .secret_manager
+            .kind
+            .map(SecretManagerKind::as_str),
+        typed_credentials: state.config.connector_typed_credentials,
+    }))
 }
 
 /// The refusal for a change of where a connector points that does not
@@ -1435,18 +1584,35 @@ fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
     }
 }
 
-/// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent,
-/// each with its managed ref derived from THIS connector's id.
+/// [`slot_changes_with`] under the policy every installation had before part B
+/// (typing allowed, no secret manager); the tests of the typed path use it.
+#[cfg(test)]
+fn slot_changes(
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+    body: SetCredentialBody,
+) -> Result<Vec<SlotChange>, ApiError> {
+    slot_changes_with(id, dial_info, body, CredentialPolicy::default())
+}
+
+/// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent.
+/// A typed value gets its managed ref derived from THIS connector's id; a
+/// reference is checked against the grammar of the installation's secret
+/// manager (`policy`) and is its own ref.
 ///
 /// # Errors
 ///
 /// 400 for a secondary credential on a connector that reads only one, for
 /// a slot that would end up naming the same credential as the other slot
-/// (one would overwrite the other's file), or for an unusable value.
-fn slot_changes(
+/// (one would overwrite the other's file), for an unusable value, for typing
+/// when the operator turned it off, for a reference when no secret manager is
+/// set up or one that does not fit it, and for a slot that sends both a value
+/// and a reference or neither.
+fn slot_changes_with(
     id: &str,
     dial_info: &ConnectorDialInfo,
     body: SetCredentialBody,
+    policy: CredentialPolicy,
 ) -> Result<Vec<SlotChange>, ApiError> {
     if body.secondary.is_some() && !has_secondary_slot(dial_info) {
         return Err(ApiError::BadRequest(
@@ -1460,21 +1626,56 @@ fn slot_changes(
         (connectors::SecretSlot::Secondary, body.secondary),
     ] {
         let Some(input) = input else { continue };
-        let value = input.value.into_secret();
-        crate::connector_secret_store::validate_secret_value(value.expose_secret())
-            .map_err(|err| ApiError::BadRequest(format!("{}: {err}", slot.as_str())))?;
+        let (new_ref, provided) = match (input.value, input.reference) {
+            (Some(value), None) => {
+                if !policy.typed_allowed {
+                    return Err(ApiError::BadRequest(TYPED_CREDENTIALS_OFF.to_owned()));
+                }
+                let kind = input.kind.ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "{}: kind is required with a value",
+                        slot.as_str()
+                    ))
+                })?;
+                let value = value.into_secret();
+                crate::connector_secret_store::validate_secret_value(value.expose_secret())
+                    .map_err(|err| ApiError::BadRequest(format!("{}: {err}", slot.as_str())))?;
+                (
+                    connectors::derive_secret_ref(id, connectors::CredentialSource::Managed, kind),
+                    Provided::Typed(value),
+                )
+            }
+            (None, Some(reference)) => {
+                let manager = policy
+                    .manager
+                    .ok_or_else(|| ApiError::BadRequest(NO_SECRET_MANAGER.to_owned()))?;
+                // The same grammar the resolver applies when it reads; a
+                // reference that fits no manager shape never reaches it.
+                manager_refs::parse(manager, &reference).map_err(|err| {
+                    ApiError::BadRequest(format!(
+                        "{}: {err} for {}",
+                        slot.as_str(),
+                        manager.as_str()
+                    ))
+                })?;
+                (reference, Provided::Reference { resolved: None })
+            }
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "{}: send either a value (with its kind) or a reference, not both and not \
+                     neither",
+                    slot.as_str()
+                )));
+            }
+        };
         let old_ref = match slot {
             connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
             connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
         };
         changes.push(SlotChange {
             slot,
-            new_ref: connectors::derive_secret_ref(
-                id,
-                connectors::CredentialSource::Managed,
-                input.kind,
-            ),
-            value,
+            new_ref,
+            provided,
             old_ref,
         });
     }
@@ -1500,6 +1701,95 @@ fn slot_changes(
         ));
     }
     Ok(changes)
+}
+
+/// Read each reference of `changes` from the secret manager, once, so the
+/// probe can test the connection with what it returns and a reference to
+/// nothing, or one the product may not read, is refused before anything is
+/// saved (`SRC-12` decision 2). `not_saved` starts the message ("the
+/// credential was NOT saved").
+///
+/// # Errors
+///
+/// 422 with the fixed text of the failure (the manager cannot be reached, the
+/// product may not sign in or read, the secret does not exist, is not a single
+/// text); never a manager's own words. 400 when the allowlist or the grammar
+/// refuses the reference, which the earlier validation makes unreachable
+/// unless the settings changed under it.
+async fn resolve_references(
+    state: &AppState,
+    changes: &mut [SlotChange],
+    not_saved: &str,
+) -> Result<(), ApiError> {
+    for change in changes.iter_mut() {
+        let Provided::Reference { resolved } = &mut change.provided else {
+            continue;
+        };
+        match state
+            .connector_secret_resolver
+            .resolve_dyn(&change.new_ref)
+            .await
+        {
+            Ok(value) => *resolved = Some(value),
+            Err(SecretError::Failed { failure, .. }) => {
+                return Err(ApiError::Unprocessable(format!("{not_saved}: {failure}")));
+            }
+            Err(_) => {
+                return Err(ApiError::BadRequest(
+                    "that reference is not one this installation can read".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The probe's resolver for `changes`: each slot's new ref answers from
+/// memory (a typed value, or what the manager returned), every other ref goes
+/// to the allowlisted resolver.
+fn candidate_resolver(
+    state: &AppState,
+    changes: &[SlotChange],
+) -> crate::connector_secret_store::CandidateSecretResolver {
+    crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .filter_map(|c| {
+                c.candidate_value()
+                    .map(|value| (c.new_ref.clone(), value.clone()))
+            })
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    )
+}
+
+/// The audit details of a credential change: the slots, how each is held,
+/// the secret manager for a reference, and whether a probe verified it.
+///
+/// A REFERENCE is audited as it is: it names a place (a path, a secret name, a
+/// version id), never a credential, and who pointed which connector at which
+/// secret is what an auditor asks. A typed value is never audited, and neither
+/// is anything a manager returned (`SRC-12` decision 11). A managed name
+/// derived from the connector's id stays out, as before.
+fn credential_audit_details(
+    manager: Option<SecretManagerKind>,
+    changes: &[SlotChange],
+    verified: bool,
+) -> Value {
+    json!({
+        "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
+        "sources": changes
+            .iter()
+            .map(|c| if c.is_reference() { "reference" } else { "managed" })
+            .collect::<Vec<_>>(),
+        "references": changes
+            .iter()
+            .filter(|c| c.is_reference())
+            .map(|c| c.new_ref.as_str())
+            .collect::<Vec<_>>(),
+        "manager": manager.map(SecretManagerKind::as_str),
+        "verified": verified,
+    })
 }
 
 /// The connector as the probe should see it: each changed slot naming its
@@ -1628,27 +1918,35 @@ async fn publish_credentials<T>(
 ) -> Result<T, ApiError> {
     let store = &state.connector_secret_store;
     let _serialized = store.lock().await;
-    let staged = store
-        .stage(
-            &changes
-                .iter()
-                .map(|c| (c.new_ref.clone(), c.value.clone()))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(|err| secret_store_error(&err))?;
-    let published = staged
-        .publish()
-        .await
-        .map_err(|err| secret_store_error(&err))?;
-    let written = match write.await {
-        Ok(written) => written,
-        Err(err) => {
-            published.rollback().await;
-            return Err(err);
-        }
+    // A reference writes no file: only typed values are staged.
+    let typed: Vec<(String, SecretValue)> = changes
+        .iter()
+        .filter_map(|c| {
+            c.value_to_store()
+                .map(|value| (c.new_ref.clone(), value.clone()))
+        })
+        .collect();
+    let written = if typed.is_empty() {
+        write.await?
+    } else {
+        let staged = store
+            .stage(&typed)
+            .await
+            .map_err(|err| secret_store_error(&err))?;
+        let published = staged
+            .publish()
+            .await
+            .map_err(|err| secret_store_error(&err))?;
+        let written = match write.await {
+            Ok(written) => written,
+            Err(err) => {
+                published.rollback().await;
+                return Err(err);
+            }
+        };
+        published.commit().await;
+        written
     };
-    published.commit().await;
     // A slot whose kind changed no longer names its old managed file —
     // unless that file is now the OTHER slot's (the two swapped kinds).
     for change in changes {
@@ -1719,15 +2017,12 @@ pub async fn set_credential(
     };
 
     let pending_dial = body.dial.take();
-    let changes = slot_changes(&id, &dial_info, body)?;
+    let mut changes = slot_changes_with(&id, &dial_info, body, CredentialPolicy::of(&state))?;
     let candidate = candidate_dial_info(&dial_info, &changes, pending_dial)?;
-    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
-        changes
-            .iter()
-            .map(|c| (c.new_ref.clone(), c.value.clone()))
-            .collect(),
-        state.connector_secret_resolver.clone(),
-    );
+    // After the re-point rule, so a refused change makes no call to the
+    // secret manager (SEC-14): "refused before any lookup or connection".
+    resolve_references(&state, &mut changes, "the credential was NOT saved").await?;
+    let resolver = candidate_resolver(&state, &changes);
     let outcome = crate::connector_probe::probe(
         &candidate,
         &resolver,
@@ -1746,16 +2041,18 @@ pub async fn set_credential(
 
     let slots: Vec<connectors::SecretSlot> = changes.iter().map(|c| c.slot).collect();
     // Same audit convention as `rotate_secret`: successful mutations only,
-    // best-effort, the slots and whether they were verified — never a ref
-    // name, never a value.
+    // best-effort; the slots, how each is held and whether they were
+    // verified — never a value, and a reference only as
+    // `credential_audit_details` says.
     let event = connector_audit_event(
         &principal,
         "connector.credential_set",
         &id,
-        json!({
-            "slots": slots.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "verified": outcome.supported,
-        }),
+        credential_audit_details(
+            state.config.secret_manager.kind,
+            &changes,
+            outcome.supported,
+        ),
         "executed",
     );
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
@@ -3091,7 +3388,7 @@ async fn save_with_credentials(
     let mut after = stored;
     after.adapter = Some(input.adapter.clone());
     after.dial = input.dial.clone();
-    let changes = slot_changes(
+    let mut changes = slot_changes_with(
         id,
         &after,
         SetCredentialBody {
@@ -3099,17 +3396,15 @@ async fn save_with_credentials(
             secondary: credential.secondary,
             dial: None,
         },
+        CredentialPolicy::of(state),
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
     check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
-    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
-        changes
-            .iter()
-            .map(|c| (c.new_ref.clone(), c.value.clone()))
-            .collect(),
-        state.connector_secret_resolver.clone(),
-    );
+    // Only after the address is approved: a refused target makes no call to
+    // the secret manager.
+    resolve_references(state, &mut changes, "the change was NOT saved").await?;
+    let resolver = candidate_resolver(state, &changes);
     let outcome = crate::connector_probe::probe(
         &candidate,
         &resolver,
@@ -3150,8 +3445,8 @@ async fn save_with_credentials(
     })
     .await?;
 
-    // The slots and whether the probe really dialled — never a ref name,
-    // never a value (same convention as `connector.credential_set`).
+    // The same details as `connector.credential_set`: never a value, a
+    // reference only as `credential_audit_details` says.
     let event = connector_audit_event(
         &principal,
         if repoint {
@@ -3160,10 +3455,11 @@ async fn save_with_credentials(
             "connector.credential_set"
         },
         id,
-        json!({
-            "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
-            "verified": outcome.supported,
-        }),
+        credential_audit_details(
+            state.config.secret_manager.kind,
+            &changes,
+            outcome.supported,
+        ),
         "executed",
     );
     if let Err(err) = store_audit::insert(pool(state)?, event).await {
@@ -5243,5 +5539,171 @@ mod tests {
             serde_json::to_value(IngestSpecResponse::new(spec("cdc", Some("0 2 * * *")), now))
                 .unwrap();
         assert!(cdc["nextRunAt"].is_null());
+    }
+    // ── SRC-12 part B: a credential can be a reference ───────────────────
+
+    fn vault_policy(typed_allowed: bool) -> CredentialPolicy {
+        CredentialPolicy {
+            manager: Some(SecretManagerKind::Vault),
+            typed_allowed,
+        }
+    }
+
+    /// A reference is its own ref: nothing is derived, nothing is written, and
+    /// the file the slot used to name is the old ref (removed after the swap).
+    #[test]
+    fn a_reference_is_its_own_ref_and_has_nothing_to_store() {
+        let info = credential_info(
+            Some("sql"),
+            &managed(connectors::CredentialKind::Password),
+            None,
+        );
+        let changes = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "reference": "vault:secret/a#k" } })),
+            vault_policy(true),
+        )
+        .expect("a reference for the configured manager");
+        assert_eq!(changes[0].new_ref, "vault:secret/a#k");
+        assert!(changes[0].is_reference());
+        assert!(changes[0].value_to_store().is_none());
+        assert!(changes[0].candidate_value().is_none(), "not read yet");
+        assert_eq!(
+            changes[0].old_ref.as_deref(),
+            Some(managed(connectors::CredentialKind::Password).as_str())
+        );
+    }
+
+    #[test]
+    fn a_reference_is_refused_without_a_secret_manager_or_of_another_managers_scheme() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let body = || set_body(json!({ "primary": { "reference": "vault:secret/a#k" } }));
+        let none = slot_changes_with("conn-x", &info, body(), CredentialPolicy::default());
+        let Err(ApiError::BadRequest(message)) = none else {
+            panic!("expected 400");
+        };
+        assert_eq!(message, NO_SECRET_MANAGER);
+        for bad in [
+            "aws-sm:prod/orders",
+            "vault:secret/../etc#k",
+            "vault:secret/a",
+            "env:CONNECTOR_X_PASSWORD",
+        ] {
+            let result = slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": { "reference": bad } })),
+                vault_policy(true),
+            );
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_slot_sends_a_value_or_a_reference_never_both_or_neither() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        for slot in [
+            json!({ "kind": "password", "value": "pw", "reference": "vault:secret/a#k" }),
+            json!({ "kind": "password" }),
+            json!({}),
+            json!({ "value": "pw" }),
+        ] {
+            let result = slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": slot })),
+                vault_policy(true),
+            );
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{slot}");
+        }
+    }
+
+    #[test]
+    fn typing_a_value_can_be_turned_off_while_a_reference_still_works() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let typed = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "password", "value": "hunter2" } })),
+            vault_policy(false),
+        );
+        let Err(ApiError::BadRequest(message)) = typed else {
+            panic!("expected 400");
+        };
+        assert_eq!(message, TYPED_CREDENTIALS_OFF);
+        assert!(!message.contains("hunter2"));
+        assert!(
+            slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": { "reference": "vault:secret/a#k" } })),
+                vault_policy(false),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Decision 11: the audit details name a reference and the manager, and
+    /// carry neither a typed value nor the derived managed name.
+    #[test]
+    fn the_audit_details_name_a_reference_and_never_a_value() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        let changes = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "hunter2-typed" },
+                "secondary": { "reference": "vault:secret/a#k" }
+            })),
+            vault_policy(true),
+        )
+        .expect("a typed primary and a referenced secondary");
+        let details = credential_audit_details(Some(SecretManagerKind::Vault), &changes, true);
+        assert_eq!(details["sources"], json!(["managed", "reference"]));
+        assert_eq!(details["references"], json!(["vault:secret/a#k"]));
+        assert_eq!(details["manager"], "vault");
+        assert_eq!(details["verified"], true);
+        let shown = details.to_string();
+        assert!(!shown.contains("hunter2-typed"), "{shown}");
+        assert!(!shown.contains("connector_managed_"), "{shown}");
+    }
+
+    #[test]
+    fn a_slot_body_prints_a_reference_but_nothing_of_a_value() {
+        let reference: CredentialSlotBody =
+            serde_json::from_value(json!({ "reference": "vault:secret/a#k" })).unwrap();
+        assert!(format!("{reference:?}").contains("vault:secret/a#k"));
+        let value: CredentialSlotBody =
+            serde_json::from_value(json!({ "kind": "password", "value": "hunter2-slot" })).unwrap();
+        assert!(!format!("{value:?}").contains("hunter2-slot"));
+        let unknown: Result<CredentialSlotBody, _> =
+            serde_json::from_value(json!({ "reference": "x", "extra": 1 }));
+        assert!(unknown.is_err());
+    }
+
+    /// `lakehouse-store` names the four schemes itself (it cannot depend on
+    /// this crate); they must be the managers' own.
+    #[test]
+    fn the_store_recognises_exactly_the_managers_schemes() {
+        for kind in SecretManagerKind::ALL {
+            assert!(
+                connectors::MANAGER_REF_SCHEMES.contains(&kind.scheme()),
+                "{}",
+                kind.scheme()
+            );
+            assert_eq!(
+                connectors::credential_source_of_ref(&format!("{}x", kind.scheme())),
+                Some(connectors::CredentialSource::Reference)
+            );
+        }
+        assert_eq!(
+            connectors::MANAGER_REF_SCHEMES.len(),
+            SecretManagerKind::ALL.len()
+        );
     }
 }

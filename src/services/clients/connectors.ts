@@ -21,6 +21,7 @@ import type {
   RotateConnectorSecretRequest,
   RotateConnectorSecretResponse,
   SchemaChangeList,
+  CredentialSettings,
   SetConnectorCredentialRequest,
   SetConnectorCredentialResponse,
   UpdateConnectorInput,
@@ -120,6 +121,9 @@ export const postgresConnectorService: ConnectorService = {
   },
   listTypes(signal) {
     return getJson<ConnectorType[]>("/api/connectors/types", { signal });
+  },
+  getCredentialSettings(signal) {
+    return getJson<CredentialSettings>("/api/connectors/credential-settings", { signal });
   },
   listIngestible(signal) {
     return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });

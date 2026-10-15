@@ -207,9 +207,13 @@ export type SecretSlot = "primary" | "secondary"
 /**
  * Which resolver scheme a derived connector-credential name uses. Mirrors
  * Rust `CredentialSource` (`rust/crates/lakehouse-store/src/connectors.rs`)
- * field-for-field, including its `snake_case` wire form.
+ * field-for-field, including its `snake_case` wire form. `reference` is a
+ * reference to a secret in the installation's secret manager (`SRC-12` part
+ * B): only the reference is stored, and the value is read at every use. The
+ * client never chooses it at create time; it is set with
+ * `PUT /api/connectors/{id}/credential`.
  */
-export type CredentialSource = "env" | "file" | "managed"
+export type CredentialSource = "env" | "file" | "managed" | "reference"
 
 /**
  * The fixed suffix a derived connector-credential name ends in. Mirrors
@@ -258,10 +262,25 @@ export type CredentialValues = {
   secondary?: string
 }
 
-/** One slot's new credential in a `PUT /api/connectors/{id}/credential` body. */
-export type CredentialSlotValue = {
-  kind: CredentialKind
-  value: string
+/**
+ * One slot's new credential in a `PUT /api/connectors/{id}/credential` body:
+ * a value to store, or (when the installation has a secret manager) a
+ * reference to a secret in it. A reference names a place (`vault:...`,
+ * `aws-sm:...`, `gcp-sm:...`, `azure-kv:...`), never a value; the server
+ * reads it once and tests the connection before saving it.
+ */
+export type CredentialSlotValue = { kind: CredentialKind; value: string } | { reference: string }
+
+/**
+ * `GET /api/connectors/credential-settings`: what this installation offers
+ * for a credential (`SRC-12` part B, decision 2). `secretManager` is the one
+ * secret manager the operator set up, or `null`; `typedCredentials` is
+ * `false` when the operator turned typing a value off
+ * (`CONNECTOR_TYPED_CREDENTIALS=false`).
+ */
+export type CredentialSettings = {
+  secretManager: "vault" | "aws" | "gcp" | "azure" | null
+  typedCredentials: boolean
 }
 
 /**
@@ -1005,6 +1024,8 @@ export interface ConnectorService {
     body: RotateConnectorSecretRequest,
     signal?: AbortSignal
   ): Promise<RotateConnectorSecretResponse>
+  /** `GET /api/connectors/credential-settings` — see `CredentialSettings`. */
+  getCredentialSettings(signal?: AbortSignal): Promise<CredentialSettings>
   /**
    * `PUT /api/connectors/{id}/credential` — save a user-supplied credential
    * as the connector's lakehouse-managed credential, probe-first (ADR 0002

@@ -21,6 +21,7 @@ import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { SECRET_MANAGER_LABEL, type SecretManager } from "@/lib/connectors/secret-reference"
 import { TEST_OUTCOME_TOAST, testOutcome, type TestOutcome } from "@/lib/connectors/test-result"
 import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
@@ -61,6 +62,8 @@ function credentialFact(source: ConnectorDetail["credentialSource"]): string {
       return "Environment variable on the server (a restart is needed after a change)"
     case "file":
       return "File on the server"
+    case "reference":
+      return "Reference to a secret in the secret manager (read at every use, never copied)"
     default:
       return "Provisioned on the server"
   }
@@ -73,12 +76,15 @@ function credentialFact(source: ConnectorDetail["credentialSource"]): string {
  * the name) are already in the header and are not repeated here (reviewer
  * SHOULD-FIX R1).
  */
-function connectorFacts(c: ConnectorDetail): MetadataItem[] {
+function connectorFacts(c: ConnectorDetail, secretManager: SecretManager | null): MetadataItem[] {
   return [
     { label: "Tenant", value: c.tenant || "Unassigned" },
     { label: "Residency", value: c.residency || "—" },
     { label: "Owner", value: c.owner || "—" },
     { label: "Credential", value: credentialFact(c.credentialSource) },
+    // `SRC-12` part B: which secret manager this installation reads from, when
+    // the operator set one up.
+    ...(secretManager ? [{ label: "Secret manager", value: SECRET_MANAGER_LABEL[secretManager] }] : []),
     {
       label: "Last test",
       value:
@@ -211,6 +217,9 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // The latest test, for the red count on the Connection tests tab. Reloaded
   // after a test of this page; `keepDataOnReload` so the count does not blink
   // out while it is asked again.
+  // What this installation offers for a credential. A failed read only means
+  // the "Secret manager" fact is left out; nothing else on the page needs it.
+  const credentialSettings = useService((s) => connectorService.getCredentialSettings(s), [])
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -342,7 +351,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           </>
         }
       />
-      <MetadataList density="compact" columns={3} items={connectorFacts(c)} />
+      <MetadataList density="compact" columns={3} items={connectorFacts(c, credentialSettings.status === "success" ? credentialSettings.data.secretManager : null)} />
       <ConnectorDeleteDialog
         connector={c}
         dependents={c.dependentPipelines}

@@ -238,6 +238,84 @@ describe("ConnectorCreatePage", () => {
   })
 
   /**
+   * `SRC-12` part B: with a secret manager set up, the credential can be a
+   * reference. The connector is created with nothing stored, the connection
+   * settings are saved, then the reference is set through the same
+   * probe-first route an edit uses, and only then is the connection tested.
+   */
+  it("creates a connector whose credential is a reference to a secret in the secret manager", async () => {
+    const calls = stubFetch((url, method) => {
+      if (url.endsWith("/api/connectors/credential-settings")) {
+        return json({ secretManager: "vault", typedCredentials: true })
+      }
+      if (url.endsWith("/api/connectors") && method === "POST") {
+        return json(
+          {
+            id: "conn-orders-k3x9",
+            name: "orders",
+            type: "PostgreSQL",
+            direction: "source",
+            health: "unknown",
+            environment: "production",
+            tenant: "Acme Co",
+            lastTestAt: null,
+            lastActivityAt: null,
+            lastRunSuccessAt: null,
+            lastRunFailureAt: null,
+            failureStreak: 0,
+            schemaChangePolicy: "apply_non_breaking",
+            pausedReason: null,
+            pausedAt: null,
+            capabilities: [],
+            owner: "Current user",
+            credential: { primary: "file:/run/secrets/connector_managed_conn_orders_k3x9_password", secondary: null },
+            credentialStored: false,
+          },
+          201
+        )
+      }
+      if (url.includes("/ingest-spec")) {
+        return json({ adapter: "sql", ingestMode: "batch", dial: {}, sourceObjects: [], scheduleCron: null })
+      }
+      if (url.endsWith("/credential") && method === "PUT") {
+        return json({ saved: true, slots: ["primary"], verified: true, message: "ok" })
+      }
+      if (url.includes("/test")) {
+        return json({ ok: true, supported: true, latencyMs: 12, message: "ok", testedAt: "2026-01-01T00:00:00.000Z" })
+      }
+      if (url.endsWith("/runs")) return json({ runs: [] })
+      return null
+    })
+    const page = renderPage()
+    await waitFor(() =>
+      expect(page.getByRole("radio", { name: /PostgreSQL/ }).getAttribute("aria-checked")).toBe("true")
+    )
+    fireEvent.change(page.getByLabelText("Name"), { target: { value: "orders" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    fireEvent.click(await waitFor(() => page.getByRole("button", { name: "Reference a secret" })))
+    expect(page.queryByLabelText("Password")).toBeNull()
+    fireEvent.change(page.getByLabelText("Path in Vault"), { target: { value: "secret/connectors/orders" } })
+    fireEvent.change(page.getByLabelText("Key in the secret"), { target: { value: "password" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    await waitFor(() => page.getByLabelText("Residency"))
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
+    fireEvent.click(page.getByRole("button", { name: "Next" }))
+    expect(page.getByText(/reference to a secret in HashiCorp Vault, read at every use/)).toBeDefined()
+    fireEvent.click(page.getByRole("button", { name: "Create connector" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+
+    const create = calls.find((c) => c.url.endsWith("/api/connectors") && c.method === "POST")
+    expect((create?.body as { credential: unknown }).credential).toEqual({ source: "managed", primary: "password" })
+    const order = (match: (c: Call) => boolean) => calls.findIndex(match)
+    const specIndex = order((c) => c.url.includes("/ingest-spec") && c.method === "PUT")
+    const credentialIndex = order((c) => c.url.endsWith("/credential") && c.method === "PUT")
+    const testIndex = order((c) => c.url.includes("/test"))
+    expect(credentialIndex).toBeGreaterThan(specIndex)
+    expect(testIndex).toBeGreaterThan(credentialIndex)
+    expect(calls[credentialIndex].body).toEqual({ primary: { reference: "vault:secret/connectors/orders#password" } })
+  })
+
+  /**
    * Both resolvers read a stored credential back trimmed, so a password
    * with a leading/trailing space would be saved and then never match. The
    * wizard says so and will not continue.

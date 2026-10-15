@@ -558,6 +558,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // gated, not the narrower `ingest:read` scope minted only for the
     // Dagster ingest service identity.
     ("GET",  "/api/connectors/types",       Policy::RequiresPermission("connector:manage")),
+    // SRC-12 part B: what the credential form may offer (the installation's
+    // secret manager, and whether typing a value is allowed). Names no
+    // address, sign-in or secret; read by whoever can set a credential.
+    ("GET",  "/api/connectors/credential-settings", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
     // Was missing entirely while `routes::mod` registered `.delete(...)` on
