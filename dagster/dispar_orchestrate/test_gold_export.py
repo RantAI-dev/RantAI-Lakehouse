@@ -600,5 +600,217 @@ class GoldKeepCopiesParsingTests(unittest.TestCase):
             self.assertEqual(cfg.gold_export_token_file, "/custom/path/gold.jwt")
             self.assertEqual(parse_gold_keep_copies(cfg.gold_keep_copies), 14)
 
+
+class GoldTrimOpTests(unittest.TestCase):
+    """DATA-2 T3: unit tests for trim_gold_mart (no network; PyIceberg and ClickHouse mocked).
+    - 9 copies keep 7
+    - 7 copies delete nothing and record nothing_to_trim
+    - a delete failure records failed with a fixed reason and leaves export result untouched
+    - a skipped export does not trim
+    """
+
+    def _make_arrow_table(self, timestamps: list[Any]):
+        import pyarrow as pa
+        return pa.Table.from_arrays([pa.array(timestamps)], names=["_exported_at"])
+
+    def test_nine_copies_keep_seven(self) -> None:
+        import datetime
+        from unittest.mock import MagicMock, patch
+
+        timestamps = [
+            datetime.datetime(2026, 10, 14, 10, i, 0, tzinfo=datetime.timezone.utc)
+            for i in range(1, 10)
+        ]
+        arrow_table = self._make_arrow_table(timestamps)
+        # timestamps descending: 9, 8, 7, 6, 5, 4, 3, 2, 1
+        # 7th newest is 3: datetime(2026, 10, 14, 10, 3, 0)
+        cutoff = timestamps[2]  # index 2 in ascending list is the 3rd oldest / 7th newest
+
+        mock_table = MagicMock()
+        mock_table.scan.return_value.to_arrow.return_value = arrow_table
+        snapshots = [MagicMock(snapshot_id=i) for i in range(1, 10)]
+        mock_table.snapshots.return_value = snapshots
+        mock_table.current_snapshot.return_value = snapshots[-1]  # snapshot 9
+
+        mock_catalog = MagicMock()
+        mock_catalog.load_table.return_value = mock_table
+
+        cfg = _cfg()
+        export_result = {"rowsExported": 42}
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog", return_value=mock_catalog), \
+             patch("dispar_orchestrate.maintenance.ensure_catalog_database") as mock_ensure_db, \
+             patch("dispar_orchestrate.maintenance.run_remove_orphan_files", return_value={"deleted_data_files_count": 2}) as mock_orphan, \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", export_result)
+
+        self.assertEqual(res, {"rowsExported": 42})
+        mock_table.delete.assert_called_once()
+        del_arg = mock_table.delete.call_args[0][0]
+        self.assertEqual(del_arg.term.name, "_exported_at")
+        self.assertEqual(del_arg.literal.value, int(cutoff.timestamp() * 1_000_000))
+
+        mock_table.maintenance.expire_snapshots.return_value.by_ids.assert_called_once()
+        expired_ids = mock_table.maintenance.expire_snapshots.return_value.by_ids.call_args[0][0]
+        self.assertEqual(len(expired_ids), 8)
+        self.assertNotIn(9, expired_ids)
+
+        mock_orphan.assert_called_once_with(
+            cfg, "gold.sales_mart", dry_run=False, catalog_db="icecat_gold_export", older_than_seconds=0
+        )
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["mart"], "sales_mart")
+        self.assertEqual(kwargs["status"], "success")
+        self.assertEqual(kwargs["copies_kept"], 7)
+        self.assertEqual(kwargs["oldest_kept_exported_at"], cutoff)
+        self.assertEqual(kwargs["copies_removed"], 2)
+        self.assertEqual(kwargs["snapshots_expired"], 8)
+        self.assertEqual(kwargs["files_removed"], 2)
+        self.assertIsNone(kwargs["reason"])
+
+    def test_seven_copies_delete_nothing_and_record_nothing_to_trim(self) -> None:
+        import datetime
+        from unittest.mock import MagicMock, patch
+
+        timestamps = [
+            datetime.datetime(2026, 10, 14, 10, i, 0, tzinfo=datetime.timezone.utc)
+            for i in range(1, 8)
+        ]
+        arrow_table = self._make_arrow_table(timestamps)
+
+        mock_table = MagicMock()
+        mock_table.scan.return_value.to_arrow.return_value = arrow_table
+
+        mock_catalog = MagicMock()
+        mock_catalog.load_table.return_value = mock_table
+
+        cfg = _cfg()
+        export_result = {"rowsExported": 10}
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog", return_value=mock_catalog), \
+             patch("dispar_orchestrate.maintenance.run_remove_orphan_files") as mock_orphan, \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", export_result)
+
+        self.assertEqual(res, {"rowsExported": 10})
+        mock_table.delete.assert_not_called()
+        mock_table.maintenance.expire_snapshots.assert_not_called()
+        mock_orphan.assert_not_called()
+
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["mart"], "sales_mart")
+        self.assertEqual(kwargs["status"], "nothing_to_trim")
+        self.assertEqual(kwargs["copies_kept"], 7)
+        self.assertEqual(kwargs["copies_removed"], 0)
+        self.assertEqual(kwargs["snapshots_expired"], 0)
+        self.assertEqual(kwargs["files_removed"], 0)
+        self.assertEqual(kwargs["reason"], "at_or_below_keep_copies")
+
+    def test_delete_failure_records_failed_with_fixed_reason_and_leaves_export_untouched(self) -> None:
+        import datetime
+        from unittest.mock import MagicMock, patch
+
+        timestamps = [
+            datetime.datetime(2026, 10, 14, 10, i, 0, tzinfo=datetime.timezone.utc)
+            for i in range(1, 10)
+        ]
+        arrow_table = self._make_arrow_table(timestamps)
+
+        mock_table = MagicMock()
+        mock_table.scan.return_value.to_arrow.return_value = arrow_table
+        mock_table.delete.side_effect = RuntimeError("disk failure")
+
+        mock_catalog = MagicMock()
+        mock_catalog.load_table.return_value = mock_table
+
+        cfg = _cfg()
+        export_result = {"rowsExported": 10}
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog", return_value=mock_catalog), \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", export_result)
+
+        # Untouched export result
+        self.assertEqual(res, {"rowsExported": 10})
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["mart"], "sales_mart")
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertEqual(kwargs["reason"], "delete_failed")
+
+    def test_commit_conflict_records_commit_conflict_reason(self) -> None:
+        import datetime
+        from unittest.mock import MagicMock, patch
+        from pyiceberg.exceptions import CommitFailedException
+
+        timestamps = [
+            datetime.datetime(2026, 10, 14, 10, i, 0, tzinfo=datetime.timezone.utc)
+            for i in range(1, 10)
+        ]
+        arrow_table = self._make_arrow_table(timestamps)
+
+        mock_table = MagicMock()
+        mock_table.scan.return_value.to_arrow.return_value = arrow_table
+        mock_table.delete.side_effect = CommitFailedException("HTTP 409 conflict")
+
+        mock_catalog = MagicMock()
+        mock_catalog.load_table.return_value = mock_table
+
+        cfg = _cfg()
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog", return_value=mock_catalog), \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", {"rowsExported": 10})
+
+        self.assertEqual(res, {"rowsExported": 10})
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertEqual(kwargs["reason"], "commit_conflict")
+
+    def test_skipped_export_does_not_trim(self) -> None:
+        from unittest.mock import patch
+
+        ctx = build_op_context()
+        export_result = {"skipped": True, "reason": "unchanged"}
+
+        with patch("dispar_orchestrate.gold_export.load_gold_catalog") as mock_catalog, \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", export_result)
+
+        self.assertEqual(res, {"skipped": True, "reason": "unchanged"})
+        mock_catalog.assert_not_called()
+        mock_record.assert_not_called()
+
+    def test_invalid_keep_copies_records_failed(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        cfg = mock.MagicMock()
+        cfg.gold_keep_copies = "0"
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog") as mock_catalog, \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", {"rowsExported": 10})
+
+        self.assertEqual(res, {"rowsExported": 10})
+        mock_catalog.assert_not_called()
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertEqual(kwargs["reason"], "invalid GOLD_KEEP_COPIES")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -268,6 +268,48 @@ console's manual publish (D1), Silver (`DATA-4`).
   - Added unit test suite `GoldKeepCopiesParsingTests` in `dagster/dispar_orchestrate/test_gold_export.py` (tested `7`, `1`, `0`, `-1`, `x`, empty, and env loading). All 29 tests pass.
   - Checked `docker compose --profile '*' config --quiet` (exit code 0).
 
+### Task T3: The Trim Op, PyIceberg Delete, Snapshot Expire and Orphan Cleanup (D1 + D3 + D5 + A1)
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - D5 + A1: Added  and  to  recording , , , , , , and fixed  strings.
+  - D1 + D3 + A1: Added  and mapped op  wired in :
+    - Keeps the newest  distinct  copies via PyIceberg .
+    - Expires unneeded snapshots via .
+    - Reclaims orphaned files through ClickHouse  with  and .
+    - Catches failures cleanly with fixed reasons (, , , , , ), preserving the export result untouched.
+    - Preserves skipped exports without trimming.
+  - Updated  to allow reusable  and  across custom catalog databases and retention windows.
+  - Unit tests: Added  in  covering:
+    - 9 copies keep 7 (asserts PyIceberg delete filter, snapshot expiry, orphan cleanup, and record).
+    - 7 copies delete nothing and record .
+    - Delete failure records  with fixed reason and leaves export result untouched.
+    - Commit conflict () records .
+    - Skipped export does not trim.
+    - Invalid  records  with .
+  - All 35 tests in , 41 tests in , and 10 tests in  pass.
+
+### Task T3: The Trim Op, PyIceberg Delete, Snapshot Expire and Orphan Cleanup (D1 + D3 + D5 + A1)
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - D5 + A1: Added `ensure_gold_trim_run_table` and `record_gold_trim_run` to `dagster/dispar_orchestrate/gold_export.py` recording `status`, `copies_kept`, `oldest_kept_exported_at`, `copies_removed`, `snapshots_expired`, `files_removed`, and fixed `reason` strings.
+  - D1 + D3 + A1: Added `run_trim_for_mart` and mapped op `trim_gold_mart(context, mart, export_result)` wired in `gold_export_job`:
+    - Keeps the newest `N` distinct `_exported_at` copies via PyIceberg `table.delete(LessThan("_exported_at", cutoff_time))`.
+    - Expires unneeded snapshots via `table.maintenance.expire_snapshots().by_ids(older_snapshot_ids).commit()`.
+    - Reclaims orphaned files through ClickHouse `run_remove_orphan_files` with `catalog_db="icecat_gold_export"` and `older_than_seconds=0`.
+    - Catches failures cleanly with fixed reasons (`"commit_conflict"`, `"delete_failed"`, `"expire_snapshots_failed"`, `"orphan_cleanup_failed"`, `"invalid GOLD_KEEP_COPIES"`, `"catalog_unavailable"`), preserving the export result untouched.
+    - Preserves skipped exports without trimming.
+  - Updated `maintenance.py` to allow reusable `ensure_catalog_database` and `run_remove_orphan_files` across custom catalog databases and retention windows.
+  - Unit tests: Added `GoldTrimOpTests` in `dagster/dispar_orchestrate/test_gold_export.py` covering:
+    - 9 copies keep 7 (asserts PyIceberg delete filter, snapshot expiry, orphan cleanup, and record).
+    - 7 copies delete nothing and record `nothing_to_trim`.
+    - Delete failure records `failed` with fixed reason and leaves export result untouched.
+    - Commit conflict (`CommitFailedException`) records `commit_conflict`.
+    - Skipped export does not trim.
+    - Invalid `GOLD_KEEP_COPIES` records `failed` with `"invalid GOLD_KEEP_COPIES"`.
+  - All 35 tests in `test_gold_export.py`, 41 tests in `test_maintenance.py`, and 10 tests in `test_op_source_metadata.py` pass.
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`

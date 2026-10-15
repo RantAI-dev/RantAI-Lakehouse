@@ -58,7 +58,9 @@ runs a zero-step job that still succeeds, which is the honest shape of
 
 from __future__ import annotations
 
+import datetime
 import os
+import uuid
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -82,7 +84,7 @@ from dagster import (
     run_status_sensor,
 )
 
-from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
+from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, record_maintenance_run
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
@@ -178,6 +180,14 @@ class GoldExportConfig:
             rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
             ch_oauth_client_id=_env("CH_OAUTH_CLIENT_ID", ""),
             ch_oauth_server_uri=_env("CH_OAUTH_SERVER_URI", ""),
+        )
+
+    def ch_auth_settings(self) -> str:
+        if not self.ch_oauth_client_id:
+            return ""
+        return (
+            f", catalog_credential = '{self.ch_oauth_client_id}:unused', "
+            f"oauth_server_uri = '{self.ch_oauth_server_uri}'"
         )
 
 
@@ -435,6 +445,402 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     return body
 
 
+
+def _sql_str(s: str | None) -> str:
+    if s is None:
+        return "NULL"
+    escaped = s.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def _sql_num(n: int | None) -> str:
+    if n is None:
+        return "NULL"
+    return str(int(n))
+
+
+def _sql_dt64(dt_or_ms: Any) -> str:
+    if dt_or_ms is None:
+        return "NULL"
+    if isinstance(dt_or_ms, (int, float)):
+        return f"fromUnixTimestamp64Milli({int(dt_or_ms)})"
+    if hasattr(dt_or_ms, "timestamp"):
+        ms = int(dt_or_ms.timestamp() * 1000)
+        return f"fromUnixTimestamp64Milli({ms})"
+    return f"parseDateTime64BestEffortOrNull({_sql_str(str(dt_or_ms))}, 3)"
+
+
+def ensure_gold_trim_run_table(target: ClickHouseTarget) -> None:
+    """Ensure `console.gold_trim_run` exists (DATA-2 D5 + A1)."""
+    _ch_exec(target, "CREATE DATABASE IF NOT EXISTS console")
+    _ch_exec(
+        target,
+        """CREATE TABLE IF NOT EXISTS console.gold_trim_run (
+            id String,
+            mart String,
+            status String,
+            copies_kept Nullable(UInt32),
+            oldest_kept_exported_at Nullable(DateTime64(3)),
+            copies_removed Nullable(UInt32),
+            snapshots_expired Nullable(UInt32),
+            files_removed Nullable(UInt32),
+            reason Nullable(String),
+            started_at DateTime64(3),
+            finished_at DateTime64(3)
+        ) ENGINE = MergeTree ORDER BY (mart, started_at)""",
+    )
+    _ch_exec(
+        target,
+        "ALTER TABLE console.gold_trim_run ADD COLUMN IF NOT EXISTS files_removed Nullable(UInt32)",
+    )
+
+
+def record_gold_trim_run(
+    target: ClickHouseTarget | None,
+    *,
+    mart: str,
+    status: str,
+    copies_kept: int | None = None,
+    oldest_kept_exported_at: Any = None,
+    copies_removed: int | None = None,
+    snapshots_expired: int | None = None,
+    files_removed: int | None = None,
+    reason: str | None = None,
+    started_at: Any = None,
+    finished_at: Any = None,
+) -> None:
+    """Record one trim run into `console.gold_trim_run` (DATA-2 D5 + A1)."""
+    if target is None:
+        return
+    ensure_gold_trim_run_table(target)
+    run_id = str(uuid.uuid4())
+    started_at = started_at or datetime.datetime.now(datetime.timezone.utc)
+    finished_at = finished_at or datetime.datetime.now(datetime.timezone.utc)
+    sql = (
+        f"INSERT INTO console.gold_trim_run ("
+        f"id, mart, status, copies_kept, oldest_kept_exported_at, "
+        f"copies_removed, snapshots_expired, files_removed, reason, "
+        f"started_at, finished_at) VALUES ("
+        f"{_sql_str(run_id)}, {_sql_str(mart)}, {_sql_str(status)}, "
+        f"{_sql_num(copies_kept)}, {_sql_dt64(oldest_kept_exported_at)}, "
+        f"{_sql_num(copies_removed)}, {_sql_num(snapshots_expired)}, "
+        f"{_sql_num(files_removed)}, {_sql_str(reason)}, "
+        f"{_sql_dt64(started_at)}, {_sql_dt64(finished_at)})"
+    )
+    _ch_exec(target, sql)
+
+
+def load_gold_catalog(cfg: GoldExportConfig) -> Any:
+    """Instantiate a PyIceberg `RestCatalog` with the `gold-export` token."""
+    token = ""
+    if cfg.gold_export_token_file and os.path.exists(cfg.gold_export_token_file):
+        with open(cfg.gold_export_token_file, encoding="utf-8") as f:
+            token = f.read().strip()
+    from pyiceberg.catalog.rest import RestCatalog
+
+    return RestCatalog(
+        name="lakekeeper",
+        warehouse=cfg.lakekeeper_warehouse,
+        uri=cfg.lakekeeper_catalog_uri,
+        token=token,
+        **{
+            "s3.endpoint": cfg.rustfs_endpoint,
+            "s3.access-key-id": cfg.rustfs_access_key,
+            "s3.secret-access-key": cfg.rustfs_secret_key,
+            "s3.region": "us-east-1",
+            "s3.path-style-access": "true",
+        },
+    )
+
+
+def run_trim_for_mart(
+    cfg: GoldExportConfig, mart: str, context: Any = None
+) -> dict[str, Any]:
+    """Execute trim logic for a single Gold mart (DATA-2 D1, D3, D5, A1)."""
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    log = context.log if context else None
+
+    # 1. Parse keep_copies (D4)
+    try:
+        keep_copies = parse_gold_keep_copies(cfg.gold_keep_copies)
+    except InvalidKeepCopiesError:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"invalid GOLD_KEEP_COPIES: {cfg.gold_keep_copies!r}")
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=INVALID_KEEP_COPIES_REASON,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": INVALID_KEEP_COPIES_REASON}
+
+    # 2. Connect to catalog and load table
+    try:
+        catalog = load_gold_catalog(cfg)
+        table = catalog.load_table(f"gold.{mart}")
+    except Exception as exc:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"failed to load table gold.{mart}: {exc}")
+        fixed_reason = "catalog_unavailable"
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=fixed_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": fixed_reason}
+
+    # 3. Check table contents
+    try:
+        df = table.scan().to_arrow()
+    except Exception as exc:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"failed to scan table gold.{mart}: {exc}")
+        fixed_reason = "table_scan_failed"
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=fixed_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": fixed_reason}
+
+    if len(df) == 0:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.info(f"gold.{mart} has 0 rows; nothing to trim")
+        record_gold_trim_run(
+            cfg.ch,
+            mart=mart,
+            status="nothing_to_trim",
+            copies_kept=0,
+            copies_removed=0,
+            snapshots_expired=0,
+            files_removed=0,
+            reason="at_or_below_keep_copies",
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        return {"status": "nothing_to_trim", "copies_kept": 0}
+
+    exported_at_col = df["_exported_at"].to_pylist()
+    distinct_exported_at = sorted(set(exported_at_col), reverse=True)
+    distinct_count = len(distinct_exported_at)
+
+    if distinct_count <= keep_copies:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        oldest_kept = distinct_exported_at[-1]
+        if log:
+            log.info(
+                f"gold.{mart} has {distinct_count} copies (<= keep_copies {keep_copies}); "
+                "nothing to trim"
+            )
+        record_gold_trim_run(
+            cfg.ch,
+            mart=mart,
+            status="nothing_to_trim",
+            copies_kept=distinct_count,
+            oldest_kept_exported_at=oldest_kept,
+            copies_removed=0,
+            snapshots_expired=0,
+            files_removed=0,
+            reason="at_or_below_keep_copies",
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        return {"status": "nothing_to_trim", "copies_kept": distinct_count}
+
+    # 4. Trimming: delete copies strictly older than the keep_copies-th newest
+    cutoff_time = distinct_exported_at[keep_copies - 1]
+    copies_to_remove = distinct_count - keep_copies
+    if log:
+        log.info(
+            f"trimming gold.{mart}: {distinct_count} copies, keeping {keep_copies}, "
+            f"removing {copies_to_remove} (cutoff {cutoff_time})"
+        )
+
+    # 4a. Delete rows
+    try:
+        from pyiceberg.expressions import LessThan
+
+        table.delete(LessThan("_exported_at", cutoff_time))
+    except Exception as exc:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"failed to delete rows from gold.{mart}: {exc}")
+        from pyiceberg.exceptions import CommitFailedException
+
+        fixed_reason = (
+            "commit_conflict"
+            if isinstance(exc, CommitFailedException)
+            else "delete_failed"
+        )
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=fixed_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": fixed_reason}
+
+    # 4b. Expire snapshots
+    try:
+        current_snapshot = table.current_snapshot()
+        current_snapshot_id = (
+            current_snapshot.snapshot_id if current_snapshot else None
+        )
+        older_snapshot_ids = [
+            s.snapshot_id
+            for s in table.snapshots()
+            if s.snapshot_id != current_snapshot_id
+        ]
+        if older_snapshot_ids:
+            table.maintenance.expire_snapshots().by_ids(older_snapshot_ids).commit()
+        snapshots_expired = len(older_snapshot_ids)
+    except Exception as exc:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"failed to expire snapshots for gold.{mart}: {exc}")
+        fixed_reason = "expire_snapshots_failed"
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=fixed_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": fixed_reason}
+
+    # 4c. ClickHouse remove_orphan_files (amendment A1)
+    files_removed = 0
+    try:
+        from dispar_orchestrate.maintenance import (
+            ensure_catalog_database,
+            run_remove_orphan_files,
+        )
+
+        catalog_db = "icecat_gold_export"
+        ensure_catalog_database(cfg, db_name=catalog_db)
+        orphan_res = run_remove_orphan_files(
+            cfg,
+            f"gold.{mart}",
+            dry_run=False,
+            catalog_db=catalog_db,
+            older_than_seconds=0,
+        )
+        files_removed = int(orphan_res.get("deleted_data_files_count", 0))
+    except Exception as exc:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(f"failed to remove orphan files for gold.{mart}: {exc}")
+        fixed_reason = "orphan_cleanup_failed"
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=fixed_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": fixed_reason}
+
+    # 5. Record success
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        record_gold_trim_run(
+            cfg.ch,
+            mart=mart,
+            status="success",
+            copies_kept=keep_copies,
+            oldest_kept_exported_at=cutoff_time,
+            copies_removed=copies_to_remove,
+            snapshots_expired=snapshots_expired,
+            files_removed=files_removed,
+            reason=None,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+    except Exception as e:
+        if log:
+            log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+
+    return {
+        "status": "success",
+        "copies_kept": keep_copies,
+        "copies_removed": copies_to_remove,
+        "snapshots_expired": snapshots_expired,
+        "files_removed": files_removed,
+    }
+
+
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/gold_export.py::trim_gold_mart",
+        reads=["Iceberg gold.{mart}"],
+        writes=[
+            "Iceberg gold.{mart} (delete older copies and expire snapshots)",
+            "ClickHouse console.gold_trim_run",
+        ],
+    ),
+)
+def trim_gold_mart(
+    context, mart: str, export_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Trim old copies from `gold.{mart}` after a successful export (DATA-2 D1).
+    A skipped or failed export does not trim.
+    Always returns `export_result` untouched so the export summary is preserved.
+    """
+    if export_result.get("skipped") is True:
+        context.log.info(f"export of {mart!r} was skipped; skipping trim")
+        return export_result
+
+    cfg = GoldExportConfig.from_env()
+    try:
+        trim_res = run_trim_for_mart(cfg, mart, context=context)
+        context.log.info(f"trim result for {mart!r}: {trim_res}")
+    except Exception as exc:
+        context.log.error(f"unexpected exception trimming {mart!r}: {exc}")
+
+    return export_result
+
+
 @op(
     retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
@@ -444,7 +850,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
         # as a `writes` phrase so the every-op walk test (which refuses
         # empty `writes`) treats this no-input collect step as having a
         # real artifact.
-        reads=["results list from export_gold_mart[*]"],
+        reads=["results list from trim_gold_mart[*]"],
         writes=["output metadata marts_exported"],
     ),
 )
@@ -463,10 +869,14 @@ def summarize_gold_export(context, results: list[dict[str, Any]]) -> list[dict[s
 def gold_export_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `gold_export_job`. A fan-out
     op (`list_gold_marts`) yields one `DynamicOutput` per mart; the
-    mapped `export_gold_mart` runs the per-mart body so a single mart's
-    HTTP error fails only that step; `summarize_gold_export` collects
-    every mapped step's result for the run summary."""
-    summarize_gold_export(list_gold_marts().map(lambda mart: export_gold_mart(mart)).collect())
+    mapped `export_gold_mart` runs the per-mart export, followed by
+    `trim_gold_mart` which keeps the newest N copies in `gold.<mart>` (DATA-2);
+    `summarize_gold_export` collects every mapped step's result for the run summary."""
+    summarize_gold_export(
+        list_gold_marts()
+        .map(lambda mart: trim_gold_mart(mart, export_gold_mart(mart)))
+        .collect()
+    )
 
 
 # Daily at 04:00 — after `bronze_maintenance_job`'s 03:00 slot, since a
