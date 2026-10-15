@@ -374,6 +374,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // factory. `pipeline:read` is the floor; the handler also refuses
     // anyone but a service identity (routes::authored_pipelines).
     ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
+    // BLD-2: the target-lag sensor's one decision-maker (plan D5). Same
+    // floor as `runnable`, and the same handler-side refusal: only the
+    // orchestrator's service identity (or a Platform Admin) may ask
+    // whether a pipeline is behind its target. `pipeline:read` rather
+    // than `pipeline:write` because a check READS state and asks for a
+    // run the orchestrator launches itself — it does not mutate the
+    // pipeline, which is what the `pipeline:write` routes are for.
+    ("POST", "/api/pipelines/runnable/{id}/lag-check", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.

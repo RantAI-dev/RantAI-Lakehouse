@@ -9,7 +9,11 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
-mod authored_pipelines;
+// `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
+// `authored_pipelines::job_name` to name the job a lag run launches, and
+// re-deriving the `authored__<id>` mapping in a second place is exactly
+// the drift the one definition exists to prevent.
+pub(crate) mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
@@ -51,7 +55,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -194,6 +198,13 @@ fn pipelines_router() -> Router<AppState> {
         )
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
         .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        // BLD-2: the target-lag sensor's one decision-maker. Under
+        // `/runnable/` because only the orchestrator may ask (same gate as
+        // `runnable` itself), not because it lists anything.
+        .route(
+            "/api/pipelines/runnable/{id}/lag-check",
+            post(authored_pipelines::lag_check),
+        )
         .route(
             "/api/pipelines/{id}",
             get(pipelines::detail)

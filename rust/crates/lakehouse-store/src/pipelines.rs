@@ -1710,6 +1710,34 @@ pub async fn get_lag_state(
     Ok(row.map(PipelineLagState::from))
 }
 
+/// The stored `target` location (`"<zone>.<table>"`) of each named
+/// pipeline, one query — the `depends_on` half of a pipeline's input list
+/// (BLD-2 plan D4).
+///
+/// `ids` that name no row are simply absent from the map: a `depends_on`
+/// entry may name a `Dagster`-native job (`ingest_job`), which has no
+/// `pipeline_definition` row and therefore no stored target to watch. The
+/// caller skips those rather than failing the check, because the pipeline
+/// still follows such a job through the `_after` sensor.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn targets_for(
+    pool: &PgPool,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, String>, StoreError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, target FROM pipeline_definition WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Read the lag state of many pipelines in one query — the list and detail
 /// routes' shape (plan D8). Pipelines with no state row are simply absent
 /// from the returned map, and the route reports `not_measured` for them.

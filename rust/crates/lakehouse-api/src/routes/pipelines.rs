@@ -3014,6 +3014,11 @@ pub async fn create(
         depends_on: body.depends_on,
         connector_id,
         id: Some(id),
+        // BLD-2 T4: the create body accepts an optional `targetLag` and
+        // this becomes that field. Until then a created pipeline starts
+        // with no target lag, which is exactly what "the field is absent"
+        // has always meant.
+        target_lag: None,
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -3206,6 +3211,9 @@ pub async fn generate(
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
         id: None,
+        // BLD-2 T4: same as `create` — a pipeline an LLM drafts starts
+        // with no target lag until a user or the assistant sets one.
+        target_lag: None,
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -5770,6 +5778,8 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                 },
                 None,
             )
@@ -8342,6 +8352,8 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: Some(id.clone()),
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                 },
                 None,
             )
@@ -9276,6 +9288,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -10343,6 +10357,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 

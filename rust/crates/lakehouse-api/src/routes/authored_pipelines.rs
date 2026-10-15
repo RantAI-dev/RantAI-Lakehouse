@@ -902,6 +902,81 @@ pub async fn runnable(
     Ok(ApiJson(json!({ "pipelines": list })))
 }
 
+/// `POST /api/pipelines/runnable/{id}/lag-check` — one target-lag check
+/// for one authored pipeline (plan D5). The orchestrator's `lag` sensor
+/// calls it every [`crate::pipeline_lag::CHECK_INTERVAL_SECONDS`] seconds
+/// and launches the job the answer names.
+///
+/// Orchestrator-only, exactly like [`runnable`]: the `pipeline:read` row in
+/// `POLICY_TABLE` is a floor, and this handler refuses anyone but a
+/// service identity or a Platform Admin. A `pipeline:write` user is not the
+/// orchestrator.
+///
+/// The gate runs first, so a human caller is told "you are not the
+/// orchestrator" (403) whatever id it asked for — which is plan D5's
+/// "another tenant's id and an unknown id are the same answer" in its
+/// strongest form: for every non-admitted caller the answer is identical,
+/// so this route cannot be used to learn whether an id exists. Only after
+/// it, and only for the one admitted non-service caller shape (a Platform
+/// Admin acting inside one tenant), does the per-id scope check run: an
+/// orchestrator is cross-tenant by design — it runs every tenant's
+/// pipelines, the whole point of `runnable` — so the scope check must not
+/// be applied to it.
+///
+/// # Errors
+///
+/// 403 for a caller that is neither the orchestrator nor a Platform Admin;
+/// 404 for an unknown id, a `Dagster`-native job name, or an id outside the
+/// caller's tenant; 503 when no Postgres is configured; 500 on a store
+/// failure; 503 when the orchestrator could not be asked about an
+/// outstanding run (the sensor skips that tick and asks again).
+pub async fn lag_check(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity checks a pipeline's target lag".to_owned(),
+        )
+        .into());
+    }
+    let pool = crate::routes::pipelines::pool(&state)?;
+    if !matches!(principal.id, PrincipalId::Service(_)) {
+        in_scope(Some(pool), &principal, &headers, &id).await?;
+    }
+    authored_only(&id)?;
+    let Some(pipeline) = pipelines::get_pipeline(pool, &id).await? else {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    };
+    let inputs = crate::pipeline_lag::inputs_of(pool, &pipeline).await?;
+    let outcome = crate::pipeline_lag::run_lag_check(
+        pool,
+        &state.dagster,
+        &crate::pipeline_lag::StateTokenReader { state: &state },
+        &pipeline,
+        &inputs,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    Ok(ApiJson(json!({
+        "decision": match outcome.decision {
+            crate::pipeline_lag::Decision::Run => "run",
+            crate::pipeline_lag::Decision::Wait => "wait",
+        },
+        "runKey": outcome.run_key,
+        "jobName": outcome.job_name,
+        "status": outcome.status.as_str(),
+        "lagSeconds": outcome.lag_seconds,
+        "targetSeconds": outcome.target_seconds,
+        "behindStreak": outcome.behind_streak,
+        "reason": outcome.reason,
+    })))
+}
+
 /// `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2032,6 +2107,8 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -2424,6 +2501,8 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -2582,6 +2661,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -2741,6 +2822,8 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -2931,6 +3014,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
@@ -3063,6 +3148,8 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
             }
         }
 
