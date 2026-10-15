@@ -1820,15 +1820,15 @@ async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
     Uuid::parse_str(&user.id).expect("user id is a uuid")
 }
 
-/// The `run_as` backfill `UPDATE` of migration `0075`, read out of the
+/// The `run_as` backfill `UPDATE` of migration `0076`, read out of the
 /// migration file itself and returned as executable SQL.
 ///
 /// Same reasoning as [`migration_0071_backfill`]: the extraction, not a
 /// copy, is what makes these tests a check on the migration rather than a
 /// restatement of it. Editing the migration's semantics changes what runs
 /// here, and `include_str!` pins the filename at compile time.
-fn migration_0075_backfill() -> &'static str {
-    const MIGRATION: &str = include_str!("../../../migrations/0075_pipeline_run_as.sql");
+fn migration_0076_backfill() -> &'static str {
+    const MIGRATION: &str = include_str!("../../../migrations/0076_pipeline_run_as.sql");
     const PREFIX: &str = "UPDATE pipeline_definition p";
     let mut found = MIGRATION
         .match_indices(PREFIX)
@@ -1843,7 +1843,7 @@ fn migration_0075_backfill() -> &'static str {
     assert_eq!(
         found.len(),
         1,
-        "migration 0075 must hold exactly one `UPDATE pipeline_definition` \
+        "migration 0076 must hold exactly one `UPDATE pipeline_definition` \
          backfill — its other statements are the ALTER, the COMMENT and the \
          CREATE INDEX"
     );
@@ -1865,7 +1865,7 @@ async fn backfill_takes_the_author_from_the_created_version(pool: PgPool) -> sql
         "create_pipeline must not invent an author; the route layer passes one"
     );
 
-    sqlx::query(migration_0075_backfill())
+    sqlx::query(migration_0076_backfill())
         .execute(&pool)
         .await?;
 
@@ -1907,7 +1907,7 @@ async fn backfill_leaves_a_baseline_only_pipeline_with_no_author(pool: PgPool) -
     .execute(&pool)
     .await?;
 
-    sqlx::query(migration_0075_backfill())
+    sqlx::query(migration_0076_backfill())
         .execute(&pool)
         .await?;
 
@@ -1935,7 +1935,7 @@ async fn backfill_skips_a_created_version_written_by_a_non_user(pool: PgPool) ->
         .await
         .expect("create pipeline");
 
-    sqlx::query(migration_0075_backfill())
+    sqlx::query(migration_0076_backfill())
         .execute(&pool)
         .await?;
 

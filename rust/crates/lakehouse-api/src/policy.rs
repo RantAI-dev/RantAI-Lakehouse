@@ -407,6 +407,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `identity:write`, not `pipeline:write`: this is a governance
     // decision about who may see the row, not a pipeline-operation grant.
     ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
+    // BLD-1 / D2: same posture as the line above — assigning the user a
+    // pipeline reads as decides whose permissions every future run of that
+    // row is governed by, which is a governance decision rather than a
+    // pipeline-operation grant, so `identity:write` (Platform Admin's
+    // `*:*`; no seeded role holds it by name) rather than `pipeline:write`.
+    ("PUT",  "/api/pipelines/{id}/run-as",            Policy::RequiresPermission("identity:write")),
     // Dagster `run_failure_sensor` posts to this; the handler then
     // refuses non-service `pipeline:write` holders, mirroring
     // `authored_pipelines::runnable` (a `pipeline:write` user is still

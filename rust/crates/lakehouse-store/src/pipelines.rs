@@ -106,7 +106,7 @@ pub struct Pipeline {
     /// every other `skip_serializing_if` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
-    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0075`), the
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), the
     /// `app_user` this pipeline reads as. The orchestrator rewrites the
     /// source `SELECT` through `sql_rewrite::enforce` as this user before
     /// it runs, so a masked column arrives masked in the target.
@@ -176,7 +176,7 @@ struct PipelineRow {
     /// needs the value, but exposing it on the public type would be a
     /// new wire field that no current caller wants.
     tenant_id: Option<Uuid>,
-    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0075`), read
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
     /// here so the `runnable`/`enforce` paths can decide whether this
     /// pipeline has an author at all without a separate read.
     run_as: Option<Uuid>,
@@ -472,7 +472,7 @@ struct FullPipelineRow {
     /// value, and threading it as a separate query at write time would
     /// race against the live row's own tenant reassignment.
     tenant_id: Option<Uuid>,
-    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0075`), read
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
     /// here so the create path can return the author it actually stored
     /// from the same `RETURNING` that built the `Pipeline`, instead of
     /// echoing back the value it hoped to write.
@@ -620,6 +620,38 @@ pub async fn list_pipelines(
 pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(), StoreError> {
     let result = sqlx::query("UPDATE pipeline_definition SET tenant_id = $1 WHERE id = $2")
         .bind(tenant_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// BLD-1 / D2: assign the `app_user` a pipeline reads as
+/// (`pipeline_definition.run_as`, migration `0076`).
+///
+/// This is the only way `run_as` changes after create: `update_pipeline`
+/// and `restore_version` never write the column, so editing someone's
+/// pipeline cannot quietly reassign who it reads as.
+///
+/// The value is bound, never interpolated. A `Dagster`-backed pipeline id
+/// has no such row, so it takes the same [`StoreError::NotFound`] path as
+/// [`assign_tenant`] — never a fabricated success.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no pipeline with `id` exists, or
+/// [`StoreError::ForeignKeyViolation`] if `run_as` names a user that does
+/// not exist (the route checks first, so this only covers a race).
+/// A user deleted afterwards does NOT raise: the column is `ON DELETE SET
+/// NULL`, so the row survives and simply loses its author — which is the
+/// D2 "does not run" state again, reached without anyone deciding it.
+/// [`StoreError::Database`] on any other failure.
+pub async fn assign_run_as(pool: &PgPool, id: &str, run_as: Uuid) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE pipeline_definition SET run_as = $1 WHERE id = $2")
+        .bind(run_as)
         .bind(id)
         .execute(pool)
         .await?;
@@ -802,7 +834,7 @@ pub struct CreatePipelineInput {
     /// (tests, internal callers) keep working unchanged.
     pub id: Option<String>,
     /// BLD-1 / D1: the `app_user` the pipeline reads as (migration
-    /// `0075`). The route layer passes the creating principal's id only
+    /// `0076`). The route layer passes the creating principal's id only
     /// when that principal is a human (`PrincipalId::User`) — a service
     /// identity has no `app_user` row, so it has no author to read as and
     /// stores `None`, which D2 turns into "this pipeline does not run"

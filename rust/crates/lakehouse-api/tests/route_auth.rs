@@ -103,6 +103,30 @@ async fn request_with_cookie(
         .expect("router never fails a request outright")
 }
 
+/// [`request_with_cookie`] with a JSON body, for routes whose handler needs
+/// one to get past the auth gate. The auth gate runs first, so the body is
+/// only ever read by a handler that has already been let in.
+async fn request_with_cookie_and_body(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: Vec<u8>,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
 /// # Authz: authenticated-but-missing-permission -> 403
 ///
 /// Every `Policy::RequiresPermission` entry, hit by a principal
@@ -233,6 +257,53 @@ async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "a seeded Analyst must be denied identity:write"
+    );
+}
+
+/// BLD-1 / D2: `PUT /api/pipelines/{id}/run-as` decides whose permissions
+/// every future run of that pipeline is governed by, so it is
+/// `identity:write` — a governance decision, exactly like
+/// `PUT /api/pipelines/{id}/tenant` above it in [`POLICY_TABLE`].
+///
+/// Both directions are named here with a real principal: a seeded Data
+/// Engineer, who holds `pipeline:*` (so they can edit and run the
+/// pipeline) but not `identity:write`, is refused; a Platform Admin is
+/// not. Naming the Data Engineer rather than the Analyst is the stronger
+/// half — `pipeline:write` alone must never be enough to reassign who a
+/// pipeline reads as.
+#[tokio::test]
+async fn assigning_a_pipelines_author_is_denied_without_identity_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let data_engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let body = br#"{"userId":"00000000-0000-0000-0000-000000000001"}"#.to_vec();
+
+    let denied = request_with_cookie_and_body(
+        &router,
+        "PUT",
+        "/api/pipelines/pl-x/run-as",
+        &data_engineer,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer's pipeline:write must not be enough to \
+         reassign who the pipeline reads as"
+    );
+
+    // The other half: the correctly-permissioned caller must never be
+    // refused by the auth gate. This asserts only "not 401/403" — the id
+    // does not exist, so a 404 from the handler is the right answer and
+    // the body is deliberately not checked here (see this file's header).
+    let allowed =
+        request_with_cookie_and_body(&router, "PUT", "/api/pipelines/pl-x/run-as", &admin, body)
+            .await;
+    assert!(
+        !matches!(allowed.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN),
+        "a Platform Admin must pass the auth gate on this route, got {}",
+        allowed.status()
     );
 }
 

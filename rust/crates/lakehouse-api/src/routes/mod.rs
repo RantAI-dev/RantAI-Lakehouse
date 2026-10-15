@@ -282,6 +282,13 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
         )
+        // BLD-1 / D2: assign the user a pipeline reads as. A distinct
+        // route for the same reason as `/tenant` — who a row reads as is a
+        // governance decision, not a field on an unrelated update body.
+        .route(
+            "/api/pipelines/{id}/run-as",
+            axum::routing::put(pipelines::assign_pipeline_run_as),
+        )
         // Dagster `run_failure_sensor` posts here once per failed run;
         // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
         // enforces service-identity (the route is gated by `pipeline:write`
