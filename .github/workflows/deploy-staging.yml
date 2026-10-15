@@ -72,7 +72,7 @@ jobs:
             sed -i "/^$name=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
-          # TENANT_WAREHOUSE_S3_* were `rustfsadmin` in .env.example (the
+          # TENANT_WAREHOUSE_S3_* used to fall back to the RustFS credentials in .env.example (the
           # same value as the RustFS keys, ADR 0002 Addendum 2 "may equal,
           # must never alias"); keep staging's tenant provisioning working.
           sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env

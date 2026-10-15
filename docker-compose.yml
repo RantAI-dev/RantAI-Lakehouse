@@ -1461,7 +1461,7 @@ services:
   #
   # SECURITY (credential-hygiene review): this used to bind-mount a
   # COMMITTED `ops/seaweedfs/iam.json` straight off the repo tree, which
-  # hard-coded `seaweedfsadmin`/`seaweedfsadmin` *and* a working STS
+  # hard-coded default admin credentials *and* a working STS
   # signing key (base64 of a self-describing placeholder string) into
   # every checkout. That file's own comment said "local/CI only", but
   # this compose file doubles as the deployment template — so a real
@@ -3135,7 +3135,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       # `./ops/g8` is bound read-write as root (see `g3a-test-runner`):
       # keep a root-owned `__pycache__/` from ever landing in the checkout.
