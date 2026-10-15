@@ -7,7 +7,7 @@
 | Also involves | Build |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `BLD-3` (the pipeline source path an uploaded table also takes) |
+| Blocked by | Nothing open (was: BLD-3, shipped) |
 
 ## Why
 

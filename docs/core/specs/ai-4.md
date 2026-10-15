@@ -5,7 +5,7 @@
 | Backlog | `AI-4` in [BACKLOG.md](../BACKLOG.md) |
 | Module | AI Copilot |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Waits for | [`BI-8`](bi-8.md) (BI phase 1) |
+| Blocked by | Nothing open (was: BI-8, shipped) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why

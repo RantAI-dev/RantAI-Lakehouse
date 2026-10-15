@@ -10,7 +10,7 @@
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `DATA-4`** and a new ADR. |
+| Plan | Not written yet. **Blocked by `DATA-4`** and a new ADR. |
 | Started | |
 | Shipped | |
 | Evidence | |

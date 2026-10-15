@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks), in two parts: A joins and aggregations, B the SQL step |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `BLD-3` (a pipeline must read Bronze before it can join Bronze tables) |
+| Blocked by | Nothing open (was: BLD-3, shipped) |
 
 ## Why
 
