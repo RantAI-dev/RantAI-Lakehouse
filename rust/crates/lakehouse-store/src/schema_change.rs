@@ -617,7 +617,7 @@ impl<'p> ObservationTx<'p> {
             // A column accepted again is no longer inactive. Only a removal
             // mark: the observation sees the whole source table, including a
             // column the user left out, and that mark is the ingest-spec
-            // save's to clear (`SRC-11` D10, migration 0071).
+            // save's to clear (`SRC-11` D10, migration 0073).
             let names: Vec<&str> = write
                 .observed_columns
                 .iter()

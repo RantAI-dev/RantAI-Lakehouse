@@ -18,6 +18,10 @@
 -- Every row that exists before this migration is a SRC-8 mark, so the
 -- default is the right value for them (no UPDATE needed). Additive; 0064 and
 -- 0065 are not edited.
+--
+-- Numbered 0072-0074, not 0070-0072: main took 0071 first (#80). These
+-- three files were applied only to CI's throwaway databases, so they were
+-- renamed rather than shifted by a compensating migration.
 
 ALTER TABLE connector_inactive_column
     ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT 'removed_at_source';

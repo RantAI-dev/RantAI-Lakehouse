@@ -2,9 +2,9 @@
 -- table, so the run list can name it ("Clear · public.orders", SRC-10
 -- decision 5, load-modes feature page).
 --
--- 0070 created `connector_run` without it: the run's `trigger_kind` says
+-- 0072 created `connector_run` without it: the run's `trigger_kind` says
 -- `refresh` or `clear` but not for what, and the console's run list lost the
--- table the previous (orchestrator-search) list showed. 0070 is not edited
+-- table the previous (orchestrator-search) list showed. 0072 is not edited
 -- (it may already be applied); this migration only adds.
 --
 -- `table_name` is the source object's name as the orchestrator's start report
@@ -12,6 +12,10 @@
 -- name check as the other report fields. NULL for every other trigger and for
 -- every run recorded before this migration: nothing is invented for them. The
 -- CHECK keeps a table off a run that is about every table.
+--
+-- Numbered 0072-0074, not 0070-0072: main took 0071 first (#80). These
+-- three files were applied only to CI's throwaway databases, so they were
+-- renamed rather than shifted by a compensating migration.
 
 ALTER TABLE connector_run
     ADD COLUMN IF NOT EXISTS table_name TEXT;

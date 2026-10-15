@@ -1,7 +1,7 @@
 //! The product's own record of a connector run, of each attempt at each
 //! table, and of the run's log (`SRC-11` decisions D5, D6, D7, D8; tables
 //! `connector_run`, `connector_run_attempt`, `connector_run_log`, migration
-//! `0070_connector_run_record.sql` -- read its header for the shape of each).
+//! `0072_connector_run_record.sql` -- read its header for the shape of each).
 //!
 //! # Who writes
 //!

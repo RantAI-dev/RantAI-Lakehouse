@@ -32,6 +32,10 @@
 --
 -- Rows are removed with their connector (ON DELETE CASCADE), as
 -- `connector_probe_result` (0044) is.
+--
+-- Numbered 0072-0074, not 0070-0072: main took 0071 first (#80). These
+-- three files were applied only to CI's throwaway databases, so they were
+-- renamed rather than shifted by a compensating migration.
 
 CREATE TABLE IF NOT EXISTS connector_run (
     run_id       TEXT        PRIMARY KEY,

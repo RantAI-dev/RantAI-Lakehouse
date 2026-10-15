@@ -419,7 +419,7 @@ async fn approval_moves_the_baseline_marks_inactive_and_lifts_the_pause(
     let inactive = list_inactive_columns(&pool, &id).await.unwrap();
     assert_eq!(inactive.len(), 1);
     assert_eq!(inactive[0].column_name, "note");
-    // `SRC-11` (migration 0071): an approved removal keeps SRC-8's reason.
+    // `SRC-11` (migration 0073): an approved removal keeps SRC-8's reason.
     assert_eq!(inactive[0].reason, "removed_at_source");
     let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
     let accepted = tx.accepted().await.unwrap().unwrap();
