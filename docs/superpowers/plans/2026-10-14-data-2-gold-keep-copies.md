@@ -369,3 +369,58 @@ applied run's result columns, and the Parquet listing after. If ClickHouse's
 catalog principal is refused on the `gold` namespace, or the 2 files remain,
 STOP and report again. If T1b passes, T2 to T6 proceed with A1, and the
 trim record (D5) gains `files_removed` from the applied run.
+
+### Round 1 (planner/reviewer, Claude Opus), at `59b4b91e`
+
+Read: the whole diff (`gold_export.py` and its tests, `maintenance.py`,
+`gold_export_history.rs`, `routes/gold.rs`, the console card, the gate,
+`docker-compose.yml`, `ci.yml`) and the handoff. T1b's measurement is good:
+2 Parquet files freed, 7 kept. `maintenance.py`'s Bronze path keeps its old
+behaviour (no age argument, ClickHouse's 3-day default). The token is
+mounted only into `dagster-code-location`, as D2 asked.
+
+**BLOCKER 1. `iceberg_orphan_files_older_than_seconds = 0` can corrupt a
+Gold table.** An orphan is any file no snapshot references, and that
+includes the files of an append that has been written but not yet
+committed. The Rust export (a console "Publish now", or the next job run)
+writes files and then commits; nothing stops it running while a trim runs
+(`gold_lock` is in the API process only, plan section 6 Q3). With age 0 the
+trim can delete those files, and the export's commit then points at files
+that no longer exist. This is why ClickHouse defaults to 3 days. Fix: a
+minimum orphan age `GOLD_ORPHAN_MIN_AGE_SECONDS`, default `3600` (an export
+of a 5,000,000-row mart is far shorter; the planner's number), passed to
+`run_remove_orphan_files`; parsed as an integer >= 0, anything else fails
+closed with a fixed reason. The trim therefore frees a removed copy's files
+on the first trim that runs at least an hour after they were written; say so
+in the module doc and the CHANGELOG. The gate may set
+`GOLD_ORPHAN_MIN_AGE_SECONDS=0` in the CI-only `.env` (no other writer runs
+there), with that reason in a comment.
+
+**BLOCKER 2. Default credentials in `docker-compose.yml`** (AGENTS rule 5).
+`gold-export-test-runner` gains
+`CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-rustfsadmin}`,
+`CONNECTOR_S3_ACCESS_KEY: ${...:-rustfsadmin}` and
+`AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-ci-password-not-real-123}`
+(and the matching email). Use `${X:-}` as every other runner does, and put
+the values in the `gold-export` CI job's CI-only `.env`, as `g9-upload` does.
+
+**BLOCKER 3. A source bind-mount in the deployment template.**
+`dagster-code-location` gains
+`./dagster/dispar_orchestrate:/opt/dagster/app/dispar_orchestrate:ro`.
+`docker-compose.yml` is also the deployment template; a deployment would run
+whatever is on the host's disk instead of the image, or fail where no
+checkout exists. Remove it; rebuild the image to test.
+
+**SHOULD-FIX 1. `ops/gold_export/spike_t1b.py` (319 lines) is committed** but
+is not a gate step (T1 said: commit only a script that becomes T5's gate).
+Remove it; its results are in the handoff.
+
+**SHOULD-FIX 2. The verification block is incomplete.** The handoff reports
+`pytest` 86 passed and `cargo test -p lakehouse-api` 99 passed; the full
+suites are about 1,040 and 4,750. Rule 7: run, on the final commit,
+`cargo test --workspace --no-fail-fast` and
+`(cd dagster && python -m pytest dispar_orchestrate -q)`, and the rest of the
+block, and record exact counts or *not verified* with the reason.
+
+Cite `DATA-2 review BLOCKER <n>` / `SHOULD-FIX <n>` at each fix site.
+
