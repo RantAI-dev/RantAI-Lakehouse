@@ -149,10 +149,62 @@ assistant's tool schema.
 
 2. Which existing function turns a user id into role names and placeholder
    values? Name it in the handoff.
-   **Answer:** `lakehouse_auth::repository::load_principal_for_user(&pool, user_id)`
-   reads the live user and tenant memberships from Postgres, resolving role names
-   (`principal.roles`). Masking and row filter obligations are evaluated dynamically
-   against those roles by `policy_engine::rewrite_sql_for_roles`.
+   **Answer (corrected, BLD-1 review SHOULD-FIX 2):**
+   `lakehouse_auth::repository::load_principal_for_user` (verified at
+   `rust/crates/lakehouse-auth/src/repository.rs:83`) takes FOUR
+   arguments and returns a `Principal`:
+
+   ```rust
+   pub async fn load_principal_for_user(
+       pool: &PgPool,
+       user_id: Uuid,
+       provider: String,
+       must_change_password: bool,
+   ) -> Result<Principal, AuthError>
+   ```
+
+   It reads the live `app_user` row, the user's `app_user_role`
+   memberships, their still-active `access_grant`s and their
+   `app_user_tenant` rows from Postgres, in that order, so a role added
+   after the pipeline was authored governs its next run. The role NAMES
+   are `Principal::role_names` (`principal.rs:89`) — the field this plan
+   earlier misquoted as `principal.roles`. `Principal::permissions`
+   (`principal.rs:58`) is the separate merge of the roles' permission
+   strings and the access grants' single tokens; the enforce route never
+   reads it. The placeholder values are NOT built here:
+   `enforce_pipeline_sql` builds `sql_rewrite::PlaceholderValues` from the
+   same principal, `author.id.uuid()` for `{principal_id}` and
+   `author.tenant_ids` for `{tenant_ids}`, exactly as Query Studio does.
+   Masking and row-filter obligations are evaluated dynamically against
+   `author.role_names` by `policy_engine::rewrite_sql_for_roles`.
+
+   What the two remaining arguments mean for a pipeline author, from
+   their own docs rather than by guess:
+
+   - `provider` is `Principal::provider` (`principal.rs:59`): "Which
+     authenticator produced this principal, for audit: `local`, `session`,
+     `service`, and later `oidc:<issuer>`. Never branch application logic
+     on this value — it exists purely so an audit log line can say how
+     someone got in." The enforce route passes `"local"`: a real session
+     principal gets `"session"` (`session.rs:140`), and `"local"` is what
+     the loader's own tests pass (`lakehouse-auth/tests/repository.rs:39`).
+     For a pipeline author no authenticator ran at all, so this is a
+     vocabulary value that fills a non-optional field, not a claim that a
+     password login happened. It
+     cannot affect enforcement: the field is documented as never branched
+     on, this route writes no audit row, and the rewrite reads only
+     `role_names`, `id` and `tenant_ids`.
+   - `must_change_password` is `Principal::must_change_password`
+     (`principal.rs:77`): `true` only for "a bootstrapped-but-not-yet-
+     rotated local login or a session minted from one", `false` for every
+     other case. The loader takes it as a parameter (rather than
+     querying `auth_identity`) so a caller that "knows by construction
+     that it must be `false`" does not pay a round trip — exactly this
+     route's case: no credential was presented, there is no
+     `auth_identity` row to be flagged on. `false` is therefore correct
+     here, and inert besides: its only consumer is `auth_gate`
+     (`policy.rs:797`), which sees the CALLER's principal, and the
+     caller's is the orchestrator's service identity, already past it.
 
 3. Does `CREATE TABLE ... AS <rewritten SELECT> LIMIT 0` still infer the
    right column types when masked columns are rewritten expressions? Quote a
