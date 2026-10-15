@@ -542,4 +542,40 @@ over this branch's new commits.
 
 ## Review
 
-*(planner)*
+### Review 1, 2026-10-14 (planner), tasks 1 to 7
+
+- `BLOCKER 1`: the Rust did not compile in CI (imports in a test module, two
+  functions over 100 lines). Fixed in fix round 1.
+- `BLOCKER 2`: a regression of `SRC-10` decision 5 — the run list could no
+  longer name the table of a refresh or clear. Fixed in fix round 1 (the run
+  record carries the table, migration `0074`).
+- `SHOULD-FIX 1`: a person's run was recorded with the trigger `other`. Fixed
+  (the API's launch is tagged `lakehouse/trigger: user`).
+- Accepted: an error the classifier does not recognise is not retried
+  (decision 2, "transient errors only"); a batch run's end is recorded from
+  the orchestrator's final status by the API's run sensors, not reported by
+  the orchestrator.
+
+### Review 2, 2026-10-15 (planner), tasks 8 and the merges
+
+- `SHOULD-FIX 1`: the old run-history route stayed after the console moved.
+  Removed.
+- `SHOULD-FIX 2` (assistant parity): the assistant's `set_ingest_spec` tool
+  did not know `excludedColumns`, so re-sending a connector's tables would
+  have dropped the user's exclusions. Fixed, fixture edited by hand.
+- Migrations renumbered `0072`–`0074` after `main` took `0071` (#80).
+- A `gitleaks` false positive on a reference to the gate's fixture password:
+  fixed by not passing it as a keyword argument; the scanner is unchanged.
+
+CI on #144 at `a2199d4b` (run 38676641937): every Rust test, clippy, MSRV,
+Dagster unit and loader tests, the frontend job, every existing gate and the
+new gate pass; the gate's steps are in `docs/plans/SRC-11-RESULT.md`. The
+only red check was the `gitleaks` false positive, fixed in `4fb71326`, whose
+CI is running. The reviewer did not compile Rust locally (12 GB free disk);
+the reviewer ran nothing heavier than the gate self-test and the Python
+fast group locally.
+
+No open `BLOCKER`. Open for the product owner: the browser check of the
+connector page (runs card, log download, Resume, column choice) at the end
+of the phase.
+

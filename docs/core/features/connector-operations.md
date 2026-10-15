@@ -6,8 +6,8 @@
 | Backlog | `SRC-11` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-11.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". Three *(proposed)* numbers: decisions 1, 5 and 7 |
-| Status | Planned. Decisions signed 2026-10-14 |
-| Plan | Not written; it waits for the signatures below and for `SRC-10` (pull request #115) to merge |
+| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gate on 2026-10-15 |
+| Plan | `docs/superpowers/plans/2026-10-14-src-11-connector-operations.md` |
 
 ## Problem
 
