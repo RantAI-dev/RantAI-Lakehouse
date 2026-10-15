@@ -208,6 +208,31 @@ pub(in crate::routes) async fn run_tool(
     }
 }
 
+/// Checks a chart call before the gate offers it as a draft (plan 18). `None`
+/// when the call is not a chart call, or when the draft can be built; the
+/// error otherwise, so a draft on a mart or column that does not exist is
+/// refused rather than offered. Writes nothing.
+///
+/// When the reporting settings cannot be read, this returns the same error
+/// the dispatch arm returns, instead of skipping the check.
+///
+/// `confirmed` is dropped during parse because `ChartInput` and its flattened `TableFields` lack
+/// `deny_unknown_fields` (`Compare` has it; adding it here would refuse drafts the Confirm path accepts).
+pub(crate) async fn check_draft(
+    state: &AppState,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<Value> {
+    if name != "create_chart" && name != "update_chart" {
+        return None;
+    }
+    let Ok(time) = crate::routes::settings::time_context(state).await else {
+        return Some(json!({ "error": "The reporting settings could not be read." }));
+    };
+    let id = (name == "update_chart").then(|| arg_str(args, "id"));
+    dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await
+}
+
 /// Reads `args[key]` as a string, matching `String(args[key] ?? "")`: a
 /// missing/`null` value becomes `""`, a non-string `Value` is
 /// stringified rather than rejected (mirroring `TypeScript`'s implicit

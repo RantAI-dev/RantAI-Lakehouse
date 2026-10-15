@@ -113,9 +113,56 @@ checks still hold on 26.8:
   shape assertions are exercised against fixtures/mocks, not a real
   server, and were unaffected by the bump.
 
-Copy `.env.example` to `.env` first (`docker compose` auto-loads `.env`
-from the project root) and set at minimum `AUTH_BOOTSTRAP_EMAIL` /
-`AUTH_BOOTSTRAP_PASSWORD`. Every other variable has a safe local default.
+Create `.env` first (`docker compose` auto-loads `.env` from the project
+root) with `sh ops/init-env.sh`, which copies `.env.example` and fills the
+secrets with generated values (see "No default credentials" below), then set
+`AUTH_BOOTSTRAP_EMAIL`. Every non-secret variable has a safe local default.
+
+### No default credentials (`SEC-18`)
+
+`docker-compose.yml` carries no credential. These variables are must-set
+(`${X:?}`): `docker compose` of any kind stops with a message naming the
+variable while one is empty, whatever profile is active:
+
+| Variable | What it is |
+| --- | --- |
+| `POSTGRES_PASSWORD` | PostgreSQL password (also inside the connection strings compose builds for the API, Lakekeeper and OpenFGA) |
+| `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
+
+`CONNECTOR_PG_PASSWORD` and `CONNECTOR_S3_ACCESS_KEY` / `_SECRET_KEY` fall
+back to those, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
+`SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
+interpolates the whole file whatever profiles are active, so `${X:?}` there
+would stop a default `up` that never starts SeaweedFS. They default to
+empty and `seaweedfs-iam-init` (which the whole profile waits on) exits 1
+while either is empty. `AUTH_BOOTSTRAP_PASSWORD` empty means no admin is
+seeded. `.env.example` holds none of these values, so copying it as it is
+does not start the stack; `sh ops/init-env.sh` writes a `.env` with generated
+values (mode 600, refuses to overwrite an existing `.env`, prints variable
+names only). Anything that runs `docker compose` without a `.env` (a CI job,
+a gate, `docker compose --profile '*' config --quiet`) must export these
+variables first; the CI jobs write CI-only throwaway values.
+
+**Upgrading an install that relied on the old defaults.** Its data was
+created with the old values, so keep them first and rotate on purpose:
+
+1. Before pulling this change, put the values the stack runs with into
+   `.env`: `POSTGRES_PASSWORD=lakehouse`, `RUSTFS_ACCESS_KEY=rustfsadmin`,
+   `RUSTFS_SECRET_KEY=rustfsadmin`,
+   `LAKEKEEPER_ENCRYPTION_KEY=this-is-not-a-secure-key-change-me` (and the
+   SeaweedFS pair `seaweedfsadmin` if you use that profile). Do not run
+   `ops/init-env.sh` over an existing stack: new values do not match the
+   existing volumes (PostgreSQL reads its password only when the data
+   directory is first created; a new Lakekeeper key cannot decrypt what is
+   stored).
+2. `docker compose up -d` as before. Nothing is recreated with a new value.
+3. Rotate afterwards, one at a time: change the PostgreSQL role password
+   inside the database (`ALTER ROLE ... PASSWORD`) and then `.env`; for the
+   object store, change the key in RustFS and `.env` together; the
+   Lakekeeper encryption key is not rotated in place (re-register the
+   warehouse storage credentials after changing it). Rotation is not done
+   by this change.
 
 ### RustFS: failure mode
 

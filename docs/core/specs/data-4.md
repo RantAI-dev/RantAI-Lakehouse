@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `DATA-10`, `DATA-2` (Silver reuses Gold's publishing, so it inherits their fixes) |
+| Blocked by | Nothing open (was: DATA-10, DATA-2, shipped) |
 
 ## Why
 

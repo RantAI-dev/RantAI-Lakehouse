@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Module | Dashboards |
-| Backlog | `BI-18` (part A: filters). The backlog row is on the unmerged docs branch `claude/gracious-albattani-vw5wsb`; it is not in `BACKLOG.md` on this branch yet. |
+| Backlog | `BI-18` (part A: filters); the assistant's filter tool is `AI-2` |
 | Status | Decisions signed 2026-10-07 |
 | Plan | `docs/superpowers/plans/2026-10-07-dashboard-filters.md` |
 
@@ -50,9 +50,12 @@ Added on 2026-10-10 to reach the target in `docs/core/specs/bi-18.md` (part A, s
 
 ## Asking the assistant
 
-Not in this change. The assistant already receives the active filters as
-page context and that summary is updated to describe the new kinds. It
-cannot set or save dashboard filters; that needs a tool of its own.
+Not in this change, by the product owner's decision of 2026-10-15
+(decision 8). The assistant already receives the active filters as page
+context and that summary is updated to describe the new kinds. It cannot
+set or save dashboard filters; that is `AI-2`, which the AI team builds
+next. Until it lands, this feature does not meet the assistant-parity rule
+in `AGENTS.md`, and that is recorded here rather than called done.
 
 ## Decisions
 
@@ -65,6 +68,8 @@ cannot set or save dashboard filters; that needs a tool of its own.
 | 5 | A filter whose column a tile lacks is skipped for that tile and the tile says so | Planner default, not objected | 2026-10-07 |
 | 6 | "Required" belongs to a saved default filter. It cannot be removed by a viewer; clearing it restores the default value. A required filter always has a value, so a dashboard never opens unfiltered by it | Planner default (the spec says only "a filter can be required") | Owner to confirm at QA |
 | 7 | "Next N" counts from tomorrow and excludes today; "last N" keeps including today, as built | Planner default | Owner to confirm at QA |
+| 8 | Phase 1 ships without the assistant's filter tool (`AI-2`); the AI team builds it in its own PR | Spec `bi-18.md` ships `BI-18` with `AI-2` | Owner, 2026-10-15 |
+| 9 | A board accepts at most 20 filters (`lakehouse_bi::filters::MAX_FILTERS`) | Planner default | Owner to confirm at QA |
 
 ## Limits to tell a customer
 
@@ -72,6 +77,7 @@ cannot set or save dashboard filters; that needs a tool of its own.
 - A value list shows at most 200 values; use search to reach the rest.
 - A filter applies to every tile whose data has a column of that name, and to no other tile.
 - Public links and embeds show the saved default filters and cannot be changed by the viewer.
+- A required filter is not an access control. Only the console enforces it; the server never reads it when building SQL, so an API caller can query without it. Use a row filter policy to limit what someone may see.
 
 ## Acceptance checklist
 

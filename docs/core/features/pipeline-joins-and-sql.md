@@ -10,7 +10,7 @@
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | Not written yet. **Waits for `BLD-3`**. |
+| Plan | Slice 1: `docs/superpowers/plans/2026-10-15-bld-1-run-as-author.md`; slices 2 and 3 not written yet. Nothing open blocks it (`BLD-3` shipped). |
 | Started | |
 | Shipped | |
 | Evidence | |
@@ -36,7 +36,6 @@ built in the Build module or by the assistant.
 ## Not included
 
 - Window functions, pivot, unpivot, unions; joins on anything but equality.
-- Masking carried into the output table (`GOV-4`).
 
 ## Asking the assistant
 
@@ -51,7 +50,7 @@ reviews that part.
 | --- | --- | --- | --- |
 | 1 | Scope | Joins, basic aggregations and a free SQL step; no window functions | Product owner, 2026-10-14 |
 | 2 | Who may use the SQL step | Anyone with `pipeline:write` | Product owner, 2026-10-14 |
-| 3 | Read permission | Checked on every table a pipeline reads, when saved and when run (a condition of decision 2) | Planner; follows from 2 |
+| 3 | Who the pipeline reads as | Its author: every read goes through the author's masking and row filters, when saved and when run | Product owner, 2026-10-14 |
 | 4 | Inputs per pipeline *(proposed)* | 5 | Product owner, 2026-10-14 |
 | 5 | Preview rows *(proposed)* | 100 | Product owner, 2026-10-14 |
 | 6 | Assistant | Same PR | Product owner, 2026-10-14 |
@@ -60,7 +59,7 @@ reviews that part.
 
 - At most 5 input tables per pipeline.
 - The SQL step takes one `SELECT`; it cannot change data or tables.
-- A pipeline's output is not masked; masking applies when people query it.
+- A pipeline reads as its author: a column masked for the author is masked in the output table too.
 
 ## Acceptance checklist
 
@@ -70,8 +69,8 @@ reviews that part.
 | `BLD-1-AC2` | Use a left join where some rows have no match | Unmatched rows are kept, with empty columns | Not run |
 | `BLD-1-AC3` | Preview a step | First 100 rows, or fewer, shown | Not run |
 | `BLD-1-AC4` | Save a SQL step containing `DROP TABLE` or `INSERT` | Refused when saved, with a clear message | Not run |
-| `BLD-1-AC5` | As a user who may not read table T, save a SQL step reading T | Refused when saved | Not run |
-| `BLD-1-AC6` | Save a pipeline reading T, then remove the author's permission on T, then run it | Run fails with a fixed message naming no database error text | Not run |
+| `BLD-1-AC5` | As an author for whom column C of table T is masked, run a pipeline that copies C | C is masked in the output table | Not run |
+| `BLD-1-AC6` | Save a pipeline reading T, then add a masking policy on a column it copies, then run it | The new run's output has the column masked | Not run |
 | `BLD-1-AC7` | Ask the assistant for the pipeline of AC1 | The same pipeline is created as a draft | Not run |
 | `BLD-1-AC8` | As a user without `pipeline:write`, try to create a pipeline | Refused with an honest message | Not run |
 | `BLD-1-AC9` | Pause the pipeline | It stops running; the output table stays | Not run |

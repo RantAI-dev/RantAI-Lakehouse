@@ -45,3 +45,17 @@ c5954ca6f47c96a1641103b7c453aa01758d7371:src/services/clients/clickhouse.ts:rant
 # `password=matrix.CONNECTOR_MYSQL_PASSWORD` is a reference to a CI fixture
 # constant, not a value. The history scan reads every branch. SEC-1.
 4ae1bcdda704797129801f537899cf527035c6ba:ops/g6/src11_connector_operations_test.py:generic-api-key:576
+
+# Not a secret: a git commit hash. The BLD-3 plan's handoff (fix round 1)
+# quoted the full id of commit 367f304c ("BLD-3 review BLOCKER 1") as the
+# GIT_SHA an image was built with; `git cat-file -t 367f304c1db0…` prints
+# `commit`. The working-tree copy now quotes 12 characters; this entry
+# covers the one historical commit that still holds the full line.
+ee0d663df87af4fb1e3ebfa9a3a857489d340a8c:docs/superpowers/plans/2026-10-14-bld-3-bronze-pipeline-source.md:generic-api-key:623
+
+# PR #83 (SEC-18) round 3: the developer's handoff in commit b9c71cb33dd7
+# pasted a 40-hex "git ls-remote" line for fix/sec-18-no-default-credentials.
+# Not a secret: its first 12 characters are commit cdbf7c6a0a74, the rest
+# matches no object in the repository (`git cat-file -t` fails), and the
+# next commit (6817e10a) cut it to 12 characters. Planner, 2026-10-15.
+b9c71cb33dd7f90d4bbf071a8ee282478117e8e4:docs/superpowers/plans/2026-10-08-sec-18-no-default-credentials.md:generic-api-key:536
