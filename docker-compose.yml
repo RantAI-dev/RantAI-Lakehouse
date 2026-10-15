@@ -1919,6 +1919,15 @@ services:
       # ever became a job. Unset: no identity is seeded and the factory
       # loads zero authored jobs, saying so in its log.
       PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
+      # BLD-1 / D5: the API's own `DataLakeCatalog` database, which a
+      # Bronze-sourced authored pipeline reads its table through -- named
+      # here because the API's policy rewriter only recognises a governed
+      # table under THIS database, so a pipeline reading Bronze anywhere
+      # else is never masked. The same single-`.env`-value reasoning as
+      # `ICEBERG_QUERY_DB` on `lakehouse-api` and `clickhouse-iceberg-init`
+      # (which creates it); an internal name, not a credential, so a
+      # default is allowed (`${X:-}`).
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
