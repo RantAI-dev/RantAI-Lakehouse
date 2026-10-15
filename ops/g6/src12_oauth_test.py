@@ -17,13 +17,15 @@ What it proves (feature page `credentials-done-properly.md`, decisions 6, 7, 8,
      checks the PKCE verifier against the challenge. The connector is then
      signed in, its refresh token is on the volume sealed (a version byte, not
      the token's text) and the access token is nowhere on it.
-  3. A load: 5 rows in Bronze. The provider's access tokens live 5 seconds and
+  3. A load: 5 rows in Bronze (`replace` mode, so later loads leave 5, and the
+     steps prove a load by Dagster's status, the run record and the provider's
+     counters, not by row counts). The provider's access tokens live 5 seconds and
      its pages answer slowly, so the load outlives one token: the orchestrator
      asked for another during the run (refresh grants counted at the provider).
   4. The provider rotates its refresh token on every refresh and honours only
      the latest. The orchestrator reports each new one to the API, which seals
      it: the file on the volume changed, is still not the token's text, and
-     a SECOND load, started after the first token expired, succeeds (10 rows).
+     a SECOND load, started after the first token expired, succeeds (run record 'succeeded').
      That only works if the rotated token was stored.
   5. The connection test passes (it performs the refresh and calls the API),
      twice in a row, which also needs the rotated token kept.
@@ -32,7 +34,7 @@ What it proves (feature page `credentials-done-properly.md`, decisions 6, 7, 8,
   7. The provider stops honouring the refresh token (revoked on its side): the
      next run fails with one attempt of class `sign_in_refused`, no wait, none of
      the provider's words in the run log or the callback page. Signing in again
-     restores loading (15 rows).
+     restores loading .
   8. Signing out calls the provider's revocation address with the stored
      refresh token and removes the file; the connector is then "not signed in"
      and a load fails with `sign_in_refused`. Signing in once more and DELETING
@@ -362,11 +364,29 @@ def volume_snapshot(connector_id: str) -> dict[str, bytes]:
     return {n: file_bytes(n) for n in managers.volume_files_for(connector_id)}
 
 
-def run_ok(connector_id: str, what: str, rows_after: int, bronze: str) -> None:
-    ops.wait_dagster(ops.launch_run(connector_id), "SUCCESS", what)
+def run_ok(connector_id: str, what: str, bronze: str) -> str:
+    """A run that succeeded, proved by Dagster's status AND the product's own run
+    record (`GET .../runs`, SRC-11), and that left the table with the 5 rows the
+    source holds. The table is loaded by `replace` (set in the spec above), so
+    a second load leaves 5 rows, not 10: row counts cannot tell a load that ran
+    from one that did not (`SRC-12 review C1 BLOCKER 2`); the record and the
+    provider's counters do. Returns the run id."""
+    run_id = ops.launch_run(connector_id)
+    ops.wait_dagster(run_id, "SUCCESS", what)
+    record = ops.poll(f"the run record of {what}", lambda: ops.run_record(connector_id, run_id), 60)
+    if record.get("status") != "succeeded":
+        ops.poll(
+            f"the run record of {what} to settle",
+            lambda: (ops.run_record(connector_id, run_id) or {}).get("status") != "running",
+            60,
+        )
+        record = ops.run_record(connector_id, run_id) or {}
+    if record.get("status") != "succeeded":
+        raise OauthGateFailure(f"{what}: the run record says {record.get('status')!r}, expected 'succeeded' ({record})")
     rows = ops.bronze_rows(bronze)
-    if rows != rows_after:
-        raise OauthGateFailure(f"{what}: bronze.{bronze} has {rows} rows, expected {rows_after}")
+    if rows != len(ROWS):
+        raise OauthGateFailure(f"{what}: bronze.{bronze} has {rows} rows, expected {len(ROWS)} (replace)")
+    return run_id
 
 
 def run_refused(connector_id: str, provider: "Provider", what: str) -> None:
@@ -421,7 +441,7 @@ def run() -> None:
         ops.expect_ok(
             api("PUT", f"/api/connectors/{cid}/ingest-spec", json={
                 "adapter": "rest", "ingestMode": "batch", "dial": dial,
-                "sourceObjects": [{"name": "/items", "target": bronze}],
+                "sourceObjects": [{"name": "/items", "target": bronze, "loadMode": "replace"}],
             }),
             "PUT ingest-spec",
         )
@@ -461,7 +481,7 @@ def steps(cid: str, bronze: str, provider: Provider, base: str) -> None:
 
     # 3. A load that outlives one access token.
     before = provider.refresh_grants()
-    run_ok(cid, "first load", 5, bronze)
+    run_ok(cid, "first load", bronze)
     refreshes = provider.refresh_grants() - before
     if refreshes < 2:
         raise OauthGateFailure(
@@ -475,8 +495,14 @@ def steps(cid: str, bronze: str, provider: Provider, base: str) -> None:
     if rotated == sealed:
         raise OauthGateFailure("the stored refresh token did not change although the provider rotated it")
     time.sleep(TOKEN_LIFETIME_S + 1)
-    run_ok(cid, "second load, after the access token expired", 10, bronze)
-    say("4. the rotated refresh token was sealed in place of the old one: the second load, started after the access token expired, worked")
+    before_second = provider.refresh_grants()
+    run_ok(cid, "second load, after the access token expired", bronze)
+    if provider.refresh_grants() <= before_second:
+        raise OauthGateFailure("the second load did not ask the provider for a refresh-token grant")
+    after_second = check_sealed(cid, provider, what="after the second load")
+    if after_second == rotated:
+        raise OauthGateFailure("the stored refresh token did not change during the second load although the provider rotated it")
+    say("4. the rotated refresh token was sealed in place of the old one: the second load, started after the access token expired, succeeded on a refresh-token grant and rotated it again")
 
     # 5. The connection test refreshes too, and keeps what it is given.
     for attempt in (1, 2):
@@ -511,7 +537,7 @@ def steps(cid: str, bronze: str, provider: Provider, base: str) -> None:
     page, _ = browser_sign_in(cid, provider)
     if "Signed in" not in page:
         raise OauthGateFailure(f"signing in again should work, got: {page[:300]}")
-    run_ok(cid, "load after signing in again", 15, bronze)
+    run_ok(cid, "load after signing in again", bronze)
     say("7. a refresh token the provider no longer honours fails the run once as sign_in_refused; signing in again restores it")
 
     # 8. Sign out revokes at the provider and removes the file; a delete does too.
