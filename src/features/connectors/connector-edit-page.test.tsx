@@ -374,6 +374,51 @@ describe("ConnectorEditPage", () => {
   })
 
   /**
+   * `SRC-12` part C: an OAuth sign-in connector's edit page asks for the client
+   * secret only. The refresh token is obtained by signing in, so it is never a
+   * field and never part of the request.
+   */
+  it("replaces an OAuth connector's client secret without ever sending a refresh token", async () => {
+    const oauthSpec = {
+      ...SPEC,
+      adapter: "rest",
+      dial: {
+        baseUrl: "https://api.example.com",
+        auth: {
+          type: "oauth2_authorization_code",
+          clientId: "app-1",
+          authorizeUrl: "https://login.example.com/authorize",
+          tokenUrl: "https://login.example.com/token",
+          scopes: ["read"],
+        },
+        pagination: { type: "none" },
+        endpoints: [{ path: "/items", recordsPath: null }],
+      },
+      secretRefs: { primary: "file:/run/secrets/connector_managed_x_secret_key", secondary: "file:/run/secrets/connector_managed_x_token" },
+    }
+    const calls = stubFetch(
+      {
+        "GET /api/connectors/conn-a/ingest-spec": () => json(oauthSpec),
+        "GET /api/connectors/credential-settings": () =>
+          json({ secretManager: null, typedCredentials: true, oauthCallbackUrl: "https://console.test/api/connectors/oauth/callback" }),
+      },
+      { ...DETAIL, type: "REST API", credentialManaged: true, credentialSource: "managed", credentialKind: "secret_key", credentialSecondaryKind: "token" }
+    )
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    expect(page.getByText("https://console.test/api/connectors/oauth/callback")).toBeDefined()
+    expect(page.queryByLabelText("Refresh token")).toBeNull()
+    fireEvent.change(page.getByLabelText("Client secret"), { target: { value: "new-secret" } })
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(writes(calls).some((c) => c.url.endsWith("/credential"))).toBe(true))
+    const put = writes(calls).find((c) => c.url.endsWith("/credential"))
+    expect(put?.body).toEqual({ primary: { kind: "secret_key", value: "new-secret" } })
+  })
+
+  /**
    * A connector pipelines still read from is not offered for deletion at
    * all: the section names the pipelines, the button is off, and no DELETE
    * is ever sent.

@@ -281,6 +281,42 @@ export type CredentialSlotValue = { kind: CredentialKind; value: string } | { re
 export type CredentialSettings = {
   secretManager: "vault" | "aws" | "gcp" | "azure" | null
   typedCredentials: boolean
+  /**
+   * This product's OAuth callback address, to enter in the provider's app
+   * settings (`SRC-12` part C). `null` when the operator has not set
+   * `CONNECTOR_OAUTH_REDIRECT_URI`: signing in is then refused.
+   */
+  oauthCallbackUrl: string | null
+}
+
+/** `GET /api/connectors/{id}/oauth` (`SRC-12` part C). Holds no token. */
+export type OAuthStatus = {
+  /** Whether the connector holds a refresh token it can read. */
+  signedIn: boolean
+  /** The address to enter in the provider's app settings; `null` when the operator has not set it. */
+  callbackUrl: string | null
+  /** Whether the dial names a revocation address, so signing out can tell the provider. */
+  revocationConfigured: boolean
+}
+
+/** `POST /api/connectors/{id}/oauth/start`: the provider's sign-in page, to open in a new window. */
+export type OAuthStart = {
+  authorizeUrl: string
+  expiresInSeconds: number
+}
+
+/**
+ * What signing out did at the provider (`SRC-12` decision 8): `done`; `notConfigured`
+ * (no revocation address, the token stays valid there until it expires); `noToken`;
+ * `failed` (the provider could not be told).
+ */
+export type OAuthRevocation = "done" | "notConfigured" | "noToken" | "failed" | "notApplicable"
+
+/** `POST /api/connectors/{id}/oauth/sign-out`. The local token is gone either way. */
+export type OAuthSignOut = {
+  signedOut: boolean
+  revocation: OAuthRevocation
+  message: string
 }
 
 /**
@@ -473,13 +509,27 @@ export type FilesDial = {
 
 /**
  * Internally tagged on `type`, mirroring `RestAuth`
- * (`#[serde(tag = "type")]`) exactly — the same four `type` values
+ * (`#[serde(tag = "type")]`) exactly — the same five `type` values
  * `RestAuth::type_tag` names.
+ *
+ * `oauth2_authorization_code` (`SRC-12` part C) is the sign-in flow with
+ * PKCE: the client id and the addresses are configuration; the client secret
+ * is the connector's primary credential and the refresh token (written by the
+ * sign-in, never typed) its secondary one. `revocationUrl` is optional: when
+ * absent, signing out cannot tell the provider.
  */
 export type RestAuth =
   | { type: "api_key"; header: string }
   | { type: "bearer" }
   | { type: "oauth2_client_credentials"; tokenUrl: string }
+  | {
+      type: "oauth2_authorization_code"
+      clientId: string
+      authorizeUrl: string
+      tokenUrl: string
+      revocationUrl?: string
+      scopes: string[]
+    }
   | { type: "basic" }
 
 export type RestPagination =
@@ -1026,6 +1076,12 @@ export interface ConnectorService {
   ): Promise<RotateConnectorSecretResponse>
   /** `GET /api/connectors/credential-settings` — see `CredentialSettings`. */
   getCredentialSettings(signal?: AbortSignal): Promise<CredentialSettings>
+  /** `GET /api/connectors/{id}/oauth` (`SRC-12` part C) — see `OAuthStatus`. 409 for a connector that does not sign in with OAuth authorization code. */
+  getOAuthStatus(id: string, signal?: AbortSignal): Promise<OAuthStatus>
+  /** `POST /api/connectors/{id}/oauth/start` — see `OAuthStart`. The state and verifier stay on the server. */
+  startOAuth(id: string, signal?: AbortSignal): Promise<OAuthStart>
+  /** `POST /api/connectors/{id}/oauth/sign-out` — revoke at the provider when it can be told, and delete the stored token. */
+  signOutOAuth(id: string, signal?: AbortSignal): Promise<OAuthSignOut>
   /**
    * `PUT /api/connectors/{id}/credential` — save a user-supplied credential
    * as the connector's lakehouse-managed credential, probe-first (ADR 0002
