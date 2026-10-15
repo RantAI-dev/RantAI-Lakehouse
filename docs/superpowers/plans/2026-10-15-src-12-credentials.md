@@ -173,6 +173,76 @@ after part B's review.
 6. **B8. Docs (planner).** ADR 0002 addendum 6, `docs/OPERATIONS.md`, the
    feature page, `CHANGELOG.md`, `docs/plans/SRC-12-RESULT.md` part B.
 
+## 3c. Tasks, part C — OAuth for REST connectors (planned 2026-10-15, after part B's review)
+
+### Decisions as built (D6, D7, D8, D11, D12; the planner's notes in italics)
+
+- **The flow (D6).** OAuth 2.0 authorization code with PKCE (S256) for
+  the REST connector. The connector's auth kind `oauth2_authorization_code`
+  holds: the provider's sign-in address, token address, optional revocation
+  address, scopes, and the app's client id; the client secret is a
+  credential like any other (typed, encrypted by part A, or a part B
+  reference). *Every address the product dials (token, revocation) must be
+  `https` and passes the same address check as connection tests; the
+  sign-in address is only handed to the browser.*
+- **Sign in.** `POST /api/connectors/{id}/oauth/start` (`connector:manage`)
+  returns the sign-in address with a `state` that is random, one-time,
+  expires after 10 minutes, and is bound to the connector and to the user
+  who started it; the PKCE verifier stays on the server with it (a table,
+  migration `0080`+). The console opens it in a new window. The provider
+  returns to the product's own callback,
+  `GET /api/connectors/oauth/callback?code&state`, which requires the same
+  signed-in user, consumes the state, exchanges the code, stores the
+  refresh token as the connector's credential (sealed, part A) and closes
+  the window with a fixed message. The callback address is shown on the
+  form, to copy into the provider's app settings. Any mismatch (unknown or
+  expired state, another user, provider error) ends with a fixed text and
+  stores nothing.
+- **Refresh (D7).** Loads ask the token address for an access token with
+  the refresh token before the first request and again when the source
+  answers 401 once; access tokens are never stored. If the provider issues
+  a new refresh token, the orchestrator sends it to the API on a new
+  service route (`ingest:read`, `require_orchestrator`, as the run reports)
+  and the API seals it in place of the old one; *the orchestrator never
+  writes the credentials volume.* A refused refresh fails the run with the
+  fixed text "sign in again" (`sign_in_refused`, not retried, `SRC-11`), and
+  the connector page shows the Sign in button. The client-credentials kind
+  gets the same "fetch again on expiry or a 401" rule. The connection test
+  performs the token request, so OAuth connectors can be tested.
+- **Sign out (D8).** Removing the credential or deleting the connector calls
+  the revocation address when one is set and says so; when none is set, the
+  page says the provider cannot be told and the token stays valid there
+  until it expires.
+- **Errors (D12)** are fixed texts; a provider's own error text or
+  description is never shown or stored.
+
+### Tasks
+
+1. **C1. Store and routes.** The pending-state table; `oauth/start`,
+   `oauth/callback`, the refresh-token update route; the auth kind in the
+   ingest spec with validation (https, address check); `POLICY_TABLE` and
+   `tests/route_auth.rs` (the callback needs a signed-in user, not
+   `connector:manage`, and checks it is the one who started). Route tests
+   with a mocked provider, including every refusal.
+2. **C2. Orchestrator.** `adapters/rest.py`: the refresh-token grant, the
+   401 retry once, the rotation report; the same expiry rule for client
+   credentials. Unit tests, no network.
+3. **C3. Test and revoke.** The connection test's token request; revocation
+   on removal and delete.
+4. **C4. Console.** The auth kind's fields, the callback address to copy,
+   the Sign in button and window, "sign in again" on the connector page.
+5. **C5. Gate.** A provider the gate runs itself (as `SRC-17`'s receiver):
+   an authorize endpoint that approves at once and redirects with a code,
+   a token endpoint issuing 5-second access tokens and rotating refresh
+   tokens, a revocation endpoint; a REST stub that requires the bearer
+   token. Steps: the gate drives the sign-in as a browser would; a load;
+   a second load after the access token expired (refresh used, the rotated
+   refresh token stored, still sealed); revocation called on removal; a
+   wrong `state` and a replayed `state` refused. Its own job, registered as
+   before.
+6. **C6. Docs (planner).** ADR 0002 addendum 7, `docs/OPERATIONS.md`, the
+   feature page, `CHANGELOG.md`, `docs/plans/SRC-12-RESULT.md`.
+
 ## 4. Build limits on this machine
 
 As the `SRC-11` and `SRC-13` plans: no `cargo test`/`build`/`nextest`/`clean`,
