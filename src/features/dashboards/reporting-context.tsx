@@ -12,7 +12,7 @@ import type { ReportingContext as Reporting } from "@/lib/time-grain";
  */
 const DEFAULT_REPORTING: Reporting = {
   timeZone: "Asia/Jakarta", weekStart: "monday",
-  numberLocale: DEFAULT_NUMBER_LOCALE, companyPalette: [], fonts: [...SHIPPED_FONT_IDS],
+  numberLocale: DEFAULT_NUMBER_LOCALE, companyPalette: [], fonts: [...SHIPPED_FONT_IDS], contentSites: [],
 };
 
 export const ReportingContext = React.createContext<Reporting>(DEFAULT_REPORTING);
@@ -34,6 +34,8 @@ export function ReportingProvider({
   // The palette and fonts are arrays; their joined text is the stable key.
   const paletteKey = (reporting?.companyPalette ?? []).join(",");
   const fontsKey = (reporting?.fonts ?? SHIPPED_FONT_IDS).join(",");
+  // Sites contain no comma (the server's grammar), so the join is a safe key.
+  const sitesKey = (reporting?.contentSites ?? []).join(",");
   // Rebuilt from the fields, not the object: the payload hands a new
   // object on every fetch, which would re-render every tile for nothing.
   const value = React.useMemo(
@@ -43,9 +45,10 @@ export function ReportingProvider({
             timeZone, weekStart, numberLocale,
             companyPalette: paletteKey ? paletteKey.split(",") : [],
             fonts: fontsKey ? fontsKey.split(",") : [],
+            contentSites: sitesKey ? sitesKey.split(",") : [],
           }
         : DEFAULT_REPORTING,
-    [timeZone, weekStart, numberLocale, paletteKey, fontsKey],
+    [timeZone, weekStart, numberLocale, paletteKey, fontsKey, sitesKey],
   );
   return <ReportingContext.Provider value={value}>{children}</ReportingContext.Provider>;
 }

@@ -1,6 +1,7 @@
-//! The deployment's reporting settings (migrations `0070` and `0072`): the
+//! The deployment's reporting settings (migrations `0070`, `0072` and `0073`): the
 //! report time zone, the first day of the week, and (`BI-17` part A) the
-//! number locale, the company palette and the allowed fonts.
+//! number locale, the company palette and the allowed fonts, and (`BI-16`
+//! part B) the sites image and web cards may load from.
 //!
 //! At most one row exists (`singleton`). No row is not an error: it means the
 //! deployment never saved the settings, and the caller supplies the defaults
@@ -26,6 +27,9 @@ pub struct ReportingSettings {
     pub company_palette: Vec<String>,
     /// The font ids dashboards may use, a subset of the console's shipped ones.
     pub fonts: Vec<String>,
+    /// The sites image and web cards may load from: `https://host[:port]`,
+    /// at most 50 (`BI-16` part B, migration `0073`).
+    pub content_sites: Vec<String>,
 }
 
 /// The saved settings, or `None` when the deployment never saved them.
@@ -35,7 +39,7 @@ pub struct ReportingSettings {
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get(pool: &PgPool) -> Result<Option<ReportingSettings>, StoreError> {
     Ok(sqlx::query_as(
-        "SELECT time_zone, week_start, number_locale, company_palette, fonts \
+        "SELECT time_zone, week_start, number_locale, company_palette, fonts, content_sites \
              FROM reporting_settings",
     )
     .fetch_optional(pool)
@@ -56,20 +60,22 @@ pub async fn upsert(
 ) -> Result<ReportingSettings, StoreError> {
     Ok(sqlx::query_as(
         "INSERT INTO reporting_settings \
-             (singleton, time_zone, week_start, number_locale, company_palette, fonts, \
+             (singleton, time_zone, week_start, number_locale, company_palette, fonts, content_sites, \
               updated_at, updated_by) \
-         VALUES (TRUE, $1, $2, $3, $4, $5, now(), $6) \
+         VALUES (TRUE, $1, $2, $3, $4, $5, $6, now(), $7) \
          ON CONFLICT (singleton) DO UPDATE SET time_zone = EXCLUDED.time_zone, \
          week_start = EXCLUDED.week_start, number_locale = EXCLUDED.number_locale, \
          company_palette = EXCLUDED.company_palette, fonts = EXCLUDED.fonts, \
-         updated_at = now(), updated_by = EXCLUDED.updated_by \
-         RETURNING time_zone, week_start, number_locale, company_palette, fonts",
+         content_sites = EXCLUDED.content_sites, updated_at = now(), updated_by = EXCLUDED.updated_by \
+         RETURNING time_zone, week_start, number_locale, company_palette, fonts, \
+         content_sites",
     )
     .bind(&settings.time_zone)
     .bind(&settings.week_start)
     .bind(&settings.number_locale)
     .bind(&settings.company_palette)
     .bind(&settings.fonts)
+    .bind(&settings.content_sites)
     .bind(updated_by)
     .fetch_one(pool)
     .await?)

@@ -19,6 +19,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import {
   COMPANY_PALETTE_MAX,
   COMPANY_PALETTE_MIN,
+  MAX_CONTENT_SITES,
   NUMBER_LOCALES,
   SHIPPED_FONTS,
   isHexColor,
@@ -32,7 +33,7 @@ const WEEK_STARTS = { monday: "Monday", sunday: "Sunday" } as const
 
 /**
  * Admin > Settings (`BI-9`, `BI-17`): the report time zone and the first day
- * of the week, the number locale, the company palette and the allowed fonts,
+ * of the week, the number locale, the company palette, the allowed fonts and the content sites,
  * for the whole deployment. Anyone signed in sees the values; only a
  * holder of `settings:write` can change them (the server enforces it; the
  * controls are disabled here so the page does not offer what would be
@@ -62,6 +63,8 @@ export function ReportingSettingsForm({
   const [palette, setPalette] = React.useState<string[]>([])
   const [fonts, setFonts] = React.useState<string[]>([])
   const [hex, setHex] = React.useState("")
+  const [sites, setSites] = React.useState<string[]>([])
+  const [site, setSite] = React.useState("")
   const save = useServiceAction(
     withNotify(
       { success: "Settings saved", error: "Settings were not saved" },
@@ -78,6 +81,7 @@ export function ReportingSettingsForm({
       setLocale(loaded.numberLocale)
       setPalette(loaded.companyPalette)
       setFonts(loaded.fonts)
+      setSites(loaded.contentSites ?? [])
     }
   }, [loaded])
 
@@ -89,7 +93,8 @@ export function ReportingSettingsForm({
       week !== loaded.weekStart ||
       locale !== loaded.numberLocale ||
       palette.join() !== loaded.companyPalette.join() ||
-      fonts.join() !== loaded.fonts.join())
+      fonts.join() !== loaded.fonts.join() ||
+      sites.join() !== (loaded.contentSites ?? []).join())
 
   function addColour() {
     const colour = hex.trim().toLowerCase()
@@ -97,6 +102,17 @@ export function ReportingSettingsForm({
       return
     setPalette([...palette, colour])
     setHex("")
+  }
+
+  // The server normalises and has the last word; this only keeps the obvious
+  // mistakes (no scheme, a path, a wildcard) from reaching it.
+  const siteText = site.trim().toLowerCase()
+  const siteValid = /^https:\/\/[a-z0-9.-]+(:[0-9]{1,5})?$/.test(siteText)
+
+  function addSite() {
+    if (!siteValid || sites.includes(siteText) || sites.length >= MAX_CONTENT_SITES) return
+    setSites([...sites, siteText])
+    setSite("")
   }
 
   function toggleFont(id: string, on: boolean) {
@@ -111,6 +127,7 @@ export function ReportingSettingsForm({
       numberLocale: locale,
       companyPalette: palette,
       fonts,
+      contentSites: sites,
     })
     if (result) state.reload()
   }
@@ -266,6 +283,51 @@ export function ReportingSettingsForm({
                 <Label htmlFor={`font-${id}`}>{label}</Label>
               </div>
             ))}
+          </section>
+          <section className="flex flex-col gap-1.5" aria-labelledby="settings-content-sites">
+            <h2 id="settings-content-sites" className="text-sm font-medium">
+              Allowed content sites
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Image and web-page cards may only show addresses on these sites, written
+              https://host or https://host:port, no wildcards. At most {MAX_CONTENT_SITES}.
+              With none listed, no such card can be saved.
+            </p>
+            <ul className="flex flex-col gap-1" aria-label="Allowed content sites">
+              {sites.map((s) => (
+                <li key={s} className="flex items-center gap-2 text-sm">
+                  <span className="font-mono">{s}</span>
+                  {canWrite ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Remove ${s}`}
+                      onClick={() => setSites(sites.filter((x) => x !== s))}
+                    >
+                      Remove
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+            {canWrite ? (
+              <div className="flex gap-2">
+                <Input
+                  aria-label="Content site"
+                  value={site}
+                  onChange={(e) => setSite(e.target.value)}
+                  placeholder="https://images.example.com"
+                  autoComplete="off"
+                />
+                <Button
+                  variant="outline"
+                  onClick={addSite}
+                  disabled={!siteValid || sites.length >= MAX_CONTENT_SITES}
+                >
+                  Add site
+                </Button>
+              </div>
+            ) : null}
           </section>
           {canWrite ? (
             <Button

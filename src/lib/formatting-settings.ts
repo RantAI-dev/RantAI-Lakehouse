@@ -26,6 +26,9 @@ export const SHIPPED_FONT_IDS = Object.keys(SHIPPED_FONTS)
 export const COMPANY_PALETTE_MIN = 2
 export const COMPANY_PALETTE_MAX = 12
 
+/** The most content sites a deployment may list; mirrors `MAX_CONTENT_SITES`. */
+export const MAX_CONTENT_SITES = 50
+
 /** Whether `s` is `#rrggbb`, the only colour form the server accepts. */
 export function isHexColor(s: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(s)

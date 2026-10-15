@@ -48,6 +48,7 @@ const DEFAULTS = {
   numberLocale: "en-US",
   companyPalette: [],
   fonts: ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
+  contentSites: [],
 }
 
 describe("ReportingSettingsForm", () => {
@@ -93,6 +94,7 @@ describe("ReportingSettingsForm", () => {
       numberLocale: "en-US",
       companyPalette: [],
       fonts: DEFAULTS.fonts,
+      contentSites: [],
     })
   })
 
@@ -129,5 +131,35 @@ describe("ReportingSettingsForm", () => {
     expect(screen.queryByRole("button", { name: "Remove #112233" })).toBeNull()
     expect(screen.getByRole("heading", { name: "Numbers" })).toBeDefined()
     expect(screen.getByRole("heading", { name: "Fonts" })).toBeDefined()
+  })
+
+  it("adds allowed content sites, refuses an address with a path or a wildcard, and saves the list", async () => {
+    const calls = mockSettings({ ...DEFAULTS, contentSites: ["https://img.example"] })
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const site = (await screen.findByLabelText("Content site")) as HTMLInputElement
+    await screen.findByText("https://img.example")
+    const add = screen.getByRole("button", { name: "Add site" }) as HTMLButtonElement
+    for (const bad of ["http://a.example", "https://a.example/x", "https://*.example", "a.example"]) {
+      fireEvent.change(site, { target: { value: bad } })
+      expect(add.disabled).toBe(true)
+    }
+    fireEvent.change(site, { target: { value: "https://CDN.example:8443" } })
+    expect(add.disabled).toBe(false)
+    fireEvent.click(add)
+    expect(screen.getByText("https://cdn.example:8443")).toBeDefined()
+    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement
+    await waitFor(() => expect(save.disabled).toBe(false))
+    fireEvent.click(save)
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const sent = JSON.parse(calls.find((c) => c.method === "PUT")?.body ?? "{}")
+    expect(sent.contentSites).toEqual(["https://img.example", "https://cdn.example:8443"])
+  })
+
+  it("shows the content sites read-only without settings:write", async () => {
+    mockSettings({ ...DEFAULTS, contentSites: ["https://img.example"] })
+    render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
+    expect(await screen.findByText("https://img.example")).toBeDefined()
+    expect(screen.queryByRole("button", { name: "Add site" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Remove https://img.example" })).toBeNull()
   })
 })

@@ -1,6 +1,7 @@
 //! `GET`/`PUT /api/settings/reporting` — the deployment's report time zone
 //! and first day of the week (`BI-9`), and the number locale, company palette
-//! and allowed fonts (`BI-17` part A, migration `0072`).
+//! and allowed fonts (`BI-17` part A, migration `0072`), and the sites image
+//! and web cards may load from (`BI-16` part B, migration `0073`).
 //!
 //! # Why one deployment-wide setting
 //!
@@ -28,6 +29,17 @@
 //! ([`add_formatting`]), so a public link and a signed embed format numbers
 //! and pick colours the way the console does.
 //!
+//! # Content sites
+//!
+//! `contentSites` (0 to 50 entries, `https://host[:port]`, no wildcard) is the
+//! list an image or web card's address must belong to
+//! ([`lakehouse_bi::embed_access::validate_content_sites`], the same parser as
+//! the signed-embed sites). It is optional like the formatting fields, rides in
+//! the `reporting` object so every view applies the same list, and an empty
+//! list (the default) means no such card can be saved: fail closed. The
+//! console and the assistant check a card's address against it at save
+//! (`lakehouse_bi::types_b::check_content_url`).
+//!
 //! # The zone is checked against the engine
 //!
 //! A name is saved only if it has the shape of a zone name
@@ -41,6 +53,7 @@ use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
 use lakehouse_auth::Principal;
+use lakehouse_bi::embed_access::validate_content_sites;
 use lakehouse_bi::formatting::{COMPANY_PALETTE_LEN, NUMBER_LOCALES, SHIPPED_FONTS, is_hex_color};
 use lakehouse_bi::grain::{TimeContext, WeekStart};
 use lakehouse_core::ApiError;
@@ -55,7 +68,7 @@ use crate::upstream_error;
 
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -65,6 +78,7 @@ struct SettingsBody {
     number_locale: Option<String>,
     company_palette: Option<Vec<String>>,
     fonts: Option<Vec<String>>,
+    content_sites: Option<Vec<String>>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -73,6 +87,7 @@ pub(crate) struct FormatSettings {
     pub number_locale: String,
     pub company_palette: Vec<String>,
     pub fonts: Vec<String>,
+    pub content_sites: Vec<String>,
 }
 
 impl Default for FormatSettings {
@@ -83,6 +98,7 @@ impl Default for FormatSettings {
             number_locale: NUMBER_LOCALES[0].to_owned(),
             company_palette: Vec::new(),
             fonts: SHIPPED_FONTS.iter().map(|f| (*f).to_owned()).collect(),
+            content_sites: Vec::new(),
         }
     }
 }
@@ -93,6 +109,7 @@ impl FormatSettings {
             number_locale: row.number_locale.clone(),
             company_palette: row.company_palette.clone(),
             fonts: row.fonts.clone(),
+            content_sites: row.content_sites.clone(),
         }
     }
 
@@ -101,6 +118,7 @@ impl FormatSettings {
             "numberLocale": self.number_locale,
             "companyPalette": self.company_palette,
             "fonts": self.fonts,
+            "contentSites": self.content_sites,
         })
     }
 }
@@ -181,10 +199,16 @@ fn checked_formatting(
         }
         None => current.fonts.clone(),
     };
+    let content_sites = match &parsed.content_sites {
+        Some(sites) => validate_content_sites(sites)
+            .map_err(|why| ApiError::BadRequest(format!("contentSites: {why}")))?,
+        None => current.content_sites.clone(),
+    };
     Ok(FormatSettings {
         number_locale,
         company_palette,
         fonts,
+        content_sites,
     })
 }
 
@@ -246,13 +270,13 @@ pub async fn get_reporting(State(state): State<AppState>) -> ApiResult<ApiJson<V
 }
 
 /// `PUT /api/settings/reporting` — save `{timeZone, weekStart}` and, when
-/// sent, `{numberLocale, companyPalette, fonts}`.
+/// sent, `{numberLocale, companyPalette, fonts, contentSites}`.
 ///
 /// # Errors
 ///
 /// 400 with a fixed message when the body is not those fields, the first
-/// day is not `monday` or `sunday`, the locale, palette or fonts are outside
-/// their lists, or the engine does not know the zone;
+/// day is not `monday` or `sunday`, the locale, palette, fonts or content
+/// sites are outside their lists, or the engine does not know the zone;
 /// 503 without a Postgres pool; 5xx through `upstream_error` when the engine
 /// or the database fails.
 pub async fn put_reporting(
@@ -286,6 +310,7 @@ pub async fn put_reporting(
             number_locale: format.number_locale,
             company_palette: format.company_palette,
             fonts: format.fonts,
+            content_sites: format.content_sites,
         },
         &principal.id.uuid().to_string(),
     )
@@ -357,6 +382,7 @@ mod tests {
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
+                "contentSites": [],
             })
         );
         assert_eq!(
@@ -378,6 +404,7 @@ mod tests {
             number_locale: "id-ID".to_owned(),
             company_palette: vec!["#112233".to_owned(), "#445566".to_owned()],
             fonts: vec!["inter".to_owned()],
+            content_sites: vec!["https://img.example".to_owned()],
         };
         assert_eq!(checked_formatting(&body(""), &current).unwrap(), current);
     }
@@ -409,6 +436,12 @@ mod tests {
                 "{extra}: {err:?}"
             );
         }
+        let wildcard = checked_formatting(
+            &body(r#","contentSites":["https://*.example"]"#),
+            &FormatSettings::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(&wildcard, ApiError::BadRequest(m) if m.starts_with("contentSites:")));
         let thirteen: Vec<String> = (0..13).map(|_| "\"#000000\"".to_owned()).collect();
         let extra = format!(r#","companyPalette":[{}]"#, thirteen.join(","));
         assert!(checked_formatting(&body(&extra), &FormatSettings::default()).is_err());

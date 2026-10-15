@@ -24,7 +24,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
 
 /// What a deployment that never saved formatting reads back.
 fn formatting_defaults(mut body: Value) -> Value {
@@ -37,6 +37,7 @@ fn formatting_defaults(mut body: Value) -> Value {
         "jetbrains-mono",
         "system"
     ]);
+    body["contentSites"] = json!([]);
     body
 }
 
@@ -265,4 +266,62 @@ async fn every_shipped_font_and_locale_passes_the_tables_checks() {
         assert_eq!(status, StatusCode::OK, "{locale}: {got}");
         assert_eq!(got["fonts"], fonts);
     }
+}
+
+#[tokio::test]
+async fn content_sites_are_saved_normalised_kept_by_a_later_save_and_refused_when_unfit() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let writer = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday",
+            "contentSites":["https://Img.Example","https://cdn.example:8443","https://img.example"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["contentSites"],
+        json!(["https://img.example", "https://cdn.example:8443"])
+    );
+    // A save without the field keeps the list.
+    let (_, again) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"sunday"}"#,
+    )
+    .await;
+    assert_eq!(again["contentSites"], body["contentSites"]);
+    let (_, read) = call(&router, "GET", &cookie, "").await;
+    assert_eq!(read["contentSites"], body["contentSites"]);
+
+    let fifty_one: Vec<String> = (0..51).map(|i| format!("https://s{i}.example")).collect();
+    for bad in [
+        json!(["http://img.example"]),
+        json!(["https://*.example"]),
+        json!(["https://img.example/path"]),
+        json!(["img.example"]),
+        json!(fifty_one),
+    ] {
+        let payload = json!({"timeZone": "UTC", "weekStart": "monday", "contentSites": bad});
+        let (status, err) = call(&router, "PUT", &cookie, &payload.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {err}");
+    }
+    let (_, after) = call(&router, "GET", &cookie, "").await;
+    assert_eq!(
+        after["contentSites"], body["contentSites"],
+        "a refused save changes nothing"
+    );
+    // Clearing the list is allowed.
+    let (_, cleared) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","contentSites":[]}"#,
+    )
+    .await;
+    assert_eq!(cleared["contentSites"], json!([]));
 }

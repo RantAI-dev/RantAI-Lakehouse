@@ -11,7 +11,8 @@ use lakehouse_test_support as _;
 use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
-/// Settings with the formatting defaults of migration `0072`.
+/// Settings with the formatting defaults of migration `0072` and the empty
+/// content-site list of `0073`.
 fn settings(zone: &str, week: &str) -> ReportingSettings {
     ReportingSettings {
         time_zone: zone.to_owned(),
@@ -19,6 +20,7 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         number_locale: "en-US".to_owned(),
         company_palette: Vec::new(),
         fonts: SHIPPED.iter().map(|f| (*f).to_owned()).collect(),
+        content_sites: Vec::new(),
     }
 }
 
@@ -100,6 +102,10 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
     chosen.number_locale = "id-ID".to_owned();
     chosen.company_palette = vec!["#1a2b3c".to_owned(), "#FFAA00".to_owned()];
     chosen.fonts = vec!["inter".to_owned(), "system".to_owned()];
+    chosen.content_sites = vec![
+        "https://img.example".to_owned(),
+        "https://cdn.example:8443".to_owned(),
+    ];
     assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
     Ok(())
@@ -135,5 +141,37 @@ async fn the_table_refuses_a_third_locale_a_bad_palette_and_a_font_it_does_not_s
         );
     }
     assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_content_sites_that_are_not_https_origins_or_are_too_many(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let mut cases = Vec::new();
+    for sites in [
+        vec!["http://img.example".to_owned()],
+        vec!["https://img.example/path".to_owned()],
+        vec!["https://*.example".to_owned()],
+        vec![
+            "https://a.example".to_owned(),
+            "javascript:alert(1)".to_owned(),
+        ],
+        vec!["https://a.example'; DROP TABLE x; --".to_owned()],
+        (0..51).map(|i| format!("https://s{i}.example")).collect(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.content_sites = sites;
+        cases.push(s);
+    }
+    for case in cases {
+        assert!(
+            upsert(&pool, &case, "u").await.is_err(),
+            "{case:?} should be refused by the table's CHECKs"
+        );
+    }
+    let mut fifty = settings("UTC", "monday");
+    fifty.content_sites = (0..50).map(|i| format!("https://s{i}.example")).collect();
+    assert_eq!(upsert(&pool, &fifty, "u").await.expect("fifty"), fifty);
     Ok(())
 }

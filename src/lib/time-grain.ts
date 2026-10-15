@@ -189,6 +189,8 @@ export type ReportingContext = {
   numberLocale?: string
   companyPalette?: string[]
   fonts?: string[]
+  /** `https://host[:port]` sites image and web cards may load from (`BI-16` part B). */
+  contentSites?: string[]
 }
 
 /** Calendar first day for ECharts (`firstDay`: 0 is Sunday, 1 is Monday). */
