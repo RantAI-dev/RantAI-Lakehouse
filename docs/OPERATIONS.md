@@ -779,6 +779,19 @@ installation's secret manager. One manager per installation:
 - `CONNECTOR_TYPED_CREDENTIALS=false` hides the "type a credential" option
   when every credential should come from the manager.
 
+### OAuth sign-in for REST connectors (`SRC-12`, ADR 0002 addendum 7)
+
+- Set `CONNECTOR_OAUTH_REDIRECT_URI` to the console's address of the
+  product's callback (the connector form shows the path to append). Register
+  exactly that address in the provider's app settings.
+- The provider's token and revocation addresses must be `https`.
+  `CONNECTOR_OAUTH_ALLOW_HTTP` is for tests only; never set it in a real
+  installation.
+- When a provider refuses a refresh (the user's access was withdrawn, the
+  app's secret changed), the connector's runs fail with "sign in again"
+  until someone with `connector:manage` signs in again from the connector
+  page.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

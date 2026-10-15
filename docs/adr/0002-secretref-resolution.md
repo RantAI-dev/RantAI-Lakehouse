@@ -572,3 +572,47 @@ on the product's file system (feature page
   `SECRET_MANAGER_ALLOWED_PREFIXES`, and should give the product's manager
   identity a policy no wider than those prefixes.
 - Typed credentials stay available unless `CONNECTOR_TYPED_CREDENTIALS=false`.
+
+## Addendum 7: OAuth sign-in for REST connectors (`SRC-12` part C, 2026-10-15)
+
+### Context
+
+`SRC-12` asks for the OAuth 2.0 authorization-code flow, with token refresh,
+for every connector whose source offers it; in this product that is the
+REST connector (feature page decisions 6 to 8, signed 2026-10-14).
+
+### Decision
+
+- A REST connector can use the auth kind `oauth2_authorization_code`. The
+  user starts the sign-in from the connector page; the product creates a
+  one-time `state` (stored hashed, bound to the connector and the user,
+  expiring after 10 minutes) and a PKCE S256 verifier, and returns the
+  provider's sign-in address. The provider returns to the product's own
+  callback address, which the operator sets (`CONNECTOR_OAUTH_REDIRECT_URI`)
+  and which is never taken from a request. The callback consumes the state
+  first, requires the same signed-in user, the connector's tenant and
+  `connector:manage`, exchanges the code, and stores only the refresh token,
+  sealed as in addendum 5. Access tokens are never stored.
+- Loads fetch an access token with the refresh token and fetch again once
+  on a 401. A rotated refresh token is sent by the orchestrator to the API
+  on a service route and sealed in place of the old one; the orchestrator
+  never writes the credentials volume. A refused refresh fails the run as
+  "sign in again", not retried.
+- The token and revocation addresses are dialled only over `https`, after
+  the same address check as connection tests, without following redirects
+  (`CONNECTOR_OAUTH_ALLOW_HTTP` exists for the gate's own provider and is
+  off unless exactly `true`). Both addresses are part of the connector's
+  target identity, so `SEC-14`'s re-point rule covers them.
+- Signing out, removing the credential or deleting the connector revokes
+  the token when the provider has a revocation address, and says so.
+
+### Deliberate limits
+
+- A connector signed in this way cannot be re-pointed to another provider:
+  `SEC-14` requires new credentials for every slot, and a refresh token can
+  only come from a new sign-in. A new connector is needed instead.
+- Client authentication is `client_secret_post` only.
+- Two runs of the same connector at once can race on a provider that
+  rotates refresh tokens.
+- The PKCE verifier is kept in clear for at most the 10 minutes of a
+  sign-in; alone, without the one-time code, it signs nobody in.
