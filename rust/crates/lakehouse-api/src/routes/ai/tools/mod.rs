@@ -7,6 +7,7 @@
 //!   buttons.
 //! - [`propose`] — `propose_sql`, a corrected statement checked for the
 //!   caller and shown to the person, never run.
+//! - [`look`] — `format_chart`, `set_dashboard_theme` (`BI-17` part A).
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
@@ -37,6 +38,9 @@ mod gold;
 mod governance;
 mod ingest;
 mod lakehouse;
+mod look;
+#[cfg(test)]
+pub(super) use look::FORMAT_FIELDS;
 mod metrics;
 mod ops;
 mod pipelines;
@@ -153,6 +157,7 @@ pub(in crate::routes) async fn run_tool(
         "list_charts" => dashboards::list_charts(ch, principal).await,
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
+        n if look::handles(n) => look::run(state, principal, name, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,

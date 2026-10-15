@@ -235,6 +235,28 @@ pub async fn create_write_high_approval(
 /// `WriteHigh`-elevation call ([`effective_risk`]) only fires when
 /// `runConfig` is present, and a model confirming a call without
 /// seeing those keys would be confirming in the dark.
+/// The confirmation line of the two formatting tools (`BI-17` part A), apart from
+/// [`summary_for`] to keep that match under clippy's line limit.
+fn look_summary(name: &str, args: &Map<String, Value>) -> String {
+    let get = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let or_same = |key: &str| {
+        let v = get(key);
+        if v.is_empty() { "tetap" } else { v }
+    };
+    if name == "format_chart" {
+        return format!(
+            "Mengubah tampilan chart {} (format, warna, sumbu, garis acuan).",
+            get("chart")
+        );
+    }
+    format!(
+        "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
+        get("board"),
+        or_same("theme"),
+        or_same("font")
+    )
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -293,6 +315,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("title"),
             s("kind")
         ),
+        "format_chart" | "set_dashboard_theme" => look_summary(spec.name, args),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
         "create_tab" => format!(
             "Menambah tab \"{}\" pada dashboard {}.",
@@ -536,6 +559,9 @@ mod tests {
         "create_board",
     ];
 
+    /// BI-17 part A / AI-8: the two formatting tools are `WriteLow` like `update_chart`.
+    const FORMAT_TOOLS: [&str; 2] = ["format_chart", "set_dashboard_theme"];
+
     /// A `PermissionSet` granting everything (`*:*`) — Platform Admin.
     fn admin_perms() -> PermissionSet {
         PermissionSet::parse("*:*")
@@ -548,6 +574,43 @@ mod tests {
 
     fn spec(name: &str) -> &'static registry::ToolSpec {
         registry::find(name).expect("registered tool")
+    }
+
+    /// BI-17 part A / AI-8: the formatting tools wait for the chat's confirmation, do not execute
+    /// without it, are refused to a user without `dashboard:write`, and (being `WriteLow`) need no approval.
+    #[test]
+    fn the_formatting_tools_need_confirmation_and_dashboard_write() {
+        let admin = admin_perms();
+        let editor = PermissionSet::parse("dashboard:read, dashboard:write");
+        let reader = PermissionSet::parse("dashboard:read");
+        for name in FORMAT_TOOLS {
+            let mut args = Map::new();
+            args.insert("chart".to_owned(), json!("c1"));
+            args.insert("board".to_owned(), json!("b1"));
+            let pending =
+                decide(true, Some(&editor), spec(name), &args).expect("must wait for confirmation");
+            assert_eq!(pending["needs_confirmation"], json!(true), "{name}");
+            assert!(
+                pending["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("c1") || s.contains("b1")),
+                "{name}"
+            );
+            assert_eq!(
+                decide(true, Some(&admin), spec(name), &confirmed_args()),
+                None,
+                "{name}"
+            );
+            let refused =
+                decide(true, Some(&reader), spec(name), &confirmed_args()).expect("refused");
+            assert!(
+                refused.get("needs_confirmation").is_none() && refused.get("error").is_some(),
+                "{name}: {refused}"
+            );
+            let ask = decide(false, Some(&admin), spec(name), &confirmed_args())
+                .expect("refused in ask mode");
+            assert!(ask.get("error").is_some(), "{name}");
+        }
     }
 
     #[test]

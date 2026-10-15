@@ -242,11 +242,7 @@ fn with_shape_properties(mut schema: Value) -> Value {
             "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it" },
         "breakdown": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
             "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it" },
-        "referenceLines": { "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
-            "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}" },
-            "label": { "type": "string", "description": "at most 60 characters" } },
-            "required": ["value"] },
-            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move" },
+        "referenceLines": reference_lines_schema(),
         "filters": filters_schema("the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""),
         "layers": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
             "mart": { "type": "string", "description": "the Gold mart this question reads (give this or sqlSource)" },
@@ -403,8 +399,111 @@ fn describe_mart_schema() -> Value {
             "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
 
+/// The `referenceLines` of the chart tools (`BI-11`, `BI-17`): a fixed or
+/// parameter value, a line computed from the rows on screen, or a band.
+fn reference_lines_schema() -> Value {
+    json!({ "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
+        "kind": { "type": "string", "enum": ["value", "average", "median", "min", "max", "trend", "band"],
+            "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`" },
+        "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line" },
+        "to": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "band only: the other edge" },
+        "label": { "type": "string", "description": "at most 60 characters" },
+        "color": { "type": "string", "description": "#rrggbb" },
+        "measure": { "type": "string", "description": "a computed line: which value of the chart it describes (a result name); default the first" } } },
+        "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen" })
+}
+
+/// The `BI-17` part A formatting fields of `create_chart`, `update_chart` and
+/// `format_chart` (the style block of `lakehouse_bi::style`), written once so
+/// the three cannot drift. The limits are the ones `style::check_style` enforces.
+fn style_properties() -> Value {
+    let value_format = json!({ "type": "object", "properties": {
+        "style": { "type": "string", "enum": ["auto", "number", "percent", "currency", "scientific", "compact"], "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before" },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "thousands": { "type": "boolean", "description": "group thousands (default true)" },
+        "currency": { "type": "string", "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR" },
+        "currencyDisplay": { "type": "string", "enum": ["symbol", "code"] },
+        "prefix": { "type": "string", "description": "at most 16 characters" },
+        "suffix": { "type": "string", "description": "at most 16 characters" } } });
+    let axis = json!({ "type": "object", "properties": {
+        "title": { "type": "string", "description": "at most 60 characters" },
+        "show": { "type": "boolean" },
+        "min": { "type": "number" }, "max": { "type": "number" },
+        "log": { "type": "boolean", "description": "logarithmic scale; every value must be above zero" },
+        "rotate": { "type": "integer", "enum": [0, 45, 90], "description": "label rotation, category axis" } } });
+    json!({
+        "format": { "oneOf": [value_format, { "type": "null" }], "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart" },
+        "valueFormats": { "type": ["object", "null"], "additionalProperties": value_format, "description": "a number format per value, keyed by the value's result name; replaces `format` for that value" },
+        "dateFormat": { "type": ["object", "null"], "properties": {
+            "style": { "type": "string", "enum": ["auto", "short", "medium", "long", "iso", "monthYear"] },
+            "hour12": { "type": "boolean" }, "abbreviate": { "type": "boolean", "description": "short month and day names" } },
+            "description": "how dates and timestamps are written" },
+        "colors": { "type": ["object", "null"], "properties": {
+            "palette": { "type": "string", "enum": ["default", "bright", "muted", "sequential-blue", "diverging-red-blue", "company"] },
+            "series": { "type": "object", "additionalProperties": { "type": "string" }, "description": "series name (or the value's result name) to #rrggbb; \"make the bars green\" is the chart's value name with a green" },
+            "byValue": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "type": "string" }, "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)" } },
+            "description": "colours; a field given here replaces the whole colors setting" },
+        "axes": { "type": ["object", "null"], "properties": {
+            "x": axis, "y": axis, "y2": axis,
+            "rightValues": { "type": "array", "items": { "type": "string" }, "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)" } },
+            "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot" },
+        "labels": { "type": ["object", "null"], "properties": { "show": { "type": "boolean" } }, "description": "write each value on its bar or point, in its format" },
+        "annotations": { "type": ["array", "null"], "maxItems": 20, "items": { "type": "object", "properties": {
+            "x": { "type": "string", "description": "the category or date the note is pinned to, as the chart shows it" },
+            "series": { "type": "string" },
+            "text": { "type": "string", "description": "plain text, at most 140 characters" } }, "required": ["x", "text"] },
+            "description": "short notes pinned to points (bar, hbar, line, area, stacked, combo, waterfall)" },
+        "tooltip": { "type": ["object", "null"], "properties": { "fields": { "type": "array", "items": { "type": "string" } } },
+            "description": "show only these of the chart's values in the tooltip (result names)" },
+        "conditional": { "type": ["array", "null"], "maxItems": 20, "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "rule": { "type": "object", "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}" },
+            "color": { "type": "string", "description": "#rrggbb; not for a range" },
+            "target": { "type": "string", "enum": ["cell", "text"] } }, "required": ["column", "rule"] },
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red" }
+    })
+}
+
+/// Insert [`style_properties`] into a chart tool's schema, the way
+/// [`with_shape_properties`] inserts the `BI-6` fields.
+fn with_style_properties(mut schema: Value) -> Value {
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = style_properties()
+    {
+        props.extend(extra);
+    }
+    schema
+}
+
+fn format_chart_schema() -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "chart".to_owned(),
+        json!({ "type": "string", "description": "the id of the chart (list_charts)" }),
+    );
+    if let Value::Object(style) = style_properties() {
+        properties.extend(style);
+    }
+    properties.insert("referenceLines".to_owned(), reference_lines_schema());
+    json!({ "type": "function", "function": { "name": "format_chart",
+        "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
+        "parameters": { "type": "object", "properties": properties, "required": ["chart"] } } })
+}
+
+fn set_dashboard_theme_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_dashboard_theme",
+        "description": "Set a dashboard's theme and font for its tiles, wherever it is shown (the console, public links, embeds). theme: auto follows the console, light or dark fixes it. font: one of the fonts an administrator allows (inter, ibm-plex-sans, source-serif, jetbrains-mono, system), or an empty string for the console's own. Not for the built-in dashboard.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard id (list_boards)" },
+            "theme": { "type": "string", "enum": ["auto", "light", "dark"] },
+            "font": { "type": "string", "enum": ["", "inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"] } },
+            "required": ["board"] } } })
+}
+
 fn create_chart_schema() -> Value {
-    with_shape_properties(with_table_properties(
+    with_style_properties(with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
@@ -424,11 +523,11 @@ fn create_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
-    ))
+    )))
 }
 
 fn update_chart_schema() -> Value {
-    with_shape_properties(with_table_properties(
+    with_style_properties(with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
@@ -448,7 +547,7 @@ fn update_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } }),
-    ))
+    )))
 }
 
 fn create_board_schema() -> Value {
@@ -1342,6 +1441,18 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "dashboard:write",
     },
     ToolSpec {
+        name: "format_chart",
+        schema: format_chart_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "set_dashboard_theme",
+        schema: set_dashboard_theme_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
         name: "create_board",
         schema: create_board_schema,
         risk: Risk::WriteLow,
@@ -1947,7 +2058,7 @@ mod tests {
         // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
         // (`AI-12`, plan 15; merged from main) + `create_tab`, `rename_tab`,
         // `move_charts_to_tab`, `move_tab` and `delete_tab` (`BI-18` part C, `AI-9`).
-        assert_eq!(tool_schemas().len(), 91);
+        assert_eq!(tool_schemas().len(), 93);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
@@ -2033,6 +2144,59 @@ mod tests {
 
     /// `BI-11` (with `AI-6`): the chart tools take a parameter for the limit
     /// and the column slots, and reference lines.
+    #[test]
+    fn the_formatting_fields_are_the_same_on_the_three_chart_tools() {
+        // BI-17 part A / AI-8: written once (`style_properties`), so create_chart, update_chart
+        // and format_chart cannot drift, and every field is a field of `lakehouse_bi::style`.
+        let style = style_properties();
+        let style = style.as_object().expect("an object");
+        assert_eq!(style.len(), 9);
+        for tool in ["create_chart", "update_chart", "format_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            for (field, definition) in style {
+                assert_eq!(&properties[field], definition, "{tool} {field}");
+            }
+            assert_eq!(
+                properties["referenceLines"],
+                reference_lines_schema(),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_chart_names_the_chart_and_nothing_else_is_required() {
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            json!(["chart"])
+        );
+        let spec = find("format_chart").expect("registered tool");
+        assert_eq!(
+            (spec.risk, spec.permission),
+            (Risk::WriteLow, "dashboard:write")
+        );
+        let spec = find("set_dashboard_theme").expect("registered tool");
+        assert_eq!(
+            (spec.risk, spec.permission),
+            (Risk::WriteLow, "dashboard:write")
+        );
+        // Its fields are exactly the ones the tool may change.
+        let schema = (find("format_chart").expect("registered tool").schema)();
+        let mut names: Vec<&str> = schema["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "chart")
+            .collect();
+        names.sort_unstable();
+        let mut allowed = crate::routes::ai::tools::FORMAT_FIELDS.to_vec();
+        allowed.sort_unstable();
+        assert_eq!(names, allowed);
+    }
+
     #[test]
     fn the_chart_tools_take_parameters_and_reference_lines() {
         for tool in ["create_chart", "update_chart"] {

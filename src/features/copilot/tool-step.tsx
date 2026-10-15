@@ -53,6 +53,8 @@ export const TOOL_LABEL: Record<string, string> = {
   describe_mart: "View Gold mart",
   create_chart: "Create chart",
   update_chart: "Edit chart",
+  format_chart: "Format chart",
+  set_dashboard_theme: "Set dashboard theme",
   list_charts: "List charts",
   delete_chart: "Delete chart",
   create_board: "Create board",
