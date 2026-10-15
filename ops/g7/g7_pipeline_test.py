@@ -120,6 +120,7 @@ change what the gate checks.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 
@@ -540,6 +541,201 @@ def _assert_source_refused(op: dict) -> None:
     )
 
 
+
+
+def psql_insert_order(customer: str, amount: float) -> None:
+    """Insert one order into the Postgres demo source table so bronze_ingest_job
+    can load it into Bronze."""
+    try:
+        import psycopg2
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "psycopg2-binary"])
+        import psycopg2
+
+    conn = psycopg2.connect(
+        host=os.environ.get("PGHOST", "postgres"),
+        port=int(os.environ.get("PGPORT", "5432")),
+        user=os.environ.get("PGUSER", os.environ.get("POSTGRES_USER", "lakehouse")),
+        password=os.environ.get("PGPASSWORD", os.environ.get("POSTGRES_PASSWORD", "lakehouse")),
+        dbname=os.environ.get("PGDATABASE", os.environ.get("POSTGRES_DB", "lakehouse")),
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ingest_demo.orders (customer, amount) VALUES (%s, %s);",
+            (customer, amount),
+        )
+    conn.commit()
+    conn.close()
+
+
+def trigger_bronze_ingest() -> str:
+    """Triggers bronze_ingest_job and waits for it to succeed."""
+    resp = _post_trigger(f"{API_URL}/api/pipelines/bronze_ingest_job/trigger", "bronze_ingest_job")
+    if not resp.ok:
+        raise G7Failure(f"POST bronze_ingest_job trigger failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    run_id = body.get("id") or body.get("runId")
+    if not run_id:
+        raise G7Failure(f"trigger bronze_ingest_job had no runId: {body}")
+
+    query = (
+        "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename "
+        "... on Run { status } } }"
+    )
+
+    def check() -> bool:
+        r = requests.post(
+            DAGSTER_URL,
+            json={"query": query, "variables": {"rid": run_id}},
+            timeout=10,
+        )
+        r.raise_for_status()
+        status = r.json().get("data", {}).get("pipelineRunOrError", {}).get("status")
+        if status == "FAILURE":
+            raise G7Failure(f"bronze_ingest_job run {run_id} failed")
+        return status == "SUCCESS"
+
+    _wait_for(f"bronze_ingest_job run {run_id} SUCCESS", check, 180, interval_s=2.0)
+    return run_id
+
+
+def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
+    """BLD-2 D11 gate: measure Bronze-to-Silver lag with a 1-minute target on compose stack.
+    Appends rows to Bronze 5 times, measuring each time-to-Silver.
+    Then leaves inputs unchanged for 5 checks, asserting no new run and status 'met'."""
+    print(f"[g7] configuring targetLag=1 minute on {pipeline_id}")
+    resp = API.put(
+        f"{API_URL}/api/pipelines/{pipeline_id}/target-lag",
+        json={"targetLag": {"kind": "lag", "minutes": 1}},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise G7Failure(f"PUT /target-lag failed: {resp.status_code} {resp.text}")
+
+    pipe_detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+    if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": 1}:
+        raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
+
+    sensor_name = f"authored__{pipeline_id.replace('-', '_')}_lag"
+    sel = {
+        "repositoryName": "__repository__",
+        "repositoryLocationName": "dispar_orchestrate.definitions",
+        "sensorName": sensor_name,
+    }
+    def sensor_exists() -> bool:
+        r = requests.post(
+            DAGSTER_URL,
+            json={
+                "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { __typename ... on Sensor { sensorState { status } } } }",
+                "variables": {"sel": sel},
+            },
+            timeout=10,
+        )
+        return r.json().get("data", {}).get("sensorOrError", {}).get("__typename") == "Sensor"
+
+    _wait_for(f"sensor {sensor_name} to appear in Dagster", sensor_exists, timeout_s=60, interval_s=2.0)
+
+    # Ensure sensor is started
+    r_start = requests.post(
+        DAGSTER_URL,
+        json={
+            "query": "mutation($sel: SensorSelector!) { startSensor(sensorSelector: $sel) { __typename ... on Sensor { sensorState { status } } } }",
+            "variables": {"sel": sel},
+        },
+        timeout=10,
+    )
+    print(f"[g7] started sensor {sensor_name}: {r_start.json()}")
+
+    print(f"[g7] waiting for initial baseline lag status to settle to 'met'...")
+    def baseline_settled() -> bool:
+        detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+        lag = detail.get("lag") or {}
+        st = lag.get("status")
+        ticks = requests.post(
+            DAGSTER_URL,
+            json={
+                "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { ... on Sensor { sensorState { status ticks(limit: 1) { status timestamp skipReason } } } } }",
+                "variables": {"sel": sel},
+            },
+            timeout=5,
+        ).json()
+        runs_list = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5).json().get("runs", []); print(f"[g7] baseline probe: status={st!r}, reason={lag.get('reason')!r}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}")
+        return st == "met"
+
+    _wait_for("initial baseline lag status 'met'", baseline_settled, timeout_s=180, interval_s=5.0)
+
+    samples: list[float] = []
+    for sample_idx in range(1, 6):
+        cust_name = f"lag_cust_{sample_idx}_{int(time.time())}"
+        psql_insert_order(cust_name, 100.0 + sample_idx)
+
+        trigger_bronze_ingest()
+        commit_t = time.time()
+
+        bronze_rows = int(
+            ch_query(
+                f"SELECT count(DISTINCT id) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` "
+                "WHERE 1 SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+            ).strip()
+        )
+
+        last_log_t = 0.0
+        def silver_reached() -> bool:
+            nonlocal last_log_t
+            curr_silver = int(
+                ch_query(f"SELECT count() FROM silver.`{SILVER_TABLE_NAME}` FORMAT TabSeparated").strip()
+            )
+            now = time.time()
+            if now - last_log_t >= 10.0:
+                last_log_t = now
+                ticks_data = requests.post(
+                    DAGSTER_URL,
+                    json={
+                        "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { ... on Sensor { sensorState { status ticks(limit: 2) { status timestamp skipReason } } } } }",
+                        "variables": {"sel": sel},
+                    },
+                    timeout=5,
+                ).json()
+                runs_list = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5).json().get("runs", [])
+                print(f"[g7] waiting for silver: curr_silver={curr_silver}/{bronze_rows}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}, sensor={ticks_data}")
+            return curr_silver >= bronze_rows
+
+        _wait_for(f"Silver table to reach {bronze_rows} rows", silver_reached, timeout_s=180, interval_s=2.0)
+        silver_t = time.time()
+        elapsed = silver_t - commit_t
+        samples.append(elapsed)
+        print(f"[g7] TARGET_LAG_SAMPLE_{sample_idx}: Bronze commit -> Silver reached {bronze_rows} rows in {elapsed:.2f}s")
+
+    runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10)
+    if not runs_resp.ok:
+        raise G7Failure(f"GET /runs failed: {runs_resp.status_code}")
+    baseline_run_count = len(runs_resp.json().get("runs", []))
+    print(f"[g7] baseline run count before unchanged checks: {baseline_run_count}")
+
+    for check_idx in range(1, 6):
+        time.sleep(30)
+        detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+        lag = detail.get("lag") or {}
+        status = lag.get("status")
+        if status != "met":
+            raise G7Failure(
+                f"Unchanged inputs check {check_idx}/5 expected status 'met', got {status!r} (reason: {lag.get('reason')})"
+            )
+        runs_now = len(API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10).json().get("runs", []))
+        if runs_now != baseline_run_count:
+            raise G7Failure(
+                f"Unchanged inputs check {check_idx}/5 expected {baseline_run_count} runs, got {runs_now} (new run launched unexpectedly)"
+            )
+        print(f"[g7] UNCHANGED_CHECK_{check_idx}/5: status=met, runs={runs_now} (no new run)")
+
+    avg_sample = sum(samples) / len(samples)
+    print(f"[g7] TARGET_LAG_RESULT: 5 samples = {[round(s, 2) for s in samples]}s, avg = {avg_sample:.2f}s")
+    if all(s <= 60.0 for s in samples):
+        print(f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET 1-MINUTE TARGET (<= 60s)")
+    else:
+        print(f"[g7] TARGET_LAG_RESULT: NOT ALL SAMPLES MET 1-MINUTE TARGET")
+
+
 def main() -> int:
     try:
         # Fail closed on an unrecognised mode rather than defaulting it to
@@ -555,6 +751,7 @@ def main() -> int:
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
         step_verify_the_silver_rows_match_the_bronze_source()
         step_verify_graph_and_source()
+        step_verify_target_lag_bronze_to_silver(pipeline_id)
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1

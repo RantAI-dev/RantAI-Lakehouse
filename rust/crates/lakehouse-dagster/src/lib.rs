@@ -1137,12 +1137,19 @@ impl DgClient {
     /// [`DgError::Server`] when the response body isn't valid `JSON` or
     /// carries a GraphQL `errors` array.
     pub async fn find_run_by_run_key(&self, run_key: &str) -> Result<Option<DgRun>, DgError> {
-        let query = "query($keys: [String!]) { pipelineRunsOrError(\
-                      filter: {runKeys: $keys}) { __typename \
+        let query = "query($filter: RunsFilter) { pipelineRunsOrError(\
+                      filter: $filter) { __typename \
                       ... on Runs { results { runId jobName status startTime endTime \
                       creationTime parentRunId rootRunId tags { key value } } } } }";
         let data: PipelineRunsOrErrorData = self
-            .execute(query, Some(json!({ "keys": [run_key] })))
+            .execute(
+                query,
+                Some(json!({
+                    "filter": {
+                        "tags": [{ "key": "dagster/run_key", "value": run_key }]
+                    }
+                })),
+            )
             .await?;
         Ok(data.runs_or_error.results.and_then(|mut runs| {
             // Most recent first, so a re-used key (which Dagster forbids
@@ -3875,7 +3882,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/graphql"))
             .and(body_partial_json(
-                json!({ "variables": { "keys": ["lag:pl-x:abc"] } }),
+                json!({ "variables": { "filter": { "tags": [{ "key": "dagster/run_key", "value": "lag:pl-x:abc" }] } } }),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
