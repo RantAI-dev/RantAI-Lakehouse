@@ -6,7 +6,6 @@
 //! read back the response), with no vendor SDK, exactly as the TypeScript
 //! client does with `fetch`.
 
-use lakehouse_core::ApiError;
 use reqwest::StatusCode;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
 use serde::Deserialize;
@@ -68,8 +67,7 @@ pub enum ChError {
     ///
     /// The `Display` impl deliberately does NOT include `reqwest`'s message:
     /// `reqwest::Error`'s `Display` appends `" for url (http://host:port/)"`,
-    /// which — through `ChError -> ApiError::Unprocessable(err.to_string())`
-    /// — would leak the internal `ClickHouse` host/port to an unauthenticated
+    /// which — had it been rendered into a response body — would leak the internal `ClickHouse` host/port to an unauthenticated
     /// caller. `src/services/clients/clickhouse.ts` never sees that URL
     /// either: Node's `fetch` (undici) rejects a connection failure with a
     /// `TypeError` whose `.message` is the fixed string `"fetch failed"`
@@ -83,9 +81,9 @@ pub enum ChError {
     #[error("fetch failed")]
     Transport(#[source] reqwest::Error),
     /// `ClickHouse` responded with a non-2xx status. The message is the
-    /// `ClickHouse` error body, trimmed, verbatim — callers surface it to
-    /// users — falling back to `ClickHouse HTTP <status>` when the body is
-    /// empty.
+    /// `ClickHouse` error body, trimmed, verbatim — SEC-11: it is for the
+    /// log, never for a response body — falling back to
+    /// `ClickHouse HTTP <status>` when the body is empty.
     #[error("{0}")]
     Server(String),
     /// The request was cancelled via the caller-supplied
@@ -97,8 +95,8 @@ pub enum ChError {
     /// (`AbortSignal`-triggered aborts surface as a generic fetch rejection
     /// in the TS client, and none of the captured routes exercise that
     /// path), so this mapping is unobservable against the parity corpus;
-    /// [`ApiError::Internal`] is the least surprising choice — a cancelled
-    /// request is a server-side condition, not a client input error.
+    /// a cancelled request is a server-side condition, not a client input
+    /// error.
     #[error("request cancelled")]
     Cancelled,
 }
@@ -109,20 +107,12 @@ impl From<reqwest::Error> for ChError {
     }
 }
 
-impl From<ChError> for ApiError {
-    /// `ClickHouse` errors are almost always the caller's SQL, not our
-    /// outage, so `Transport`/`Server` map to `422 Unprocessable` — matching
-    /// `src/app/api/query/run/route.ts`, which returns 422 (not 500) when
-    /// `chQuery` throws. `Cancelled` is a server-side condition rather than
-    /// a client input error, so it maps to `500 Internal` instead — see the
-    /// doc comment on [`ChError::Cancelled`].
-    fn from(err: ChError) -> Self {
-        match err {
-            ChError::Cancelled => Self::Internal(err.to_string()),
-            other => Self::Unprocessable(other.to_string()),
-        }
-    }
-}
+// There is deliberately NO `From<ChError> for ApiError` (SEC-11). It used to
+// exist and turned `ChError::Server`'s text -- the database's own message,
+// with table names and the server version -- into a response body at every
+// `?`. A handler now has to say how it reports the failure
+// (`lakehouse_api::upstream_error`), so a new `?` on a `ChError` in a route
+// does not compile instead of leaking.
 
 /// HTTP client for `ClickHouse`'s plain HTTP interface.
 ///
@@ -588,20 +578,6 @@ mod tests {
         let rows = c.rows("SELECT n FROM t", None).await.unwrap();
         assert_eq!(rows, full.data);
         assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn ch_error_converts_to_unprocessable_api_error() {
-        let api_err: ApiError = ChError::Server("bad sql".to_owned()).into();
-        assert_eq!(api_err.status(), 422);
-        assert_eq!(api_err.to_string(), "bad sql");
-    }
-
-    #[test]
-    fn cancelled_converts_to_internal_api_error() {
-        let api_err: ApiError = ChError::Cancelled.into();
-        assert_eq!(api_err.status(), 500);
-        assert_eq!(api_err.to_string(), "request cancelled");
     }
 
     /// A real transport failure (connection refused) must never leak the

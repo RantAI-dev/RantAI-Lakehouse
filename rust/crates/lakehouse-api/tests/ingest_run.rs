@@ -298,7 +298,190 @@ async fn ingest_run_dagster_launch_failure_is_422_not_200() {
         .await
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    // SEC-11 + F2.7: this used to assert that Dagster's own message ("job not
+    // found") reached the body; that asserted the bug. The body is now the
+    // fixed sentence `LaunchFailure` allows, and the orchestrator's text is
+    // only in the log.
     assert_eq!(body["error"], "Dagster did not accept the ingest run");
+    assert!(!body.to_string().contains("job not found"), "{body}");
+}
+
+/// Posts `ingest/run` for `connector_id` against a `Dagster` that answers the
+/// launch with `launch_run`, and returns the status, the `Retry-After`
+/// header and the JSON body.
+async fn ingest_run_with_launch_result(
+    connector_id: &str,
+    launch_run: Value,
+) -> (StatusCode, Option<String>, Value) {
+    let server = MockServer::start().await;
+    mount_recent_runs(&server, json!([])).await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": launch_run }
+        })))
+        .mount(&server)
+        .await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, connector_id).await;
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/connectors/{connector_id}/ingest/run"))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().expect("ascii header").to_owned());
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (
+        status,
+        retry_after,
+        serde_json::from_slice(&bytes).expect("valid JSON"),
+    )
+}
+
+/// `PR #105 CI fix`: Dagster's typed "job not loaded" result (what a code
+/// location that is still loading answers) is a 503 with the stable code
+/// `orchestrator_job_not_loaded`, a `Retry-After`, a fixed sentence and a
+/// reference, and none of Dagster's own words. The G6 gates retry on the
+/// code; they used to match Dagster's text, which SEC-11 removed.
+#[tokio::test]
+async fn ingest_run_job_not_loaded_is_a_503_with_a_code_and_no_upstream_text() {
+    for launch_run in [
+        json!({ "__typename": "PipelineNotFoundError", "message": "planted-marker" }),
+        json!({ "__typename": "PythonError", "message": "planted-marker",
+                "className": "DagsterUserCodeUnreachableError" }),
+    ] {
+        let (status, retry_after, body) =
+            ingest_run_with_launch_result("conn-ingest-sql-notloaded", launch_run).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after.as_deref(), Some("5"));
+        assert_eq!(body["code"], "orchestrator_job_not_loaded");
+        let message = body["error"].as_str().expect("an error message");
+        assert!(
+            message.starts_with(
+                "The orchestrator has not loaded this job yet. Try again shortly. Reference: "
+            ),
+            "{message}"
+        );
+        assert!(!body.to_string().contains("planted-marker"), "{body}");
+        assert!(
+            !body.to_string().contains("PipelineNotFoundError"),
+            "{body}"
+        );
+    }
+}
+
+/// Any other Dagster launch failure keeps the generic 422: a fixed sentence,
+/// no code, no upstream text. Words that merely look like "not loaded" in the
+/// message do not make it one; only the typed fields do.
+#[tokio::test]
+async fn ingest_run_other_launch_failures_stay_generic_without_a_code() {
+    let (status, retry_after, body) = ingest_run_with_launch_result(
+        "conn-ingest-sql-generic",
+        json!({ "__typename": "PythonError",
+                "message": "PipelineNotFoundError planted-marker", "className": "ValueError" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(retry_after.is_none());
+    assert!(body.get("code").is_none(), "{body}");
+    // F2.7: the generic 422 body is the fixed sentence; the reference moved
+    // to the dagster crate's log line with the raw text.
+    assert_eq!(body["error"], "Dagster did not accept the ingest run");
+    assert!(!body.to_string().contains("planted-marker"), "{body}");
+}
+
+/// `PR #105 CI fix`: Dagster not answering at all is a 503 with
+/// `orchestrator_unreachable` and a `Retry-After`, not a bare 503 a client
+/// can only guess at. `spin_up`'s default Dagster URL is a dead upstream.
+#[tokio::test]
+async fn ingest_run_with_dagster_down_is_a_503_with_an_unreachable_code() {
+    let app = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-sql-down").await;
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/connectors/conn-ingest-sql-down/ingest/run")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get("retry-after").is_some());
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(body["code"], "orchestrator_unreachable");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("message")
+            .starts_with("The orchestrator is not reachable. Try again shortly. Reference: "),
+        "{body}"
+    );
+}
+
+/// `PR #105 CI fix`: `POST /api/pipelines/{job}/trigger` answers the same
+/// typed "job not loaded" launch result the same way (503 plus the code), so
+/// the G3/G3a/G7 gates retry on the code too.
+#[tokio::test]
+async fn pipeline_trigger_job_not_loaded_is_a_503_with_a_code() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "PipelineNotFoundError" } }
+        })))
+        .mount(&server)
+        .await;
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pipelines/some_job/trigger")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(body["code"], "orchestrator_job_not_loaded");
+    assert!(
+        !body.to_string().contains("PipelineNotFoundError"),
+        "{body}"
+    );
 }
 
 /// A second run while this connector's run is still going is refused with

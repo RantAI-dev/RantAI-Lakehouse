@@ -32,7 +32,7 @@ use crate::json::ApiJson;
 use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
 use crate::routes::load_alerts;
-use crate::routes::support::{extract_json_object, js_error};
+use crate::routes::support::{extract_json_object, upstream_message};
 use crate::state::AppState;
 
 use crate::tenant::TENANT_OWNER;
@@ -106,7 +106,7 @@ pub async fn list(
         // String(e) }, { status: 503 }); }` in `pipelines/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "pipelines": [], "error": js_error(err) })),
+            ApiJson(json!({ "pipelines": [], "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -395,7 +395,7 @@ async fn runs_body(state: &AppState, id: &str) -> Value {
         }),
         Err(err) => {
             tracing::warn!(%err, "pipeline runs: orchestrator unreachable");
-            json!({ "runs": [], "unavailable": js_error(err) })
+            json!({ "runs": [], "unavailable": upstream_message(err) })
         }
     }
 }
@@ -566,14 +566,14 @@ pub async fn volume(
         Ok(runs) => volume_body(&runs),
         Err(err) => {
             // AGENTS.md rule 4: never leak upstream detail into a
-            // response body. `js_error` is `Display`, not the original
+            // response body. `upstream_message` is `Display`, not the original
             // error's own message — it is the routing layer's fixed
-            // string (`routes::support::js_error`).
+            // string (`routes::support::upstream_message`).
             tracing::warn!(%err, "pipeline volume: orchestrator unreachable");
             json!({
                 "runs": [],
                 "medianRows": Value::Null,
-                "unavailable": js_error(err),
+                "unavailable": upstream_message(err),
             })
         }
     };
@@ -750,7 +750,7 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -767,7 +767,7 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -1188,7 +1188,7 @@ pub async fn source(
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -1267,7 +1267,7 @@ pub async fn run_steps(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -1424,8 +1424,8 @@ const MAX_LOG_LINES_PER_PAGE: u32 = 500;
 ///
 /// 404 if `run_id` names a run `Dagster` reports as not found
 /// (`RunNotFoundError`); 503 if the `Dagster` `run_logs` call fails for
-/// any other reason, via [`js_error`], same as every other `Dagster`-
-/// backed route in this module — `js_error` wraps `DgError`'s own
+/// any other reason, via [`upstream_message`], same as every other `Dagster`-
+/// backed route in this module — `upstream_message` wraps `DgError`'s own
 /// `Display` (a client-generated summary already truncated/shaped by
 /// `lakehouse_dagster`, never a raw HTTP response body or stack trace),
 /// not a fresh classification step of its own; a transport-level failure
@@ -1479,12 +1479,12 @@ pub async fn run_logs(
             ApiJson(json!({ "error": format!("run {run_id} not found") })),
         )
             .into_response(),
-        // Never forward the raw Dagster error body -- `js_error` classifies
+        // Never forward the raw Dagster error body -- `upstream_message` classifies
         // it the same way every other Dagster-backed route in this file
         // does.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -1864,6 +1864,11 @@ const REFUSED_RUN_CONFIG_HINT: &[(&str, &str)] = &[
 /// Returns a 401 [`Response`] (not a propagated [`ApiError`] — this
 /// handler predates `ApiResult` and stays bare-`Response`-returning, like
 /// [`pause`]/[`resume`]) if no principal is present.
+///
+/// A launch that meets a job `Dagster` has not loaded yet answers `503`
+/// with `code: orchestrator_job_not_loaded` (`PR #105 CI fix`; see
+/// `routes::connectors::ingest_run` for the contract); any other launch
+/// failure is the generic `422`.
 pub async fn trigger(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -1971,6 +1976,15 @@ pub async fn trigger(
             // the body is the FIXED message below. The upstream detail
             // is logged at the dagster crate boundary.
             if let Some(failure) = outcome.failure {
+                // `PR #105 CI fix` (SEC-11): a job the orchestrator has not
+                // loaded yet is a 503 with the stable `orchestrator_job_not_loaded`
+                // code, decided from Dagster's typed result, so the gates
+                // retry on the code and not on Dagster's text. Everything
+                // else keeps main's 404 / 422 split below.
+                if outcome.job_not_loaded {
+                    return ApiRejection(crate::upstream_error::job_not_loaded(&failure.as_str()))
+                        .into_response();
+                }
                 let status = match failure {
                     lakehouse_dagster::LaunchFailure::NotFound => StatusCode::NOT_FOUND,
                     lakehouse_dagster::LaunchFailure::Refused => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2006,7 +2020,7 @@ pub async fn trigger(
         // status: 503 }); }` in `[id]/trigger/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -2088,7 +2102,7 @@ async fn validate_run_config_response(
         Err(err) => Some(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response(),
         ),
@@ -2360,7 +2374,7 @@ fn build_config_error_body(errors: Vec<lakehouse_dagster::ConfigValidationError>
 ///
 /// Returns a 401 [`Response`] (same posture as [`trigger`]/[`pause`]/
 /// [`resume`]) if no principal is present. Returns a 503 with
-/// `js_error(err)` (matching [`source`]'s posture) if the GraphQL call
+/// `upstream_message(err)` (matching [`source`]'s posture) if the GraphQL call
 /// fails for any other reason.
 pub async fn config_schema(
     State(state): State<AppState>,
@@ -2494,7 +2508,7 @@ pub async fn run_failed_event(
         .dagster
         .pipeline_run_status(&req.run_id)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let Some(info) = status else {
         return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
     };
@@ -2524,7 +2538,8 @@ pub async fn run_failed_event(
             "reason": "run already alerted; sensor retry ignored",
         })));
     }
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
@@ -2540,7 +2555,7 @@ pub async fn run_failed_event(
         silence_source.as_deref().map(|s| s as &dyn SilenceSource),
     )
     .await
-    .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     Ok(ApiJson(json!({ "matched": matched })))
 }
 
@@ -2603,7 +2618,7 @@ async fn volume_drop_for_run(
         .dagster
         .list_runs_for_job_with_materializations(&job, 30)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let mut history: Vec<i64> = Vec::with_capacity(runs_with_rows.len());
     let mut current_rows: Option<i64> = None;
     let mut found_current = false;
@@ -2681,7 +2696,7 @@ pub async fn run_finished_event(
         .dagster
         .pipeline_run_status(&req.run_id)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     let Some(info) = status else {
         return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
     };
@@ -2711,7 +2726,8 @@ pub async fn run_finished_event(
         // No SLA at all — the alert rule cannot decide.
         None
     };
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
     let silence_source: Option<Box<dyn SilenceSource>> = state
         .pg
@@ -2742,7 +2758,7 @@ pub async fn run_finished_event(
                 silence_source.as_deref().map(|s| s as &dyn SilenceSource),
             )
             .await
-            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+            .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
         }
     }
     if volume_drop == Some(true) {
@@ -2760,7 +2776,7 @@ pub async fn run_finished_event(
                 silence_source.as_deref().map(|s| s as &dyn SilenceSource),
             )
             .await
-            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+            .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
         }
     }
     Ok(ApiJson(json!({ "matched": matched })))
@@ -3546,7 +3562,7 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -3578,12 +3594,16 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
         }
         Ok(o) => (
             StatusCode::CONFLICT,
-            ApiJson(json!({ "error": o.error.unwrap_or_else(|| "schedule mutation failed".to_owned()) })),
+            ApiJson(json!({
+                "error": o
+                    .error
+                    .map_or_else(|| "schedule mutation failed".to_owned(), upstream_message)
+            })),
         )
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -3762,7 +3782,7 @@ pub async fn cancel_run(
         },
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response(),
     }
@@ -3841,7 +3861,7 @@ pub async fn retry_run(
             Err(err) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({ "error": js_error(err) })),
+                    ApiJson(json!({ "error": upstream_message(err) })),
                 )
                     .into_response();
             }
@@ -3852,7 +3872,7 @@ pub async fn retry_run(
             Err(err) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
-                    ApiJson(json!({ "error": js_error(err) })),
+                    ApiJson(json!({ "error": upstream_message(err) })),
                 )
                     .into_response();
             }
@@ -3900,7 +3920,7 @@ pub async fn retry_run(
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": upstream_message(err) })),
             )
                 .into_response();
         }
@@ -8745,10 +8765,13 @@ mod tests {
         }
 
         /// F2.7 SENTINEL: `launchRun` returning `PipelineNotFoundError`
-        /// MUST surface as a 404 with the FIXED body. Dagster's
-        /// typename/message MUST NOT appear anywhere in the body.
+        /// MUST surface as a 503 `orchestrator_job_not_loaded` with a
+        /// FIXED body. Dagster's typename/message MUST NOT appear anywhere
+        /// in the body. (`PR #105 CI fix`: a code location that is still
+        /// loading answers exactly this, so the gates retry on the code;
+        /// #80 first pinned it as a 404, the merge of the two chose 503.)
         #[tokio::test]
-        async fn trigger_with_run_config_pipeline_not_found_returns_404_with_fixed_body() {
+        async fn trigger_with_run_config_pipeline_not_found_returns_503_job_not_loaded() {
             const SENTINEL: &str = "TRIGGER_PIPELINE_NOT_FOUND_SENTINEL_444";
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -8773,8 +8796,8 @@ mod tests {
             .await;
             assert_eq!(
                 response.status(),
-                StatusCode::NOT_FOUND,
-                "PipelineNotFoundError on launchRun MUST be a 404",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PipelineNotFoundError on launchRun MUST be a 503 (job not loaded)",
             );
             let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -8786,8 +8809,12 @@ mod tests {
             );
             let parsed: Value = serde_json::from_slice(&body_bytes).expect("valid JSON");
             assert_eq!(
-                parsed["error"], "orchestrator refused the launch",
-                "trigger not-found body MUST be the fixed classified string",
+                parsed["code"], "orchestrator_job_not_loaded",
+                "trigger not-found body MUST carry the stable retry code",
+            );
+            assert!(
+                !body_str.contains("PipelineNotFoundError"),
+                "the typename MUST NOT appear in the body, got {body_str}"
             );
         }
 
@@ -8975,6 +9002,12 @@ mod tests {
             env.insert("DATABASE_URL".to_owned(), database_url);
             env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // SEC-10: these tests deliver to a `wiremock` webhook on loopback,
+            // which the production webhook policy refuses and no setting can
+            // open; this test-only switch (absent from production builds) lets
+            // the delivery reach it. The refusal itself is tested in
+            // `webhook_guard`.
+            env.insert("WEBHOOK_TEST_ALLOW_ALL".to_owned(), "true".to_owned());
             let config = Config::from_map(&env).expect("a valid test Config");
             AppState::new(config)
         }

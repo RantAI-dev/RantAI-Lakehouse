@@ -2766,14 +2766,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "hmac 0.13.0",
- "lakehouse-clickhouse",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
- "tokio",
- "wiremock",
 ]
 
 [[package]]

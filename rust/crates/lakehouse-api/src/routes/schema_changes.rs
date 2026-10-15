@@ -915,7 +915,10 @@ mod tests {
             format!("{}/graphql", dagster.uri()),
         );
         env.insert("CH_URL".to_owned(), ch.uri());
-        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // The webhook mock listens on loopback, which the real address
+        // policy refuses (`SEC-10`); the policy has its own tests.
+        state.webhook_sender_override = Some(lakehouse_notify::MappedResolver::new().into_sender());
         let data: Vec<Value> = rules
             .iter()
             .map(|(id, kind, connector)| {

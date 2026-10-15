@@ -86,6 +86,14 @@ services:
       # same way INGEST_ALLOW_INTERNAL_HOSTS is set for Dagster above. Not
       # for a real deployment.
       CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: "true"
+      # SEC-10, GATE-ONLY (PR #105 CI fix): the `g6-alerts` gate posts alert
+      # webhooks to a receiver it runs inside the compose network, an RFC 1918
+      # address that SEC-10 refuses by default. Allow exactly the subnet this
+      # file pins for the project's default network (`networks.default` below),
+      # which holds that receiver and nothing outside the compose project.
+      # Loopback, link-local and the cloud metadata address stay closed
+      # whatever this lists. Not for a real deployment.
+      WEBHOOK_ALLOWED_CIDRS: "10.213.67.0/24"
     volumes:
       - type: volume
         source: g6_secrets
@@ -258,9 +266,16 @@ services:
   #
   # The gate starts its own webhook receiver in this container, on a port the
   # API reaches over the compose network (nothing is published). `SEC-10`
-  # (alert webhooks cannot reach internal addresses) is not built yet; when it
-  # lands it will refuse this receiver's address by default and must give this
-  # gate its documented opt-in.
+  # (alert webhooks cannot reach internal addresses) refuses that address by
+  # default, and the gate may not weaken the default. It uses the documented
+  # opt-in instead, `WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api` above, GATE-ONLY
+  # like `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`: the main `docker-compose.yml`
+  # and `.env.example` keep it empty. The runner's address is whatever the
+  # compose network hands out, so the override pins the project's default
+  # network to a subnet of its own (`networks.default` at the end of this
+  # file) and the opt-in lists exactly that subnet, not a broad private range.
+  # PR #105 CI fix: without it the gate failed with "webhook address is not
+  # allowed" when it created its first rule.
   #
   # `clickhouse-iceberg-init`: an upload load asks ClickHouse whether the
   # table name is free (`ICEBERG_QUERY_DB`), as `g9-test-runner` does.
@@ -327,7 +342,9 @@ services:
   # `mysql-g6` that it switches off and on (the source going away and coming
   # back), and the webhook receiver of `SRC-17`'s gate. The container's own
   # address is found by a UDP route probe, not by service name (`compose run`
-  # gives no alias). `SEC-10` is not built yet; see `g6-alerts-test-runner`.
+  # gives no alias). `SEC-10` is built: the receiver must sit inside the fixed
+  # subnet `WEBHOOK_ALLOWED_CIDRS` names on `lakehouse-api` (see the
+  # `networks:` block at the end of this file); see `g6-alerts-test-runner`.
   #
   # `CONNECTOR_AUTO_DISABLE_AFTER` and `INGEST_SERVICE_TOKEN` are `${X:-}`,
   # not `${X:?}`: this file is loaded by every g6 job, and only this job's
@@ -381,3 +398,16 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests && python src11_connector_operations_test.py"]
+
+# PR #105 CI fix (SEC-10): a fixed subnet for the project's default network,
+# so `WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api` can name exactly the network
+# the `g6-alerts` receiver lives on instead of a broad private range. The
+# range is outside Docker's default pools (172.16/12, 192.168/16) so it cannot
+# collide with an auto-assigned network, and nothing is published on it.
+# Compose refuses to start if the range overlaps an existing network, which
+# is a loud failure, not a silent widening.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.213.67.0/24

@@ -288,7 +288,10 @@ async fn deliver_with_rules(
     text: &str,
     persist_as: Option<&str>,
 ) -> usize {
-    let http = reqwest::Client::new();
+    // SEC-10 (merged with `SRC-17`): connector-event webhooks go through the
+    // same address-checking sender as every other alert delivery, never a
+    // bare `reqwest` client.
+    let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_connector_event_to(
@@ -697,7 +700,10 @@ mod tests {
         for (key, value) in extra_env {
             env.insert((*key).to_owned(), (*value).to_owned());
         }
-        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // The webhook mock listens on loopback, which the real address
+        // policy refuses (`SEC-10`); the policy has its own tests.
+        state.webhook_sender_override = Some(lakehouse_notify::MappedResolver::new().into_sender());
         let data: Vec<Value> = rules
             .iter()
             .map(|(id, kind, connector)| {

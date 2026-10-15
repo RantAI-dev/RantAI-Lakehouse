@@ -1,4 +1,5 @@
 import type { ChartKind, ChartSpec, ChartSource } from "@/lib/dashboard-specs";
+import type { TableDefFields } from "@/lib/table-types";
 
 /**
  * Shared BI/dashboard types.
@@ -39,13 +40,57 @@ export type ChartInput = {
   text?: string; // markdown content (kind="text")
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
-};
+} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
 
 /** Tile position on the grid canvas (12 columns). Key = chartId. */
 export type TileBox = { x: number; y: number; w: number; h: number };
 export type LayoutMap = Record<string, TileBox>;
-/** Dashboard filter: a column value that filters every tile that has that column. */
-export type FilterDef = { column: string; values: string[] };
+/** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
+export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
+export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
+/** `next`: the `n` units starting tomorrow, today excluded (BI-18 round two). */
+export type RelativeAnchor = "last" | "this" | "previous" | "next";
+/** What a column holds, as far as filtering cares; derived server-side from its ClickHouse type. */
+export type FilterKind = "number" | "date" | "datetime" | "text";
+/**
+ * Dashboard filter, applied to every tile whose data has the column. The
+ * typed fields are optional so a filter saved before typed filters
+ * (`{ column, values }`) is still valid and means `in`.
+ */
+export type FilterDef = {
+  column: string;
+  values: string[];
+  op?: FilterOp;
+  /** `between` bounds: a number, or a date as `YYYY-MM-DD`; either may be absent. */
+  min?: string;
+  max?: string;
+  /** `relative`: `n` units ending today (`last`) or starting tomorrow (`next`), or this / the previous calendar unit. */
+  unit?: RelativeUnit;
+  n?: number;
+  anchor?: RelativeAnchor;
+  /** `contains` / `starts_with` / `ends_with` / `not_contains`, at most 200 characters. */
+  text?: string;
+  /** `between` leaves out `min` / `max` itself ("after", "before", "greater than", "less than"). Absent means inclusive. */
+  minExclusive?: boolean;
+  maxExclusive?: boolean;
+  /** The filter cannot be removed in the console. Meaningful only on a board's saved default. */
+  required?: boolean;
+};
+/** A column a filter can target, with how many tiles of the board have it. */
+export type FilterField = { column: string; kind: FilterKind | string; tiles: number };
+/** A filter an active tile could not honour, so the tile can say so. */
+export type FilterSkip = { column: string; reason: "no_column" | "wrong_type" | string };
+
+/**
+ * What a click on a chart does instead of opening the drill menu (BI-18·B).
+ * Mirrors `lakehouse_bi::click::ClickAction`. Absent = the drill menu, which
+ * is what every chart saved before this existed does. The server checks the
+ * shape and the URL rule only, not that the board, column or query exists.
+ */
+export type ChartClick =
+  | { kind: "dashboard"; board: string; column: string }
+  | { kind: "query"; id: string }
+  | { kind: "url"; url: string };
 
 export type Board = {
   id: string;
@@ -58,6 +103,11 @@ export type Board = {
   folderId?: string | null;
   layout?: LayoutMap;
   filters?: FilterDef[];
+  /**
+   * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
+   * 1800, 3600). Absent when none was saved; BI-18·B.
+   */
+  refreshSeconds?: number;
   createdAt?: string;
   /**
    * Kapan board terakhir ditulis.

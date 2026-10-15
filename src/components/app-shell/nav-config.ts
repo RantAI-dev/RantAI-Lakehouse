@@ -25,6 +25,7 @@ import {
   SearchCode,
   Server,
   Settings,
+  SlidersHorizontal,
   ShieldCheck,
   Tags,
   Users,
@@ -228,6 +229,7 @@ export const NAV_GROUPS: NavGroup[] = [
       },
       { title: "SSO", href: "/admin/sso", icon: LogIn },
       { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
+      { title: "Settings", href: "/admin/settings", icon: SlidersHorizontal },
     ],
   },
 ]

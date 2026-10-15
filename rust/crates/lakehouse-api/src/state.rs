@@ -16,7 +16,6 @@ use lakehouse_core::secret::{
     SecretError, SecretResolver, SecretValue,
 };
 use lakehouse_dagster::DgClient;
-use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
@@ -77,8 +76,6 @@ pub struct AppState {
     pub clickhouse: Arc<ChClient>,
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
-    /// Resolves and caches the signed-embedding (`JWT`) secret.
-    pub embed_secret: Arc<EmbedSecretResolver>,
     /// `OpenAI`-compatible chat-completions client.
     pub llm: Arc<LlmClient>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
@@ -205,6 +202,13 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
+    /// Test seam for the alert webhook sender (merge of `SEC-10` into the
+    /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
+    /// listener on loopback, which the real address policy refuses by
+    /// design and no setting can open. Compiled only for this crate's tests,
+    /// so a service build has no way to swap the policy.
+    #[cfg(test)]
+    pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
 }
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
@@ -542,8 +546,6 @@ impl AppState {
             config.dagster_location.clone(),
         );
         let clickhouse = Arc::new(clickhouse);
-        let embed_secret =
-            EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
         let llm = LlmClient::new(
             config.llm_url.clone(),
             config.llm_model.clone(),
@@ -636,7 +638,6 @@ impl AppState {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
             connector_secret_resolver: connector_secret_resolver(
@@ -659,7 +660,21 @@ impl AppState {
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
+            #[cfg(test)]
+            webhook_sender_override: None,
         }
+    }
+
+    /// The webhook sender for alert deliveries that have no request of their
+    /// own to take a policy from: [`crate::webhook_guard::sender`] over this
+    /// state's config (`SEC-10`), or the test override.
+    #[must_use]
+    pub fn webhook_sender(&self) -> lakehouse_notify::WebhookSender {
+        #[cfg(test)]
+        if let Some(sender) = &self.webhook_sender_override {
+            return sender.clone();
+        }
+        crate::webhook_guard::sender(&self.config)
     }
 }
 

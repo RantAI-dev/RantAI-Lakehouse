@@ -71,9 +71,11 @@ API runs with; the same value as the API container's, from the job's `.env`);
 `SRC11_FORWARDER_PORT` (default 13306); `SRC17_RECEIVER_HOST` and
 `SRC17_RECEIVER_PORT` (default 8099) for the receiver.
 
-`SEC-10` (alert webhooks cannot reach internal addresses) is NOT built yet.
-When it lands it will refuse the receiver's address by default and must give
-this gate its documented opt-in (the gate may not weaken the default). The
+`SEC-10` (alert webhooks cannot reach internal addresses) is built: the API
+refuses the receiver's address by default, and the gate's documented opt-in is
+`WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api` in
+`ops/g6/docker-compose.g6.override.yml`, the pinned gate subnet only (the
+receiver lives inside it; the gate does not weaken the default). The
 forwarder needs no opt-in of its own: the connector's address is checked by the
 gate-only `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` and `INGEST_ALLOW_INTERNAL_HOSTS`
 of `ops/g6/docker-compose.g6.override.yml`, the ones every other g6 gate uses.

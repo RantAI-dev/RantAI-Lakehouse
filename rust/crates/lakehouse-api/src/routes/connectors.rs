@@ -49,8 +49,8 @@ use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarg
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::js_error;
 use crate::state::AppState;
+use crate::upstream_error::orchestrator_unreachable;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::pipelines::pool`.
@@ -3221,12 +3221,11 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// for transport failures and malformed GraphQL responses. This
 /// handler branches the identical way: `outcome.failure` present
 /// becomes a 422 with the fixed body string `"Dagster did not accept
-/// the ingest run"` (F2.7 — Dagster's own text was logged at the
-/// dagster crate boundary); `Err(err)` becomes a 503, classified
-/// through [`js_error`] the same way `trigger`'s own 503 branch is
-/// (`DgError`'s `Display` is already sanitized — see that type's doc
-/// comment — so this is not a fourteenth Phase-1
-/// `ApiError::Internal(err.to_string())` leak).
+/// the ingest run"` (F2.7: Dagster's own text was logged at the
+/// dagster crate boundary), except that a job the orchestrator has not
+/// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
+/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// see below.
 ///
 /// # Errors
 ///
@@ -3237,6 +3236,22 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// queued or running (see [`connector_runs`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
 /// on a `Dagster` transport failure; 503/500 as above for the database pool.
+///
+/// Two `503` answers carry a stable `code` beside the fixed `error`
+/// sentence and a `Retry-After`, so a client retries on the code and never
+/// on text (`PR #105 CI fix`; the G6 gates used to match `Dagster`'s own
+/// `PipelineNotFoundError` text, which `SEC-11` rightly removed):
+///
+/// - `orchestrator_job_not_loaded`: the launch result is `Dagster`'s typed
+///   "job not found" (or an unreachable user-code server), i.e. the code
+///   location is still loading. It was a `422` before; `503` is the
+///   route's status for "backing service not ready", the console treats
+///   any non-2xx the same, and nothing else depends on the `422`.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
+///   with a protocol failure, on the run list or the launch.
+///
+/// Every other launch failure stays the generic `422` with a reference id
+/// and no code.
 ///
 /// # A run of one table (`SRC-10` decision 5)
 ///
@@ -3322,7 +3337,7 @@ async fn launch_ingest(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| orchestrator_unreachable(&err))?;
     if let Some(active) = connector_runs(&recent, &id)
         .into_iter()
         .find(ConnectorIngestRun::is_active)
@@ -3376,11 +3391,17 @@ async fn launch_ingest(
         .await
     {
         Ok(outcome) => {
-            // F2.7: `outcome.failure` is the typed `LaunchFailure`.
-            // The 422 body is the FIXED classified string — Dagster's
-            // own `message` / `errors[].message` text was logged at
-            // the dagster crate boundary.
-            if outcome.failure.is_some() {
+            if let Some(failure) = outcome.failure {
+                // `PR #105 CI fix` (SEC-11): "not loaded yet" is decided from
+                // Dagster's typed result, never from its text, and answered
+                // with a fixed sentence and a stable code the gates and the
+                // console retry on.
+                if outcome.job_not_loaded {
+                    return Err(crate::upstream_error::job_not_loaded(&failure.as_str()).into());
+                }
+                // F2.7: the 422 body is the FIXED classified string; Dagster's
+                // own `message` / `errors[].message` text was logged at the
+                // dagster crate boundary.
                 return Err(ApiError::Unprocessable(
                     "Dagster did not accept the ingest run".to_owned(),
                 )
@@ -3401,7 +3422,7 @@ async fn launch_ingest(
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
-        Err(err) => Err(ApiError::Unavailable(js_error(err)).into()),
+        Err(err) => Err(orchestrator_unreachable(&err).into()),
     }
 }
 
