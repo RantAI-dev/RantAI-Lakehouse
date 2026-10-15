@@ -49,11 +49,14 @@ from dispar_orchestrate import gold_export
 from dispar_orchestrate.gold_export import (
     GoldExportConfig,
     InvalidKeepCopiesError,
+    InvalidOrphanMinAgeError,
+    INVALID_ORPHAN_MIN_AGE_REASON,
     _headers,
     evaluate_authored_success,
     gold_export_job,
     gold_export_schedule,
     parse_gold_keep_copies,
+    parse_gold_orphan_min_age_seconds,
 )
 
 
@@ -601,6 +604,65 @@ class GoldKeepCopiesParsingTests(unittest.TestCase):
             self.assertEqual(parse_gold_keep_copies(cfg.gold_keep_copies), 14)
 
 
+
+
+class GoldOrphanMinAgeParsingTests(unittest.TestCase):
+    """DATA-2 review BLOCKER 1: parse GOLD_ORPHAN_MIN_AGE_SECONDS setting as integer >= 0.
+    Values 3600, 0 parse successfully; -1, x, empty, None fail with
+    fixed reason 'invalid GOLD_ORPHAN_MIN_AGE_SECONDS'.
+    """
+
+    def test_parses_default_3600(self) -> None:
+        self.assertEqual(parse_gold_orphan_min_age_seconds("3600"), 3600)
+        self.assertEqual(parse_gold_orphan_min_age_seconds(3600), 3600)
+
+    def test_parses_zero(self) -> None:
+        self.assertEqual(parse_gold_orphan_min_age_seconds("0"), 0)
+        self.assertEqual(parse_gold_orphan_min_age_seconds(0), 0)
+
+    def test_negative_rejected(self) -> None:
+        with self.assertRaises(InvalidOrphanMinAgeError) as ctx:
+            parse_gold_orphan_min_age_seconds("-1")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
+        with self.assertRaises(InvalidOrphanMinAgeError):
+            parse_gold_orphan_min_age_seconds(-1)
+
+    def test_non_integer_rejected(self) -> None:
+        with self.assertRaises(InvalidOrphanMinAgeError) as ctx:
+            parse_gold_orphan_min_age_seconds("x")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
+
+    def test_empty_rejected(self) -> None:
+        with self.assertRaises(InvalidOrphanMinAgeError) as ctx:
+            parse_gold_orphan_min_age_seconds("")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
+
+        with self.assertRaises(InvalidOrphanMinAgeError) as ctx:
+            parse_gold_orphan_min_age_seconds("   ")
+        self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
+
+        with self.assertRaises(InvalidOrphanMinAgeError) as ctx:
+            parse_gold_orphan_min_age_seconds(None)
+        self.assertEqual(str(ctx.exception), "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
+
+    def test_config_from_env_defaults(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            cfg = GoldExportConfig.from_env()
+            self.assertEqual(cfg.gold_orphan_min_age_seconds, "3600")
+            self.assertEqual(parse_gold_orphan_min_age_seconds(cfg.gold_orphan_min_age_seconds), 3600)
+
+    def test_config_from_env_custom(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "GOLD_ORPHAN_MIN_AGE_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            cfg = GoldExportConfig.from_env()
+            self.assertEqual(cfg.gold_orphan_min_age_seconds, "0")
+            self.assertEqual(parse_gold_orphan_min_age_seconds(cfg.gold_orphan_min_age_seconds), 0)
+
 class GoldTrimOpTests(unittest.TestCase):
     """DATA-2 T3: unit tests for trim_gold_mart (no network; PyIceberg and ClickHouse mocked).
     - 9 copies keep 7
@@ -658,7 +720,7 @@ class GoldTrimOpTests(unittest.TestCase):
         self.assertNotIn(9, expired_ids)
 
         mock_orphan.assert_called_once_with(
-            cfg, "gold.sales_mart", dry_run=False, catalog_db="icecat_gold_export", older_than_seconds=0
+            cfg, "gold.sales_mart", dry_run=False, catalog_db="icecat_gold_export", older_than_seconds=3600
         )
         mock_record.assert_called_once()
         kwargs = mock_record.call_args.kwargs
@@ -810,6 +872,28 @@ class GoldTrimOpTests(unittest.TestCase):
         kwargs = mock_record.call_args.kwargs
         self.assertEqual(kwargs["status"], "failed")
         self.assertEqual(kwargs["reason"], "invalid GOLD_KEEP_COPIES")
+
+
+
+    def test_invalid_orphan_min_age_records_failed(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        cfg = mock.MagicMock()
+        cfg.gold_keep_copies = "7"
+        cfg.gold_orphan_min_age_seconds = "-1"
+        ctx = build_op_context()
+
+        with patch("dispar_orchestrate.gold_export.GoldExportConfig.from_env", return_value=cfg), \
+             patch("dispar_orchestrate.gold_export.load_gold_catalog") as mock_catalog, \
+             patch("dispar_orchestrate.gold_export.record_gold_trim_run") as mock_record:
+            res = gold_export.trim_gold_mart(ctx, "sales_mart", {"rowsExported": 10})
+
+        self.assertEqual(res, {"rowsExported": 10})
+        mock_catalog.assert_not_called()
+        mock_record.assert_called_once()
+        kwargs = mock_record.call_args.kwargs
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertEqual(kwargs["reason"], "invalid GOLD_ORPHAN_MIN_AGE_SECONDS")
 
 
 if __name__ == "__main__":

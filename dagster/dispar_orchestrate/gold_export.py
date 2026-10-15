@@ -63,8 +63,11 @@ configured via `GOLD_KEEP_COPIES`). Following `export_gold_mart`, the mapped
 op `trim_gold_mart` prunes older copies via PyIceberg delete matching
 `_exported_at < cutoff` and snapshot expiry, followed by ClickHouse
 `EXECUTE remove_orphan_files` through `icecat_gold_export` with
-`iceberg_orphan_files_older_than_seconds = 0` to delete unreferenced Parquet
-files from object storage. Every trim operation records its result (status,
+`iceberg_orphan_files_older_than_seconds = <GOLD_ORPHAN_MIN_AGE_SECONDS>`
+(default 3600 seconds, 1 hour; DATA-2 review BLOCKER 1) to delete unreferenced
+Parquet files from object storage without endangering in-flight uncommitted
+appends from concurrent exports. The trim therefore frees a removed copy's
+files on the first trim that runs at least an hour after they were written. Every trim operation records its result (status,
 copies kept, oldest kept timestamp, copies removed, snapshots expired,
 files removed, and fixed failure reasons) in `console.gold_trim_run`."""
 
@@ -106,10 +109,15 @@ def _env(name: str, default: str) -> str:
 
 
 INVALID_KEEP_COPIES_REASON = "invalid GOLD_KEEP_COPIES"
+INVALID_ORPHAN_MIN_AGE_REASON = "invalid GOLD_ORPHAN_MIN_AGE_SECONDS"
 
 
 class InvalidKeepCopiesError(ValueError):
     """Raised when GOLD_KEEP_COPIES cannot be parsed as an integer >= 1."""
+
+
+class InvalidOrphanMinAgeError(ValueError):
+    """Raised when GOLD_ORPHAN_MIN_AGE_SECONDS cannot be parsed as an integer >= 0 (DATA-2 review BLOCKER 1)."""
 
 
 def parse_gold_keep_copies(raw: Any) -> int:
@@ -130,6 +138,27 @@ def parse_gold_keep_copies(raw: Any) -> int:
         raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON) from None
     if val < 1:
         raise InvalidKeepCopiesError(INVALID_KEEP_COPIES_REASON)
+    return val
+
+
+def parse_gold_orphan_min_age_seconds(raw: Any) -> int:
+    """Parse GOLD_ORPHAN_MIN_AGE_SECONDS setting as an integer >= 0 (DATA-2 review BLOCKER 1).
+
+    Anything else (negative, non-numeric, empty string, None) raises
+    InvalidOrphanMinAgeError("invalid GOLD_ORPHAN_MIN_AGE_SECONDS").
+    """
+    if raw is None:
+        raise InvalidOrphanMinAgeError(INVALID_ORPHAN_MIN_AGE_REASON)
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            raise InvalidOrphanMinAgeError(INVALID_ORPHAN_MIN_AGE_REASON)
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        raise InvalidOrphanMinAgeError(INVALID_ORPHAN_MIN_AGE_REASON) from None
+    if val < 0:
+        raise InvalidOrphanMinAgeError(INVALID_ORPHAN_MIN_AGE_REASON)
     return val
 
 
@@ -163,6 +192,7 @@ class GoldExportConfig:
     # instead of silently, which is the honest state to ship.
     run_token: str
     gold_keep_copies: str = "7"
+    gold_orphan_min_age_seconds: str = "3600"
     gold_export_token_file: str = "/tokens/gold-export.jwt"
     lakekeeper_catalog_uri: str = "http://lakekeeper:8181/catalog"
     lakekeeper_warehouse: str = "default"
@@ -180,6 +210,7 @@ class GoldExportConfig:
             marts=_marts_from_env(),
             run_token=_env("GOLD_EXPORT_RUN_TOKEN", ""),
             gold_keep_copies=_env("GOLD_KEEP_COPIES", "7"),
+            gold_orphan_min_age_seconds=_env("GOLD_ORPHAN_MIN_AGE_SECONDS", "3600"),
             gold_export_token_file=_env(
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE", "/tokens/gold-export.jwt"
             ),
@@ -572,7 +603,7 @@ def run_trim_for_mart(
     started_at = datetime.datetime.now(datetime.timezone.utc)
     log = context.log if context else None
 
-    # 1. Parse keep_copies (D4)
+    # 1. Parse keep_copies (D4) and orphan_min_age_seconds (DATA-2 review BLOCKER 1)
     try:
         keep_copies = parse_gold_keep_copies(cfg.gold_keep_copies)
     except InvalidKeepCopiesError:
@@ -592,6 +623,30 @@ def run_trim_for_mart(
             if log:
                 log.warning(f"failed to record gold_trim_run for {mart}: {e}")
         return {"status": "failed", "reason": INVALID_KEEP_COPIES_REASON}
+
+    try:
+        orphan_min_age_seconds = parse_gold_orphan_min_age_seconds(
+            cfg.gold_orphan_min_age_seconds
+        )
+    except InvalidOrphanMinAgeError:
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        if log:
+            log.error(
+                f"invalid GOLD_ORPHAN_MIN_AGE_SECONDS: {cfg.gold_orphan_min_age_seconds!r}"
+            )
+        try:
+            record_gold_trim_run(
+                cfg.ch,
+                mart=mart,
+                status="failed",
+                reason=INVALID_ORPHAN_MIN_AGE_REASON,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        except Exception as e:
+            if log:
+                log.warning(f"failed to record gold_trim_run for {mart}: {e}")
+        return {"status": "failed", "reason": INVALID_ORPHAN_MIN_AGE_REASON}
 
     # 2. Connect to catalog and load table
     try:
@@ -765,12 +820,14 @@ def run_trim_for_mart(
 
         catalog_db = "icecat_gold_export"
         ensure_catalog_database(cfg, db_name=catalog_db)
+        # DATA-2 review BLOCKER 1: pass orphan_min_age_seconds to prevent
+        # deleting in-flight uncommitted files from concurrent exports.
         orphan_res = run_remove_orphan_files(
             cfg,
             f"gold.{mart}",
             dry_run=False,
             catalog_db=catalog_db,
-            older_than_seconds=0,
+            older_than_seconds=orphan_min_age_seconds,
         )
         files_removed = int(orphan_res.get("deleted_data_files_count", 0))
     except Exception as exc:

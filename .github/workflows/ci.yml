@@ -1518,6 +1518,8 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           GOLD_EXPORT_RUN_TOKEN=ci-gold-export-token-not-a-real-secret
           DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # DATA-2 review BLOCKER 1: CI runs with age 0 to allow immediate orphan cleanup in gate test (no other writer runs here)
+          GOLD_ORPHAN_MIN_AGE_SECONDS=0
           EOF
 
       # Fixture image, built here rather than shared; see `g3a-dagster`.

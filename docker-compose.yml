@@ -1870,6 +1870,8 @@ services:
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       # DATA-2 (D4): number of Gold export copies to keep per mart (default 7)
       GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}
+      # DATA-2 review BLOCKER 1: minimum orphan age in seconds before removal (default 3600)
+      GOLD_ORPHAN_MIN_AGE_SECONDS: ${GOLD_ORPHAN_MIN_AGE_SECONDS:-3600}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the
