@@ -179,4 +179,105 @@ planner (section 5).
 
 ## 6. Handoff
 
+### Slice B — developer (OpenCode MiniMax M3.1), 2026-10-15
+
+Branch `fix/pr105-orchestrator-class`, base `e17a8281`. Commits:
+
+- `66fc42f3` `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` — B1.
+- `ba8d63a2` `docs(proxy): say why the embed frame check uses fetch (PR #105 review SHOULD-FIX 2)` — B2.
+- the commit carrying this section.
+
+**B1, what changed.** `lakehouse-dagster` gains `DgError::Status(u16)`
+(`Display` unchanged, `"Dagster HTTP {n}"`), built at all three non-2xx
+sites (`e17a8281`: 1157, 2323, 2393 — the plan named the first and "any
+other"). `upstream_error::orchestrator_unreachable` keeps `Transport` and
+`Status(s) if s >= 500` on the 503 + `code: orchestrator_unreachable`, and
+sends `Status(4xx)` and `Server(..)` to a 502 with the context's `failed`
+sentence, no `code`, no `Retry-After`, raw text to the log only. A 502 did
+not exist in the workspace, so `ApiError::BadGateway` is added in
+`lakehouse-core` (accepted by the planner) with `UpstreamFailure::
+into_bad_gateway` beside `into_not_ready`; `ApiError::status()` is the only
+exhaustive `match` on `ApiError` in the workspace and carries the new arm.
+`routes/connectors.rs`'s `ingest_run_request` doc comment is updated to
+state the split (it still described a "protocol failure" as unreachable).
+Unit tests added: four in `upstream_error.rs` (Transport → 503 + code +
+`WARN` log, `Status(502)` → 503 + code, `Status(400)` → 502 no code, and a
+GraphQL `Server(..)` → 502 whose planted marker appears in the log and not
+in the body), one in `lakehouse-dagster` (a `503` answer is
+`DgError::Status(503)` with the same `Display`), one in `lakehouse-core`
+(`BadGateway` → 502).
+
+**Commands run** (from `rust/`; see the target-dir deviation below; every
+number below is quoted from that run on this branch's code):
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo clippy -p lakehouse-dagster -p lakehouse-api -p lakehouse-core --all-targets -- -D warnings` | exit 0, no warnings (lakehouse-core added to the plan's two crates because B1 edits it) |
+| `cargo test -p lakehouse-dagster` | `test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-api --lib upstream_error` | `test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 1677 filtered out` |
+| `cargo test -p lakehouse-api --lib connectors` | `test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 1623 filtered out` |
+| `cargo test -p lakehouse-api --lib pipelines` | `test result: ok. 157 passed; 0 failed; 0 ignored; 0 measured; 1541 filtered out` |
+| `cargo test -p lakehouse-api --test sec11_guard` | `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-core` | `test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` (not in the plan's list; run because B1 adds a variant and a test to that crate) |
+| `cargo test -p lakehouse-core bad_gateway_maps_to_502` | `test result: ok. 1 passed; 0 failed; 47 filtered out` |
+| `bun run typecheck` | exit 0 |
+| `bun run lint` | exit 0, `6 problems (0 errors, 6 warnings)`, all pre-existing on this branch and in files this slice does not touch (`data-table.tsx`, `sidebar.tsx`, `alerts-page.tsx`, `open-format-card.test.tsx`, `use-data-table.ts`, `dashboard-specs.ts`) |
+
+**Deviation: `CARGO_TARGET_DIR`.** The plan's shared
+`/home/uaa/rantai/.cargo-target` is not safe while two worktrees build the
+same crates, and I hit it. `cargo test -p lakehouse-api --lib
+upstream_error` against the shared dir first failed to compile MY
+`upstream_error.rs` against the OTHER developer's `lakehouse-dagster` and
+`lakehouse-core` (`E0599: no variant ... named Status` / `BadGateway`), and
+the next run of the same command executed `lakehouse_api-17d22573297d3f60`,
+whose dep-info names `/home/uaa/rantai/wt-pr105-embed/rust/migrations/...`:
+the other worktree. That run's "17 passed" was their binary, not mine —
+exactly the false green rule 7 exists to catch. The unit's `-C metadata`
+and extra-filename are identical across the two worktrees, so the builds
+overwrite each other's artifacts and cargo's mtime freshness check can
+accept the wrong one. Every cargo command above therefore ran with
+`CARGO_TARGET_DIR=/home/uaa/rantai/.cargo-target-pr105-orch`, seeded by
+copying the shared dir's `deps/`, `build/` and `.fingerprint/` (not
+`incremental/`, ~7.5 GB) so the dependency cache stayed warm, after
+touching this worktree's `crates/**/*.rs` and `migrations/*.sql` so every
+workspace crate was rebuilt from here. Provenance checked afterwards: the
+newest `lakehouse_api-*.d` files in that directory name
+`/home/uaa/rantai/wt-pr105-orch`. Nothing in the shared directory was
+deleted and `cargo clean` was never run, so the other developer's cache is
+untouched. The planner may want a per-branch target dir (or a note that
+the shared one is single-developer only) in `AGENTS.md`.
+
+**Not verified, and why.**
+
+- `cargo test --workspace` and `cargo clippy --workspace`: the plan
+  forbids them on this 11 GB machine while two developers build; CI runs
+  them.
+- `cargo test -p lakehouse-api` in full (only the three `--lib` filters
+  the plan names) and every integration test (`ingest_run`, `embed_tokens`,
+  `route_auth`, …): they need `lakehouse_test_support::database_url()`, i.e.
+  a real Postgres, which this run does not have. Read, not run:
+  `tests/ingest_run.rs::ingest_run_with_dagster_down_is_a_503_with_an_unreachable_code`
+  asserts the 503 + `orchestrator_unreachable` for `spin_up`'s dead
+  `127.0.0.1:1` upstream; that is a `Transport`, the arm whose behaviour is
+  unchanged, so the narrowed split should not move it — but it is unproven
+  here.
+- `bun run test`: the plan's B2 acceptance is `typecheck` + `lint` only.
+- The 502 is proven by unit tests against constructed `DgError` values, not
+  against a live `Dagster` answering 4xx or a GraphQL error; no compose,
+  Dagster or ClickHouse was run.
+- Slice A (embed events) is not in this branch.
+
+**Plan vs code.** No scope mismatch; the anchors held (`DgError` at 157,
+`Server(format!("Dagster HTTP …"))` at 1157, `orchestrator_unreachable` at
+181, all at `e17a8281`), and the file's two further non-2xx sites fall
+under the plan's "any other non-2xx site". Two things the plan did not
+spell out, both recorded above: the new `ApiError::BadGateway` variant
+(accepted) and the `routes/connectors.rs` doc comment. Still owned by the
+planner: `docs/core/features/no-raw-upstream-errors.md:52` still presents
+`orchestrator_unreachable` as the answer for every orchestrator failure,
+which is the line SHOULD-FIX 6 rewrites. `ops/g6/g6_ingest_matrix_test.py`
+needs no change: its `RETRYABLE_ORCHESTRATOR_CODES` gate is exactly what
+makes the 502 fail fast by design.
+
 ## 7. Review
