@@ -77,7 +77,68 @@ the working-tree `gitleaks` job; `ci.yml`.
 
 ## 6. Handoff
 
-(developer appends here)
+### Handoff (2026-10-15, Round 1)
+
+1. Commits:
+```
+aaa2cc4510d5 docs(security): document history-scan HEAD scoping and daily all-branch scan (SEC-36)
+611e3fc5ebc5 ci(security): add daily all-branch history scan workflow (SEC-36)
+60303bb90930 ci(security): scope history-scan to HEAD on main and PRs (SEC-36)
+c8c8662db6ab docs(core): SEC-36 spec and plan; backlog status for SEC-16/17/18/27/36
+```
+
+2. Verifications run:
+- **T1 gitleaks HEAD vs --all in scratch clone (AC2):**
+  Scratch clone created under `/home/shiro/rantai/review-logs/sec36-scratch` with `git fetch origin '+refs/heads/*:refs/remotes/origin/*'`.
+  - Command: `docker run --rm -v /home/shiro/rantai/review-logs/sec36-scratch:/repo -w /repo zricethezav/gitleaks:v8.30.1 detect --source /repo --config /repo/.gitleaks.toml --redact --log-opts="HEAD"`
+    Counts / output: `1289 commits scanned. scanned ~25966800 bytes (25.97 MB) in 4.81s; no leaks found` (0 leaks, exit code 0).
+  - Command: `docker run --rm -v /home/shiro/rantai/review-logs/sec36-scratch:/repo -w /repo zricethezav/gitleaks:v8.30.1 detect --source /repo --config /repo/.gitleaks.toml --redact --log-opts="--all"`
+    Counts / output: `2106 commits scanned. scanned ~38545966 bytes (38.55 MB) in 6.55s; leaks found: 25` (exit code 1).
+    Findings breakdown: 22 `generic-api-key` findings on `origin/feat/phase-1-rest` (#144); 3 `rantai-internal-lan-host` on `origin/backup-pre-rewrite`.
+  - Scratch clone deleted when done (`rm -rf /home/shiro/rantai/review-logs/sec36-scratch`).
+- **Gitleaks v8.30.1 source verification (`sources/git.go`):**
+  Inspected upstream `sources/git.go` lines 74–95:
+  Without `--log-opts`:
+  `cmd = exec.CommandContext(ctx, "git", "-C", sourceClean, "log", "-p", "-U0", "--full-history", "--all", "--diff-filter=tuxdb")` (lines 93–94)
+  With `--log-opts`:
+  `args := []string{"-C", sourceClean, "log", "-p", "-U0"}` (line 75)
+  `args = append(args, userArgs...)` (line 90)
+  `cmd = exec.CommandContext(ctx, "git", args...)` (line 91)
+- **Merge commit diff behavior in `git log -p`:**
+  Ran `git log -p -n 1 6a1285d6` on a merge commit in the repo. Git outputs the commit message and metadata but skips diff output for merge commits by default (diffs require `-m`, `-c`, or `--cc`). Documented in `docs/CI.md`.
+- **T1 workflow YAML validation:**
+  Command: `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/security.yml"))'`
+  Output: valid YAML.
+- **T2 workflow YAML & trigger validation:**
+  Command: `python3 -c 'import yaml; p = yaml.safe_load(open(".github/workflows/security-all-branches.yml")); tr = p.get("on") or p.get(True); assert "push" not in tr and "pull_request" not in tr and "schedule" in tr and "workflow_dispatch" in tr'`
+  Output: validated schedule `17 3 * * *` and workflow_dispatch present; push and pull_request absent.
+- **T3 grep check:**
+  Command: `grep -n 'fetch --all' docs/CI.md .github/workflows/security.yml`
+  Output: 0 matches (exit code 1).
+- **Working-tree gitleaks pre-push check:**
+  Command: `docker run --rm -v /home/shiro/rantai/wt/sec-36:/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`
+  Counts / output: `scanned ~20069881 bytes (20.07 MB) in 3.79s; no leaks found` (exit code 0).
+- **Languages not touched:**
+  Rust (cargo fmt/clippy/test), TypeScript (bun run typecheck/lint/test), Python (ops/lint, pytest), Docker Compose config/up: *not verified* (only CI workflows, docs/CI.md and CHANGELOG.md touched; per AGENTS.md "Keep build time down: Only build what changed").
+
+3. Skipped / premises:
+- Nothing skipped. The plan's premises held: `--log-opts="HEAD"` isolates the scan to the checked-out commit on main and PRs, and `--log-opts="--all"` in the daily workflow catches the 22 unmerged findings from #144.
+
+4. Repository status:
+```
+git status --short
+(clean)
+
+git log --oneline --abbrev=12 origin/main..HEAD | head
+PENDING_COMMIT_HASH docs(core): handoff for SEC-36 history scan scope
+aaa2cc4510d5 docs(security): document history-scan HEAD scoping and daily all-branch scan (SEC-36)
+611e3fc5ebc5 ci(security): add daily all-branch history scan workflow (SEC-36)
+60303bb90930 ci(security): scope history-scan to HEAD on main and PRs (SEC-36)
+c8c8662db6ab docs(core): SEC-36 spec and plan; backlog status for SEC-16/17/18/27/36
+
+git ls-remote --heads origin fix/sec-36-gitleaks-scope
+PENDING_REMOTE_REF	refs/heads/fix/sec-36-gitleaks-scope
+```
 
 ## 7. Review
 
