@@ -483,6 +483,63 @@ Only `docker-compose.yml`, `.env.example`, `ops/`, `.github/workflows/ci.yml`, `
 6. Step e: the second `append` load of a table whose Iceberg table still has `secret_note` but the incoming batch does not; if the sink refuses a batch with fewer columns the run fails and the step says so (a product finding, not a gate defect).
 7. `INGEST_SERVICE_TOKEN` inside the runner: only for the due list; empty -> the gate's own message.
 
+### Merge of main and review 2 fixes (developer, 2026-10-15, branch `feat/phase-1-rest`)
+
+Commits: `3041cc84` (merge of `origin/main` at `224b776f`, no textual conflict),
+`6fc4a397` (migrations renumbered), `6137abfa` (SHOULD-FIX 1), `28fb4807`
+(SHOULD-FIX 2), and this entry.
+
+**Merge.** Clean, no conflict hunks. Files both sides touched since the last
+merge base: `.github/workflows/ci.yml`, `docker-compose.yml`, `docs/CI.md`,
+`docs/core/BACKLOG.md`, `routes/connectors.rs`, `routes/mod.rs`,
+`tests/ingest_run.rs`, `lakehouse-dagster/src/lib.rs`. Semantic checks:
+`LaunchOutcome.error` became `failure: Option<LaunchFailure>` on main (F2.7);
+this branch's only launch caller is `launch_ingest` (already merged onto the
+new shape) and its new `launch_run_with_config_and_tags` returns the same
+`LaunchOutcome`, so nothing of ours reads `.error`. `ci.yml`: main added G7
+to `g3a-dagster` and a `timeout-minutes`; our `g6-ops` job is separate, job
+keys are unique, `scripts/ci/tests/test_required_gate.sh` passes (46/46).
+
+**Renumbering.** Main took `0071_pipeline_definition_version_tenant.sql` (#80).
+`0070_connector_run_record` -> `0072`, `0071_connector_inactive_column_reason`
+-> `0073`, `0072_connector_run_table` -> `0074`. They had run only on CI's
+throwaway databases. Each why-header says "Numbered 0072-0074, not 0070-0072:
+main took 0071 first (#80)". References changed: `connector_run.rs:4`,
+`schema_change.rs` (src, "migration 0071" -> 0073), `tests/schema_change.rs`
+(same), the 0074 header's own "0070" -> "0072", and this plan (the migration
+list and Fix round 1 BLOCKER 2). References to main's 0071 pipeline migration
+were left alone.
+
+**SHOULD-FIX 1.** `GET /api/connectors/{id}/ingest/runs` removed: route in
+`routes/mod.rs`, `ingest_run_history` in `routes/connectors.rs`, the
+`POLICY_TABLE` row in `policy.rs`, and two tests in `tests/ingest_run.rs`
+(`route_auth.rs` had no per-route line for it). Kept, because
+`ingest_run_request`'s one-run-at-a-time guard uses them:
+`connector_runs`, `DgClient::list_runs_for_job_with_config`. Cut
+`ConnectorIngestRun` to `run_id` and `status` (the rest, `run_config_text`
+and the `Serialize` derive served only the removed route).
+
+**SHOULD-FIX 2.** `set_ingest_spec` (`routes/ai/registry.rs`): per-object
+`excludedColumns` property and the sentence "keep each object's loadMode,
+primaryKey and excludedColumns ... one sent without excludedColumns loads
+every column again"; new test
+`set_ingest_spec_lists_excluded_columns_and_says_to_keep_them`.
+`tests/fixtures/tool_schemas.json` was edited BY HAND to what
+`write_tool_schema_fixture` would emit (not regenerated: no cargo test here).
+
+**Ran.** `cargo fmt --check` clean; `test_required_gate.sh` 46 passed, 0 failed;
+`ci.yml` and `docker-compose.yml` load as YAML; four `ops/lint` checks plus
+the lint self-test ok; dagster pytest `-m "not loader"` 915 passed, 258
+deselected; `bun run typecheck` clean; `bun test src/features/connectors` 268
+pass, 0 fail.
+**Not verified.** Any cargo check/clippy/test (`/` at the 12 GB floor): the
+Rust edits of this round and the merge result are uncompiled.
+Most likely to fail in CI: (1) `tool_schemas_snapshot_is_byte_identical` if my
+hand edit differs by a byte; (2) a compile error from the merge in code that
+touches `lakehouse-dagster`'s changed types; (3) a dead-code or unused-import
+clippy error after the `ConnectorIngestRun` cut; (4) the gitleaks history scan
+over this branch's new commits.
+
 ## Review
 
 *(planner)*
