@@ -300,6 +300,25 @@ console's manual publish (D1), Silver (`DATA-4`).
   - D6 (Console): Added `GoldTrimSummary` to `src/services/contracts/gold.ts`. Updated `OpenFormatCard` in `src/features/catalog/open-format-card.tsx` to display `"Copies kept: N (oldest <time>)"` on success, and `"Trim failed: <reason>"` on failure. Never renders "trimmed" for failed or null rows.
   - D6 (Console Tests): Added tests in `src/features/catalog/open-format-card.test.tsx` verifying success, failed, and null trim cases. All 12 tests pass. All tests in `src/features/gold/` pass. `bun x tsc --noEmit` clean with zero errors.
 
+### Task T5: Acceptance Gate Proves 7 Copies Kept and Storage Reclaimed
+
+- **Status**: SUCCEEDED.
+- **Changes**:
+  - Extended `ops/gold_export/gold_export_test.py`:
+    - Waits for Dagster webserver.
+    - Enables publication for `MART_NAME` via `PUT /api/gold/export/{MART_NAME}/publication` with `{"enabled": true}`.
+    - Runs 9 export cycles through the job path: in each cycle, mutates mart rows in ClickHouse (`INSERT INTO serving.gold_export_smoke ...`), triggers `gold_export_job` via `POST /api/pipelines/gold_export_job/trigger`, and polls Dagster GraphQL until run status is `SUCCESS`.
+    - Proves 7 copies kept: ClickHouse `SELECT count(DISTINCT _exported_at) FROM icecat_gold_export.gold.gold_export_smoke` confirms exactly 7 copies.
+    - Proves storage reclaimed: queries S3 object store via `boto3`, asserting exactly 7 parquet files remain in the table's data prefix and verifying removed copies' parquet files (including cycle 1 and cycle 2 files) are completely deleted.
+    - Proves publication detail: asserts `GET /api/gold/export/{MART_NAME}/publication` returns `trim` with `copiesKept: 7`, `status: "success"`, and non-null `oldestKeptExportedAt`.
+  - Updated `docker-compose.yml`:
+    - `dagster-code-location`: mounts `./dagster/dispar_orchestrate:/opt/dagster/app/dispar_orchestrate:ro`.
+    - `gold-export-test-runner`: updated to `profiles: ["dagster"]`, depends on `lakehouse-api`, `dagster-webserver` (healthy), and `lakekeeper-authz-init`, installs `boto3`, and configures `DAGSTER_URL`, `CH_RUSTFS_S3_ENDPOINT`, `CONNECTOR_S3_*`, and `LAKEHOUSE_WAREHOUSE_BUCKET`.
+  - Updated `.github/workflows/ci.yml`:
+    - Updated `gold-export` job to download Dagster image artifacts, set `LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci`, write `DAGSTER_URL` to `.env`, bring up `lakehouse-api dagster-code-location dagster-webserver dagster-daemon` with `--profile dagster`, and run `gold-export-test-runner` with `--profile dagster`.
+    - Raised `timeout-minutes` from 20 to 31 (measured acceptance test execution time: 327s / ~6 minutes, + 5m slack = 11m raise).
+- **Local Verification**: Clean compose stack (`-p data2test`) run under `flock /home/shiro/rantai/.heavy.lock` passed in 327 seconds. All containers and volumes torn down cleanly.
+
 ## 8. Review
 
 ### Planner response to T1 (Claude Opus), at `356080b4`
