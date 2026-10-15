@@ -28,7 +28,7 @@ import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
 import { binsOfTile, relabelBins } from "@/lib/chart-bins";
 import { labelOtherRows, tileMeasureLabels, visibleColumns, withResolvedSlots, type ShapeDefFields } from "@/lib/chart-shape";
 import type { Rows } from "./tile-dialogs";
-import { MAX_BULLETS, type TypeDefFields } from "@/lib/type-b";
+import { HISTOGRAM_ROW_CAP, MAX_BULLETS, type TypeDefFields } from "@/lib/type-b";
 import { ProgressCard } from "./progress-card";
 import { ImageCard, WebCard } from "./content-cards";
 import { bulletOption, histogramOption } from "./type-b-option";
@@ -228,7 +228,15 @@ function TypeBBody({
     if ("message" in drawn) {
       return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{drawn.message}.</p>;
     }
-    return <EChart option={drawn.option} height="100%" />;
+    // A result as long as the server's cap may have been cut (a narrow width over a wide column); say so, as a cut-off chart does.
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
+        {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
+        ) : null}
+      </div>
+    );
   }
   const valueColumn = yCols[0] ?? "v";
   const goalColumn = def?.goal && typeof def.goal === "object" ? (yCols[1] ?? "g") : undefined;

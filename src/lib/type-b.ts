@@ -15,6 +15,8 @@ export const MAX_HISTOGRAM_COUNT = 100
 export const MAX_BANDS = 3
 export const MAX_ALT = 200
 export const MAX_URL = 2000
+/** The most ranges the server returns for a histogram (`HISTOGRAM_LIMIT` in `builder.rs`); a full result may have been cut. */
+export const HISTOGRAM_ROW_CAP = 100
 /** The bullet graphs a tile draws; the rest are summarised ("N more not shown"). */
 export const MAX_BULLETS = 20
 /** The most ranges a histogram draws between its first and its last; more would be a stripe of zeros. */

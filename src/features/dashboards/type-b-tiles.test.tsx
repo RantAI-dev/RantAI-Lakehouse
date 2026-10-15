@@ -92,6 +92,15 @@ describe("a histogram", () => {
     expect(screen.getByRole("status").textContent).toContain("Too many ranges")
   })
 
+  it("says when the result is as long as the server's cap and may have been cut", () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({ price: i * 10, __count: 1 }))
+    tile(spec, rows(full, { bins: { price: { mode: "width", width: 10, min: 0, max: 1000 } } }))
+    expect(screen.getByText(/Only the first 100 ranges are shown/)).toBeTruthy()
+    cleanup()
+    tile(spec, rows(full.slice(0, 99), { bins: { price: { mode: "width", width: 10, min: 0, max: 1000 } } }))
+    expect(screen.queryByText(/Only the first 100 ranges/)).toBeNull()
+  })
+
   it("is no data without rows", () => {
     tile(spec, rows([]))
     expect(screen.getByText("No data.")).toBeTruthy()
