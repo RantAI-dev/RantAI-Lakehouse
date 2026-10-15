@@ -748,7 +748,7 @@ async fn probe_rest(
 /// URL with [`parse_endpoint_host_port`]'s hand-rolled splitter, the client
 /// with the `url` crate; a URL the two read differently could make the client
 /// dial a host the check never saw, so a mismatch is refused.
-fn url_names_target(url: &str, host: &str, port: u16) -> bool {
+pub(crate) fn url_names_target(url: &str, host: &str, port: u16) -> bool {
     reqwest::Url::parse(url).is_ok_and(|parsed| {
         parsed
             .host_str()
@@ -1327,7 +1327,7 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
 /// The S3 client for [`probe_s3`], pinned to the [`Approved`] addresses of
 /// `endpoint_host` (see [`PinnedHttpConnector`]). Separate from `probe_s3` so
 /// a test can build the same client against a stand-in server.
-fn s3_client(
+pub(crate) fn s3_client(
     endpoint: &str,
     bucket: &str,
     endpoint_host: &str,

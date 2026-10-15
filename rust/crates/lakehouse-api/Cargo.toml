@@ -143,6 +143,11 @@ tokio-util = { workspace = true, features = ["compat", "io"] }
 # (one copy in `Cargo.lock`); no TLS provider of its own beyond the `rustls`
 # feature `object_store`'s `aws` feature already turns on for it.
 reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+# `SRC-13` (D2): `connector_listing` walks `object_store`'s `list` stream so a
+# bucket listing can stop at its bound instead of collecting every key.
+# `futures` 0.3 is already in `Cargo.lock` (`lakehouse-iceberg` depends on it),
+# so this adds no package; only this crate's dependency list in the lockfile.
+futures = "0.3"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

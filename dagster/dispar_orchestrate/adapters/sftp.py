@@ -91,34 +91,25 @@ def _connect_kwargs(spec: dict, secrets: dict[str, str]) -> dict[str, Any]:
     return kwargs
 
 
-def build_source(
-    spec: dict,
-    secrets: dict[str, str],
-    source_objects: list[dict],
-    *,
-    resolve_checked=ssrf_guard.resolve_checked,
-) -> AdapterBuildResult:
-    """Build one dlt-shaped source per `source_objects` entry over an
-    SFTP directory.
-
-    `_validate_hostname` and `resolve_checked` both run BEFORE any
-    connection attempt (the canonical hostname-shape
-    check from `adapters/sql.py`, imported rather than re-implemented --
-    see `ssrf_guard_kafka.py`/`ssrf_guard_mongo.py`
-    for the same pattern) -- a rejected or blocked dial never constructs
-    a `paramiko.SSHClient` at all (see this module's
-    `test_build_source_checks_the_host_before_connecting`). The actual
-    connect call is pinned to that checked address -- see the module
-    docstring's SSRF section for why a name-only check is not enough for
-    a driver that resolves its own hostname.
-    """
+def resolve_host(spec: dict, *, resolve_checked=ssrf_guard.resolve_checked) -> ssrf_guard.ResolvedAddress:
+    """`_validate_hostname` and `resolve_checked`, BEFORE any connection attempt
+    (the canonical hostname-shape check from `adapters/sql.py`, imported rather
+    than re-implemented -- see `ssrf_guard_kafka.py`/`ssrf_guard_mongo.py` for the
+    same pattern). A rejected or blocked dial never constructs a
+    `paramiko.SSHClient` at all (see this module's
+    `test_build_source_checks_the_host_before_connecting`)."""
     _validate_hostname("host", spec["host"])
-    resolved = resolve_checked(spec["host"], spec["port"])
+    return resolve_checked(spec["host"], spec["port"])
 
-    file_format = spec.get("fileFormat", "csv")
-    if file_format not in _SUPPORTED_FILE_FORMATS:
-        raise ValueError(f"sftp adapter does not support fileFormat {file_format!r} (supported: {_SUPPORTED_FILE_FORMATS})")
 
+def open_session(spec: dict, secrets: dict[str, str], resolved: ssrf_guard.ResolvedAddress) -> tuple[Any, Any]:
+    """Connect to `spec['host']` pinned to `resolved` (the address `resolve_host`
+    checked) and open the SFTP session. Shared by `build_source` and the table
+    discovery (`discover.py`, SRC-13). The caller closes the client.
+
+    The actual connect call is pinned to that checked address -- see the module
+    docstring's SSRF section for why a name-only check is not enough for a driver
+    that resolves its own hostname."""
     connect_kwargs = _connect_kwargs(spec, secrets)
 
     client: Any = paramiko.SSHClient()
@@ -130,7 +121,26 @@ def build_source(
     # `socket.getaddrinfo` hands back for that name is forced.
     with ssrf_guard.pinned_resolution(spec["host"], resolved):
         client.connect(**connect_kwargs)
-    sftp = client.open_sftp()
+    return client, client.open_sftp()
+
+
+def build_source(
+    spec: dict,
+    secrets: dict[str, str],
+    source_objects: list[dict],
+    *,
+    resolve_checked=ssrf_guard.resolve_checked,
+) -> AdapterBuildResult:
+    """Build one dlt-shaped source per `source_objects` entry over an
+    SFTP directory. The host is checked by `resolve_host` and the connection
+    opened, pinned, by `open_session`."""
+    resolved = resolve_host(spec, resolve_checked=resolve_checked)
+
+    file_format = spec.get("fileFormat", "csv")
+    if file_format not in _SUPPORTED_FILE_FORMATS:
+        raise ValueError(f"sftp adapter does not support fileFormat {file_format!r} (supported: {_SUPPORTED_FILE_FORMATS})")
+
+    _client, sftp = open_session(spec, secrets, resolved)
 
     sources: dict[str, Iterator[dict]] = {}
     base_path = spec["path"].rstrip("/")

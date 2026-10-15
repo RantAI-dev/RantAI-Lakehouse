@@ -184,6 +184,33 @@ def _paginate(base_url: str, endpoint: dict, pagination: dict, headers: dict, ht
     raise ValueError(f"rest adapter does not know pagination type {ptype!r}")
 
 
+def _prepare(
+    spec: dict,
+    secrets: dict[str, str],
+    *,
+    resolve_checked,
+    http_get: Callable | None,
+) -> tuple[dict, Callable, ssrf_guard.ResolvedAddress]:
+    """Resolve and check `baseUrl`, build the auth headers, and pick the GET: the
+    part of a read that `build_source` and `first_page_records` share, so a
+    preview dials, authenticates and refuses redirects exactly as a load does."""
+    parsed = urlparse(spec["baseUrl"])
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    resolved = resolve_checked(parsed.hostname, port)
+
+    headers, _params = _auth_headers_and_params(spec["auth"], secrets, resolve_checked=resolve_checked)
+
+    def _real_http_get(url, *, headers, params):
+        # WS3 plan review Z5: allow_redirects=False -- a redirect to an
+        # unchecked host must never be followed silently.
+        resp = requests.get(url, headers=headers, params=params, timeout=30, allow_redirects=False)
+        _refuse_redirect(resp, what=f"GET {url}")
+        resp.raise_for_status()
+        return resp.json()
+
+    return headers, http_get or _real_http_get, resolved
+
+
 def build_source(
     spec: dict,
     secrets: dict[str, str],
@@ -200,24 +227,50 @@ def build_source(
     # need one; the parameter exists here purely for call-site arity, not
     # because this adapter reads it.
     del source_objects
-    parsed = urlparse(spec["baseUrl"])
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    resolved = resolve_checked(parsed.hostname, port)
-
-    headers, _params = _auth_headers_and_params(spec["auth"], secrets, resolve_checked=resolve_checked)
-
-    def _real_http_get(url, *, headers, params):
-        # WS3 plan review Z5: allow_redirects=False -- a redirect to an
-        # unchecked host must never be followed silently.
-        resp = requests.get(url, headers=headers, params=params, timeout=30, allow_redirects=False)
-        _refuse_redirect(resp, what=f"GET {url}")
-        resp.raise_for_status()
-        return resp.json()
-
-    get = http_get or _real_http_get
+    headers, get, resolved = _prepare(spec, secrets, resolve_checked=resolve_checked, http_get=http_get)
 
     def _rows():
         for endpoint in spec["endpoints"]:
             yield from _paginate(spec["baseUrl"], endpoint, spec["pagination"], headers, get)
 
     return AdapterBuildResult(source=_rows(), resolved=resolved)
+
+
+def first_page_records(
+    spec: dict,
+    secrets: dict[str, str],
+    endpoint_path: str,
+    *,
+    limit: int,
+    resolve_checked=ssrf_guard.resolve_checked,
+    http_get: Callable | None = None,
+) -> list:
+    """The records of the FIRST page of one declared endpoint, at most `limit`
+    (SRC-13 decision D6: "REST: the first page"). The same address check, auth,
+    no-redirect GET, first-request parameters (`page` pagination asks for page 1)
+    and `recordsPath` a load uses, so what a preview shows is what a load would
+    read first. One request only: the preview never follows a page or a cursor.
+
+    The request is made here, so this function pins the resolution itself
+    (`ssrf_guard.pinned_resolution`); a load pins in its caller because it reads
+    later.
+
+    # Errors
+
+    `ValueError` when `endpoint_path` is not one of `spec["endpoints"]`;
+    `ssrf_guard.SsrfBlocked` for a blocked or redirecting target; whatever the
+    request raises (`requests.RequestException`, `KeyError`/`TypeError` for a body
+    that is not the declared shape).
+    """
+    endpoint = next((e for e in spec["endpoints"] if e["path"] == endpoint_path), None)
+    if endpoint is None:
+        raise ValueError("the endpoint is not one the connector declares")
+    headers, get, resolved = _prepare(spec, secrets, resolve_checked=resolve_checked, http_get=http_get)
+    pagination = spec.get("pagination") or {}
+    params = {pagination["param"]: 1} if pagination.get("type") == "page" else {}
+    with ssrf_guard.pinned_resolution(urlparse(spec["baseUrl"]).hostname, resolved):
+        body = get(spec["baseUrl"] + endpoint["path"], headers=headers, params=params)
+    records = _extract(body, endpoint.get("recordsPath"))
+    if not isinstance(records, list):
+        raise TypeError("the endpoint's records are not a list")
+    return records[:limit]

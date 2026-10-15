@@ -30,6 +30,7 @@ pub mod catalog_search_cache;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_discover;
+pub mod connector_listing;
 pub mod connector_probe;
 pub mod connector_secret_store;
 pub mod error;
