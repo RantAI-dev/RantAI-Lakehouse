@@ -99,6 +99,13 @@ fn env(
             "VAULT_TOKEN".to_owned(),
             "ci-vault-token-not-real".to_owned(),
         );
+        // `SRC-12 review B4 BLOCKER 1`: references are accepted only under an
+        // operator-allowed prefix (fail closed), so the app under test is
+        // given the one that covers `REFERENCE`; a test overrides it via `extra`.
+        env.insert(
+            "SECRET_MANAGER_ALLOWED_PREFIXES".to_owned(),
+            "vault:secret/connectors/".to_owned(),
+        );
     }
     for (key, value) in extra {
         env.insert((*key).to_owned(), (*value).to_owned());
@@ -334,7 +341,10 @@ async fn a_reference_outside_the_operators_prefixes_is_refused_and_never_read() 
         Some(json!({ "primary": { "reference": "vault:secret/other/orders#password" } })),
     )
     .await;
-    assert!(body.to_string().contains("outside the secrets"), "{body}");
+    assert_eq!(
+        body["error"],
+        "That reference is outside the secrets this installation allows connectors to reference"
+    );
 
     let app = spin_up_with_env(&env(
         secrets.path(),
