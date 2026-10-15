@@ -376,3 +376,60 @@ and gitleaks.
 
 Unchanged from §5, plus: no new leaks you notice on `main` outside §1;
 list them in the handoff and the planner files backlog items.
+
+### Handoff (2026-10-15, round 2)
+
+**Branch / Commits:**
+- Branch: `fix/sec-16-cross-tenant` (PR #87)
+- Base merge commit (M1): `b6dc2fbe` (`merge: origin/main into fix/sec-16-cross-tenant (SEC-16 round 2)`)
+- Fix commit (M2): `f9aefa1b` (`fix(api): close annotation 503 test block in catalog routes`)
+- Handoff commit (M3): this commit (`docs(plan): SEC-16 round 2 handoff`)
+
+**Tasks completed:**
+- **M1 (Merge origin/main):** Merged `origin/main` at `41d7677a`. Resolved conflicts across `CHANGELOG.md`, `rust/crates/lakehouse-api/src/routes/catalog.rs`, `rust/crates/lakehouse-store/src/connectors.rs`, and `rust/crates/lakehouse-store/tests/connectors.rs`.
+- **M2 (Make merged branch pass):** Fixed syntax error in `rust/crates/lakehouse-api/src/routes/catalog.rs` by restoring the missing closing brace on test function `annotation_routes_answer_503_when_the_catalog_cannot_be_asked` (line 4371).
+- **M3 (Verification under heavy lock):** Ran format check, clippy workspace check, `lakehouse-store` test suite, `lakehouse-api` test suite, TypeScript client tests, and gitleaks scan.
+
+**Verification results:**
+- `cd rust && cargo fmt --check`: passed cleanly (0 formatting differences).
+- `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings`: passed cleanly (0 warnings, 0 errors).
+- `RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-store --no-fail-fast`:
+  - `Running unittests src/lib.rs`: `test result: ok. 199 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.90s`
+  - `Running tests/agents.rs`: `test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.61s`
+  - `Running tests/annotation.rs`: `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.35s`
+  - `Running tests/audit.rs`: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s`
+  - `Running tests/chat_term.rs`: `test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.71s`
+  - `Running tests/connector_ingest_spec.rs`: `test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s`
+  - `Running tests/connector_ingest_spec_seed.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s`
+  - `Running tests/connector_type.rs`: `test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s`
+  - `Running tests/connectors.rs`: `test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.22s`
+  - `Running tests/gold_publication.rs`: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s`
+  - `Running tests/governance.rs`: `test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.22s`
+  - `Running tests/home_layout.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s`
+  - `Running tests/identity.rs`: `test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.35s`
+  - `Running tests/knowledge.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s`
+  - `Running tests/maintenance_policy.rs`: `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.12s`
+  - `Running tests/overview.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s`
+  - `Running tests/pipelines.rs`: `test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.94s`
+  - `Running tests/queries.rs`: `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.38s`
+  - `Running tests/reporting_settings.rs`: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s`
+  - `Running tests/schema.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s`
+  - `Running tests/schema_change.rs`: `test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.64s`
+  - `Running tests/semantic.rs`: `test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.76s`
+  - `Running tests/sessions.rs`: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.50s`
+  - `Running tests/uploads.rs`: `test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.86s`
+  - `Doc-tests lakehouse_store`: `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+- `RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-api --no-fail-fast`:
+  - `Running unittests src/lib.rs`: `test result: FAILED. 182 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.55s`
+    - Failure name: `state::tests::connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag` (known pre-existing environment failure, documented in spec)
+  - `Running tests/sec11_guard.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+  - `Doc-tests lakehouse_api`: `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+- `bun test src/services/clients`: `4 pass, 0 fail, 4 expect() calls, ran 4 tests across 1 files [40.00ms]`
+- `gitleaks`: `No leaks found. 2226 commits scanned.`
+
+**Known Issues:**
+- The single failing test in `lakehouse-api` (`state::tests::connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag`) is a known environment failure not related to SEC-16 regressions (specified in Round 2 spec).
+
+**Next Steps for Reviewer:**
+- Review the merge commit `b6dc2fbe` and fix commit `f9aefa1b`.
+- Proceed with Round 2 review under §10.
