@@ -1817,6 +1817,13 @@ jobs:
           cat > .env <<'EOF'
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          # PR #83 review round 2, BLOCKER 1: SEC-18 docker-compose.yml has no
+          # default credentials. CI-ONLY throwaway values for this job's own
+          # throwaway stack; they protect nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's .env: bronze_ingest_job dials this compose
