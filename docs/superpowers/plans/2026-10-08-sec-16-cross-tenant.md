@@ -433,3 +433,36 @@ list them in the handoff and the planner files backlog items.
 **Next Steps for Reviewer:**
 - Review the merge commit `b6dc2fbe` and fix commit `f9aefa1b`.
 - Proceed with Round 2 review under §10.
+
+## 10. Review of round 2 (planner, 2026-10-15)
+
+Reviewed the merged result (`git diff origin/main...HEAD`) at `25b4802b`,
+then merged `origin/main` again (`#83`, `#171`, `#172`, `#174`; no Rust,
+console or Dagster change, so the runs below still apply).
+
+No `BLOCKER`. No `SHOULD-FIX`.
+
+The handoff listed only two `lakehouse-api` test binaries; the planner ran
+the whole of both crates itself on `25b4802b` (fmt and workspace clippy
+clean, exit 0):
+`cargo test -j 4 -p lakehouse-store -p lakehouse-api --no-fail-fast`:
+71 binaries, 4547 passed, 11 failed, 4 ignored. The 11 failures were in
+`lakehouse-api`'s unit tests (`connector_deprovision`, `connector_discover`,
+`gold_export`, `policy_engine::iceberg_columns`, `agents::budget_end_to_end`)
+under machine load: rerun alone with `RUST_TEST_THREADS=2`, all 17 tests of
+those groups pass. The suites this PR touches: `route_auth` 34,
+`upload_routes` 87, `connector_ingestible_tenant` 5, `sec11_guard` 4,
+`connector_repoint` 12, all passed.
+
+Mutation (planner): replacing the tenant-scoped list in `list_ingestible`
+with the unscoped one makes
+`a_user_sees_their_own_tenants_connector_and_not_another_tenants` fail
+(4 passed, 1 failed); restored.
+
+Checked and found right: E1–E6 as written in section 2, adapted to
+`main`'s shapes; the tenant filter is a bound parameter; the service check
+reads `PrincipalId::Service`; the annotation existence check uses
+`catalog_profile::resolve_source`, the one existing lookup (rule 4), and
+its 503 is a fixed sentence; `TABLE_NOT_FREE` is one sentence for every
+reason that is not the caller's own tenant's connector. Feature-page
+decisions D1–D6 signed by the product owner on 2026-10-15.

@@ -64,7 +64,7 @@ map, not through these routes; nothing it can ask changes.
 
 ## Decisions
 
-Until signed, the default is used.
+Signed by the product owner on 2026-10-15: the defaults below, as built.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
