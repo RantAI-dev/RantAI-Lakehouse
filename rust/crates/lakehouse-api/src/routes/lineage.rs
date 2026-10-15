@@ -755,17 +755,15 @@ mod tests {
             options.get_username(),
             options.get_host(),
             options.get_port(),
-            options
-                .get_database()
-                .expect("#[sqlx::test] always targets a named database"),
+            options.get_database().unwrap_or_default(),
         )
     }
 
-    fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+    fn state_for(pool: &lakehouse_store::PgPool) -> Result<AppState, crate::config::ConfigError> {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
-        let config = Config::from_map(&env).expect("a valid test Config");
-        AppState::new(config)
+        let config = Config::from_map(&env)?;
+        Ok(AppState::new(config))
     }
 
     fn restricted_principal() -> Principal {
@@ -804,9 +802,9 @@ mod tests {
         }
     }
 
-    async fn seed_test_tenant_owned(pool: &lakehouse_store::PgPool) {
-        let tenant_1 = uuid::Uuid::parse_str("11111111-1111-4111-8111-000000000001").unwrap();
-        let tenant_2 = uuid::Uuid::parse_str("11111111-1111-4111-8111-000000000002").unwrap();
+    async fn seed_test_tenant_owned(pool: &lakehouse_store::PgPool) -> Result<(), sqlx::Error> {
+        let tenant_1 = uuid::Uuid::from_u128(1);
+        let tenant_2 = uuid::Uuid::from_u128(2);
 
         // Tenant 1
         sqlx::query(
@@ -817,8 +815,7 @@ mod tests {
         .bind("Connector 1")
         .bind(json!([{"target": "t1_raw"}]).to_string())
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::query(
             "INSERT INTO pipeline_definition (id, name, kind, status, source, target, schedule, tenant_id)              VALUES ($1, $2, 'batch', 'draft', $3, $4, '@hourly', $5)",
@@ -829,8 +826,7 @@ mod tests {
         .bind("silver.t1_clean")
         .bind(tenant_1)
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::query(
             "INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id)              VALUES ($1, $2, $3)",
@@ -839,8 +835,7 @@ mod tests {
         .bind(tenant_1)
         .bind("up-t1")
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         // Tenant 2
         sqlx::query(
@@ -851,8 +846,7 @@ mod tests {
         .bind("Connector 2")
         .bind(json!([{"target": "t2_raw"}]).to_string())
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::query(
             "INSERT INTO pipeline_definition (id, name, kind, status, source, target, schedule, tenant_id)              VALUES ($1, $2, 'batch', 'draft', $3, $4, '@hourly', $5)",
@@ -863,8 +857,7 @@ mod tests {
         .bind("silver.t2_clean")
         .bind(tenant_2)
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
 
         sqlx::query(
             "INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id)              VALUES ($1, $2, $3)",
@@ -873,17 +866,20 @@ mod tests {
         .bind(tenant_2)
         .bind("up-t2")
         .execute(pool)
-        .await
-        .unwrap();
+        .await?;
+
+        Ok(())
     }
 
     /// DATA-19 review BLOCKER 1: a caller belonging to no tenant who is not
     /// unrestricted sees none of the three tenant-owned resources (connectors,
     /// authored pipelines, upload claims) and receives a coverage note.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn a_zero_tenant_restricted_caller_sees_none_of_the_three(pool: lakehouse_store::PgPool) {
-        let state = state_for(&pool);
-        seed_test_tenant_owned(&pool).await;
+    async fn a_zero_tenant_restricted_caller_sees_none_of_the_three(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
 
         let principal = restricted_principal();
         let mut g = Graph::default();
@@ -898,15 +894,18 @@ mod tests {
             ),
             "must push coverage note explaining why tenant-owned rows are omitted"
         );
+        Ok(())
     }
 
     /// DATA-19 review BLOCKER 1: an unrestricted caller (`*:*`) with no tenant
     /// retains the unscoped read and sees all three tenant-owned resources
     /// across all tenants.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn an_unrestricted_caller_sees_all(pool: lakehouse_store::PgPool) {
-        let state = state_for(&pool);
-        seed_test_tenant_owned(&pool).await;
+    async fn an_unrestricted_caller_sees_all(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
 
         let principal = unrestricted_principal();
         let mut g = Graph::default();
@@ -931,17 +930,20 @@ mod tests {
         assert!(!g.coverage.contains(
             &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
         ));
+        Ok(())
     }
 
     /// DATA-19 review BLOCKER 1: a caller belonging to a tenant sees only its
     /// own connectors, authored pipelines, and upload claims, never another
     /// tenant's.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn a_tenant_caller_sees_only_its_own(pool: lakehouse_store::PgPool) {
-        let state = state_for(&pool);
-        seed_test_tenant_owned(&pool).await;
+    async fn a_tenant_caller_sees_only_its_own(
+        pool: lakehouse_store::PgPool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = state_for(&pool)?;
+        seed_test_tenant_owned(&pool).await?;
 
-        let tenant_1 = uuid::Uuid::parse_str("11111111-1111-4111-8111-000000000001").unwrap();
+        let tenant_1 = uuid::Uuid::from_u128(1);
         let principal = tenant_principal(tenant_1);
         let mut g = Graph::default();
         add_tenant_owned(&state, &principal, Some(tenant_1), &mut g).await;
@@ -967,5 +969,6 @@ mod tests {
         assert!(!g.coverage.contains(
             &"connectors, pipelines and uploads are not shown: you belong to no tenant".to_owned()
         ));
+        Ok(())
     }
 }
