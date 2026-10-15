@@ -536,3 +536,27 @@ df32fbdc41f6 docs(plan): SEC-18 round 2 review: 1 BLOCKER, 1 SHOULD-FIX
 git ls-remote --heads origin fix/sec-18-no-default-credentials:
 cdbf7c6a0a74	refs/heads/fix/sec-18-no-default-credentials
 ```
+
+## 8. Review of round 3 (planner, 2026-10-15)
+
+BLOCKER 1 and SHOULD-FIX 1 are fixed (`15779e04`, `cdbf7c6a`): the
+per-job script prints no missing variable for any job, and `.env.example`
+assigns none of the three gone ports. The planner removed the stale
+"NOT 8090, oidc-mock publishes that" comment above `TRINO_HOST_PORT`
+(a comment only). No open `BLOCKER`.
+
+Re-run by the planner on the branch head, from a `git archive` copy:
+
+- empty `.env`: `docker compose --profile '*' config --quiet` exits 1 with
+  "required variable POSTGRES_PASSWORD is missing a value: POSTGRES_PASSWORD
+  is required (PostgreSQL password; run ops/init-env.sh or see
+  docs/OPERATIONS.md)" (AC1);
+- after `sh ops/init-env.sh`: the same command exits 0;
+- `check_intra_package_imports.py` OK, `check_bare_iceberg_count.py` OK,
+  `check_compose_init_readiness.py` exit 0; gitleaks `dir`: no leaks;
+- the branch merges with `origin/main` without conflict.
+
+Not re-run by the planner: a local `docker compose up` (the developer's
+round-2 run is in §6; CI's G1–G9 jobs each start the stack from this file).
+
+Merge waits on the owner's six `STAGING_*` repository secrets.
