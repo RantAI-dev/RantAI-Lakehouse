@@ -131,3 +131,95 @@ No `BLOCKER` in the code.
   Backlog item needed.
 - Not in scope and still true: `ClickHouse`'s `default` user has no
   password inside the compose network.
+
+## 6. Round 2 (2026-10-15): bring the branch up to `main`
+
+Planner: the Security & Delivery lane. The branch was 532 commits behind
+`origin/main` (`41d7677a`) when this section was written. `main` has added
+services, CI jobs and credential literals since 2026-10-08, so `SEC-18` is
+not done until the merged result has none either. The review of the merged
+result goes under §7.
+
+### Decisions already made
+
+- Merge, do not rebase: a merge commit `Merge origin/main into fix/sec-18-…`.
+  Nobody force-pushes this branch.
+- `SEC-15` wins on `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`: `main`'s
+  `${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-}` stays. This branch's old
+  `:-true` in that hunk is dropped. Taking the branch side re-opens the
+  internal-address guard: `BLOCKER` if it happens.
+- The rule from N1 applies to everything `main` added: a password, secret
+  key, access key or encryption key in `docker-compose.yml` has no literal
+  fallback. It is `${X:?<message naming the .env variable>}` or derives
+  from such a variable. A user name (`POSTGRES_USER`, `CH_USER`), a database
+  name, a bucket name, and a `secretRef` string (`env:UPLOAD_S3_*`) are not
+  credentials and may keep their defaults.
+- Every CI job that writes a `.env` and starts the stack sets the must-set
+  variables to CI-only throwaway values, the N3 pattern. A job on `main`
+  that hard-codes `rustfsadmin` (`UPLOAD_S3_*`, `CONNECTOR_S3_*`, the g9
+  job from #114) uses the same throwaway value as `RUSTFS_ACCESS_KEY` /
+  `RUSTFS_SECRET_KEY` in that job, so the stack and the client agree.
+- `deploy-staging.yml`: keep everything `main` changed, plus this branch's
+  check that stops the deploy when a `STAGING_*` secret is missing. The six
+  secret names stay as N3 wrote them.
+
+### Anchors (verified at `origin/main` `41d7677a`)
+
+- `docker-compose.yml` literal fallbacks, by grep
+  `\$\{[A-Z0-9_]*(PASSWORD|SECRET|KEY)[A-Z0-9_]*:-`: lines 31, 313, 332-334,
+  558-559, 583-584, 630, 661-663, 682, 714, 738, 854-856, 924-925,
+  1409-1410, 1495-1496, 1560-1561, 1693, 1862. Several are the ones N1
+  already fixed on the branch; the rest are new on `main`.
+- `.github/workflows/ci.yml` lines 1340-1341, 1436-1437, 1550-1551 write
+  `rustfsadmin` into a job's `.env`.
+- `.env.example` lines 52, 59, 265-266, 385-386, 638-640 carry the literals.
+
+### Tasks (one commit each, in order)
+
+**M1. Merge `origin/main`.** Conflicts expected in `.github/workflows/deploy-staging.yml`,
+`CHANGELOG.md`, `docker-compose.yml`. Resolve hunk by hunk (rule 9); in
+`CHANGELOG.md` keep every bullet from both sides. After the merge:
+`grep -n 'CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS' docker-compose.yml` shows
+only `:-}` forms. Acceptance: `docker compose --profile '*' config --quiet`
+passes with a throwaway `.env` that sets the must-set variables.
+
+**M2. Close the literals `main` added.** Apply the decisions above to
+`docker-compose.yml`, `.env.example` (placeholder sentinel
+`CHANGE-ME-BEFORE-ANY-NON-THROWAWAY-USE` per `CODE-STANDARD.md` §7, or empty
+with the reason), every workflow under `.github/workflows/`, `ops/init-env.sh`,
+`scripts/compose.sh` if it seeds values, and any `ops/` gate script that
+writes a `.env` for compose. Acceptance:
+`grep -nE '\$\{[A-Z0-9_]*(PASSWORD|SECRET|KEY)[A-Z0-9_]*:-[^}$]' docker-compose.yml`
+prints only `secretRef` lines (`env:…`), each of which you list in the
+handoff; `grep -rn 'rustfsadmin\|seaweedfsadmin\|this-is-not-a-secure-key' docker-compose.yml .env.example .github/`
+prints nothing.
+
+**M3. Prove it (no commit unless a fix is needed).** All under the heavy lock:
+1. AC1: in a scratch copy with an empty `.env`, `docker compose config`
+   fails and the message names the variable to set. Quote it.
+2. AC2: a real `scripts/compose.sh up -d --wait` (or `docker compose -p sec18-check up -d --wait`)
+   of the default profile from a clean project name, with `ops/init-env.sh`
+   generating the `.env` (or a throwaway `.env`). Quote `docker compose ps`
+   showing every service healthy/exited 0, then `down -v`.
+3. `python3 ops/lint/check_intra_package_imports.py`,
+   `python3 ops/lint/check_bare_iceberg_count.py`,
+   `python3 ops/lint/check_compose_init_readiness.py`; if a `ops/g*` Python
+   file changed, the Dagster pytest is not needed but `python3 -m py_compile`
+   on each changed file is.
+4. gitleaks `dir` scan of the worktree: no leaks.
+
+### Out of scope
+
+- The code fallbacks the 2026-10-08 review named (`ops/g3/g3_loadgen.py`,
+  the `dlt` pipeline, `config.rs`'s `postgres://lakehouse:lakehouse`): a
+  separate backlog item. No Rust changes in this PR.
+- `ClickHouse`'s `default` user having no password inside the network.
+- Creating the `STAGING_*` repository secrets: the owner does that before
+  merge (§7 says which).
+
+### Verify, do not assume
+
+- Does a service `main` added since 2026-10-08 read a credential the branch
+  never saw? List each new service you changed in the handoff.
+- Does any CI job start the stack without writing a `.env` (relying on the
+  old defaults)? It now fails at `config`; find it before CI does.
