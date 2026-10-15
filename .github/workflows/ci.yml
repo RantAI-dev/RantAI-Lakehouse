@@ -2035,9 +2035,15 @@ jobs:
       # lakehouse_store::connect_lazy's doc comment. This intentionally
       # smoke-tests the container's own boot path, not the full
       # docker-compose stack.
+      # SRC-12 decision 4 (SRC-12 review 1 BLOCKER 1): the API refuses to start
+      # without `CONNECTOR_SECRETS_KEY`, and this job runs the image outside
+      # compose, so it passes the key itself. The same obviously fake CI-only
+      # value every other job writes into its `.env`; the start-up check stays.
       - name: Run container
         run: |
-          docker run -d --name lakehouse-api -p 8080:8080 rantai-lakehouse-api:ci
+          docker run -d --name lakehouse-api -p 8080:8080 \
+            -e CONNECTOR_SECRETS_KEY=Y2ktY29ubmVjdG9yLWtleS1ub3QtcmVhbC0wMDAwMDA= \
+            rantai-lakehouse-api:ci
           for i in $(seq 1 30); do
             if docker inspect -f '{{.State.Running}}' lakehouse-api 2>/dev/null | grep -q true; then
               break
