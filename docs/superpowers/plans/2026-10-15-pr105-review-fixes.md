@@ -273,6 +273,18 @@ untouched. The reviewer should re-run its own verification somewhere other
 than the shared dir while two worktrees are live; a per-branch target dir
 (or a note in `AGENTS.md`) may be worth the planner's attention.
 
+**Re-verified on the final tree** (code identical to `29f31e98`, after that
+commit): every command in the table above was run once more against the
+plan's *shared* `/home/uaa/rantai/.cargo-target` and printed the same counts
+— `69`, `21`, `75`, `157`, `4`, `cargo fmt --check` clean, `bun run typecheck`
+exit 0, `bun run lint` 0 errors/6 warnings. `--lib upstream_error` is the
+discriminating one: `21` (17 pre-existing + this slice's 4) is this branch's
+binary, where the slice-A worktree's prints `17`. In that same shared dir
+the first clippy run failed `E0599` on code that had passed there minutes
+earlier and the immediate re-run was clean — the overwrite described above,
+seen from the other side, and the reason the shared dir is not a place to
+take a green from.
+
 **Consequences worth a look.** A `Dagster` answer that is neither a
 transport failure nor a `5xx` is now a `502`, and
 `ops/g6/g6_ingest_matrix_test.py` raises at once on anything that is not
