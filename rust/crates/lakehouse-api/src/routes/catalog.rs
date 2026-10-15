@@ -1484,29 +1484,82 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow, replacement_nam
     // DATA-12 F4: the mark rides the same overlay, so it reaches the live
     // list, `/api/catalog/query`, the search copy and the detail body. Absent
     // when there is no mark, as `tags` is.
-    if let Some(certification) = set(annotation.certification.as_ref()) {
-        o.insert("certification".to_owned(), json!(certification));
-        if let Some(note) = set(annotation.certification_note.as_ref()) {
-            o.insert("certificationNote".to_owned(), json!(note));
-        }
-        if let Some(replacement) = set(annotation.replacement_asset_id.as_ref()) {
-            o.insert("replacementAssetId".to_owned(), json!(replacement));
-            // DATA-12 review SHOULD-FIX 1: the notice names the replacement
-            // by its name; absent (never "") when it left the catalog.
-            if let Some(name) = replacement_name.map(str::trim).filter(|n| !n.is_empty()) {
-                o.insert("replacementName".to_owned(), json!(name));
-            }
-        }
-        if let Some(by) = set(annotation.certified_by.as_ref()) {
-            o.insert("certifiedBy".to_owned(), json!(by));
-        }
-        if let Some(at) = annotation.certified_at.and_then(|at| {
-            at.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        }) {
-            o.insert("certifiedAt".to_owned(), json!(at));
+    insert_certification_fields(o, annotation, replacement_name);
+}
+
+/// Writes the part-1 mark fields (`certification`, `certificationNote`,
+/// `replacementAssetId`, `replacementName`, `certifiedBy`, `certifiedAt`) of
+/// `annotation` into `o`; nothing when the annotation has no mark. The one
+/// place their names and shapes are decided: the catalog rows, the chart
+/// builder's mart list and Query Studio's sources (`DATA-12` part 3) all
+/// call it.
+pub(crate) fn insert_certification_fields(
+    o: &mut serde_json::Map<String, Value>,
+    annotation: &AnnotationRow,
+    replacement_name: Option<&str>,
+) {
+    let Some(certification) = set(annotation.certification.as_ref()) else {
+        return;
+    };
+    o.insert("certification".to_owned(), json!(certification));
+    if let Some(note) = set(annotation.certification_note.as_ref()) {
+        o.insert("certificationNote".to_owned(), json!(note));
+    }
+    if let Some(replacement) = set(annotation.replacement_asset_id.as_ref()) {
+        o.insert("replacementAssetId".to_owned(), json!(replacement));
+        // DATA-12 review SHOULD-FIX 1: the notice names the replacement
+        // by its name; absent (never "") when it left the catalog.
+        if let Some(name) = replacement_name.map(str::trim).filter(|n| !n.is_empty()) {
+            o.insert("replacementName".to_owned(), json!(name));
         }
     }
+    if let Some(by) = set(annotation.certified_by.as_ref()) {
+        o.insert("certifiedBy".to_owned(), json!(by));
+    }
+    if let Some(at) = annotation.certified_at.and_then(|at| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    }) {
+        o.insert("certifiedAt".to_owned(), json!(at));
+    }
+}
+
+/// The marks of the assets in `ids`, by id, from one read of the annotations
+/// (`DATA-12` part 3: no query per mart or per source). An id with no mark is
+/// not in the map. `names` maps an asset id to its display name, so a
+/// replacement that is itself in the list is named; one that is not stays
+/// unnamed. A failed read is logged and answers no marks: a mark decorates a
+/// picker, it never gates it.
+pub(crate) async fn certification_marks(
+    state: &AppState,
+    ids: &[String],
+    names: &HashMap<String, String>,
+) -> HashMap<String, serde_json::Map<String, Value>> {
+    let Some(pool) = state.pg.as_deref() else {
+        return HashMap::new();
+    };
+    let annotations = match lakehouse_store::annotation::list_all(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "asset_annotation lookup failed; the marks are left off");
+            return HashMap::new();
+        }
+    };
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    annotations
+        .iter()
+        .filter(|row| wanted.contains(row.asset_id.as_str()))
+        .filter_map(|row| {
+            let mut fields = serde_json::Map::new();
+            let replacement_name = row
+                .replacement_asset_id
+                .as_deref()
+                .and_then(|r| names.get(r.trim()))
+                .map(String::as_str);
+            insert_certification_fields(&mut fields, row, replacement_name);
+            (!fields.is_empty()).then(|| (row.asset_id.clone(), fields))
+        })
+        .collect()
 }
 
 /// The `name` of the asset `id` in an assembled list, if it is there.
@@ -5035,6 +5088,86 @@ mod tests {
             assert!(
                 !next_read_rebuilds(&state).await,
                 "a write that stored nothing must not drop the copy"
+            );
+        }
+
+        // ── DATA-12 part 3: marks for pickers ───────────────────────────
+
+        async fn mark(
+            pool: &lakehouse_store::PgPool,
+            id: &str,
+            status: &str,
+            note: Option<&str>,
+            replacement: Option<&str>,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: status.to_owned(),
+                    note: note.map(str::to_owned),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn certification_marks_returns_only_the_requested_marked_assets_with_the_replacement_named(
+            pool: lakehouse_store::PgPool,
+        ) {
+            mark(
+                &pool,
+                "serving.old",
+                "deprecated",
+                Some("Superseded"),
+                Some("serving.new"),
+            )
+            .await;
+            mark(&pool, "serving.trusted", "certified", None, None).await;
+            mark(&pool, "serving.elsewhere", "certified", None, None).await;
+            // Details only: an annotation without a mark is not a mark.
+            lakehouse_store::annotation::upsert_annotation(
+                &pool,
+                &lakehouse_store::annotation::AnnotationInput {
+                    asset_id: "serving.plain".to_owned(),
+                    owner: Some("x".to_owned()),
+                    steward: None,
+                    tags: vec![],
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+            let state = state_for(&pool, "http://127.0.0.1:0", None);
+            let ids: Vec<String> = [
+                "serving.old",
+                "serving.trusted",
+                "serving.plain",
+                "serving.unannotated",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            let names = HashMap::from([("serving.new".to_owned(), "new".to_owned())]);
+
+            let marks = certification_marks(&state, &ids, &names).await;
+
+            assert_eq!(marks.len(), 2, "{marks:?}");
+            let old = &marks["serving.old"];
+            assert_eq!(old["certification"], json!("deprecated"));
+            assert_eq!(old["certificationNote"], json!("Superseded"));
+            assert_eq!(old["replacementAssetId"], json!("serving.new"));
+            assert_eq!(old["replacementName"], json!("new"));
+            assert_eq!(
+                marks["serving.trusted"]["certification"],
+                json!("certified")
+            );
+            assert!(
+                !marks.contains_key("serving.elsewhere"),
+                "only requested ids"
             );
         }
 

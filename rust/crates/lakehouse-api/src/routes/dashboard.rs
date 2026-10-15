@@ -683,12 +683,52 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         };
     }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            if q.mart.is_none() {
+                mark_marts(&state, &mut body).await;
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(json!({ "error": err.to_string() })),
         )
             .into_response(),
+    }
+}
+
+/// `DATA-12` part 3: puts each mart's certified or deprecated mark on the
+/// mart list the chart builder's picker reads, from the same annotation
+/// fields the catalog shows (`catalog::insert_certification_fields`), so the
+/// picker can mark a mart and warn when a deprecated one is chosen. A mart's
+/// catalog id is `serving.<name>`; an unmarked mart gains no key. One batch
+/// read for the whole list.
+async fn mark_marts(state: &AppState, body: &mut Value) {
+    let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let id_of = |m: &Value| {
+        m.get("name")
+            .and_then(Value::as_str)
+            .map(|n| format!("serving.{n}"))
+    };
+    let ids: Vec<String> = marts.iter().filter_map(id_of).collect();
+    // The marts are the names a replacement can have in this list.
+    let names: std::collections::HashMap<String, String> = ids
+        .iter()
+        .filter_map(|id| Some((id.clone(), id.strip_prefix("serving.")?.to_owned())))
+        .collect();
+    let by_id = crate::routes::catalog::certification_marks(state, &ids, &names).await;
+    if by_id.is_empty() {
+        return;
+    }
+    for mart in marts {
+        let Some(fields) = id_of(mart).and_then(|id| by_id.get(&id)) else {
+            continue;
+        };
+        if let Some(o) = mart.as_object_mut() {
+            o.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
     }
 }
 
@@ -1453,6 +1493,80 @@ mod tests {
         let out = yaml_board("b1", "Board 1", Some(&layout));
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+    }
+
+    // ── DATA-12 part 3: marks on the mart list ───────────────────────────
+    mod marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn deprecate(pool: &lakehouse_store::PgPool, id: &str, replacement: Option<&str>) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use the v2 mart".to_owned()),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecated_mart_reaches_the_picker_payload_with_its_note_and_replacement(
+            pool: lakehouse_store::PgPool,
+        ) {
+            deprecate(&pool, "serving.orders", Some("serving.orders_v2")).await;
+            let mut body = json!({ "marts": [
+                { "name": "orders", "rows": 10 },
+                { "name": "orders_v2", "rows": 12 },
+                { "name": "stock", "rows": 3 },
+            ]});
+
+            mark_marts(&state_for(&pool), &mut body).await;
+
+            let orders = &body["marts"][0];
+            assert_eq!(orders["certification"], json!("deprecated"));
+            assert_eq!(orders["certificationNote"], json!("Use the v2 mart"));
+            assert_eq!(orders["replacementAssetId"], json!("serving.orders_v2"));
+            assert_eq!(orders["replacementName"], json!("orders_v2"));
+            assert_eq!(orders["rows"], json!(10), "the existing fields are kept");
+            assert!(body["marts"][1].get("certification").is_none());
+            assert!(body["marts"][2].get("certification").is_none());
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_list_with_no_marks_is_left_exactly_as_it_was(pool: lakehouse_store::PgPool) {
+            let original = json!({ "marts": [{ "name": "orders", "rows": 10 }] });
+            let mut body = original.clone();
+            mark_marts(&state_for(&pool), &mut body).await;
+            assert_eq!(body, original);
+        }
     }
 }
 
