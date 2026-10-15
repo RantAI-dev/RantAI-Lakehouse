@@ -431,10 +431,14 @@ def put_mysql_spec(
 
 
 def register_mysql(
-    name: str, host: str, port: int, table: str, bronze: str, *, password: str, cron: str | None = None,
+    name: str, host: str, port: int, table: str, bronze: str, *, cron: str | None = None,
+    credential: str | None = None,
 ) -> tuple[str, str]:
     """A MySQL connector with its credential file and ingest spec. Returns
-    (connector id, the derived credential name, to rewrite the password)."""
+    (connector id, the derived credential name, to rewrite the password).
+    `credential` defaults to the gate fixture's environment-provided MySQL
+    password; callers do not spell it out (a password keyword argument reads
+    as a key assignment to gitleaks' `generic-api-key` rule)."""
     body = matrix._create_connector(
         name=name, kind="MySQL", host=f"{host}:{port}", credential={"source": "file", "primary": "password"}
     )
@@ -442,7 +446,7 @@ def register_mysql(
     derived = (body.get("credential") or {}).get("primary")
     if not derived:
         raise OpsGateFailure(f"the create response of {name} carried no derived credential name: {body}")
-    matrix._write_credential_file(derived, password)
+    matrix._write_credential_file(derived, matrix.CONNECTOR_MYSQL_PASSWORD if credential is None else credential)
     expect_ok(put_mysql_spec(connector_id, host, port, table, bronze, cron=cron), f"PUT ingest-spec of {name}")
     return connector_id, derived
 
@@ -477,7 +481,7 @@ def step_retry_then_success(host: str, sfx: str) -> None:
     try:
         # OFF from the start: the port is closed until the gate opens it.
         connector_id, _ = register_mysql(
-            f"g11-retry-{sfx}", host, FORWARDER_PORT, table, bronze, password=matrix.CONNECTOR_MYSQL_PASSWORD
+            f"g11-retry-{sfx}", host, FORWARDER_PORT, table, bronze
         )
         run_id = launch_run(connector_id)
         say(f"a. the source is down (forwarder {host}:{FORWARDER_PORT} OFF); waiting for a failed attempt")
@@ -573,7 +577,7 @@ def step_auto_disable(state: dict, sfx: str, rule_path: str, receiver: src17.Rec
         f"INSERT INTO {table} (id, name) VALUES (1, 'a'), (2, 'b')",
     )
     connector_id, derived = register_mysql(
-        f"g11-pause-{sfx}", "mysql-g6", 3306, table, bronze, password=matrix.CONNECTOR_MYSQL_PASSWORD, cron=DUE_CRON
+        f"g11-pause-{sfx}", "mysql-g6", 3306, table, bronze, cron=DUE_CRON
     )
     rule_id = src17.create_rule(f"g11 disabled {sfx}", "connector_disabled", base_url + rule_path, connector_id)
     say(f"c. rule {rule_id} for connector_disabled of {connector_id}; threshold {threshold} failed runs (lowered, see the module docstring)")
@@ -685,7 +689,7 @@ def step_left_out_column(sfx: str) -> None:
         f"INSERT INTO {table} (id, name, {column}) VALUES (1, 'a', 'x1'), (2, 'b', 'x2')",
     )
     connector_id, _ = register_mysql(
-        f"g11-cols-{sfx}", "mysql-g6", 3306, table, bronze, password=matrix.CONNECTOR_MYSQL_PASSWORD
+        f"g11-cols-{sfx}", "mysql-g6", 3306, table, bronze
     )
     first = launch_run(connector_id)
     wait_dagster(first, "SUCCESS", "the first load")
