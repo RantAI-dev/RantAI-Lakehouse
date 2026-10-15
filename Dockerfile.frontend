@@ -11,6 +11,7 @@
 # runtime, only for the build.
 
 FROM oven/bun:1-alpine AS builder
+RUN apk add --no-cache nodejs
 WORKDIR /app
 
 # Dependencies (cached unless lockfiles change)
