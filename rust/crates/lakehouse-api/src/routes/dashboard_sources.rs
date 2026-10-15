@@ -43,6 +43,7 @@ use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{SpecRunFailure, render_stored_spec, try_run_spec_sql};
 use crate::sql_guard::check_sql_source;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// Rows a preview returns — enough to see the shape, not a result set.
 const PREVIEW_ROWS: u32 = 50;
@@ -87,20 +88,18 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))
 }
 
-/// A `ClickHouse` failure as a fixed message: a server-side error means the
-/// statement itself failed (422), anything else that `ClickHouse` is
-/// unreachable (503). The detail is only logged.
+/// Fixed words for a dashboard SQL source that failed to run (SEC-11).
+const SQL_SOURCE: upstream_error::Context = upstream_error::Context::new(
+    "dashboard SQL source",
+    "The SQL source failed to run.",
+    "ClickHouse is unavailable.",
+);
+
+/// A `ClickHouse` failure as a fixed message plus a reference id: a
+/// server-side error means the statement itself failed (422), anything else
+/// that `ClickHouse` is unreachable (503). The detail is only logged.
 fn classify_ch_error(err: &ChError) -> ApiError {
-    match err {
-        ChError::Server(_) => {
-            tracing::warn!(%err, "dashboard SQL source failed to run");
-            ApiError::Unprocessable("the SQL source failed to run".to_owned())
-        }
-        ChError::Transport(_) | ChError::Cancelled => {
-            tracing::warn!(%err, "clickhouse unreachable for a dashboard SQL source");
-            ApiError::Unavailable("clickhouse unavailable".to_owned())
-        }
-    }
+    upstream_error::ch_error(&SQL_SOURCE, err)
 }
 
 /// The placeholder values (`{{principal_id}}` and friends) of `principal`.
@@ -650,7 +649,8 @@ mod preview_tests {
             "{err:?}"
         );
         assert!(
-            matches!(err, ApiError::Unprocessable(ref m) if m == "the SQL source failed to run"),
+            // SEC-11: the fixed message now carries a reference id after it.
+            matches!(err, ApiError::Unprocessable(ref m) if m.starts_with("The SQL source failed to run. Reference: ")),
             "{err:?}"
         );
     }

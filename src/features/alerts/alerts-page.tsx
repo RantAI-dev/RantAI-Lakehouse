@@ -238,7 +238,7 @@ function AlertConditionFields({
               void loadFields(mart)
             }}
           >
-            <SelectTrigger>
+            <SelectTrigger className="w-full">
               <SelectValue placeholder="pick a mart" />
             </SelectTrigger>
             <SelectContent>
@@ -258,7 +258,7 @@ function AlertConditionFields({
             onValueChange={(v) => setF((prev) => ({ ...prev, measure: v ?? "" }))}
             disabled={fields.length === 0}
           >
-            <SelectTrigger>
+            <SelectTrigger className="w-full">
               <SelectValue placeholder={measurePlaceholder} />
             </SelectTrigger>
             <SelectContent>
@@ -279,7 +279,7 @@ function AlertConditionFields({
             value={f.agg ?? "sum"}
             onValueChange={(v) => setF((prev) => ({ ...prev, agg: v ?? "sum" }))}
           >
-            <SelectTrigger>
+            <SelectTrigger className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -297,7 +297,7 @@ function AlertConditionFields({
             value={f.op ?? ">"}
             onValueChange={(v) => setF((prev) => ({ ...prev, op: v ?? ">" }))}
           >
-            <SelectTrigger>
+            <SelectTrigger className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -339,7 +339,7 @@ function DigestConditionFields({ f, setF, boards, boardsError }: DigestCondition
         value={f.board ?? ""}
         onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
-        <SelectTrigger>
+        <SelectTrigger className="w-full">
           <SelectValue placeholder="pick a dashboard" />
         </SelectTrigger>
         <SelectContent>
@@ -443,7 +443,7 @@ function RuleEditDialog({
                   })
                 }
               >
-                <SelectTrigger>
+                <SelectTrigger className="w-full">
                   <SelectValue>{ruleKindLabel(f.type)}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
@@ -466,7 +466,7 @@ function RuleEditDialog({
                   setF((prev) => ({ ...prev, channel: v ?? "webhook" }))
                 }
               >
-                <SelectTrigger>
+                <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -487,7 +487,7 @@ function RuleEditDialog({
               value={f.severity ?? "none"}
               onValueChange={(v) => setF((prev) => ({ ...prev, severity: !v || v === "none" ? undefined : v }))}
             >
-              <SelectTrigger>
+              <SelectTrigger className="w-full">
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
               <SelectContent>

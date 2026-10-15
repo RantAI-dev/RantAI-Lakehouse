@@ -27,6 +27,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
+use crate::embed_access::{self, EmbedAccess};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
@@ -371,6 +372,12 @@ pub struct Board {
     /// a board value built in code before it is saved.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub folder_id: Option<String>,
+    /// Signed-embed access state (`SEC-12`): what has been withdrawn and
+    /// which sites may frame the embed. Never serialised: the list of
+    /// withdrawn token ids is not for a dashboard listing, and it is read
+    /// through `GET /api/dashboard/embed-info`.
+    #[serde(skip)]
+    pub embed_access: EmbedAccess,
 }
 
 /// A tile's position on the 12-column grid canvas.
@@ -542,6 +549,27 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // SEC-12: signed-embed access state kept with the board. `revoked_before`
+    // is a Unix-seconds instant ("withdraw all"), the two JSON columns hold
+    // the individually withdrawn tokens and the sites allowed to frame the
+    // embed (`crate::embed_access`). Constant defaults, like the columns
+    // above, so a row written before they existed reads as "nothing
+    // withdrawn, no site may frame".
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_before UInt64 DEFAULT 0",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_revoked_jti_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_origins_json String DEFAULT '[]'",
+        None,
+    )
+    .await?;
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_folder (\n\
            id String, name String, parent_id String DEFAULT '',\n\
@@ -576,7 +604,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -594,6 +622,18 @@ fn parse_filters(s: &str) -> Vec<FilterDef> {
 
 fn row_str<'a>(row: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A `UInt64` column: `ClickHouse` quotes 64-bit integers in JSON output by
+/// default, so it arrives as a string; a number is accepted too.
+fn row_u64(row: &serde_json::Map<String, Value>, key: &str) -> u64 {
+    row.get(key)
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| v.as_u64())
+        })
+        .unwrap_or(0)
 }
 
 fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
@@ -619,6 +659,11 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
         folder_id: Some(row_str(row, "folder_id").to_owned()),
+        embed_access: EmbedAccess::from_stored(
+            row_u64(row, "embed_revoked_before"),
+            row_str(row, "embed_revoked_jti_json"),
+            row_str(row, "embed_origins_json"),
+        ),
     }
 }
 
@@ -701,6 +746,7 @@ pub async fn create_board(
         public_token: None,
         embed_enabled: None,
         folder_id: None,
+        embed_access: EmbedAccess::default(),
     })
 }
 
@@ -717,12 +763,20 @@ async fn upsert_board(
     public_token: &str,
     embed_enabled: bool,
     folder_id: &str,
+    embed_access: &EmbedAccess,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
+    // Every save is a full-row INSERT, so the embed access state is written
+    // back on every save (carried forward from the board that was read), or
+    // an unrelated edit such as a rename would reset a withdrawal (SEC-12).
+    let withdrawn_json =
+        serde_json::to_string(&embed_access.withdrawn).unwrap_or_else(|_| "[]".to_owned());
+    let origins_json =
+        serde_json::to_string(&embed_access.origins).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id) VALUES \
-         ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, embed_revoked_before, embed_revoked_jti_json, embed_origins_json) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(description),
@@ -732,6 +786,9 @@ async fn upsert_board(
         SqlLiteral::from(public_token),
         i32::from(embed_enabled),
         SqlLiteral::from(folder_id),
+        embed_access.revoked_before,
+        SqlLiteral::from(withdrawn_json),
+        SqlLiteral::from(origins_json),
     );
     ch.exec(&sql, None).await
 }
@@ -776,6 +833,7 @@ async fn save_board_patch(
     // folder must carry the current one forward or the board would fall
     // back to the root.
     let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
+    let embed_access = patch.embed_access.unwrap_or(&board.embed_access);
     upsert_board(
         ch,
         &board.id,
@@ -787,6 +845,7 @@ async fn save_board_patch(
         public_token,
         embed_enabled,
         folder_id,
+        embed_access,
     )
     .await
 }
@@ -803,6 +862,7 @@ struct BoardPatch<'a> {
     public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
+    embed_access: Option<&'a EmbedAccess>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -903,6 +963,7 @@ pub async fn update_board_layout(
         public_token: None,
         embed_enabled: None,
         folder_id: None,
+        embed_access: EmbedAccess::default(),
     });
     save_board_patch(
         ch,
@@ -939,6 +1000,7 @@ pub async fn update_board_filters(
         public_token: None,
         embed_enabled: None,
         folder_id: None,
+        embed_access: EmbedAccess::default(),
     });
     save_board_patch(
         ch,
@@ -1008,6 +1070,109 @@ pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bo
     )
     .await?;
     Ok(enable)
+}
+
+/// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
+/// Returns the normalised list that was stored.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or an entry is not an
+/// acceptable site (see [`embed_access::validate_origins`]);
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn set_board_embed_origins(
+    ch: &ChClient,
+    id: &str,
+    origins: &[String],
+) -> Result<Vec<String>, BiError> {
+    let origins = embed_access::validate_origins(origins).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id)
+        .await?
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    let access = EmbedAccess {
+        origins: origins.clone(),
+        ..board.embed_access.clone()
+    };
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            embed_access: Some(&access),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(origins)
+}
+
+/// "Withdraw all embed tokens" for a board (`SEC-12`): every token whose
+/// `iat` is at or before `now_unix_seconds` is refused from the next request.
+/// Returns the stored instant.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist;
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn revoke_all_embed_tokens(
+    ch: &ChClient,
+    id: &str,
+    now_unix_seconds: u64,
+) -> Result<u64, BiError> {
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id)
+        .await?
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    let access = board.embed_access.clone().revoke_all(now_unix_seconds);
+    let revoked_before = access.revoked_before;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            embed_access: Some(&access),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(revoked_before)
+}
+
+/// "Withdraw one embed token" for a board (`SEC-12`): a token carrying
+/// `jti` is refused for this board until it could no longer be accepted
+/// anyway (`exp` plus `tolerance_secs`).
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or the list of
+/// individually withdrawn tokens is full; [`BiError::Clickhouse`] on a
+/// `ClickHouse` failure.
+pub async fn withdraw_embed_token(
+    ch: &ChClient,
+    id: &str,
+    jti: &str,
+    exp: u64,
+    now_unix_seconds: u64,
+    tolerance_secs: u64,
+) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id)
+        .await?
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    let access = board
+        .embed_access
+        .clone()
+        .withdraw_token(jti, exp, now_unix_seconds, tolerance_secs)
+        .map_err(BiError::Validation)?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            embed_access: Some(&access),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Fetch a board by its public share token (read-only, no auth). `None` if
@@ -2410,10 +2575,12 @@ mod tests {
         // `ADD COLUMN` statements added for the dashboard list page, plus
         // dashboard SQL sources (`bi_source`) and folders (`bi_folder` +
         // `bi_board.folder_id`) joining the bootstrap; the property under
-        // test — every later call is free — is unchanged.
+        // test — every later call is free — is unchanged. 16 = those 13 plus
+        // the three SEC-12 `bi_board` columns (`embed_revoked_before`,
+        // `embed_revoked_jti_json`, `embed_origins_json`).
         assert_eq!(
-            first_call_requests, 13,
-            "first call should issue all 13 DDL statements"
+            first_call_requests, 16,
+            "first call should issue all 16 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -2738,6 +2905,36 @@ mod tests {
         assert_eq!(parsed.has_year, Some(true));
     }
 
+    /// SEC-12: the three embed columns come back as the board's access state
+    /// (a `UInt64` arrives quoted), a row from before they existed reads as
+    /// "nothing withdrawn, no site may frame it", and none of it is
+    /// serialised into a dashboard listing.
+    #[test]
+    fn row_to_board_reads_the_embed_access_columns_and_does_not_serialise_them() {
+        let row = serde_json::json!({
+            "id": "b_1", "name": "Dash", "embed_enabled": "1",
+            "embed_revoked_before": "1700000000",
+            "embed_revoked_jti_json": "[{\"jti\":\"j1\",\"exp\":1700003600}]",
+            "embed_origins_json": "[\"https://app.customer.example\"]",
+        });
+        let board = row_to_board(row.as_object().unwrap());
+        assert_eq!(board.embed_access.revoked_before, 1_700_000_000);
+        assert_eq!(board.embed_access.withdrawn.len(), 1);
+        assert_eq!(
+            board.embed_access.origins,
+            vec!["https://app.customer.example"]
+        );
+        let json = serde_json::to_string(&board).unwrap();
+        assert!(
+            !json.contains("j1") && !json.contains("customer.example"),
+            "{json}"
+        );
+
+        let old_row = serde_json::json!({ "id": "b_old", "name": "Old" });
+        let old = row_to_board(old_row.as_object().unwrap());
+        assert_eq!(old.embed_access, EmbedAccess::default());
+    }
+
     /// `Board`'s JSON wire shape must match the TS `Board` type
     /// (`createdAt`/`publicToken`/`embedEnabled`, not `snake_case`) — this
     /// struct isn't wired to a route yet, but when it is, the mismatch
@@ -2757,6 +2954,7 @@ mod tests {
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
             folder_id: Some("f_1".to_owned()),
+            embed_access: EmbedAccess::default(),
         };
         let json = serde_json::to_value(&board).unwrap();
         assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
