@@ -223,3 +223,53 @@ assistant's tool schema.
 ## 8. Review
 
 (Reviewer.)
+
+### Round 1 (planner/reviewer, Claude Opus), at `4d716d53fa74`
+
+Read: the whole diff (migration `0076`, store, `run-as` and `enforce`
+routes, `policy.rs`, `route_auth`, `pipeline_enforce.rs`,
+`authored_factory.py` and its tests, the gate and its compose service and CI
+step, the console) against D1 to D6 and `AGENTS.md`. The security core is
+right: every statement that reads the source (`CREATE TABLE ... AS ...
+LIMIT 0`, the staging `INSERT`) uses the SQL the API returned and never the
+built `SELECT`; 409/422 fail the op without retry and transport errors stay
+retryable; the refusal text in an op failure is the API's fixed message or a
+fixed fallback; the author is resolved live through
+`load_principal_for_user` with the author's own placeholders; a service
+identity gets `run_as = NULL` instead of a foreign-key failure; `run-as`
+checks the user is in the pipeline's tenant, refuses a tenant-less
+pipeline, and is audited; the backfill reads `created` versions only and
+skips non-users. The gate's three cases ran on a clean stack (handoff).
+
+**BLOCKER 1. A new `ApiError::Internal(err.to_string())`.**
+`authored_pipelines.rs`, `enforce_pipeline_sql`, the
+`load_principal_for_user` error arm: `other => ApiError::Internal(other.to_string())`.
+`Internal` renders its string as the response body (`#[error("{0}")]`), so
+an `AuthError`'s upstream text (a `sqlx` message, for one) reaches the
+caller. `AGENTS.md` names this exact pattern as the known gap and says not to
+add another (principle 4). Classify it through `upstream_error` (the
+`report(&upstream_error::DATABASE, ..)` / `into_api_error` path the module
+already uses for its other database failures), so the body is the fixed
+"database error" text and the detail goes to the log only. Add a test that
+the 500 body carries no upstream text.
+
+**SHOULD-FIX 1. A doc comment moved to the wrong function.**
+`routes/mod.rs`: `pipelines_router`'s doc ("The `/api/pipelines/*`
+sub-router (Task 2.5) ...") now sits above `pipeline_enforce_router`, joined
+to the new text by a `//` line, so `pipeline_enforce_router` is documented
+as the whole sub-router and `pipelines_router` has no doc. Put each doc on
+its own function.
+
+**SHOULD-FIX 2. The handoff quotes a signature that does not exist** (rule
+1). Section 6 answer 2 says `load_principal_for_user(&pool, user_id)` and
+`principal.roles`; the call takes four arguments (`pool, user_id, auth
+source, flag`) and the field is `role_names`. Correct the answer and say
+what the `"local"` / `false` arguments mean for a pipeline author.
+
+**SHOULD-FIX 3. The verification block was not the one `AGENTS.md`
+names.** The handoff ran `cargo test -p <crate>` crate by crate; the rule is
+`cargo test --workspace --no-fail-fast` on the final commit, with its counts.
+Run it once after the fixes and quote the totals.
+
+Cite `BLD-1 review BLOCKER 1` / `SHOULD-FIX <n>` at each fix site and in the
+commit bodies.
