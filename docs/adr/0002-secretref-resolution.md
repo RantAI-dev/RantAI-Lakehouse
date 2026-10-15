@@ -472,3 +472,53 @@ in a type whose `Debug` is redacted.
 - Deleting a connector removes its managed credential files. A failed
   credential swap removes the files it wrote, except any file the
   connector names at that moment.
+
+## Addendum 5: managed credentials are encrypted at rest (`SRC-12`, 2026-10-15)
+
+### Context
+
+Addendum 4 stores the value a user types as a plain file on the
+`connector_secrets` volume and names encryption as the follow-up ("would
+replace `connector_secret_store` without changing any route or resolver").
+`SRC-12` asks for it: without a secret manager, a stored credential must be
+unreadable without a key from the environment, and compose must refuse to
+start without that key. The product owner signed AES-256-GCM on
+2026-10-14 (feature page `docs/core/features/credentials-done-properly.md`,
+decision 4).
+
+### Decision
+
+- **One key per installation**, `CONNECTOR_SECRETS_KEY`: 32 random bytes,
+  base64. The API and the orchestrator both receive it; both are refused a
+  start without it (`${CONNECTOR_SECRETS_KEY:?…}` in compose). There is no
+  default anywhere, `.env.example` included.
+- **Only `managed` files are encrypted.** `env:` variables and operator
+  `file:`s stay the operator's, as they are.
+- **Format of a managed file**: a version byte, a 96-bit random nonce, then
+  the AES-256-GCM ciphertext with its tag. The associated data is the file's
+  name, so a file copied under another connector's name does not open.
+- **Who does what**: only the API seals (it is the only writer, as in
+  addendum 4); the API and the orchestrator both open. A shared test vector
+  is checked by both test suites so the two implementations cannot drift.
+- **First start with the key**: a plain managed file found at start-up is
+  sealed in place (sealed copy written, fsynced, renamed over the plain
+  one). Leftover temporary and backup files of an interrupted replace are
+  removed at start-up, so no older value survives on disk.
+- **Changing the key**: an operator command re-seals every managed file
+  with a new key. While it runs, and until the old key is removed from the
+  environment, the old key (`CONNECTOR_SECRETS_KEY_PREVIOUS`) still opens
+  files; it never seals.
+
+### Deliberate limits
+
+- The key sits in the same environment as the processes that use it. This
+  protects a copied volume or backup, not a compromised API or
+  orchestrator process. A secret manager (`SRC-12` part B) is the answer
+  for that.
+- Losing the key loses every managed credential: they must be entered again.
+
+### Consequences
+
+- Every installation, development ones included, must set the key once.
+- Gates set a CI-only key in their override files.
+- `connector_secret_store` and both resolvers change; no route changes.
