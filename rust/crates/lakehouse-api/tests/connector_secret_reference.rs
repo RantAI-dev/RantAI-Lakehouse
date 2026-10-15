@@ -378,7 +378,13 @@ async fn typing_a_value_can_be_turned_off_and_a_reference_still_works() {
     let app = spin_up_with_env(&env(
         secrets.path(),
         Some(&vault),
-        &[("CONNECTOR_TYPED_CREDENTIALS", "false")],
+        &[
+            ("CONNECTOR_TYPED_CREDENTIALS", "false"),
+            (
+                "CONNECTOR_OAUTH_REDIRECT_URI",
+                "https://console.test/api/connectors/oauth/callback",
+            ),
+        ],
     ))
     .await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
@@ -454,14 +460,22 @@ async fn the_credential_settings_say_what_the_form_may_offer() {
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({"secretManager": null, "typedCredentials": true})
+        // SRC-12 review C2 SHOULD-FIX 1: part C added `oauthCallbackUrl`
+        // (null until the operator sets `CONNECTOR_OAUTH_REDIRECT_URI`).
+        json!({"secretManager": null, "typedCredentials": true, "oauthCallbackUrl": null})
     );
 
     let vault = vault_with_secret().await;
     let app = spin_up_with_env(&env(
         secrets.path(),
         Some(&vault),
-        &[("CONNECTOR_TYPED_CREDENTIALS", "false")],
+        &[
+            ("CONNECTOR_TYPED_CREDENTIALS", "false"),
+            (
+                "CONNECTOR_OAUTH_REDIRECT_URI",
+                "https://console.test/api/connectors/oauth/callback",
+            ),
+        ],
     ))
     .await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
@@ -476,7 +490,11 @@ async fn the_credential_settings_say_what_the_form_may_offer() {
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({"secretManager": "vault", "typedCredentials": false})
+        json!({
+            "secretManager": "vault",
+            "typedCredentials": false,
+            "oauthCallbackUrl": "https://console.test/api/connectors/oauth/callback"
+        })
     );
     // Names no address and no sign-in.
     assert!(!body.to_string().contains("127.0.0.1"));
