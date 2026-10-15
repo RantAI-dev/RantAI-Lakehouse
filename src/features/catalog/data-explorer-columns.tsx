@@ -20,6 +20,7 @@ import { AssetRowActions } from "./data-explorer-actions"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { CertificationBadge, Pill, TierBadge } from "@/components/patterns/status-badge"
 import { formatBytes } from "@/lib/format"
+import { governedPairLabels } from "./governed-tags"
 import { matchedOnLabel } from "@/lib/palette-search"
 import {
   DATA_LAYER_LABEL,
@@ -174,17 +175,27 @@ export function getDataExplorerColumns({
     {
       // Not sortable: the server refuses `tags` as a sort field (a list has
       // no order to sort by), so the header must not offer it. The filter
-      // sends `iLike`, which matches when any tag contains the text.
+      // sends `iLike`, which matches when any tag contains the text. DATA-12
+      // part 2: the filter reads governed pairs too (as `key: value`, the
+      // server's `tags` array filter), so the column shows both kinds.
       id: "tags",
-      accessorFn: (asset) => asset.tags ?? [],
+      accessorFn: (asset) => [...governedPairLabels(asset.governedTags), ...(asset.tags ?? [])],
       header: ({ column }) => <DataTableColumnHeader column={column} label="Tags" />,
       cell: ({ row }) => {
         const tags = row.original.tags ?? []
-        if (tags.length === 0) return <span className="text-muted-foreground">—</span>
+        const governed = governedPairLabels(row.original.governedTags)
+        if (tags.length === 0 && governed.length === 0) {
+          return <span className="text-muted-foreground">—</span>
+        }
         return (
           // Capped so a long list wraps inside the column instead of widening
           // the table (DATA-11 review SHOULD-FIX 7).
           <span className="flex max-w-[14rem] flex-wrap gap-1">
+            {governed.map((pair) => (
+              <Pill key={`governed:${pair}`} tone="info" title="Governed tag">
+                {pair}
+              </Pill>
+            ))}
             {tags.map((tag) => (
               <Pill key={tag} tone="neutral">
                 {tag}

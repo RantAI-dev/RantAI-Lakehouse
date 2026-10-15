@@ -60,6 +60,15 @@ describe("Data Explorer columns", () => {
     expect(screen.getByText("—")).toBeTruthy()
   })
 
+  it("shows governed tags as key: value pills beside the free tags", () => {
+    // DATA-12 part 2: the Tags column shows both kinds.
+    render(<>{cellOf("tags", { tags: ["pii"], governedTags: { data_domain: "finance" } })}</>)
+    expect(screen.getByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("pii")).toBeTruthy()
+    render(<>{cellOf("tags", { governedTags: { tier: "gold" } })}</>)
+    expect(screen.getByText("tier: gold")).toBeTruthy()
+  })
+
   it("filters Owner and Tags as text and offers no sort on Tags", () => {
     expect(column("owner").meta).toMatchObject({ variant: "text" })
     expect(column("tags").meta).toMatchObject({ variant: "text" })
