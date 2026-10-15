@@ -1927,10 +1927,50 @@ async fn a_connector_that_loads_the_table_is_refused_even_when_the_tenant_holds_
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
 }
 
+/// `SEC-16` regression: a connector of ANOTHER tenant that loads the table
+/// closes the name, but the answer is the one sentence every other reason
+/// gets, not "A connector loads that table", which told a person that another
+/// organisation has a connector writing a table of that name. It fails before
+/// the fix, which answered with the connector's sentence.
+#[tokio::test]
+async fn another_tenants_connector_closes_the_table_with_the_one_sentence() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    sqlx::query(
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
+         adapter, ingest_mode, dial, source_objects) VALUES \
+         ('conn-retail-orders', '11111111-1111-4111-8111-000000000002', \
+         'retail orders', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
+         'production', 'meridian', 'sql', 'batch', \
+         '{\"driver\":\"postgres\",\"host\":\"127.0.0.1\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb, \
+         '[{\"name\":\"public.orders\",\"target\":\"retail_orders_raw\"}]'::jsonb)",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("retail_orders_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(reply.json["error"], NOT_FREE);
+    assert!(
+        !reply.text.to_lowercase().contains("connector"),
+        "the answer must not mention a connector: {}",
+        reply.text
+    );
+    assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
+}
+
 /// The one sentence for a table name that is not this tenant's to load into
 /// (review finding B4): another tenant's claim, and an existing table nobody
 /// claimed, are told apart by nothing a caller can see.
-const NOT_FREE: &str = "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it.";
+const NOT_FREE: &str = "That table name cannot be used. Choose another name.";
 
 /// An existing table is only loaded into again by the tenant that holds its
 /// claim. Registered in the catalog and claimed by nobody: refused, and no
