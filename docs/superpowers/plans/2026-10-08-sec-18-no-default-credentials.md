@@ -390,3 +390,149 @@ Checked and found right:
 Merge preconditions (owner): the six `STAGING_*` repository secrets exist
 with staging's current values; existing installs set the four must-set
 variables before pulling (upgrade note in `docs/OPERATIONS.md`).
+
+### Handoff (2026-10-15, round 3)
+
+#### 1. Commits
+- `15779e04e414` `fix(ci): set required compose credentials in g8-time-travel (SEC-18)` (PR #83 review round 2, BLOCKER 1)
+- `cdbf7c6a0a74` `docs(env): remove deprecated OpenFGA and OIDC mock host ports (SEC-18)` (PR #83 review round 2, SHOULD-FIX 1)
+- This commit: `docs(plan): record round 3 handoff (SEC-18)`
+
+Full log: `git log --oneline --abbrev=12 origin/main..HEAD`:
+(recorded at this commit)
+cdbf7c6a0a74 docs(env): remove deprecated OpenFGA and OIDC mock host ports (SEC-18)
+15779e04e414 fix(ci): set required compose credentials in g8-time-travel (SEC-18)
+df32fbdc41f6 docs(plan): SEC-18 round 2 review: 1 BLOCKER, 1 SHOULD-FIX
+0a98c7dd931d docs(sec-18): record round 2 handoff (M3)
+3d3551c0cb4c fix(compose): close credentials added by main (SEC-18, M2)
+9ac99239b14b Merge origin/main into fix/sec-18-no-default-credentials
+935636a5dc9d docs(plan): SEC-18 round 2, bring the branch up to main
+4c18937f6a05 docs(security): review of SEC-18
+1dfe6d704548 docs: SEC-18 upgrade note in the changelog and the plan's handoff (N4)
+666670ff98ea ci: every compose start sets its own credentials, docs point at the helper (SEC-18, N3)
+cec8f999ef0c fix(env): .env.example holds no credential, add ops/init-env.sh (SEC-18, N2)
+f7faa6900eb0 fix(compose): no default credentials, must-set secrets refuse to start (SEC-18, N1)
+97f6f1d4e578 docs(security): feature page and plan for SEC-18
+
+#### 2. Verification Commands and Proof
+
+##### Check 1: BLOCKER 1 ci.yml check script
+Command:
+```python
+python3 - <<'PY'
+import re
+s=open('.github/workflows/ci.yml').read().split('\n'); job=None
+for i,l in enumerate(s):
+    m=re.match(r'^  ([a-z0-9][a-z0-9_-]*):\s*$',l); job=m.group(1) if m else job
+    if re.search(r"cat\s+>+\s*\.env\b",l):
+        j=i+1; blk=[]
+        while j<len(s) and s[j].strip()!='EOF': blk.append(s[j]); j+=1
+        t='\n'.join(blk)
+        print(job,'missing',[n for n in ['POSTGRES_PASSWORD','RUSTFS_ACCESS_KEY','RUSTFS_SECRET_KEY','LAKEKEEPER_ENCRYPTION_KEY'] if n+'=' not in t])
+PY
+```
+Output:
+```
+g1-rustfs missing []
+g2-seaweedfs missing []
+g3a-dagster missing []
+g3-maintenance missing []
+g4-cdc missing []
+g6-ingest missing []
+g6-ingest-other missing []
+g6-oracle missing []
+g9-upload missing []
+g6-alerts missing []
+gold-export missing []
+g8-governance missing []
+g8-time-travel missing []
+```
+Counts: 13 of 13 compose-starting jobs verified, 0 missing credentials.
+
+##### Check 2: SHOULD-FIX 1 deprecated port assignments
+Command:
+```bash
+grep -n 'OPENFGA_HTTP_HOST_PORT\|OPENFGA_GRPC_HOST_PORT\|OIDC_MOCK_HOST_PORT' .env.example docker-compose.yml
+```
+Output:
+```
+docker-compose.yml:759:    # `OPENFGA_HTTP_HOST_PORT`/`OPENFGA_GRPC_HOST_PORT` are gone with it —
+docker-compose.yml:814:    # `OIDC_MOCK_HOST_PORT` is gone with it — see docs/OPERATIONS.md for
+```
+Result: 0 assignments found; `.env.example` has 0 occurrences; `docker-compose.yml` has 0 assignments (only commentary documenting removal).
+
+##### Check 3: Throwaway .env compose config check
+In a scratch copy with `docker-compose.yml`, `.env.example`, and `ops/init-env.sh`:
+```bash
+sh ops/init-env.sh
+docker compose --profile '*' config --quiet
+```
+Output:
+```
+init-env: wrote /tmp/sec18-scratch.t8kSdu/.env (mode 600). Filled:
+  POSTGRES_PASSWORD
+  RUSTFS_ACCESS_KEY
+  RUSTFS_SECRET_KEY
+  LAKEKEEPER_ENCRYPTION_KEY
+  SEAWEEDFS_ACCESS_KEY
+  SEAWEEDFS_SECRET_KEY
+  AUTH_BOOTSTRAP_PASSWORD
+  TENANT_WAREHOUSE_S3_ACCESS_KEY
+  TENANT_WAREHOUSE_S3_SECRET_KEY
+init-env: AUTH_BOOTSTRAP_EMAIL is still the example address; edit it in .env.
+```
+Exit code: 0 (`docker compose --profile '*' config --quiet` passed with 0 errors).
+
+##### Check 4: Gitleaks dir scan
+Command:
+```bash
+docker run --rm -v /home/shiro/rantai/wt/sec-18:/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact
+```
+Output:
+```
+scanned ~20308298 bytes (20.31 MB) in 4.09s
+no leaks found
+```
+
+##### Check 5: Repository Lint Scripts
+Commands:
+```bash
+python3 ops/lint/check_intra_package_imports.py
+python3 ops/lint/check_bare_iceberg_count.py
+python3 ops/lint/check_compose_init_readiness.py
+```
+Output:
+```
+OK: all intra-package dispar_orchestrate imports resolve
+R11 guard: no bare count() against a Bronze Iceberg table found.
+```
+Exit code: 0 across all checks.
+
+#### 3. Skipped / Premises
+- `docker compose up`: *not verified* this round per task instructions ("No docker compose up is needed this round (no service changed)").
+- Rust, TypeScript, and Python test suites: *not verified* (no Rust, TS, or Python files touched in round 3).
+
+#### 4. Status and Branch Output
+```
+git status --short:
+<empty>
+```
+
+```
+git log --oneline origin/main..HEAD | head:
+cdbf7c6a0a74 docs(env): remove deprecated OpenFGA and OIDC mock host ports (SEC-18)
+15779e04e414 fix(ci): set required compose credentials in g8-time-travel (SEC-18)
+df32fbdc41f6 docs(plan): SEC-18 round 2 review: 1 BLOCKER, 1 SHOULD-FIX
+0a98c7dd931d docs(sec-18): record round 2 handoff (M3)
+3d3551c0cb4c fix(compose): close credentials added by main (SEC-18, M2)
+9ac99239b14b Merge origin/main into fix/sec-18-no-default-credentials
+935636a5dc9d docs(plan): SEC-18 round 2, bring the branch up to main
+4c18937f6a05 docs(security): review of SEC-18
+1dfe6d704548 docs: SEC-18 upgrade note in the changelog and the plan's handoff (N4)
+666670ff98ea ci: every compose start sets its own credentials, docs point at the helper (SEC-18, N3)
+```
+
+```
+git ls-remote --heads origin fix/sec-18-no-default-credentials:
+cdbf7c6a0a74136dc698f1f516a5a04eb41f7e0d	refs/heads/fix/sec-18-no-default-credentials
+```
