@@ -313,6 +313,51 @@ export function getPipelineColumns({
       },
     },
     {
+      id: "lag",
+      accessorFn: (row) => (row.targetLag ? row.lag?.status ?? "not_measured" : ""),
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Lag" />
+      ),
+      cell: ({ row }) => {
+        const targetLag = row.original.targetLag
+        const lag = row.original.lag
+        if (!targetLag || !lag) {
+          return <span className="text-xs text-muted-foreground">—</span>
+        }
+        if (lag.status === "met") {
+          return (
+            <Pill tone="success" title={lag.reason ?? undefined}>
+              Met
+            </Pill>
+          )
+        }
+        if (lag.status === "behind") {
+          return (
+            <Pill tone="destructive" title={lag.reason ?? undefined}>
+              Behind
+            </Pill>
+          )
+        }
+        return (
+          <Pill tone="neutral" title={lag.reason ?? undefined}>
+            Not measured
+          </Pill>
+        )
+      },
+      enableColumnFilter: true,
+      enableSorting: true,
+      meta: {
+        label: "Lag",
+        variant: "select",
+        options: [
+          { value: "met", label: "Met" },
+          { value: "behind", label: "Behind" },
+          { value: "not_measured", label: "Not measured" },
+        ],
+        icon: Timer,
+      },
+    },
+    {
       id: "freshnessLagSeconds",
       accessorKey: "freshnessLagSeconds",
       header: ({ column }) => (

@@ -72,6 +72,8 @@ export type AlertRule = {
    * `pipeline`.
    */
   connector?: string
+  /** Pipeline id or `*` for pipeline rules. */
+  pipeline?: string
 }
 
 /**
@@ -96,6 +98,7 @@ export type SaveAlertRuleInput = {
   severity?: string
   /** Connector id or `*`; see [`AlertRule.connector`]. */
   connector?: string
+  pipeline?: string
 }
 
 /** Body of `GET /api/alerts/status`. */

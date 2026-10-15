@@ -4,6 +4,19 @@ import type { EntityStatus } from "@/lib/status"
 /** The kinds a pipeline can be authored as. */
 export type PipelineKind = "batch" | "incremental"
 
+/** Target lag setting (BLD-2 D2). */
+export type TargetLag =
+  | { kind: "lag"; minutes: number }
+  | { kind: "downstream" }
+
+/** Measured freshness lag status (BLD-2 D8). */
+export type PipelineLag = {
+  status: "met" | "behind" | "not_measured"
+  lagSeconds: number | null
+  lastCheckAt: string | null
+  reason: string | null
+}
+
 export type Pipeline = {
   id: string
   name: string
@@ -31,6 +44,8 @@ export type Pipeline = {
   incrementalColumn?: string
   transforms?: string[]
   fbicEnabled?: boolean
+  targetLag?: TargetLag | null
+  lag?: PipelineLag | null
 }
 
 /**
@@ -195,6 +210,7 @@ export type CreatePipelineInput = {
   /** Optional ingress connector this pipeline reads through (WS4 item F5) — mirrors `Pipeline.connectorId`. */
   connectorId?: string
   description?: string
+  targetLag?: TargetLag | null
 }
 
 /**
@@ -282,4 +298,6 @@ export interface PipelineService {
   deletePipeline(id: string, signal?: AbortSignal): Promise<void>
   /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
   getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
+  /** `PUT /api/pipelines/{id}/target-lag` — set or clear an authored pipeline's target lag (BLD-2 D8). */
+  setTargetLag(id: string, targetLag: TargetLag | null, signal?: AbortSignal): Promise<Pipeline>
 }
