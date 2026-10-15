@@ -179,11 +179,14 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
-/// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
-/// purely to keep that function under `clippy::too_many_lines` — it merges
-/// straight back in, with no separate middleware/state of its own.
-// BLD-1 / D3's single route, split out so `pipelines_router` stays
-/// inside clippy's line budget for a one-line addition.
+/// `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3), the rewrite
+/// the orchestrator asks for before it runs a pipeline's `SELECT`.
+///
+/// Its own function for the same reason [`pipelines_router`] is: so the
+/// route can be added without pushing that function over
+/// `clippy::too_many_lines`. It merges straight back in, through
+/// [`authored_pipelines_router`], and carries no middleware or state of
+/// its own.
 fn pipeline_enforce_router() -> Router<AppState> {
     Router::new().route(
         "/api/pipelines/runnable/{id}/enforce",
@@ -202,6 +205,9 @@ fn authored_pipelines_router() -> Router<AppState> {
     pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
 }
 
+/// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
+/// purely to keep that function under `clippy::too_many_lines` — it merges
+/// straight back in, with no separate middleware/state of its own.
 fn pipelines_router() -> Router<AppState> {
     Router::new()
         .route(
