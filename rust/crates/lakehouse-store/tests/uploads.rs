@@ -34,9 +34,9 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete, find_by_sha256, get,
-    get_by_run_id, insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim,
-    table_claimed, upload_in_tenants,
+    ClaimedTable, LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete,
+    find_by_sha256, get, get_by_run_id, insert, list, list_claims, mark_finished, mark_ingesting,
+    table_being_loaded, table_claim, table_claimed, upload_in_tenants,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -124,6 +124,20 @@ async fn rows_with_id(pool: &PgPool, id: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// `(table, upload that asked, file name while the upload is there)` of each
+/// claim [`list_claims`] returns, for one assertion per list.
+fn names(rows: &[ClaimedTable]) -> Vec<(&str, &str, Option<&str>)> {
+    rows.iter()
+        .map(|c| {
+            (
+                c.bronze_table.as_str(),
+                c.upload_id.as_str(),
+                c.original_filename.as_deref(),
+            )
+        })
+        .collect()
 }
 
 /// Claim `table` for `tenant_id` the way the ingest route does before it marks
@@ -1703,5 +1717,71 @@ async fn get_by_run_id_finds_the_upload_of_a_run_or_none(pool: PgPool) -> sqlx::
     let found = get_by_run_id(&pool, "run-2").await.unwrap().unwrap();
     assert_eq!(found.id, "up-2");
     assert!(get_by_run_id(&pool, "run-none").await.unwrap().is_none());
+    Ok(())
+}
+
+/// DATA-19 / D5: `list_claims` is what the lineage graph reads, so it
+/// answers three questions at once — whose claims are visible, what the
+/// file name still is, and what a claim whose upload was deleted says.
+///
+/// The tenant rule is `ConnectorFilter`'s, the one every tenant-scoped
+/// read in this crate follows: `Some(t)` shows only `t`'s rows, so
+/// another tenant's claim is invisible and a claim whose tenant was
+/// deleted (`ON DELETE SET NULL`) belongs to nobody and is invisible to
+/// EVERY tenant-scoped caller (fail closed, never "showed to everybody");
+/// the unscoped `None` read shows every claim, both of those included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_shows_only_the_caller_s_tenant_and_names_the_upload_when_it_is_there(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-claims-a").await;
+    let tenant_b = tenant(&pool, "uploads-claims-b").await;
+    add(&pool, "up-a", tenant_a, "").await;
+    add(&pool, "up-b", tenant_b, "").await;
+    add(&pool, "up-orphan", tenant_a, "").await;
+    claim(&pool, tenant_a, "a_raw", "up-a").await;
+    claim(&pool, tenant_b, "b_raw", "up-b").await;
+    claim(&pool, tenant_a, "orphan_raw", "up-orphan").await;
+    // A claim whose tenant is gone belongs to nobody.
+    sqlx::query("UPDATE upload_table_claim SET tenant_id = NULL WHERE bronze_table = 'b_raw'")
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        names(&list_claims(&pool, Some(tenant_a)).await.unwrap()),
+        vec![
+            ("a_raw", "up-a", Some("stock.csv")),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ],
+        "a tenant-scoped read shows this tenant's claims and never another's"
+    );
+    assert!(
+        list_claims(&pool, Some(tenant_b)).await.unwrap().is_empty(),
+        "a claim whose tenant was deleted is nobody's claim"
+    );
+
+    // The unscoped read shows every claim, including both that a
+    // tenant-scoped caller cannot see.
+    assert_eq!(
+        names(&list_claims(&pool, None).await.unwrap()),
+        vec![
+            ("a_raw", "up-a", Some("stock.csv")),
+            ("b_raw", "up-b", Some("stock.csv")),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ]
+    );
+
+    // A claim outlives the upload that made it: deleting the upload's row
+    // leaves the claim, and the name goes with it rather than a guess.
+    delete(&pool, "up-a").await.unwrap();
+    let after = list_claims(&pool, Some(tenant_a)).await.unwrap();
+    assert_eq!(
+        names(&after),
+        vec![
+            ("a_raw", "up-a", None),
+            ("orphan_raw", "up-orphan", Some("stock.csv")),
+        ],
+        "a deleted upload leaves its claim, with no file name to show"
+    );
     Ok(())
 }

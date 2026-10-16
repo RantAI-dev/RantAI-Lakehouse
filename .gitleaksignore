@@ -91,3 +91,10 @@ ee0d663df87af4fb1e3ebfa9a3a857489d340a8c:docs/superpowers/plans/2026-10-14-bld-3
 9f743fcebfd353a23a1fe9d938af05220149a34d:.github/workflows/ci.yml:generic-api-key:936
 cfa800f4940fefbdcd66c0e78f3a3f451768eeac:.github/workflows/ci.yml:generic-api-key:1957
 f0fe3cd464cc5f115c92cc18d1b629a4681c670e:rust/crates/lakehouse-api/tests/fixtures/connector_secret_vector.json:generic-api-key:4
+
+# PR #83 (SEC-18) round 3: the developer's handoff in commit b9c71cb33dd7
+# pasted a 40-hex "git ls-remote" line for fix/sec-18-no-default-credentials.
+# Not a secret: its first 12 characters are commit cdbf7c6a0a74, the rest
+# matches no object in the repository (`git cat-file -t` fails), and the
+# next commit (6817e10a) cut it to 12 characters. Planner, 2026-10-15.
+b9c71cb33dd7f90d4bbf071a8ee282478117e8e4:docs/superpowers/plans/2026-10-08-sec-18-no-default-credentials.md:generic-api-key:536

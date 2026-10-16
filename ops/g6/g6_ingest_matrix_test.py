@@ -111,8 +111,11 @@ SFTP_HOSTKEY_PUB = "/sftp-hostkey/ssh_host_ed25519_key.pub"
 MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MONGO_G6_ROOT_USER = os.environ.get("MONGO_G6_ROOT_USER", "")
 MONGO_G6_ROOT_PASSWORD = os.environ.get("MONGO_G6_ROOT_PASSWORD", "")
-RUSTFS_ACCESS_KEY = os.environ.get("RUSTFS_ACCESS_KEY", "rustfsadmin")
-RUSTFS_SECRET_KEY = os.environ.get("RUSTFS_SECRET_KEY", "rustfsadmin")
+# SEC-18: no literal fallback. docker-compose.yml passes these into
+# `g6-test-runner` from the job's CI-only .env (must-set), so an empty value
+# here means the gate was started outside that wiring and should fail.
+RUSTFS_ACCESS_KEY = os.environ.get("RUSTFS_ACCESS_KEY", "")
+RUSTFS_SECRET_KEY = os.environ.get("RUSTFS_SECRET_KEY", "")
 CATALOG_DB = "icecat_g6"
 
 GATE_SECRETS_DIR = "/gate-secrets"

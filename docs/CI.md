@@ -1,6 +1,6 @@
 # CI/CD
 
-This repo's CI is split into four workflows under `.github/workflows/`:
+This repo's CI is split into workflows under `.github/workflows/`:
 
 - **`ci.yml`** — change-scoped fast feedback and acceptance testing. Begins with
   a change scope detector (`changes`) and unconditional repo lints (`repo-lints`),
@@ -22,6 +22,10 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
   only to avoid spending ~30 runner minutes per PR run when no PR checks consume
   the artifact.
+- **`security-all-branches.yml`** — daily scheduled (`cron: '17 3 * * *'`) and manual
+  dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
+  Deliberately separate from pull-request checks so findings on one branch do
+  not block unrelated PRs (SEC-36, D2).
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -182,7 +186,7 @@ fingerprint (commit, file, rule, line):
 | `llm.ts:9` in `8ac6ee2` | Internal LLM node key | Rotated |
 | 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b`, and the same 4 files in the root commit `6c3a7ff` (an ancestor of `main`) | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
 | `test_schema_observer.py:26` in `31ec837` | Test token literal | False positive; the literal is gone since #129 |
-| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant. The history scan reads every branch |
+| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant (surfaced when scanning all branches) |
 
 Because the entries are full fingerprints, they match nothing else: the same
 secret in a new commit, or any new secret, is **not** baselined and turns
@@ -227,6 +231,40 @@ deliberately not undertaken as a side effect of a CI-hardening pass — it
 needs a human to explicitly decide to take it on and coordinate with anyone
 holding a local clone. The baseline makes it unnecessary for keeping the
 scan useful.
+
+### Scan scope on PRs and `main` vs. the daily all-branch scan (`SEC-36`)
+
+Historically, `history-scan` fetched all remote branches and invoked `gitleaks`
+with no `--log-opts`, causing `gitleaks` to pass `--all` to `git log` and
+scan every ref in the repository. A test value or secret pushed on an
+unrelated feature branch (such as #144) turned the check red on `main` and
+on every open PR.
+
+Under `SEC-36` (decisions D1–D2):
+
+- **In `security.yml` (`history-scan`)**: on pushes to `main` and on pull
+  requests, `gitleaks detect` runs with `--log-opts="HEAD"` (D1). On a push
+  to `main`, this scans `main`'s history; on a pull request, `actions/checkout`
+  checks out `refs/pull/<n>/merge`, so it scans `main` plus the pull request's
+  commits. It does not scan unrelated branches, making the scan independent
+  of what other refs exist or are fetched.
+- **In `security-all-branches.yml`**: a dedicated daily workflow (`cron: '17 3 * * *'`
+  and `workflow_dispatch`) fetches all remote branches and runs
+  `gitleaks detect --log-opts="--all"` (D2). This runs as a scheduled job,
+  deliberately not as a pull-request check, so a finding on one branch
+  never blocks an unrelated PR.
+- **When the daily all-branch run turns red**: it means at least one branch
+  in the repository carries an un-baselined finding. The owner of that branch
+  must fix it: by rotating the secret, replacing the literal with a synthetic
+  value that does not match the rule, or baselining it in `.gitleaksignore`
+  with an exact fingerprint and justification.
+
+Note on merge commits: `gitleaks` uses `git log -p -U0` under the hood. Git
+by default skips diffs for merge commits in `git log -p` unless `-c`, `--cc`,
+or `-m` is specified. Consequently, conflict resolutions introduced in merge
+commits are not diffed by `gitleaks` (this was true before `SEC-36` and
+remains true).
+
 
 ## Docker
 

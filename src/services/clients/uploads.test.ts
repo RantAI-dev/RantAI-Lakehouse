@@ -190,13 +190,13 @@ describe("uploadService errors", () => {
   })
 
   it("keeps a 409's status and a 403's own words", async () => {
-    stubFetch(() => json({ error: "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it." }, 409))
+    stubFetch(() => json({ error: "That table name cannot be used. Choose another name." }, 409))
     const conflict = await rejection(
       uploadService.ingest("up-1", { bronzeTable: "x", encoding: "utf-8", delimiter: ",", headerRow: 0 })
     )
     expect(conflict.status).toBe(409)
     expect(conflict.message).toBe(
-      "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it."
+      "That table name cannot be used. Choose another name."
     )
 
     stubFetch(() => json({ error: "permission_denied: connector:manage" }, 403))
