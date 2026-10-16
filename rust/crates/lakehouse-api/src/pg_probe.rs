@@ -96,6 +96,8 @@ pub(crate) enum PgProbeError {
     Query,
     /// The server sent a message this probe does not understand.
     Protocol,
+    /// The server did not ask for a password (e.g. `trust` server; SEC-14B review round 1, BLOCKER 3).
+    NoPasswordAsked,
 }
 
 impl fmt::Display for PgProbeError {
@@ -112,6 +114,7 @@ impl fmt::Display for PgProbeError {
             Self::Connection => "connection failed",
             Self::Query => "database rejected the connection",
             Self::Protocol => "the server sent a message this probe did not understand",
+            Self::NoPasswordAsked => "the server did not ask for a password",
         };
         f.write_str(text)
     }
@@ -310,9 +313,18 @@ where
 
     let mut buffer = BytesMut::new();
     let mut scram: Option<ScramSha256> = None;
+    let mut scram_finished = false;
     loop {
         match read_message(stream, &mut buffer).await? {
-            Message::AuthenticationOk => break,
+            Message::AuthenticationOk => {
+                if !scram_finished {
+                    if scram.is_some() {
+                        return Err(PgProbeError::Authentication);
+                    }
+                    return Err(PgProbeError::NoPasswordAsked);
+                }
+                break;
+            }
             Message::AuthenticationSasl(body) => {
                 if !offers_scram_sha256(&body)? {
                     return Err(PgProbeError::NoScram);
@@ -350,6 +362,7 @@ where
                 state
                     .finish(body.data())
                     .map_err(|_| PgProbeError::Authentication)?;
+                scram_finished = true;
             }
             // Every password method other than SCRAM-SHA-256, plus the
             // methods this client has no implementation for: one fixed
@@ -847,6 +860,133 @@ mod tests {
             err.to_string(),
             "the server sent a message this probe did not understand"
         );
+        server.await.unwrap();
+    }
+    /// (g) A server that answers `SaslContinue` and then `AuthenticationOk`
+    /// without sending `SaslFinal` never completes the SCRAM signature check
+    /// and must be refused (SEC-14B review round 1, BLOCKER 3).
+    #[tokio::test]
+    async fn scram_skipped_final_signature_is_refused() {
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let plain_port = plain.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = plain.accept().await.unwrap();
+            read_framed(&mut socket, false).await; // startup packet
+
+            // 1. Offer SCRAM-SHA-256
+            socket
+                .write_all(&backend_message(
+                    b'R',
+                    b"\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00",
+                ))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // Read client initial response
+            let client_init = read_framed(&mut socket, true).await;
+            let r_pos = client_init.windows(2).position(|w| w == b"r=").unwrap();
+            let nonce_bytes = &client_init[r_pos + 2..];
+            let end = nonce_bytes
+                .iter()
+                .position(|&b| b == b',' || b == 0)
+                .unwrap_or(nonce_bytes.len());
+            let client_nonce = std::str::from_utf8(&nonce_bytes[..end]).unwrap();
+
+            // 2. Send SaslContinue with server-first-message echoing client nonce
+            let server_first = format!("r={client_nonce}servernonce,s=c2FsdA==,i=4096");
+            let mut continue_body = 11i32.to_be_bytes().to_vec();
+            continue_body.extend_from_slice(server_first.as_bytes());
+            socket
+                .write_all(&backend_message(b'R', &continue_body))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // Read client final response
+            read_framed(&mut socket, true).await;
+
+            // 3. Skip SaslFinal and directly send AuthenticationOk (type 0)
+            socket
+                .write_all(&backend_message(b'R', &0i32.to_be_bytes()))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // If a broken client sends query, respond with success
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(300), socket.read_u8()).await
+            {
+                socket
+                    .write_all(&backend_message(b'C', b"SELECT 1\x00"))
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&backend_message(b'Z', b"I"))
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+
+        let proxy = TlsProxy::start("127.0.0.1", plain_port).await;
+        let approved = approved_for(proxy.port()).await;
+        let err = connect_and_select(
+            &target(proxy.port(), PROXY_SERVER_NAME),
+            &approved,
+            &SecretValue::new("pencil"),
+            None,
+        )
+        .await
+        .expect_err("skipping SaslFinal must be refused");
+        assert_eq!(err.to_string(), "authentication failed");
+        server.await.unwrap();
+    }
+
+    /// (h) A server that answers `AuthenticationOk` without requiring any
+    /// authentication (a `trust` server) must not report the credential as
+    /// verified and is refused with a fixed message (SEC-14B review round 1, BLOCKER 3).
+    #[tokio::test]
+    async fn trust_server_is_refused_without_reporting_credential_verified() {
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let plain_port = plain.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = plain.accept().await.unwrap();
+            read_framed(&mut socket, false).await; // startup packet
+            // Immediately send AuthenticationOk (type 0)
+            socket
+                .write_all(&backend_message(b'R', &0i32.to_be_bytes()))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // If a broken client sends query, respond with success
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(300), socket.read_u8()).await
+            {
+                socket
+                    .write_all(&backend_message(b'C', b"SELECT 1\x00"))
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&backend_message(b'Z', b"I"))
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+
+        let proxy = TlsProxy::start("127.0.0.1", plain_port).await;
+        let approved = approved_for(proxy.port()).await;
+        let err = connect_and_select(
+            &target(proxy.port(), PROXY_SERVER_NAME),
+            &approved,
+            &SecretValue::new("any-pw"),
+            None,
+        )
+        .await
+        .expect_err("trust server must be refused");
+        assert_eq!(err.to_string(), "the server did not ask for a password");
         server.await.unwrap();
     }
 }
