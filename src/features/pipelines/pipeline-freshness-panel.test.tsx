@@ -1,12 +1,25 @@
 let mockPermissions = ["pipeline:write"]
 
-import { mock } from "bun:test"
+import { afterAll, mock } from "bun:test"
 
+import * as realAuth from "@/features/auth/auth-provider"
+
+// The panel asks the signed-in user whether it may save. `mock.module`
+// outlives this file in `bun test src` (PR #160's note, learned the same
+// way in `src/features/dashboards/chart-builder.test.tsx`), so the real
+// exports are kept, only `useAuth` is replaced, and the real module goes
+// back in `afterAll`: a bare `{ useAuth }` leaves every later file -- the
+// catalog asset-detail tabs among them -- without `AuthProvider`.
+const real = { ...realAuth }
 mock.module("@/features/auth/auth-provider", () => ({
+  ...real,
   useAuth: () => ({
     hasPermission: (permission: string) => mockPermissions.includes(permission),
   }),
 }))
+afterAll(() => {
+  mock.module("@/features/auth/auth-provider", () => real)
+})
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
