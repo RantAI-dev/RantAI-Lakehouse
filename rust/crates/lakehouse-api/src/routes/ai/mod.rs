@@ -46,6 +46,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upstream_error;
 
 // ── POST /api/ai/build-status ───────────────────────────────────────────
 
@@ -89,7 +90,17 @@ pub async fn build_status(
             .into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": err.to_string(), "status": "unknown", "steps": [] })),
+            ApiJson({
+                let mut body = upstream_error::report(
+                    &upstream_error::SERVICE,
+                    upstream_error::Class::Unavailable,
+                    &err,
+                )
+                .to_json();
+                body["status"] = json!("unknown");
+                body["steps"] = json!([]);
+                body
+            }),
         )
             .into_response(),
     }
@@ -516,6 +527,17 @@ async fn prepare_chat(
         name: None,
     }];
     messages.extend(history);
+    // The newest user message names the mode for this turn. `recent_user`
+    // above is read from the request, so the language line is unaffected.
+    if let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == LlmMessageRole::User)
+        && let Some(content) = last_user.content.as_mut()
+    {
+        content.push_str("\n\n");
+        content.push_str(prompt::mode_note(is_build));
+    }
     Ok(PreparedChat {
         messages,
         tools,
@@ -857,7 +879,14 @@ async fn run_chat(
                     (approval_result, outcome, run_id, approval_id)
                 } else {
                     let outcome = gate::outcome_of(&refusal);
-                    (refusal, outcome, None, None)
+                    if outcome == "needs_confirmation"
+                        && let Some(error) =
+                            tools::check_draft(state, &call.function.name, &args).await
+                    {
+                        (error, "failed", None, None)
+                    } else {
+                        (refusal, outcome, None, None)
+                    }
                 }
             } else if not_offered {
                 let error = not_offered_refusal(&call.function.name);
@@ -1182,7 +1211,13 @@ pub async fn tool_call(
             (approval_result, outcome, run_id, approval_id)
         } else {
             let outcome = gate::outcome_of(&refusal);
-            (refusal, outcome, None, None)
+            if outcome == "needs_confirmation"
+                && let Some(error) = tools::check_draft(&state, &parsed.tool, &parsed.args).await
+            {
+                (error, "failed", None, None)
+            } else {
+                (refusal, outcome, None, None)
+            }
         }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
@@ -1261,7 +1296,6 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
 /// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
 /// error is logged.
 fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
-    tracing::warn!(%err, "LLM call failed");
     match err {
         lakehouse_llm::LlmError::Transport(_) => {
             "The AI service could not be reached. Try again later.".to_owned()
@@ -1279,8 +1313,16 @@ fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
 
 /// The fixed 503 body for a Copilot LLM failure.
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    // SEC-11: the provider's text is logged under a reference the user can
+    // quote (`errorId`), not shown.
+    let class = match err {
+        lakehouse_llm::LlmError::Transport(_) => upstream_error::Class::Unavailable,
+        lakehouse_llm::LlmError::Api(_) => upstream_error::Class::Failed,
+    };
+    let failure = upstream_error::report(&upstream_error::MODEL, class, err);
     json!({
         "error": "AI Copilot is unavailable",
+        "errorId": failure.reference(),
         "detail": llm_error_detail(err),
         "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
     })
@@ -1459,10 +1501,19 @@ fn owner_key(principal: &Principal) -> String {
     principal.id.uuid().to_string()
 }
 
+/// A `500` for a failed chat-session read or write. The session store is
+/// `ClickHouse`; its text goes to the log under the reference (SEC-11).
 fn internal(err: &impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        ApiJson(json!({ "error": err.to_string() })),
+        ApiJson(
+            upstream_error::report(
+                &upstream_error::DATABASE,
+                upstream_error::Class::Failed,
+                err,
+            )
+            .to_json(),
+        ),
     )
         .into_response()
 }
@@ -1739,7 +1790,7 @@ pub async fn sessions_save(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
 
     let requested = parsed
         .id
@@ -1748,7 +1799,7 @@ pub async fn sessions_save(
         Some(id) => {
             let row = session_row(ch, &owner, id)
                 .await
-                .map_err(|err| ApiError::Internal(err.to_string()))?;
+                .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
             // Never overwrite someone else's session under its id.
             Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
         }
@@ -1798,7 +1849,7 @@ pub async fn sessions_save(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1838,10 +1889,10 @@ pub async fn sessions_rename(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     let row = session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
     let field = |k: &str| {
         row.get(k)
@@ -1862,7 +1913,7 @@ pub async fn sessions_rename(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -1903,10 +1954,10 @@ pub async fn sessions_delete(
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?
         .is_none()
     {
         return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
@@ -1924,7 +1975,7 @@ pub async fn sessions_delete(
         },
     )
     .await
-    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    .map_err(|err| upstream_error::internal_error(&upstream_error::DATABASE, &err))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -2240,6 +2291,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_approval_sentence_in_build_mode_depends_on_a_needs_approval_result() {
+        let text = prompt::SYSTEM_BUILD_SUFFIX;
+        let line = text
+            .lines()
+            .find(|l| l.contains("delete_alert_rule"))
+            .expect("the build prompt lists the approval-gated tools");
+        assert!(
+            line.contains("needs_approval"),
+            "the approval line must name needs_approval as the condition, got: {line}"
+        );
+        assert!(
+            !text.contains("Tell the user the request is waiting in Approvals"),
+            "the approval line must not tell the user the request is waiting unconditionally"
+        );
+    }
+
     #[tokio::test]
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
@@ -2332,6 +2400,117 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// The message list the model receives after the system message: the
+    /// history `prepare_chat` built, with the request's own messages.
+    fn history_of(messages: &[(&str, &str)]) -> ChatBody {
+        ChatBody {
+            messages: messages
+                .iter()
+                .map(|(role, content)| IncomingMessage {
+                    role: (*role).to_owned(),
+                    content: (*content).to_owned(),
+                })
+                .collect(),
+            ..ChatBody::default()
+        }
+    }
+
+    /// The last user message the model is sent, and the assistant message
+    /// that came before it, as text.
+    async fn sent_to_model(state: &AppState, body: ChatBody, mode: Option<&str>) -> Vec<String> {
+        let who = analyst(1);
+        let body = ChatBody {
+            mode: mode.map(str::to_owned),
+            ..body
+        };
+        let prepared = prepare_chat(state, Some(&who), &axum::http::HeaderMap::new(), body)
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        prepared
+            .messages
+            .iter()
+            .skip(1)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect()
+    }
+
+    const ASK_MODE_REPLY: &str = "I am in ASK mode and cannot change anything.";
+
+    #[tokio::test]
+    async fn a_switch_to_build_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", ASK_MODE_REPLY),
+            ("user", "Yes, make it now."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        let note = prompt::mode_note(true);
+        assert_eq!(sent[0], "Make a chart.");
+        assert_eq!(
+            sent[1], ASK_MODE_REPLY,
+            "the assistant message is unchanged"
+        );
+        assert_eq!(sent[2], format!("Yes, make it now.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_ask_is_stated_in_the_newest_message() {
+        let body = history_of(&[
+            ("user", "Make a chart."),
+            ("assistant", "Done."),
+            ("user", "Now only read."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("ask")).await;
+        let note = prompt::mode_note(false);
+        assert_eq!(sent[1], "Done.");
+        assert_eq!(sent[2], format!("Now only read.\n\n{note}"));
+    }
+
+    #[tokio::test]
+    async fn the_reply_language_does_not_move_with_the_mode_note() {
+        // The newest message is Indonesian. The language line is read from the
+        // request, so the note in the history must not change it.
+        let state = state_with_ask_back("false");
+        let who = analyst(1);
+        let headers = axum::http::HeaderMap::new();
+        let question = "Tolong buat grafik penjualan per wilayah sekarang.";
+        let body = |mode: &str| {
+            let mut b = history_of(&[("user", question)]);
+            b.mode = Some(mode.to_owned());
+            b
+        };
+        let build = prepare_chat(&state, Some(&who), &headers, body("build"))
+            .await
+            .map_err(|_| "a valid body")
+            .expect("a prepared chat");
+        let system = build.messages[0].content.clone().unwrap_or_default();
+        let lang = prompt::closing(question, None);
+        assert!(
+            system.ends_with(&lang),
+            "the language line is unchanged in build mode: {system}"
+        );
+        assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_message_gets_a_mode_note() {
+        // The console never sends a note back, but the input allows one in an
+        // earlier message: the new note goes on the newest message only.
+        let earlier = format!("Earlier question.\n\n{}", prompt::mode_note(false));
+        let body = history_of(&[
+            ("user", &earlier),
+            ("assistant", "Answer."),
+            ("user", "Newest question."),
+        ]);
+        let sent = sent_to_model(&state_with_ask_back("false"), body, Some("build")).await;
+        assert_eq!(sent[0], earlier, "the earlier note is not added to again");
+        assert_eq!(
+            sent[2],
+            format!("Newest question.\n\n{}", prompt::mode_note(true))
+        );
     }
 
     #[tokio::test]
@@ -2605,6 +2784,7 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("1016"), "{text}");
         assert!(!text.contains("upstream-secret-detail"), "{text}");
+        assert!(body["errorId"].is_string(), "{text}");
         assert_eq!(
             body["detail"],
             "The AI service returned an error (HTTP 530). Try again later."

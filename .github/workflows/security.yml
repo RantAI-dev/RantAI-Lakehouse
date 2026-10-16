@@ -94,22 +94,24 @@ jobs:
 
   # ── Separate on purpose; see docs/CI.md for the full, honest status. ──
   #
-  # A prior audit reported a real LLM API key leaked in git history on
-  # commits reachable from both `main` and `feat/rust-backend`. This job
-  # exists to scan full git history — the mode a leak in history actually
-  # requires to be caught — as a separate job from the working-tree
-  # `gitleaks` job above, specifically so its result (red OR green) stays
-  # individually visible in the Actions UI rather than being folded into
-  # (and potentially masking, or being masked by) another job's status.
+  # A Phase 1 audit reported a real LLM API key leaked in git history, and
+  # the custom rules in `.gitleaks.toml` found it (plus staging tokens and
+  # private LAN addresses). The product owner confirmed on 2026-10-14 that
+  # every real secret found is rotated, and a history rewrite would break
+  # every open branch, so those findings are baselined in `.gitleaksignore`
+  # by exact fingerprint (commit, file, rule, line); see SEC-1 and
+  # docs/superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md.
   #
-  # As actually run in CI with gitleaks' default ruleset against this
-  # repo's real history, this job currently reports NO findings — see
-  # docs/CI.md's "history-scan" section for the full, honest account of
-  # that discrepancy (verified independently, not assumed) and what it
-  # does and doesn't prove. It is intentionally still not part of required
-  # status checks: if the reported leak used a key format gitleaks'
-  # default rules don't match, a future run could legitimately turn red,
-  # and that must not silently block merges.
+  # This job therefore reports only findings that are NOT in the baseline:
+  # a new secret, or the same secret in a new commit, turns it red. That is
+  # its purpose. It is intentionally still not part of required status
+  # checks, so a red run needs a human to look at it rather than silently
+  # blocking merges.
+  #
+  # Scoped to HEAD (SEC-36, D1): on push to main or pull_request, gitleaks
+  # scans the history reachable from HEAD (main's history, plus the PR's
+  # commits on a PR) rather than every remote branch. A separate daily
+  # workflow (`security-all-branches.yml`, D2) scans all branches.
   #
   # Do NOT set `continue-on-error: true` here and do NOT fold this into
   # the `gitleaks` job above — keep its result independently visible
@@ -124,24 +126,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch all branches
-        run: git fetch --all --tags
-
       - name: Explain this job's purpose and known status
         run: |
           cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           ## history-scan
 
-          A prior audit reported a real LLM API key leaked in git history.
-          This job scans full history with gitleaks' default ruleset to
-          check for it. As of the last verification, this scan does NOT
-          reproduce that finding — see docs/CI.md for the full, honest
-          write-up of that discrepancy. This job is intentionally not part
-          of required status checks either way: if a future run does turn
-          red, that must not silently block merges — see docs/CI.md for
-          what a red result here would require (a human-authorized history
-          rewrite: purge the blob, force-push every affected ref, rotate
-          the key at the provider).
+          Scans the git history reachable from HEAD with `.gitleaks.toml`
+          (SEC-36, D1). On push to main, this scans main's history; on a
+          pull request, it scans main plus the PR's commits. Unrelated
+          branches are not scanned here so their findings cannot turn
+          another PR red; all branches are scanned daily by the separate
+          `security-all-branches.yml` workflow (D2).
+
+          Findings listed in `.gitleaksignore` are the rotated or
+          false-positive findings from the Phase 1 audit and the staging
+          tokens (SEC-1); they are not reported. Any other finding,
+          including the same secret in a new commit, turns this job red:
+          treat it as a new leak, rotate the secret first, then decide
+          whether to baseline it. This job is intentionally not part of
+          required status checks, so a red run needs a human to look at it.
+          See docs/CI.md ("history-scan") and
+          docs/superpowers/plans/2026-10-14-sec-1-gitleaks-baseline.md.
           EOF
 
       - name: Install gitleaks
@@ -154,11 +159,16 @@ jobs:
 
       # Same .gitleaks.toml as the working-tree job (only excludes the two
       # verified-synthetic test-fixture JWTs and gitignored build dirs —
-      # neither masks a real secret), so this job's redness reflects the
-      # actual leak rather than known-benign noise. No `--no-git`: this is
-      # a full-history scan (`git log -p` under the hood), on purpose.
-      - name: gitleaks detect (full history)
-        run: gitleaks detect --source . --config .gitleaks.toml --redact -v
+      # neither masks a real secret). `.gitleaksignore` at the repository
+      # root is read from `--source` and baselines the SEC-1 findings by
+      # exact fingerprint.
+      #
+      # Scoped to HEAD (SEC-36, D1): scans the history reachable from HEAD
+      # (`git log -p -U0 HEAD` under the hood) rather than every branch,
+      # so findings on unrelated branches do not fail checks on main or PRs.
+      # Full branch coverage is handled by the daily scheduled workflow.
+      - name: gitleaks detect (HEAD history)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact -v --log-opts="HEAD"
 
   # `dependency-review-action` calls GitHub's Dependency Graph diff API,
   # which historically required GitHub Advanced Security for *private*

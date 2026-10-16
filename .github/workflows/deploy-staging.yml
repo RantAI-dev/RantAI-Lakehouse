@@ -41,9 +41,43 @@ jobs:
 
       - name: Setup staging .env
         working-directory: ${{ github.workspace }}
+        # bash, stated: the secret loop below uses indirect expansion.
+        shell: bash
+        # SEC-18: docker-compose.yml has no default credentials and
+        # .env.example carries none, so the staging values come from
+        # repository secrets, never from the repo. They MUST equal the
+        # values the existing staging volumes were initialised with
+        # (PostgreSQL only reads its password at first init; the Lakekeeper
+        # encryption key cannot change without losing stored credentials),
+        # or be rotated on purpose. The step fails before touching the
+        # running stack when one is missing.
         run: |
+          for name in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
+            LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY; do
+            var="STAGING_${name}"
+            value="${!var}"
+            if [ -z "$value" ]; then
+              echo "::error::repository secret STAGING_$name is not set (SEC-18: no default credentials; see docs/OPERATIONS.md)"
+              exit 1
+            fi
+          done
           cp .env.example .env
           cat .env.staging >> .env
+          # Same newline guard as LLM_KEY below, and the same last-wins
+          # reasoning: `.env.example` ships these keys empty.
+          for name in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
+            LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY; do
+            var="STAGING_${name}"
+            value="${!var}"
+            sed -i "/^$name=/d" .env
+            printf '\n%s=%s\n' "$name" "$value" >> .env
+          done
+          # TENANT_WAREHOUSE_S3_* used to fall back to the RustFS credentials in .env.example (the
+          # same value as the RustFS keys, ADR 0002 Addendum 2 "may equal,
+          # must never alias"); keep staging's tenant provisioning working.
+          sed -i '/^TENANT_WAREHOUSE_S3_ACCESS_KEY=/d;/^TENANT_WAREHOUSE_S3_SECRET_KEY=/d' .env
+          printf '\nTENANT_WAREHOUSE_S3_ACCESS_KEY=%s\nTENANT_WAREHOUSE_S3_SECRET_KEY=%s\n' \
+            "$STAGING_RUSTFS_ACCESS_KEY" "$STAGING_RUSTFS_SECRET_KEY" >> .env
           # Paid provider credential, kept OUT of the repo (this repo is
           # public): inject it as the ONLY LLM_KEY= line in the file.
           # .env.example ships an empty `LLM_KEY=` too; compose resolves
@@ -59,7 +93,50 @@ jobs:
           # degrading to 503, never a broken deploy.
           sed -i '/^LLM_KEY=/d' .env
           printf '\nLLM_KEY=%s\n' "${{ secrets.LLM_KEY }}" >> .env
+          # SEC-13: the staging admin password, the six service tokens and
+          # the embed secret used to be committed in .env.staging, readable
+          # by anyone (this repo is public). They now come from repo secrets
+          # named STAGING_<NAME>, passed in through `env:` below rather than
+          # interpolated into this script, so a value with a quote or a `$`
+          # cannot change what the script does. Same rule as LLM_KEY: delete
+          # any existing line, then append exactly one, on its own line.
+          # Unlike LLM_KEY these are required: an empty token leaves the
+          # scheduled pipelines inert and /api/pipelines answering 401/503
+          # with nothing in the deploy log to say why, so a missing secret
+          # fails the deploy here, by name, instead (fail closed).
+          missing=""
+          for name in AUTH_BOOTSTRAP_PASSWORD AGENT_RUN_TOKEN GOLD_EXPORT_RUN_TOKEN \
+                      INGEST_SERVICE_TOKEN ALERTS_RUN_TOKEN PIPELINE_RUN_TOKEN \
+                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET; do
+            var="STAGING_${name}"
+            value="${!var}"
+            if [ -z "$value" ]; then
+              missing="$missing $var"
+              continue
+            fi
+            sed -i "/^${name}=/d" .env
+            printf '\n%s=%s\n' "$name" "$value" >> .env
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
           echo "=== staging .env ready ==="
+        env:
+          STAGING_POSTGRES_PASSWORD: ${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          STAGING_RUSTFS_ACCESS_KEY: ${{ secrets.STAGING_RUSTFS_ACCESS_KEY }}
+          STAGING_RUSTFS_SECRET_KEY: ${{ secrets.STAGING_RUSTFS_SECRET_KEY }}
+          STAGING_LAKEKEEPER_ENCRYPTION_KEY: ${{ secrets.STAGING_LAKEKEEPER_ENCRYPTION_KEY }}
+          STAGING_SEAWEEDFS_ACCESS_KEY: ${{ secrets.STAGING_SEAWEEDFS_ACCESS_KEY }}
+          STAGING_SEAWEEDFS_SECRET_KEY: ${{ secrets.STAGING_SEAWEEDFS_SECRET_KEY }}
+          STAGING_AUTH_BOOTSTRAP_PASSWORD: ${{ secrets.STAGING_AUTH_BOOTSTRAP_PASSWORD }}
+          STAGING_AGENT_RUN_TOKEN: ${{ secrets.STAGING_AGENT_RUN_TOKEN }}
+          STAGING_GOLD_EXPORT_RUN_TOKEN: ${{ secrets.STAGING_GOLD_EXPORT_RUN_TOKEN }}
+          STAGING_INGEST_SERVICE_TOKEN: ${{ secrets.STAGING_INGEST_SERVICE_TOKEN }}
+          STAGING_ALERTS_RUN_TOKEN: ${{ secrets.STAGING_ALERTS_RUN_TOKEN }}
+          STAGING_PIPELINE_RUN_TOKEN: ${{ secrets.STAGING_PIPELINE_RUN_TOKEN }}
+          STAGING_LAKEHOUSE_MAINTENANCE_TOKEN: ${{ secrets.STAGING_LAKEHOUSE_MAINTENANCE_TOKEN }}
+          STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)
         working-directory: ${{ github.workspace }}

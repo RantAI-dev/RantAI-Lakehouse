@@ -41,6 +41,7 @@ from dagster import (
     RunsFilter,
     build_op_context,
     job,
+    op,
 )
 
 from dispar_orchestrate import authored_factory, authored_transforms
@@ -189,6 +190,176 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(sql, "SELECT * FROM silver.`orders`")
 
 
+class BronzeSourceTest(unittest.TestCase):
+    """BLD-3 / D1 + D2: a `bronze` source is Iceberg in Lakekeeper, not a
+    ClickHouse database, so it is read through this job's own
+    `DataLakeCatalog` database (`CATALOG_DB`) as
+    ``icecat_authored.`bronze.<table>` ``, and every statement that reads
+    that database carries `SETTINGS allow_database_iceberg = 1`.
+
+    No network and no ClickHouse: `_ch_exec`/`_ch_query_json` are
+    monkeypatched exactly as `OpForPipelineTest` does, and
+    `ensure_catalog_database` is monkeypatched on THIS module (it
+    `POST`s through `connector_catalog.ch_exec`, which
+    `authored_factory._ch_exec` never sees) so the test can also assert
+    it ran BEFORE the first read. Calls are recorded in order, because
+    "before the first read" is half of what D1 requires.
+    """
+
+    def _run_op(self, **definition_overrides: object) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        pipeline = _ready_pipeline(**definition_overrides)
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        calls: list[tuple[str, str]] = []
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        with mock.patch.object(
+            authored_factory,
+            "_ch_exec",
+            side_effect=lambda target, statement: calls.append(("sql", statement)),
+        ), mock.patch.object(
+            authored_factory,
+            "_ch_query_json",
+            side_effect=lambda target, statement: next(counts),
+        ), mock.patch.object(
+            authored_factory,
+            "ensure_catalog_database",
+            side_effect=lambda target, database: calls.append(("ensure", database)),
+        ), mock.patch.object(
+            authored_factory.ClickHouseTarget,
+            "from_env",
+            return_value=ClickHouseTarget("http://ch", "default", ""),
+        ):
+            result = run_fn(build_op_context())
+        return result, calls
+
+    @staticmethod
+    def _statements(calls: list[tuple[str, str]]) -> list[str]:
+        """The SQL statements the op sent, in order (the `ensure` entries
+        record the catalog database name in the same slot, so they are
+        filtered out here rather than matching the catalog's own name)."""
+        return [statement for kind, statement in calls if kind == "sql"]
+
+    @staticmethod
+    def _ensured_databases(calls: list[tuple[str, str]]) -> list[str]:
+        return [database for kind, database in calls if kind == "ensure"]
+
+    @staticmethod
+    def _bronze_pipeline(**overrides: object) -> dict[str, object]:
+        """`_ready_pipeline` DEFINITION overrides for a Bronze-to-Silver
+        pipeline, the shape `ops/g7/g7_pipeline_test.py` authors."""
+        return {
+            "sourceZone": "bronze",
+            "sourceTable": "g3a_orders",
+            "transforms": ["dedupe(id)", "select(id,name)"],
+            "targetZone": "silver",
+            "targetTable": "bronze_out",
+            **overrides,
+        }
+
+    def test_a_bronze_source_is_read_through_the_jobs_own_catalog_database(self) -> None:
+        """D1: the source is ``icecat_authored.`bronze.g3a_orders` `` -- the
+        job's own `DataLakeCatalog` database plus the catalog's own flat
+        `bronze.<table>` name -- never the ClickHouse database `bronze`
+        that does not exist on this stack (the 404 T1 reproduced)."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        self.assertEqual(self._ensured_databases(calls), [authored_factory.CATALOG_DB])
+        self.assertEqual(authored_factory.CATALOG_DB, "icecat_authored")
+        selects = [s for s in self._statements(calls) if "icecat_authored" in s]
+        self.assertTrue(selects, f"no statement read the catalog database: {calls}")
+        for statement in selects:
+            self.assertIn(
+                "FROM icecat_authored.`bronze.g3a_orders`",
+                statement,
+                f"bronze source not read through the catalog database: {statement}",
+            )
+        # The Bronze source is never spelled as a ClickHouse database.
+        self.assertFalse(
+            [s for s in self._statements(calls) if "`g3a_orders`" in s and "icecat_authored" not in s]
+        )
+
+    def test_the_catalog_database_is_ensured_before_the_first_statement_that_reads_it(self) -> None:
+        """D1: ensured here, by `_resolve_source`, so the run never depends on
+        another job's catalog database having been created first."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        ensure_index = next(i for i, (kind, _) in enumerate(calls) if kind == "ensure")
+        first_read_index = next(
+            i
+            for i, (kind, statement) in enumerate(calls)
+            if kind == "sql" and "icecat_authored" in statement
+        )
+        self.assertLess(ensure_index, first_read_index, f"{calls}")
+
+    def test_every_statement_reading_the_catalog_database_carries_allow_database_iceberg(self) -> None:
+        """D2: ClickHouse refuses an Iceberg read without the setting, so it
+        rides on the `CREATE TABLE ... AS SELECT ... LIMIT 0`, on the
+        staging table's own `CREATE`, and on the staging `INSERT ... SELECT`
+        -- the three statements that read the source. It rides LAST in each
+        statement (ClickHouse parses `SETTINGS` as the SELECT's final
+        clause), which is why `_reading` appends it rather than building it
+        into `_build_select_sql`'s `FROM` clause."""
+        _, calls = self._run_op(**self._bronze_pipeline())
+        reads = [s for s in self._statements(calls) if "icecat_authored" in s]
+        self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
+        for statement in reads:
+            self.assertTrue(
+                statement.endswith("SETTINGS allow_database_iceberg = 1"),
+                f"statement does not carry the Iceberg read setting: {statement}",
+            )
+        kinds = [
+            "staging CREATE" if statement.startswith("CREATE TABLE silver.`__staging") else
+            "INSERT" if statement.startswith("INSERT INTO") else "target CREATE"
+            for statement in reads
+        ]
+        self.assertEqual(
+            sorted(kinds),
+            ["INSERT", "staging CREATE", "target CREATE"],
+        )
+
+    def test_a_silver_source_is_read_exactly_as_before(self) -> None:
+        """D3: a `silver` (or `gold`, or any ClickHouse zone) source is still
+        ``silver.`orders` ``, no catalog database is ensured, and no
+        statement grows a setting it did not have before."""
+        result, calls = self._run_op()
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(self._ensured_databases(calls), [])
+        statements = self._statements(calls)
+        self.assertFalse([s for s in statements if "icecat_authored" in s])
+        self.assertFalse([s for s in statements if "allow_database_iceberg" in s])
+        self.assertTrue(
+            any(
+                "ENGINE = MergeTree ORDER BY tuple() AS SELECT id, name FROM silver.`orders` LIMIT 0" in s
+                for s in statements
+            ),
+            statements,
+        )
+        self.assertTrue(
+            any("INSERT INTO serving.`__staging_orders_clean` SELECT id, name FROM silver.`orders`" == s for s in statements),
+            statements,
+        )
+
+    def test_resolve_source_marks_only_bronze_as_an_iceberg_read(self) -> None:
+        """`_PipelineSource.reads_iceberg` is what makes `_reading` attach the
+        setting, so it must be true for `bronze` alone."""
+        target = ClickHouseTarget("http://ch", "default", "")
+        with mock.patch.object(authored_factory, "ensure_catalog_database") as ensured:
+            bronze = authored_factory._resolve_source(target, "bronze", "orders")
+        ensured.assert_called_once_with(target, authored_factory.CATALOG_DB)
+        self.assertEqual(bronze.clickhouse_name, "icecat_authored.`bronze.orders`")
+        self.assertTrue(bronze.reads_iceberg)
+        for zone in ("silver", "gold", "serving"):
+            source = authored_factory._resolve_source(target, zone, "orders")
+            self.assertEqual(source.clickhouse_name, f"{zone}.`orders`")
+            self.assertFalse(source.reads_iceberg)
+
+    def test_a_bronze_source_with_a_silver_target_is_still_executed(self) -> None:
+        """The refusal is on the TARGET only: `bronze` -> `silver` is the
+        path D1/D2 fixed, and it must keep running (the whole point of
+        this change)."""
+        _, calls = self._run_op(
+            **{"sourceZone": "bronze", "sourceTable": "g3a_orders", "targetZone": "silver"}
+        )
+        self.assertTrue([s for s in self._statements(calls) if "silver.`orders_clean`" in s])
+
+
 class OpForPipelineTest(unittest.TestCase):
     """Executes the built op's own function directly (not through a full
     Dagster job run) -- same level `test_maintenance.py` exercises its ops
@@ -334,6 +505,32 @@ class OpForPipelineTest(unittest.TestCase):
         self.assertFalse(ctx.exception.allow_retries)
         self.assertIsInstance(ctx.exception.__cause__, authored_transforms.TransformError)
 
+    def test_a_bronze_target_is_refused_before_any_sql_is_sent(self) -> None:
+        """BLD-3 / D4: Bronze is written by ingestion, so a pipeline with a
+        `bronze` target is a config rejection, not a run failure to retry --
+        retrying gets the same refusal. `Failure(allow_retries=False)`
+        wraps `AuthoredJobError` (the shape the connector-source guard
+        above uses), the guard fires BEFORE any SQL is built, and the
+        wording is the one constant the API and the assistant's schema
+        refusal also use."""
+        from dagster import Failure
+
+        pipeline = _ready_pipeline(targetZone="bronze")
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec, \
+             mock.patch.object(authored_factory, "_ch_query_json") as mocked_query:
+            with self.assertRaises(Failure) as ctx:
+                run_fn(build_op_context())
+        self.assertFalse(ctx.exception.allow_retries)
+        self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredJobError)
+        self.assertIn(authored_factory.BRONZE_TARGET_REFUSED_REASON, str(ctx.exception))
+        self.assertEqual(
+            authored_factory.BRONZE_TARGET_REFUSED_REASON,
+            "a pipeline cannot write to bronze; bronze is written by ingestion",
+        )
+        mocked_exec.assert_not_called()
+        mocked_query.assert_not_called()
+
     def test_connector_sourced_pipeline_raises_a_non_retryable_failure_wrapping_authored_job_error(
         self,
     ) -> None:
@@ -456,7 +653,8 @@ class AuthoredScheduleTest(unittest.TestCase):
 class _FakeDagsterRun:
     """Stand-in for `dagster.DagsterRun` carrying only the fields the
     sensor body reads (`job_name`, `start_time`, `end_time`, `run_id`,
-    `status`). The factory module never constructs one of these -- it
+    `status`, and -- for a `file_ingest_job` run -- its resolved
+    `run_config`). The factory module never constructs one of these -- it
     only consumes whatever `context.instance.get_runs` returns -- so a
     minimal stub is enough."""
 
@@ -467,36 +665,61 @@ class _FakeDagsterRun:
         status: DagsterRunStatus,
         start_time: float | None,
         end_time: float | None,
+        run_config: Any = None,
     ) -> None:
         self.job_name = job_name
         self.run_id = run_id
         self.status = status
         self.start_time = start_time
         self.end_time = end_time
+        self.run_config = run_config
+
+
+class _FakeRunRecord:
+    """Drop-in for `dagster._core.storage.dagster_run.RunRecord`.
+
+    In Dagster 1.13.20 the run's `start_time`/`end_time` live HERE and not
+    on the `DagsterRun` (`DATA-19` gate finding, `authored_factory`'s
+    "Why RECORDS and not runs"), so the stub is faithful to that shape
+    rather than to what an older Dagster returned. A stub with the times
+    on the run itself is what let `R3 plan 2a`'s sensor pass its unit
+    tests and fail on every real tick."""
+
+    def __init__(self, run: _FakeDagsterRun) -> None:
+        self.dagster_run = run
+        self.start_time = run.start_time
+        self.end_time = run.end_time
 
 
 class _StubInstance:
     """Drop-in for `context.instance`. Records every `(filter, limit)`
-    pair the sensor asks for and returns the run list the test set up
-    for that pair. Indexed by `RunsFilter.job_name` so the sensor's
-    per-upstream query and per-downstream query can be answered
-    independently."""
+    pair the sensor asks for and returns the record list the test set up
+    for that pair, newest first, honouring the `limit` the sensor chose.
+    Indexed by `RunsFilter.job_name` so the sensor's per-upstream query
+    and per-downstream query can be answered independently.
+
+    Only `get_run_records` exists here on purpose: a sensor that went
+    back to `get_runs` would raise `AttributeError` in every test rather
+    than quietly reading times off an object that no longer has them."""
 
     def __init__(self, runs_by_job: dict[str, list[_FakeDagsterRun]]) -> None:
         self._runs_by_job = runs_by_job
         self.calls: list[tuple[RunsFilter | None, int | None]] = []
 
-    def get_runs(
+    def get_run_records(
         self,
         filters: RunsFilter | None = None,
         cursor: str | None = None,
         limit: int | None = None,
         bucket_by: Any = None,
         ascending: bool = False,
-    ) -> Sequence[_FakeDagsterRun]:
+    ) -> Sequence[_FakeRunRecord]:
         self.calls.append((filters, limit))
         job_name = filters.job_name if filters else None
-        return list(self._runs_by_job.get(job_name, []))
+        runs = list(self._runs_by_job.get(job_name, []))
+        if limit is not None:
+            runs = runs[:limit]
+        return [_FakeRunRecord(run) for run in runs]
 
 
 class _StubContext:
@@ -995,6 +1218,362 @@ class TestDependencySensor:
         # Same key for both ticks = one daemon-decided downstream run.
         assert out_a[0].run_key == out_b[0].run_key
         assert out_a[0].run_key == "authored-deps:upstream-a-1,upstream-b-1"
+
+
+def _file_ingest_run(
+    run_id: str, table: str | None, end_time: float = 200.0, start_time: float = 180.0
+) -> _FakeDagsterRun:
+    """A `file_ingest_job` SUCCESS run that loaded `table`, carrying the
+    SAME run-config shape `routes::uploads::run_config` launches the job
+    with (`ops.ingest_uploaded_file.config.bronze_table_name`). `table`
+    of `None` is a run launched without that config at all."""
+    config = (
+        {
+            "ops": {
+                "ingest_uploaded_file": {
+                    "config": {
+                        "upload_id": "up-1",
+                        "storage_key": "uploads/tenant/up-1.csv",
+                        "bronze_table_name": table,
+                        "load_mode": "replace",
+                        "encoding": "utf-8",
+                        "delimiter": ",",
+                        "header_row": 0,
+                    }
+                }
+            }
+        }
+        if table is not None
+        else {}
+    )
+    return _FakeDagsterRun(
+        job_name="file_ingest_job",
+        run_id=run_id,
+        status=DagsterRunStatus.SUCCESS,
+        start_time=start_time,
+        end_time=end_time,
+        run_config=config,
+    )
+
+
+def _build_bronze_dep_sensor(pid: str, depends_on: list[str], source_zone: str, source_table: str):
+    """A sensor for a pipeline whose SOURCE is `source_zone.source_table`
+    -- the field DATA-19 / D1 filters a `file_ingest_job` upstream by."""
+    pipeline = _dep_pipeline(pid, depends_on)
+    pipeline["definition"] = {**_ready_pipeline()["definition"], "sourceZone": source_zone, "sourceTable": source_table}
+
+    @job(name=f"authored__{pid.replace('-', '_')}")
+    def _placeholder_job() -> None:
+        return None
+
+    return build_authored_dependency_sensor(pipeline, authored_job=_placeholder_job)
+
+
+def _tick(sensor: Any, instance: _StubInstance, upstream_run: _FakeDagsterRun) -> list[Any]:
+    return list(sensor._run_status_sensor_fn(_StubContext(upstream_run, instance)))
+
+
+class TestFileIngestUpstreamIsFilteredByTable:
+    """DATA-19 / D1: `file_ingest_job` is a per-TABLE job, so a pipeline
+    that names it counts only the SUCCESS runs whose own run config says
+    they loaded THAT pipeline's source table. A load of any other table is
+    a run of a different chain and must not trigger this one -- otherwise
+    every upload anywhere re-runs every Bronze pipeline in the
+    deployment."""
+
+    def _instance(self, table_runs: list[_FakeDagsterRun]) -> _StubInstance:
+        return _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                "file_ingest_job": table_runs,
+            }
+        )
+
+    def test_a_successful_load_of_the_source_table_triggers_the_pipeline(self) -> None:
+        """The whole point of the feature: a re-upload of the pipeline's
+        OWN source table is a fresh SUCCESS run, so the chain fires with
+        a run_key naming that run."""
+        instance = self._instance([_file_ingest_run("up-1", "orders")])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:up-1"
+
+    def test_a_load_of_another_table_does_not_trigger_the_pipeline(self) -> None:
+        """A newer SUCCESS run of `file_ingest_job` that loaded a DIFFERENT
+        table is not a run of this chain. The unfiltered rule (newest run
+        wins) would have fired here, and would have fired again on every
+        upload in the deployment."""
+        instance = self._instance(
+            [
+                _file_ingest_run("other-new", "invoices", end_time=250.0),
+                _file_ingest_run("ours", "orders", end_time=200.0),
+            ]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "other-new"))
+
+        assert len(out) == 1
+        # It did NOT skip: its own table's load IS fresh, so the chain is
+        # allowed to run -- and the run_key names THAT run, never the
+        # other table's.
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_only_a_load_of_another_table_is_not_even_a_success_for_this_chain(self) -> None:
+        """With NO run for the source table at all, the chain waits and
+        says why -- the reason names the table and the rule, because
+        "waiting on file_ingest_job" alone reads as "the upload has not
+        run yet" when the real answer is "a DIFFERENT upload has, twice".
+        """
+        instance = self._instance(
+            [_file_ingest_run("other-1", "invoices"), _file_ingest_run("other-2", "shipments")]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "invoices"))
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "orders" in reason.skip_message
+        assert "file_ingest_job" in reason.skip_message
+
+    def test_a_run_without_the_config_is_not_a_match(self) -> None:
+        """A `file_ingest_job` run launched without the op config (a job
+        launch, a hand-made run, a future config shape) reads as "not
+        about our table", never as a match on an empty name."""
+        instance = self._instance([_file_ingest_run("no-config", None)])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+
+    def test_a_pipeline_whose_source_is_not_bronze_never_fires_on_an_upload(self) -> None:
+        """A stored row can predate the API's refusal
+        (`routes::authored_pipelines::validate_file_ingest_upstream`). A
+        non-Bronze source has no Bronze table to match, so the filter
+        matches nothing and the chain waits: unsupported, honestly, never
+        "works, approximately" by firing on every upload."""
+        instance = self._instance([_file_ingest_run("up-1", "orders")])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "silver", "orders_clean")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "silver" in reason.skip_message or "orders_clean" in reason.skip_message
+
+    def test_the_filtered_upstream_reads_more_than_one_run(self) -> None:
+        """The other upstreams still ask for exactly ONE run; the filtered
+        one asks for a bounded window, because "the newest run that loaded
+        our table" is not in the first one whenever a later upload
+        loaded another table."""
+        instance = self._instance(
+            [_file_ingest_run(f"other-{i}", "invoices") for i in range(3)]
+            + [_file_ingest_run("ours", "orders", end_time=150.0)]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        limits = [limit for filters, limit in instance.calls if filters and filters.job_name == "file_ingest_job"]
+        assert limits == [authored_factory.FILE_INGEST_SCAN_LIMIT]
+
+    def test_the_all_upstreams_rule_holds_with_a_filtered_and_an_authored_upstream(self) -> None:
+        """Section 6, question 2: mixing a per-table `file_ingest_job`
+        with an authored pipeline changes WHICH run of the first one
+        counts, not the ALL rule: every upstream must be fresh, the first
+        stale one ends the tick with its own reason, and one round of
+        successes asks for one downstream run keyed on both."""
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                # Fresh for THIS chain, but the newest run of the job
+                # loaded another table.
+                "file_ingest_job": [
+                    _file_ingest_run("other-new", "invoices", end_time=250.0),
+                    _file_ingest_run("ours", "orders", end_time=200.0),
+                ],
+                "authored__pl_up_a": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_up_a",
+                        run_id="upstream-a-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=180.0,
+                        end_time=210.0,
+                    )
+                ],
+            }
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job", "pl-up-a"], "bronze", "orders")
+
+        fired = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+        assert len(fired) == 1
+        assert fired[0].run_key == "authored-deps:ours,upstream-a-1"
+
+        # The same graph with the AUTHORED upstream behind: the tick ends
+        # on that upstream, by name, and asks for nothing.
+        instance._runs_by_job["authored__pl_up_a"] = [
+            _FakeDagsterRun(
+                job_name="authored__pl_up_a",
+                run_id="upstream-a-1",
+                status=DagsterRunStatus.SUCCESS,
+                start_time=40.0,
+                end_time=50.0,
+            )
+        ]
+        behind = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+        assert len(behind) == 1
+        assert not isinstance(behind[0], RunRequest)
+        assert "pl-up-a" in behind[0].skip_message
+
+
+class TestFileIngestRunConfigReader:
+    """The config path the filter reads, and its refusals."""
+
+    def test_the_path_is_the_one_the_api_launches_with(self) -> None:
+        assert authored_factory.FILE_INGEST_OP_CONFIG == (
+            "ops",
+            "ingest_uploaded_file",
+            "config",
+            "bronze_table_name",
+        )
+
+    def test_a_resolved_config_reads_the_table_it_loaded(self) -> None:
+        run = _file_ingest_run("r", "stock_raw")
+        assert authored_factory._run_config_value(
+            run, authored_factory.FILE_INGEST_OP_CONFIG
+        ) == "stock_raw"
+
+    def test_a_missing_or_reshaped_config_answers_none(self) -> None:
+        path = authored_factory.FILE_INGEST_OP_CONFIG
+        none = _FakeDagsterRun("file_ingest_job", "r", DagsterRunStatus.SUCCESS, 1.0, 2.0)
+        assert authored_factory._run_config_value(none, path) is None
+        assert authored_factory._run_config_value(_file_ingest_run("r", None), path) is None
+        # A config that is a list, one whose `ops` is not a mapping, and
+        # a table name that is not a non-empty string all answer None
+        # rather than raising: a run storage that changed shape must not
+        # take a sensor tick down with it.
+        for config in (
+            [],
+            {"ops": "none"},
+            {"ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": 7}}}},
+            {"ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": ""}}}},
+        ):
+            assert (
+                authored_factory._run_config_value(
+                    _FakeDagsterRun("file_ingest_job", "r", DagsterRunStatus.SUCCESS, 1.0, 2.0, config),
+                    path,
+                )
+                is None
+            ), config
+
+    def test_an_empty_table_name_matches_no_record(self) -> None:
+        records = [_FakeRunRecord(_file_ingest_run("r", "orders"))]
+        assert authored_factory._latest_record_for_table(records, "orders") is records[0]
+        assert authored_factory._latest_record_for_table(records, "") is None
+        assert authored_factory._latest_record_for_table(records, "invoices") is None
+
+    def test_a_real_runs_config_resolves_to_the_table_the_load_wrote(self) -> None:
+        """The assumption D1 rests on, proven on a REAL run instead of a
+        stub: `execute_in_process` against a temp instance writes a
+        `file_ingest_job` run whose stored `run_config` -- the exact
+        attribute `_run_config_value` reads, the exact value
+        `context.instance.get_runs` hands the sensor -- is read back and
+        resolves to the table that was launched.
+
+        This is why no tag was added to the launch (plan D1): the config
+        Dagster already stores carries the table. If a future Dagster
+        resolves the config into a different shape, this test fails here,
+        with the real payload, instead of the filter silently matching
+        nothing in production.
+        """
+        from dagster._core.test_utils import instance_for_test
+
+        from dispar_orchestrate.file_ingest import CONFIG_SCHEMA
+
+        @op(name="ingest_uploaded_file", config_schema=CONFIG_SCHEMA)
+        def _ingest_uploaded_file(context):  # noqa: ANN001, ANN202 - a Dagster op
+            return {"bronze_table_name": context.op_config["bronze_table_name"]}
+
+        @job(name="file_ingest_job")
+        def _file_ingest_job() -> None:
+            _ingest_uploaded_file()
+
+        # `routes::uploads::run_config`'s own shape, verbatim.
+        launch = {
+            "ops": {
+                "ingest_uploaded_file": {
+                    "config": {
+                        "upload_id": "up-1",
+                        "storage_key": "uploads/t/up-1.csv",
+                        "bronze_table_name": "stock_raw",
+                        "load_mode": "replace",
+                        "encoding": "utf-8",
+                        "delimiter": ",",
+                        "header_row": 0,
+                    }
+                }
+            }
+        }
+        with instance_for_test() as instance:
+            result = _file_ingest_job.execute_in_process(
+                run_config=launch, instance=instance, raise_on_error=False
+            )
+            assert result.success
+            runs = instance.get_runs(RunsFilter(job_name="file_ingest_job"), limit=1)
+            assert len(runs) == 1
+            stored = runs[0]
+            assert (
+                authored_factory._run_config_value(
+                    stored, authored_factory.FILE_INGEST_OP_CONFIG
+                )
+                == "stock_raw"
+            ), f"the stored run config resolved to {stored.run_config!r}"
+
+            # And the record the SENSOR reads carries the times and the
+            # run whose config this is: `get_run_records` is what the
+            # sensor asks for, since Dagster 1.13 moved `start_time` /
+            # `end_time` off the run and onto the record.
+            records = instance.get_run_records(
+                RunsFilter(job_name="file_ingest_job"), limit=1
+            )
+            assert len(records) == 1
+            record = records[0]
+            assert record.dagster_run.run_id == stored.run_id
+            # THE finding this gate's step 10 caught, pinned so it cannot
+            # come back: the run carries no times and the record does.
+            assert not hasattr(stored, "start_time")
+            assert not hasattr(stored, "end_time")
+            assert isinstance(record.start_time, float)
+            assert isinstance(record.end_time, float)
+            assert record.start_time < record.end_time
+            assert (
+                authored_factory._latest_record_for_table([record], "stock_raw")
+                is record
+            )
+            assert (
+                authored_factory._latest_record_for_table([record], "invoices_raw")
+                is None
+            )
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

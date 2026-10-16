@@ -113,9 +113,56 @@ checks still hold on 26.8:
   shape assertions are exercised against fixtures/mocks, not a real
   server, and were unaffected by the bump.
 
-Copy `.env.example` to `.env` first (`docker compose` auto-loads `.env`
-from the project root) and set at minimum `AUTH_BOOTSTRAP_EMAIL` /
-`AUTH_BOOTSTRAP_PASSWORD`. Every other variable has a safe local default.
+Create `.env` first (`docker compose` auto-loads `.env` from the project
+root) with `sh ops/init-env.sh`, which copies `.env.example` and fills the
+secrets with generated values (see "No default credentials" below), then set
+`AUTH_BOOTSTRAP_EMAIL`. Every non-secret variable has a safe local default.
+
+### No default credentials (`SEC-18`)
+
+`docker-compose.yml` carries no credential. These variables are must-set
+(`${X:?}`): `docker compose` of any kind stops with a message naming the
+variable while one is empty, whatever profile is active:
+
+| Variable | What it is |
+| --- | --- |
+| `POSTGRES_PASSWORD` | PostgreSQL password (also inside the connection strings compose builds for the API, Lakekeeper and OpenFGA) |
+| `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` | RustFS root key pair |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts what Lakekeeper stores in its own schema |
+
+`CONNECTOR_PG_PASSWORD` and `CONNECTOR_S3_ACCESS_KEY` / `_SECRET_KEY` fall
+back to those, never to a literal. `SEAWEEDFS_ACCESS_KEY` /
+`SEAWEEDFS_SECRET_KEY` are used only by `--profile seaweedfs`; compose
+interpolates the whole file whatever profiles are active, so `${X:?}` there
+would stop a default `up` that never starts SeaweedFS. They default to
+empty and `seaweedfs-iam-init` (which the whole profile waits on) exits 1
+while either is empty. `AUTH_BOOTSTRAP_PASSWORD` empty means no admin is
+seeded. `.env.example` holds none of these values, so copying it as it is
+does not start the stack; `sh ops/init-env.sh` writes a `.env` with generated
+values (mode 600, refuses to overwrite an existing `.env`, prints variable
+names only). Anything that runs `docker compose` without a `.env` (a CI job,
+a gate, `docker compose --profile '*' config --quiet`) must export these
+variables first; the CI jobs write CI-only throwaway values.
+
+**Upgrading an install that relied on the old defaults.** Its data was
+created with the old values, so keep them first and rotate on purpose:
+
+1. Before pulling this change, put the values the stack runs with into
+   `.env`: `POSTGRES_PASSWORD=lakehouse`, `RUSTFS_ACCESS_KEY=rustfsadmin`,
+   `RUSTFS_SECRET_KEY=rustfsadmin`,
+   `LAKEKEEPER_ENCRYPTION_KEY=this-is-not-a-secure-key-change-me` (and the
+   SeaweedFS pair `seaweedfsadmin` if you use that profile). Do not run
+   `ops/init-env.sh` over an existing stack: new values do not match the
+   existing volumes (PostgreSQL reads its password only when the data
+   directory is first created; a new Lakekeeper key cannot decrypt what is
+   stored).
+2. `docker compose up -d` as before. Nothing is recreated with a new value.
+3. Rotate afterwards, one at a time: change the PostgreSQL role password
+   inside the database (`ALTER ROLE ... PASSWORD`) and then `.env`; for the
+   object store, change the key in RustFS and `.env` together; the
+   Lakekeeper encryption key is not rotated in place (re-register the
+   warehouse storage credentials after changing it). Rotation is not done
+   by this change.
 
 ### RustFS: failure mode
 
@@ -225,9 +272,11 @@ partition synthetic load vs. a 1-file/partition control). This is a real
 operational requirement, not a nicety, for any deployment taking CDC-rate
 or dlt-batch writes into Bronze at meaningful volume — see ADR 0009. It
 does not affect `lakehouse-api`'s own boot or any of its existing routes;
-`dagster/dispar_orchestrate/maintenance.py`'s `expire_snapshots` chain is
-independent of Trino and keeps running either way (it does not compact
-data files, only aged snapshot/manifest metadata).
+`dagster/dispar_orchestrate/maintenance.py`'s snapshot expiry chain
+(default 7-day retention floor, OPS-1) requires Trino because ClickHouse 26.8
+refuses `expire_snapshots` on catalog-backed tables. If the `trino` profile is
+down or unconfigured, snapshot expiry logs a warning and skips cleanly, leaving
+snapshots unexpired without failing the maintenance job.
 
 ### Debezium Server (opt-in, `dagster` profile — P5, CDC)
 
@@ -645,6 +694,94 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Alert webhooks and internal addresses (`SEC-10`)
+
+An alert or digest sends its message to a webhook URL a user typed, so the
+sender applies the same address policy as the connector tests above:
+
+- **Internal addresses are refused.** Loopback, RFC1918, link-local (cloud
+  metadata), carrier-grade NAT, multicast, `0/8`, the reserved block and their
+  IPv6 forms, including IPv4 wrapped in IPv6. The host is resolved once; if
+  any address it resolves to is blocked the whole name is refused, and the
+  request goes to the address that was checked. A rule is checked when it is
+  saved (a 400 with "webhook address is not allowed") and again at every send,
+  because a name can resolve differently later.
+- **Redirects are not followed.** A webhook that answers with a redirect is a
+  failed delivery ("webhook redirect not followed"); give the final URL. The
+  sender also ignores a system proxy (a proxy resolves the name itself, which
+  defeats the check) and gives up after 10 seconds (it had no limit before).
+- **To allow an internal tool** (an on-premises chat or incident server), set
+  `WEBHOOK_ALLOWED_CIDRS` to its network or address (comma-separated, e.g.
+  `10.1.0.0/16`; a bare address is one host) and restart `lakehouse-api`. It
+  is separate from `CONNECTOR_PROBE_ALLOWED_CIDRS`, has no allow-everything
+  form, and never opens loopback, link-local, multicast or `0/8`. A malformed
+  entry stops the API at start.
+- **Failed deliveries carry a fixed reason**, never the HTTP library's text:
+  "webhook address is not allowed", "webhook host could not be resolved",
+  "webhook redirect not followed", "webhook HTTP <status>", "webhook request
+  timed out", "webhook connection failed", "webhook request failed". Delivery
+  records written before this change may hold the old library text; they are
+  not rewritten.
+- **Email (`SMTP`) is a separate item** and unchanged.
+
+### Signed dashboard embeds (`SEC-12`)
+
+A customer's server signs a short-lived token and the embed page presents it.
+What the operator needs to know:
+
+- **`EMBED_SECRET` is the only source of the signing secret.** The API no
+  longer generates one and keeps it in `console.app_kv`. Unset or empty: signed
+  embedding is unavailable (`POST /api/embed/data` answers `503` "embedding is
+  not configured", the Share dialog says so, and no sample token is offered),
+  and the rest of the product runs. Set it to a long random value and sign with
+  the same value. **An old `embed_secret` row in `console.app_kv` is no longer
+  read. Remove it** (`ALTER TABLE console.app_kv DELETE WHERE k = 'embed_secret'`
+  in `ClickHouse`); the API does not delete it for you. A deployment that relied
+  on the generated secret must read it once from that row and set `EMBED_SECRET`
+  to it, or issue new tokens with a new secret.
+- **`EMBED_TOKEN_MAX_LIFETIME_SECONDS`** (default `86400`) is the longest
+  `exp - iat` a token may have. It must be a positive whole number; anything
+  else stops the API at start. The Share dialog shows the value in force.
+- **Signing a token.** HS256, with these claims (placeholder values):
+
+  ```json
+  {
+    "resource": { "dashboard": "b_0123abcd" },
+    "params": { "region": "North" },
+    "iat": 1800000000,
+    "exp": 1800000600,
+    "jti": "7d1e8f3a-0000-0000-0000-000000000000"
+  }
+  ```
+
+  `iat` and `exp` are required numbers in Unix seconds; `exp - iat` must not
+  exceed the limit; `iat` may be at most 60 seconds ahead of the API's clock and
+  `exp` at most 60 seconds behind it. `jti` is optional (1 to 128 characters of
+  `A-Za-z0-9._-`) and is what makes one token withdrawable. `params` are filters
+  the viewer cannot change. Any other claim is ignored. A token that fails any
+  check is refused with the one message "embed token is invalid or expired".
+- **Withdrawing.** In the Share dialog (needs `dashboard:write`): "Withdraw all
+  embed tokens" refuses every token of that dashboard issued at or before that
+  moment; "Withdraw one token" takes a pasted token and refuses its `jti` for
+  that dashboard until the token could not be accepted anyway. Both are read
+  from the dashboard on every request, with no cache, so they apply to the next
+  request. Withdraw all uses the API server's clock against the token's `iat`:
+  a token minted by a clock more than a moment ahead of the API's survives it
+  until it expires, which the lifetime limit bounds.
+- **Framing.** Each dashboard lists the sites allowed to show its embed pages
+  (Share dialog; at most 20; `https://host[:port]`, or `http://localhost[:port]`
+  for development; no wildcards). The console's `proxy.ts` asks the API
+  (`POST /api/embed/frame`, which needs no sign-in and answers only the list)
+  and sends `Content-Security-Policy: frame-ancestors <sites>`, or
+  `frame-ancestors 'none'` when the list is empty, the token is not good, or
+  the API cannot be reached within 3 seconds. The console reads the API address
+  from `RUST_API_URL` **at run time** for this call (the image defaults it to
+  `http://localhost:8080`; a deployment must pass `-e RUST_API_URL=...`, as the
+  staging deploy does). If it points where nothing listens, every embed page is
+  sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
+  viewer's browser; it does not replace the token. No other console page sends
+  a framing header.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
@@ -753,7 +890,7 @@ check.
 | Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
-| Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |
+| Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
 | SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |
 
 ## Login throttling and session cleanup

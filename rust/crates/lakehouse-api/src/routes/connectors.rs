@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use lakehouse_auth::Principal;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
 use lakehouse_dagster::{DgConfiguredRun, iso_from_unix_seconds, map_run_status};
@@ -49,8 +49,9 @@ use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarg
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::js_error;
+use crate::routes::support::upstream_message;
 use crate::state::AppState;
+use crate::upstream_error::orchestrator_unreachable;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::pipelines::pool`.
@@ -180,7 +181,7 @@ pub struct IngestibleQuery {
     due_until: Option<String>,
 }
 
-/// `GET /api/connectors/ingestible` — every connector that has an ingest
+/// `GET /api/connectors/ingestible` — the connectors that have an ingest
 /// spec set (`adapter IS NOT NULL`), as an
 /// [`connectors::IngestibleConnector`]. Gated on `ingest:read`
 /// (`POLICY_TABLE`), a strictly narrower grant than the base
@@ -188,6 +189,17 @@ pub struct IngestibleQuery {
 /// `dagster/dispar_orchestrate/ingest_factory.py`'s `ingest:read`-scoped
 /// service identity calls, from its schedule sensor and at run time
 /// (`run_ingest`'s own re-fetch of its own connector).
+///
+/// # Who sees which rows (`SEC-16`)
+///
+/// A service principal ([`PrincipalId::Service`], the identity the
+/// orchestrator holds) and an unrestricted (`*:*`) principal see every
+/// tenant's rows: scheduled loads of every tenant depend on it. Any other
+/// caller sees only the rows of the tenant [`crate::tenant_scope::resolve`]
+/// gives, filtered in SQL, and a caller in no tenant gets `[]`. Before this
+/// the route returned every tenant's hosts, usernames and secret names to
+/// anyone holding `ingest:read`. The service check reads the principal's
+/// kind, never its display name or provider.
 ///
 /// With `?dueAfter=&dueUntil=`, only the batch connectors whose
 /// `scheduleCron` fires in `(dueAfter, dueUntil]` — what the schedule
@@ -198,13 +210,29 @@ pub struct IngestibleQuery {
 /// # Errors
 ///
 /// 400 if only one bound is given or either is not RFC 3339; 503 if no
-/// pool is configured; 500 on a database failure.
+/// pool is configured; 500 on a database failure; 401 without a
+/// principal; 404 if `X-Tenant` names a tenant the caller is not in.
 pub async fn list_ingestible(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Query(query): Query<IngestibleQuery>,
 ) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     let window = due_window(&query)?;
-    let all = connectors::list_ingestible_connectors(pool(&state)?).await?;
+    // SEC-16: only a service identity or an unrestricted principal reads
+    // across tenants; everyone else is scoped like `list`, fail closed.
+    let all = if matches!(principal.id, PrincipalId::Service(_))
+        || crate::routes::catalog::is_unrestricted(&principal)
+    {
+        connectors::list_ingestible_connectors(pool(&state)?).await?
+    } else if let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? {
+        connectors::list_ingestible_connectors_for_tenant(pool(&state)?, tenant_id).await?
+    } else {
+        Vec::new()
+    };
     Ok(ApiJson(match window {
         Some((after, until)) => all
             .into_iter()
@@ -3196,17 +3224,18 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// (WS3 plan review Z9)
 ///
 /// [`lakehouse_dagster::DgClient::launch_run_with_config`] returns
-/// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`, for
-/// a GraphQL-level launch failure (a bad job name, a
+/// `Ok(LaunchOutcome { run_id: None, failure: Some(_) })`, NOT `Err`,
+/// for a GraphQL-level launch failure (a bad job name, a
 /// `RunConfigValidationInvalid`) — exactly the branching
-/// `routes::pipelines::trigger` (`pipelines.rs:184-207`) already proves
-/// out: `Err` is reserved for transport failures and malformed GraphQL
-/// responses. This handler branches the identical way: `outcome.error`
-/// present becomes a 422 naming that error; `Err(err)` becomes a 503,
-/// classified through [`js_error`] the same way `trigger`'s own 503
-/// branch is (`DgError`'s `Display` is already sanitized — see that
-/// type's doc comment — so this is not a fourteenth Phase-1
-/// `ApiError::Internal(err.to_string())` leak).
+/// `routes::pipelines::trigger` already proves out: `Err` is reserved
+/// for transport failures and malformed GraphQL responses. This
+/// handler branches the identical way: `outcome.failure` present
+/// becomes a 422 with the fixed body string `"Dagster did not accept
+/// the ingest run"` (F2.7: Dagster's own text was logged at the
+/// dagster crate boundary), except that a job the orchestrator has not
+/// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
+/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// see below.
 ///
 /// # Errors
 ///
@@ -3217,6 +3246,22 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// queued or running (see [`ingest_run_history`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
 /// on a `Dagster` transport failure; 503/500 as above for the database pool.
+///
+/// Two `503` answers carry a stable `code` beside the fixed `error`
+/// sentence and a `Retry-After`, so a client retries on the code and never
+/// on text (`PR #105 CI fix`; the G6 gates used to match `Dagster`'s own
+/// `PipelineNotFoundError` text, which `SEC-11` rightly removed):
+///
+/// - `orchestrator_job_not_loaded`: the launch result is `Dagster`'s typed
+///   "job not found" (or an unreachable user-code server), i.e. the code
+///   location is still loading. It was a `422` before; `503` is the
+///   route's status for "backing service not ready", the console treats
+///   any non-2xx the same, and nothing else depends on the `422`.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
+///   with a protocol failure, on the run list or the launch.
+///
+/// Every other launch failure stays the generic `422` with a reference id
+/// and no code.
 ///
 /// # A run of one table (`SRC-10` decision 5)
 ///
@@ -3302,7 +3347,7 @@ async fn launch_ingest(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| orchestrator_unreachable(&err))?;
     if let Some(active) = connector_runs(&recent, &id)
         .into_iter()
         .find(ConnectorIngestRun::is_active)
@@ -3353,8 +3398,21 @@ async fn launch_ingest(
         .await
     {
         Ok(outcome) => {
-            if let Some(error) = outcome.error {
-                return Err(ApiError::Unprocessable(error).into());
+            if let Some(failure) = outcome.failure {
+                // `PR #105 CI fix` (SEC-11): "not loaded yet" is decided from
+                // Dagster's typed result, never from its text, and answered
+                // with a fixed sentence and a stable code the gates and the
+                // console retry on.
+                if outcome.job_not_loaded {
+                    return Err(crate::upstream_error::job_not_loaded(&failure.as_str()).into());
+                }
+                // F2.7: the 422 body is the FIXED classified string; Dagster's
+                // own `message` / `errors[].message` text was logged at the
+                // dagster crate boundary.
+                return Err(ApiError::Unprocessable(
+                    "Dagster did not accept the ingest run".to_owned(),
+                )
+                .into());
             }
             if let (Some((object, action)), Some(principal)) = (&request, principal) {
                 // The table's name and the action, never a row or a count.
@@ -3371,7 +3429,7 @@ async fn launch_ingest(
             }
             Ok(ApiJson(json!({ "runId": outcome.run_id })))
         }
-        Err(err) => Err(ApiError::Unavailable(js_error(err)).into()),
+        Err(err) => Err(orchestrator_unreachable(&err).into()),
     }
 }
 
@@ -3549,7 +3607,7 @@ pub async fn ingest_run_history(
         .dagster
         .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
     Ok(ApiJson(connector_runs(&runs, &id)))
 }
 

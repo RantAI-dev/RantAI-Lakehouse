@@ -47,8 +47,10 @@ Frontend:
 bun run typecheck   # tsc --noEmit
 bun run lint        # eslint
 bun run test         # bun test src/lib
-bun --bun next build # production build
+bun run build       # production build
 ```
+
+`bun run build` runs `next build` under Node (Node 20.9 or newer must be installed). It runs under Node because Bun's Turbopack runtime fails with "Expected CommonJS module to have a function wrapper" (`REL-8`, PR #170 review round 1, SHOULD-FIX 2).
 
 Backend (from `rust/`):
 

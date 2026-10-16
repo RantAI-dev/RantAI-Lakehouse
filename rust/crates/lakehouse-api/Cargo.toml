@@ -88,8 +88,8 @@ croner.workspace = true
 # list, WHERE, nested subquery) without hand-rolling an exhaustive
 # `Expr` match that a future sqlparser variant could silently bypass.
 sqlparser = { workspace = true, features = ["visitor"] }
-# `croner` 2.x always pulls in `chrono` as its own non-optional datetime
-# backend (see `rust/Cargo.toml`'s comment on the `croner` entry); this
+# `croner` pulls in `chrono` as its datetime backend through its default
+# `chrono` feature (see `rust/Cargo.toml`'s comment on the `croner` entry); this
 # crate needs `chrono` itself as a direct dependency too, for
 # `crate::next_run::next_run_at`'s own `chrono::DateTime::from_timestamp`
 # round trip -- `chrono` was already in `rust/Cargo.lock` as a TRANSITIVE
@@ -148,6 +148,9 @@ tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
+# `AppState::webhook_sender_override`: tests that deliver to a loopback
+# `wiremock` listener need a resolver that approves it (`SEC-10` merge).
+lakehouse-notify = { path = "../lakehouse-notify", features = ["test-support"] }
 # connector_probe.rs's own tests (`PanicIfCalledResolver`) implement
 # `lakehouse_core::secret::DynSecretResolver` directly -- that trait is
 # `#[async_trait::async_trait]` at its definition site

@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 
 use super::arg_str;
 use crate::state::AppState;
+use crate::upstream_error;
 
 /// Deserializes `args` directly into [`AlertRuleInput`] — its fields
 /// (`name`, `type`, `mart`, `measure`, `agg`, `op`, `threshold`, `board`,
@@ -49,7 +50,8 @@ pub(super) async fn list_alert_rules(state: &AppState, principal: Option<&Princi
             Ok(rules) => json!({ "rules": rules }),
             Err(err) => json!({ "error": err.to_string() }),
         },
-        Err(err) => json!({ "error": err.to_string() }),
+        // SEC-11: the database's own text goes to the log under a reference id.
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -72,9 +74,12 @@ pub(super) async fn create_alert_rule(
     {
         return json!({ "error": err.to_string() });
     }
-    match lakehouse_alerts::save_rule(&state.clickhouse, &input, None).await {
+    // SEC-10: `save_rule` checks the webhook target with the same sender and
+    // message as the console route.
+    let webhooks = state.webhook_sender();
+    match lakehouse_alerts::save_rule(&state.clickhouse, &webhooks, &input, None).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -94,9 +99,11 @@ pub(super) async fn update_alert_rule(
     {
         return json!({ "error": err.to_string() });
     }
-    match lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id)).await {
+    // SEC-10: as in `create_alert_rule`.
+    let webhooks = state.webhook_sender();
+    match lakehouse_alerts::save_rule(&state.clickhouse, &webhooks, &input, Some(&id)).await {
         Ok(rule) => json!({ "ok": true, "rule": rule }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::alert(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -116,7 +123,7 @@ pub(super) async fn delete_alert_rule(
     }
     match lakehouse_alerts::delete_rule(&state.clickhouse, &id).await {
         Ok(()) => json!({ "ok": true }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -125,7 +132,8 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    let http = reqwest::Client::new();
+    // SEC-10: the sender checks every webhook target and never follows a redirect.
+    let http = state.webhook_sender();
     let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
     // Same real `FreshnessSource`/`SilenceSource` wiring as
     // `routes::alerts::run` (WS5 item C1) — reused here, not
@@ -163,7 +171,7 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     .await
     {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
@@ -178,6 +186,76 @@ mod tests {
 
     fn state() -> AppState {
         AppState::new(Config::from_map(&HashMap::new()).unwrap())
+    }
+
+    /// SEC-11: a `ClickHouse` that fails every request with a planted marker.
+    async fn failing_clickhouse() -> (wiremock::MockServer, AppState) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 60. DB::Exception: Table planted-marker-table-x doesn't exist (version 0.0.0)",
+            ))
+            .mount(&server)
+            .await;
+        let mut state = state();
+        state.clickhouse = std::sync::Arc::new(lakehouse_clickhouse::ChClient::new(
+            server.uri(),
+            "default".to_owned(),
+            String::new(),
+        ));
+        (server, state)
+    }
+
+    fn assert_fixed_failure(result: &Value) {
+        let text = result.to_string();
+        assert!(
+            !text.contains("planted-marker"),
+            "database text leaked: {text}"
+        );
+        assert!(!text.contains("version 0.0.0"), "{text}");
+        assert!(result["errorId"].is_string(), "no reference id: {text}");
+        assert_eq!(result["error"], "The database request failed.");
+    }
+
+    #[tokio::test]
+    async fn a_failing_alert_tool_reports_a_fixed_message_and_a_reference() {
+        let (_server, state) = failing_clickhouse().await;
+        assert_fixed_failure(&list_alert_rules(&state, None).await);
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("r1"));
+        // `SRC-7`: without an unrestricted principal the delete first reads
+        // the rule for the scope check; that failure has its own fixed
+        // message (no database text), so only the leak is asserted here.
+        let deleted = delete_alert_rule(&state, None, &args).await;
+        assert!(
+            !deleted.to_string().contains("planted-marker"),
+            "database text leaked: {deleted}"
+        );
+    }
+
+    /// Validation text in `AlertError` is ours and stays as written.
+    #[tokio::test]
+    async fn an_alert_validation_failure_keeps_its_own_message() {
+        // `save_rule` ensures its table first, then validates; a healthy
+        // `ClickHouse` gets us to the validation message.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        let mut state = state();
+        state.clickhouse = std::sync::Arc::new(lakehouse_clickhouse::ChClient::new(
+            server.uri(),
+            "default".to_owned(),
+            String::new(),
+        ));
+        let result = create_alert_rule(&state, None, &Map::new()).await;
+        assert!(result["error"].is_string(), "{result}");
+        assert!(result.get("errorId").is_none(), "{result}");
     }
 
     #[tokio::test]

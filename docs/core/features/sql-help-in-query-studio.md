@@ -28,7 +28,7 @@ A query that fails in Query Studio shows its error and nothing else. The person 
 
 ## Not included
 
-- Variables in the statement. **Waits for `QS-5`.**
+- Variables in the statement. **Blocked by `QS-5`.**
 - An optimise action. The spec names one against Databricks and Snowflake; it is not built here.
 - Autocomplete by AI (the spec lists it as later).
 - Fix with AI on Trino. It is a later backlog item, after another stream repairs Trino's catalog access on staging; until then the button is disabled on Trino and says why.

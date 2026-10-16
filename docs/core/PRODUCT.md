@@ -131,7 +131,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Pipelines with schedules, dependencies, retries, alerts, version history | **Have** | Yes | — |
+| Pipelines with schedules, dependencies, retries, alerts, version history | **Have**. A pipeline reads Bronze (Iceberg) tables since `BLD-3` (PR #155), proven by gate `g7` in CI | Yes | — |
 | Transformations authored in the console | **Partial.** Five operations: dedupe, filter, rename, cast, select. Joins and aggregations are written as SQL outside the builder | Yes: full SQL, visual and code | Richer transformations |
 | Tables that refresh themselves when their inputs change | **Missing.** Not found; pipelines that run after their upstreams are the nearest thing | Yes (Dynamic Tables, materialized views) | Yes |
 | Notebooks, Python, Spark | **Missing** | Yes, all three | Large; decide if wanted |
@@ -271,10 +271,11 @@ in `README.md` ("Status / Known limitations").
   affected pages return errors.
 - Workspace settings cannot be changed.
 
-Earlier documents (`PRODUCT_SPECS.md`, `docs/FEATURE_COVERAGE.md`,
-`docs/UX_FLOWS.md`, the sales playbook) describe an older product and
-disagree with the build in places. Where they differ from this file, trust
-this file and the code.
+Earlier product documents (the old product spec, feature coverage table,
+UX flows and similar) were moved to [`docs/archive/`](../archive/) on
+2026-10-15 (`DOC-1`). The sales playbook still describes an older
+positioning (decision 6 below). Where any document differs from this file,
+trust this file and the code.
 
 ---
 
@@ -375,7 +376,7 @@ the single list the base mirrors. The table here is the summary.
 | 2 | What switching publishing off does | Stop updating; keep the table |
 | 3 | The "decide whether we want these" list in section 5 | Say no to model training and mobile app; defer the rest |
 | 4 | Which competitor is the one to beat | Per module, as the specs already use: Metabase for dashboards (Tableau as the ceiling), Databricks for Data and Query Studio, Airbyte for connectors |
-| 5 | What happens to the old documents | Archive `PRODUCT_SPECS.md` and `docs/UX_FLOWS.md`; rewrite `docs/FEATURE_COVERAGE.md` from section 2 |
+| 5 | What happens to the old documents | Decided 2026-10-15 (`DOC-1`, product owner's instruction): all archived in `docs/archive/`; section 2 of this file is the coverage table, so `FEATURE_COVERAGE.md` was archived rather than rewritten |
 | 6 | Rewrite the sales playbook around the new positioning | Yes; it leads with on-premises, which is no longer the main message |
 | 7 | Which assistant actions need human approval (`DEC-8`) | Also making a dashboard public or embeddable, changing who can see it, and email outside the company |
 | 8 | How to get business-app connectors (`DEC-9`) | Reuse dlt verified sources first; our loader already runs on dlt |

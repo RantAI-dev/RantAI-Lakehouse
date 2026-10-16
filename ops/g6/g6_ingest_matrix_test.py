@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -110,8 +111,11 @@ SFTP_HOSTKEY_PUB = "/sftp-hostkey/ssh_host_ed25519_key.pub"
 MSSQL_SA_PASSWORD = os.environ.get("MSSQL_SA_PASSWORD", "")
 MONGO_G6_ROOT_USER = os.environ.get("MONGO_G6_ROOT_USER", "")
 MONGO_G6_ROOT_PASSWORD = os.environ.get("MONGO_G6_ROOT_PASSWORD", "")
-RUSTFS_ACCESS_KEY = os.environ.get("RUSTFS_ACCESS_KEY", "rustfsadmin")
-RUSTFS_SECRET_KEY = os.environ.get("RUSTFS_SECRET_KEY", "rustfsadmin")
+# SEC-18: no literal fallback. docker-compose.yml passes these into
+# `g6-test-runner` from the job's CI-only .env (must-set), so an empty value
+# here means the gate was started outside that wiring and should fail.
+RUSTFS_ACCESS_KEY = os.environ.get("RUSTFS_ACCESS_KEY", "")
+RUSTFS_SECRET_KEY = os.environ.get("RUSTFS_SECRET_KEY", "")
 CATALOG_DB = "icecat_g6"
 
 GATE_SECRETS_DIR = "/gate-secrets"
@@ -130,8 +134,56 @@ TENANT_ID = ""
 GATE_TENANT_SLUG = "meridian-group"
 
 
+# SEC-11 replaces an upstream error's text with a fixed sentence plus
+# "Reference: <10 hex>"; the raw text is only in the API's log under that
+# reference. This gate runs in a container with no docker socket, so it
+# cannot read that log itself (see step_column_gate_rejects_an_unsupported_
+# column_type); it names the reference and the command instead, and CI's
+# "API log lines for the references the gate quoted" step prints the lines
+# (`ops/gates/api_log_for_references.sh`). PR #105 CI fix.
+_REFERENCE_RE = re.compile(r"Reference: ([0-9a-f]{10})")
+
+
+def reference_hint(text: str) -> str:
+    """The note appended to a failure whose text quotes an API reference id,
+    or "" when it quotes none."""
+    refs = sorted(set(_REFERENCE_RE.findall(text)))
+    if not refs:
+        return ""
+    return (
+        "\n  the API logged the upstream error under reference "
+        + ", ".join(refs)
+        + " (docker compose logs lakehouse-api | grep "
+        + "\\|".join(refs)
+        + "); CI prints those lines after a failed run"
+    )
+
+
 class G6Failure(Exception):
-    pass
+    def __init__(self, message: object = "") -> None:
+        text = str(message)
+        super().__init__(text + reference_hint(text))
+
+
+# `code` values the API puts beside `error` when the orchestrator is not
+# ready (rust/crates/lakehouse-api/src/upstream_error.rs): the job's code
+# location is still loading, or the orchestrator did not answer. These are
+# the only API failures a launch is retried on, and the test is the code,
+# never the message text (PR #105 CI fix; SEC-11 removed Dagster's text).
+RETRYABLE_ORCHESTRATOR_CODES = ("orchestrator_job_not_loaded", "orchestrator_unreachable")
+# One wait for Dagster to list the job and then up to this many launches.
+INGEST_RUN_ATTEMPTS = 3
+
+
+def api_error_code(resp: requests.Response) -> str | None:
+    """The `code` field of an API error body, or None for a body that is
+    not JSON or carries none."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
 
 
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0):
@@ -172,7 +224,7 @@ def step_wait_for_services() -> None:
     # POST races the recovered gRPC server by milliseconds (seen twice in
     # CI: PR #57 and the R3 merge to main). The launch sites guard against
     # that race directly via `_post_ingest_run`, which waits again on a
-    # 422 `PipelineNotFoundError` and retries once. Wait here only until
+    # 503 with `code: orchestrator_job_not_loaded` and retries. Wait here only until
     # Dagster itself lists `ingest_job`.
     _wait_for("Dagster code location (ingest_job loaded)", _ingest_job_is_loaded, 120)
 
@@ -483,42 +535,49 @@ def _create_connector(*, name: str, kind: str, host: str, credential: dict) -> d
     return created.json()
 
 
-def _post_ingest_run(connector_id: str) -> requests.Response:
-    """POST /api/connectors/{id}/ingest/run with a one-shot retry that
-    closes compose's dagster-code-location reload window. The reload
-    can land AFTER step_wait_for_services() already observed a loaded
-    location -- compose recreates the container when THIS runner
-    starts, so the first launch POST races the recovered gRPC server
-    by milliseconds and the API returns 422 `PipelineNotFoundError`
-    (seen twice in CI: PR #57 and the R3 merge to main). On a 422
-    whose body names `PipelineNotFoundError`, wait up to 120 s for
-    `_ingest_job_is_loaded` and POST once more. Any other failure
-    raises immediately. The retry's own failure raises with an
-    explicit `post-reload retry` note so the gate's failure log names
-    which side of the race it lost.
+def _post_ingest_run(connector_id: str, body: dict | None = None) -> requests.Response:
+    """POST /api/connectors/{id}/ingest/run, retried ONLY while the API
+    says the orchestrator is not ready. Compose can recreate the
+    dagster-code-location container when THIS runner starts, so a launch
+    can race the recovered gRPC server by milliseconds (seen in CI: PR #57,
+    the R3 merge to main, PR #105). The API answers that with 503 and
+    `code: orchestrator_job_not_loaded` (Dagster's typed "job not found")
+    or `orchestrator_unreachable` (Dagster did not answer while it
+    reloaded). On such a code the gate waits up to 120 s for
+    `_ingest_job_is_loaded`, honours Retry-After, and POSTs again, at most
+    INGEST_RUN_ATTEMPTS launches in all. Any other failure, including every
+    other status and a 503 without one of those codes, raises at once: a
+    gate that retried anything would prove nothing.
+
+    This used to match `PipelineNotFoundError` in the response text, which
+    SEC-11 (no upstream text in a response) removed; the transient then
+    became a hard failure (PR #105 CI fix).
+
+    `body` is SRC-10's run of one table (`{object, action}`); it is sent on
+    every attempt, so the SRC-10 steps get the same retry on the code.
     """
     url = f"{API_URL}/api/connectors/{connector_id}/ingest/run"
-    resp = API.post(url, timeout=10)
+    resp = API.post(url, json=body, timeout=10)
+    for attempt in range(1, INGEST_RUN_ATTEMPTS):
+        if resp.ok:
+            return resp
+        code = api_error_code(resp)
+        if resp.status_code != 503 or code not in RETRYABLE_ORCHESTRATOR_CODES:
+            break
+        print(
+            f"[g6] ingest/run for {connector_id!r} answered {code} (launch {attempt} of "
+            f"{INGEST_RUN_ATTEMPTS}); waiting for ingest_job to reload"
+        )
+        _wait_for(
+            "Dagster code location (ingest_job loaded) post-reload",
+            _ingest_job_is_loaded,
+            120,
+        )
+        time.sleep(min(int(resp.headers.get("Retry-After", "1") or 1), 30))
+        resp = API.post(url, json=body, timeout=10)
     if resp.ok:
         return resp
-    if resp.status_code != 422 or "PipelineNotFoundError" not in resp.text:
-        raise G6Failure(f"ingest/run for {connector_id!r} failed: {resp.status_code} {resp.text}")
-    print(
-        f"[g6] ingest/run for {connector_id!r} hit the dagster-code-location "
-        "reload window; waiting for ingest_job to reload"
-    )
-    _wait_for(
-        "Dagster code location (ingest_job loaded) post-reload",
-        _ingest_job_is_loaded,
-        120,
-    )
-    retry = API.post(url, timeout=10)
-    if retry.ok:
-        return retry
-    raise G6Failure(
-        f"ingest/run for {connector_id!r} failed (post-reload retry): "
-        f"{retry.status_code} {retry.text}"
-    )
+    raise G6Failure(f"ingest/run for {connector_id!r} failed: {resp.status_code} {resp.text}")
 
 
 def _register_and_run(
@@ -1690,13 +1749,9 @@ def _src10_latest(connector_id: str, table: str) -> tuple | None:
 
 
 def _src10_run(connector_id: str, label: str, body: dict | None = None) -> None:
-    if body is None:
-        run_id = _post_ingest_run(connector_id).json().get("runId")
-    else:
-        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/ingest/run", json=body, timeout=10)
-        if not resp.ok:
-            raise G6Failure(f"SRC-10 {label}: ingest/run {body} answered {resp.status_code} {resp.text[:300]}")
-        run_id = resp.json().get("runId")
+    # Through `_post_ingest_run` (retry on the API's `code`, PR #105 CI fix),
+    # with or without a body: a run of one table can meet the same reload.
+    run_id = _post_ingest_run(connector_id, body).json().get("runId")
     if not run_id:
         raise G6Failure(f"SRC-10 {label}: ingest/run returned no runId")
     print(f"[g6] SRC-10 {label}: launched run {run_id}")

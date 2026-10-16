@@ -29,7 +29,7 @@
 
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::{Ident, SqlLiteral};
-use lakehouse_notify::{DeliverResult, EmailSender, deliver};
+use lakehouse_notify::{DeliverResult, EmailSender, WebhookSender, deliver};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -990,15 +990,27 @@ pub async fn get_rule(ch: &ChClient, id: &str) -> Result<Option<AlertRule>, ChEr
 /// # Errors
 ///
 /// Returns [`AlertError::Validation`] on invalid input (see
-/// [`normalize_input`]), or [`AlertError::Clickhouse`] on a `ClickHouse`
-/// failure.
+/// [`normalize_input`]) or a webhook target `webhooks` refuses (`SEC-10`),
+/// or [`AlertError::Clickhouse`] on a `ClickHouse` failure.
 pub async fn save_rule(
     ch: &ChClient,
+    webhooks: &WebhookSender,
     input: &AlertRuleInput,
     id: Option<&str>,
 ) -> Result<AlertRule, AlertError> {
     ensure(ch).await?;
     let normalized = normalize_input(input)?;
+    // SEC-10: refuse a webhook that points at an address webhooks may not
+    // reach when the rule is SAVED, with the sender's fixed message, so the
+    // author learns at once instead of from a failed delivery. A name can
+    // resolve differently later, so the sender checks again at every send;
+    // this check is the early warning, that one is the guarantee.
+    if normalized.channel == AlertChannel::Webhook {
+        webhooks
+            .check(&normalized.target)
+            .await
+            .map_err(|err| AlertError::Validation(err.to_string()))?;
+    }
     let rid = id.map_or_else(new_rule_id, str::to_owned);
     let enabled: u8 = u8::from(input.enabled != Some(false));
     let threshold = normalized.threshold;
@@ -1185,6 +1197,17 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
     } else {
         Vec::new()
     };
+    // BI-8: a tile on a SQL source that names a calculated field is built
+    // over it, so the fields are read when a source tile exists. A mart tile
+    // uses the SQL stored with it, as before.
+    let fields = if sources.is_empty() {
+        lakehouse_bi::fields::FieldCatalog::default()
+    } else {
+        lakehouse_bi::fields::FieldCatalog::from_fields(
+            lakehouse_bi::fields::list_fields(ch).await?,
+        )
+    };
+    let time = lakehouse_bi::grain::TimeContext::default();
     let mut lines = vec![format!(
         "Dashboard: {} — {} tile",
         board.name,
@@ -1201,12 +1224,19 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         let sql = match chart.def.sql_source.as_deref() {
             None => Some(chart.spec.sql.clone()),
             Some(id) => sources.iter().find(|s| s.id == id).and_then(|s| {
+                // BI-9: a digest tile is a KPI or gauge with no dashboard
+                // filters, so no date expression, bucket or relative filter
+                // is built here and the default time context is never read.
                 lakehouse_bi::builder::sql_for_sql_source(
                     chart,
                     &s.sql,
-                    &s.column_names(),
+                    &s.column_kinds(),
                     &[],
                     &[],
+                    &lakehouse_bi::builder::ReadContext {
+                        fields: &fields,
+                        ..lakehouse_bi::builder::ReadContext::new(&time)
+                    },
                 )
             }),
         };
@@ -1404,7 +1434,7 @@ pub fn late(
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
 pub async fn evaluate_pipeline_late(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     pipeline_id: &str,
     late_source: Option<&dyn LateSource>,
@@ -1512,11 +1542,22 @@ pub async fn late_decision(
 /// * `Source(String)` — a classified error from the [`LateSource`]
 ///   implementation (the message is already classified by the source
 ///   before this crate sees it).
+///
+/// F2.7: `ListRules` previously used `#[error(transparent)]`, which
+/// forwarded the upstream `ClickHouse` error body (`ChError::Server`)
+/// into `routes::alerts`'s `format!("{err}")` — a leak of upstream text
+/// into the 500 response. The route layer's `format!("{err}")` (lines
+/// 757 / 793) now sees the FIXED display, never `ChError`'s Display —
+/// the upstream detail remains available via `tracing::error!(source
+/// = %err, ...)` (or by inspecting `err` at the route layer) and is
+/// not echoed in the HTTP body.
 #[derive(Debug, Error)]
 pub enum PipelineLateError {
     /// `ClickHouse` unreachable while listing alert rules (mirrors the
-    /// sibling functions' `ChError` return).
-    #[error(transparent)]
+    /// sibling functions' `ChError` return). F2.7: `Display` is a
+    /// FIXED classified string — the upstream `ClickHouse` body is
+    /// NOT echoed through `Display` here (AGENTS.md principle 4).
+    #[error("database error")]
     ListRules(#[from] ChError),
     /// A classified error from the [`LateSource`] implementation — the
     /// message is already classified by the source before this crate
@@ -1541,7 +1582,7 @@ pub enum PipelineLateError {
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
 pub async fn evaluate_pipeline_slow(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     pipeline_id: &str,
     run_id: &str,
@@ -1585,7 +1626,7 @@ pub async fn evaluate_pipeline_slow(
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
 pub async fn evaluate_pipeline_volume_drop(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     pipeline_id: &str,
     run_id: &str,
@@ -1621,7 +1662,7 @@ pub async fn evaluate_pipeline_volume_drop(
 /// caller — this never sees a "this kind didn't fire" case.
 async fn deliver_one_kind(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     pipeline_id: &str,
     silence: Option<&dyn SilenceSource>,
@@ -1684,7 +1725,7 @@ impl RuleScope<'_> {
 /// `SRC-17` F1: the outcome used to be discarded here).
 async fn deliver_matching(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     kind: AlertKind,
@@ -1712,7 +1753,7 @@ async fn deliver_matching(
 /// fail on the rule store.
 async fn deliver_to_matching(
     rules: &[AlertRule],
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     kind: AlertKind,
@@ -1759,7 +1800,7 @@ pub async fn load_rules(ch: &ChClient) -> Result<Vec<AlertRule>, ChError> {
 /// its outcome (`SRC-17` F1, F2). Non-`SRC-7` kinds deliver nothing.
 pub async fn deliver_connector_event_to(
     rules: &[AlertRule],
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     kind: AlertKind,
     connector_id: &str,
@@ -1806,7 +1847,7 @@ pub async fn deliver_connector_event_to(
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
 pub async fn evaluate_connector_event(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     kind: AlertKind,
     connector_id: &str,
@@ -1845,7 +1886,7 @@ pub async fn evaluate_connector_event(
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
 pub async fn evaluate_pipeline_failure(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     pipeline_id: &str,
     run_id: &str,
@@ -1919,7 +1960,7 @@ pub async fn evaluate_pipeline_failure(
 /// propagated.
 pub async fn run_rules(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     only: Option<&str>,
     freshness: Option<&dyn FreshnessSource>,
@@ -1941,7 +1982,7 @@ pub async fn run_rules(
 
 async fn run_one(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     freshness: Option<&dyn FreshnessSource>,
     silence: Option<&dyn SilenceSource>,
@@ -2021,7 +2062,7 @@ fn now_millis() -> i64 {
 /// caller still records `RunResult::fired`/`value` honestly — only this
 /// delivery attempt is skipped. WS5 plan review U6.
 async fn deliver_unless_silenced(
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     rule: &AlertRule,
@@ -2050,7 +2091,7 @@ async fn deliver_unless_silenced(
 
 async fn run_alert(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     gate: &dyn SqlGate,
@@ -2096,7 +2137,7 @@ async fn run_alert(
 
 async fn run_digest(
     ch: &ChClient,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     gate: &dyn SqlGate,
@@ -2138,7 +2179,7 @@ async fn run_digest(
 ///   inability to measure freshness is not evidence either way.
 async fn run_freshness(
     freshness: Option<&dyn FreshnessSource>,
-    http: &reqwest::Client,
+    http: &WebhookSender,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
     rule: &AlertRule,
@@ -2258,6 +2299,41 @@ mod tests {
     fn late_is_false_when_gap_is_exactly_the_threshold() {
         // Strict `>`: gap == threshold is NOT late.
         assert_eq!(late(Some(1_000.0), Some(800.0), Some(200)), Some(false));
+    }
+
+    // ── F2.7: `PipelineLateError::ListRules` Display ────────────────────
+    //
+    // The route layer at `routes/alerts.rs:757,793` formats the error
+    // with `format!("{err}")`. Pre-fix that carried `ChError`'s body
+    // verbatim (e.g. `Code: 47. Unknown identifier: nope`) into the 500
+    // response. The sentinel text MUST NOT survive Display; the route
+    // layer's output MUST be the fixed `"database error"` classified
+    // string (AGENTS.md principle 4: classify before surfacing).
+
+    #[test]
+    fn pipeline_late_error_list_rules_display_does_not_forward_clickhouse_body() {
+        const SENTINEL: &str = "ALERTS_LIST_RULES_SENTINEL_999111";
+        let err: PipelineLateError =
+            ChError::Server(format!("Code: 47. Unknown identifier — {SENTINEL}")).into();
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "`PipelineLateError::ListRules` Display MUST NOT forward `ChError`'s body, got {rendered:?}",
+        );
+        assert_eq!(
+            rendered, "database error",
+            "`PipelineLateError::ListRules` Display MUST be the fixed \"database error\" classified string",
+        );
+    }
+
+    #[test]
+    fn pipeline_late_error_source_display_carries_the_supplied_string() {
+        // Sanity: the `Source(String)` variant stays untouched by the F2
+        // fix — the doc comment promises it is ALREADY classified by
+        // the LateSource implementation, so it is safe to forward
+        // verbatim.
+        let err = PipelineLateError::Source("classified at the source".to_owned());
+        assert_eq!(format!("{err}"), "classified at the source");
     }
 
     // ── SqlGate ──────────────────────────────────────────────────────────
@@ -2934,6 +3010,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Orders failure".to_owned()),
                 kind: Some("pipeline_failure".to_owned()),
@@ -2947,7 +3024,7 @@ mod tests {
         .await
         .unwrap();
 
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_failure(
             &ch,
@@ -2994,6 +3071,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Any failure".to_owned()),
                 kind: Some("pipeline_failure".to_owned()),
@@ -3007,7 +3085,7 @@ mod tests {
         .await
         .unwrap();
 
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched =
             evaluate_pipeline_failure(&ch, &http, &email, "pl-some-other", "run-x", &[], None)
@@ -3044,6 +3122,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Other failure".to_owned()),
                 kind: Some("pipeline_failure".to_owned()),
@@ -3057,7 +3136,7 @@ mod tests {
         .await
         .unwrap();
 
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched =
             evaluate_pipeline_failure(&ch, &http, &email, "pl-orders", "run-deadbeef", &[], None)
@@ -3182,6 +3261,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Orders late".to_owned()),
                 kind: Some("pipeline_late".to_owned()),
@@ -3199,7 +3279,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("pl-orders".to_owned(), (60_i32, Some(1_000.0_f64 - 600.0)));
         let source = FixedLateSource(map);
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_late(
             &ch,
@@ -3241,6 +3321,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Within threshold".to_owned()),
                 kind: Some("pipeline_late".to_owned()),
@@ -3258,7 +3339,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("pl-orders".to_owned(), (60_i32, Some(1_000.0_f64 - 30.0)));
         let source = FixedLateSource(map);
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_late(
             &ch,
@@ -3299,6 +3380,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("No SLA".to_owned()),
                 kind: Some("pipeline_late".to_owned()),
@@ -3313,7 +3395,7 @@ mod tests {
         .unwrap();
 
         let source = FixedLateSource(std::collections::HashMap::new());
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_late(
             &ch,
@@ -3360,6 +3442,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Never succeeded".to_owned()),
                 kind: Some("pipeline_late".to_owned()),
@@ -3376,7 +3459,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("pl-orders".to_owned(), (60_i32, None));
         let source = FixedLateSource(map);
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_late(
             &ch,
@@ -3419,6 +3502,7 @@ mod tests {
 
         save_rule(
             &ch,
+            &test_webhook_sender(),
             &AlertRuleInput {
                 name: Some("Any late".to_owned()),
                 kind: Some("pipeline_late".to_owned()),
@@ -3438,7 +3522,7 @@ mod tests {
             (60_i32, Some(1_000.0_f64 - 600.0)),
         );
         let source = FixedLateSource(map);
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let matched = evaluate_pipeline_late(
             &ch,
@@ -3475,6 +3559,65 @@ mod tests {
             pipeline: None,
             connector: None,
         }
+    }
+
+    /// `SEC-10`: a webhook sender that approves every target, so these
+    /// tests can deliver to a local `wiremock` listener. The address policy
+    /// itself is tested where it lives, in the API crate; here only the
+    /// wiring (save checks, delivery goes through the sender) is under test.
+    fn test_webhook_sender() -> WebhookSender {
+        lakehouse_notify::MappedResolver::new().into_sender()
+    }
+
+    /// `SEC-10`: a resolver that refuses everything, standing in for the API
+    /// crate's address policy.
+    struct RefuseAll;
+
+    impl lakehouse_notify::TargetResolver for RefuseAll {
+        fn resolve<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> lakehouse_notify::ResolveFuture<'a> {
+            Box::pin(async { Err(lakehouse_notify::TargetRefusal::NotAllowed) })
+        }
+    }
+
+    /// `SEC-10`: saving a webhook rule asks the sender first. A refused
+    /// target is a validation error with the sender's fixed message, and
+    /// nothing is inserted.
+    #[tokio::test]
+    async fn save_rule_refuses_a_webhook_the_sender_refuses() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let refusing = WebhookSender::new(std::sync::Arc::new(RefuseAll));
+
+        let err = save_rule(
+            &ch,
+            &refusing,
+            &AlertRuleInput {
+                target: Some("http://internal.test/hook".to_owned()),
+                ..valid_alert_input()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "webhook address is not allowed");
+        let inserts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("INSERT INTO console.alert_rule"))
+            .count();
+        assert_eq!(inserts, 0, "a refused rule must not be written");
     }
 
     /// SMTP unconfigured (`host: None`) — `deliver` returns a fast,
@@ -3516,7 +3659,7 @@ mod tests {
             expected: Some(30),
             last_snapshot_ms: Some(0),
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         // 60 min old, 30 min budget.
         let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
@@ -3531,7 +3674,7 @@ mod tests {
             expected: Some(30),
             last_snapshot_ms: Some(60 * 60_000 - 5 * 60_000),
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         // 5 min old, 30 min budget.
         let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
@@ -3550,7 +3693,7 @@ mod tests {
             expected: Some(30),
             last_snapshot_ms: None,
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
         assert!(!result.fired, "an unmeasurable freshness must never fire");
@@ -3564,7 +3707,7 @@ mod tests {
             expected: None,
             last_snapshot_ms: Some(0),
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
         assert!(!result.fired, "a missing dataset_sla row must never fire");
@@ -3574,7 +3717,7 @@ mod tests {
     #[tokio::test]
     async fn freshness_skips_when_no_source_is_configured() {
         let rule = freshness_rule("bronze.orders");
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let result = run_freshness(None, &http, &email, None, &rule, 60 * 60_000).await;
         assert!(!result.fired);
@@ -3611,7 +3754,7 @@ mod tests {
             expected: Some(30),
             last_snapshot_ms: Some(0),
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let result = run_freshness(
             Some(&src),
@@ -3637,7 +3780,7 @@ mod tests {
             expected: Some(30),
             last_snapshot_ms: Some(0),
         };
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let result = run_freshness(
             Some(&src),
@@ -3658,7 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_unless_silenced_skips_the_deliver_call_entirely_when_silenced() {
         let rule = freshness_rule("bronze.orders");
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered =
             deliver_unless_silenced(&http, &email, Some(&AlwaysSilenced), &rule, "title", "text")
@@ -3669,7 +3812,7 @@ mod tests {
     #[tokio::test]
     async fn deliver_unless_silenced_with_no_source_configured_behaves_as_unsilenced() {
         let rule = freshness_rule("bronze.orders");
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = deliver_unless_silenced(&http, &email, None, &rule, "title", "text").await;
         assert!(delivered.is_some());
@@ -3837,9 +3980,15 @@ mod tests {
             )
             .mount(&server)
             .await;
+        // `SEC-10` merged with `SRC-7`: the rule's webhook target is a name, so
+        // the sender needs a resolver that approves it (nothing is dialled).
+        let webhooks = lakehouse_notify::MappedResolver::new()
+            .with("hooks.example.com", "127.0.0.1:9".parse().unwrap())
+            .into_sender();
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let saved = save_rule(
             &ch,
+            &webhooks,
             &connector_input("connector_failure", Some("conn-pg-oms")),
             Some("al_c1"),
         )
@@ -3849,6 +3998,7 @@ mod tests {
 
         let err = save_rule(
             &ch,
+            &webhooks,
             &connector_input("connector_failure", Some("x' OR 1=1 --")),
             None,
         )
@@ -3943,7 +4093,7 @@ mod tests {
             ],
         )
         .await;
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = evaluate_connector_event(
             &ch,
@@ -3991,7 +4141,7 @@ mod tests {
             .mount(&server)
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = evaluate_connector_event(
             &ch,
@@ -4015,7 +4165,7 @@ mod tests {
             &[("quiet", 0)],
         )
         .await;
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = evaluate_connector_event(
             &ch,
@@ -4044,7 +4194,7 @@ mod tests {
             &[("dis", 1), ("sch", 1)],
         )
         .await;
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         for (kind, expected) in [
             (AlertKind::ConnectorDisabled, "dis"),
@@ -4065,7 +4215,7 @@ mod tests {
     async fn evaluate_connector_event_delivers_an_upload_failure_rule_for_any_upload() {
         let (_server, ch) =
             connector_event_server(&[("up", "upload_failure", "*", true)], &[("up", 1)]).await;
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = evaluate_connector_event(
             &ch,
@@ -4132,7 +4282,7 @@ mod tests {
             .mount(&server)
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let attempted = evaluate_connector_event(
             &ch,
@@ -4180,7 +4330,7 @@ mod tests {
     #[tokio::test]
     async fn evaluate_connector_event_ignores_a_non_connector_kind() {
         let (_server, ch) = connector_event_server(&[], &[]).await;
-        let http = reqwest::Client::new();
+        let http = test_webhook_sender();
         let email = no_smtp_email_sender();
         let delivered = evaluate_connector_event(
             &ch,
