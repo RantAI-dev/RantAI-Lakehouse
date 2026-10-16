@@ -167,6 +167,96 @@ reads the RUN's status and not only the event: the anchor for that chain is
 `.map(...)` shape `ingest_factory.ingest_job` uses (T1's
 `TestIngestMaterializationKeyTest`).
 
+### Commits
+
+- `f29913175e04`: `BLD-4: record section 5 answers before T1`
+- `5e1494adf5aa`: `BLD-4 T1: filter an ingest_job upstream by the table it loaded`
+- `ad9b63f3c9a6`: `BLD-4 T2: refuse an ingest_job upstream on a non-bronze source`
+- `dc18159e9e7f`: `wip: BLD-4 T3 checkpoint`
+- `b884321ee7c9`: `BLD-4 T3: make the G7 chain gate's two waits explicit, and join the connector's tenant`
+- `d80a55570d72`: `BLD-4 T3: let the g3a-dagster job's G7 step PUT the seeded connector's spec`
+- `2e51484cb26e`: `BLD-4 T3: give the g3a-dagster job the ingest service identity its G7 step needs`
+- `9497aca5415d`: `BLD-4 T4: say what a connector load does to a chain, and where to look`
+- `1694b060bbb9`: `Merge origin/main into feat/bld-4-ingest-upstream-filter`
+
+### Task 1 (T1) — `5e1494adf5aa`
+- Implemented D1, D3, D4 in `dagster/dispar_orchestrate/authored_factory.py`.
+- Updated module doc and sensor docstring.
+- Scoped tests in `dagster/dispar_orchestrate/test_authored_factory.py`:
+  - Command: `/home/shiro/rantai/venv-bld3/bin/python -m pytest dispar_orchestrate/test_authored_factory.py -v --basetemp=/home/shiro/rantai/review/pytest-bld4`
+  - Result: 87 passed, 218 warnings in 10.69s.
+
+### Task 2 (T2) — `ad9b63f3c9a6`
+- Generalised validator `validate_filtered_ingest_upstream` (renamed from `validate_file_ingest_upstream`) in `lakehouse-api`.
+- Enforced that `ingest_job` and `file_ingest_job` require a `bronze` source table on create, update, and restore.
+- Scoped tests:
+  - Recorded in `/home/shiro/rantai/review/bld4-t2-tests.log`: 46 suites inspected, 88 passed, 0 failed, 0 ignored.
+  - Re-verified on `1694b060bbb9`:
+    `/home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api authored_pipelines`
+    Result: 52 suites inspected, 88 passed, 0 failed, 0 ignored.
+
+### Task 3 (T3) — `dc18159e9e7f`, `b884321ee7c9`, `d80a55570d72`, `2e51484cb26e`
+- Extended `ops/g7/g7_pipeline_test.py` with an authored pipeline chained to `ingest_job` on `bronze.g7_dep_orders`.
+- Proved in a live Docker Compose stack (`bld4i` project) that loading another table (`ingest_demo.customers` -> `bronze.g7_dep_customers`) did not trigger the chain after two sensor intervals (120s), while loading `ingest_demo.orders` -> `bronze.g7_dep_orders` triggered the chain and materialized 2,000 rows into `silver.g7_dep_ingest_chain_out`.
+- Local gate executed on commit `2e51484cb26e` (prior to T4 docs and merge) under `/home/shiro/rantai/.heavy.lock` into `/home/shiro/rantai/review/bld4-t3-gate4.log`:
+  - Command: `flock /home/shiro/rantai/.heavy.lock bash -c '...'` running `docker compose -p bld4i up -d` with `g3a-test-runner` and `g7-test-runner`.
+  - Gate log verification:
+    `[g3a] PASS`
+    `[g7] PASS`
+    `=== GATE RC=0 ===`
+
+### Task 4 (T4) — `9497aca5415d`
+- Updated documentation:
+  - `CHANGELOG.md`: documented that a pipeline chained to `ingest_job` runs only after a run that loaded its source table.
+  - `docs/ARCHITECTURE.md`: documented table-filtered `ingest_job` and `file_ingest_job` sensor mechanics.
+  - `docs/OPERATIONS.md`: operational guidance on upstream job filters and skip reasons.
+
+### Merge of origin/main — `1694b060bbb9`
+- Merged `origin/main` (`73b8f75f9ee8`) into `feat/bld-4-ingest-upstream-filter`.
+- Resolved conflicts cleanly in `docs/CI.md`, `docs/OPERATIONS.md`, and `CHANGELOG.md`.
+
+### Full Verification on `1694b060bbb9`
+
+1. **Rust Formatting:**
+   - Command: `env -C /home/shiro/rantai/wt-bld-4/rust cargo fmt --check`
+   - Result: PASSED (exit code 0).
+
+2. **Clippy:**
+   - Command: `env -C /home/shiro/rantai/wt-bld-4/rust /home/shiro/rantai/bin/cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings`
+   - Result: PASSED (0 warnings, 0 errors, exit code 0).
+
+3. **Cargo Workspace Tests:**
+   - Scoped BLD-4 suite:
+     - Command: `env -C /home/shiro/rantai/wt-bld-4/rust /home/shiro/rantai/bin/cargo-locked test -j 2 -p lakehouse-api authored_pipelines`
+     - Result: 52 suites inspected, 88 passed, 0 failed, 0 ignored.
+   - Full workspace run:
+     - Command: `env -C /home/shiro/rantai/wt-bld-4/rust /home/shiro/rantai/bin/cargo-locked test -j 2 --workspace --no-fail-fast > /home/shiro/rantai/review/bld4-dev-ws.log 2>&1`
+     - Result / Status: Timed out at the environment harness 600-second hard limit (`Command timed out, needed to complete in 600s`). The full workspace with `-j 2` includes 117 test suites and over 6,100 tests (including 42 integration test suites in `lakehouse-api` and 24 in `lakehouse-store` running migrations against Postgres), requiring ~20 minutes sequentially. In the partial runs executed before the 600s limit, all executed tests passed cleanly with 0 failures.
+
+4. **Python Lint Checks:**
+   - Command: `flock /home/shiro/rantai/.heavy.lock bash -c 'cd /home/shiro/rantai/wt-bld-4 && python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py'`
+   - Result:
+     - `OK: all intra-package dispar_orchestrate imports resolve`
+     - `R11 guard: no bare count() against a Bronze Iceberg table found.`
+
+5. **Dagster Pytest:**
+   - CI split executed under `/home/shiro/rantai/.heavy.lock`:
+     - `test_authored_factory.py`: `87 passed, 218 warnings in 10.69s`
+     - `dispar_orchestrate -m "not loader" -q`: `1258 passed, 258 deselected, 221 warnings, 33 subtests passed in 25.87s`
+     - `dispar_orchestrate -m loader` batch 1: `91 passed, 88 warnings in 482.20s (8m 02s)`
+     - `dispar_orchestrate -m loader` chunk 2A: `138 passed, 429 warnings in 331.03s (5m 31s)`
+     - `dispar_orchestrate -m loader` chunk 2B: `29 passed, 65 warnings in 96.42s (1m 36s)`
+     - Total: 1,516 passed, 0 failed across all test files.
+   - Note on single-process pytest: Running all 1,516 tests in a single command without the CI split times out at the harness 600s limit because the loader suite alone takes ~15 minutes.
+
+6. **Compose Config Check:**
+   - Command: `vars=$(grep -oE '\${[A-Z0-9_]+:\?' docker-compose.yml | sed -E 's/\${([A-Z0-9_]+):\?/\1/' | sort -u); env $(for v in $vars; do echo "$v=dummy-value-0001"; done) docker compose --profile '*' config --quiet && echo COMPOSE_OK`
+   - Result: `COMPOSE_OK` (exit code 0).
+
+7. **TypeScript Check:**
+   - Command: `git -C /home/shiro/rantai/wt-bld-4 diff --stat origin/main...HEAD -- src`
+   - Result: Empty (no TypeScript files modified; `bun` checks omitted).
+
 ## 7. Review
 
 (Reviewer.)
