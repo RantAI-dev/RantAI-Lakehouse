@@ -441,10 +441,6 @@ lines).
 
 ## 9. Review
 
-(planner)
-
-## 9. Review
-
 Round 1, reviewed 2026-10-16 at `10e2b8fe` (developers: DeepSeek, MiniMax
 M3.1, Gemini; read with a separate security reviewer). E1, E2's refusal
 paths, E3, E5, E6 are implemented as planned; T3(b)'s mutation evidence
@@ -517,6 +513,37 @@ SQL Server dial a "CDC drop helper" (it is `connector_listing`).
 **SHOULD-FIX 9.** Pin `postgres-protocol = "0.6.12"` in `rust/Cargo.toml`
 with the reason (the SCRAM iteration cap this code relies on is there).
 
-The planner's own run of fmt, workspace clippy, `cargo deny` and the
-`lakehouse-api`/`lakehouse-store` tests is in progress; its counts go here
-before merge.
+Round 2, reviewed 2026-10-17 at `1668cbe2`. All three BLOCKERs and
+SHOULD-FIX 4–9 are fixed, each cited at its fix site:
+
+- BLOCKER 1 (`2db17d61`): `ca.key` and `ca.srl` are deleted after signing;
+  `ca.crt` is copied into a second volume, `lakehouse_postgres_ca`, which is
+  the only one `lakehouse-api` mounts. The compose re-run in the handoff
+  lists `ca.crt` alone under the API's mount.
+- BLOCKER 2 (`1f86647e`): `read_message` checks the 5-byte header and
+  refuses a length below 4 or above 64 KiB (`MAX_BACKEND_MESSAGE_LEN`) as
+  `Protocol` before `Message::parse`; a fake-server test sends
+  `0xFFFFFFFF`.
+- BLOCKER 3 (`61b5c28d`): `AuthenticationOk` after `SaslContinue` but
+  before a verified `SaslFinal` is refused, and a server that never asks
+  for a password is refused as `NoPasswordAsked` ("the server did not ask
+  for a password"). Mutation evidence for each is in the round-2 handoff.
+- SHOULD-FIX 4–9: comment corrected (no channel binding, the relay risk
+  without a CA documented in OPERATIONS); the `:-` CA default documented
+  with the combined-bundle route in OPERATIONS and `.env.example`; startup
+  parses at least one PEM certificate; tiberius' extra public roots stated
+  at `connector_probe.rs` and in OPERATIONS; changelog names corrected;
+  `postgres-protocol = "0.6.12"` pinned with the reason.
+
+Planner verification at `1668cbe2`, run from the shared target under the
+heavy lock (`review-logs/sec14b-review2.log`): `cargo fmt --check` ok;
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+exit 0; `cargo deny check` exit 0; `RUST_TEST_THREADS=2 cargo test -p
+lakehouse-api -p lakehouse-store --no-fail-fast`: 5009 passed, 29 failed,
+4 ignored. The 29 failures were in three binaries (`connector_oauth_flow`
+17, `connector_probe_history_route` 4, `connector_repoint` 8) while the
+machine's load average was 15–30 from other stacks; rerun alone with
+`RUST_TEST_THREADS=1` (`review-logs/sec14b-rerun.log`) all three pass:
+20, 5 and 13 passed, 0 failed. Not a regression.
+
+No open BLOCKER. Ready for the pull request.
