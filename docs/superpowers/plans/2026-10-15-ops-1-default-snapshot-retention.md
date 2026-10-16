@@ -139,6 +139,85 @@ any Rust or console change.
   - `check_bare_iceberg_count.py`: OK.
   - Gitleaks scan: Clean (0 leaks found).
 
+### Handoff (2026-10-16, round 2 — T2, the measurement)
+
+1. **Commits** (`git log --oneline origin/main..HEAD`):
+   - `76cd01c9` `chore(trino): measurement-only override for the OPS-1 snapshot floor`
+   - `0d9b73e0` `docs(plans): OPS-1 result, the measured default snapshot retention`
+
+2. **Verification actually run** (every command below ran in this worktree, in the
+   foreground, on the pushed commit; logs under `/home/shiro/rantai/review-logs/`):
+   - `sh ops/init-env.sh` → wrote a local, gitignored `.env` (SEC-18: no default credentials).
+   - `docker compose --profile '*' config --quiet` → OK, unchanged by the new file
+     (run again after the override was added).
+   - `docker compose -f docker-compose.yml -f ops/trino/docker-compose.ops1-measure.override.yml --profile trino config` → OK; the rendered `services.trino.command` is byte-identical to the base file's apart from one added line once shell comments are stripped, verified by diffing the two configs.
+   - `docker compose -p ops1check --profile dagster build dagster-code-location` → `Image rantai-lakehouse-dagster:local Built`.
+   - `docker compose -p ops1check --profile dagster --profile trino up -d lakehouse-api dagster-code-location dagster-webserver dagster-daemon trino trino-maintenance-cron` → started; `docker compose -p ops1check ps` reports `trino running healthy`, `dagster-webserver healthy`.
+   - Ten `docker compose -p ops1check exec -T trino trino --server http://trino:8080 --user trino-maintenance --execute "INSERT INTO iceberg.bronze.ops1_measure VALUES (current_timestamp, N)"` → `INSERT: 1 row` for each, then `count(*)` on `"bronze.ops1_measure$snapshots"` → `10`.
+   - Four runs of the maintenance job, each `curl -X POST /api/pipelines/bronze_maintenance_job/trigger`, each polled to `completed` (`GET /api/pipelines/bronze_maintenance_job/runs`): `033c8b95…`, `90e38e5a…`, `6f44f86c…`, `64276604…`.
+   - `docker compose -f docker-compose.yml -f ops/trino/docker-compose.ops1-measure.override.yml -p ops1check --profile trino up -d trino` → `grep min-retention /etc/trino/catalog/iceberg.properties` → `23:iceberg.expire-snapshots.min-retention=0s` (the override proven by a real `up`, not by `config`).
+   - `docker compose -p ops1check --profile dagster --profile trino down -v` → all 21 containers, 6 volumes and the network removed; `docker ps -a | grep ops1check`, `docker volume ls | grep ops1check`, `docker network ls | grep ops1check` each print nothing. The unrelated `ops7drill-*` stack and its testcontainers were left untouched.
+   - gitleaks (`zricethezav/gitleaks:v8.30.1 dir …`) before each push: 9 findings, all in the untracked, gitignored local `.env` (the random values `init-env.sh` generated); zero in the committed files.
+   - *Not verified*: the Rust, TypeScript, Dagster-pytest and console blocks of the project's verification list. This round adds only a YAML file under `ops/` and a Markdown result document — no `rust/`, `src/`, `dagster/` or `docker-compose.yml` change — so the scoped checks were the compose ones quoted above. T3's docs were verified in round 1 and are unchanged since.
+
+3. **Premises that turned out wrong, and what was skipped**
+   - Round-1 BLOCKER 1's "create the measurement table through Trino
+     (`CREATE TABLE iceberg.<bronze namespace>.ops1_measure (id bigint)`)" is not
+     possible in this build: Lakekeeper's `trino` principal holds
+     `select modify` and never `create` (`lakekeeper-authz-init`'s
+     `grant trino select modify`), and `docker-compose.yml`'s `trino` service
+     records the reproduced `ForbiddenException` for both `trino-maintenance`
+     and `console-reader`. The table was created instead with the `dlt`
+     principal (the one `dagster-code-location`'s bronze ingest writes as)
+     through pyiceberg, with the same Bronze shape (day-partitioned
+     `_ingested_at`, format-version 2). Recorded in `OPS-1-RESULT.md`.
+   - T2 step 2 expects "snapshot count unchanged". Measured **10 → 11**:
+     `trino-maintenance-cron` (ADR 0009's 6-hour loop, which starts with the
+     `trino` profile) rewrote the measurement table at
+     `2026-10-15T22:43:05Z` (`rewritten_data_files_count=10,
+     added_data_files_count=1`) — one `replace` snapshot, from its own log, not
+     from the maintenance job. The cron was then stopped and every later
+     measurement quotes it.
+   - Two stack facts, both measured and recorded in `OPS-1-RESULT.md`:
+     Lakekeeper's warehouse has no `default-prefix`, so a new table lives at
+     `s3://lakehouse-warehouse/<uuid>/` rather than `bronze/<name>/`; and the
+     whole `dagster` profile could not be started profile-wide because this
+     host cannot pull `debezium-server`'s digest-pinned image, so the stack was
+     brought up by service name.
+   - **Found, not fixed** (report item 5):
+     `GET /api/lakehouse/tables/{ns}/{table}/maintenance` answers
+     `lastRun: null` / `lastVerbRuns: []` for a Bronze table, because it filters
+     `bronze_meta.*` on the bare table name from the URL while the job records
+     the qualified `bronze.<name>`; the same query with the qualified name
+     returns the row. Pre-existing on `origin/main` (this branch touches no
+     `rust/` file — `git diff --stat origin/main...HEAD` lists none) and the
+     aggregate `GET /api/governance/maintenance` shows the run correctly.
+     Location: `rust/crates/lakehouse-api/src/routes/lakehouse.rs`
+     (`maintenance_verb_run_query`) and
+     `rust/crates/lakehouse-api/src/routes/governance.rs`
+     (`maintenance_run_query`), against
+     `dagster/dispar_orchestrate/maintenance.py`'s
+     `discover_bronze_tables`-sourced `table_name`.
+
+4. **Plan-file state**
+
+```text
+$ git status --short
+ M docs/superpowers/plans/2026-10-15-ops-1-default-snapshot-retention.md
+
+$ git log --oneline origin/main..HEAD | head
+0d9b73e0 docs(plans): OPS-1 result, the measured default snapshot retention
+76cd01c9 chore(trino): measurement-only override for the OPS-1 snapshot floor
+2dae5fbf docs(plan): OPS-1 review round 1: T2 is required, with the way through
+0e666b77 docs: default 7d snapshot retention (OPS-1)
+2632cecb feat(dagster): default snapshot retention to 7d (OPS-1)
+146b1396 Merge remote-tracking branch 'origin/main' into 'feat/ops-1-default-snapshot-retention'
+81484aca docs(plan): OPS-1 spec and plan, default snapshot retention
+
+$ git ls-remote --heads origin feat/ops-1-default-snapshot-retention
+0d9b73e03f53fd6c300219f84535de8ee4e26de0	refs/heads/feat/ops-1-default-snapshot-retention
+```
+
 ## 8. Review
 
 Round 1, reviewed 2026-10-15 at `0e666b77`.
