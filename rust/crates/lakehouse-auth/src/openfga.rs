@@ -55,6 +55,10 @@ use crate::secret::Secret;
 /// service accounts every warehouse needs regardless of who provisioned
 /// it. Matches `docker-compose.yml`'s `lakekeeper-authz-init`
 /// `grant()` calls exactly (verb sets included).
+/// How long a dropped table can be undropped: 7 days, the spec's retention
+/// window (`DATA-15` F4). The compose warehouse inits write the same number.
+pub const DELETE_RETENTION_SECONDS: u64 = 604_800;
+
 const MACHINE_GRANTS: &[(&str, &[&str])] = &[
     ("rust-iceberg", &["create", "modify", "select"]),
     ("debezium", &["create", "modify", "select"]),
@@ -265,6 +269,10 @@ impl LakekeeperAdminClient {
             .await
             .map_err(|_| OpenfgaError::Server)?;
         if let Some(existing) = list.warehouses.iter().find(|w| w.name == name) {
+            // `DATA-15` F4: also on a warehouse that already exists, so a
+            // tenant warehouse made before soft delete shipped gets it on
+            // its next provisioning call.
+            self.set_soft_delete_profile(&existing.id).await?;
             return Ok(existing.id.clone());
         }
 
@@ -299,7 +307,41 @@ impl LakekeeperAdminClient {
             .json()
             .await
             .map_err(|_| OpenfgaError::Server)?;
+        self.set_soft_delete_profile(&created.warehouse_id).await?;
         Ok(created.warehouse_id)
+    }
+
+    /// Makes a dropped table in `warehouse_id` soft-deleted for
+    /// [`DELETE_RETENTION_SECONDS`] (7 days) instead of hard-deleted, so it
+    /// can be undropped (`DATA-15` F4). `Lakekeeper` 0.13.3 defaults to a
+    /// hard delete, which cannot come back. Idempotent: the same profile
+    /// written twice is the same profile. A failure is returned, not
+    /// swallowed: a warehouse left on hard delete would silently lose the
+    /// restore the asset page promises.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn set_soft_delete_profile(&self, warehouse_id: &str) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/warehouse/{warehouse_id}/delete-profile",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "delete-profile": {
+                    "type": "soft",
+                    "expiration-seconds": DELETE_RETENTION_SECONDS
+                }
+            }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())
     }
 
     /// Grant [`MACHINE_GRANTS`] onto `warehouse_id`. A `409` response (an

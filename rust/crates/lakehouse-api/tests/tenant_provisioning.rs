@@ -155,6 +155,13 @@ async fn create_tenant_provisions_a_warehouse_and_stops_honestly_at_grants_ready
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"warehouse-id": "wh-new"})))
         .mount(&server)
         .await;
+    // `DATA-15` F4: provisioning also puts the new warehouse on soft delete,
+    // so a call the test did not mount would fail the provisioning.
+    Mock::given(method("POST"))
+        .and(path("/management/v1/warehouse/wh-new/delete-profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path(
             "/management/v1/permissions/warehouse/wh-new/assignments",
