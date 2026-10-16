@@ -1805,7 +1805,7 @@ async fn baseline_backfill_is_idempotent_under_rerun(pool: PgPool) -> sqlx::Resu
     Ok(())
 }
 
-// ── BLD-2: target lag (migration `0077`) ────────────────────────────────
+// ── BLD-2: target lag (migration `0084`) ────────────────────────────────
 
 /// The wire value round-trips through the two stored columns, in both
 /// kinds, on the read paths the list, the detail and the orchestrator's
@@ -2215,7 +2215,7 @@ async fn lag_state_stamps_the_tenant_and_is_deleted_with_the_pipeline(
     assert!(after.requested_run_key.is_none());
     assert_eq!(after.consumed_at, Some(now));
 
-    // `ON DELETE CASCADE` (migration 0077): no orphan measurement.
+    // `ON DELETE CASCADE` (migration 0084): no orphan measurement.
     assert!(
         pipelines::delete_pipeline(&pool, &created.id, None)
             .await

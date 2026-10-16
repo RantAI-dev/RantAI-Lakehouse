@@ -16,7 +16,7 @@
 //! definition that is not a choice of how to build the pipeline: it is a
 //! promise about how fresh the output has to be. The measurement behind
 //! that promise lives in its own `pipeline_lag_state` table, written only
-//! by the API's lag check — see `0077_pipeline_target_lag.sql`'s header for
+//! by the API's lag check — see `0084_pipeline_target_lag.sql`'s header for
 //! why it is not columns on the definition row, and why
 //! [`TargetLag::from_columns`] is the only place a row shape learns to
 //! read the pair.
@@ -118,7 +118,7 @@ pub struct Pipeline {
     /// every other `skip_serializing_if` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
-    /// BLD-2: how fresh this pipeline's output must be (migration `0077`),
+    /// BLD-2: how fresh this pipeline's output must be (migration `0084`),
     /// derived from the `target_lag_seconds`/`target_lag_downstream`
     /// column pair. `None` = no target lag: the pipeline runs on its
     /// `schedule`/`depends_on` exactly as before.
@@ -142,7 +142,7 @@ pub struct Pipeline {
     pub run_as: Option<Uuid>,
 }
 
-/// BLD-2: how fresh a pipeline's output must be (migration `0077`). The
+/// BLD-2: how fresh a pipeline's output must be (migration `0084`). The
 /// wire form is plan D2's internally tagged union: `null`, or
 /// `{"kind":"lag","minutes":N}` for `2..=10080` whole minutes (the floor
 /// is the measured one, plan D11; see
@@ -269,7 +269,7 @@ struct PipelineRow {
     /// needs the value, but exposing it on the public type would be a
     /// new wire field that no current caller wants.
     tenant_id: Option<Uuid>,
-    /// BLD-2 (migration `0077`): the two columns behind
+    /// BLD-2 (migration `0084`): the two columns behind
     /// [`Pipeline::target_lag`]. Read raw and combined by
     /// [`TargetLag::from_columns`] so no row shape has to know the wire
     /// union.
@@ -575,7 +575,7 @@ struct FullPipelineRow {
     /// value, and threading it as a separate query at write time would
     /// race against the live row's own tenant reassignment.
     tenant_id: Option<Uuid>,
-    /// BLD-2 (migration `0077`); see [`PipelineRow`]'s own doc comment on
+    /// BLD-2 (migration `0084`); see [`PipelineRow`]'s own doc comment on
     /// the same pair.
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
@@ -943,7 +943,7 @@ pub struct CreatePipelineInput {
     /// itself via [`crate::pipelines::slug_id`], so existing callers
     /// (tests, internal callers) keep working unchanged.
     pub id: Option<String>,
-    /// BLD-2 (migration `0077`): the target lag this pipeline is created
+    /// BLD-2 (migration `0084`): the target lag this pipeline is created
     /// with, or `None` for none. The route layer validates the range
     /// (`2..=10080` minutes) before calling, and the column CHECK is the
     /// database-level backstop.
@@ -1002,7 +1002,7 @@ pub async fn create_pipeline(
     // source — there is no per-row "explicitly defaulted" distinction
     // worth preserving).
     let max_retries = input.max_retries.unwrap_or(2);
-    // BLD-2 (migration `0077`): the one wire value becomes the two stored
+    // BLD-2 (migration `0084`): the one wire value becomes the two stored
     // columns here, and nowhere else.
     let (target_lag_seconds, target_lag_downstream) =
         input.target_lag.map_or((None, false), TargetLag::columns);
@@ -1325,7 +1325,7 @@ struct RunnableRow {
     status: String,
     schedule: String,
     depends_on: Vec<String>,
-    /// BLD-2 (migration `0077`), carried to the factory so it can apply
+    /// BLD-2 (migration `0084`), carried to the factory so it can apply
     /// plan D3 (a target lag replaces the schedule while it is set).
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
@@ -1355,7 +1355,7 @@ pub struct RunnablePipeline {
     /// docstring on "every way this degrades to empty lists without
     /// raising" for why a second fetch would defeat that.
     pub depends_on: Vec<String>,
-    /// BLD-2 (migration `0077`): the pipeline's target lag, so the
+    /// BLD-2 (migration `0084`): the pipeline's target lag, so the
     /// orchestrator's factory can decide (plan D3/D6) that neither the cron
     /// schedule nor the `_after` sensor applies while it is set. `None` for
     /// every pipeline written before this migration — which is exactly the
@@ -1683,7 +1683,7 @@ pub async fn get_definition_version(
     Ok(Some(snapshot))
 }
 
-// ── BLD-2: `pipeline_lag_state` (migration `0077`) ──────────────────────
+// ── BLD-2: `pipeline_lag_state` (migration `0084`) ──────────────────────
 
 /// One pipeline's lag state: what it last consumed, what is pending, the
 /// run this pipeline was last asked to make, and the check that last ran.
