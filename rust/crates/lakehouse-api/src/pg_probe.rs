@@ -418,6 +418,10 @@ fn offers_scram_sha256(body: &AuthenticationSaslBody) -> Result<bool, PgProbeErr
     }
 }
 
+/// Maximum backend message length accepted by the probe (64 KiB; SEC-14B review round 1, BLOCKER 2).
+/// Prevents a rogue server from forcing a ~4 GiB buffer allocation via an untrusted length header.
+const MAX_BACKEND_MESSAGE_LEN: usize = 64 * 1024;
+
 /// Read one full backend message, filling `buffer` from `stream` until
 /// `Message::parse` can decode it. `Message::parse` consumes exactly one
 /// message and leaves any following bytes in `buffer`.
@@ -426,8 +430,17 @@ where
     S: AsyncRead + Unpin,
 {
     loop {
-        if let Some(message) = Message::parse(buffer).map_err(|_| PgProbeError::Protocol)? {
-            return Ok(message);
+        if buffer.len() >= 5 {
+            let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]);
+            if len < 4 || (len as usize) > MAX_BACKEND_MESSAGE_LEN {
+                return Err(PgProbeError::Protocol);
+            }
+            if buffer.len() > len as usize {
+                if let Some(message) = Message::parse(buffer).map_err(|_| PgProbeError::Protocol)? {
+                    return Ok(message);
+                }
+                return Err(PgProbeError::Protocol);
+            }
         }
         let mut chunk = [0u8; 4096];
         let read = stream.read(&mut chunk).await?;
@@ -788,5 +801,52 @@ mod tests {
             roots.add(parsed.into_iter().next().unwrap()).is_err(),
             "a root store must not accept arbitrary bytes as a CA"
         );
+    }
+
+    /// (f) A backend message header claiming a huge length (e.g. 0xFFFFFFFF)
+    /// is refused as a protocol error without growing the buffer capacity (SEC-14B review round 1, BLOCKER 2).
+    #[tokio::test]
+    async fn oversized_backend_message_length_is_refused_without_buffer_growth() {
+        let mut stream = std::io::Cursor::new(b"R\xff\xff\xff\xff");
+        let mut buffer = BytesMut::new();
+        let Err(err) = read_message(&mut stream, &mut buffer).await else {
+            panic!("oversized message length must be refused");
+        };
+        assert!(matches!(err, PgProbeError::Protocol));
+        assert!(
+            buffer.capacity() < MAX_BACKEND_MESSAGE_LEN,
+            "buffer capacity must not grow to 4 GiB, was {}",
+            buffer.capacity()
+        );
+    }
+
+    /// (f, second half) The same oversized header sent by a fake server over
+    /// a full dial is refused as a protocol error.
+    #[tokio::test]
+    async fn fake_server_sending_huge_length_is_refused() {
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let plain_port = plain.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = plain.accept().await.unwrap();
+            read_framed(&mut socket, false).await; // startup packet
+            socket.write_all(b"R\xff\xff\xff\xff").await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let proxy = TlsProxy::start("127.0.0.1", plain_port).await;
+        let approved = approved_for(proxy.port()).await;
+        let err = connect_and_select(
+            &target(proxy.port(), PROXY_SERVER_NAME),
+            &approved,
+            &SecretValue::new("pw"),
+            None,
+        )
+        .await
+        .expect_err("oversized length must be refused");
+        assert_eq!(
+            err.to_string(),
+            "the server sent a message this probe did not understand"
+        );
+        server.await.unwrap();
     }
 }
