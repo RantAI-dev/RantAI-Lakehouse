@@ -148,7 +148,7 @@ export function encodingLabel(encoding: UploadEncoding | string): string {
 }
 
 /** The encodings the API reads, in the order a menu lists them. */
-export const UPLOAD_ENCODINGS: readonly { value: UploadEncoding; label: string }[] = [
+export const UPLOAD_ENCODINGS: readonly { value: UploadEncoding; label: string; disabled?: boolean }[] = [
   { value: "utf-8", label: encodingLabel("utf-8") },
   { value: "utf-16", label: encodingLabel("utf-16") },
 ]
@@ -158,7 +158,7 @@ export const UPLOAD_ENCODINGS: readonly { value: UploadEncoding; label: string }
  * them. The tab is the tab character itself, which is what the API sends and
  * takes.
  */
-export const UPLOAD_DELIMITERS: readonly { value: string; label: string }[] = [",", ";", "\t", "|"].map(
+export const UPLOAD_DELIMITERS: readonly { value: string; label: string; disabled?: boolean }[] = [",", ";", "\t", "|"].map(
   (value) => ({ value, label: delimiterLabel(value) })
 )
 
