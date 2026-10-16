@@ -30,6 +30,7 @@ import {
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
+import { cn } from "@/lib/utils"
 import { snapshotRetentionText } from "@/lib/snapshot-picker"
 import {
   formatCompactNumber,
@@ -199,6 +200,7 @@ function IcebergSnapshots({
           <TableRow className="hover:bg-transparent">
             <TableHead className="text-xs">Committed</TableHead>
             <TableHead className="text-xs">Operation</TableHead>
+            <TableHead className="text-xs">Author</TableHead>
             <TableHead className="text-right text-xs">Added</TableHead>
             <TableHead className="text-right text-xs">Deleted</TableHead>
             <TableHead className="text-right text-xs">Rows after</TableHead>
@@ -221,6 +223,10 @@ function IcebergSnapshots({
                   ) : null}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{s.operation}</TableCell>
+                {/* DATA-15 F5: only the author a commit recorded; a load through dlt records none. */}
+                <TableCell className={cn("py-1.5 text-xs", s.author ? undefined : "text-muted-foreground")}>
+                  {s.author ?? "unknown"}
+                </TableCell>
                 <TableCell className="py-1.5 text-right text-xs tabular-nums">
                   {signed(s.summary.addedRecords, "+")}
                 </TableCell>

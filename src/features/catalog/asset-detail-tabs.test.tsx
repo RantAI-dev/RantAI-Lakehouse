@@ -113,6 +113,7 @@ const TABLE = {
       parentId: null,
       timestampMs: Date.parse("2026-09-23T03:37:39Z"),
       operation: "append",
+      author: null,
       summary: { addedRecords: 2000, deletedRecords: null, totalRecords: 2000, totalDataFiles: 1 },
     },
   ],
@@ -195,6 +196,7 @@ function stubApi({
   grants = [],
   grantRefusal,
   tableMissing = false,
+  snapshotAuthor = null,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
 }: {
   permissions?: string[]
@@ -211,6 +213,8 @@ function stubApi({
   grantRefusal?: { status: number; error: string }
   /** The Iceberg table is gone (404), as after a drop (`DATA-15`). */
   tableMissing?: boolean
+  /** The author the table's one snapshot recorded (`DATA-15`); `null` when it recorded none. */
+  snapshotAuthor?: string | null
   /** What `GET .../restore` answers. */
   restore?: unknown
 } = {}) {
@@ -255,7 +259,8 @@ function stubApi({
     if (path.endsWith("/maintenance")) return json({ configured: false })
     if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
     if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) {
-      return tableMissing ? json({ error: "table not found" }, 404) : json(TABLE)
+      if (tableMissing) return json({ error: "table not found" }, 404)
+      return json({ ...TABLE, snapshots: TABLE.snapshots.map((snap) => ({ ...snap, author: snapshotAuthor })) })
     }
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
@@ -1571,6 +1576,21 @@ describe("Sample tab: the data preview", () => {
       fireEvent.keyDown(cityName, { key: "End" })
       expect(document.activeElement).toBe(within(headerOf("free")).getByRole("button", { name: "free" }))
     })
+  })
+})
+
+describe("Activity tab: who made each version", () => {
+  it("shows the author a commit recorded, and unknown where it recorded none", async () => {
+    stubApi({ snapshotAuthor: "connector conn-pg, run 1a2b" })
+    url.search = "tab=activity"
+    renderTabs()
+    expect(await screen.findByText("connector conn-pg, run 1a2b")).toBeTruthy()
+    expect(screen.getByRole("columnheader", { name: "Author" })).toBeTruthy()
+    cleanup()
+
+    stubApi({ snapshotAuthor: null })
+    renderTabs()
+    expect(await screen.findByText("unknown")).toBeTruthy()
   })
 })
 
