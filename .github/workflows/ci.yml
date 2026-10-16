@@ -684,11 +684,11 @@ jobs:
       - name: Build the oidc-mock fixture image
         run: docker compose -p g3aci --profile dagster build oidc-mock
 
-      - name: Bring up lakehouse-api + Dagster + the G3a source table
+      - name: Bring up lakehouse-api + Dagster + the G3a source table + the Iceberg query database
         run: >
           docker compose -p g3aci --profile dagster up -d --no-build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon
-          g3a-source-init
+          g3a-source-init clickhouse-iceberg-init
 
       - name: Run the G3a end-to-end test inside the compose network
         run: docker compose -p g3aci --profile dagster run --rm g3a-test-runner
@@ -701,6 +701,21 @@ jobs:
       # clean local stack -- see the `timeout-minutes` above).
       - name: Run the G7 authored-pipeline test inside the compose network
         run: docker compose -p g3aci --profile dagster run --rm g7-test-runner
+
+      # BLD-1 (slice 1): a pipeline reads as its author, proven on the
+      # rows it writes. Case 1: masked author writes masked. Case 2:
+      # unmasked author writes clear. Case 3: no author fails with D2's
+      # message. Case 3 needs a pipeline whose `run_as` is NULL: the runner
+      # creates it with an author first (`BLD1_NO_AUTHOR_FIXTURE=create`),
+      # `psql` clears the column, and the runner runs all three cases.
+      - name: Run the BLD-1 author-gate acceptance test inside the compose network
+        run: |
+          fixture_output=$(docker compose -p g3aci --profile dagster run --rm -e BLD1_NO_AUTHOR_FIXTURE=create bld1-test-runner)
+          echo "$fixture_output"
+          fixture_id=$(echo "$fixture_output" | sed -n "s/^BLD1_FIXTURE_PIPELINE_ID=//p" | tr -d "\r\n")
+          docker compose -p g3aci exec -T postgres psql -U "${POSTGRES_USER:-lakehouse}" -d "${POSTGRES_DB:-lakehouse}" -c \
+            "UPDATE pipeline_definition SET run_as = NULL WHERE id = '$fixture_id'"
+          docker compose -p g3aci --profile dagster run --rm -e BLD1_NO_AUTHOR_PIPELINE_ID="$fixture_id" bld1-test-runner
 
       - name: Compose logs (on failure)
         if: failure()
