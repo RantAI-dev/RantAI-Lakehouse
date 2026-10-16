@@ -8,6 +8,18 @@
 //! job data, and unions this table's rows on top so a freshly authored
 //! pipeline is visible immediately rather than vanishing the way an
 //! authored governance rule did before the Task 2.3 gap fix.
+//!
+//! # Target lag (BLD-2)
+//!
+//! [`Pipeline::target_lag`] is derived from the `target_lag_seconds` /
+//! `target_lag_downstream` column pair (plan D1) and is the one field of a
+//! definition that is not a choice of how to build the pipeline: it is a
+//! promise about how fresh the output has to be. The measurement behind
+//! that promise lives in its own `pipeline_lag_state` table, written only
+//! by the API's lag check — see `0077_pipeline_target_lag.sql`'s header for
+//! why it is not columns on the definition row, and why
+//! [`TargetLag::from_columns`] is the only place a row shape learns to
+//! read the pair.
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;

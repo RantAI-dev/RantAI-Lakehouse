@@ -5,6 +5,18 @@
 //! Ports `src/app/api/pipelines/route.ts`,
 //! `src/app/api/pipelines/[id]/runs/route.ts`, and
 //! `src/app/api/pipelines/[id]/trigger/route.ts`.
+//!
+//! # Target lag: read here, decided elsewhere
+//!
+//! This module serialises a pipeline's target lag (`targetLag`, plan D2)
+//! and attaches the `lag` measurement the console shows (plan D8), but it
+//! decides nothing about it: every "is it fresh enough, run or wait"
+//! question is answered once, in [`crate::pipeline_lag`], from the
+//! orchestrator's lag-check route. The list therefore reads the state
+//! table once for every lag pipeline it is returning instead of asking
+//! per pipeline, and the list payload and the detail payload cannot drift
+//! apart over what "behind" means, because neither of them is what
+//! decides it.
 
 use axum::Extension;
 use axum::body::Bytes;

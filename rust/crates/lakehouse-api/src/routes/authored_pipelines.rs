@@ -13,6 +13,16 @@
 //! start`, which re-imports its module on reload; the plain `dagster api
 //! grpc` server it used before would not have.
 //!
+//! A third trigger exists for a pipeline with a target lag (plan D3): while
+//! one is set, `authored_factory.py` builds NEITHER the cron schedule nor
+//! the `_after` sensor, and an `authored__<id>_lag` sensor asks
+//! `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds instead.
+//! `schedule` and `depends_on` stay stored, so removing the lag returns the
+//! pipeline to them. What that ask is answered with lives in
+//! [`crate::pipeline_lag`]; this module owns the two routes that write the
+//! lag and forward the ask, so the console, the assistant's tool and the
+//! orchestrator all reach the same decision through one door.
+//!
 //! # Who may read every tenant's definitions
 //!
 //! [`runnable`] lists authored pipelines across all tenants, as
