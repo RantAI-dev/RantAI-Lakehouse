@@ -5034,10 +5034,16 @@ mod tests {
             )
             .mount(&server)
             .await;
+        // `DATA-14` (CI failure): the target is a name, so the sender needs a
+        // resolver that approves it without dialling; the bare sender resolved
+        // the real host in CI.
+        let webhooks = lakehouse_notify::MappedResolver::new()
+            .with("hooks.example.com", "127.0.0.1:9".parse().unwrap())
+            .into_sender();
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let saved = save_rule(
             &ch,
-            &test_webhook_sender(),
+            &webhooks,
             &quality_input(Some("silver.orders")),
             Some("al_q1"),
         )
