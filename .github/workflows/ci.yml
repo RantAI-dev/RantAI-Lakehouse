@@ -978,6 +978,8 @@ jobs:
           SSO_USER_A_PASSWORD=ci-only-alice-password-0001
           SSO_USER_B_PASSWORD=ci-only-bob-password-0001
           EOF
+          # #144 (SRC-12) made CONNECTOR_SECRETS_KEY must-set; generated at run time, as every other gate job does.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
 
       # Fixture image, built here rather than shared (the API depends on
       # oidc-mock being healthy, so it must be up even though this gate signs
