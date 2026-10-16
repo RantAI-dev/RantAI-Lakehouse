@@ -39,6 +39,12 @@
 //!   [`TableClaim::Ours`] or [`TableClaim::Theirs`].
 //! - [`table_claimed`] asks whether anyone holds it, for the one caller with
 //!   no tenant to ask on behalf of (a connector's ingest spec, plan task T8).
+//! - [`list_claims`] lists a tenant's claims with the upload each one came
+//!   from and that upload's file name while it exists. It is the record the
+//!   lineage graph draws an `upload -> bronze.<table>` edge from (`DATA-19`),
+//!   which is why a claim outliving its upload matters outside the ownership
+//!   rules above: the origin of a table stays drawable after the file is
+//!   gone.
 //!
 //! A claim is NEVER RELEASED. Not when the upload that made it is deleted
 //! ([`delete`] removes the upload's row and nothing else), not when the load
@@ -422,6 +428,129 @@ pub async fn mark_ingesting(
         .await?)
 }
 
+/// Hours after which an `ingesting` row no longer counts against the load
+/// limits (`SEC-17 review fix (SHOULD-FIX 1)`, feature page decision D9). A
+/// row leaves `ingesting` only when its job reports or someone reads it, so
+/// loads whose job died in a tenant nobody opens would otherwise count for
+/// ever and refuse every load in the installation. Six hours is far past the
+/// longest load (the request deadline and the job's own bounds are minutes);
+/// the row itself is not changed here, it is only not counted.
+const LOAD_COUNTS_FOR_HOURS: i32 = 6;
+
+/// How many loads may run at once (`SEC-17`): per `uploaded_by` and in
+/// total. Both are at least 1; the API reads them from its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadLimits {
+    /// Loads (`ingesting` rows) one `uploaded_by` may have at once.
+    pub per_user: i64,
+    /// Loads any `uploaded_by` may have at once, together.
+    pub total: i64,
+}
+
+/// What [`mark_ingesting_within_limits`] did.
+#[derive(Debug)]
+pub enum MarkOutcome {
+    /// The upload is now `ingesting`.
+    Marked(Box<Upload>),
+    /// No row changed: no such upload, or it is already `ingesting`
+    /// (the same case [`mark_ingesting`] answers `None` for).
+    NotMarked,
+    /// A limit was reached; nothing was changed.
+    LimitReached,
+}
+
+/// Whether `uploaded_by` (the person recorded on upload `id`) and the
+/// installation are both under `limits`, counting `ingesting` rows. A read:
+/// the route asks it before it claims a table name so that a refusal leaves
+/// no claim behind; [`mark_ingesting_within_limits`] is what decides.
+///
+/// The person is the one the upload records, not whoever pressed Load
+/// (`SEC-17`, decision D6).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn loads_under_limits(
+    pool: &PgPool,
+    id: &str,
+    limits: LoadLimits,
+) -> Result<bool, StoreError> {
+    let mut conn = pool.acquire().await?;
+    Ok(under_limits(&mut conn, id, limits).await?)
+}
+
+/// The two counts and the comparison, on a connection that may already hold
+/// the lock of [`mark_ingesting_within_limits`].
+async fn under_limits(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    limits: LoadLimits,
+) -> Result<bool, sqlx::Error> {
+    let (mine, all): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE uploaded_by = \
+             (SELECT uploaded_by FROM file_upload WHERE id = $1)), \
+           count(*) \
+         FROM file_upload WHERE status = 'ingesting' \
+           AND updated_at > now() - make_interval(hours => $2)",
+    )
+    .bind(id)
+    .bind(LOAD_COUNTS_FOR_HOURS)
+    .fetch_one(conn)
+    .await?;
+    Ok(mine < limits.per_user && all < limits.total)
+}
+
+/// [`mark_ingesting`] with the load limits of `SEC-17`: counts the
+/// `ingesting` rows and marks this one in ONE transaction, serialised by a
+/// transaction-level advisory lock, so two starts at the same moment cannot
+/// both take the last place.
+///
+/// The lock is one key for the whole installation: starting a load is rare
+/// and the section it guards is two short statements. The count is of rows,
+/// not of runs: a row is `ingesting` from the claim until it is settled, so
+/// a claim that never got a run counts until it is settled as stale.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_ingesting_within_limits(
+    pool: &PgPool,
+    id: &str,
+    parse_options: &Value,
+    bronze_table: &str,
+    load_mode: LoadMode,
+    limits: LoadLimits,
+) -> Result<MarkOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    // `hashtext()` keys the lock on a constant string; the prefix keeps it
+    // apart from the other advisory locks keyed on bare strings.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('file_upload:ingest_limit'))")
+        .execute(&mut *tx)
+        .await?;
+    if !under_limits(&mut tx, id, limits).await? {
+        tx.rollback().await?;
+        return Ok(MarkOutcome::LimitReached);
+    }
+    let sql = format!(
+        "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
+         bronze_table = $3, load_mode = $4, run_id = NULL, error = NULL, row_count = NULL, \
+         updated_at = now() \
+         WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
+    );
+    let marked: Option<Upload> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(Json(parse_options.clone()))
+        .bind(bronze_table)
+        .bind(load_mode.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(marked.map_or(MarkOutcome::NotMarked, |row| {
+        MarkOutcome::Marked(Box::new(row))
+    }))
+}
+
 /// Give a claimed upload the Dagster run that carries its load out: sets
 /// `run_id` on a row that is `ingesting` and has no run yet.
 ///
@@ -610,6 +739,69 @@ pub async fn claim_table(
     .fetch_one(pool)
     .await?;
     Ok(holder == Some(tenant_id))
+}
+
+/// One claimed raw table and the upload that asked for the name, as the
+/// lineage graph reads it (`routes::lineage`, `DATA-19` / D5).
+///
+/// `original_filename` is `None` when the `file_upload` row is gone: a
+/// claim outlives the upload that made it (the module doc), and deleting
+/// an upload deletes its row for real. A caller that shows this node says
+/// "deleted upload" for `None` rather than guessing a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedTable {
+    /// The claimed raw table name (`upload_table_claim.bronze_table`).
+    pub bronze_table: String,
+    /// The upload that first asked for the name (`upload_id`). Kept even
+    /// when that upload is gone — the claim must outlive it.
+    pub upload_id: String,
+    /// The upload's original file name, when the row still exists.
+    pub original_filename: Option<String>,
+}
+
+/// Every claim `tenant_id` holds, with the file name of the upload that
+/// asked for the name when that row still exists.
+///
+/// The tenant rule is [`ConnectorFilter`]'s, the one every tenant-scoped
+/// read in this crate follows: `Some(t)` shows only the rows whose own
+/// `tenant_id` is `t`, so a claim whose tenant was deleted
+/// (`ON DELETE SET NULL`) belongs to nobody and is invisible to every
+/// tenant-scoped caller (fail closed); `None` is the unscoped read and
+/// shows every claim, `tenant_id IS NULL` included. It exists for the
+/// lineage route, which resolves its tenant first exactly as
+/// `routes::connectors::list` does.
+///
+/// One `LEFT JOIN`, not one query per claim: the lineage graph reads every
+/// claim of the caller's tenant on every focus, and a claim per table
+/// makes a second round trip per table.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_claims(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+) -> Result<Vec<ClaimedTable>, StoreError> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT c.bronze_table, c.upload_id, f.original_filename \
+           FROM upload_table_claim c \
+           LEFT JOIN file_upload f ON f.id = c.upload_id \
+          WHERE ($1::uuid IS NULL OR c.tenant_id = $1) \
+          ORDER BY c.bronze_table",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(bronze_table, upload_id, original_filename)| ClaimedTable {
+                bronze_table,
+                upload_id,
+                original_filename,
+            },
+        )
+        .collect())
 }
 
 /// Whether ANY tenant holds `table`, a claim whose tenant is gone included.

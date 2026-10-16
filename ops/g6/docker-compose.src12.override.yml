@@ -1,0 +1,35 @@
+# ops/g6/docker-compose.src12.override.yml -- SRC-12 part A gate only.
+#
+# Layered AFTER ops/g6/docker-compose.g6.override.yml:
+#   docker compose -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+#     -f ops/g6/docker-compose.src12.override.yml --profile g6-sql --profile g6-ops --profile dagster ...
+#
+# Why it exists: the g6 override replaces /run/secrets in `lakehouse-api` with
+# its read-only `g6_secrets` volume, so no g6 gate can make the API WRITE a
+# managed credential (see the docstring of `step_files_connection_test` in
+# g6_ingest_matrix_test.py). This gate has to: it types a credential through
+# the API and reads back what landed on disk. Compose merges `volumes` by
+# mount path, so the entries below replace the g6 ones for /run/secrets only:
+# the API gets the base file's own writable `lakehouse_connector_secrets`
+# volume, `dagster-code-location` the same volume read-only (exactly the
+# default stack), and the existing g6 runner gets a read-only view at
+# /managed-secrets to inspect the stored file. The g6 fixtures (mysql-g6, the
+# internal-host opt-ins) are untouched.
+services:
+  lakehouse-api:
+    volumes:
+      - type: volume
+        source: lakehouse_connector_secrets
+        target: /run/secrets
+  dagster-code-location:
+    volumes:
+      - type: volume
+        source: lakehouse_connector_secrets
+        target: /run/secrets
+        read_only: true
+  g6-ops-test-runner:
+    volumes:
+      - type: volume
+        source: lakehouse_connector_secrets
+        target: /managed-secrets
+        read_only: true

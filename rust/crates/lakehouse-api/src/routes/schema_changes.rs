@@ -212,7 +212,7 @@ pub struct ApproveResponse {
 
 /// A name that is not blank, short and free of control characters, so it
 /// can sit in an alert text and a log line as it is.
-fn check_name(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
+pub(super) fn check_name(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
     if value.trim().is_empty() {
         return Err(ApiError::BadRequest(format!("{what} must not be blank")));
     }
@@ -302,15 +302,16 @@ fn shape_for_phase(
 }
 
 /// `ingest:read` is also a user's permission; only the orchestrator (or an
-/// unrestricted administrator) reports what a source looks like.
-fn require_orchestrator(principal: &Principal) -> Result<(), ApiError> {
+/// unrestricted administrator) reports what a source looks like, or how a run
+/// went (`routes::connector_runs`, `SRC-11`, which reuses this guard).
+pub(super) fn require_orchestrator(principal: &Principal) -> Result<(), ApiError> {
     if matches!(principal.id, PrincipalId::Service(_))
         || crate::routes::catalog::is_unrestricted(principal)
     {
         return Ok(());
     }
     Err(ApiError::PermissionDenied(
-        "only the orchestrator's service identity reports source schemas".to_owned(),
+        "only the orchestrator's service identity files this report".to_owned(),
     ))
 }
 

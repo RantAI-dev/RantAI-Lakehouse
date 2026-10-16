@@ -253,6 +253,11 @@ export type ChartRenderSpec = Omit<ChartSpec, "sql"> & {
   board?: string;
   /** Structured definition (ChartInput) to prefill on edit. */
   def?: unknown;
+  /**
+   * The columns the chart's parameter slots took in this response (BI-11): the
+   * server resolves them, the tile reads its rows and names its series by them.
+   */
+  resolved?: { dimension?: string; breakdown?: string | null; measures?: unknown[] };
 };
 
 /** Strip SQL from the spec and attach its source — for the API response to the browser. */

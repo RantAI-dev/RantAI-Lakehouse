@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """G9 acceptance test (file upload, DATA-9): a file is uploaded, previewed,
 loaded into a raw table, loaded again with `append`, deleted, and the table is
-checked to be still there -- the end-to-end proof that the upload routes, the
-`file_ingest_job` run and the query route work together on a deployed stack,
-which their unit and route tests, each with the other side faked, cannot show.
-T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
+checked to be still there, and then a pipeline is built over that uploaded
+table, re-run by a re-upload of it, left alone by an upload into another
+table, and traced back to the upload in lineage -- the end-to-end proof that
+the upload routes, the `file_ingest_job` run, the dependency sensor and the
+query route work together on a deployed stack, which their unit and route
+tests, each with the other side faked, cannot show. T9 of
+`docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014; step 10
+is `DATA-19`
+(`docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md`).
 
 # What it checks, in order
 
@@ -54,6 +59,27 @@ T9 of `docs/superpowers/plans/2026-10-02-upload-file.md`, under ADR 0014.
    `ingest_run`, and deletes the upload. The API converts the file and stores
    the text beside it; the load job is the one step 3 runs, unchanged.
 
+10. An uploaded table feeding a pipeline (`DATA-19`,
+    `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md`):
+    it authors a `bronze.<table>` -> `silver.<table>_clean` pipeline whose
+    `dependsOn` names `file_ingest_job` -- the console's "Run again after
+    this table is re-uploaded" switch, sent here as the field it sends --
+    activates it, waits for the orchestrator to build the job, triggers one
+    run and waits for it to succeed, and reads the Silver table through
+    `POST /api/query/run`. Then it re-uploads the same table with ONE row
+    changed, expects the pipeline to run AGAIN on its own (no trigger call:
+    the `authored__<id>_after` sensor fired on the new `file_ingest_job`
+    SUCCESS), and expects the Silver table to show the change. Then it loads
+    a file into a DIFFERENT table and expects the pipeline NOT to run again
+    -- the sensor counts only the runs that loaded its own source table.
+    Finally it asks the lineage route for the Silver table and expects the
+    chain `upload:<id> -> bronze.<table> -> silver.<table>_clean`.
+
+8. SEC-17: it uploads a CSV file with 1,001 columns. Its preview answers 400
+   with "The file has more than 1,000 columns." and the same file read with
+   another delimiter previews again; a load request for it answers 400 with the
+   same sentence, before any table name is claimed. The upload is deleted.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -68,9 +94,17 @@ Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
   API itself is set to.
 - `DAGSTER_URL`: the Dagster GraphQL endpoint. Optional: when set, the gate
   waits for the code location to list `file_ingest_job` before it starts.
+  Step 10 needs it: without it the gate cannot prove the orchestrator built
+  the authored job it authors, and it says so instead of pretending.
 - `G9_TENANT_ID`: a tenant the account belongs to, sent as `X-Tenant`.
   Optional: without it the gate puts the account into the seeded tenant
   `meridian-group` (`step_ensure_tenant`) and sends that tenant's id.
+
+Step 10 also needs the stack to have `PIPELINE_RUN_TOKEN` set (the same
+value for `lakehouse-api` and the Dagster code location). Unset, the code
+location loads zero authored jobs and zero chain sensors, so the gate's
+first wait would fail with "the orchestrator never built the job" -- which
+is the honest answer for such a stack.
 
 It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` and
 `ops/fixtures/parquet/` beside this directory, so a container that runs it needs `ops/` and not only
@@ -81,7 +115,10 @@ It reads the fixtures from `ops/fixtures/uploads/`, `ops/fixtures/workbooks/` an
 The raw tables `g9_upload_<suffix>` (four rows), `g9_upload_<suffix>_xlsx`
 (three) and `g9_upload_<suffix>_parquet` (three) with their Iceberg files and
 catalog entries; the claims on their names, which are never released; four
-`ingest_run` rows; audit events and query history entries. A raw table and
+`ingest_run` rows; audit events and query history entries. Step 10 adds the
+Silver table `g9_upload_<suffix>_clean` (two rows, written by the authored
+pipeline), its authored pipeline row and its version row, the corrected copy's
+`ingest_run` row, and the claim on `g9_upload_<suffix>_other`. A raw table and
 its claim cannot be removed through the API (deleting a raw table is outside
 the plan, section 5), so an operator who wants them gone removes them by hand.
 The upload itself is deleted at the end, and also when a step fails, as far as
@@ -140,6 +177,30 @@ LOAD_TIMEOUT_S = 240
 # ClickHouse's `DataLakeCatalog` engine after the run that wrote it reported
 # success (`g6_ingest_matrix_test.py` polls for the same reason, for 30 s).
 VISIBLE_TIMEOUT_S = 60
+
+# DATA-19 step 10. An authored pipeline needs its job BUILT before it can
+# be triggered, and the build happens on the code-location reload the
+# activate call asks for -- a cold code server on a stack that has just
+# booted is the slow case, so these are bounds for a slow stack, not
+# measurements.
+JOB_BUILT_TIMEOUT_S = 300
+# One authored run: read Bronze through the job's own `DataLakeCatalog`
+# database, write Silver, report the row delta.
+PIPELINE_RUN_TIMEOUT_S = 420
+# `GET /api/pipelines/{id}/runs` speaks the API's own vocabulary, not
+# Dagster's: `lakehouse_dagster::map_run_status` renders a run's SUCCESS
+# as `completed` and its FAILURE as `failed`, and every other state as
+# `queued` / `running` / `cancelled` / `unknown`. The gate matches those
+# words, so a run that succeeded is never mistaken for one that is still
+# going.
+RUN_COMPLETED = "completed"
+RUN_FAILED = "failed"
+
+# How long the gate watches a pipeline that must NOT run. Longer than a
+# sensor evaluation: Dagster's daemon evaluates a run-status sensor on its
+# tick, so anything shorter would prove nothing -- a sensor that fired late
+# would read as "did not fire".
+NO_RETRIGGER_WAIT_S = 180
 
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "")
@@ -437,6 +498,48 @@ def step_delete_keeps_the_table(api, upload_id: str, table: str, table_rows: int
     print(f"[g9] the upload is gone and the table keeps its {left} rows")
 
 
+# SEC-17: the sentence for the column cap, as `routes/uploads.rs` words it
+# (`JOB_TOO_MANY_COLUMNS`) and `file_ingest.py` records it (`TOO_MANY_COLUMNS`).
+TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+
+
+def step_column_cap(api) -> None:
+    """A file of 1,001 columns is refused at the preview and at the load request,
+    with the one sentence, and a delimiter that reads it as fewer columns
+    previews again (a wrong guess must not lock a good file out). The 400 at the
+    load request comes before any claim, mark or launch, so nothing is left
+    behind but the upload, which is deleted."""
+    header = ",".join(f"c{n}" for n in range(1_001))
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": ("g9_wide.csv", f"{header}\n1\n".encode(), "text/csv")},
+        timeout=60,
+    )
+    upload_id = _expect(resp, 201, "POST /api/uploads (1,001 columns)").json()["id"]
+    try:
+        refused = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=30), 400, "preview of 1,001 columns")
+        if refused.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the preview's 400 should say {TOO_MANY_COLUMNS!r}, it said {refused.text[:200]}")
+        again = _expect(
+            api.get(f"{API_URL}/api/uploads/{upload_id}/preview", params={"delimiter": ";"}, timeout=30),
+            200,
+            "preview of the same file with another delimiter",
+        ).json()
+        if len(again.get("columns", [])) != 1:
+            raise G9Failure(f"with ';' the file is one column, the preview shows {again.get('columns')}")
+        body = {"bronzeTable": f"g9_wide_{secrets.token_hex(4)}", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+        ingest = _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=30), 400, "ingest of 1,001 columns")
+        if ingest.json().get("error") != TOO_MANY_COLUMNS:
+            raise G9Failure(f"the ingest's 400 should say {TOO_MANY_COLUMNS!r}, it said {ingest.text[:200]}")
+        print("[g9] 1,001 columns: refused at the preview and at the load request, one column under ';'")
+    finally:
+        # Never loaded, so the delete is allowed; a failed delete must not hide
+        # the failure that matters, so it is reported and not raised.
+        gone = api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30)
+        if gone.status_code != 204:
+            print(f"[g9] cleanup: DELETE of the wide upload answered {gone.status_code}", file=sys.stderr)
+
+
 def step_workbook(api, base_table: str, state: dict) -> None:
     path = WORKBOOKS / WORKBOOK
     if not path.is_file():
@@ -570,6 +673,336 @@ def step_parquet(api, base_table: str, state: dict) -> None:
     print("[g9] parquet: PASS (the upload is gone, the table stays)")
 
 
+def _dagster_lists_job(requests, job_name: str) -> bool:
+    """Whether the code location's job list holds `job_name`."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=10)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
+
+
+def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
+    """Author a `bronze.<table>` -> `silver.<silver_table>` pipeline whose
+    `dependsOn` names `file_ingest_job`, exactly the body the console's
+    "Run again after this table is re-uploaded" switch sends
+    (`src/features/pipelines/pipeline-create-page.tsx`, `DATA-19` D3).
+
+    `schedule` is `manual` on purpose: every run this gate cares about is
+    either triggered explicitly or launched by the sensor, and a cron would
+    add runs nobody asked for and the "did not run again" step could no
+    longer tell them apart."""
+    resp = api.post(
+        f"{API_URL}/api/pipelines",
+        json={
+            "name": f"g9_pipeline_{secrets.token_hex(3)}",
+            "kind": "batch",
+            "sourceZone": "bronze",
+            "sourceTable": table,
+            "incrementalColumn": "",
+            "transforms": [],
+            "targetZone": "silver",
+            "targetTable": silver_table,
+            "schedule": "manual",
+            "dependsOn": ["file_ingest_job"],
+        },
+        timeout=60,
+    )
+    created = _expect(resp, 201, "POST /api/pipelines").json()
+    pipeline_id = created.get("id")
+    if not pipeline_id or created.get("source") != f"bronze.{table}":
+        raise G9Failure(f"the created pipeline should name bronze.{table}, got {created}")
+    print(f"[g9] pipeline {pipeline_id}: bronze.{table} -> silver.{silver_table}, depends on file_ingest_job")
+
+    # An authored pipeline is a `draft` until it is activated, and only a
+    # `ready` one is built into a job with a sensor.
+    activated = _expect(
+        api.post(f"{API_URL}/api/pipelines/{pipeline_id}/status", json={"status": "ready"}, timeout=60),
+        200,
+        "POST /api/pipelines/{id}/status",
+    ).json()
+    if activated.get("status") != "ready":
+        raise G9Failure(f"the pipeline should be ready after activation, got {activated.get('status')!r}")
+
+    if not DAGSTER_URL:
+        raise G9Failure(
+            "step 10 needs DAGSTER_URL: without the orchestrator there is no job to trigger "
+            "and no sensor to fire, so this step would prove nothing"
+        )
+    job_name = f"authored__{pipeline_id.replace('-', '_')}"
+    _wait_for(f"the orchestrator built {job_name}", lambda: _dagster_lists_job(requests, job_name), JOB_BUILT_TIMEOUT_S)
+    print(f"[g9] the orchestrator built {job_name}")
+    return pipeline_id
+
+
+def _pipeline_runs(api, pipeline_id: str) -> list[dict]:
+    body = _expect(
+        api.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=60), 200, "GET /api/pipelines/{id}/runs"
+    ).json()
+    if body.get("unavailable"):
+        raise G9Failure(f"the orchestrator could not be asked for runs: {body['unavailable']}")
+    return body.get("runs", [])
+
+
+def _succeeded(api, pipeline_id: str) -> list[dict]:
+    return [r for r in _pipeline_runs(api, pipeline_id) if r.get("status") == RUN_COMPLETED]
+
+
+def step_first_pipeline_run(api, pipeline_id: str, silver_table: str, table_rows: int) -> None:
+    """Trigger one run and wait for it, then read the Silver table it
+    wrote. The trigger is what makes the later "it ran again on its own"
+    step meaningful: without a prior run there is no `start_time` for the
+    sensor's freshness rule to beat."""
+    triggered = _expect(
+        api.post(f"{API_URL}/api/pipelines/{pipeline_id}/trigger", json={}, timeout=60),
+        200,
+        "POST /api/pipelines/{id}/trigger",
+    ).json()
+    print(f"[g9] pipeline: triggered run {triggered.get('runId') or triggered.get('id')}")
+
+    def succeeded() -> bool:
+        runs = _pipeline_runs(api, pipeline_id)
+        failed = [r for r in runs if r.get("status") == RUN_FAILED]
+        if failed:
+            raise G9Failure(f"the authored run failed: {failed[0]}")
+        return [r for r in runs if r.get("status") == RUN_COMPLETED]
+
+    try:
+        _wait_for("the authored pipeline run succeeded", succeeded, PIPELINE_RUN_TIMEOUT_S)
+    except G9Failure as exc:
+        # The statuses are what a reader needs: "completed" is the API's
+        # word for a successful run (`map_run_status`), and a run stuck in
+        # `running` says the wait, not this gate, was the problem.
+        statuses = [r.get("status") for r in _pipeline_runs(api, pipeline_id)]
+        raise G9Failure(f"{exc}; the pipeline's runs were {statuses}") from exc
+
+    counted: list[int] = []
+
+    def holds() -> bool:
+        counted.append(count_silver_rows(api, silver_table))
+        return counted[-1] == table_rows
+
+    try:
+        _wait_for(f"silver.{silver_table} holds {table_rows} rows", holds, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        raise G9Failure(f"{exc}; the last count was {counted[-1] if counted else 'never read'}") from exc
+    print(f"[g9] pipeline: silver.{silver_table} holds {table_rows} rows, read from its Bronze source")
+
+
+def count_silver_rows(api, silver_table: str) -> int:
+    """Every count in this gate runs under a `WHERE` (R11). A Silver table
+    is a `ClickHouse` `MergeTree`, but the rule costs nothing and the
+    Bronze ones beside it depend on it."""
+    body = run_query(api, f"SELECT count() AS n FROM silver.`{silver_table}` WHERE 1")
+    return int(body["rows"][0]["n"])
+
+
+def step_reupload_reruns_the_pipeline(api, table: str, silver_table: str, pipeline_id: str, using: dict, expected: dict, state: dict) -> str:
+    """Re-upload the SAME table with one row changed and expect the
+    pipeline to run again by itself.
+
+    The changed file is built from the fixture itself (same encoding,
+    delimiter and header row, one cell changed), so the second load is the
+    first one with different data -- exactly what a user re-uploading a
+    corrected export does."""
+    upload_id = upload_changed_copy(api, expected, state)
+    print(f"[g9] re-upload: {upload_id} into {table} (one row changed)")
+    step_load(api, upload_id, table, "replace", using, len(expected["rows"]), table_rows=len(expected["rows"]))
+
+    before = len(_succeeded(api, pipeline_id))
+
+    def reran() -> bool:
+        return len(_succeeded(api, pipeline_id)) > before
+
+    _wait_for("the pipeline ran again after the re-upload", reran, PIPELINE_RUN_TIMEOUT_S)
+    after = _succeeded(api, pipeline_id)
+    print(f"[g9] the pipeline ran again without being triggered ({before} -> {len(after)} successful runs)")
+
+    # And the change is in the Silver table: the fixture's own row, with
+    # the quantity the changed file carries.
+    qty = CHANGED_QTY
+    columns = ["plnt", "material", "description", "qty"]
+
+    def shows_change() -> bool:
+        body = run_query(
+            api,
+            f"SELECT {', '.join(columns)} FROM silver.`{silver_table}` WHERE 1 ORDER BY material",
+        )
+        got = [[row[c] for c in columns] for row in body["rows"]]
+        return any(row[3] == qty for row in got)
+
+    try:
+        _wait_for(f"silver.{silver_table} shows the changed row ({qty})", shows_change, VISIBLE_TIMEOUT_S, retry_failures=True)
+    except G9Failure as exc:
+        body = run_query(api, f"SELECT {', '.join(columns)} FROM silver.`{silver_table}` WHERE 1 ORDER BY material")
+        raise G9Failure(f"{exc}; the table holds {body['rows']}") from exc
+    print(f"[g9] silver.{silver_table} shows the re-uploaded row")
+    _delete_upload(api, upload_id, state)
+    return upload_id
+
+
+# The quantity the changed copy of `sap_report_utf16.xls` carries in the
+# row the gate asserts on. The original says `4`; the changed copy says
+# `9001`, which no other fixture and no earlier step mentions.
+CHANGED_QTY = "9001"
+# The last data row of the fixture, as tab-separated cells.
+_CHANGED_ROW = ["8250", "0000200", "PP BAND", CHANGED_QTY]
+
+
+def changed_fixture_bytes(expected: dict) -> bytes:
+    """`sap_report_utf16.xls` with its last data row's quantity changed.
+
+    Built from the fixture's OWN expected rows, so the header, the title
+    lines, the encoding, the BOM and the CRLF endings stay exactly as the
+    preview detected them: the only difference a re-upload introduces here
+    is the cell the gate asserts on. Re-encoded as UTF-16 LE with the BOM
+    the fixture starts with, which is what makes the API's preview detect
+    `utf-16` again."""
+    raw, _expected = _fixture()
+    text = raw.decode("utf-16")
+    lines = text.split("\r\n")
+    header = expected["columns"]
+    # The header cells are the fixture's own, lower-cased by the loader;
+    # the changed row is matched on its position in the file (the last
+    # non-blank record), not on a guess about its content.
+    for index in range(len(lines) - 1, -1, -1):
+        cells = lines[index].split("\t")
+        if len(cells) == len(header) and cells[0] == expected["rows"][-1][0] and cells[1] == expected["rows"][-1][1]:
+            lines[index] = "\t".join(_CHANGED_ROW)
+            return b"\xff\xfe" + "\r\n".join(lines).encode("utf-16-le")
+    raise G9Failure("the fixture's last data row could not be found, so it cannot be changed")
+
+
+def upload_changed_copy(api, expected: dict, state: dict) -> str:
+    """Upload the changed copy of the fixture as a new upload of its own
+    (the same bytes would be refused as a duplicate)."""
+    raw = changed_fixture_bytes(expected)
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (f"{FIXTURE}_corrected.xls", raw, "application/vnd.ms-excel")},
+        timeout=60,
+    )
+    upload = _expect(resp, 201, "POST /api/uploads (corrected copy)").json()
+    state["upload_id"] = upload["id"]
+    state["deleted"] = False
+    return upload["id"]
+
+
+def _delete_upload(api, upload_id: str, state: dict) -> None:
+    _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE /api/uploads/{id}")
+    if state.get("upload_id") == upload_id:
+        state["deleted"] = True
+
+
+def step_other_table_does_not_rerun(api, table: str, pipeline_id: str, state: dict) -> None:
+    """Load a file into a DIFFERENT table and expect no run.
+
+    This is the step that distinguishes "the pipeline runs after an
+    upload" from "the pipeline runs after a re-upload of ITS OWN table":
+    without the per-table filter in the sensor, this load would fire the
+    chain just as the re-upload did."""
+    other = f"{table}_other"
+    path = PARQUETS / PARQUET
+    if not path.is_file():
+        raise G9Failure(f"fixture missing: {path}")
+    raw = path.read_bytes()
+    resp = api.post(
+        f"{API_URL}/api/uploads",
+        files={"file": (PARQUET, raw, "application/octet-stream")},
+        timeout=60,
+    )
+    upload_id = _expect(resp, 201, "POST /api/uploads (other table)").json()["id"]
+    state["upload_id"], state["deleted"] = upload_id, False
+    launched = _expect(
+        api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json={"bronzeTable": other, "mode": "replace"}, timeout=60),
+        200,
+        f"POST .../ingest (into {other})",
+    ).json()
+    if not launched.get("runId"):
+        raise G9Failure(f"the other table's load should have launched, got {launched}")
+
+    def settled() -> bool:
+        current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+        if current.get("status") == "failed":
+            raise G9Failure(f"the {other} load failed: {current.get('error')!r}")
+        return current.get("status") == "ingested"
+
+    _wait_for(f"upload {upload_id} into {other} ingested", settled, LOAD_TIMEOUT_S)
+
+    before = len(_succeeded(api, pipeline_id))
+    print(f"[g9] other table: {other} loaded; watching {NO_RETRIGGER_WAIT_S}s for a run that must not come")
+    time.sleep(NO_RETRIGGER_WAIT_S)
+    after = len(_succeeded(api, pipeline_id))
+    if after != before:
+        raise G9Failure(
+            f"loading {other} ran the pipeline ({before} -> {after} successful runs); "
+            "only a re-upload of the pipeline's own source table may trigger it"
+        )
+    print(f"[g9] other table: the pipeline did not run again ({after} successful runs, unchanged)")
+    _delete_upload(api, upload_id, state)
+
+
+def step_lineage_shows_the_upload(api, upload_id: str, table: str, silver_table: str) -> None:
+    """`GET /api/governance/lineage` for the Silver table must show the
+    upload that made its Bronze source: `upload:<id>` -> `bronze.<table>`
+    -> `silver.<silver_table>`. The first edge is DATA-19's own
+    (`upload_table_claim`); the second is the authored pipeline's."""
+    resp = api.get(f"{API_URL}/api/governance/lineage", params={"focus": f"silver.{silver_table}"}, timeout=60)
+    body = _expect(resp, 200, "GET /api/governance/lineage").json()
+    wanted = [
+        (f"upload:{upload_id}", f"bronze:{table}", "upload"),
+        (f"bronze:{table}", f"table:silver.{silver_table}", "pipeline"),
+    ]
+    missing = [
+        f"{f} -> {t} [{k}]"
+        for f, t, k in wanted
+        if not any(
+            edge.get("from") == f and edge.get("to") == t and edge.get("kind") == k
+            for edge in body.get("edges", [])
+        )
+    ]
+    if missing:
+        drawn = sorted(
+            f"{edge.get('from')} -> {edge.get('to')} [{edge.get('kind')}]"
+            for edge in body.get("edges", [])
+        )
+        raise G9Failure(f"the lineage of silver.{silver_table} is missing {missing}; it draws {drawn}")
+    node = next((n for n in body.get("nodes", []) if n.get("id") == f"upload:{upload_id}"), None)
+    if node is None:
+        raise G9Failure(f"the lineage has no node for upload:{upload_id}: {body.get('nodes')}")
+    print(f"[g9] lineage: upload:{upload_id} -> bronze.{table} -> silver.{silver_table} ({node.get('label')!r})")
+
+
+def step_feeds_a_pipeline(
+    api, requests, table: str, first_upload_id: str, using: dict, expected: dict, state: dict
+) -> None:
+    """DATA-19, the whole feature in five assertions, in the order they
+    can each fail informatively:
+
+    1. a Bronze table an upload made is a pipeline's source;
+    2. the pipeline runs once and its Silver table holds the rows;
+    3. re-uploading the source table runs it AGAIN, with no trigger call,
+       and the changed row reaches Silver;
+    4. loading a DIFFERENT table does NOT run it;
+    5. lineage draws `upload -> bronze.<table> -> silver.<out>`.
+
+    `first_upload_id` is the upload the first load was made from, so the
+    lineage step names the upload the table really came from -- the claim
+    records the FIRST upload to ask for a table name, and the corrected
+    copy of step 3 keeps that claim (a claim is never taken away)."""
+    silver_table = f"{table}_clean"
+    pipeline_id = step_create_pipeline_over_uploaded_table(api, requests, table, silver_table)
+    # The table holds the `replace` load AND the `append` of it that step
+    # 4 made, so the pipeline copies twice the file's rows. The re-upload
+    # below replaces them again, which is the point: a re-upload that
+    # changes nothing would not show anything downstream either.
+    step_first_pipeline_run(api, pipeline_id, silver_table, 2 * len(expected["rows"]))
+    step_reupload_reruns_the_pipeline(api, table, silver_table, pipeline_id, using, expected, state)
+    step_other_table_does_not_rerun(api, table, pipeline_id, state)
+    step_lineage_shows_the_upload(api, first_upload_id, table, silver_table)
+    print("[g9] pipeline: PASS (uploaded table -> pipeline, re-upload re-ran it, another upload did not)")
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description=__doc__,
@@ -594,8 +1027,10 @@ def main() -> int:
         step_rows_and_types(api, table, expected)
         step_one_ingest_run_per_load(api, upload_id, table, file_rows)
         step_delete_keeps_the_table(api, upload_id, table, 2 * file_rows, state)
+        step_column_cap(api)
         step_workbook(api, table, state)
         step_parquet(api, table, state)
+        step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
         print(f"[g9] FAILED: {reason}", file=sys.stderr)

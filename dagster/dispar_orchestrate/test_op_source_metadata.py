@@ -26,6 +26,10 @@ from dispar_orchestrate import authored_factory, op_metadata
 from dispar_orchestrate.definitions import defs
 
 
+# The two ops `ingest_job` runs (SRC-11 D1 gives them their own retries).
+_INGEST_OPS = ("run_ingest", "ingest_source_object")
+
+
 def _every_op():
     """Every op of every job the code location registers, read from `defs`
     itself. This list used to be written by hand, and four ops
@@ -105,6 +109,13 @@ class OpSourceMetadataTest(unittest.TestCase):
         reach the policy."""
         expected = op_metadata.DEFAULT_RETRY_POLICY
         for op in _every_op():
+            if op.name in _INGEST_OPS:
+                # SRC-11 D1: the ingest ops retry on their own schedule (1, 5
+                # and 15 minutes, raised as `RetryRequested` by
+                # `ingest_factory._fail_or_retry`), which a `RetryPolicy` cannot
+                # express. They carry NO policy, so the default cannot also
+                # apply to them; the test below pins that.
+                continue
             with self.subTest(op=op.name):
                 self.assertIsNotNone(op.retry_policy, f"{op.name} declares no retry_policy")
                 self.assertEqual(
@@ -127,6 +138,16 @@ class OpSourceMetadataTest(unittest.TestCase):
                     expected.jitter,
                     f"{op.name} has jitter={op.retry_policy.jitter}, expected {expected.jitter}",
                 )
+
+    def test_the_ingest_ops_carry_no_retry_policy_because_they_raise_their_own_retries(self) -> None:
+        """SRC-11 D1: `DEFAULT_RETRY_POLICY` (two retries after about 30 s) is
+        replaced for the ingest ops only. A policy left on them would retry a
+        failure `ingest_errors.classify` decided is not retried."""
+        by_name = {op.name: op for op in _every_op()}
+        for name in _INGEST_OPS:
+            with self.subTest(op=name):
+                self.assertIn(name, by_name)
+                self.assertIsNone(by_name[name].retry_policy)
 
     def test_default_retry_policy_retries_a_transient_network_error(self) -> None:
         """`DEFAULT_RETRY_POLICY.delay=30` would slow the suite by a full

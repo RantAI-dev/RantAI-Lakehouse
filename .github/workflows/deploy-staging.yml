@@ -107,7 +107,7 @@ jobs:
           missing=""
           for name in AUTH_BOOTSTRAP_PASSWORD AGENT_RUN_TOKEN GOLD_EXPORT_RUN_TOKEN \
                       INGEST_SERVICE_TOKEN ALERTS_RUN_TOKEN PIPELINE_RUN_TOKEN \
-                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET; do
+                      LAKEHOUSE_MAINTENANCE_TOKEN EMBED_SECRET CONNECTOR_SECRETS_KEY; do
             var="STAGING_${name}"
             value="${!var}"
             if [ -z "$value" ]; then
@@ -136,6 +136,9 @@ jobs:
           STAGING_ALERTS_RUN_TOKEN: ${{ secrets.STAGING_ALERTS_RUN_TOKEN }}
           STAGING_PIPELINE_RUN_TOKEN: ${{ secrets.STAGING_PIPELINE_RUN_TOKEN }}
           STAGING_LAKEHOUSE_MAINTENANCE_TOKEN: ${{ secrets.STAGING_LAKEHOUSE_MAINTENANCE_TOKEN }}
+          # SRC-12: the key managed connector credentials are sealed with;
+          # required, like the tokens above (compose refuses to start without it).
+          STAGING_CONNECTOR_SECRETS_KEY: ${{ secrets.STAGING_CONNECTOR_SECRETS_KEY }}
           STAGING_EMBED_SECRET: ${{ secrets.STAGING_EMBED_SECRET }}
 
       - name: Build & start backend stack (core + seaweedfs + dagster + trino)

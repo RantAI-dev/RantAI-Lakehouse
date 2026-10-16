@@ -8,6 +8,7 @@
 
 import * as React from "react"
 import { PencilIcon } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
@@ -20,9 +21,12 @@ import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-for
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
+import { SECRET_MANAGER_LABEL, referenceProblem } from "@/lib/connectors/secret-reference"
 import type {
   CdcDial,
   CredentialKind,
+  CredentialSettings,
+  CredentialSource,
   FilesDial,
   KafkaDial,
   MongoDial,
@@ -33,6 +37,7 @@ import type {
   SqlDriver,
 } from "@/services/contracts/connectors"
 import { CredentialValueInput, credentialValueProblem } from "./credential-value-input"
+import { SecretReferenceField } from "./secret-reference-field"
 
 /**
  * `CreateConnectorInput.host` still exists on the base connector row
@@ -81,6 +86,12 @@ export type CredentialSlot = {
    * secret, even though it is stored like one). */
   plain?: boolean
   placeholder?: string
+  /**
+   * The value is not typed: it arrives when the person signs in at the
+   * provider, from the connector page (`SRC-12` part C: the OAuth refresh
+   * token). The form shows no field for it and sends no value for it.
+   */
+  signIn?: boolean
 }
 
 export type CredentialSlots = { primary: CredentialSlot; secondary: CredentialSlot | null }
@@ -132,6 +143,13 @@ export function credentialSlotsFor(adapter: string | null, dial: Record<string, 
           return {
             primary: { kind: "access_key", label: "Client ID", plain: true },
             secondary: { kind: "secret_key", label: "Client secret" },
+          }
+        case "oauth2_authorization_code":
+          // The client id is part of the connection settings; the client secret
+          // is typed, the refresh token comes from signing in.
+          return {
+            primary: { kind: "secret_key", label: "Client secret" },
+            secondary: { kind: "token", label: "Refresh token", signIn: true },
           }
         default:
           return { primary: { kind: "api_key", label: "API key" }, secondary: null }
@@ -186,6 +204,7 @@ export function DialFormFor({
   typeName,
   dial,
   onChange,
+  oauthCallbackUrl,
 }: {
   adapter: string | null
   /** `selectedType.name` — needed alongside `adapter` because Oracle
@@ -196,6 +215,8 @@ export function DialFormFor({
   typeName: string | null
   dial: Record<string, unknown> | null
   onChange: (next: Record<string, unknown>) => void
+  /** `CredentialSettings.oauthCallbackUrl`: shown by the REST form's OAuth sign-in fields. */
+  oauthCallbackUrl?: string | null
 }) {
   // Oracle is the one type whose dial form is picked by NAME, not by
   // `adapter` alone -- see this function's `typeName` doc comment above.
@@ -236,6 +257,7 @@ export function DialFormFor({
         <RestDialForm
           value={dial as unknown as RestDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          oauthCallbackUrl={oauthCallbackUrl}
         />
       )
     case "sheets":
@@ -292,20 +314,33 @@ export function credentialProblems({
   slots,
   primaryValue,
   secondaryValue,
+  referenceManager = null,
 }: {
   noCredential: boolean
   optional: boolean
   slots: CredentialSlots
   primaryValue: string
   secondaryValue: string
+  /** Set while the form is in "Reference a secret" mode: the values are references. */
+  referenceManager?: CredentialSettings["secretManager"]
 }): { primary: string | null; secondary: string | null } {
   if (noCredential) return { primary: null, secondary: null }
-  const nothingTyped = primaryValue === "" && (!slots.secondary || secondaryValue === "")
+  // A slot filled by signing in is never typed, so it is never a problem here.
+  const typedSecondary = slots.secondary && !slots.secondary.signIn ? slots.secondary : null
+  const nothingTyped = primaryValue === "" && (!typedSecondary || secondaryValue === "")
   if (optional && nothingTyped) return { primary: null, secondary: null }
+  if (referenceManager) {
+    const check = (reference: string) =>
+      reference === "" ? "Required." : referenceProblem(referenceManager, reference)
+    return {
+      primary: check(primaryValue),
+      secondary: typedSecondary ? check(secondaryValue) : null,
+    }
+  }
   return {
     primary: credentialValueProblem(normalizedCredential(slots.primary, primaryValue)),
-    secondary: slots.secondary
-      ? credentialValueProblem(normalizedCredential(slots.secondary, secondaryValue))
+    secondary: typedSecondary
+      ? credentialValueProblem(normalizedCredential(typedSecondary, secondaryValue))
       : null,
   }
 }
@@ -320,62 +355,114 @@ export function CredentialFields({
   noCredential,
   optional,
   credentialManaged,
+  credentialSource,
   slots,
   primaryValue,
   onPrimaryValueChange,
   secondaryValue,
   onSecondaryValueChange,
   problems,
+  settings = null,
+  referenceMode = false,
+  onReferenceModeChange,
 }: {
   noCredential: boolean
   /** Edit page: blank keeps the current credential. */
   optional: boolean
   /** Edit page: whether the current credential is stored by lakehouse. */
   credentialManaged?: boolean
+  /** Edit page: how the current credential is held (`SRC-12` decision 10). */
+  credentialSource?: CredentialSource | null
   slots: CredentialSlots
   primaryValue: string
   onPrimaryValueChange: (value: string) => void
   secondaryValue: string
   onSecondaryValueChange: (value: string) => void
   problems: { primary: string | null; secondary: string | null }
+  /** What this installation offers (`SRC-12` part B); `null` until loaded. */
+  settings?: CredentialSettings | null
+  /** Whether the credential is a reference to a secret in the secret manager. */
+  referenceMode?: boolean
+  onReferenceModeChange?: (referenceMode: boolean) => void
 }) {
   if (noCredential) {
     return <p className="text-xs text-muted-foreground">This connection authenticates with no credential.</p>
   }
-  const pair = slots.secondary !== null && !slots.primary.multiline && !slots.secondary.multiline
+  const manager = settings?.secretManager ?? null
+  // With a secret manager set up, the form offers "Reference a secret"; the
+  // operator can turn typing a value off, which leaves only the reference.
+  const showReference = manager !== null && referenceMode
+  const typedSecondary = slots.secondary && !slots.secondary.signIn ? slots.secondary : null
+  const pair = typedSecondary !== null && !slots.primary.multiline && !typedSecondary.multiline
+  const field = (id: string, slot: CredentialSlot, value: string, onChange: (value: string) => void) =>
+    showReference ? (
+      <SecretReferenceField key={`${id}-${credentialSlotsKey(slots)}`} manager={manager} idPrefix={id} onChange={onChange} />
+    ) : (
+      <CredentialValueInput id={id} slot={slot} value={value} onChange={onChange} />
+    )
   return (
-    <div className={cn("grid gap-3", pair && "sm:grid-cols-2")}>
+    <div className={cn("grid gap-3", pair && !showReference && "sm:grid-cols-2")}>
+      {manager !== null && onReferenceModeChange ? (
+        <div className={cn("space-y-1", pair && !showReference && "sm:col-span-2")}>
+          <div role="group" aria-label="How the credential is given" className="inline-flex gap-1">
+            {settings?.typedCredentials ? (
+              <Button
+                type="button"
+                size="sm"
+                variant={referenceMode ? "outline" : "default"}
+                aria-pressed={!referenceMode}
+                onClick={() => onReferenceModeChange(false)}
+              >
+                Type a value
+              </Button>
+            ) : null}
+            <Button
+              type="button"
+              size="sm"
+              variant={referenceMode ? "default" : "outline"}
+              aria-pressed={referenceMode}
+              onClick={() => onReferenceModeChange(true)}
+            >
+              Reference a secret
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Secret manager: {SECRET_MANAGER_LABEL[manager]}.
+            {settings?.typedCredentials ? "" : " Typing a value is turned off on this installation."}
+          </p>
+        </div>
+      ) : null}
       <Field
-        label={slots.primary.label}
-        htmlFor="credential-primary"
+        label={showReference ? `${slots.primary.label} (reference)` : slots.primary.label}
+        htmlFor={showReference ? undefined : "credential-primary"}
         error={primaryValue && problems.primary ? problems.primary : undefined}
       >
-        <CredentialValueInput
-          id="credential-primary"
-          slot={slots.primary}
-          value={primaryValue}
-          onChange={onPrimaryValueChange}
-        />
+        {field("credential-primary", slots.primary, primaryValue, onPrimaryValueChange)}
       </Field>
-      {slots.secondary ? (
+      {typedSecondary ? (
         <Field
-          label={slots.secondary.label}
-          htmlFor="credential-secondary"
+          label={showReference ? `${typedSecondary.label} (reference)` : typedSecondary.label}
+          htmlFor={showReference ? undefined : "credential-secondary"}
           error={secondaryValue && problems.secondary ? problems.secondary : undefined}
         >
-          <CredentialValueInput
-            id="credential-secondary"
-            slot={slots.secondary}
-            value={secondaryValue}
-            onChange={onSecondaryValueChange}
-          />
+          {field("credential-secondary", typedSecondary, secondaryValue, onSecondaryValueChange)}
         </Field>
       ) : null}
+      {slots.secondary?.signIn ? (
+        <p className="text-xs text-muted-foreground">
+          The {slots.secondary.label.toLowerCase()} is not entered here: you get it by signing in at the
+          provider, from the connector page, once the connector is saved.
+        </p>
+      ) : null}
       <p className={cn("text-xs text-muted-foreground", pair && "sm:col-span-2")}>
-        {optional
+        {showReference
+          ? "Only the reference is stored. The product reads the secret from the secret manager at every test and every run, after checking now that it can read it and that the connection works. Changing the secret there takes effect at the next run."
+          : optional
           ? credentialManaged
             ? "Leave blank to keep the current credential. A new one is tested against the source before it replaces the old."
-            : "This connector's credential is provisioned by an operator on the server. Leave blank to keep it, or enter one to have lakehouse store it instead."
+            : credentialSource === "env"
+              ? "This connector's credential is an environment variable on the server, read when the API and the orchestrator start: if an operator changes it, they must restart both. Leave blank to keep it, or enter one to have lakehouse store it instead."
+              : "This connector's credential is provisioned by an operator on the server. Leave blank to keep it, or enter one to have lakehouse store it instead."
           : "Stored by lakehouse when you create the connector, and never shown again. You can replace it later from the connector's edit page."}
       </p>
     </div>

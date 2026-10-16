@@ -47,6 +47,10 @@ SECRET_FIELD_NAMES: dict[tuple[str, str | None], tuple[str, ...]] = {
     ("rest", "bearer"): ("token",),
     ("rest", "basic"): ("username", "password"),
     ("rest", "oauth2_client_credentials"): ("clientId", "clientSecret"),
+    # SRC-12 part C: the client id is configuration in the dial; the two secrets
+    # are the client secret (primary) and the refresh token (secondary, written
+    # by the sign-in callback). Mirrors `ingest_spec::secret_field_names`.
+    ("rest", "oauth2_authorization_code"): ("clientSecret", "refreshToken"),
     ("sheets", None): ("serviceAccountJson",),
     ("mongodb", None): ("password",),
     ("kafka", "none"): (),

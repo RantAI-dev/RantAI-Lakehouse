@@ -47,6 +47,29 @@ pub struct TestApp {
 /// default for every upstream this crate does not itself own.
 const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
 
+/// `SRC-12` decision 4: the installation key every test app is given unless
+/// a test overrides `CONNECTOR_SECRETS_KEY`: base64 of 32 bytes of `0x2a`.
+/// Not a secret; it protects nothing outside a test's temporary directory.
+/// SEC-36: encoded at run time, so the repository holds no key-shaped literal
+/// for the `generic-api-key` rule to match.
+pub fn test_connector_secrets_key() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode([0x2a_u8; 32])
+}
+
+/// The credential the API stored in `dir` under `file_name`, opened with
+/// [`test_connector_secrets_key`]. Panics if the file is not a seal under
+/// that key (which is what a test asserting "stored encrypted" wants).
+pub fn stored_credential(dir: &std::path::Path, file_name: &str) -> String {
+    let bytes = std::fs::read(dir.join(file_name)).unwrap();
+    let ring = lakehouse_api::secret_crypto::Keyring::from_values(
+        Some(&test_connector_secrets_key()),
+        None,
+    )
+    .unwrap();
+    String::from_utf8(ring.open(file_name, &bytes).unwrap().plaintext).unwrap()
+}
+
 /// Creates a brand-new, randomly named database on the shared test
 /// Postgres container, migrates it (`0002_seed_identity.sql` and friends
 /// run as part of that), and returns a [`TestApp`] wired to it.
@@ -134,6 +157,10 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     env.insert("CH_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("DAGSTER_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
+    env.insert(
+        "CONNECTOR_SECRETS_KEY".to_owned(),
+        test_connector_secrets_key(),
+    );
     for (k, v) in overrides {
         env.insert(k.clone(), v.clone());
     }

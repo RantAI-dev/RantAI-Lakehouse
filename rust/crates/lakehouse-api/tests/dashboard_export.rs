@@ -94,6 +94,35 @@ async fn mount(ch: &MockServer, data: Vec<Value>) {
                 }),
             ),
             chart_row("c_bar", "bar", &json!({ "dimension": "region", "measures": ["email"] })),
+            // BI-6: raw tables with filters of their own.
+            chart_row(
+                "c_own",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "region"],
+                    "filters": [{ "column": "region", "values": ["south", "east"] }],
+                }),
+            ),
+            // BI-7: a raw table that joins a second table.
+            chart_row(
+                "c_join",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "mart_y__email", "mart_y__secret"],
+                    "joins": [{
+                        "mart": "mart_y", "type": "left",
+                        "on": [{ "left": "region", "op": "=", "right": "region" }],
+                    }],
+                }),
+            ),
+            chart_row(
+                "c_gone",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "region"],
+                    "filters": [{ "column": "gone", "values": ["x"] }],
+                }),
+            ),
         ],
     )
     .await;
@@ -251,6 +280,181 @@ async fn the_export_writes_every_visible_column_masked_filtered_sorted_and_audit
     assert_eq!(args["board"], "b1");
     assert_eq!(args["rows"], 2);
     assert_eq!(args["cut"], false);
+}
+
+/// BI-6: a raw table's own filters narrow its file as they narrow the tile, ahead
+/// of the dashboard's, under the same mask and row filter; one that no longer
+/// applies refuses the export and nothing is read or audited.
+#[tokio::test]
+async fn the_export_carries_the_tiles_own_filters_and_refuses_one_that_no_longer_applies() {
+    let ch = MockServer::start().await;
+    mount(&ch, vec![json!({"email": "***", "region": "south"})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+    governance::create_policy(
+        &pool,
+        &CreatePolicyInput {
+            name: "export-own-test".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "Exporter".to_owned(),
+            resources: "serving.mart_x".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                r#"{"roles":["Exporter"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let filters = urlencoding_free(r#"[{"column":"region","values":["south","west"]}]"#);
+    let resp = get(
+        &router,
+        &format!("/api/dashboard/table-export?chart=c_own&filters={filters}"),
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sent: Vec<String> = statements(&ch)
+        .await
+        .into_iter()
+        .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("region IN ('south', 'east') AND region IN ('south', 'west')"),
+        "own filters ahead of the dashboard's: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("replaceRegexpOne(toString(`email`)"),
+        "mask: {}",
+        sent[0]
+    );
+
+    let before = statements(&ch).await.len();
+    let refused = get(&router, "/api/dashboard/table-export?chart=c_gone", &cookie).await;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let after = statements(&ch).await;
+    assert!(
+        !after[before..]
+            .iter()
+            .any(|s| s.contains("serving.mart_x") && !s.contains("system.")),
+        "a refused export reads nothing: {after:?}"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.table_export'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audited, 1,
+        "only the export that was handed over is audited"
+    );
+}
+
+/// BI-7 (`BI-7-AC4`, `BI-7-AC2`): the file of a raw table that joins a second
+/// table lists the joined columns, and each table is read through its own
+/// policy: a mask on a column of the joined table and a row filter on it, with
+/// a different mask on the first table, all in the one statement the engine
+/// receives.
+#[tokio::test]
+async fn the_export_of_a_joined_table_lists_joined_columns_and_governs_each_table() {
+    let ch = MockServer::start().await;
+    // The all-marts column read comes first so it wins over the generic answer.
+    answer(
+        &ch,
+        "SELECT table, name, type FROM system.columns",
+        json!([
+            {"name": "table", "type": "String"}, {"name": "name", "type": "String"},
+            {"name": "type", "type": "String"}
+        ]),
+        ["mart_x", "mart_y"]
+            .iter()
+            .flat_map(|t| {
+                ["email", "region", "secret"]
+                    .iter()
+                    .map(move |n| json!({"table": t, "name": n, "type": "String"}))
+            })
+            .collect(),
+    )
+    .await;
+    mount(
+        &ch,
+        vec![json!({"email": "***", "mart_y__email": "b@x", "mart_y__secret": "***"})],
+    )
+    .await;
+    let (router, pool, cookie) = app(&ch).await;
+    for (table, mask, filter) in [
+        ("mart_x", r#"["email"]"#, ""),
+        (
+            "mart_y",
+            r#"["secret"]"#,
+            r#","rowFilter":"region = 'south'""#,
+        ),
+    ] {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: format!("join-{table}"),
+                kind: "Row filter".to_owned(),
+                subjects: "Exporter".to_owned(),
+                resources: format!("serving.{table}"),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(format!(
+                    r#"{{"roles":["Exporter"],"table":"serving.{table}","mask":{mask}{filter}}}"#
+                )),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let resp = get(&router, "/api/dashboard/table-export?chart=c_join", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    // The file starts with a byte-order mark (see the export route).
+    assert!(
+        body.trim_start_matches('\u{feff}')
+            .starts_with("email,mart_y__email,mart_y__secret"),
+        "{body}"
+    );
+    let sent: Vec<String> = statements(&ch)
+        .await
+        .into_iter()
+        .filter(|s| s.contains("JOIN") && !s.contains("system."))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let sql = &sent[0];
+    assert!(sql.contains("LEFT JOIN"), "{sql}");
+    assert!(
+        sql.contains("replaceRegexpOne(toString(`email`)"),
+        "first table masked: {sql}"
+    );
+    assert!(
+        sql.contains("replaceRegexpOne(toString(`secret`)"),
+        "joined table masked: {sql}"
+    );
+    assert!(
+        sql.contains("WHERE (region = 'south')"),
+        "joined table row-filtered: {sql}"
+    );
+    assert_eq!(
+        sql.matches("FROM serving.mart_").count(),
+        2,
+        "each table is read once, only inside its projection: {sql}"
+    );
+    assert!(sql.contains("join_use_nulls = 1"), "{sql}");
 }
 
 /// Query strings need `%`-escapes; this keeps the test free of a dependency.

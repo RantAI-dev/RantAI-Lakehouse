@@ -65,3 +65,20 @@ test("the box names the three kinds of formula", () => {
   assert.equal(levelLabel("aggregate", "number"), "Aggregate, number.")
   assert.match(levelLabel("table", "number"), /^Table calculation/)
 })
+
+test("BI-11: after { the parameters are suggested, and picking one closes the brace", () => {
+  const names = { columns: ["visitors"], fields: [], params: [{ name: "target", detail: "Target · number" }, { name: "top", detail: "Top · number" }] }
+  const text = "[visitors] / {ta"
+  const got = suggest(text, text.length, names, [])
+  assert.deepEqual(got.items.map((i) => [i.kind, i.label, i.insert]), [["param", "target", "target}"]])
+  assert.equal(applySuggestion(text, got, got.items[0]).text, "[visitors] / {target}")
+  const closed = "{ta}"
+  const again = suggest(closed, 3, names, [])
+  assert.equal(again.items[0].insert, "target", "an existing } is kept")
+})
+
+test("BI-11: a closed {name} ends the parameter state, and nothing is suggested inside text", () => {
+  const names = { columns: ["visitors"], fields: [], params: [{ name: "target", detail: "" }] }
+  assert.equal(suggest("{target} + vi", 13, names, []).items[0]?.kind, "column")
+  assert.equal(suggest("'{ta", 4, names, []).items.length, 0)
+})

@@ -6,6 +6,8 @@ use super::{FormulaError, clip};
 pub const MAX_FORMULA_CHARS: usize = 2000;
 /// Longest `[column name]`, in characters.
 const MAX_BRACKET_CHARS: usize = 200;
+/// Longest `{parameter}` name, in characters.
+const MAX_PARAM_CHARS: usize = 64;
 /// Numbers at or above this magnitude are refused: an integer past it no
 /// longer prints exactly as a double.
 const MAX_NUMBER: f64 = 1e15;
@@ -21,6 +23,8 @@ pub enum Tok {
     Name(String),
     /// `[Column Name]`, the text between the brackets.
     Bracket(String),
+    /// `{name}`, a parameter (`BI-11`).
+    Param(String),
     /// `(`
     LParen,
     /// `)`
@@ -113,6 +117,7 @@ fn lex_one(chars: &[char], i: usize) -> Result<(Tok, usize), FormulaError> {
         '>' => Ok((Tok::Gt, 1)),
         '\'' | '"' => lex_text(chars, i, c),
         '[' => lex_bracket(chars, i),
+        '{' => lex_param(chars, i),
         c if c.is_ascii_digit() => lex_number(chars, i),
         c if c.is_ascii_alphabetic() || c == '_' => {
             let len = chars[i..]
@@ -191,6 +196,33 @@ fn lex_bracket(chars: &[char], start: usize) -> Result<(Tok, usize), FormulaErro
         ));
     }
     Ok((Tok::Bracket(name), len))
+}
+
+/// `{name}`: a parameter reference. The name is an identifier of at most
+/// [`MAX_PARAM_CHARS`] characters and nothing else, so what is read here can
+/// never carry anything but a lookup key (`BI-11`).
+fn lex_param(chars: &[char], start: usize) -> Result<(Tok, usize), FormulaError> {
+    let Some(rel) = chars[start + 1..].iter().position(|c| *c == '}') else {
+        return Err(FormulaError::at(
+            "this parameter is missing its closing }.",
+            start,
+            chars.len() - start,
+        ));
+    };
+    let name: String = chars[start + 1..start + 1 + rel].iter().collect();
+    let len = rel + 2;
+    let well_formed = rel > 0
+        && rel <= MAX_PARAM_CHARS
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit());
+    if !well_formed {
+        return Err(FormulaError::at(
+            "a parameter name is letters, digits and _, and does not start with a digit.",
+            start,
+            len,
+        ));
+    }
+    Ok((Tok::Param(name), len))
 }
 
 /// `123`, `1.5`, `2e3`, `1.5E-7`. No sign (a minus is an operator) and no
