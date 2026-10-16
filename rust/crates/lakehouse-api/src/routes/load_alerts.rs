@@ -1276,11 +1276,14 @@ mod tests {
         assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
         let kinds: Vec<(String, i64)> = sqlx::query_as(
             "SELECT kind, count(*) FROM pipeline_run_event \
-             WHERE pipeline_id = 'connector:conn-pg-lakehouse' GROUP BY kind",
+             WHERE pipeline_id = 'connector:conn-pg-lakehouse' \
+             AND kind <> 'quality_load' GROUP BY kind",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
+        // DATA-14 (F4): a successful run also records a `quality_load` dedupe
+        // row for the on-load quality pass; this test is about the alert kinds.
         // SRC-17 F2: a handed-over report leaves two rows, the count and the
         // marker written once the rules were read (`success_alerted`).
         // Before, the single `success` row was all there was. Still no
