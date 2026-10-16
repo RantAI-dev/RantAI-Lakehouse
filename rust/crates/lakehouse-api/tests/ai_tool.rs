@@ -391,6 +391,13 @@ async fn unauthenticated_request_is_refused_by_the_policy_layer() {
 //     named board). The CPU-only bounds / off-grid /
 //     `w`-or-`h`-below-1 checks are covered by `parse_arrange_tiles`'s
 //     unit tests in `tools/boards.rs`.
+//   * `arrange_board`, "nothing is saved on refusal" (plan 131's last
+//     clause): covered for the bounds case, which is decided before the
+//     tool reads the layout — see
+//     `arrange_board_refuses_an_off_grid_box_and_saves_nothing`. It
+//     stays fixture-bound for the off-board case, where the refusal can
+//     only be reached after reading real `bi_board` and `bi_chart` rows,
+//     so its no-save consequence cannot be shown here either.
 //   * `save_board_filters` (plan 133): of its four lines, three are covered
 //     here — "21 filters are refused" and "an invalid op is refused" both run
 //     before any `ClickHouse` call (see
@@ -514,6 +521,51 @@ async fn rename_board_on_default_fails_with_the_console_message() {
         body["result"]["error"],
         json!("invalid dashboard"),
         "route's own message must surface through the tool"
+    );
+}
+
+/// `arrange_board` refuses a box that does not fit the 12-column grid, and
+/// **nothing is saved when it refuses** (plan 131's last clause). The bounds
+/// check runs inside `parse_arrange_tiles`, which the tool calls before it
+/// reads the board's layout (`tools/boards.rs:154`, ahead of `read_layout`
+/// at `:159` and the save at `:197`), so a refusal here is answered without
+/// touching the store. That is what the second assertion pins: the error is
+/// the tool's own, not the dead upstream's "database is unavailable", which
+/// is what a tool that parsed the box and then tried to save would return.
+#[tokio::test]
+async fn arrange_board_refuses_an_off_grid_box_and_saves_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "arrange_board",
+            "args": {
+                "board": "b-arrange",
+                // x + w = 8 + 5 = 13, past the twelfth column.
+                "tiles": { "c-1": { "x": 8, "y": 0, "w": 5, "h": 3 } },
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    let err = body["result"]["error"].as_str().expect("error message");
+    assert!(
+        err.contains("12-column grid"),
+        "the grid refusal must name the grid, got: {err}"
+    );
+    assert!(
+        !err.contains("database is unavailable"),
+        "the refusal must come from the bounds check, before any save was \
+         attempted; reaching the store at all means the parse error was \
+         ignored, got: {err}"
     );
 }
 
