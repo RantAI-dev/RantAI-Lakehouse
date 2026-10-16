@@ -250,3 +250,43 @@ are reported, not improvised (`AGENTS.md`, developer role).
 
 `DATA-12-AC10` … `AC17` (drafted by the planner on the feature page in the same
 commit as this plan; the owner runs them after QA).
+
+## Handoff and review
+
+### Planner's review, 2026-10-16, at `3b0b08a0`
+
+The developer's tasks 1 to 10 are on the branch (`22e2f485` to `c5e76658`,
+renumbered in `cf68c369`); task 11's handoff entry was never written: the
+session that ran it ended. The planner ran task 11's verification itself and
+reviewed the diff against this plan.
+
+No `BLOCKER`, no `SHOULD-FIX`.
+
+**Checked and correct.**
+- Store and migration `0073_governed_tags.sql`: `governed_tag_key` (key,
+  allowed values, creator) and the per-asset pairs, shapes checked in the
+  database as well as in the handler.
+- Tag keys behind `GET/POST/PUT/DELETE /api/governance/tag-keys`, writes on
+  `governance:write`, with `POLICY_TABLE` rows and `route_auth` cases.
+- `governedTags` on the annotation PUT is optional: omitting it changes
+  nothing, so an older caller cannot wipe a table's governed tags. Values are
+  checked against the key's allowed list.
+- Search and the Tags filter find governed pairs; the Tag keys page, the
+  About card editor and the Data Explorer column show them.
+- Part 3: the mart list and a query's sources carry the certification
+  fields; the chart builder shows the mark and the deprecation notice for a
+  chosen mart (reusing part 1's `DeprecationNotice`); the Query Studio panel
+  shows marks; `describe_mart` returns the fields. The tool's schema did not
+  change, so `tool_schemas.json` needs no regeneration.
+
+**Verification, by the planner, at `3b0b08a0`** (detached job, log kept
+outside the repo): `cargo fmt --check` exit 0; `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings` clean in 3m13s
+(`CARGO_INCREMENTAL=0`); `bun run typecheck` exit 0; `bun run lint` 0 errors,
+8 warnings; `bun run test` 1551 pass, 1 skip, 0 fail (1552 tests, 166
+files); both Python lint lines OK; no duplicate migration numbers.
+
+**Not verified.** No Rust test has run on this machine; CI on #106 runs
+them. The parts 2 and 3 screens have not been tried in a browser; the
+product owner's check of `DATA-12-AC10` onwards waits for the end of the
+phase.
