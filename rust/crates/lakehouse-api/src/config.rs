@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 
 use lakehouse_core::ident::Ident;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -140,6 +142,11 @@ pub enum ConfigError {
     /// the logs to explain it.
     #[error("CONNECTOR_TLS_CA_FILE must name a readable file, cannot read {0:?}")]
     UnreadableConnectorTlsCaFile(std::path::PathBuf),
+    /// A set `CONNECTOR_TLS_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first connector dial that the CA
+    /// file cannot be used (SEC-14B review round 1, SHOULD-FIX 6).
+    #[error("CONNECTOR_TLS_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptyConnectorTlsCaFile(std::path::PathBuf),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -1170,6 +1177,16 @@ fn parse_connector_tls_ca_file(
     // `read` (not `File::open`) so a directory, which opens but cannot be
     // read as a certificate, is caught here too.
     std::fs::read(&path).map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let certificates = CertificateDer::pem_file_iter(&path)
+        .map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let mut count = 0usize;
+    for cert in certificates {
+        cert.map_err(|_| ConfigError::EmptyConnectorTlsCaFile(path.clone()))?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(ConfigError::EmptyConnectorTlsCaFile(path));
+    }
     Ok(Some(path))
 }
 
@@ -2513,7 +2530,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("ca.pem");
-        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = crate::tls_proxy::pem_certificate(certified.cert.der());
+        std::fs::write(&ca, cert).unwrap();
         let env = env_with("CONNECTOR_TLS_CA_FILE", ca.to_str().unwrap());
         let cfg = Config::from_map(&env).unwrap();
         assert_eq!(cfg.connector_tls_ca_file.as_deref(), Some(ca.as_path()));
@@ -2541,6 +2560,37 @@ mod tests {
                 "the message must name the variable: {err}"
             );
         }
+    }
+
+    /// `SEC-14` part B, SHOULD-FIX 6: a set path that contains no PEM certificate
+    /// stops the API at start with a message naming the variable, never a silent fall
+    /// back to discovering it on the first connector dial.
+    #[test]
+    fn an_empty_connector_tls_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // File is empty (0 bytes, no PEM certificate)
+        let env = env_with("CONNECTOR_TLS_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // File has non-PEM text
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
     }
 
     #[test]
