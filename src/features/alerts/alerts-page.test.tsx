@@ -7,6 +7,7 @@ import {
   alertRuleFormFields,
   alertRuleSaveInput,
   connectorForKind,
+  isMetricRule,
   seesEveryTenant,
 } from "./alerts-page"
 import { ruleKindLabel, ruleScope } from "./rules-columns"
@@ -50,6 +51,19 @@ describe("alertRuleFormFields", () => {
       freshnessTarget: false,
       ...NO_LOAD_FIELDS,
     })
+  })
+})
+
+describe("a rule that watches a metric (BI-2)", () => {
+  it("is a metric rule as soon as it has a metric field, even before one is picked, and not otherwise", () => {
+    expect(isMetricRule({ metric: "" })).toBe(true)
+    expect(isMetricRule({ metric: "total_visitors" })).toBe(true)
+    expect(isMetricRule({})).toBe(false)
+    expect(isMetricRule({ metric: undefined })).toBe(false)
+  })
+
+  it("still shows the condition fields of an alert rule, which hold the metric choice", () => {
+    expect(alertRuleFormFields("alert").martMeasure).toBe(true)
   })
 })
 

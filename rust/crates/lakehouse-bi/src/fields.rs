@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::builder::{AggregateField, Relation, RelationColumns, TableCalc};
+use crate::filters::ColumnKind;
 use crate::formula::compile::{ChartCtx, FType, FixedJoin, Level, Scope, compile};
 use crate::grain::TimeContext;
 use crate::specs::ChartKind;
@@ -121,6 +122,33 @@ pub struct FieldDef {
 }
 
 impl FieldDef {
+    /// Whether this is a value group (`BI-10`), whose `formula` is the JSON of
+    /// a [`crate::groups::GroupDef`] and not formula text.
+    #[must_use]
+    pub fn is_group(&self) -> bool {
+        self.level == crate::groups::LEVEL
+    }
+
+    /// Whether this is a metric's catalog entry (`BI-2`), whose `formula` is
+    /// the JSON body [`crate::metrics`] writes.
+    #[must_use]
+    pub fn is_metric(&self) -> bool {
+        self.level == crate::metrics::LEVEL_METRIC
+    }
+
+    /// Whether this is a segment's catalog entry (`BI-2`).
+    #[must_use]
+    pub fn is_segment(&self) -> bool {
+        self.level == crate::metrics::LEVEL_SEGMENT
+    }
+
+    /// Whether this is a calculated field in the formula language: not a value
+    /// group, a metric or a segment.
+    #[must_use]
+    pub fn is_formula_field(&self) -> bool {
+        !self.is_group() && !self.is_metric() && !self.is_segment()
+    }
+
     /// Whether the stored level is aggregate.
     #[must_use]
     pub fn is_aggregate(&self) -> bool {
@@ -236,6 +264,34 @@ pub async fn list_fields_for(
     Ok(rows.iter().filter_map(row_to_field).collect())
 }
 
+/// [`list_fields`] plus the metrics and segments as catalog entries
+/// (`BI-2`): what a read that builds tiles loads. The calculated-field routes
+/// keep using [`list_fields`], which has none of them.
+///
+/// # Errors
+///
+/// Returns [`ChError`] when the fields cannot be read; a failure to read the
+/// metric or segment tables leaves them out (see [`crate::metrics::with_metrics`]).
+pub async fn list_catalog_fields(ch: &ChClient) -> Result<Vec<FieldDef>, ChError> {
+    crate::metrics::with_metrics(ch, list_fields(ch).await?).await
+}
+
+/// [`list_fields_for`] plus the metrics and segments of that source.
+///
+/// # Errors
+///
+/// As [`list_catalog_fields`].
+pub async fn list_catalog_fields_for(
+    ch: &ChClient,
+    kind: SourceKind,
+    source_id: &str,
+) -> Result<Vec<FieldDef>, ChError> {
+    let own = list_fields_for(ch, kind, source_id).await?;
+    let mut all = crate::metrics::with_metrics(ch, own).await?;
+    all.retain(|f| f.source_kind == kind && f.source_id == source_id);
+    Ok(all)
+}
+
 /// One live field by id.
 ///
 /// # Errors
@@ -346,15 +402,112 @@ impl FieldCatalog {
         }
     }
 
+    /// `filters` of a chart on `def`'s source with every `{ "segment": … }`
+    /// replaced by the segment's filters (`BI-2`).
+    ///
+    /// # Errors
+    ///
+    /// The sentence for a segment that does not exist on this source.
+    pub fn expand_chart_filters(
+        &self,
+        def: &ChartInput,
+        filters: &[crate::filters::FilterDef],
+    ) -> Result<Vec<crate::filters::FilterDef>, String> {
+        if filters.iter().all(|f| f.segment.is_none()) {
+            return Ok(filters.to_vec());
+        }
+        let here = self.for_chart(def);
+        crate::metrics::expand_segments(filters, &|name| {
+            here.iter()
+                .find(|f| f.is_segment() && f.name == name)
+                .and_then(crate::metrics::segment_filters)
+        })
+    }
+
+    /// `BI-2`: whether a metric or a segment `def` names is missing, belongs
+    /// to another source, or no longer checks out against `cols`. A tile that
+    /// names one must say so, not fall back to the statement saved with the
+    /// chart (which still holds the old number) or drop the filter.
+    #[must_use]
+    pub fn broken_reference(
+        &self,
+        def: &ChartInput,
+        cols: &RelationColumns,
+        time: &TimeContext,
+    ) -> bool {
+        let uses_segment = def.shape.own_filters().iter().any(|f| f.segment.is_some());
+        if !def.measures.has_metrics() && !uses_segment {
+            return false;
+        }
+        if self
+            .expand_chart_filters(def, def.shape.own_filters())
+            .is_err()
+        {
+            return true;
+        }
+        if !def.measures.has_metrics() {
+            return false;
+        }
+        let from = Relation::Sql(String::new());
+        prepare(self.for_chart(def), def, from, cols, time).is_err()
+    }
+
+    /// BI-2 review fix (SHOULD-FIX) R3: the label of each metric `def` reads
+    /// (as a measure of the chart or of one of its questions), by metric name,
+    /// so a tile can show "Total visitors" where its result column is called
+    /// `total_visitors`. A metric with no label, or whose label is its name, is
+    /// left out and the tile shows the name. `raw` is the chart's own source
+    /// columns: with them a plain measure that the reader would read as the
+    /// metric ([`plain_name_is_metric`]) is labelled too; without them only a
+    /// marked measure is.
+    #[must_use]
+    pub fn metric_labels(
+        &self,
+        def: &ChartInput,
+        raw: Option<&RelationColumns>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let mut take = |fields: &[FieldDef],
+                        measures: &crate::shape::MeasureList,
+                        raw: Option<&RelationColumns>| {
+            for (i, name) in measures.iter().enumerate() {
+                let is = measures.is_metric(i)
+                    || raw.is_some_and(|r| plain_name_is_metric(fields, r, name));
+                let label = fields
+                    .iter()
+                    .find(|f| f.is_metric() && f.name == *name)
+                    .and_then(crate::metrics::entry_label);
+                if let (true, Some(label)) = (is, label)
+                    && label != *name
+                {
+                    out.insert(name.clone(), label);
+                }
+            }
+        };
+        take(self.for_chart(def), &def.measures, raw);
+        for l in def.shape.layers_list() {
+            let fields = match l.sql_source.as_deref().filter(|s| !s.is_empty()) {
+                Some(id) => self.of(SourceKind::SqlSource, id),
+                None => self.of(SourceKind::Mart, &l.mart),
+            };
+            take(fields, &l.measures, None);
+        }
+        out
+    }
+
     /// Whether `def` names a field of its source (and so must be built at
     /// read time, with the source's columns at hand).
     #[must_use]
     pub fn chart_uses(&self, def: &ChartInput) -> bool {
         let fields = self.for_chart(def);
-        !fields.is_empty()
-            && referenced(def)
-                .iter()
-                .any(|(n, _)| fields.iter().any(|f| f.name == *n))
+        // A chart that names a metric is always rebuilt: a metric that is gone
+        // is the tile's plain error, never the statement saved with the chart.
+        def.measures.has_metrics()
+            || def.shape.own_filters().iter().any(|f| f.segment.is_some())
+            || (!fields.is_empty()
+                && referenced(def)
+                    .iter()
+                    .any(|(n, _)| fields.iter().any(|f| f.name == *n)))
     }
 }
 
@@ -365,6 +518,8 @@ impl FieldCatalog {
 enum Slot {
     /// A measure: the one place an aggregate field can stand.
     Measure,
+    /// A measure that names a saved metric (`BI-2`): it matches only a metric.
+    Metric,
     /// Any other column slot.
     Other,
 }
@@ -376,9 +531,33 @@ fn referenced(def: &ChartInput) -> Vec<(&str, Slot)> {
         out.push((&def.dimension, Slot::Other));
     }
     out.extend(def.breakdown.iter().map(|b| (b.as_str(), Slot::Other)));
-    out.extend(def.measures.iter().map(|m| (m.as_str(), Slot::Measure)));
+    out.extend(def.measures.iter().enumerate().map(|(i, m)| {
+        (
+            m.as_str(),
+            if def.measures.is_metric(i) {
+                Slot::Metric
+            } else {
+                Slot::Measure
+            },
+        )
+    }));
     out.extend(def.lat.iter().map(|c| (c.as_str(), Slot::Other)));
     out.extend(def.lon.iter().map(|c| (c.as_str(), Slot::Other)));
+    // BI-6: a chart's own filters and groupings read per-row fields like any
+    // other column slot.
+    out.extend(
+        def.shape
+            .own_filters()
+            .iter()
+            .map(|f| (f.column.as_str(), Slot::Other)),
+    );
+    out.extend(
+        def.shape
+            .groupings
+            .iter()
+            .flatten()
+            .map(|g| (g.column.as_str(), Slot::Other)),
+    );
     let t = &def.tables;
     for list in [&t.columns, &t.rows].into_iter().flatten() {
         out.extend(list.iter().map(|c| (c.as_str(), Slot::Other)));
@@ -405,7 +584,9 @@ fn referenced(def: &ChartInput) -> Vec<(&str, Slot)> {
 fn takes_aggregate_measure(def: &ChartInput) -> bool {
     let kind = def.kind;
     match kind {
-        ChartKind::Kpi => !def.tables.compares_to_previous(kind),
+        // BI-2: a comparing KPI takes a metric, whose number is the whole
+        // aggregate the trend statement computes per period.
+        ChartKind::Kpi => !def.tables.compares_to_previous(kind) || def.measures.has_metrics(),
         ChartKind::Gauge => true,
         ChartKind::Boxplot
         | ChartKind::Pointmap
@@ -421,6 +602,12 @@ fn takes_aggregate_measure(def: &ChartInput) -> bool {
 /// a pivot, a raw table, a map and a box plot have none.
 fn takes_table_calc(def: &ChartInput) -> bool {
     let kind = def.kind;
+    // BI-13: the questions of a combined chart are matched on their dimension
+    // values, so a calculation over the order of one question's groups has no
+    // meaning there.
+    if combines_questions(def) {
+        return false;
+    }
     matches!(
         kind,
         ChartKind::Bar
@@ -433,10 +620,31 @@ fn takes_table_calc(def: &ChartInput) -> bool {
     ) || (kind == ChartKind::Table && !def.tables.is_rows_mode(kind))
 }
 
+/// Whether the chart is one question of a combined chart, or carries layers
+/// (`BI-13`).
+fn combines_questions(def: &ChartInput) -> bool {
+    def.shape.layer_query || !def.shape.layers_list().is_empty()
+}
+
+/// The sentence for a table calculation used where the chart cannot have one.
+fn table_calc_refusal(name: &str, combined: bool) -> String {
+    if combined {
+        return format!(
+            "'{name}' is a table calculation; a chart that combines several questions takes none."
+        );
+    }
+    format!(
+        "'{name}' is a table calculation; it can only be a value (measure) of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart, not a dimension, breakdown, column, pivot value, map, KPI or gauge."
+    )
+}
+
 /// How a chart may use the fields it names, for [`prepare_refs`].
 struct Use {
     aggregate_measure_ok: bool,
     table_calc_ok: bool,
+    /// The chart combines questions (`BI-13`); only changes the sentence of a
+    /// refused table calculation.
+    combined: bool,
     chart: Option<ChartCtx>,
 }
 
@@ -496,6 +704,7 @@ pub fn prepare<H: std::hash::BuildHasher>(
         &Use {
             aggregate_measure_ok: takes_aggregate_measure(def),
             table_calc_ok: takes_table_calc(def),
+            combined: combines_questions(def),
             chart: Some(chart_ctx(def, time)),
         },
         from,
@@ -522,9 +731,92 @@ pub fn prepare_named<H: std::hash::BuildHasher>(
     let none = Use {
         aggregate_measure_ok: false,
         table_calc_ok: false,
+        combined: false,
         chart: None,
     };
     prepare_refs(fields, &refs, &none, from, cols, time)
+}
+
+/// Whether a plain (unmarked) measure `name` is a metric of the source.
+///
+/// BI-2 review fix (BLOCKER) R1: a chart saved before the stored definition
+/// kept its metric marker has the metric's name as a plain measure. A name
+/// that is no column and no calculated field, and is a metric of the source,
+/// is that metric, so such a chart heals on its next read.
+///
+/// BI-2 review fix (SHOULD-FIX) R2: the reader ([`named_metrics`]) and the
+/// metric's usage (`metrics::charts_using_metric`, which the delete-in-use
+/// rule shares) both ask this one function, so they cannot disagree.
+#[must_use]
+pub fn plain_name_is_metric(fields: &[FieldDef], raw: &RelationColumns, name: &str) -> bool {
+    !raw.contains_key(name)
+        && !fields
+            .iter()
+            .any(|f| f.is_formula_field() && f.name == name)
+        && fields.iter().any(|f| f.is_metric() && f.name == name)
+}
+
+/// The metrics the measures name (`BI-2`). A measure that names a metric
+/// matches a metric and nothing else: a metric that is gone, or that has a
+/// column's name, is the tile's plain error, with no fallback to a column or
+/// to a stored statement.
+fn named_metrics<'a>(
+    fields: &[FieldDef],
+    refs: &[(&'a str, Slot)],
+    raw: &RelationColumns,
+) -> Result<BTreeSet<&'a str>, String> {
+    let mut metrics: BTreeSet<&str> = BTreeSet::new();
+    let healed =
+        |name: &str, slot: Slot| slot == Slot::Measure && plain_name_is_metric(fields, raw, name);
+    for (name, _) in refs
+        .iter()
+        .filter(|(n, s)| *s == Slot::Metric || healed(n, *s))
+    {
+        if raw.contains_key(*name) {
+            return Err(format!(
+                "the metric '{name}' has the name of a column of this source and cannot be read."
+            ));
+        }
+        if !fields.iter().any(|f| f.is_metric() && f.name == *name) {
+            return Err(format!(
+                "the metric '{name}' does not exist on this source (it may have been deleted)."
+            ));
+        }
+        metrics.insert(name);
+    }
+    Ok(metrics)
+}
+
+/// The aggregate expression of each named metric, under its own condition.
+fn metric_aggregates(
+    metrics: &BTreeSet<&str>,
+    fields: &[FieldDef],
+    (raw, time): (&RelationColumns, &TimeContext),
+    usage: &Use,
+) -> Result<Vec<AggregateField>, String> {
+    let mut out: Vec<AggregateField> = Vec::new();
+    for name in metrics {
+        let Some(entry) = fields.iter().find(|f| f.is_metric() && f.name == *name) else {
+            continue;
+        };
+        if !usage.aggregate_measure_ok {
+            return Err(format!(
+                "the metric '{name}' can only be a value of a chart that groups, or of a single-number card."
+            ));
+        }
+        out.push(crate::metrics::compile_entry(entry, raw, fields, time).map_err(|p| p.message)?);
+    }
+    Ok(out)
+}
+
+/// The names of the calculated fields the slots name (a metric slot names a
+/// metric, see [`named_metrics`]).
+fn used_names<'a>(live: &[&'a FieldDef], refs: &[(&str, Slot)]) -> BTreeSet<&'a str> {
+    refs.iter()
+        .filter(|(_, slot)| *slot != Slot::Metric)
+        .filter_map(|(name, _)| live.iter().find(|f| f.name == *name))
+        .map(|f| f.name.as_str())
+        .collect()
 }
 
 fn prepare_refs<H: std::hash::BuildHasher>(
@@ -538,33 +830,41 @@ fn prepare_refs<H: std::hash::BuildHasher>(
     let raw: RelationColumns = cols.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let live: Vec<&FieldDef> = fields
         .iter()
-        .filter(|f| !raw.contains_key(&f.name))
+        .filter(|f| !raw.contains_key(&f.name) && !f.is_metric() && !f.is_segment())
         .collect();
-    let mut used: BTreeSet<&str> = BTreeSet::new();
-    for (name, _) in refs {
-        if let Some(field) = live.iter().find(|f| f.name == *name) {
-            used.insert(field.name.as_str());
-        }
-    }
-    if used.is_empty() {
+    let used = used_names(&live, refs);
+    let metrics = named_metrics(fields, refs, &raw)?;
+    if used.is_empty() && metrics.is_empty() {
         return Ok(None);
     }
     let mut scope = Scope::new(&raw, time);
     if let Some(chart) = &usage.chart {
         scope = scope.with_chart(chart.clone());
     }
-    for f in &live {
+    // BI-10: a value group is compiled on its own below; the formula language
+    // does not know it.
+    for f in live.iter().filter(|f| !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     let mut columns: Vec<(String, String)> = Vec::new();
-    let mut aggregates: Vec<AggregateField> = Vec::new();
+    let mut aggregates = metric_aggregates(&metrics, fields, (&raw, time), usage)?;
     let mut table_calcs: Vec<TableCalc> = Vec::new();
     let mut fixed: Vec<FixedJoin> = Vec::new();
     let mut aug = raw.clone();
+    aug.extend(
+        aggregates
+            .iter()
+            .map(|a| (a.name.clone(), ColumnKind::Number)),
+    );
     for name in &used {
         let Some(field) = live.iter().find(|f| f.name == *name) else {
             continue;
         };
+        if field.is_group() {
+            columns.push((field.name.clone(), group_column(field, refs, &raw)?));
+            aug.insert(field.name.clone(), ColumnKind::Text);
+            continue;
+        }
         let compiled = compile(&field.formula, &scope, Some(&field.name)).map_err(|problem| {
             format!(
                 "the calculated field '{}' does not check out: {problem}",
@@ -581,9 +881,7 @@ fn prepare_refs<H: std::hash::BuildHasher>(
         match compiled.level {
             Level::Table => {
                 if !(usage.table_calc_ok && only_measure) {
-                    return Err(format!(
-                        "'{name}' is a table calculation; it can only be a value (measure) of a bar, hbar, line, area, stacked, combo, waterfall or grouped table chart, not a dimension, breakdown, column, pivot value, map, KPI or gauge."
-                    ));
+                    return Err(table_calc_refusal(name, usage.combined));
                 }
                 table_calcs.push(TableCalc {
                     name: field.name.clone(),
@@ -603,6 +901,7 @@ fn prepare_refs<H: std::hash::BuildHasher>(
                     name: field.name.clone(),
                     sql: compiled.sql,
                     reads: compiled.reads.into_iter().collect(),
+                    prefer_columns: false,
                 });
             }
             _ => columns.push((field.name.clone(), compiled.sql)),
@@ -631,8 +930,38 @@ fn prepare_refs<H: std::hash::BuildHasher>(
     Ok(Some(Prepared {
         from,
         cols: aug,
-        used: used.into_iter().map(str::to_owned).collect(),
+        used: used.into_iter().chain(metrics).map(str::to_owned).collect(),
     }))
+}
+
+/// A value group used in a chart: its per-row expression, unless it stands
+/// only as a measure (it is text).
+fn group_column(
+    field: &FieldDef,
+    refs: &[(&str, Slot)],
+    raw: &RelationColumns,
+) -> Result<String, String> {
+    let name = field.name.as_str();
+    let only_measure = refs
+        .iter()
+        .filter(|(n, _)| *n == name)
+        .all(|(_, s)| *s == Slot::Measure);
+    if only_measure {
+        return Err(format!(
+            "'{name}' is a value group (text); it cannot be a value (measure)."
+        ));
+    }
+    group_sql(field, raw)
+}
+
+/// The per-row expression of a value group against the source's current
+/// columns: the column must still exist and still be text.
+fn group_sql(field: &FieldDef, raw: &RelationColumns) -> Result<String, String> {
+    let broken = || format!("the value group '{}' does not check out.", field.name);
+    let def = crate::groups::GroupDef::from_stored(&field.formula).ok_or_else(broken)?;
+    def.validate(raw)
+        .map_err(|why| format!("the value group '{}': {why}", field.name))?;
+    def.sql().ok_or_else(broken)
 }
 
 /// The inferred level and type of a formula over a source, for saving it.
@@ -650,7 +979,7 @@ pub fn check<H: std::hash::BuildHasher>(
 ) -> Result<(Level, FType), crate::formula::FormulaError> {
     let raw: RelationColumns = cols.iter().map(|(k, v)| (k.clone(), *v)).collect();
     let mut scope = Scope::new(&raw, time);
-    for f in others.iter().filter(|f| f.name != own) {
+    for f in others.iter().filter(|f| f.name != own && !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     // The field being saved is in scope with its NEW formula, so a formula
@@ -740,12 +1069,12 @@ pub fn fields_using<'a>(
     name: &str,
 ) -> Vec<&'a str> {
     let mut scope = Scope::new(cols, time);
-    for f in siblings {
+    for f in siblings.iter().filter(|f| !f.is_group()) {
         scope = scope.with_field(&f.name, &f.formula);
     }
     siblings
         .iter()
-        .filter(|f| f.name != name)
+        .filter(|f| f.name != name && !f.is_group())
         .filter(|f| {
             compile(&f.formula, &scope, Some(&f.name)).is_ok_and(|c| c.fields.contains(name))
         })
@@ -822,6 +1151,51 @@ mod tests {
         };
         let marts = HashMap::from([("mart_x".to_owned(), cols())]);
         sql_with_filters_report(spec, &[], filters, &marts, &read)
+    }
+
+    fn group_field(name: &str, json: &str) -> FieldDef {
+        let mut f = field(name, json, Level::Row);
+        f.level = crate::groups::LEVEL.to_owned();
+        f.ty = "text".to_owned();
+        f
+    }
+
+    #[test]
+    fn a_value_group_is_a_text_column_of_the_relation_and_a_measure_cannot_be_one() {
+        let cat = FieldCatalog::from_fields(vec![group_field(
+            "region",
+            r#"{"column":"g","rest":"other","groups":[{"name":"A","values":["x","it's"]}]}"#,
+        )]);
+        let time = TimeContext::default();
+        let read = ReadContext {
+            time: &time,
+            grain: None,
+            fields: &cat,
+        };
+        let marts = HashMap::from([("mart_x".to_owned(), cols())]);
+        let got = sql_with_filters_report(
+            &spec(ChartKind::Bar, "region", &["v"]),
+            &[],
+            &[],
+            &marts,
+            &read,
+        );
+        assert!(
+            got.sql.contains(
+                "(SELECT *, multiIf(toString(g) IN ('x', 'it''s'), 'A', 'Other') AS region FROM serving.mart_x) AS calc"
+            ),
+            "{}",
+            got.sql
+        );
+        // As a measure it is refused, so the chart keeps its stored statement.
+        let measure = sql_with_filters_report(
+            &spec(ChartKind::Bar, "g", &["region"]),
+            &[],
+            &[],
+            &marts,
+            &read,
+        );
+        assert_eq!(measure.sql, "SELECT 1");
     }
 
     #[test]
@@ -1054,7 +1428,7 @@ mod tests {
             got.sql
         );
         assert!(got.sql.ends_with("SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"));
-        s.def.measures = vec!["bad".to_owned()];
+        s.def.measures = vec!["bad".to_owned()].into();
         assert!(
             sql_for_sql_source_report(
                 &s,

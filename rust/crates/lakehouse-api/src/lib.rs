@@ -35,6 +35,7 @@ pub mod connector_oauth;
 pub mod connector_probe;
 pub mod connector_secret_store;
 pub mod csv_export;
+pub mod csv_safe;
 pub mod error;
 pub mod gold_export;
 pub mod gold_export_history;
@@ -66,6 +67,7 @@ pub mod transform_grammar;
 #[cfg(test)]
 mod tls_proxy;
 
+pub mod upload_limits;
 pub mod upload_parquet;
 pub mod upload_parse;
 pub mod upload_store;

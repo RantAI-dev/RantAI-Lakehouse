@@ -338,10 +338,25 @@ async fn with_the_switch_off_a_direct_tool_call_is_refused_and_runs_nothing() {
 /// feature, and its system prompt is the same bytes as before. The values are
 /// pinned here, not computed from the code under test: a change to either is
 /// an intended change, and this fixture is then updated by hand.
+//
+// Updated by hand in the merge of phase 2 into main's `propose_sql` work: `BI-2`
+// (plan 2026-10-11-bi-2-reusable-metrics.md, section 7) puts `list_metrics`,
+// `describe_metric` and `query_metric` in `ALWAYS` on purpose, so a question for
+// a number is answered from a named metric. `propose_sql` itself is still
+// absent: only an allowlist naming it offers it.
+//
+// Updated by hand when AI-1/AI-2/AI-20 (plan 20) taught SYSTEM_BUILD_SUFFIX
+// about the six dashboard-board tools: `rename_board`, `delete_board`,
+// `arrange_board`, `move_chart`, `set_board_view_filters` and
+// `save_board_filters`. Only the prompt's bytes moved; the offered-tool list
+// above is untouched, because none of the six is in `ALWAYS` (five are writes,
+// and the read-only `set_board_view_filters` is routed in by the dashboard
+// domain's own word list, which the test's turn does not match).
 const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "ask_user",
     "describe_dataset",
     "describe_mart",
+    "describe_metric",
     "get_cdc_health",
     "get_lineage",
     "get_quality",
@@ -350,11 +365,13 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "list_boards",
     "list_connectors",
     "list_datasets",
+    "list_metrics",
     "list_pipelines",
+    "query_metric",
     "run_sql",
 ];
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =
-    "d451c89f816618dd5223f467d03b0c93835a32070367112ba30df4ead5c83046";
+    "f59505f7a7fff527cbb8a25e44b7a86b37f62868746c86f14881cddfcf5cfb68";
 
 fn sha256_hex(text: &str) -> String {
     use std::fmt::Write as _;

@@ -19,6 +19,7 @@ mod connector_oauth;
 mod connector_probe;
 mod connector_secret_store;
 mod csv_export;
+mod csv_safe;
 mod error;
 mod gold_export;
 mod gold_export_history;
@@ -49,6 +50,8 @@ mod transform_grammar;
 // because `main.rs` compiles the same sources into the binary.
 #[cfg(test)]
 mod tls_proxy;
+
+mod upload_limits;
 mod upload_parquet;
 mod upload_parse;
 mod upload_store;
@@ -62,8 +65,19 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use state::AppState;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Builds the runtime by hand instead of `#[tokio::main]` only to set the
+/// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
+/// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(config::WORKER_STACK_BYTES)
+        .build()
+        .context("failed to build the tokio runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

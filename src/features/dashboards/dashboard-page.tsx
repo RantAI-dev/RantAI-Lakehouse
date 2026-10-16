@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
+import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Moon, Pencil, SlidersHorizontal, Sparkles, Table2, Trash2 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -11,14 +11,19 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { dashboardDestination, queryDestination, urlDestination } from "@/lib/click-destination";
+import { binRangeFilter, isLastBin, toggleBinFilter } from "@/lib/chart-bins";
 import { bucketActions, bucketRangeFilter, dashboardRangeDestination, toggleBucketFilter } from "@/lib/bucket-click";
+import { ParamControls } from "./param-controls";
+import { ParamDialog } from "./param-dialog";
+import { PARAMS_PARAM, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, savedParamsBody, withParamsParam, withValue, type BoardParam, type ParamControl, type ParamValue } from "@/lib/params";
 import { GRAIN_PARAM, differsFromSaved, grainQuery, readGrainParam, savedGrainBody, shownGrain, withGrainParam, type GrainChoice } from "@/lib/grain-switch";
 import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type ColumnKind, type Grain, type ReportingContext } from "@/lib/time-grain";
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
+import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { ChartClick, LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -34,6 +39,7 @@ import { fmtInt } from "./chart-option";
 import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { GrainMarkers } from "./grain-marker";
+import { OwnFiltersMarker } from "./filters/own-filters-marker";
 import { GrainSwitch } from "./grain-switch";
 import { ReportingProvider } from "./reporting-context";
 import { FilterBar } from "./filters/filter-bar";
@@ -41,6 +47,7 @@ import { SkippedFiltersMarker } from "./filters/skipped-marker";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, type DrillTarget } from "./drill";
+import { DrillTrail, useTileDrills } from "./tile-drills";
 import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
@@ -50,7 +57,8 @@ import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell }
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
 type BoardOpt = { id: string; name: string; folderId?: string | null };
-type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
+/** `resolved`: the columns a chart's parameter slots took in this response (BI-11). */
+type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef; resolved?: { dimension?: string; breakdown?: string | null } };
 type Payload = {
   board: string; layout: LayoutMap;
   /** The filters in force for this response (the address's, else the default). */
@@ -63,6 +71,8 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
+  params?: ParamControl[]; defaultParams?: Record<string, ParamValue>; appliedParams?: Record<string, ParamValue>;
   filterColumns: string[]; filterFields?: FilterField[];
   boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
@@ -78,6 +88,7 @@ const NO_KPIS: KpiMeta[] = [];
 const NO_RESULTS: Record<string, Cell> = {};
 const NO_FILTERS: FilterDef[] = [];
 const NO_FIELDS: FilterField[] = [];
+const NO_CONTROLS: ParamControl[] = [];
 
 /** "open the Sales dashboard", for the hover cue of a chart with a saved click. */
 function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
@@ -92,13 +103,23 @@ function clickVerb(click: ChartClick, boards: readonly BoardOpt[]): string {
  * definition, but its `x` is a real mart column (`canDrill` leaves out the
  * built-in line and area, whose axis is a derived period).
  */
-function clickSpecOf(spec: ChartCard): ClickSpec {
+/**
+ * The tile's id when it has filters of its own (BI-6) or joined tables (BI-7), so the records list it
+ * opens carries them: the server reads the tile's definition and lists the same relation.
+ */
+function ownFilterChart(spec: ChartCard): string | undefined {
+  return spec.source !== "builtin" && (spec.def?.filters?.length || spec.def?.joins?.length) ? spec.id : undefined;
+}
+
+function clickSpecOf(spec: ChartCard, level?: string): ClickSpec {
   const own = spec.source !== "builtin";
   return {
     kind: spec.kind,
     source: spec.source,
-    dimension: (own ? spec.def?.dimension : spec.x) || undefined,
-    breakdown: (own ? spec.def?.breakdown : spec.series) || undefined,
+    // BI-6 part 2: after steps a row is no longer a set of source rows: no value drill.
+    // BI-10: a drilled tile shows the next level of its hierarchy, and clicks on that.
+    dimension: (own ? (spec.def?.steps?.length ? undefined : level ?? spec.resolved?.dimension ?? spec.def?.dimension) : spec.x) || undefined,
+    breakdown: (own ? spec.resolved?.breakdown ?? spec.def?.breakdown : spec.series) || undefined,
     y: spec.y,
   };
 }
@@ -133,6 +154,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const fParam = searchParams.get(FILTER_PARAM);
   // The dashboard's grain switch lives in the address beside the filters.
   const gChoice: GrainChoice = readGrainParam(searchParams.get(GRAIN_PARAM));
+  // BI-11: the parameter values a viewer chose live in the address too (`?p=`).
+  const pParam = searchParams.get(PARAMS_PARAM);
+  const pValues = React.useMemo(() => readParamsParam(pParam), [pParam]);
+  const [paramsOpen, setParamsOpen] = React.useState(false);
   const [savingDefault, setSavingDefault] = React.useState(false);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   // Tile delete is one click away, so it asks first.
@@ -157,7 +182,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   React.useEffect(() => { setFsDark(readFullscreenDark()); }, []);
   const dark = themeDark || (fullscreen && fsDark);
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
-  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean }) | null>(null);
+  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; tileId?: string }) | null>(null);
   const [records, setRecords] = React.useState<RecordsRequest | null>(null);
   // Tiles whose saved click destination the viewer set aside for the drill menu (this session only).
   const [menuTiles, setMenuTiles] = React.useState<ReadonlySet<string>>(new Set());
@@ -177,18 +202,21 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (fromAddress) q.set("filters", JSON.stringify(fromAddress));
       const grainAsked = grainQuery(gChoice);
       if (grainAsked) q.set("grain", grainAsked);
+      const paramsAsked = paramsQuery(pValues);
+      if (paramsAsked) q.set("params", paramsAsked);
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
-      setData(json);
+      // BI-11: a chart's parameter slots arrive as `{ param }` objects and are held as `{name}` text.
+      setData({ ...json, charts: (json.charts ?? []).map((c) => (c.def ? { ...c, def: normalizeDef(c.def) } : c)) });
       setLayout(json.layout ?? {});
     } catch (e) {
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
-  }, [board, fParam, gChoice]);
+  }, [board, fParam, gChoice, pValues]);
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
@@ -305,11 +333,19 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // differs from the saved default is sent; Reset drops both address parameters
   // in a single navigation.
   const grainDirty = gChoice !== null && differsFromSaved(shownGrainValue, data?.grain);
-  const rowDirty = dirty || grainDirty;
+  // BI-11: the parameters join the same row, the same Save as default and Reset.
+  const paramControls = data?.params ?? NO_CONTROLS;
+  const paramsDirty = pValues !== null && paramsDiffer(paramControls, data?.defaultParams);
+  const rowDirty = dirty || grainDirty || paramsDirty;
+  const changeParam = React.useCallback((name: string, value: ParamValue) => {
+    const qs = withParamsParam(window.location.search, withValue(pValues, data?.defaultParams ?? {}, name, value));
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [router, pathname, pValues, data?.defaultParams]);
   const resetRow = React.useCallback(() => {
     const q = new URLSearchParams(window.location.search);
     q.delete(FILTER_PARAM);
     q.delete(GRAIN_PARAM);
+    q.delete(PARAMS_PARAM);
     const qs = q.toString();
     router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
   }, [router, pathname]);
@@ -319,6 +355,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       const body: Record<string, unknown> = { id: board };
       if (dirty) body.filters = normalizeFilters(filters);
       if (grainDirty) body.grain = savedGrainBody(shownGrainValue);
+      if (paramsDirty) body.params = savedParamsBody(paramControls);
       const res = await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
@@ -334,7 +371,25 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     } finally {
       setSavingDefault(false);
     }
-  }, [board, dirty, grainDirty, filters, shownGrainValue, resetRow]);
+  }, [board, dirty, grainDirty, paramsDirty, paramControls, filters, shownGrainValue, resetRow]);
+  // BI-11: an editor ticks a parameter in the dialog and its control joins (or leaves) this
+  // dashboard's row. Written at once through the board write path; the values already saved stay.
+  const toggleShownParam = React.useCallback(async (name: string, on: boolean) => {
+    const current: BoardParam[] = paramControls.map((c) => ({ name: c.param.name, value: data?.defaultParams?.[c.param.name] }));
+    const next = on ? [...current, { name }] : current.filter((p) => p.name !== name);
+    try {
+      const res = await apiFetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, params: next }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? "Could not change the parameters shown");
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [board, paramControls, data?.defaultParams, load]);
   // BI-18·B: an editor's choice becomes the dashboard's own default. Written
   // through the board write path (`dashboard:write`); the session choice is
   // dropped once it is the saved one.
@@ -370,13 +425,19 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setDrill(null);
   }, [applyFilters, filters]);
 
+  // BI-10: a bin of a binned chart sets one numeric range on its column.
+  const crossFilterBin = React.useCallback((column: string, lower: number, bin: { width: number; last: boolean }) => {
+    applyFilters(toggleBinFilter(filters, binRangeFilter(column, lower, bin.width, bin.last)));
+    setDrill(null);
+  }, [applyFilters, filters]);
+
   // Drill-down: the rows behind the clicked value (or behind a whole tile),
   // for the filters in force so the list agrees with the number clicked. A
   // built-in tile ignores dashboard filters, so its rows are not narrowed.
-  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean) => {
+  const openRecords = React.useCallback((request: Omit<RecordsRequest, "filters">, builtin: boolean, extra: FilterDef[] = NO_FILTERS) => {
     setDrill(null);
-    setRecords({ ...request, filters: builtin ? NO_FILTERS : filters });
-  }, [filters]);
+    setRecords({ ...request, filters: builtin ? NO_FILTERS : [...filters, ...extra], params: paramsQuery(data?.appliedParams ?? null) ?? undefined });
+  }, [filters, data?.appliedParams]);
 
   // No "jump to the newest user dashboard" from the built-in board here.
   // That effect dated from when `/dashboards` was this page; it now is the
@@ -454,10 +515,48 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
   const charts = data?.charts ?? NO_CHARTS;
+  // BI-10: a viewer's own, temporary drill down a hierarchy; nothing is saved.
+  const tileDrills = useTileDrills(charts, filters, !edit);
   const results = data?.results ?? NO_RESULTS;
 
   // Tell Copilot what is on this dashboard — the built-in one included.
-  const { setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded } = useCopilot();
+  const {
+    messages: messagesFromCopilot,
+    setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded,
+  } = useCopilot();
+  // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
+  // assistant answer applies when its `board` matches the board on screen —
+  // mirror what it set into the page address (`?f=`) with the same helper a
+  // chip change uses. A step for another board is ignored here; the step
+  // card carries the link instead.
+  const chatViewFilters = React.useMemo(
+    () => extractViewFiltersFromChat(messagesFromCopilot, board),
+    [messagesFromCopilot, board],
+  );
+  // Re-applying the same filters (a re-render of the same message) loops back
+  // through `writeAddress` and reloads the page; key on the filter JSON so a
+  // single apply is one navigation.
+  const chatViewFilterKey = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (chatViewFilters === null) return;
+    const key = JSON.stringify(chatViewFilters);
+    if (chatViewFilterKey.current === key) return;
+    chatViewFilterKey.current = key;
+    writeAddress(filtersToParam(chatViewFilters, defaultFilters));
+  }, [chatViewFilters, defaultFilters, writeAddress]);
+  // AI-2 (plan 20) — the page context carries the grain (shown, saved) and
+  // the active filters as compact JSON so the model's table context lists
+  // them in machine-readable form too. Each is bounded by its own budget;
+  // `summarizeFilterJson` returns `null` over budget so the chip text stays
+  // as the single source of truth.
+  const grainText = React.useMemo(
+    () => summarizeGrain(shownGrainValue, data?.grain),
+    [shownGrainValue, data?.grain],
+  );
+  const filterJson = React.useMemo(
+    () => summarizeFilterJson(filters, { maxChars: 4000 }),
+    [filters],
+  );
   React.useEffect(() => {
     // The numbers on screen, not just tile titles (plan §6): KPIs and tiles
     // with their first rows, and the filters in force. Built from data this
@@ -469,6 +568,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ],
       results,
     );
+    const filterLine = filterJson
+      ? `Active filters: ${summarizeFilters(filters)} (raw: ${filterJson}).`
+      : `Active filters: ${summarizeFilters(filters)}.`;
     setPageContext({
       key: "dashboard-view",
       title: `Working on "${dashName}"`,
@@ -479,13 +581,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       },
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `Active filters: ${summarizeFilters(filters)}. ` +
+        `${grainText}. ` +
+        `${filterLine} ` +
+        `Parameters shown (a formula reads one as {name}; list_parameters has them all): ${summarizeParams(paramControls)}. ` +
         `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, kpis, results, filters, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, grainText, filterJson, paramControls, setPageContext]);
 
   // Carry out a chart's saved click destination (BI-18·B) for the clicked
   // value. The server did not check that the target exists, so the console
@@ -538,7 +642,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       followClick(saved, target.value, target.grain);
       return;
     }
-    setDrill({ name: target.value, label: target.label, grain: target.grain, column: target.column, mart: spec.mart, sqlSource: spec.sqlSource, x: pos.x, y: pos.y, builtin: spec.source === "builtin" });
+    const bin = target.bin ? { width: target.bin.width, last: isLastBin(Number(target.value), target.bin.width, target.bin.max) } : undefined;
+    // BI-13: a mark of one of the chart's other questions lists that question's own rows and
+    // filters the dashboard by that question's dimension; the server needs the chart and the question's index.
+    const layer = ctx.layer;
+    setDrill({
+      tileId: spec.id, name: target.value, label: target.label, grain: target.grain, bin,
+      column: layer ? layer.dimension : target.column,
+      mart: layer ? layer.mart : spec.mart, sqlSource: layer ? layer.sqlSource : spec.sqlSource,
+      chart: layer ? spec.id : ownFilterChart(spec), layer: layer?.index,
+      x: pos.x, y: pos.y, builtin: spec.source === "builtin",
+    });
   };
   const toggleMenuTile = (id: string) => setMenuTiles((prev) => {
     const next = new Set(prev);
@@ -550,7 +664,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const tableSorts = React.useRef<Record<string, { column: string; dir: "asc" | "desc" }>>({});
   async function exportRawTable(id: string) {
     try {
-      const done = await downloadTableExport(id, filters, tableSorts.current[id]);
+      const done = await downloadTableExport(id, filters, tableSorts.current[id], paramsQuery(data?.appliedParams ?? null));
       const note = exportNotice(done);
       if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
     } catch (e) {
@@ -562,7 +676,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
-    const clickSpec = clickSpecOf(spec);
+    const drilled = tileDrills.drills[spec.id];
+    const level = drilled ? tileDrills.currentLevel(spec) : undefined;
+    const clickSpec = clickSpecOf(spec, level);
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
     const menu: TileMenuItem[] = [
@@ -573,8 +689,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         ? [{ label: menuTiles.has(spec.id) ? "Click opens its destination" : "Click opens the drill menu", icon: <MousePointerClick />, onSelect: () => toggleMenuTile(spec.id) }]
         : []),
       // A KPI, gauge or table has no mark to click: its rows are one step away here.
-      ...(offersTileRecords(spec.kind) && (spec.mart || spec.sqlSource)
-        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource }, spec.source === "builtin") }]
+      ...((offersTileRecords(spec.kind) || spec.def?.steps?.length) && (spec.mart || spec.sqlSource)
+        ? [{ label: "View records", icon: <Table2 />, onSelect: () => openRecords({ title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: ownFilterChart(spec) }, spec.source === "builtin") }]
         : []),
       // BI-9: a chart grouped by a part of the date (a weekday) has no rows to
       // list or range to filter; the menu says why instead of leaving the click dead.
@@ -602,10 +718,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       subtitle: spec.subtitle,
       hint: (
         <>
+          {/* BI-6: the chart's own filters, listed and not removable here. */}
+          {spec.def?.filters?.length ? <OwnFiltersMarker filters={spec.def.filters} /> : null}
           {hasRows(cell) && cell.filtersSkipped?.length ? <SkippedFiltersMarker skipped={cell.filtersSkipped} /> : null}
           {/* A pivot says its own cut-off in its footer (the cell cap, not the latest buckets). */}
           {hasRows(cell) && (cell.grainSkipped || (cell.truncated && spec.kind !== "pivot"))
-            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={spec.def?.limit} /> : null}
+            ? <GrainMarkers skipped={cell.grainSkipped} truncated={cell.truncated && spec.kind !== "pivot"} limit={typeof spec.def?.limit === "number" ? spec.def.limit : undefined} /> : null}
           {drillable ? (
         <Tooltip>
           <TooltipTrigger render={<span className="inline-flex shrink-0 text-muted-foreground/70" />}>
@@ -635,7 +753,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ),
       menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
-      body: (
+      body: drilled ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <DrillTrail steps={drilled.steps} onClimb={(index) => tileDrills.climb(spec, index)} />
+          <div className="min-h-0 flex-1">
+            <TileBody spec={{ ...spec, x: level ?? spec.x, def: { ...spec.def, dimension: level } }} cell={drilled.cell} dark={dark} loading={loading || drilled.loading}
+              onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
+          </div>
+        </div>
+      ) : (
         <TileBody spec={spec} cell={cell} dark={dark} loading={loading} paging={{ filters }} onTableSort={(sort) => { tableSorts.current[spec.id] = sort; }}
           onDataClick={drillable ? onChartClick(spec, clickSpec) : undefined} />
       ),
@@ -643,6 +769,8 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   });
 
   const dialogSpec = tileDialog ? charts.find((c) => c.id === tileDialog.id) : undefined;
+  const drillChart = drill?.tileId ? charts.find((c) => c.id === drill.tileId) : undefined;
+  const drillOffer = drillChart ? tileDrills.offer(drillChart) : null;
   const filterFields = data?.filterFields ?? NO_FIELDS;
   const showFilterBar = filterFields.length > 0 || filters.length > 0;
 
@@ -692,6 +820,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
+            {hasPermission("dashboard:write") ? (
+              <Button size="sm" variant="outline" onClick={() => setParamsOpen(true)}>
+                <SlidersHorizontal className="size-4" /> Parameters
+              </Button>
+            ) : null}
             <Button size="sm" onClick={() => setNewChartOpen(true)}>
               <ChartColumn className="size-4" /> New chart
             </Button>
@@ -702,7 +835,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
-      {showFilterBar || grainedCharts.length > 0 ? (
+      {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
         <div data-print-hide className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/50 px-3 py-2">
           {grainedCharts.length > 0 ? (
             <GrainSwitch
@@ -711,6 +844,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onChange={(next) => writeGrain(next === "" ? "own" : next)}
             />
           ) : null}
+          <ParamControls controls={paramControls} onChange={changeParam} />
           <FilterBar
             board={board}
             fields={filterFields}
@@ -796,14 +930,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         onConfirm={() => { if (removing) void removeChart(removing.id); }}
       />
 
+      {paramsOpen ? (
+        <ParamDialog
+          open
+          onOpenChange={setParamsOpen}
+          canWrite={hasPermission("dashboard:write")}
+          shown={paramControls.map((c) => c.param.name)}
+          onToggleShown={(name, on) => void toggleShownParam(name, on)}
+          onChanged={() => void load()}
+        />
+      ) : null}
       {editing ? (
         <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}
-          editId={editing.id} initial={editing.def} board={board} boards={boards}
+          editId={editing.id} initial={editing.def} board={board} boards={boards} paramValues={data?.appliedParams}
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
       {newChartOpen ? (
         <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
-          board={board} boards={boards}
+          board={board} boards={boards} paramValues={data?.appliedParams}
           onSaved={() => { setNewChartOpen(false); void load(); }} />
       ) : null}
 
@@ -813,11 +957,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           onClose={() => setDrill(null)}
           onFilter={
             drill.builtin ? undefined
+              : drill.bin
+                ? () => crossFilterBin(drill.column, Number(drill.name), drill.bin as { width: number; last: boolean })
               : drill.grain && isGrain(drill.grain)
                 ? (bucketActions(drill.grain).filter ? () => crossFilterBucket(drill.column, drill.grain as Grain, drill.name) : undefined)
                 : () => crossFilter(drill.column, drill.name)
           }
-          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain }, drill.builtin)}
+          onRecords={() => openRecords({ title: drill.label ?? drill.name, mart: drill.mart, sqlSource: drill.sqlSource, column: drill.column, value: drill.name, grain: drill.grain, binWidth: drill.bin?.width, chart: drill.chart, layer: drill.layer }, drill.builtin, drillChart && drill.layer === undefined ? tileDrills.fixed(drillChart) : NO_FILTERS)}
+          drillDown={drillOffer && drill.layer === undefined ? ("reason" in drillOffer ? drillOffer : { label: `Drill down to ${drillOffer.to}`, onSelect: () => { if (drillChart) tileDrills.down(drillChart, drillOffer.hierarchy, drill.name, drill.label); setDrill(null); } }) : undefined}
         />
       ) : null}
       <RecordsDialog request={records} onClose={() => setRecords(null)} />

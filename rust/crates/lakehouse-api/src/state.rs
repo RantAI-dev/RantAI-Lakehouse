@@ -30,6 +30,7 @@ use crate::connector_secret_store::{ConnectorSecretStore, SharedKeyring};
 use crate::gold_lock::MartLocks;
 use crate::secret_crypto::{CryptoError, Keyring, MANAGED_FILE_PREFIX};
 use crate::secret_manager::{ManagerResolver, SecretManagerKind, SecretManagerSettings};
+use crate::upload_limits::ReceiveLimiter;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -203,6 +204,9 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
+    /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
+    /// per user and in total. Shared across clones; always populated.
+    pub upload_receive: ReceiveLimiter,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -529,6 +533,18 @@ fn connector_secret_resolver(
     ))
 }
 
+/// `SRC-12` decision 4: one keyring for the store (seals) and the resolver
+/// (opens), built once by [`AppState::new`]. A missing or malformed key is
+/// kept as its error, not dropped: `main` refuses to start on it, and any
+/// credential read or write names the setting.
+fn connector_secrets_keyring(config: &Config) -> SharedKeyring {
+    Keyring::from_values(
+        config.connector_secrets_key.as_deref(),
+        config.connector_secrets_key_previous.as_deref(),
+    )
+    .map(Arc::new)
+}
+
 /// `SRC-12 review B1 BLOCKER 1`: with a secret manager set and no allowed
 /// prefix, no reference is accepted (fail closed); say so once at start-up.
 fn warn_if_no_reference_prefixes(settings: &SecretManagerSettings) {
@@ -678,20 +694,16 @@ impl AppState {
         let secrets_dir = config.connector_secrets_dir.clone();
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
-        // SRC-12 decision 4: one keyring for the store (seals) and the
-        // resolver (opens). A missing or malformed key is kept as its
-        // error, not dropped: `main` refuses to start on it, and any
-        // credential read or write names the setting.
-        let secrets_keyring: SharedKeyring = Keyring::from_values(
-            config.connector_secrets_key.as_deref(),
-            config.connector_secrets_key_previous.as_deref(),
-        )
-        .map(Arc::new);
+        let secrets_keyring = connector_secrets_keyring(&config);
         let throttle_policy = ThrottlePolicy {
             max_failures: config.login_max_failures,
             window: Duration::seconds(i64::from(config.login_failure_window_secs)),
             lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
         };
+        let upload_receive = ReceiveLimiter::new(
+            config.upload_max_concurrent_per_user,
+            config.upload_max_concurrent,
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -719,6 +731,7 @@ impl AppState {
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
+            upload_receive,
             #[cfg(test)]
             webhook_sender_override: None,
         }

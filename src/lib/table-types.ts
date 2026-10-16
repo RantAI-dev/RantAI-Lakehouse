@@ -27,8 +27,14 @@ export type PivotTotals = "none" | "grand" | "all"
 
 export const COMPARE_PERIODS = ["day", "week", "month", "quarter", "year"] as const
 export type ComparePeriod = (typeof COMPARE_PERIODS)[number]
+/**
+ * `previous`: the latest period against the one before; `last_year` (BI-2): against the same
+ * period one year earlier. The date column and period may be left out when the KPI measures a
+ * metric: the metric's own date column and default grain are used.
+ */
 export type KpiCompare =
-  | { kind: "previous"; dateColumn: string; period: ComparePeriod | string }
+  | { kind: "previous"; dateColumn?: string; period?: ComparePeriod | string }
+  | { kind: "last_year"; dateColumn?: string; period?: ComparePeriod | string }
   | { kind: "goal"; value: number }
 
 export type TableDefFields = {

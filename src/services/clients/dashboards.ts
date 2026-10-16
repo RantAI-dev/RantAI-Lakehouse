@@ -3,6 +3,7 @@ import type {
   CreateBoardInput,
   DashboardFolder,
   DashboardService,
+  JoinSuggestions,
   SaveSqlSourceInput,
   SqlSource,
   SqlSourcePreview,
@@ -148,6 +149,13 @@ export const clickhouseDashboardService: DashboardService = {
       "/api/dashboard/sources/preview",
       { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(chart ? { sql, chart } : { sql }), signal },
       "SQL source preview failed"
+    )
+  },
+  async joinSuggestions(left, right, signal) {
+    return request<JoinSuggestions>(
+      `/api/dashboard/join-suggestions?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`,
+      { cache: "no-store", signal },
+      "Join suggestions could not be loaded"
     )
   },
   async listFolders(signal) {

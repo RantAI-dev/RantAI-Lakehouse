@@ -44,6 +44,12 @@ export type DashboardService = {
     chart?: Record<string, unknown>,
     signal?: AbortSignal
   ): Promise<SqlSourcePreview>
+  /**
+   * `GET /api/dashboard/join-suggestions` (`BI-7`): candidate column pairs for
+   * joining the mart `right` to the mart `left`, best first, and whether the
+   * suggested pairs cover the right table's sorting key. Column metadata only.
+   */
+  joinSuggestions(left: string, right: string, signal?: AbortSignal): Promise<JoinSuggestions>
   listFolders(signal?: AbortSignal): Promise<DashboardFolder[]>
   createFolder(input: { name: string; parentId?: string }, signal?: AbortSignal): Promise<DashboardFolder>
   updateFolder(
@@ -153,6 +159,25 @@ export type SqlSourcePreview = {
    * is `{ error }` when the chart's own query was refused).
    */
   chart?: { spec: Record<string, unknown>; result: Record<string, unknown> }
+}
+
+/** One suggested pair: `rank` says why (`keys`, `name_and_type` or `name`); `suggested` pairs are applied by default. */
+export type JoinSuggestion = {
+  left: string
+  right: string
+  rank: "keys" | "name_and_type" | "name" | string
+  suggested: boolean
+}
+
+/** `GET /api/dashboard/join-suggestions` (`lakehouse_bi::joins::Suggestions`). */
+export type JoinSuggestions = {
+  left: string
+  right: string
+  pairs: JoinSuggestion[]
+  /** The right table's sorting key (a set). */
+  rightKey: string[]
+  /** Whether the suggested right-hand columns cover that key; when not, rows may multiply. */
+  coversRightKey: boolean
 }
 
 /**

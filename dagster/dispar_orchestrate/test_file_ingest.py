@@ -42,6 +42,7 @@ from dispar_orchestrate.file_ingest import (
     NO_ROWS,
     NOT_REGISTERED,
     TABLE_NAME,
+    TOO_MANY_COLUMNS,
     TOO_MANY_ROWS,
     UNREADABLE,
     FileIngestParams,
@@ -214,11 +215,12 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
-def test_there_are_seven_different_failure_reasons_among_them_the_header_row_with_no_columns():
+def test_there_are_eight_different_failure_reasons_among_them_the_header_row_with_no_columns():
     # Review finding C2 made it seven: a header row with no columns has a
-    # sentence of its own. The API counts the same seven against the same file.
+    # sentence of its own. SEC-17 made it eight with the column cap. The API
+    # counts the same eight against the same file.
     in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
-    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 7
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 8
     assert HEADER_NO_COLUMNS == "The header row has no columns."
     assert HEADER_NO_COLUMNS != HEADER_PAST_END
 
@@ -226,6 +228,12 @@ def test_there_are_seven_different_failure_reasons_among_them_the_header_row_wit
 def test_the_row_cap_in_the_sentence_is_the_row_cap_the_job_enforces():
     assert file_ingest.MAX_ROWS == 2_000_000
     assert f"{file_ingest.MAX_ROWS:,}" in TOO_MANY_ROWS
+
+
+def test_the_column_cap_in_the_sentence_is_the_column_cap_the_job_enforces():
+    assert file_ingest.MAX_COLUMNS == 1_000
+    assert f"{file_ingest.MAX_COLUMNS:,}" in TOO_MANY_COLUMNS
+    assert TOO_MANY_COLUMNS == "The file has more than 1,000 columns."
 
 
 def test_a_load_failure_refuses_any_sentence_the_api_does_not_show():
@@ -361,6 +369,28 @@ def test_a_file_with_nothing_below_the_header_has_no_rows(text):
     with pytest.raises(LoadFailure) as caught:
         parse_file(text, ",", 0)
     assert caught.value.reason == NO_ROWS
+
+
+def test_a_header_of_1000_columns_is_parsed():
+    text = ",".join(f"c{n}" for n in range(1_000)) + "\n" + ",".join("1" for _ in range(1_000)) + "\n"
+    parsed = parse_file(text, ",", 0)
+    assert len(parsed.columns) == 1_000
+    assert parsed.row_count == 1
+
+
+def test_a_header_of_1001_columns_is_refused_before_any_row_is_read():
+    # No row below the header: read in order, the file would fail as NO_ROWS,
+    # so TOO_MANY_COLUMNS shows the header was judged first.
+    text = ",".join(f"c{n}" for n in range(1_001)) + "\n"
+    with pytest.raises(LoadFailure) as caught:
+        parse_file(text, ",", 0)
+    assert caught.value.reason == TOO_MANY_COLUMNS
+
+
+def test_a_header_of_nothing_but_commas_is_over_the_column_cap():
+    with pytest.raises(LoadFailure) as caught:
+        parse_file("," * 5_000 + "\n1\n", ",", 0)
+    assert caught.value.reason == TOO_MANY_COLUMNS
 
 
 def test_the_row_cap_is_a_failure_found_while_counting_and_a_file_at_the_cap_passes(monkeypatch):

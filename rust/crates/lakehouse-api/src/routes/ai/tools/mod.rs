@@ -24,6 +24,7 @@
 
 mod alerts;
 mod ask;
+mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
@@ -36,6 +37,7 @@ mod gold;
 mod governance;
 mod ingest;
 mod lakehouse;
+mod metrics;
 mod ops;
 mod pipelines;
 mod propose;
@@ -98,6 +100,18 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+///
+/// The match is the registry-to-domain lookup and nothing more: 65 arms
+/// naming a tool, plus one guard arm (`n if calc_fields::handles(n)`),
+/// plus a catch-all, over 16 per-domain modules. All but
+/// `create_chart | update_chart` are a one-line delegation; that one reads
+/// the report time zone first, because a chart's SQL is built in it (`BI-9`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lookup table over 16 domain modules, 65 of its 66 arms a \
+              one-line delegation; the split by domain already happened, so \
+              splitting the table itself would only scatter that lookup"
+)]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,
@@ -133,8 +147,7 @@ pub(in crate::routes) async fn run_tool(
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(ch, args).await,
         "create_chart" | "update_chart" => {
-            // BI-9: a chart's SQL is built with the report time zone, which
-            // is a deployment setting.
+            // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
                 // The cause was logged under a reference by `time_context`.
                 return json!({ "error": "The reporting settings could not be read." });
@@ -149,14 +162,15 @@ pub(in crate::routes) async fn run_tool(
         "list_boards" => dashboards::list_boards(ch).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
-        "list_sql_sources" => dashboards::list_sql_sources(ch).await,
+        "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
-        "list_formula_functions"
-        | "list_calculated_fields"
-        | "validate_formula"
-        | "create_calculated_field"
-        | "update_calculated_field"
-        | "delete_calculated_field" => calc_fields::run(state, principal, name, args).await,
+        "rename_board"
+        | "delete_board"
+        | "arrange_board"
+        | "move_chart"
+        | "set_board_view_filters"
+        | "save_board_filters" => boards::run(state, principal, name, args).await,
+        n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,

@@ -23,7 +23,9 @@ export const CAPABILITIES: Capability[] = [
     label: "Query Data",
     desc: "Query & explore catalog, lineage, quality",
     icon: Database,
-    tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart"],
+    tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart",
+      // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
+      "list_metrics", "describe_metric", "query_metric"],
   },
   {
     key: "dashboard",
@@ -31,9 +33,19 @@ export const CAPABILITIES: Capability[] = [
     desc: "Create & manage charts / boards",
     icon: BarChart3,
     write: true,
-    tools: ["describe_mart", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
+    tools: ["describe_mart", "suggest_join", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
       // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.
-      "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field"],
+      "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field",
+      // BI-10: value groups and hierarchies.
+      "create_value_group", "list_hierarchies", "create_hierarchy", "delete_hierarchy",
+      // BI-11: parameters.
+      "list_parameters", "create_parameter", "update_parameter", "delete_parameter",
+      // BI-2 / AI-7: reusable metrics (a tool missing here never reaches the model, see BI-8 R1 above).
+      "list_metrics", "describe_metric", "query_metric", "create_metric", "update_metric", "delete_metric",
+      // AI-1 / AI-2 / AI-20 (plan 20): rename and delete the board, move tiles,
+      // move a chart to another board, set the view's filters (read-only, so
+      // Ask mode can offer it too) and save the board's default filters.
+      "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters"],
   },
   {
     key: "pipeline",

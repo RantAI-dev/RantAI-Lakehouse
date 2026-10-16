@@ -254,6 +254,13 @@ services:
       # `true`, empty or unset leaves it on; any other value stops the API
       # at start (see config.rs).
       AI_RELEVANT_TABLES: ${AI_RELEVANT_TABLES:-}
+      # SEC-17: uploads in progress at once, per user and in the whole
+      # installation (files being received and loads running, each counted
+      # against both). Empty or unset keeps the defaults, 4 and 16; a value
+      # that is not a whole number of 1 or more stops the API at start (see
+      # config.rs).
+      UPLOAD_MAX_CONCURRENT_PER_USER: ${UPLOAD_MAX_CONCURRENT_PER_USER:-}
+      UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -2186,6 +2193,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       # Not a credential -- a retention window -- so a dev default is fine
       # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
@@ -2198,6 +2207,12 @@ services:
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # OPS-7 E6: warehouse source endpoint/bucket and ClickHouse connection (non-secret).
+      BACKUP_WAREHOUSE_ENDPOINT: ${BACKUP_WAREHOUSE_ENDPOINT:-${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}}
+      BACKUP_WAREHOUSE_BUCKET: ${BACKUP_WAREHOUSE_BUCKET:-${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
     command: ["python", "-m", "dispar_orchestrate.backup_job"]
     restart: "no"
 
@@ -2305,6 +2320,14 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    # BLD-4 (`ops/g7/g7_pipeline_test.py`): the second SMALLEST table a
+    # connector-shaped gate needs to load one table and NOT another (a
+    # `ingest_job` run of one table) and so prove that a chain after
+    # `ingest_job` fires only for the table it reads. It is a fixture, not a
+    # product schema: the seeded `conn-pg-lakehouse` row is NOT edited to
+    # load it (0034's seed is applied, never edited) and the only code path
+    # that loads it is that gate's own ingest-spec PUT, against this stack's
+    # own instance.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2320,6 +2343,16 @@ services:
         SELECT 'customer_' || (g % 500), (g % 1000)::numeric + 0.5
         FROM generate_series(1, 2000) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.orders);
+        CREATE TABLE IF NOT EXISTS ingest_demo.customers (
+          id bigserial PRIMARY KEY,
+          name text NOT NULL,
+          email text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        );
+        INSERT INTO ingest_demo.customers (name, email)
+        SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
+        FROM generate_series(1, 20) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
         "
     restart: "no"
 
@@ -2431,6 +2464,20 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # BLD-4: the two Bronze tables the dependency-chain half proves
+      # itself against, each loaded by a run of ONE table on the stack's
+      # own `conn-pg-lakehouse` connector. `orders` (the G3a fixture's
+      # source table) is the chain's OWN table; `customers` is the
+      # smallest second table `g3a-source-init` creates for this. Both
+      # Bronze names are fresh on purpose: a chain that already had a
+      # qualifying anchor would pass the "fires after its own table"
+      # assertion without this job loading anything.
+      G7_INGEST_CONNECTOR_ID: ${G7_INGEST_CONNECTOR_ID:-conn-pg-lakehouse}
+      G7_INGEST_OBJECT_A: ${G7_INGEST_OBJECT_A:-ingest_demo.orders}
+      G7_INGEST_BRONZE_TABLE_A: ${G7_INGEST_BRONZE_TABLE_A:-g7_dep_orders}
+      G7_INGEST_OBJECT_B: ${G7_INGEST_OBJECT_B:-ingest_demo.customers}
+      G7_INGEST_BRONZE_TABLE_B: ${G7_INGEST_BRONZE_TABLE_B:-g7_dep_customers}
+      G7_CHAIN_SILVER_TABLE: ${G7_CHAIN_SILVER_TABLE:-g7_dep_ingest_chain_out}
       # What the source step asserts (BLD-3 review BLOCKER 1): `required`
       # (the default, and what a real deployment wants) makes the gate
       # demand the op's real source text, which needs images carrying a
