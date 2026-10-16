@@ -204,6 +204,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-29` | Task | Dashboard feature code imports `@/services/clients/*` directly in 25 files (was 11): `records.ts`, `table-export.ts`, `filters/use-filter-values.ts` (hand-rolled effect, not `useService`), `click-setting.tsx`. Route them through `@/services` | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 6 |
 | `BI-30` | Task | One CSV rule: `csv_export.rs` repeats `upload_workbook.rs`'s quoting and BOM, its `neutralise` differs from `csv_safe::neutralize_csv` (#86), and `src/lib/csv.ts` does not neutralise. Pick one owner | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 7 |
 | `AI-20` | Task | The dashboard's page context sends the filters but not the time-grain override (`dashboard-page.tsx`), so the assistant cannot see it | AI Copilot | P2 | Todo |  | PR #104 review SHOULD-FIX 11 |
+| `AI-21` | Feature | The assistant undoes its last dashboard change in one step. **Waits for `BI-18`** (version history part) | AI Copilot | P2 | Planned |  | `AI-1` spec |
 
 ## Later (P3)
 

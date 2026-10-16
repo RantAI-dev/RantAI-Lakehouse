@@ -50,12 +50,18 @@ Added on 2026-10-10 to reach the target in `docs/core/specs/bi-18.md` (part A, s
 
 ## Asking the assistant
 
-Not in this change, by the product owner's decision of 2026-10-15
-(decision 8). The assistant already receives the active filters as page
-context and that summary is updated to describe the new kinds. It cannot
-set or save dashboard filters; that is `AI-2`, which the AI team builds
-next. Until it lands, this feature does not meet the assistant-parity rule
-in `AGENTS.md`, and that is recorded here rather than called done.
+Yes, since the assistant now manages dashboards
+(`docs/core/features/assistant-manages-dashboards.md`, plan
+`plans/20-the-assistant-renames-arranges-and-filters-dashboards.md`,
+decisions signed 2026-10-15). The assistant uses
+`set_board_view_filters` to change the view's filters — the active
+filters in the page address — by default; a separate `save_board_filters`
+saves the board's default when the person asks for it, through Confirm,
+and refuses on the built-in Main board as the console does. The page
+context the assistant reads lists the active filters as compact JSON,
+within the same 5,000-character budget as before, and falls back to the
+chip summary when it does not. Decision 8 is closed; the assistant-parity
+gap this section used to call out is now closed.
 
 ## Decisions
 
