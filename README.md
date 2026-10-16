@@ -283,6 +283,7 @@ the chat timeout); they were missing from the table above until 2026-10-15
 | `CONNECTOR_PROBE_ALLOWED_CIDRS` | Private networks a connector may dial although internal addresses are refused: the narrow alternative to the setting above | empty | No |
 | `WEBHOOK_ALLOWED_CIDRS` | Internal networks an alert webhook may call (`SEC-10`); never opens loopback, link-local or multicast | empty | No |
 | `CONNECTOR_SECRETS_DIR` | Where the API itself reads and writes connector credential files; refs keep saying `file:/run/secrets/...`, the orchestrator's path | `/run/secrets` | Only when the API runs outside Docker |
+| `CONNECTOR_TLS_CA_FILE` | The CA certificate (PEM) connector dials verify the database server against (`SEC-14` part B); unset still requires TLS but trusts the server's certificate (`require`), set verifies the chain and host name (`verify-full`); an unreadable path stops the API at start | unset | No |
 | `ICEBERG_QUERY_DB` | The `ClickHouse` `DataLakeCatalog` database the API reads Iceberg tables through (compose creates `icecat_api`) | unset in the API (compose sets `icecat_api`); unset means Iceberg tables stay unreadable for policy checks and the catalog | Only when running the API outside compose |
 | `GIT_SHA` | The commit the image was built from; lets the pipeline source view say whether the code shown is the code that ran | `unknown` | No |
 
