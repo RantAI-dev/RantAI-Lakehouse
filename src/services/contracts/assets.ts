@@ -457,6 +457,30 @@ export type DecideAccessRequestResult = {
   grant?: AccessGrant
 }
 
+/**
+ * One grant in force that was made from an asset's page
+ * (`GET /api/catalog/{id}/grants`, `DATA-15`): a direct one, or that of an
+ * approved access request for this asset. The permission is global — the
+ * grant says only where it was made.
+ */
+export type AssetGrant = {
+  id: string
+  user: string
+  userEmail: string
+  permission: string
+  grantedAt: string
+  expiresAt: string
+  via: "request" | "direct" | string
+  /** Who granted it; `null` when that person was deleted or is not recorded. */
+  grantedBy: string | null
+}
+
+/** `POST /api/catalog/{id}/grants`'s body (`DATA-15`). */
+export type GrantAccessInput = {
+  email: string
+  permission: string
+}
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
   /**
@@ -545,4 +569,18 @@ export interface AssetService {
     comment: string | undefined,
     signal?: AbortSignal
   ): Promise<DecideAccessRequestResult>
+  /**
+   * `GET /api/catalog/{id}/grants` — the grants in force made from this
+   * asset. Needs `access:approve`. Optional for the same dead-fixture
+   * reason as `requestAccess`; no mock implements it.
+   */
+  listGrants?(id: string, signal?: AbortSignal): Promise<AssetGrant[]>
+  /**
+   * `POST /api/catalog/{id}/grants` — give a user a permission for 30 days.
+   * Refused (as a `ServiceError` carrying the server's sentence) for an
+   * unknown e-mail, for oneself, and for a permission the user already holds.
+   */
+  grantAccess?(id: string, input: GrantAccessInput, signal?: AbortSignal): Promise<void>
+  /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
+  revokeGrant?(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

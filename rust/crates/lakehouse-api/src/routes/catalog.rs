@@ -2765,7 +2765,7 @@ const ANNOTATION_DESCRIPTION_MAX_LEN: usize = 4000;
 const ANNOTATION_TAGS_MAX_COUNT: usize = 20;
 const ANNOTATION_TAG_MAX_LEN: usize = 64;
 
-fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
+pub(crate) fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "annotation store unavailable: no Postgres pool is configured".to_owned(),
@@ -2795,7 +2795,7 @@ fn tag_is_valid(tag: &str) -> bool {
 /// # Errors
 /// [`ApiError::BadRequest`] if `id` exceeds [`ANNOTATION_ID_MAX_LEN`]
 /// characters.
-fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
     if id.chars().count() > ANNOTATION_ID_MAX_LEN {
         return Err(ApiError::BadRequest(format!(
             "id must be at most {ANNOTATION_ID_MAX_LEN} characters"
@@ -3439,7 +3439,7 @@ pub async fn access_request(
 /// a value, so this uses the same 30-day window its own store-layer test
 /// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
 /// exercises.
-const GRANT_DAYS: i64 = 30;
+pub(crate) const GRANT_DAYS: i64 = 30;
 
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),

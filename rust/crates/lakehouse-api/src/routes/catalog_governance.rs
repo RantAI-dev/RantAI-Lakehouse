@@ -677,6 +677,21 @@ fn mark_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> Stri
     }
 }
 
+/// The history line of a grant or revoke made from the asset's page
+/// (`DATA-15` F3): the permission, the grantee, and for a grant the day it
+/// ends (the day, not the instant). The actor is the entry's own `actor`, so
+/// the history names both people.
+fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+    let permission = arg("permission").unwrap_or("a permission");
+    let grantee = arg("grantee").unwrap_or("a user");
+    if action == "catalog.grant" {
+        let until = arg("expiresAt").map_or("its expiry", |at| at.get(..10).unwrap_or(at));
+        format!("Granted {permission} to {grantee} until {until}")
+    } else {
+        format!("Revoked {permission} from {grantee}")
+    }
+}
+
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
@@ -712,6 +727,7 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
         "catalog.certify" | "catalog.deprecate" | "catalog.uncertify" => {
             mark_summary(event.action.as_str(), arg)
         }
+        "catalog.grant" | "catalog.revoke" => grant_summary(event.action.as_str(), arg),
         "catalog.sla_remove" => "Removed the freshness target".to_owned(),
         "catalog.sla_set" => event
             .args
@@ -1711,6 +1727,32 @@ mod tests {
             approval_id: None,
             session_id: None,
         }
+    }
+
+    /// `DATA-15` F3: the history names both people (the actor, and the
+    /// grantee in the sentence), the permission and the day a grant ends.
+    #[test]
+    fn change_entries_name_a_grant_and_a_revoke_with_both_people() {
+        let grant = change_entry(&audit_event(
+            "catalog.grant",
+            json!({
+                "permission": "query:read",
+                "grantee": "Bayu",
+                "expiresAt": "2026-11-15T08:00:00.000Z",
+            }),
+        ));
+        assert_eq!(grant["actor"], "Rina");
+        assert_eq!(
+            grant["summary"],
+            "Granted query:read to Bayu until 2026-11-15"
+        );
+
+        let revoke = change_entry(&audit_event(
+            "catalog.revoke",
+            json!({ "permission": "query:read", "grantee": "Bayu" }),
+        ));
+        assert_eq!(revoke["actor"], "Rina");
+        assert_eq!(revoke["summary"], "Revoked query:read from Bayu");
     }
 
     /// The history line says what was done in plain words, from the

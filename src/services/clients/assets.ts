@@ -2,6 +2,7 @@ import type {
   AssetService,
   Asset,
   AssetDetail,
+  AssetGrant,
   AssetProfile,
   AssetFilter,
   CatalogNamespace,
@@ -165,5 +166,29 @@ export const clickhouseAssetService: AssetService = {
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to decide access request");
     return json as DecideAccessRequestResult;
+  },
+  async listGrants(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/grants`, { signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load the grants");
+    return (json?.grants ?? []) as AssetGrant[];
+  },
+  async grantAccess(id, input, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/grants`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to grant access");
+  },
+  async revokeGrant(id, grantId, signal) {
+    const res = await apiFetch(
+      `/api/catalog/${encodeURIComponent(id)}/grants/${encodeURIComponent(grantId)}`,
+      { method: "DELETE", signal }
+    );
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to revoke the grant");
   },
 };

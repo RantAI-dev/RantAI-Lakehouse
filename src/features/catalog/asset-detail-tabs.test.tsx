@@ -192,6 +192,8 @@ function stubApi({
   sample = (limit) => Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })),
   tagKeys = [],
   annotationRefusal,
+  grants = [],
+  grantRefusal,
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -201,12 +203,23 @@ function stubApi({
   tagKeys?: unknown[]
   /** When set, `PUT .../annotation` is refused with this sentence (400). */
   annotationRefusal?: string
+  /** The grants `GET .../grants` answers (`DATA-15`). */
+  grants?: unknown[]
+  /** When set, `POST .../grants` is refused with this status and sentence. */
+  grantRefusal?: { status: number; error: string }
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
     if (method === "PUT" && path.endsWith("/annotation")) {
       return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
+    }
+    if (path.includes("/grants")) {
+      if (method === "GET") return json({ grants })
+      if (method === "POST") {
+        return grantRefusal ? json({ error: grantRefusal.error }, grantRefusal.status) : json({ ok: true, id: "grant-new" })
+      }
+      if (method === "DELETE") return json({ ok: true })
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
@@ -1549,6 +1562,85 @@ describe("Sample tab: the data preview", () => {
       fireEvent.keyDown(cityName, { key: "End" })
       expect(document.activeElement).toBe(within(headerOf("free")).getByRole("button", { name: "free" }))
     })
+  })
+})
+
+describe("Access tab: grants", () => {
+  const GRANT = {
+    id: "grant-1",
+    user: "Bayu Pratama",
+    userEmail: "bayu@meridian.example",
+    permission: "query:read",
+    grantedAt: "2026-10-16T08:00:00.000Z",
+    expiresAt: "2026-11-15T08:00:00.000Z",
+    via: "direct",
+    grantedBy: "Rina Wijaya",
+  }
+
+  it("lists the grants made from the asset, with who granted and when it ends, and says what a grant is", async () => {
+    stubApi({ grants: [GRANT, { ...GRANT, id: "grant-2", permission: "lineage:read", via: "request", grantedBy: null }] })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/gives this permission for every table, for 30 days/)).toBeTruthy()
+    expect(await within(card).findAllByText("Bayu Pratama")).toHaveLength(2)
+    expect(within(card).getByText("Granted here")).toBeTruthy()
+    expect(within(card).getByText("Approved request")).toBeTruthy()
+    expect(within(card).getByText(/by Rina Wijaya, until November 15, 2026/)).toBeTruthy()
+  })
+
+  it("gives a permission by e-mail and reloads the list", async () => {
+    const fetchSpy = stubApi({ grants: [] })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    await within(card).findByText("No grant has been made from this asset.")
+    fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: " bayu@meridian.example " } })
+    fireEvent.change(within(card).getByLabelText("Permission"), { target: { value: "lineage:read" } })
+    fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
+
+    await waitFor(() => expect(writes(fetchSpy).some((w) => w[0] === "POST" && String(w[1]).endsWith("/grants"))).toBe(true))
+    const post = writes(fetchSpy).find((w) => w[0] === "POST" && String(w[1]).endsWith("/grants"))
+    expect(post?.[1]).toBe("/api/catalog/demo-orders/grants")
+    expect(post?.[2]).toEqual({ email: "bayu@meridian.example", permission: "lineage:read" })
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.filter((c) => (c[1]?.method ?? "GET") === "GET" && String(c[0]).endsWith("/grants")).length).toBe(2)
+    )
+  })
+
+  it("shows the server's refusal in its own words, without a prefix", async () => {
+    stubApi({ grantRefusal: { status: 403, error: "permission_denied: you cannot grant access to yourself" } })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: "me@meridian.example" } })
+    fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
+    expect((await within(card).findByRole("alert")).textContent).toBe("you cannot grant access to yourself")
+  })
+
+  it("revokes after a confirmation", async () => {
+    const fetchSpy = stubApi({ grants: [GRANT] })
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke query:read from Bayu Pratama" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }))
+    await waitFor(() =>
+      expect(writes(fetchSpy).some((w) => w[0] === "DELETE" && w[1] === "/api/catalog/demo-orders/grants/grant-1")).toBe(true)
+    )
+  })
+
+  it("shows no Grants card, and asks for no grants, to a reader without access:approve", async () => {
+    const fetchSpy = stubApi({ permissions: ["catalog:read"] })
+    url.search = "tab=access"
+    renderTabs()
+
+    await screen.findByText("Your access")
+    expect(screen.queryByText("Grants")).toBeNull()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/grants"))).toBe(false)
   })
 })
 
