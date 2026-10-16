@@ -504,6 +504,34 @@ sensor; `routes::pipelines::authored_status` also stops the stored
 sensor next to the schedule when pausing a chained pipeline, so the
 chain truly goes quiet (Dagster keeps sensor state across a reload).
 
+**Two upstreams are per table, not per job (DATA-19, BLD-4).** The
+newest `SUCCESS` run of the job is the right freshness anchor for every
+other upstream, but it is the wrong one for the two ingestion jobs,
+because both load a Bronze table and are shared by every table they
+touch:
+
+- `file_ingest_job` loads ONE uploaded file into ONE table per run, so
+  the anchor is the newest successful run whose config names the
+  pipeline's own source table (DATA-19).
+- `ingest_job` loads EVERY selected object of ONE connector in a run,
+  and is the SAME job for every connector, so its run config names a
+  connector and not any table. The anchor is the newest successful run
+  that MATERIALIZED the pipeline's own source table -- the asset key
+  each loaded object records inside its run (BLD-4).
+
+So a load of a different table never fires such a pipeline, however
+recent it is, and the `SkipReason` names the table it was waiting for.
+Both upstreams are accepted only on a pipeline whose source is `bronze`
+(`routes::authored_pipelines::validate_per_table_upstream`, one rule
+run from create, update and restore): on any other source the chain
+would be wired and could never fire, so it is refused at save time with
+the job's own message, and a row stored before the rule waits with the
+same reason. The window each walk reads is bounded
+(`PER_TABLE_UPSTREAM_SCAN_LIMIT`, 20 materializations/runs), so a source
+table that has not loaded in its last 20 materializations (`ingest_job`)
+or runs (`file_ingest_job`) waits rather than anchoring on a run older than
+that.
+
 **Where the skip reason shows.** `GET /api/pipelines/{id}/schedule-ticks`
 merges the pipeline's schedule ticks with the `authored__<id>_after`
 sensor's ticks. Every tick carries `kind: "schedule"` or `kind: "sensor"`;

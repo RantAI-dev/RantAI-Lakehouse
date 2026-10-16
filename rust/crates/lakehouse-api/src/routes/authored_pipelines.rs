@@ -35,18 +35,18 @@
 //! traceback). It is logged and never returned; the response says only
 //! whether the orchestrator picked the change up (AGENTS.md principle 4).
 
-//! # The two rules every write here is refused by (DATA-19)
+//! # The two rules every write here is refused by (DATA-19, BLD-4)
 //!
-//! `validate_target_zone` and [`validate_file_ingest_upstream`] are the
+//! `validate_target_zone` and [`validate_per_table_upstream`] are the
 //! two rules a write is checked against before anything is stored, and
 //! both run from the same three call sites (create, update, restore) so
 //! the message a reader gets is the same whichever route they used. The
 //! first refuses a `bronze` TARGET: Bronze is written by ingestion and by
-//! nothing else. The second refuses a `file_ingest_job` upstream on a
-//! source that is not `bronze`, because that job loads one uploaded file
-//! into one Bronze table and the sensor behind the chain counts only the
-//! runs that loaded the pipeline's own table -- so the chain would be
-//! wired and would never fire.
+//! nothing else. The second refuses a per-table upstream — `file_ingest_job`
+//! (DATA-19) or `ingest_job` (BLD-4) — on a source that is not `bronze`,
+//! because each of those jobs loads one Bronze table per chain trigger and
+//! the sensor behind the chain counts only the runs that loaded the
+//! pipeline's own table — so the chain would be wired and would never fire.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -475,12 +475,40 @@ pub fn validate_target_zone(target_zone: &str) -> Result<(), ApiRejection> {
 pub const FILE_INGEST_UPSTREAM_REFUSED: &str =
     "file_ingest_job can only be an upstream of a pipeline whose source is a bronze table";
 
-/// DATA-19 / D2: whether `depends_on` may list
-/// [`uploads::FILE_INGEST_JOB`] given the pipeline's `source_zone`.
+/// BLD-4 / D2: the same refusal for the other per-table upstream.
+///
+/// `ingest_job` is ONE static job for every connector and writes EVERY
+/// selected object of ONE connector in one run, so its sensor-side filter
+/// counts the run that materialized the pipeline's own Bronze table
+/// (`authored_factory._latest_record_for_ingest_table`, reading
+/// `ingest_factory.py`'s `AssetMaterialization(asset_key=f"bronze.
+/// {target}")`). Same consequence as above, one job later: without the
+/// refusal a `silver` pipeline could name it and never fire.
+///
+/// One message per job, in that job's own words, rather than one shared
+/// sentence with a substituted name: each names the job it refuses so the
+/// console shows a rule the reader can match to the one they typed.
+pub const INGEST_UPSTREAM_REFUSED: &str =
+    "ingest_job can only be an upstream of a pipeline whose source is a bronze table";
+
+/// The per-table upstreams, each beside the refusal text that names it.
+/// One table, so the walk below cannot skip a job that has a message and
+/// adding a third is one line.
+const PER_TABLE_UPSTREAMS: [(&str, &str); 2] = [
+    (
+        super::uploads::FILE_INGEST_JOB,
+        FILE_INGEST_UPSTREAM_REFUSED,
+    ),
+    (super::connectors::INGEST_JOB, INGEST_UPSTREAM_REFUSED),
+];
+
+/// BLD-4 / D2 + DATA-19 / D2: whether `depends_on` may list a per-table
+/// upstream (`file_ingest_job`, `ingest_job`) given the pipeline's
+/// `source_zone`.
 ///
 /// Accepted only for a `bronze` source: that is the only zone whose table
-/// an upload's load produces, and so the only one whose table the sensor's
-/// `bronze_table_name` filter can equal. `None` (a `PUT` that did not submit
+/// one of those jobs' loads produces, and so the only one whose table the
+/// sensor's per-table filter can equal. `None` (a `PUT` that did not submit
 /// `dependsOn`, so the stored chain is kept) skips, exactly as
 /// [`validate_pipeline_input`]'s own `depends_on` argument does: the stored
 /// chain was validated when it was written, and re-reading it here would
@@ -492,10 +520,11 @@ pub const FILE_INGEST_UPSTREAM_REFUSED: &str =
 ///
 /// # Errors
 ///
-/// [`ApiRejection`] (the route maps it to 400) carrying
-/// [`FILE_INGEST_UPSTREAM_REFUSED`] verbatim when `depends_on` lists
-/// `file_ingest_job` and `source_zone` is not `bronze`.
-pub fn validate_file_ingest_upstream(
+/// [`ApiRejection`] (the route maps it to 400) carrying the refusal text
+/// for the offending job — [`FILE_INGEST_UPSTREAM_REFUSED`] or
+/// [`INGEST_UPSTREAM_REFUSED`] — when `depends_on` lists that job and
+/// `source_zone` is not `bronze`.
+pub fn validate_per_table_upstream(
     source_zone: &str,
     depends_on: Option<&[String]>,
 ) -> Result<(), ApiRejection> {
@@ -505,11 +534,10 @@ pub fn validate_file_ingest_upstream(
     if source_zone == "bronze" {
         return Ok(());
     }
-    if deps
-        .iter()
-        .any(|dep| dep == super::uploads::FILE_INGEST_JOB)
-    {
-        return Err(ApiError::BadRequest(FILE_INGEST_UPSTREAM_REFUSED.to_owned()).into());
+    for (job, refused) in PER_TABLE_UPSTREAMS {
+        if deps.iter().any(|dep| dep == job) {
+            return Err(ApiError::BadRequest(refused.to_owned()).into());
+        }
     }
     Ok(())
 }
@@ -1219,10 +1247,10 @@ pub async fn update(
     // (PR #59 review) moved them into the shared `validate_pipeline_input`
     // that this route and `restore_version` both call below.
     validate_target_zone(&body.target_zone)?;
-    // DATA-19 / D2: the same shape as the guard above, on the upstream
-    // side. `None` here means the body omitted `dependsOn` and the stored
-    // chain is kept, so there is nothing new to check.
-    validate_file_ingest_upstream(&body.source_zone, body.depends_on.as_deref())?;
+    // DATA-19 / D2 + BLD-4 / D2: the same shape as the guard above, on the
+    // upstream side. `None` here means the body omitted `dependsOn` and the
+    // stored chain is kept, so there is nothing new to check.
+    validate_per_table_upstream(&body.source_zone, body.depends_on.as_deref())?;
     let pool = crate::routes::pipelines::pool(&state)?;
     // Dagster unreachable degrades to "no Dagster upstreams accepted"
     // (empty list) rather than 500ing the update — see
@@ -1435,12 +1463,12 @@ pub async fn restore_version(
     // the shared `validate_pipeline_input` this route calls below,
     // which also takes the tenant-scoped `others`.
     validate_target_zone(&snapshot.target_zone)?;
-    // DATA-19 / D2: the snapshot is replayed whole, so its `depends_on`
-    // is checked against its own `source_zone` on every restore (a stored
-    // version can predate the rule, the same reason the Bronze-target
-    // refusal above is re-applied here). Always `Some(...)`: a restore
-    // always carries the snapshot's chain.
-    validate_file_ingest_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
+    // DATA-19 / D2 + BLD-4 / D2: the snapshot is replayed whole, so its
+    // `depends_on` is checked against its own `source_zone` on every restore
+    // (a stored version can predate the rule, the same reason the
+    // Bronze-target refusal above is re-applied here). Always `Some(...)`: a
+    // restore always carries the snapshot's chain.
+    validate_per_table_upstream(&snapshot.source_zone, Some(&snapshot.depends_on))?;
     let dagster_jobs = match state.dagster.list_jobs().await {
         Ok(j) => j,
         Err(err) => {
@@ -2786,25 +2814,25 @@ mod tests {
     /// 3. `None` (a `PUT` that submitted no `dependsOn`) skips, and every
     ///    other upstream is left alone.
     #[test]
-    fn validate_file_ingest_upstream_refuses_a_non_bronze_source_and_accepts_bronze() {
+    fn validate_per_table_upstream_refuses_a_non_bronze_source_and_accepts_bronze() {
         let file_ingest = vec![crate::routes::uploads::FILE_INGEST_JOB.to_owned()];
         for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
             assert_eq!(
-                validate_file_ingest_upstream(zone, Some(&file_ingest))
+                validate_per_table_upstream(zone, Some(&file_ingest))
                     .expect_err("file_ingest_job needs a bronze source")
                     .0
                     .to_string(),
                 FILE_INGEST_UPSTREAM_REFUSED,
                 "zone {zone} must be refused"
             );
-            validate_file_ingest_upstream(zone, None)
+            validate_per_table_upstream(zone, None)
                 .expect("a PUT without dependsOn keeps the stored chain, unchecked");
-            validate_file_ingest_upstream(zone, Some(&["pl-other".to_owned()]))
+            validate_per_table_upstream(zone, Some(&["pl-other".to_owned()]))
                 .expect("another upstream is not this rule's business");
-            validate_file_ingest_upstream(zone, Some(&[]))
+            validate_per_table_upstream(zone, Some(&[]))
                 .expect("an explicitly empty chain has nothing to refuse");
         }
-        validate_file_ingest_upstream("bronze", Some(&file_ingest))
+        validate_per_table_upstream("bronze", Some(&file_ingest))
             .expect("a bronze source is the one source an upload can feed");
         assert_eq!(
             FILE_INGEST_UPSTREAM_REFUSED,
@@ -2812,6 +2840,58 @@ mod tests {
         );
         assert!(
             FILE_INGEST_UPSTREAM_REFUSED.starts_with(crate::routes::uploads::FILE_INGEST_JOB),
+            "the message must name the job it refuses, or the console shows a rule it cannot match"
+        );
+    }
+
+    /// BLD-4 / D2: the same rule for `ingest_job` — the OTHER per-table
+    /// upstream the sensor filters by table (`ingest_job` is one static job
+    /// for every connector, so its newest run says nothing about which table
+    /// loaded). Both jobs walk the SAME guard, so the walk has to answer
+    /// both names: each refusal names its own job, and neither job's
+    /// presence is hidden behind the other's message.
+    #[test]
+    fn validate_per_table_upstream_refuses_each_job_with_its_own_text() {
+        let ingest = vec![crate::routes::connectors::INGEST_JOB.to_owned()];
+        let both = vec![
+            crate::routes::uploads::FILE_INGEST_JOB.to_owned(),
+            crate::routes::connectors::INGEST_JOB.to_owned(),
+        ];
+        for zone in ["silver", "gold", "serving", "lake", "Bronze"] {
+            assert_eq!(
+                validate_per_table_upstream(zone, Some(&ingest))
+                    .expect_err("ingest_job needs a bronze source")
+                    .0
+                    .to_string(),
+                INGEST_UPSTREAM_REFUSED,
+                "zone {zone} must be refused for ingest_job"
+            );
+            // A chain naming both is refused too, and by whichever job the
+            // walk reaches FIRST -- either text is a true statement about
+            // that chain, and both are pinned below.
+            assert!(
+                [FILE_INGEST_UPSTREAM_REFUSED, INGEST_UPSTREAM_REFUSED].contains(
+                    &validate_per_table_upstream(zone, Some(&both))
+                        .expect_err("either per-table job on a non-bronze source is refused")
+                        .0
+                        .to_string()
+                        .as_str()
+                ),
+                "a chain naming both jobs must be refused on zone {zone}"
+            );
+        }
+        // The accepted half, unchanged for the new job: a Bronze source is
+        // the one source either job's load can feed.
+        validate_per_table_upstream("bronze", Some(&ingest))
+            .expect("a bronze source is the one source a connector load can feed");
+        validate_per_table_upstream("bronze", Some(&both))
+            .expect("a bronze source may chain both per-table jobs");
+        assert_eq!(
+            INGEST_UPSTREAM_REFUSED,
+            "ingest_job can only be an upstream of a pipeline whose source is a bronze table"
+        );
+        assert!(
+            INGEST_UPSTREAM_REFUSED.starts_with(crate::routes::connectors::INGEST_JOB),
             "the message must name the job it refuses, or the console shows a rule it cannot match"
         );
     }
@@ -2848,6 +2928,57 @@ mod tests {
     async fn create_with_a_file_ingest_upstream_on_a_bronze_source_passes_the_guard() {
         let body = Bytes::from_static(
             br#"{"name":"pl-file-ingest-ok","kind":"batch","sourceZone":"bronze","sourceTable":"t","targetZone":"silver","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["file_ingest_job"]}"#,
+        );
+        let err = crate::routes::pipelines::create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("the store is not configured in this state");
+        assert_eq!(
+            err.0.status(),
+            503,
+            "the guard must pass and the request must reach the store, got: {}",
+            err.0
+        );
+    }
+
+    /// BLD-4 / D2 on `POST /api/pipelines`, the refusal half for the other
+    /// per-table upstream: a non-Bronze source that lists `ingest_job` is
+    /// refused with [`INGEST_UPSTREAM_REFUSED`]. Same route, same
+    /// `state_without_pool()` and same reason for it as the `file_ingest_job`
+    /// pair above -- the guard reads the parsed body, so it must answer
+    /// before any store, orchestrator or tenant lookup decides anything.
+    /// BLD-4 review R1 SHOULD-FIX 6: create was the one call site of the
+    /// three (update, restore) with no `ingest_job` test.
+    #[tokio::test]
+    async fn create_with_an_ingest_upstream_on_a_silver_source_is_refused() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-connector-ingest","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["ingest_job"]}"#,
+        );
+        let err = crate::routes::pipelines::create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("ingest_job on a silver source must be refused");
+        assert_eq!(err.0.status(), 400);
+        assert_eq!(err.0.to_string(), INGEST_UPSTREAM_REFUSED);
+    }
+
+    /// The accepted half, in this job's words: the same body with a `bronze`
+    /// source passes the guard, so the create reaches the store and answers
+    /// 503 for the missing pool instead of 400. The refusal above and this
+    /// one differ in exactly one field of the body, so a guard that
+    /// refused every `ingest_job` chain on create would fail here.
+    #[tokio::test]
+    async fn create_with_an_ingest_upstream_on_a_bronze_source_passes_the_guard() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-connector-ingest-ok","kind":"batch","sourceZone":"bronze","sourceTable":"t","targetZone":"silver","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["ingest_job"]}"#,
         );
         let err = crate::routes::pipelines::create(
             State(state_without_pool()),
@@ -3009,7 +3140,14 @@ mod tests {
     /// the guard at all. Each test reads the stored row back afterwards,
     /// because "refused" has to mean "wrote nothing" as well as "answered
     /// 400".
-    mod file_ingest_upstream_is_refused {
+    /// DATA-19 / D2 + BLD-4 / D2, on the two write routes a chain can
+    /// arrive through: `update` (a submitted body) and `restore_version`
+    /// (a stored snapshot, which can predate the rule because rows and
+    /// versions are not migrated). Each per-table job gets the same two
+    /// proofs — the refusal, and nothing written — and they are in ONE
+    /// module because they walk ONE guard: the job name is the only
+    /// difference.
+    mod per_table_upstream_is_refused {
         use lakehouse_store::pipelines::{self, CreatePipelineInput};
         use lakehouse_test_support as _;
 
@@ -3094,6 +3232,45 @@ mod tests {
             );
         }
 
+        /// BLD-4 / D2, the other per-table job through the same route and
+        /// the same body with one field changed: `ingest_job` is refused
+        /// with ITS text (`INGEST_UPSTREAM_REFUSED`), so a silver pipeline
+        /// cannot be chained to a connector load it could never follow.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn update_put_refuses_an_ingest_upstream_on_a_silver_source(pool: sqlx::PgPool) {
+            let created = pipelines::create_pipeline(
+                &pool,
+                &pipeline_input("pl-update-connector-ingest"),
+                None,
+            )
+            .await
+            .expect("seed the row the refused update would rewrite");
+            let body = Bytes::from_static(
+                br#"{"kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["ingest_job"]}"#,
+            );
+            let err = update(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(created.id.clone()),
+                body,
+            )
+            .await
+            .expect_err("ingest_job on a silver source must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), INGEST_UPSTREAM_REFUSED);
+
+            let after = pipelines::get_pipeline(&pool, &created.id)
+                .await
+                .expect("get_pipeline")
+                .expect("the row still exists");
+            assert!(
+                after.depends_on.is_empty(),
+                "the refused update must not have written the upstream, found {:?}",
+                after.depends_on
+            );
+        }
+
         /// A stored version can predate the rule (rows are not migrated),
         /// so restoring one is refused on the snapshot's own
         /// `source_zone`, not replayed straight back into the live row.
@@ -3146,6 +3323,61 @@ mod tests {
             .expect_err("replaying a stored file_ingest_job chain must be refused");
             assert_eq!(err.0.status(), 400);
             assert_eq!(err.0.to_string(), FILE_INGEST_UPSTREAM_REFUSED);
+        }
+
+        /// BLD-4 / D2, the other per-table job on the replay route: a
+        /// stored version that chains `ingest_job` is refused on the
+        /// snapshot's own `silver` source, with `ingest_job`'s own text.
+        /// The version is written through the store for the same reason
+        /// as the one above — the create and update ROUTES refuse that
+        /// body themselves, so only the store can hold a row that predates
+        /// the rule.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_of_an_ingest_upstream_version_returns_400(pool: sqlx::PgPool) {
+            let created = pipelines::create_pipeline(
+                &pool,
+                &pipeline_input("pl-restore-connector-ingest"),
+                None,
+            )
+            .await
+            .expect("seed the row the refused restore would rewrite");
+            let pre_refusal = UpdatePipelineInput {
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "s".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "t".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                depends_on: Some(vec![crate::routes::connectors::INGEST_JOB.to_owned()]),
+            };
+            pipelines::update_pipeline(&pool, &created.id, &pre_refusal, None)
+                .await
+                .expect("store a pre-refusal version that lists the upstream")
+                .expect("the row still exists");
+            let version: (i32,) = sqlx::query_as(
+                "SELECT max(version) FROM pipeline_definition_version WHERE pipeline_id = $1",
+            )
+            .bind(&created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count the version rows");
+
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path((created.id.clone(), version.0)),
+            )
+            .await
+            .expect_err("replaying a stored ingest_job chain must be refused");
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(err.0.to_string(), INGEST_UPSTREAM_REFUSED);
         }
     }
 

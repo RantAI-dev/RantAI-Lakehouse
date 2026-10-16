@@ -26,11 +26,15 @@ all tenants) and builds, per pipeline:
   `authored_status` route has to stop the stored sensor next to the
   schedule (F1.2).
 
-  One upstream is per-table rather than per-job: `file_ingest_job` loads
-  ONE uploaded file into ONE Bronze table per run, so a pipeline that
-  names it counts only the SUCCESS runs whose own config loaded the
-  pipeline's source table (DATA-19 / D1). A load of another table is not
-  a run of this chain.
+   Two upstreams are per-table rather than per-job: `file_ingest_job` loads
+   ONE uploaded file into ONE Bronze table per run, and `ingest_job` loads
+   EVERY selected object of ONE connector into Bronze per run while being
+   the SAME job for every connector. A pipeline that names either counts
+   only the SUCCESS runs that loaded ITS source table (DATA-19 / D1, BLD-4
+   / D1); a load of another table is a run of a different chain. See
+   `_latest_record_for_table` and `_latest_record_for_ingest_table` for how
+   each job's loaded table is read, and the plan
+   `docs/superpowers/plans/2026-10-15-bld-4-ingest-upstream-filter.md`.
 
 The API asks the webserver to reload this code location whenever a
 pipeline becomes ready, is edited, paused, resumed or deleted
@@ -93,13 +97,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import quote
 
 import requests
 from dagster import (
+    AssetKey,
     AssetMaterialization,
-DagsterRunStatus,
+    DagsterRunStatus,
     DefaultScheduleStatus,
     DefaultSensorStatus,
     Failure,
@@ -902,7 +907,7 @@ def _upstream_job_selector(upstream_id: str) -> JobSelector:
     )
 
 
-# ── DATA-19 / D1: a re-upload triggers only the pipelines that read it ────
+# ── BLD-4 / D1 + DATA-19 / D1: a load triggers only the pipelines it fed ──
 
 # Where a load's run config says which table it wrote:
 # `ops.ingest_uploaded_file.config.bronze_table_name`, exactly the shape
@@ -911,14 +916,72 @@ def _upstream_job_selector(upstream_id: str) -> JobSelector:
 # silently change the filter into a match-nothing one.
 FILE_INGEST_OP_CONFIG = ("ops", "ingest_uploaded_file", "config", "bronze_table_name")
 
-# How many recent SUCCESS runs of `file_ingest_job` one tick looks at when
-# it has to find the newest one that loaded THIS pipeline's table. The
-# window is bounded for the same reason `MAX_DEPENDS_ON` is: a per-tick
-# scan over an unbounded run history would grow with every upload anyone
-# ever made. It is a window, not a cap on what triggers the chain -- a
-# table whose newest load is older than the window simply waits for its
-# next upload, and the SkipReason says exactly that.
-FILE_INGEST_SCAN_LIMIT = 20
+# The other per-table upstream: `ingest_factory.py`'s ONE static job, named
+# `ingest_job` (`ingest_factory.ingest_job`), which every connector's load
+# runs through (`{"ops": {"run_ingest": {"config": {"connector_id": ...}}}}`
+# from `routes/connectors.rs`, plus an optional `object`/`action` for a run
+# of one table). There is no `JOB_NAME` constant in `ingest_factory` to
+# import -- `file_ingest.JOB_NAME` is the one that exists -- so the name
+# lives here, and `TestIngestUpstreamIsFilteredByTable` pins it against
+# `ingest_factory.ingest_job.name` so a rename there cannot silently turn
+# this filter into a match-nothing one.
+INGEST_JOB = "ingest_job"
+
+
+@dataclass(frozen=True)
+class _PerTableUpstream:
+    """How one per-table upstream loads Bronze, in the words a `SkipReason`
+    needs for it (D4).
+
+    The two upstreams do not load a table the same way, so the reason for
+    "this chain cannot be triggered" and for "the chain is waiting" is
+    written once here per job rather than duplicated at the two skip sites.
+    `loads` names what the job writes, `trigger` what one run of it is
+    called, and `window` what the scan window counts.
+    """
+
+    loads: str
+    trigger: str
+    window: str
+
+
+_PER_TABLE_UPSTREAMS: dict[str, _PerTableUpstream] = {
+    FILE_INGEST_JOB: _PerTableUpstream(
+        loads="loads uploaded files into bronze tables",
+        trigger="upload",
+        window="runs",
+    ),
+    INGEST_JOB: _PerTableUpstream(
+        loads="loads every selected object of one connector into bronze tables",
+        trigger="connector load",
+        window="loads",
+    ),
+}
+
+# How many recent loads one tick looks at when it has to find the newest
+# one that loaded THIS pipeline's table -- for `file_ingest_job` the newest
+# SUCCESS runs, for `ingest_job` the newest materializations of the one
+# Bronze asset key. ONE window, not one per job (`AGENTS.md` rule 4): two
+# constants with the same value drift. It is bounded for the same reason
+# `MAX_DEPENDS_ON` is: a per-tick scan over an unbounded history would grow
+# with every load anyone ever made. It is a window, not a cap on what
+# triggers the chain -- a table whose newest load is older than the window
+# simply waits for its next load, and the SkipReason says exactly that.
+PER_TABLE_UPSTREAM_SCAN_LIMIT = 20
+
+
+def _bronze_asset_key(table: str) -> AssetKey:
+    """The asset key `ingest_factory` logs for a Bronze table.
+
+    `AssetMaterialization(asset_key="bronze.<target>")` parses the string
+    the way `AssetKey.__init__` does -- on the PERIOD -- so it is the
+    TWO-component key `["bronze", "<target>"]`, not the one-component
+    `["bronze.<target>"]`. Proven against the real classes in
+    `TestIngestMaterializationKeyTest`; building the one-component key here
+    would match nothing and every chain would wait forever, which is the
+    failure this docstring exists to prevent.
+    """
+    return AssetKey(["bronze", table])
 
 
 def _run_config_value(run: Any, path: tuple[str, ...]) -> str | None:
@@ -960,6 +1023,91 @@ def _latest_record_for_table(records: Sequence[Any], table: str) -> Any | None:
     return None
 
 
+def _per_table_upstream_skip(
+    upstream_id: str, bronze_table: str | None, source_label: str
+) -> str:
+    """D4: why a per-table upstream is not fresh for THIS pipeline, in words
+    that name the table (the same discipline `DATA-19`'s reasons follow).
+
+    Two causes, and they are not the same fact: the pipeline reads no Bronze
+    table at all, so this job can never trigger it; or the job has not
+    loaded the pipeline's own table inside the scan window, so what happened
+    was a load of some OTHER table. Naming the table is what makes the
+    second one legible -- "waiting on ingest_job" alone reads as "no load has
+    run yet" when the real answer is "other tables' loads have, twice".
+    """
+    upstream = _PER_TABLE_UPSTREAMS[upstream_id]
+    if not bronze_table:
+        return (
+            f"upstream {upstream_id!r} {upstream.loads} and this pipeline reads "
+            f"{source_label}, so no {upstream.trigger} can trigger it"
+        )
+    return (
+        f"upstream {upstream_id!r} has no SUCCESS run that loaded {bronze_table!r} in its "
+        f"last {PER_TABLE_UPSTREAM_SCAN_LIMIT} {upstream.window}; a load of another "
+        "table never triggers this pipeline"
+    )
+
+
+def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
+    """The newest SUCCESS run of `ingest_job` that materialized `table`, or
+    `None` (BLD-4 / D1).
+
+    `ingest_job` is ONE job for every connector and loads EVERY selected
+    object of that connector in one run, so its run config names the
+    `connector_id` and not the tables (`DATA-19`'s config filter does not
+    carry over). What DOES name the table is the materialization each loaded
+    object logs inside the run that loaded it --
+    `ingest_factory.ingest_source_object`'s `AssetMaterialization(asset_key=f"bronze.
+    {target}")`, where `target` is `obj['target']`.
+
+    Two bounded calls, joined on `run_id` -- neither one alone can answer the
+    question (verified in the plan's section 5.1):
+
+    1. `instance.fetch_materializations` on the one asset key, newest first.
+       It filters by asset key only: `AssetRecordsFilter` has no `job_name`
+       and no status, and the per-event `get_event_records` twin is
+       deprecated in `dagster==1.13.20` ("Use fetch_materializations
+       instead").
+    2. `instance.get_run_records` keyed on the materializations' `run_ids`
+       with `statuses=[DagsterRunStatus.SUCCESS]` (BLD-4 review R1 BLOCKER 1),
+       which is where the RUN's status and `end_time` live. A materialization
+       logged by a step whose run later FAILED is still in the event log --
+       the log is append-only per step -- so the event alone is NOT evidence
+       of a load this chain may follow; only the run's own record is.
+
+    An empty `table` matches nothing: a pipeline whose source zone is not
+    `bronze` has no Bronze table to filter on, and fail-closed here means its
+    chain waits with an honest reason instead of firing on every connector
+    load in the deployment.
+    """
+    if not table:
+        return None
+    materializations = instance.fetch_materializations(
+        _bronze_asset_key(table), limit=PER_TABLE_UPSTREAM_SCAN_LIMIT
+    )
+    if not materializations.records:
+        return None
+    # BLD-4 review R1 BLOCKER 1: key the run lookup on the materializations
+    # so loads of other tables do not push this table's run out of the window.
+    success_records = instance.get_run_records(
+        filters=RunsFilter(
+            run_ids=[m.run_id for m in materializations.records],
+            statuses=[DagsterRunStatus.SUCCESS],
+        ),
+        limit=PER_TABLE_UPSTREAM_SCAN_LIMIT,
+    )
+    # The run records are the run-side of the join: one dict lookup per
+    # materialization, no per-run instance call.
+    success_by_run_id = {record.dagster_run.run_id: record for record in success_records}
+    # `fetch_materializations` is newest first, so the first record whose run
+    # SUCCEEDED is the newest load of this table the chain may follow.
+    for materialization in materializations.records:
+        if materialization.run_id in success_by_run_id:
+            return success_by_run_id[materialization.run_id]
+    return None
+
+
 def build_authored_dependency_sensor(
     pipeline: dict[str, Any], authored_job: Any
 ) -> Any | None:
@@ -997,11 +1145,14 @@ upstreams like `ingest_job`); `request_job` must be the
 `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
 Verified against dagster 1.13.20's `run_status_sensor` signature.
 
-`file_ingest_job` is the one upstream the freshness walk filters
-(DATA-19 / D1): it is a per-table job, so a pipeline counts only the
-SUCCESS runs whose own config says they loaded ITS source table, and a
-load of any other table never triggers it. Every other upstream keeps
-the unfiltered rule above, byte for byte.
+TWO upstreams are per-table, so the freshness walk filters them
+(`DATA-19` / D1 and `BLD-4` / D1): a pipeline counts only the SUCCESS
+runs that loaded ITS source table, and a load of any other table never
+triggers it. `file_ingest_job` writes ONE table per run and reads it from
+the run's config; `ingest_job` writes EVERY selected object of ONE
+connector per run and reads it from the materialization that run logged
+(`_latest_record_for_ingest_table`). Everything else keeps the
+unfiltered rule above, byte for byte.
 """
     depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
@@ -1022,17 +1173,19 @@ the unfiltered rule above, byte for byte.
     monitored = [_upstream_job_selector(dep) for dep in depends_on]
     downstream_safe = _dagster_safe_name(pipeline["id"])
     upstream_ids = list(depends_on)
-    # DATA-19 / D1: the Bronze table whose re-upload may trigger THIS
-    # pipeline, and `None` for every other shape. A `file_ingest_job`
-    # upstream only ever means "run me again when this table is
-    # re-uploaded", and only a `bronze` source names such a table -- the
-    # zone an upload's load writes (`routes::uploads::run_config`). A
-    # pipeline whose source is `silver`/`gold`/... has no Bronze table to
-    # match, so its filtered upstream matches nothing and the chain waits
-    # with a reason rather than firing on every upload. The API refuses
-    # that combination on create/update/restore
-    # (`routes::authored_pipelines::validate_file_ingest_upstream`); this
-    # is the same rule applied to a stored row that predates it.
+    # BLD-4 / D1 + DATA-19 / D1: the Bronze table whose load may trigger
+    # THIS pipeline, and `None` for every other shape. A `file_ingest_job` or
+    # `ingest_job` upstream only ever means "run me again when this table is
+    # loaded", and only a `bronze` source names such a table -- the zone a
+    # load writes (`routes::uploads::run_config`,
+    # `ingest_factory.py`'s `bronze.<target>` materialization). A pipeline
+    # whose source is `silver`/`gold`/... has no Bronze table to match, so
+    # its filtered upstream matches nothing and the chain waits with a
+    # reason rather than firing on every load. The API refuses that
+    # combination on create/update/restore
+    # (`routes::authored_pipelines`'s per-table upstream validator, the
+    # `DATA-19` one `file_ingest_job` introduced); this is the same rule
+    # applied to a stored row that predates it.
     definition = pipeline.get("definition") or {}
     source_zone = definition.get("sourceZone")
     source_table = definition.get("sourceTable")
@@ -1129,37 +1282,36 @@ the unfiltered rule above, byte for byte.
                 if upstream_id.startswith("pl-")
                 else upstream_id
             )
-            # DATA-19 / D1: `file_ingest_job` is the one upstream whose
-            # runs are about ONE table each, so its newest run is not
-            # enough -- the newest run THAT LOADED THIS PIPELINE'S TABLE
-            # is. Everything else asks for one run exactly as before.
-            filtered = upstream_id == FILE_INGEST_JOB
-            upstream_records = context.instance.get_run_records(
-                filters=RunsFilter(
-                    job_name=upstream_job_name,
-                    statuses=[DagsterRunStatus.SUCCESS],
-                ),
-                limit=FILE_INGEST_SCAN_LIMIT if filtered else 1,
-            )
-            latest = (
-                _latest_record_for_table(upstream_records, bronze_table or "")
-                if filtered
-                else (upstream_records[0] if upstream_records else None)
-            )
+            # DATA-19 / D1 + BLD-4 / D1: two upstreams are per-TABLE, so
+            # their newest run is not enough -- the newest run THAT LOADED
+            # THIS PIPELINE'S TABLE is. `file_ingest_job` is one table per
+            # run and reads it from the run config; `ingest_job` is one
+            # connector per run and reads it from the run's own
+            # materialization. Everything else asks for one run exactly as
+            # before.
+            if upstream_id == INGEST_JOB:
+                latest = _latest_record_for_ingest_table(
+                    context.instance, bronze_table or ""
+                )
+            else:
+                filtered = upstream_id == FILE_INGEST_JOB
+                upstream_records = context.instance.get_run_records(
+                    filters=RunsFilter(
+                        job_name=upstream_job_name,
+                        statuses=[DagsterRunStatus.SUCCESS],
+                    ),
+                    limit=PER_TABLE_UPSTREAM_SCAN_LIMIT if filtered else 1,
+                )
+                latest = (
+                    _latest_record_for_table(upstream_records, bronze_table or "")
+                    if filtered
+                    else (upstream_records[0] if upstream_records else None)
+                )
             if latest is None or latest.end_time is None:
-                if filtered:
-                    if not bronze_table:
-                        yield SkipReason(
-                            f"upstream {upstream_id!r} loads uploaded files into bronze "
-                            f"tables and this pipeline reads {source_label}, so no upload "
-                            "can trigger it"
-                        )
-                    else:
-                        yield SkipReason(
-                            f"upstream {upstream_id!r} has no SUCCESS run that loaded "
-                            f"{bronze_table!r} in its last {FILE_INGEST_SCAN_LIMIT} runs; "
-                            "a load of another table never triggers this pipeline"
-                        )
+                if upstream_id in _PER_TABLE_UPSTREAMS:
+                    yield SkipReason(
+                        _per_table_upstream_skip(upstream_id, bronze_table, source_label)
+                    )
                     return
                 yield SkipReason(
                     f"upstream {upstream_id!r} has never had a SUCCESS run; "
@@ -1167,6 +1319,15 @@ the unfiltered rule above, byte for byte.
                 )
                 return
             if latest.end_time <= (downstream_start or 0.0):
+                if upstream_id in _PER_TABLE_UPSTREAMS and bronze_table:
+                    # BLD-4 review R1 SHOULD-FIX 1: name the table in the stale anchor reason
+                    yield SkipReason(
+                        f"upstream {upstream_id!r} has no SUCCESS run that loaded "
+                        f"{bronze_table!r} after the downstream's most-recent "
+                        f"start ({downstream_start}); this upstream run "
+                        f"({upstream_run.run_id}) is stale"
+                    )
+                    return
                 yield SkipReason(
                     f"upstream {upstream_id!r} has no SUCCESS run after the "
                     f"downstream's most-recent start ({downstream_start}); "

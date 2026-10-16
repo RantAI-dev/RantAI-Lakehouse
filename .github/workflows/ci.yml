@@ -654,6 +654,18 @@ jobs:
           # `ops/g6/docker-compose.g6.override.yml`'s header comment
           # documents for its own fixtures.
           INGEST_ALLOW_INTERNAL_HOSTS=true
+          # BLD-4: the G7 step PUTs an ingest-spec onto the seeded
+          # `conn-pg-lakehouse`, whose `dial` host is this compose
+          # network's own `postgres` (0034_seed_connector_ingest_spec.sql).
+          # `PUT /api/connectors/{id}/ingest-spec` parses the `dial`
+          # through the same internal-host guard `connector_probe` uses
+          # (`connector_probe.rs`'s refusal), so without this the API
+          # answers 400 before the ingest ever runs. This is the API-side
+          # twin of `INGEST_ALLOW_INTERNAL_HOSTS` above (which covers the
+          # Dagster ingest job's own SSRF guard); the `ops/g6` jobs lift
+          # it the same way through `docker-compose.g6.override.yml`. Only
+          # this job's throwaway stack is affected.
+          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true
           # SRC-20: the G7 step below authors a real pipeline, and the
           # code location builds ZERO authored jobs when this is unset
           # (`authored_factory._fetch_authored_pipelines` logs
@@ -665,6 +677,22 @@ jobs:
           # value every other job that starts an authored pipeline uses
           # (this is that value's one existing shape in the file).
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          # BLD-4: the G7 step launches `ingest_job` through
+          # `POST /api/connectors/{id}/ingest/run`, and the op re-fetches its
+          # own connector from `GET /api/connectors/ingestible`
+          # (`ingest_factory._fetch_one_connector`). That route is
+          # `Policy::RequiresPermission("ingest:read")`
+          # (`policy.rs`), which only `lakehouse-api`'s
+          # `main::bootstrap_ingest_run_service` seeds, and only from this
+          # value -- with it unset the API seeds no identity and the op
+          # raises `requests.HTTPError: 401 Client Error: Unauthorized for
+          # url: http://lakehouse-api:8080/api/connectors/ingestible`,
+          # failing the `ingest_job` run (measured against this stack:
+          # `RUN_FAILURE - Execution of run for "ingest_job" failed. Steps
+          # failed: ['run_ingest']`). The same value every job that starts
+          # an ingest run already uses; compose passes it to both
+          # `lakehouse-api` and `dagster-code-location`.
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
           # BLD-3 review BLOCKER 1: the G7 step's source assertion
           # follows the BUILD, and this job's images have no commit. The
           # `images` job deliberately passes no `GIT_SHA` to either build

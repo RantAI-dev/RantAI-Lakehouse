@@ -2980,11 +2980,12 @@ pub async fn create(
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
-    // DATA-19 / D2: `file_ingest_job` is only an upstream of a pipeline
-    // that reads a Bronze table, so the create route applies the same
-    // guard `authored_pipelines::update` and `restore_version` run — one
-    // rule, one message, three call sites.
-    crate::routes::authored_pipelines::validate_file_ingest_upstream(
+    // DATA-19 / D2 + BLD-4 / D2: `file_ingest_job` and `ingest_job` are
+    // only upstreams of a pipeline that reads a Bronze table, so the create
+    // route applies the same guard `authored_pipelines::update` and
+    // `restore_version` run — one rule, one message per job, three call
+    // sites.
+    crate::routes::authored_pipelines::validate_per_table_upstream(
         &body.source_zone,
         Some(&body.depends_on),
     )?;
