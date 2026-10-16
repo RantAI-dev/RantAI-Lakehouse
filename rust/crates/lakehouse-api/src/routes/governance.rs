@@ -1523,7 +1523,7 @@ pub async fn delete_classification_rule(
 
 // ── /api/governance/tag-keys (DATA-12 part 2) ──────────────────────────
 
-/// Longest display name stored as `created_by` (`0071`'s CHECK).
+/// Longest display name stored as `created_by` (`0073`'s CHECK).
 const TAG_KEY_ACTOR_MAX_LEN: usize = 128;
 
 fn tag_key_json(row: &lakehouse_store::governed_tag::TagKeyRow) -> Value {

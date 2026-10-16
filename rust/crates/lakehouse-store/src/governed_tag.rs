@@ -1,4 +1,4 @@
-//! Governed tags (`DATA-12` part 2, migration `0071`): tag keys an admin
+//! Governed tags (`DATA-12` part 2, migration `0073`): tag keys an admin
 //! defines with the values each may take, and the `key = value` pairs a table
 //! carries from them. Free tags (`asset_annotation.tags`) are a separate
 //! column and are never read or written here.

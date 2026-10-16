@@ -28,8 +28,8 @@
 
 ## Planner decisions (not owner-signed; the reviewer may veto at review)
 
-- **Storage** — two tables in one migration `0071_governed_tags.sql` (numbering
-  decided below):
+- **Storage** — two tables in one migration `0073_governed_tags.sql` (first
+  numbered `0071`; renumbered twice, see "Second renumber" below):
   - `governed_tag_key(key TEXT PRIMARY KEY, allowed_values TEXT[] NOT NULL,
     created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at
     TIMESTAMPTZ NOT NULL)`.
@@ -95,6 +95,27 @@ UPDATE _sqlx_migrations SET version = 70
 The running dev stack (`lakehouse-postgres-1`) stops at version 55 and needs
 nothing. The part-1 plan keeps its historical `0062` mentions; `CHANGELOG.md`'s
 part-1 entry is updated to `0070` by the renumber commit.
+
+**Second renumber (2026-10-16, merge of `main` at `cacf7991`).** Main took
+`0070_reporting_settings.sql` and `0071_pipeline_definition_version_tenant.sql`
+while this branch's two were unmerged, so by the same rule this branch's moved
+again, content unchanged:
+
+- `0070_asset_certification.sql` → `0072_asset_certification.sql`
+- `0071_governed_tags.sql` → `0073_governed_tags.sql`
+
+The `CHANGELOG.md` part-1 entry and the code comments that name the migration
+(`lakehouse-store/src/lib.rs`, `governed_tag.rs`, `routes/governance.rs`) say
+`0072`/`0073` now. The text above keeps the numbers as they stood when each
+decision was taken. `0073_governed_tags.sql` is byte-identical to the old
+`0071` file, so its header still says "like `0032` and `0070`": that `0070` is
+the certification migration (now `0072`), not main's. The header is left
+alone because editing an applied migration changes its recorded checksum.
+A database that applied this branch's migrations under the old numbers needs
+the same kind of one-time, guarded record fix as above (version 70 → 72 for
+asset_certification, 71 → 73 for governed_tags, each `WHERE version = <old> AND
+description LIKE '%<name>%'`); none was run here.
+
 - **Catalog overlay** — rows and detail carry `governedTags` (object, keys
   sorted) next to `tags`, via the annotation overlay in
   `routes/catalog.rs:1481-1490`; absent when empty, like part 1's fields.
