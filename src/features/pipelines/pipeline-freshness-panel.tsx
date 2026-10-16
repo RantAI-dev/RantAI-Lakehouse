@@ -12,6 +12,20 @@ import { formatDateTime } from "@/lib/format"
 import { pipelineService } from "@/services"
 import type { PipelineDetail, TargetLag } from "@/services/contracts/pipelines"
 
+/**
+ * The minutes a `lag` target lag carries, or `null` when it carries none.
+ *
+ * `TargetLag` is widened with `| string` (D2, review R1 BLOCKER 10), so a
+ * stored value this contract does not know about has no `minutes` to read.
+ * Reading through this one helper keeps the panel honest — it falls back to
+ * the default it would offer anyway instead of rendering "undefined
+ * minutes".
+ */
+function lagMinutes(targetLag: TargetLag | null | undefined): number | null {
+  if (!targetLag || targetLag.kind !== "lag") return null
+  return typeof targetLag.minutes === "number" ? targetLag.minutes : null
+}
+
 export function PipelineFreshnessPanel({
   pipeline,
   onUpdated,
@@ -28,10 +42,9 @@ export function PipelineFreshnessPanel({
     if (!pipeline.targetLag) return "none"
     return pipeline.targetLag.kind === "lag" ? "lag" : "downstream"
   })
-  const [minutes, setMinutes] = React.useState<number>(() => {
-    if (pipeline.targetLag?.kind === "lag") return pipeline.targetLag.minutes
-    return 10
-  })
+  const [minutes, setMinutes] = React.useState<number>(
+    () => lagMinutes(pipeline.targetLag) ?? 10
+  )
   const [localError, setLocalError] = React.useState<string | null>(null)
 
   // BLD-2 review R1 BLOCKER 10: use useServiceAction
@@ -41,44 +54,51 @@ export function PipelineFreshnessPanel({
 
   const saving = saveAction.status === "pending"
   const error = localError || saveAction.error?.message || null
+  // `reset` is a stable `useCallback`; depending on it in the sync effect
+  // below is what keeps the React compiler from assuming the effect is
+  // missing a dependency.
+  const { reset: resetSave } = saveAction
 
   // Sync state if pipeline changes externally
   React.useEffect(() => {
     if (!isEditing) {
+      const configuredMinutes = lagMinutes(pipeline.targetLag)
       if (!pipeline.targetLag) {
         setMode("none")
         setMinutes(10)
-      } else if (pipeline.targetLag.kind === "lag") {
+      } else if (configuredMinutes != null) {
         setMode("lag")
-        setMinutes(pipeline.targetLag.minutes)
+        setMinutes(configuredMinutes)
       } else {
         setMode("downstream")
         setMinutes(10)
       }
       setLocalError(null)
-      saveAction.reset()
+      resetSave()
     }
-  }, [pipeline.targetLag, isEditing])
+  }, [pipeline.targetLag, isEditing, resetSave])
 
   const targetLagDesc = React.useMemo(() => {
     if (!pipeline.targetLag) return "None (runs on schedule or demand)"
+    const configuredMinutes = lagMinutes(pipeline.targetLag)
+    if (configuredMinutes != null) {
+      return `${configuredMinutes} minute${configuredMinutes === 1 ? "" : "s"}`
+    }
     if (pipeline.targetLag.kind === "downstream") return "Downstream"
-    return `${pipeline.targetLag.minutes} minute${pipeline.targetLag.minutes === 1 ? "" : "s"}`
+    // A `kind` this build does not know is shown as such rather than
+    // silently read as `downstream` (AGENTS.md principle 2).
+    return "Unknown target lag"
   }, [pipeline.targetLag])
 
-  const currentLagDesc = React.useMemo(() => {
-    if (pipeline.lag?.lagSeconds != null) {
-      return `${pipeline.lag.lagSeconds}s`
-    }
-    return "—"
-  }, [pipeline.lag?.lagSeconds])
+  // No `React.useMemo` here: the React compiler memoizes these itself and
+  // rejects a hand-written dependency list that does not match what the
+  // body reads (`react-hooks/preserve-manual-memoization`).
+  const currentLagDesc =
+    pipeline.lag?.lagSeconds != null ? `${pipeline.lag.lagSeconds}s` : "—"
 
-  const lastCheckDesc = React.useMemo(() => {
-    if (pipeline.lag?.lastCheckAt) {
-      return formatDateTime(pipeline.lag.lastCheckAt)
-    }
-    return "—"
-  }, [pipeline.lag?.lastCheckAt])
+  const lastCheckDesc = pipeline.lag?.lastCheckAt
+    ? formatDateTime(pipeline.lag.lastCheckAt)
+    : "—"
 
   const statusPill = React.useMemo(() => {
     if (!pipeline.targetLag) {
@@ -117,13 +137,14 @@ export function PipelineFreshnessPanel({
   const handleCancel = () => {
     setIsEditing(false)
     setLocalError(null)
-    saveAction.reset()
+    resetSave()
+    const configuredMinutes = lagMinutes(pipeline.targetLag)
     if (!pipeline.targetLag) {
       setMode("none")
       setMinutes(10)
-    } else if (pipeline.targetLag.kind === "lag") {
+    } else if (configuredMinutes != null) {
       setMode("lag")
-      setMinutes(pipeline.targetLag.minutes)
+      setMinutes(configuredMinutes)
     } else {
       setMode("downstream")
       setMinutes(10)

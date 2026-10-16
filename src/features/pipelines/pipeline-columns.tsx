@@ -327,7 +327,7 @@ export function getPipelineColumns({
         // BLD-2 review R1 SHOULD-FIX 19: render "Not measured" when targetLag is set but lag has not run
         if (!lag || lag.status === "not_measured") {
           return (
-            <Pill tone="muted" title={lag?.reason ?? undefined}>
+            <Pill tone="neutral" title={lag?.reason ?? undefined}>
               Not measured
             </Pill>
           )
