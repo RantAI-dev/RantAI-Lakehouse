@@ -7,18 +7,25 @@ import { downloadCsv, toCsv } from "@/lib/csv";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { RowsTable } from "@/components/patterns/rows-table";
 import type { FilterSkip } from "@/services/clients/bi-store";
+import { visibleColumns } from "@/lib/chart-shape";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";
+import type { BinMeta } from "@/lib/chart-bins";
+import type { LayerCell } from "./combined-option";
 
 export type Rows = {
   columns: string[];
   rows: Record<string, unknown>[];
   /** Active filters this tile's data could not honour (BI-18). */
   filtersSkipped?: FilterSkip[];
+  /** The label of each metric the tile shows, by metric name; a metric with no label is absent and reads by its name (BI-2). */
+  metricLabels?: Record<string, string>;
   /** The grain the rows were bucketed with, when the chart has one (BI-9). */
   grain?: string;
   /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */
   grainColumn?: string;
+  /** The bins of a binned chart, by column: the width and the data's range, read over the same rows as the bins (BI-10). */
+  bins?: Record<string, BinMeta>;
   /** A dashboard grain switch this chart could not take; it kept its own (BI-9). */
   grainSkipped?: string;
   /** More buckets existed than the chart's limit; the latest are shown (BI-9). A pivot: more cells than it may return, so the first are shown (BI-16). */
@@ -27,6 +34,10 @@ export type Rows = {
   total?: number;
   limit?: number;
   offset?: number;
+  /** Lines on the value axis, at the values this read gave their parameters (BI-11). */
+  referenceLines?: { value: number; label?: string }[];
+  /** The chart's other questions, each answered on its own (BI-13). */
+  layers?: LayerCell[];
 };
 export type Cell = Rows | TileFailure;
 
@@ -36,11 +47,13 @@ export function hasRows(c: Cell | undefined): c is Rows {
 
 /** A tile's result as a CSV download, named after the chart. */
 export function downloadRowsCsv(title: string, data: Rows): void {
+  // BI-6 R1: the server's internal columns (`__other`, ...) are not in the file.
+  const columns = visibleColumns(data.columns);
   const rows = data.rows.map((r) =>
-    Object.fromEntries(data.columns.map((c) => [c, r[c] == null ? "" : String(r[c])]))
+    Object.fromEntries(columns.map((c) => [c, r[c] == null ? "" : String(r[c])]))
   );
   const name = title.replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").toLowerCase() || "chart";
-  downloadCsv(`${name}.csv`, toCsv(data.columns, rows));
+  downloadCsv(`${name}.csv`, toCsv(columns, rows));
 }
 
 /** The numbers behind one chart, with a CSV download. */
@@ -59,7 +72,7 @@ export function TileDataDialog({
         </DialogHeader>
         {hasRows(cell) && cell.rows.length ? (
           <>
-            <RowsTable columns={cell.columns} rows={cell.rows} />
+            <RowsTable columns={visibleColumns(cell.columns)} rows={cell.rows} />
             <div className="flex items-center justify-between">
               <p className="text-[11px] text-muted-foreground">{cell.rows.length} rows</p>
               <Button size="sm" variant="outline" onClick={() => downloadRowsCsv(title, cell)}>

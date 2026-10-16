@@ -28,3 +28,12 @@ test("a map chart keeps its map and coordinate columns for the preview and the b
   const plain = chartDefFromArgs({ title: "T", kind: "bar", mart: "mart_x", dimension: "d", measures: ["m"], lat: "  " })
   expect([plain.map, plain.lat, plain.lon]).toEqual([undefined, undefined, undefined])
 })
+
+test("a create_chart call with layers keeps them, and how its own series is drawn, for the preview and the builder (BI-13)", () => {
+  const layers = [{ mart: "mart_rooms", dimension: "month", measures: ["rooms"], draw: "line", axis: "right" }]
+  const def = chartDefFromArgs({ title: "T", kind: "bar", mart: "mart_x", dimension: "month", measures: ["visitors"], layers, draw: "bar", axis: "left" })
+  expect(def.layers).toEqual(layers as never)
+  expect([def.draw, def.axis]).toEqual(["bar", "left"])
+  const plain = chartDefFromArgs({ title: "T", kind: "bar", mart: "mart_x", dimension: "d", measures: ["m"], draw: "dots", axis: "up" })
+  expect([plain.layers, plain.draw, plain.axis]).toEqual([undefined, undefined, undefined])
+})

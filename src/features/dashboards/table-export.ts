@@ -6,8 +6,9 @@ import { apiFetch } from "@/services/http";
 export type TableExportResult = { rows: number; cut: boolean; cap: number; fileName: string };
 
 /** The query string of `GET /api/dashboard/table-export`: the tile, the dashboard's filters, the viewer's sort. */
-export function tableExportQuery(chart: string, filters: readonly FilterDef[], sort?: { column: string; dir: "asc" | "desc" } | null): URLSearchParams {
+export function tableExportQuery(chart: string, filters: readonly FilterDef[], sort?: { column: string; dir: "asc" | "desc" } | null, params?: string | null): URLSearchParams {
   const q = new URLSearchParams({ chart });
+  if (params) q.set("params", params);
   const active = normalizeFilters([...filters]);
   if (active.length) q.set("filters", JSON.stringify(active));
   if (sort) {
@@ -32,8 +33,9 @@ export async function downloadTableExport(
   chart: string,
   filters: readonly FilterDef[],
   sort?: { column: string; dir: "asc" | "desc" } | null,
+  params?: string | null,
 ): Promise<TableExportResult> {
-  const res = await apiFetch(`/api/dashboard/table-export?${tableExportQuery(chart, filters, sort).toString()}`, { cache: "no-store" });
+  const res = await apiFetch(`/api/dashboard/table-export?${tableExportQuery(chart, filters, sort, params).toString()}`, { cache: "no-store" });
   if (!res.ok) {
     const json = (await res.json().catch(() => null)) as { error?: unknown } | null;
     throw new Error(typeof json?.error === "string" ? json.error : "The export failed.");

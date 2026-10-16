@@ -382,7 +382,7 @@ pub(super) fn mode_note(is_build: bool) -> &'static str {
 pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
-- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. To rename a board, call rename_board with the new name. To delete a board, call delete_board: it needs human approval, and the board's charts go with it. To arrange or resize the tiles on a board, call arrange_board with only the tiles that change; the grid has 12 columns and list_boards gives the current layout. To move a chart to another board, call move_chart with the chart id and the new board id. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. A chart can read only a Gold mart (describe_mart lists its columns) or a saved SQL source (list_sql_sources); a Silver or Bronze table cannot be charted, so say so and offer a mart or a SQL source instead. The page context lists the active filters; set_board_view_filters changes only this person's view and is the default for any filter request; save_board_filters only when the person asks to save for everyone.
+- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. To rename a board, call rename_board with the new name. To delete a board, call delete_board: it needs human approval, and the board's charts go with it. To arrange or resize the tiles on a board, call arrange_board with only the tiles that change; the grid has 12 columns and list_boards gives the current layout. To move a chart to another board, call move_chart with the chart id and the new board id. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. A chart can read only a Gold mart (describe_mart lists its columns) or a saved SQL source (list_sql_sources); a Silver or Bronze table cannot be charted, so say so and offer a mart or a SQL source instead. To put two marts side by side (for example visitors next to hotel capacity by province), call suggest_join, then create_chart with `joins`; a joined table's columns are <table>__<column>, and a joined table's measure should use max or avg. To group a number in ranges (visitors in bins of 500) pass `bin` ({mode: width, width: 500}, or auto, or count) on create_chart; for a map drawn as cells pass `grid`. To gather values under names of the user's own, take the values from the data, then create_value_group, and use its name as dimension. A hierarchy (list_hierarchies, create_hierarchy) lets a viewer click down from province to city; do not invent one. A parameter (list_parameters, create_parameter) is a value a viewer changes on the dashboard: a formula reads it as {name}, `limit` and a reference line (`referenceLines`) can take {param: name}, and a list parameter can switch the dimension, breakdown or a measure's column; to draw a target line, create a number parameter and pass it in referenceLines. Reuse an existing one. To draw two sources on one chart (visitors next to hotel rooms by month), keep the first question as the chart and add the other as `layers` (its own mart or sqlSource, a dimension of the same kind, measures, draw bar or line, axis left or right; right for numbers on another scale); do not join tables that should stay apart, and a chart with layers has no breakdown, 'Other' or steps. The page context lists the active filters; set_board_view_filters changes only this person's view and is the default for any filter request; save_board_filters only when the person asks to save for everyone.
 - Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
@@ -392,7 +392,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_board, delete_calculated_field, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_board, delete_calculated_field, delete_metric, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
 
@@ -414,6 +414,11 @@ const ALWAYS: &[&str] = &[
     "list_boards",
     "list_alert_rules",
     "get_cdc_health",
+    // BI-2 / AI-7: a question for a number may be answered by a named metric,
+    // and the model can only prefer one if it can see them on every turn.
+    "list_metrics",
+    "describe_metric",
+    "query_metric",
 ];
 
 /// One domain of tools and the words (English and Indonesian, lowercase
@@ -461,6 +466,8 @@ const DOMAINS: &[Domain] = &[
             "visual",
             "plot",
             "kpi",
+            "metric",
+            "metrik",
             "card",
             "kartu",
             "tile",
@@ -489,10 +496,18 @@ const DOMAINS: &[Domain] = &[
             "resize",
             "ukuran",
             "default",
+            "bins of",
+            "histogram",
+            "hierarchy",
+            "drill down",
+            "parameter",
+            "reference line",
+            "target line",
         ],
         tools: &[
             "list_charts",
             "list_sql_sources",
+            "suggest_join",
             "suggest_dashboard",
             "create_chart",
             "update_chart",
@@ -504,12 +519,23 @@ const DOMAINS: &[Domain] = &[
             "move_chart",
             "set_board_view_filters",
             "save_board_filters",
+            "create_metric",
+            "update_metric",
+            "delete_metric",
             "list_formula_functions",
             "list_calculated_fields",
             "validate_formula",
             "create_calculated_field",
             "update_calculated_field",
             "delete_calculated_field",
+            "create_value_group",
+            "list_hierarchies",
+            "create_hierarchy",
+            "delete_hierarchy",
+            "list_parameters",
+            "create_parameter",
+            "update_parameter",
+            "delete_parameter",
         ],
     },
     Domain {

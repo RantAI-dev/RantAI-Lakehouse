@@ -25,6 +25,8 @@ dagster/dispar_orchestrate/test_authored_factory.py -v`
 
 from __future__ import annotations
 
+import contextlib
+import os
 import unittest
 from typing import Any, Sequence
 from unittest import mock
@@ -58,6 +60,28 @@ def _cfg(run_token: str = "a-real-token") -> authored_factory.AuthoredPipelineCo
     return authored_factory.AuthoredPipelineConfig(
         api_url="http://lakehouse-api.invalid:8080", run_token=run_token,
     )
+
+
+@contextlib.contextmanager
+def _enforce_passthrough():
+    """Make the op's BLD-1 / D4 enforcement call answer with the SQL it was
+    given, unchanged.
+
+    Every test below that exercises the op's happy path needs this: the op
+    now POSTs its `SELECT` to the API and runs whatever comes back, so
+    without it each of them would make a real request to
+    `http://lakehouse-api.invalid:8080` (a host that does not resolve) and
+    fail on a connection error rather than on the thing it is testing.
+    Returning the input verbatim is the neutral stand-in — it leaves every
+    assertion about the SQL the op builds and writes exactly as valid as
+    before D4. The tests that care about enforcement itself
+    (`EnforceSqlTest`) mock the transport instead of this seam, so they
+    exercise the real `_enforced_sql`.
+    """
+    with mock.patch.object(
+        authored_factory, "_enforced_sql", side_effect=lambda cfg, pid, sql: sql,
+    ) as enforced:
+        yield enforced
 
 
 class HeadersTest(unittest.TestCase):
@@ -191,19 +215,24 @@ class BuildSelectSqlTest(unittest.TestCase):
 
 
 class BronzeSourceTest(unittest.TestCase):
-    """BLD-3 / D1 + D2: a `bronze` source is Iceberg in Lakekeeper, not a
-    ClickHouse database, so it is read through this job's own
-    `DataLakeCatalog` database (`CATALOG_DB`) as
-    ``icecat_authored.`bronze.<table>` ``, and every statement that reads
-    that database carries `SETTINGS allow_database_iceberg = 1`.
+    """BLD-1 / D5 (was BLD-3 / D1 + D2): a `bronze` source is Iceberg in
+    Lakekeeper, not a ClickHouse database, so it is read through a
+    `DataLakeCatalog` database as ``<db>.`bronze.<table>` ``, and every
+    statement that reads that database carries
+    `SETTINGS allow_database_iceberg = 1`.
+
+    WHICH database changed in D5, and these tests pin the new answer: it is
+    the API's own `ICEBERG_QUERY_DB`, because the API's policy rewriter
+    only recognises a governed table under that name, and a pipeline that
+    read Bronze through a private database was therefore never rewritten
+    at all. This module no longer creates a catalog database either — the
+    `clickhouse-iceberg-init` compose service owns that one — so the
+    "ensured before the first read" assertion BLD-3 made is replaced by
+    "this module creates none".
 
     No network and no ClickHouse: `_ch_exec`/`_ch_query_json` are
-    monkeypatched exactly as `OpForPipelineTest` does, and
-    `ensure_catalog_database` is monkeypatched on THIS module (it
-    `POST`s through `connector_catalog.ch_exec`, which
-    `authored_factory._ch_exec` never sees) so the test can also assert
-    it ran BEFORE the first read. Calls are recorded in order, because
-    "before the first read" is half of what D1 requires.
+    monkeypatched exactly as `OpForPipelineTest` does, and the enforcement
+    call is stubbed by `_enforce_passthrough`. Calls are recorded in order.
     """
 
     def _run_op(self, **definition_overrides: object) -> tuple[dict[str, Any], list[tuple[str, str]]]:
@@ -220,27 +249,19 @@ class BronzeSourceTest(unittest.TestCase):
             "_ch_query_json",
             side_effect=lambda target, statement: next(counts),
         ), mock.patch.object(
-            authored_factory,
-            "ensure_catalog_database",
-            side_effect=lambda target, database: calls.append(("ensure", database)),
-        ), mock.patch.object(
             authored_factory.ClickHouseTarget,
             "from_env",
             return_value=ClickHouseTarget("http://ch", "default", ""),
-        ):
+        ), mock.patch.dict(
+            os.environ, {"ICEBERG_QUERY_DB": "icecat_api"}, clear=False,
+        ), _enforce_passthrough():
             result = run_fn(build_op_context())
         return result, calls
 
     @staticmethod
     def _statements(calls: list[tuple[str, str]]) -> list[str]:
-        """The SQL statements the op sent, in order (the `ensure` entries
-        record the catalog database name in the same slot, so they are
-        filtered out here rather than matching the catalog's own name)."""
+        """The SQL statements the op sent, in order."""
         return [statement for kind, statement in calls if kind == "sql"]
-
-    @staticmethod
-    def _ensured_databases(calls: list[tuple[str, str]]) -> list[str]:
-        return [database for kind, database in calls if kind == "ensure"]
 
     @staticmethod
     def _bronze_pipeline(**overrides: object) -> dict[str, object]:
@@ -255,38 +276,43 @@ class BronzeSourceTest(unittest.TestCase):
             **overrides,
         }
 
-    def test_a_bronze_source_is_read_through_the_jobs_own_catalog_database(self) -> None:
-        """D1: the source is ``icecat_authored.`bronze.g3a_orders` `` -- the
-        job's own `DataLakeCatalog` database plus the catalog's own flat
-        `bronze.<table>` name -- never the ClickHouse database `bronze`
-        that does not exist on this stack (the 404 T1 reproduced)."""
+    def test_a_bronze_source_is_read_through_the_api_iceberg_query_database(self) -> None:
+        """D5: the source is ``icecat_api.`bronze.g3a_orders` `` -- the API's
+        OWN `ICEBERG_QUERY_DB` plus the catalog's own flat `bronze.<table>`
+        name -- never the ClickHouse database `bronze` that does not exist
+        on this stack, and never a database private to this module (which
+        is the change D5 makes, and the reason: the API's policy rewriter
+        resolves a governed table by its name under this database, so
+        reading through any other one left the query unenforced)."""
         _, calls = self._run_op(**self._bronze_pipeline())
-        self.assertEqual(self._ensured_databases(calls), [authored_factory.CATALOG_DB])
-        self.assertEqual(authored_factory.CATALOG_DB, "icecat_authored")
-        selects = [s for s in self._statements(calls) if "icecat_authored" in s]
+        selects = [s for s in self._statements(calls) if "icecat_api" in s]
         self.assertTrue(selects, f"no statement read the catalog database: {calls}")
         for statement in selects:
             self.assertIn(
-                "FROM icecat_authored.`bronze.g3a_orders`",
+                "FROM icecat_api.`bronze.g3a_orders`",
                 statement,
                 f"bronze source not read through the catalog database: {statement}",
             )
         # The Bronze source is never spelled as a ClickHouse database.
         self.assertFalse(
-            [s for s in self._statements(calls) if "`g3a_orders`" in s and "icecat_authored" not in s]
+            [s for s in self._statements(calls) if "`g3a_orders`" in s and "icecat_api" not in s]
         )
 
-    def test_the_catalog_database_is_ensured_before_the_first_statement_that_reads_it(self) -> None:
-        """D1: ensured here, by `_resolve_source`, so the run never depends on
-        another job's catalog database having been created first."""
+    def test_this_module_creates_no_catalog_database_of_its_own(self) -> None:
+        """D5: `clickhouse-iceberg-init` creates the API's `ICEBERG_QUERY_DB`
+        on every `up`, so a `CREATE DATABASE ... DataLakeCatalog` here would
+        be a second copy of a statement that already exists -- and the one
+        that exists is the one the rewriter must see."""
         _, calls = self._run_op(**self._bronze_pipeline())
-        ensure_index = next(i for i, (kind, _) in enumerate(calls) if kind == "ensure")
-        first_read_index = next(
-            i
-            for i, (kind, statement) in enumerate(calls)
-            if kind == "sql" and "icecat_authored" in statement
+        self.assertFalse(
+            [s for s in self._statements(calls) if "CREATE DATABASE" in s and "icecat_api" in s],
+            f"this module created the API's catalog database itself: {calls}",
         )
-        self.assertLess(ensure_index, first_read_index, f"{calls}")
+        self.assertFalse(
+            hasattr(authored_factory, "CATALOG_DB"),
+            "the private catalog-database name is gone in D5; the source is "
+            "named from the API's ICEBERG_QUERY_DB instead",
+        )
 
     def test_every_statement_reading_the_catalog_database_carries_allow_database_iceberg(self) -> None:
         """D2: ClickHouse refuses an Iceberg read without the setting, so it
@@ -297,7 +323,7 @@ class BronzeSourceTest(unittest.TestCase):
         clause), which is why `_reading` appends it rather than building it
         into `_build_select_sql`'s `FROM` clause."""
         _, calls = self._run_op(**self._bronze_pipeline())
-        reads = [s for s in self._statements(calls) if "icecat_authored" in s]
+        reads = [s for s in self._statements(calls) if "icecat_api" in s]
         self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
         for statement in reads:
             self.assertTrue(
@@ -316,13 +342,12 @@ class BronzeSourceTest(unittest.TestCase):
 
     def test_a_silver_source_is_read_exactly_as_before(self) -> None:
         """D3: a `silver` (or `gold`, or any ClickHouse zone) source is still
-        ``silver.`orders` ``, no catalog database is ensured, and no
-        statement grows a setting it did not have before."""
+        ``silver.`orders` ``, no Iceberg read setting appears, and no
+        statement grows anything it did not have before."""
         result, calls = self._run_op()
         self.assertEqual(result["rows"], 3)
-        self.assertEqual(self._ensured_databases(calls), [])
         statements = self._statements(calls)
-        self.assertFalse([s for s in statements if "icecat_authored" in s])
+        self.assertFalse([s for s in statements if "icecat_api" in s])
         self.assertFalse([s for s in statements if "allow_database_iceberg" in s])
         self.assertTrue(
             any(
@@ -338,15 +363,17 @@ class BronzeSourceTest(unittest.TestCase):
 
     def test_resolve_source_marks_only_bronze_as_an_iceberg_read(self) -> None:
         """`_PipelineSource.reads_iceberg` is what makes `_reading` attach the
-        setting, so it must be true for `bronze` alone."""
-        target = ClickHouseTarget("http://ch", "default", "")
-        with mock.patch.object(authored_factory, "ensure_catalog_database") as ensured:
-            bronze = authored_factory._resolve_source(target, "bronze", "orders")
-        ensured.assert_called_once_with(target, authored_factory.CATALOG_DB)
-        self.assertEqual(bronze.clickhouse_name, "icecat_authored.`bronze.orders`")
+        setting, so it must be true for `bronze` alone. The catalog database
+        is a PARAMETER (D5: the caller's `ICEBERG_QUERY_DB`, not a constant
+        of this module's), so a different value is a different source name
+        rather than an ignored argument."""
+        bronze = authored_factory._resolve_source("bronze", "orders", "icecat_api")
+        self.assertEqual(bronze.clickhouse_name, "icecat_api.`bronze.orders`")
         self.assertTrue(bronze.reads_iceberg)
+        other = authored_factory._resolve_source("bronze", "orders", "some_other_db")
+        self.assertEqual(other.clickhouse_name, "some_other_db.`bronze.orders`")
         for zone in ("silver", "gold", "serving"):
-            source = authored_factory._resolve_source(target, zone, "orders")
+            source = authored_factory._resolve_source(zone, "orders", "icecat_api")
             self.assertEqual(source.clickhouse_name, f"{zone}.`orders`")
             self.assertFalse(source.reads_iceberg)
 
@@ -358,6 +385,140 @@ class BronzeSourceTest(unittest.TestCase):
             **{"sourceZone": "bronze", "sourceTable": "g3a_orders", "targetZone": "silver"}
         )
         self.assertTrue([s for s in self._statements(calls) if "silver.`orders_clean`" in s])
+
+
+class EnforceSqlTest(unittest.TestCase):
+    """BLD-1 / D4: the SQL the op RUNS is the API's rewrite of the SQL it
+    BUILT, never the SQL it built.
+
+    These mock the HTTP transport (`requests.post`), not `_enforced_sql`, so
+    the real request shape -- URL, headers, body -- and the real refusal
+    handling are exercised. Everything else (ClickHouse) is monkeypatched
+    the way `OpForPipelineTest` does; no test here touches the network.
+    """
+
+    #: The rewrite a governed column gets back from the API. Deliberately
+    #: NOT the SQL we sent: if the op ran its own SQL, every assertion
+    #: below would fail.
+    ENFORCED = "SELECT id, '***' AS name FROM silver.`orders`"
+
+    def _post_returning(self, status: int, body: Any) -> Any:
+        """A canned response whose `.json()` returns `body`."""
+        resp = mock.Mock(status_code=status)
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = body
+        return resp
+
+    def _post_raising(self, exc: Exception) -> Any:
+        resp = mock.Mock()
+        resp.raise_for_status.side_effect = exc
+        return resp
+
+    def _run_op_with(self, post: Any, **definition_overrides: object) -> Any:
+        pipeline = _ready_pipeline(**definition_overrides)
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        counts = iter([[{"n": "0"}], [{"n": "3"}]])
+        statements: list[str] = []
+        with mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: statements.append(s)), \
+             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             mock.patch.object(authored_factory.requests, "post", return_value=post) as mocked_post, \
+             mock.patch.dict(os.environ, {"LAKEHOUSE_API_URL": "http://api.invalid:8080", "PIPELINE_RUN_TOKEN": "run-tok"}):
+            result = run_fn(build_op_context())
+        return result, statements, mocked_post
+
+    def test_the_op_runs_the_sql_the_api_returned_and_never_its_own(self) -> None:
+        """The whole point of D4: the `SELECT` this module builds is a
+        REQUEST, not a command. Every statement that reads the source --
+        the target `CREATE TABLE ... AS`, the staging `CREATE` and the
+        staging `INSERT` -- must carry the API's text, and the unmasked
+        original must appear in none of them."""
+        result, statements, mocked_post = self._run_op_with(
+            self._post_returning(200, {"sql": self.ENFORCED})
+        )
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(mocked_post.call_count, 1, "exactly one enforcement call per run")
+        sent = mocked_post.call_args.kwargs["json"]
+        self.assertEqual(sent["sql"], "SELECT id, name FROM silver.`orders`")
+        reads = [s for s in statements if "silver.`orders`" in s]
+        self.assertEqual(len(reads), 3, f"expected CREATE, staging CREATE and INSERT: {reads}")
+        for statement in reads:
+            self.assertIn(self.ENFORCED, statement, f"op ran its own SQL: {statement}")
+            self.assertNotIn("SELECT id, name FROM", statement, f"unmasked SQL reached ClickHouse: {statement}")
+
+    def test_the_enforcement_call_is_authenticated_and_addressed_to_the_pipeline(self) -> None:
+        """The route is the orchestrator-only one, so the run token goes
+        with it, and the pipeline id in the URL is the row being run --
+        URL-quoted, so an id could never inject a path segment."""
+        _, _, mocked_post = self._run_op_with(self._post_returning(200, {"sql": self.ENFORCED}))
+        url = mocked_post.call_args.args[0]
+        headers = mocked_post.call_args.kwargs["headers"]
+        self.assertEqual(url, "http://api.invalid:8080/api/pipelines/runnable/pl-dedupe-select-abc123/enforce")
+        self.assertEqual(headers["Authorization"], "Bearer run-tok")
+        self.assertEqual(headers["x-run-token"], "run-tok")
+        self.assertEqual(headers["content-type"], "application/json")
+
+    def _assert_refused_without_retry(self, post: Any) -> str:
+        """A refusal fails the op on the first attempt, with the API's own
+        fixed message, and no statement reaches ClickHouse."""
+        from dagster import Failure
+
+        with self.assertRaises(Failure) as ctx:
+            self._run_op_with(post)
+        self.assertFalse(ctx.exception.allow_retries)
+        self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredEnforceRefused)
+        return str(ctx.exception)
+
+    def test_a_pipeline_with_no_author_fails_without_retry(self) -> None:
+        """D2's 409: the pipeline has no recorded author, so the API refuses
+        to rewrite anything. Retrying minutes later gets the same answer --
+        only an administrator assigning an author changes it."""
+        message = self._assert_refused_without_retry(
+            self._post_returning(409, {"error": "this pipeline has no author to read as; an administrator must assign one"})
+        )
+        self.assertIn("no author to read as", message)
+
+    def test_a_deactivated_author_fails_without_retry(self) -> None:
+        """D2's other 409, same shape: the author's row exists but is not
+        active, which is a decision, not an outage."""
+        self._assert_refused_without_retry(
+            self._post_returning(409, {"error": "this pipeline has no author to read as; an administrator must assign one"})
+        )
+
+    def test_a_refused_construct_fails_without_retry(self) -> None:
+        """A 422 is the policy engine refusing a construct it will not
+        rewrite -- also a decision, also not retried."""
+        self._assert_refused_without_retry(
+            self._post_returning(422, {"error": "Query menyentuh tabel yang diatur kebijakan melalui konstruksi yang tidak didukung"})
+        )
+
+    def test_a_transport_failure_is_left_retryable(self) -> None:
+        """An unreachable API is infrastructure, not a decision: the
+        exception propagates UNWRAPPED so the op's retry policy still sees
+        a plain retryable failure, exactly as before D4 existed."""
+        pipeline = _ready_pipeline()
+        run_fn = authored_factory._op_for_pipeline(pipeline)
+        with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec, \
+             mock.patch.object(authored_factory, "_ch_query_json"), \
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             mock.patch.object(authored_factory.requests, "post", side_effect=requests.ConnectionError("refused")):
+            with self.assertRaises(requests.ConnectionError):
+                run_fn(build_op_context())
+        mocked_exec.assert_not_called()
+
+    def test_a_refusal_without_a_message_never_echoes_the_body(self) -> None:
+        """The API's refusal body is fixed text by construction, so it is
+        safe to put in an op failure. A body that is NOT the documented
+        shape is not: we use our own fixed fallback rather than forwarding
+        whatever arrived."""
+        message = self._assert_refused_without_retry(self._post_returning(409, ["unexpected"]))
+        self.assertIn(authored_factory._ENFORCE_REFUSAL_FALLBACK, message)
+        self.assertNotIn("unexpected", message)
+
+    def test_a_2xx_without_a_sql_is_refused_rather_than_run(self) -> None:
+        """A response the op cannot read is never treated as "nothing to
+        enforce", which would silently run the unmasked SQL."""
+        self._assert_refused_without_retry(self._post_returning(200, {"sql": None}))
 
 
 class OpForPipelineTest(unittest.TestCase):
@@ -393,7 +554,8 @@ class OpForPipelineTest(unittest.TestCase):
         exec_calls: list[str] = []
         with mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             _enforce_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["rows"], 3)
@@ -424,7 +586,8 @@ class OpForPipelineTest(unittest.TestCase):
         counts = iter([[{"n": "0"}], [{"n": "3"}]])
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             _enforce_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["rows"], 3)
@@ -461,7 +624,8 @@ class OpForPipelineTest(unittest.TestCase):
         # First invocation -- staging-write + EXCHANGE.
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_1)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             _enforce_passthrough():
             first = run_fn(build_op_context())
         self.assertEqual(first["rows"], 3)
 
@@ -470,7 +634,8 @@ class OpForPipelineTest(unittest.TestCase):
         # rows of delta (no double-count, no leftover staging rows).
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts_2)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             _enforce_passthrough():
             second = run_fn(build_op_context())
         self.assertEqual(second["rows"], 3)
 
@@ -481,7 +646,8 @@ class OpForPipelineTest(unittest.TestCase):
         counts = iter([[{"n": "0"}], [{"n": "1"}]])
         with mock.patch.object(authored_factory, "_ch_exec"), \
              mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
+             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")), \
+             _enforce_passthrough():
             result = run_fn(build_op_context())
 
         self.assertEqual(result["skipped_verbs"], [authored_factory.FBIC_UNSUPPORTED_REASON])

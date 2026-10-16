@@ -672,7 +672,8 @@ async fn save_board_filters_on_main_fails_with_the_console_message() {
 }
 
 /// `save_board_filters` refuses more than the 20 filters the route allows
-/// (`routes/dashboard.rs:942`, `validate_filters`). The refusal runs before
+/// (`routes/dashboard.rs:1163`, `validate_filters` inside `boards_update`).
+/// The refusal runs before
 /// the route's first `ClickHouse` call, so the dead upstream never gets
 /// asked — this is the plan's "21 filters are refused" line, asserted
 /// through the tool rather than against the library.
@@ -706,7 +707,7 @@ async fn save_board_filters_refuses_more_than_twenty_filters() {
 }
 
 /// `save_board_filters` refuses an invalid filter op. The tool parses the
-/// args into `Vec<FilterDef>` itself (`tools/boards.rs:419`), so this one
+/// args into `Vec<FilterDef>` itself (`tools/boards.rs:424`), so this one
 /// never reaches the route at all — it is the plan's "an invalid op is
 /// refused" line for Save filters, which the view-filter tool's own invalid
 /// op test does not cover.

@@ -89,3 +89,19 @@ test("a raw table needs at least one column", () => {
   assert.deepEqual(draftProblems("table", { ...emptyTableDraft(), mode: "rows" }), ["Columns"])
   assert.deepEqual(draftProblems("table", emptyTableDraft()), [])
 })
+
+test("a KPI comparison with last year, and a period comparison that leaves the date column to the metric (BI-2)", async () => {
+  const { draftFromDef, draftPayload, draftProblems, emptyTableDraft } = await import("./table-draft")
+  const draft = { ...emptyTableDraft(), compareKind: "last_year" as const }
+  // With no date column the comparison is sent as its kind alone: the server takes the metric's own.
+  assert.deepEqual((draftPayload("kpi", draft) as { compare: unknown }).compare, { kind: "last_year" })
+  assert.deepEqual(
+    (draftPayload("kpi", { ...draft, compareColumn: "d", comparePeriod: "week" }) as { compare: unknown }).compare,
+    { kind: "last_year", dateColumn: "d", period: "week" },
+  )
+  assert.deepEqual(draftProblems("kpi", draft), ["Date column"])
+  assert.deepEqual(draftProblems("kpi", draft, true), [])
+  const back = draftFromDef({ compare: { kind: "last_year", dateColumn: "d", period: "quarter" } } as never)
+  assert.equal(back.compareKind, "last_year")
+  assert.equal(back.comparePeriod, "quarter")
+})

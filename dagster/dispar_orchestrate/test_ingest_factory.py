@@ -281,6 +281,37 @@ def test_run_one_object_records_rejected_on_a_bad_secret_ref(monkeypatch) -> Non
     assert recorded[0]["rows"] is None
 
 
+def test_run_one_object_records_failed_for_a_connector_nobody_signed_in_to(monkeypatch) -> None:
+    # SRC-12 part C: an authorization-code connector whose refresh token cannot be
+    # read is "sign in again": a failed row naming the type only, then the op fails.
+    import dispar_orchestrate.ingest_factory as f
+    from dispar_orchestrate.adapters.rest import OAuthSignInRefused
+    from dispar_orchestrate.secret_resolver import SecretRefRejected
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+
+    def resolve(ref):
+        if ref == "file:/run/secrets/client":
+            return "client-secret"
+        raise SecretRefRejected(f"secretRef {ref!r} does not resolve to a real file")
+
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", resolve)
+    connector = {
+        "id": "conn-a",
+        "adapter": "rest",
+        "dial": {"baseUrl": "https://api.example.com", "auth": {"type": "oauth2_authorization_code"}},
+        "secretRef": "file:/run/secrets/client",
+        "secretRefSecondary": "file:/run/secrets/token",
+    }
+    with pytest.raises(OAuthSignInRefused):
+        f._run_one_object(connector, {"name": "/items", "target": "items"})
+    assert recorded[0]["status"] == "failed"
+    assert recorded[0]["rows"] is None
+    assert "sign in" not in recorded[0]["error"] and "client-secret" not in recorded[0]["error"]
+    assert recorded[0]["error"].endswith("OAuthSignInRefused")
+
+
 def test_run_one_object_records_failed_and_reraises_on_any_other_exception(monkeypatch) -> None:
     # A driver/HTTP/sink error is NOT silently invisible -- it gets an
     # ingest_run row (status="failed") AND still fails the op (re-raised),
@@ -1648,7 +1679,7 @@ def test_a_source_build_that_reflects_no_table_is_refused_rather_than_loaded_unc
 
 
 def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> None:
-    from dagster import Failure, build_op_context
+    from dagster import Failure, RetryRequested, build_op_context
 
     import dispar_orchestrate.ingest_factory as f
 
@@ -1661,9 +1692,11 @@ def test_the_op_retries_an_unreachable_api_but_not_a_refusal(monkeypatch) -> Non
         return fake
 
     monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationUnreachable("down")))
-    with pytest.raises(Failure) as unreachable:
+    # SRC-11 D1: a transient failure is a `RetryRequested` with the first wait,
+    # no longer a `Failure` that `DEFAULT_RETRY_POLICY` retries.
+    with pytest.raises(RetryRequested) as unreachable:
         f.ingest_source_object(build_op_context(), payload)
-    assert unreachable.value.allow_retries is True  # DEFAULT_RETRY_POLICY keeps retrying a transient failure
+    assert unreachable.value.seconds_to_wait == 60
 
     monkeypatch.setattr(f, "_run_one_object", raises(f.schema_observer.ObservationRefused("HTTP 403")))
     with pytest.raises(Failure) as refused:
@@ -1747,7 +1780,7 @@ def test_failures_that_are_not_a_refused_credential_are_not_recognised() -> None
 
 def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driver_errors(monkeypatch) -> None:
     import pymysql.err
-    from dagster import Failure, build_op_context
+    from dagster import Failure, RetryRequested, build_op_context
 
     import dispar_orchestrate.ingest_factory as f
 
@@ -1772,7 +1805,7 @@ def test_the_op_does_not_retry_a_refused_credential_but_still_retries_other_driv
 
     unreachable = _wrapped_like_sqlalchemy(pymysql.err.OperationalError(2003, "Can't connect to MySQL server"))
     monkeypatch.setattr(f, "_run_one_object", raises(unreachable))
-    with pytest.raises(type(unreachable)):  # propagates as it did: the retry policy handles it
+    with pytest.raises(RetryRequested):  # SRC-11 D1: retried on the ingest schedule, not by the default policy
         f.ingest_source_object(build_op_context(), payload)
 
 

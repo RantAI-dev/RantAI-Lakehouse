@@ -4,7 +4,8 @@ import { SqlDialForm } from "./sql-dial-form"
 import { RestDialForm } from "./rest-dial-form"
 import { CdcDialForm } from "./cdc-dial-form"
 import { FilesDialForm } from "./files-dial-form"
-import { credentialSlotsFor, driverForType } from "../connector-form-parts"
+import { credentialProblems, credentialSlotsFor, driverForType } from "../connector-form-parts"
+import type { RestDial } from "@/services/contracts/connectors"
 
 describe("dial forms", () => {
   it("SqlDialForm renders host/port/database/user as plain inputs, no secret picker for user", () => {
@@ -77,15 +78,106 @@ describe("dial forms", () => {
     expect(slots("rest", "bearer")).toEqual(["Bearer token", null])
     expect(slots("rest", "basic")).toEqual(["Username", "Password"])
     expect(slots("rest", "oauth2_client_credentials")).toEqual(["Client ID", "Client secret"])
+    // SRC-12 part C: the client secret is typed; the refresh token comes from signing in.
+    expect(slots("rest", "oauth2_authorization_code")).toEqual(["Client secret", "Refresh token"])
     expect(slots("sheets")).toEqual(["Service account JSON", null])
     // Two slots never share a kind: each kind names its own stored file.
     const pair = credentialSlotsFor("rest", { auth: { type: "basic" } })
     expect(pair.primary.kind).not.toBe(pair.secondary?.kind)
   })
-  it("RestDialForm renders an auth-type selector with all four types", () => {
+  it("RestDialForm renders an auth-type selector with all five types", () => {
     render(<RestDialForm value={null} onChange={mock()} />)
     const select = screen.getByLabelText("Auth type") as HTMLSelectElement
     const options = Array.from(select.options).map((o) => o.value)
-    expect(options).toEqual(["api_key", "bearer", "oauth2_client_credentials", "basic"])
+    expect(options).toEqual([
+      "api_key",
+      "bearer",
+      "oauth2_client_credentials",
+      "oauth2_authorization_code",
+      "basic",
+    ])
+  })
+  it("RestDialForm starts the authorization-code auth with empty addresses and no scopes (SRC-12 part C)", () => {
+    const onChange = mock()
+    render(<RestDialForm value={null} onChange={onChange} />)
+    fireEvent.change(screen.getByLabelText("Auth type"), { target: { value: "oauth2_authorization_code" } })
+    expect(onChange.mock.calls[0][0].auth).toEqual({
+      type: "oauth2_authorization_code",
+      clientId: "",
+      authorizeUrl: "",
+      tokenUrl: "",
+      scopes: [],
+    })
+  })
+  describe("OAuth authorization code (SRC-12 part C)", () => {
+    const CODE_DIAL: RestDial = {
+      baseUrl: "https://api.example.com",
+      auth: {
+        type: "oauth2_authorization_code",
+        clientId: "app-1",
+        authorizeUrl: "https://login.example.com/authorize",
+        tokenUrl: "https://login.example.com/token",
+        revocationUrl: "https://login.example.com/revoke",
+        scopes: ["read", "offline_access"],
+      },
+      pagination: { type: "none" },
+      endpoints: [{ path: "/items", recordsPath: null }],
+    }
+
+    it("shows the stored addresses, client id and scopes", () => {
+      render(<RestDialForm value={CODE_DIAL} onChange={mock()} />)
+      expect((screen.getByLabelText("Client ID") as HTMLInputElement).value).toBe("app-1")
+      expect((screen.getByLabelText("Sign-in URL") as HTMLInputElement).value).toBe(
+        "https://login.example.com/authorize"
+      )
+      expect((screen.getByLabelText("Token URL") as HTMLInputElement).value).toBe("https://login.example.com/token")
+      expect((screen.getByLabelText("Revocation URL (optional)") as HTMLInputElement).value).toBe(
+        "https://login.example.com/revoke"
+      )
+      expect((screen.getByLabelText("Scopes") as HTMLInputElement).value).toBe("read offline_access")
+    })
+
+    it("emits scopes as a list, keeps a trailing space while typing, and drops an emptied revocation address", () => {
+      const onChange = mock()
+      render(<RestDialForm value={CODE_DIAL} onChange={onChange} />)
+      const scopes = screen.getByLabelText("Scopes") as HTMLInputElement
+      fireEvent.change(scopes, { target: { value: "read " } })
+      expect(onChange.mock.calls[0][0].auth.scopes).toEqual(["read"])
+      expect(scopes.value).toBe("read ")
+      fireEvent.change(screen.getByLabelText("Revocation URL (optional)"), { target: { value: "" } })
+      expect("revocationUrl" in onChange.mock.calls[1][0].auth).toBe(false)
+    })
+
+    it("says what signing out cannot do when there is no revocation address", () => {
+      render(<RestDialForm value={CODE_DIAL} onChange={mock()} />)
+      expect(screen.getByText(/the token stays valid\s+there until it expires/)).toBeDefined()
+    })
+
+    it("shows the callback address to copy, or says the operator has not set it", () => {
+      const { unmount } = render(
+        <RestDialForm value={CODE_DIAL} onChange={mock()} oauthCallbackUrl="https://console.test/api/connectors/oauth/callback" />
+      )
+      expect(screen.getByText("https://console.test/api/connectors/oauth/callback")).toBeDefined()
+      unmount()
+      render(<RestDialForm value={CODE_DIAL} onChange={mock()} oauthCallbackUrl={null} />)
+      expect(screen.getByText(/CONNECTOR_OAUTH_REDIRECT_URI/)).toBeDefined()
+    })
+
+    it("asks for the client secret only: the refresh token slot is never a typed field", () => {
+      const slots = credentialSlotsFor("rest", CODE_DIAL as unknown as Record<string, unknown>)
+      expect(slots.primary).toMatchObject({ kind: "secret_key", label: "Client secret" })
+      expect(slots.secondary).toMatchObject({ kind: "token", signIn: true })
+      // With the secret typed, nothing is wrong; with it blank, the secret is required.
+      expect(
+        credentialProblems({ noCredential: false, optional: false, slots, primaryValue: "s3cret", secondaryValue: "" })
+      ).toEqual({ primary: null, secondary: null })
+      const blank = credentialProblems({ noCredential: false, optional: false, slots, primaryValue: "", secondaryValue: "" })
+      expect(blank.primary).not.toBeNull()
+      expect(blank.secondary).toBeNull()
+      // On the edit page a blank form keeps what is stored.
+      expect(
+        credentialProblems({ noCredential: false, optional: true, slots, primaryValue: "", secondaryValue: "" })
+      ).toEqual({ primary: null, secondary: null })
+    })
   })
 })

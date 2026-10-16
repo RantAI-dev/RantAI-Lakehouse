@@ -20,8 +20,18 @@ export type RecordsRequest = {
   value?: string;
   /** With `column` and `value`: `value` is a bucket of a chart grouped by this grain (BI-9), and the rows are those that fall in it. */
   grain?: string;
+  /** With `column` and `value`: `value` is the lower edge of a bin of this width (BI-10), and the rows are those whose number falls in it. */
+  binWidth?: number;
   /** The dashboard's active filters, so the list agrees with the number clicked. */
   filters: FilterDef[];
+  /**
+   * BI-6: the tile the list belongs to, set when the tile has filters of its
+   * own. The server adds them to the list, so it agrees with the number
+   * clicked on the tile; the route reads a relation, not a tile, without it.
+   */
+  chart?: string;
+  /** BI-13: with `chart`, the index (from 0) of one of its other questions; the list is that question's own rows. */
+  layer?: number;
   /**
    * A raw table (BI-16 part A): list these columns of the whole tile, in this
    * order, sorted by `sortColumn`. Not combined with `column` and `value`.
@@ -29,6 +39,8 @@ export type RecordsRequest = {
   columns?: readonly string[];
   sortColumn?: string;
   sortDir?: "asc" | "desc";
+  /** BI-11: the parameter values the tile was drawn with (JSON), so a calculated column reads the value that was clicked. */
+  params?: string;
 };
 
 export type RecordsPage = {
@@ -49,6 +61,7 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
     q.set("column", req.column);
     q.set("value", req.value);
     if (req.grain) q.set("grain", req.grain);
+    if (req.binWidth !== undefined) q.set("binWidth", String(req.binWidth));
   }
   if (req.columns?.length) {
     q.set("columns", req.columns.join(","));
@@ -57,6 +70,11 @@ export function recordsQuery(req: RecordsRequest, offset: number): URLSearchPara
       if (req.sortDir) q.set("sortDir", req.sortDir);
     }
   }
+  if (req.chart) {
+    q.set("chart", req.chart);
+    if (req.layer !== undefined) q.set("layer", String(req.layer));
+  }
+  if (req.params) q.set("params", req.params);
   q.set("limit", String(RECORDS_PAGE_SIZE));
   q.set("offset", String(offset));
   const active = normalizeFilters(req.filters);

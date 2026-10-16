@@ -208,6 +208,29 @@ describe("KpiCard", () => {
     expect(container.querySelector(".text-emerald-600")).not.toBeNull()
   })
 
+  it("shows the change against the same period last year, and against the previous period, of a metric's KPI (BI-2-AC3)", () => {
+    const cell: Rows = {
+      columns: ["visit_date", "v"], grain: "month",
+      rows: [
+        { visit_date: "2025-11-01", v: 200 }, { visit_date: "2026-09-01", v: 300 }, { visit_date: "2026-10-01", v: 150 }, { visit_date: "2026-11-01", v: 250 },
+      ],
+    }
+    // The comparison names no date column: the metric's own is the one in the rows.
+    render(<KpiCard def={{ compare: { kind: "last_year" } }} cell={cell} />)
+    expect(screen.getByText("250")).toBeTruthy()
+    expect(screen.getByText(/\+50 \(\+25%\)/)).toBeTruthy()
+    expect(screen.getByText(/vs Nov 2025/)).toBeTruthy()
+    const previous = screen.getByLabelText("Change against the previous period")
+    expect(previous.textContent).toMatch(/\+100/)
+    expect(previous.textContent).toMatch(/vs Oct 2026/)
+  })
+
+  it("says so when no data exists a year earlier", () => {
+    const cell: Rows = { columns: [], grain: "month", rows: [{ d: "2026-10-01", v: 150 }, { d: "2026-11-01", v: 250 }] }
+    render(<KpiCard def={{ compare: { kind: "last_year", dateColumn: "d", period: "month" } }} cell={cell} />)
+    expect(screen.getByText("No data a year earlier.")).toBeTruthy()
+  })
+
   it("colours a rise as worse when down is good", () => {
     const cell: Rows = { columns: [], grain: "month", rows: [{ day: "2026-01-01", v: 10 }, { day: "2026-02-01", v: 12 }] }
     const { container } = render(<KpiCard def={{ compare: { kind: "previous", dateColumn: "day", period: "month" }, goodDirection: "down" }} cell={cell} />)
@@ -249,6 +272,23 @@ describe("TileBody", () => {
     expect(screen.queryByText("b")).toBeNull()
     expect(screen.getByText(/^Rp/)).toBeTruthy()
   })
+
+  it("labels a binned grouping 500 – 1,000 from the width the tile carries, and from a width the chart fixes when it carries none", () => {
+    const rows = [{ visitors: 0, n: 3 }, { visitors: 500, n: 4 }];
+    const cell: Rows = { columns: ["visitors", "n"], rows, bins: { visitors: { mode: "auto", width: 500, min: 44, max: 970 } } };
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "auto" } }] })} cell={cell} dark={false} loading={false} />);
+    expect(screen.getByText("0 – 500")).toBeTruthy();
+    expect(screen.getByText("500 – 1,000")).toBeTruthy();
+    cleanup();
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "width", width: 250 } }] })} cell={{ columns: ["visitors", "n"], rows }} dark={false} loading={false} />);
+    expect(screen.getByText("0 – 250")).toBeTruthy();
+    expect(screen.getByText("500 – 750")).toBeTruthy();
+    cleanup();
+    // Nothing is guessed: automatic bins without what the server read show the lower edges as numbers.
+    render(<TileBody spec={spec("table", { groupings: [{ column: "visitors", bin: { mode: "auto" } }] })} cell={{ columns: ["visitors", "n"], rows }} dark={false} loading={false} />);
+    expect(screen.queryByText("0 – 500")).toBeNull();
+    expect(screen.getByText("500")).toBeTruthy();
+  });
 
   it("draws a raw table from a stored definition, and a pivot too", () => {
     render(<TileBody spec={spec("table", SPEC.def)} cell={FIRST_PAGE} dark={false} loading={false} />)

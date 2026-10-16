@@ -120,19 +120,33 @@ function Detected({ text }: { readonly text: string }) {
  */
 export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) {
   const { shown, settled } = view
-  if (shown === null) {
+  // SEC-17: a refusal of the reading itself (400, such as "The file has more
+  // than 1,000 columns.") with nothing shown yet keeps the controls on screen,
+  // because a wrong delimiter guess is what the person must be able to
+  // change. Any other failure with nothing to show has no controls to offer.
+  const refusedReading = shown === null && view.error !== null && view.error.code === "invalid_request"
+  if (shown === null && !refusedReading) {
     if (view.error !== null) return <PreviewFailure error={view.error} onRetry={view.retry} />
     return <LoadingSkeleton rows={3} />
   }
 
-  const workbook = shown.workbook
-  const parquet = shown.parquet
-  const encodings = UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
-    ? UPLOAD_ENCODINGS
-    : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
-  const delimiters = UPLOAD_DELIMITERS.some((d) => d.value === view.values.delimiter)
-    ? UPLOAD_DELIMITERS
-    : [...UPLOAD_DELIMITERS, { value: view.values.delimiter, label: delimiterLabel(view.values.delimiter) }]
+  const workbook = shown?.workbook
+  const parquet = shown?.parquet
+  // SEC-17: with no preview yet, the first option says the service detects
+  // the value, and it is not one to choose.
+  const undecided = { value: "", label: "Detected by the service", disabled: true }
+  const encodings =
+    shown === null
+      ? [undecided, ...UPLOAD_ENCODINGS]
+      : UPLOAD_ENCODINGS.some((e) => e.value === view.values.encoding)
+        ? UPLOAD_ENCODINGS
+        : [...UPLOAD_ENCODINGS, { value: view.values.encoding as "utf-8", label: encodingLabel(view.values.encoding) }]
+  const delimiters =
+    shown === null
+      ? [undecided, ...UPLOAD_DELIMITERS]
+      : UPLOAD_DELIMITERS.some((d) => d.value === view.values.delimiter)
+        ? UPLOAD_DELIMITERS
+        : [...UPLOAD_DELIMITERS, { value: view.values.delimiter, label: delimiterLabel(view.values.delimiter) }]
 
   return (
     <div className="space-y-4">
@@ -176,12 +190,12 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
               onChange={(e) => view.setEncoding(e.target.value as UploadParseOptions["encoding"])}
             >
               {encodings.map((e) => (
-                <option key={e.value} value={e.value}>
+                <option key={e.value} value={e.value} disabled={e.disabled}>
                   {e.label}
                 </option>
               ))}
             </select>
-            <Detected text={encodingLabel(shown.detected.encoding)} />
+            {shown !== null ? <Detected text={encodingLabel(shown.detected.encoding)} /> : null}
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="upload-delimiter">Delimiter</Label>
@@ -192,12 +206,12 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
               onChange={(e) => view.setDelimiter(e.target.value)}
             >
               {delimiters.map((d) => (
-                <option key={d.value} value={d.value}>
+                <option key={d.value} value={d.value} disabled={d.disabled}>
                   {d.label}
                 </option>
               ))}
             </select>
-            <Detected text={delimiterLabel(shown.detected.delimiter)} />
+            {shown !== null ? <Detected text={delimiterLabel(shown.detected.delimiter)} /> : null}
           </div>
           </>
         )}
@@ -217,11 +231,13 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             className={view.headerProblem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
           >
             {view.headerProblem ??
-              `Detected: ${headerRowDisplay(shown.detected.headerRow)}. ${
-                workbook
-                  ? "Counted from the sheet's first filled cell, blank rows included."
-                  : "Counted from the top of the file, blank rows included."
-              }`}
+              (shown === null
+                ? "Counts every row from the top of the file, blank ones included, starting at 1."
+                : `Detected: ${headerRowDisplay(shown.detected.headerRow)}. ${
+                    workbook
+                      ? "Counted from the sheet's first filled cell, blank rows included."
+                      : "Counted from the top of the file, blank rows included."
+                  }`)}
           </p>
         </div>
       </div>
@@ -248,7 +264,7 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
         </div>
       ) : null}
 
-      {shown.columns.length === 0 ? (
+      {shown === null ? null : shown.columns.length === 0 ? (
         <p role="alert" className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
           {parquet
             ? "This file has no columns."

@@ -23,11 +23,37 @@ use crate::filters::{
 };
 use crate::formula::compile::{FixedJoin, HiddenAgg, Shift};
 use crate::grain::{self, Grain, TimeContext, WeekStart};
+use crate::joins;
+use crate::shape;
 use crate::specs::Aggregate;
 use crate::store::{ChartInput, StoredChartSpec};
 use crate::tables;
 
+mod binned;
+mod ranked;
 mod staged;
+pub mod steps;
+
+pub use binned::BinRead;
+
+/// One more bin over a relation whose rows are already filtered
+/// ([`binned::add_layer`] for a caller outside this module).
+#[must_use]
+pub fn binned_layer(
+    relation: Relation,
+    column: &Ident,
+    mode: crate::bin::BinMode,
+    needed: &[String],
+) -> Relation {
+    binned::add_layer(
+        relation,
+        &binned::Layer {
+            column: column.clone(),
+            mode,
+        },
+        needed,
+    )
+}
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
 /// (measures) before it can accept filters or be built.
@@ -53,6 +79,20 @@ pub const SQL_SOURCE_SETTINGS: &str =
 pub enum Relation {
     /// A Gold mart, unqualified (`mart_x`); rendered as `serving.mart_x`.
     Mart(Ident),
+    /// A table and the tables joined to it (`BI-7`), read as one flat table:
+    /// the base table's columns under their own names, each joined table's
+    /// under `<alias>__<column>`. Every table is a plain `serving.<table>`
+    /// reference in a `FROM` or `JOIN` position, so the role rewrite
+    /// substitutes its masked, filtered projection at each one. Only
+    /// [`crate::joins::plan`] creates it.
+    Joined {
+        /// The base table, unqualified.
+        base: Ident,
+        /// Its columns.
+        base_columns: Vec<Ident>,
+        /// The joined tables, in order.
+        joins: Vec<crate::joins::JoinedTable>,
+    },
     /// A dashboard SQL source's text. The API validates it (read-only,
     /// `serving.*` tables only, no `;`/`SETTINGS`/`FORMAT`) before storing
     /// it; here it is only ever wrapped as a derived table so this
@@ -71,6 +111,20 @@ pub enum Relation {
         base: Box<Relation>,
         /// Complete SQL fragments, joined with `AND`.
         predicates: Vec<String>,
+    },
+    /// `base` joined to the one-row range of a number column (`BI-10`): the
+    /// column's minimum, maximum and bin width over `base` itself, as
+    /// `__bmn_<c>`, `__bmx_<c>` and `__bw_<c>` beside every column of `base`.
+    /// A [`Relation::Bucketed`] over it turns the column into its bin. The
+    /// subquery reads the same `base` text as the outer query, so the edges
+    /// come from the rows the bins hold, and the role rewrite substitutes the
+    /// governed projection at both reads. Only [`crate::bin::layers`] creates
+    /// it.
+    Ranged {
+        /// What is binned (already filtered when predicates apply).
+        base: Box<Relation>,
+        /// The column and the rule for its width.
+        range: crate::bin::Range,
     },
     /// `base` with the grained dimension replaced by its bucket
     /// (`BI-9`): `SELECT <bucket> AS <dimension>, <carried columns> FROM
@@ -151,6 +205,13 @@ pub struct AggregateField {
     pub sql: String,
     /// The source columns it reads, which a bucketing inner query must carry.
     pub reads: Vec<String>,
+    /// `BI-2`: the expression reads columns whose names a measure of the same
+    /// statement may also use as its result name (`visitors`), which the engine
+    /// resolves to the measure and rejects as an aggregate inside an aggregate.
+    /// The statement then asks for `prefer_column_name_to_alias`. Only a
+    /// metric sets it, so a chart that uses a calculated aggregate keeps the
+    /// statement it always had.
+    pub prefer_columns: bool,
 }
 
 impl Relation {
@@ -161,7 +222,19 @@ impl Relation {
     pub fn render(&self) -> String {
         match self {
             Self::Mart(mart) => format!("serving.{mart}"),
+            Self::Joined {
+                base,
+                base_columns,
+                joins,
+            } => Self::render_joined(base, base_columns, joins),
             Self::Sql(sql) => format!("(\n{}\n) AS src", sql.trim()),
+            Self::Ranged { base, range } => {
+                let inner = base.render();
+                format!(
+                    "(SELECT * FROM {inner} CROSS JOIN ({}) AS rng) AS ranged",
+                    range.scalars_sql(&inner)
+                )
+            }
             Self::Filtered { base, predicates } => format!(
                 "(SELECT * FROM {} WHERE {}) AS flt",
                 base.render(),
@@ -218,12 +291,27 @@ impl Relation {
         }
     }
 
+    /// Whether the rows come from a dashboard SQL source, looking through the
+    /// wrappers a builder puts around it.
+    #[must_use]
+    pub fn is_sql_source(&self) -> bool {
+        match self {
+            Self::Mart(_) | Self::Joined { .. } => false,
+            Self::Sql(_) => true,
+            Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
+            | Self::Bucketed { base, .. }
+            | Self::Calculated { base, .. }
+            | Self::Fixed { base, .. } => base.is_sql_source(),
+        }
+    }
+
     /// The aggregate calculated field called `name` that this relation
     /// carries, looking through the wrappers a builder puts around it.
     #[must_use]
     pub fn aggregate_field(&self, name: &str) -> Option<&AggregateField> {
         match self {
-            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Mart(_) | Self::Sql(_) | Self::Joined { .. } => None,
             Self::Calculated {
                 base, aggregates, ..
             } => aggregates
@@ -231,6 +319,7 @@ impl Relation {
                 .find(|a| a.name == name)
                 .or_else(|| base.aggregate_field(name)),
             Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Fixed { base, .. } => base.aggregate_field(name),
         }
@@ -243,10 +332,22 @@ impl Relation {
     pub(crate) fn settings(&self) -> String {
         match self {
             Self::Mart(_) => String::new(),
+            // BI-7: an outer join's missing side is empty (NULL), not the
+            // type's default; the engine's own join memory limit stays.
+            Self::Joined { .. } => " SETTINGS join_use_nulls = 1".to_owned(),
             Self::Sql(_) => SQL_SOURCE_SETTINGS.to_owned(),
+            Self::Calculated {
+                base, aggregates, ..
+            } => {
+                if aggregates.iter().any(|a| a.prefer_columns) {
+                    add_settings(&base.settings(), &["prefer_column_name_to_alias = 1"])
+                } else {
+                    base.settings()
+                }
+            }
             Self::Filtered { base, .. }
-            | Self::Bucketed { base, .. }
-            | Self::Calculated { base, .. } => base.settings(),
+            | Self::Ranged { base, .. }
+            | Self::Bucketed { base, .. } => base.settings(),
             Self::Fixed { base, .. } => add_settings(&base.settings(), &["join_use_nulls = 1"]),
         }
     }
@@ -256,7 +357,7 @@ impl Relation {
     #[must_use]
     pub fn table_calc(&self, name: &str) -> Option<&TableCalc> {
         match self {
-            Self::Mart(_) | Self::Sql(_) => None,
+            Self::Mart(_) | Self::Sql(_) | Self::Joined { .. } => None,
             Self::Calculated {
                 base, table_calcs, ..
             } => table_calcs
@@ -264,6 +365,7 @@ impl Relation {
                 .find(|t| t.name == name)
                 .or_else(|| base.table_calc(name)),
             Self::Filtered { base, .. }
+            | Self::Ranged { base, .. }
             | Self::Bucketed { base, .. }
             | Self::Fixed { base, .. } => base.table_calc(name),
         }
@@ -289,11 +391,57 @@ impl Relation {
 
 /// `settings` (empty or ` SETTINGS a, b`) with more settings appended.
 pub(crate) fn add_settings(settings: &str, more: &[&str]) -> String {
-    if settings.is_empty() {
+    // BI-7: a joined relation under a `Fixed` join asks for the same setting
+    // twice; a setting already there is not repeated.
+    let more: Vec<&str> = more
+        .iter()
+        .copied()
+        .filter(|m| !settings.contains(*m))
+        .collect();
+    if more.is_empty() {
+        settings.to_owned()
+    } else if settings.is_empty() {
         format!(" SETTINGS {}", more.join(", "))
     } else {
         format!("{settings}, {}", more.join(", "))
     }
+}
+
+/// A measure of a grouped chart as the statement reads it (`BI-6`): the
+/// source column, the name of its result column, and the aggregate it carries
+/// when it has one of its own (otherwise the chart's).
+///
+/// A measure without an aggregate of its own is named after its column, so a
+/// chart saved before `BI-6` builds exactly the statement it always did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Measure {
+    /// The column that is aggregated.
+    pub column: Ident,
+    /// The result column's name.
+    pub alias: Ident,
+    /// The measure's own aggregate; `None` takes the chart's.
+    pub aggregate: Option<Aggregate>,
+}
+
+impl Measure {
+    /// A measure that takes the chart's aggregate and keeps its column's name.
+    #[must_use]
+    pub fn plain(column: Ident) -> Self {
+        Self {
+            alias: column.clone(),
+            column,
+            aggregate: None,
+        }
+    }
+}
+
+/// Which result column a chart is ordered by (`BI-6`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sort {
+    /// The dimension, a grouping, or a measure's result name.
+    pub by: Ident,
+    /// Descending.
+    pub desc: bool,
 }
 
 /// Builder for the general (non-KPI) chart SQL: `SELECT dimension, agg(measure)
@@ -306,13 +454,22 @@ pub(crate) fn add_settings(settings: &str, more: &[&str]) -> String {
 pub struct QueryBuilder<S> {
     from: Relation,
     dimension: Option<Ident>,
-    measures: Vec<Ident>,
+    measures: Vec<Measure>,
     agg: Aggregate,
     order: String,
     limit: u32,
     breakdown: Option<Ident>,
     where_clauses: Vec<String>,
     grain: Option<(Grain, WeekStart)>,
+    /// `BI-6`: an order that replaces `order`.
+    sort: Option<Sort>,
+    /// `BI-6`: gather the groups past `limit` into an `Other` group.
+    other: bool,
+    /// `BI-6`: the columns of a table grouped by several (replaces
+    /// `dimension`).
+    groupings: Vec<Ident>,
+    /// `BI-6` part 2: steps applied to the grouped result.
+    steps: Option<steps::StepsSql>,
     _state: PhantomData<S>,
 }
 
@@ -338,6 +495,10 @@ impl QueryBuilder<NeedsProjection> {
             breakdown: None,
             where_clauses: Vec::new(),
             grain: None,
+            sort: None,
+            other: false,
+            groupings: Vec::new(),
+            steps: None,
             _state: PhantomData,
         }
     }
@@ -389,10 +550,46 @@ impl QueryBuilder<NeedsProjection> {
         self
     }
 
+    /// Order the groups by one result column (`BI-6`), in place of `order`.
+    #[must_use]
+    pub fn sort(mut self, sort: Option<Sort>) -> Self {
+        self.sort = sort;
+        self
+    }
+
+    /// Gather the groups past the limit into one `Other` group (`BI-6`).
+    #[must_use]
+    pub fn other(mut self, other: bool) -> Self {
+        self.other = other;
+        self
+    }
+
+    /// Group by several columns (`BI-6`, a table), instead of by `dimension`.
+    #[must_use]
+    pub fn groupings(mut self, groupings: Vec<Ident>) -> Self {
+        self.groupings = groupings;
+        self
+    }
+
+    /// Apply steps to the grouped result (`BI-6` part 2); the sort and limit
+    /// then belong to the last step's result.
+    #[must_use]
+    pub fn steps(mut self, steps: Option<steps::StepsSql>) -> Self {
+        self.steps = steps;
+        self
+    }
+
     /// Supply the measure columns, completing the projection and unlocking
-    /// [`QueryBuilder::filter_in`]/[`QueryBuilder::build`].
+    /// [`QueryBuilder::filter_in`]/[`QueryBuilder::build`]. Each takes the
+    /// chart's aggregate and its column's name.
     #[must_use]
     pub fn measures(self, measures: Vec<Ident>) -> QueryBuilder<Ready> {
+        self.measure_list(measures.into_iter().map(Measure::plain).collect())
+    }
+
+    /// [`Self::measures`] for measures that may carry an aggregate of their own.
+    #[must_use]
+    pub fn measure_list(self, measures: Vec<Measure>) -> QueryBuilder<Ready> {
         QueryBuilder {
             from: self.from,
             dimension: self.dimension,
@@ -403,6 +600,10 @@ impl QueryBuilder<NeedsProjection> {
             breakdown: self.breakdown,
             where_clauses: self.where_clauses,
             grain: self.grain,
+            sort: self.sort,
+            other: self.other,
+            groupings: self.groupings,
+            steps: self.steps,
             _state: PhantomData,
         }
     }
@@ -425,13 +626,54 @@ impl QueryBuilder<Ready> {
         self
     }
 
+    /// The order in the words `order` always used (`none`, `asc`, `desc`), for
+    /// the rules that read it: a sort by the dimension is `none` (by bucket),
+    /// a sort by a measure is a value order.
+    pub(crate) fn order_words(&self) -> &str {
+        match &self.sort {
+            None => &self.order,
+            Some(s) if self.is_dimension(&s.by) => "none",
+            Some(s) if s.desc => "desc",
+            Some(_) => "asc",
+        }
+    }
+
+    fn is_dimension(&self, name: &Ident) -> bool {
+        self.dimension.as_ref().is_some_and(|d| d == name)
+    }
+
+    /// The measure the chart is sorted by, with its position.
+    pub(crate) fn sort_measure(&self) -> Option<(usize, &Measure)> {
+        let sort = self.sort.as_ref()?;
+        self.measures
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.alias == sort.by)
+    }
+
     /// Render the final SQL. Ports `buildSql` in `bi-store.ts`.
+    ///
+    /// `BI-6`: "Other", a sort by a measure beside a breakdown, and several
+    /// groupings have their own statements; everything else is the statement
+    /// it always was, with a sort (when set) in place of `order`.
     #[must_use]
     pub fn build(&self) -> String {
         // BI-8 part 2: a chart with a table calculation or a period comparison
         // has its own, staged statement.
         if let Some(sql) = self.staged_sql() {
             return sql;
+        }
+        if self.steps.is_some() {
+            return self.steps_sql();
+        }
+        if self.other {
+            return self.other_sql();
+        }
+        if !self.groupings.is_empty() {
+            return self.groupings_sql();
+        }
+        if self.breakdown.is_some() && self.sort_measure().is_some() {
+            return self.ranked_sql();
         }
         let from = self.from.render();
         let settings = self.from.settings();
@@ -456,23 +698,26 @@ impl QueryBuilder<Ready> {
         // its latest buckets (the limit it carries is its whole range).
         let latest = self
             .grain
-            .is_some_and(|(g, _)| grain::cuts_to_latest(g, &self.order));
+            .is_some_and(|(g, _)| grain::cuts_to_latest(g, self.order_words()));
         let bucket_limit = self.limit + u32::from(latest);
         let key = self.grain.map_or_else(
             || dimension.clone(),
             |(g, week_start)| g.order_key(&dimension, week_start),
         );
+        // BI-6: a sort by the dimension keeps the groups it keeps and only
+        // turns the final order round when it is descending.
+        let key_dir = match &self.sort {
+            Some(s) if self.is_dimension(&s.by) => {
+                format!(" {}", if s.desc { "DESC" } else { "ASC" })
+            }
+            _ => String::new(),
+        };
 
         if let Some(breakdown) = &self.breakdown {
             let Some(measure) = self.measures.first() else {
                 return String::new();
             };
             let agg_expr = self.agg_of(measure);
-            let inner = if self.where_clauses.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {} ", self.where_clauses.join(" AND "))
-            };
             let outer = if self.where_clauses.is_empty() {
                 "WHERE".to_owned()
             } else {
@@ -482,63 +727,183 @@ impl QueryBuilder<Ready> {
             // ordered by bucket) the latest.
             let keep_by = if latest {
                 format!("{key} DESC")
-            } else if let Some(field) = self.from.aggregate_field(measure.as_str()) {
+            } else if !key_dir.is_empty() {
+                // BI-6: a sort by the dimension keeps its first N in that order.
+                format!("{key}{key_dir}")
+            } else if let Some(field) = self.from.aggregate_field(measure.column.as_str()) {
                 format!("{} DESC", field.sql)
-            } else if self.agg == Aggregate::Count {
+            } else if self.measure_aggregate(measure) == Aggregate::Count {
                 "count() DESC".to_owned()
             } else {
-                format!("{}({measure}) DESC", self.agg)
+                format!(
+                    "{}({}) DESC",
+                    self.measure_aggregate(measure),
+                    measure.column
+                )
             };
             return format!(
                 "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
-                 {outer} {dimension} IN (SELECT {dimension} FROM {from} {inner}\
+                 {outer} {dimension} IN (SELECT {dimension} FROM {from} {where_sql}\
                  GROUP BY {dimension} ORDER BY {keep_by} LIMIT {bucket_limit}) \
-                 GROUP BY {dimension}, {breakdown} ORDER BY {key}, {breakdown}{settings}",
+                 GROUP BY {dimension}, {breakdown} ORDER BY {key}{key_dir}, {breakdown}{settings}",
             );
         }
 
-        let sel = self
-            .measures
-            .iter()
-            .map(|m| self.agg_of(m))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let order_clause = if self.order == "none" {
-            key.clone()
-        } else {
-            let Some(first) = self.measures.first() else {
-                return String::new();
-            };
-            format!(
-                "{first} {}",
-                if self.order == "asc" { "ASC" } else { "DESC" }
-            )
+        let (sel, renamed) = self.select_lists();
+        let Some(order_clause) = self.order_clause(&key, &key_dir) else {
+            return String::new();
         };
         if latest {
-            return format!(
-                "SELECT * FROM (SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} \
-                 ORDER BY {key} DESC LIMIT {bucket_limit}) ORDER BY {key}{settings}",
+            let inner = format!(
+                "SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} \
+                 ORDER BY {key} DESC LIMIT {bucket_limit}"
             );
+            return match renamed {
+                Some(renamed) => format!(
+                    "SELECT {dimension}, {renamed} FROM ({inner}) ORDER BY {key}{key_dir}{settings}"
+                ),
+                None => format!("SELECT * FROM ({inner}) ORDER BY {key}{key_dir}{settings}"),
+            };
         }
-        format!(
-            "SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} ORDER BY {order_clause} LIMIT {limit}{settings}",
-            limit = self.limit,
-        )
+        match renamed {
+            Some(renamed) => format!(
+                "SELECT {dimension}, {renamed} FROM (SELECT {dimension}, {sel} FROM {from} \
+                 {where_sql}GROUP BY {dimension}) ORDER BY {order_clause} LIMIT {limit}{settings}",
+                limit = self.limit,
+            ),
+            None => format!(
+                "SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} ORDER BY {order_clause} LIMIT {limit}{settings}",
+                limit = self.limit,
+            ),
+        }
     }
 
-    fn agg_of(&self, measure: &Ident) -> String {
-        format!("{} AS {measure}", self.agg_expr(measure))
+    /// The measures' select list, and when the engine would read one measure's
+    /// result name as a column another measure aggregates, the list that
+    /// renames them outside. `round(sum(v)) AS v` beside `round(avg(v)) AS
+    /// avg_v` fails with error 184 (the second `v` is read as the first
+    /// alias, an aggregate inside an aggregate; measured on `ClickHouse` 26.8),
+    /// so such a chart aggregates under `__m<i>` names in an inner select and
+    /// renames them in the outer. A chart whose names cannot clash keeps the
+    /// statement it always had.
+    fn select_lists(&self) -> (String, Option<String>) {
+        let clash = self.measures.iter().enumerate().any(|(i, a)| {
+            self.measures
+                .iter()
+                .enumerate()
+                .any(|(j, b)| i != j && a.alias == b.column)
+        });
+        if !clash {
+            let sel = self
+                .measures
+                .iter()
+                .map(|m| self.agg_of(m))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (sel, None);
+        }
+        let inner = self
+            .measures
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{} AS __m{i}", self.agg_expr(m)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outer = self
+            .measures
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("__m{i} AS {}", m.alias))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (inner, Some(outer))
+    }
+
+    /// The `ORDER BY` of an ungrouped-by-breakdown chart: the sort when set
+    /// (the dimension through `key`, a measure by its result name), else
+    /// `order` (`none` is by `key`, a value order is by the first measure).
+    /// `None` when the first measure a value order needs is missing.
+    fn order_clause(&self, key: &str, key_dir: &str) -> Option<String> {
+        Some(match &self.sort {
+            Some(s) if !self.is_dimension(&s.by) => {
+                format!("{} {}", s.by, if s.desc { "DESC" } else { "ASC" })
+            }
+            Some(_) => format!("{key}{key_dir}"),
+            None if self.order == "none" => key.to_owned(),
+            None => format!(
+                "{} {}",
+                self.measures.first()?.alias,
+                if self.order == "asc" { "ASC" } else { "DESC" }
+            ),
+        })
+    }
+
+    fn agg_of(&self, measure: &Measure) -> String {
+        format!("{} AS {}", self.agg_expr(measure), measure.alias)
+    }
+
+    /// The aggregate a measure is built with: its own, else the chart's.
+    pub(crate) fn measure_aggregate(&self, measure: &Measure) -> Aggregate {
+        measure.aggregate.unwrap_or(self.agg)
     }
 
     /// The measure's aggregate expression, without its alias.
-    fn agg_expr(&self, measure: &Ident) -> String {
+    pub(crate) fn agg_expr(&self, measure: &Measure) -> String {
         // BI-8: an aggregate calculated field is the whole measure.
-        if let Some(field) = self.from.aggregate_field(measure.as_str()) {
+        if let Some(field) = self.from.aggregate_field(measure.column.as_str()) {
             field.sql.clone()
-        } else if self.agg == Aggregate::Count {
+        } else if self.measure_aggregate(measure) == Aggregate::Count {
             "count()".to_owned()
         } else {
-            format!("round({}({measure}))", self.agg)
+            format!(
+                "round({}({}))",
+                self.measure_aggregate(measure),
+                measure.column
+            )
+        }
+    }
+
+    /// `BI-6`: a table grouped by several columns. The groupings that are cut
+    /// by a grain are already buckets in the relation (nested
+    /// [`Relation::Bucketed`]), so this is the ordinary `GROUP BY` over them;
+    /// without a sort or an order it lists the groups in grouping order.
+    fn groupings_sql(&self) -> String {
+        let groups = self
+            .groupings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (sel, renamed) = self.select_lists();
+        let where_sql = if self.where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {} ", self.where_clauses.join(" AND "))
+        };
+        let order = match &self.sort {
+            Some(s) => format!("{} {}, {groups}", s.by, if s.desc { "DESC" } else { "ASC" }),
+            None if self.order == "none" => groups.clone(),
+            None => {
+                let Some(first) = self.measures.first() else {
+                    return String::new();
+                };
+                format!(
+                    "{} {}, {groups}",
+                    first.alias,
+                    if self.order == "asc" { "ASC" } else { "DESC" }
+                )
+            }
+        };
+        let from = self.from.render();
+        let (limit, settings) = (self.limit, self.from.settings());
+        match renamed {
+            Some(renamed) => format!(
+                "SELECT {groups}, {renamed} FROM (SELECT {groups}, {sel} FROM {from} \
+                 {where_sql}GROUP BY {groups}) ORDER BY {order} LIMIT {limit}{settings}"
+            ),
+            None => format!(
+                "SELECT {groups}, {sel} FROM {from} {where_sql}GROUP BY {groups} ORDER BY {order} LIMIT {limit}{settings}"
+            ),
         }
     }
 }
@@ -616,9 +981,10 @@ const SQL_SOURCE_MAX_ROWS: u32 = 2000;
 #[must_use]
 pub fn point_limit(from: &Relation) -> u32 {
     match from {
-        Relation::Mart(_) => POINT_LIMIT,
+        Relation::Mart(_) | Relation::Joined { .. } => POINT_LIMIT,
         Relation::Sql(_) => POINT_LIMIT.min(SQL_SOURCE_MAX_ROWS),
         Relation::Filtered { base, .. }
+        | Relation::Ranged { base, .. }
         | Relation::Bucketed { base, .. }
         | Relation::Calculated { base, .. }
         | Relation::Fixed { base, .. } => point_limit(base),
@@ -721,6 +1087,9 @@ pub struct FilteredSql {
     /// What a raw table, a pivot or a comparing KPI needs beyond its rows
     /// (`BI-16` part A).
     pub table: Option<TableRead>,
+    /// `BI-10`: one statement per binned column, which reads the bins' width,
+    /// minimum and maximum so the tile can label them. Empty without bins.
+    pub bins: Vec<BinRead>,
 }
 
 /// What the tile of a raw table, a pivot or a KPI with a comparison carries
@@ -797,9 +1166,13 @@ fn grained<H: std::hash::BuildHasher>(
     };
     let r = grain::resolve(def.grain.as_deref(), spec.spec.kind, column, read.grain);
     let g = r.effective.zip(column).map(|(grain, column)| {
-        let order = def.order.as_deref().unwrap_or("none");
-        let limit =
-            grain::effective_limit(grain, order, grain::clamp_limit(spec.spec.kind, def.limit));
+        let order = def.effective_order();
+        let order = order.as_str();
+        let limit = grain::effective_limit(
+            grain,
+            order,
+            grain::clamp_limit(spec.spec.kind, def.limit_value()),
+        );
         Grained {
             grain,
             column,
@@ -871,6 +1244,7 @@ where
         grain_column: None,
         latest_limit: None,
         table: None,
+        bins: Vec::new(),
     };
     if spec.spec.kind == crate::specs::ChartKind::Text {
         return FilteredSql {
@@ -881,6 +1255,7 @@ where
             grain_column: None,
             latest_limit: None,
             table: None,
+            bins: Vec::new(),
         };
     }
     let def: &ChartInput = &spec.def;
@@ -889,7 +1264,12 @@ where
     }
     let empty_cols: RelationColumns<HCols> = RelationColumns::default();
     let cols = mart_cols.get(&def.mart).unwrap_or(&empty_cols);
-    let outcome = filter_predicates(cols, years, filters, read.time);
+    // BI-7: the dashboard's filters apply to the columns of the whole flat
+    // relation; one on a base column's name still means the base column.
+    let Ok((filter_cols, joined)) = joined_relation(def, cols, mart_cols) else {
+        return unfiltered(Vec::new());
+    };
+    let outcome = filter_predicates(&filter_cols, years, filters, read.time);
     // BI-16 part A: a raw table is rebuilt too, because its second statement
     // (the count) is built here and not stored; a comparing KPI because its
     // periods depend on the deployment's time settings. BI-8: so is a chart
@@ -899,6 +1279,7 @@ where
         || kind == crate::specs::ChartKind::Pivot
         || def.tables.is_rows_mode(kind)
         || def.tables.compares_to_previous(kind)
+        || def.uses_shaping()
         || read.fields.chart_uses(def);
     if outcome.predicates.is_empty() && !rebuilds {
         return unfiltered(outcome.skipped);
@@ -908,25 +1289,102 @@ where
     // only ever fail on data corruption; fall back to the stored SQL rather
     // than panicking, matching "SQL never comes raw from untrusted input"
     // without introducing a new failure mode.
-    let Ok(mart) = Ident::new(def.mart.clone()) else {
+    if Ident::new(def.mart.clone()).is_err() {
         return unfiltered(outcome.skipped);
-    };
-    let from = Relation::Mart(mart);
-    match fields::prepare(
+    }
+    // BI-7: a calculated field is compiled against the base table's columns
+    // alone, and the joined columns are added to what the chart can name
+    // afterwards.
+    let from = joined.from.clone();
+    let prepared = fields::prepare(
         read.fields.for_chart(def),
         def,
         from.clone(),
         cols,
         read.time,
-    ) {
-        Ok(None) => report_over(spec, &from, cols, outcome, read, Some(&spec.spec.sql)),
-        Ok(Some(p)) => report_over(spec, &p.from, &p.cols, outcome, read, Some(&spec.spec.sql)),
+    );
+    match prepared {
+        Ok(None) => report_over(
+            spec,
+            &from,
+            &filter_cols,
+            outcome,
+            read,
+            Some(&spec.spec.sql),
+        ),
+        Ok(Some(p)) => match joins::with_joined_columns(p.cols, &filter_cols, &joined.joined) {
+            Ok(all) => report_over(spec, &p.from, &all, outcome, read, Some(&spec.spec.sql)),
+            Err(_) => Some(unfiltered(outcome.skipped)),
+        },
         // A field that no longer checks out: the chart keeps the SQL it was
         // saved with and the dashboard's error is the field's, never other
         // SQL built from a half-understood definition.
         Err(_) => Some(unfiltered(outcome.skipped)),
     }
     .unwrap_or_else(|| unfiltered(Vec::new()))
+}
+
+/// The relation a mart chart reads, joins included, and the columns the
+/// dashboard's filters can name: the mart's own when it has no joins. `Err`
+/// when a join no longer checks out (a table or column went away).
+fn joined_relation<H, S>(
+    def: &ChartInput,
+    cols: &RelationColumns<H>,
+    mart_cols: &HashMap<String, RelationColumns<H>, S>,
+) -> Result<(RelationColumns, joins::ChartRelation), ()>
+where
+    H: std::hash::BuildHasher,
+    S: std::hash::BuildHasher,
+{
+    let Ok(mart) = Ident::new(def.mart.clone()) else {
+        return Err(());
+    };
+    if def.shape.joins_list().is_empty() {
+        return Ok((
+            cols.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            joins::ChartRelation {
+                from: Relation::Mart(mart),
+                cols: RelationColumns::default(),
+                joined: Vec::new(),
+                origins: HashMap::new(),
+            },
+        ));
+    }
+    let planned =
+        joins::chart_relation(&mart, def.shape.joins_list(), mart_cols).map_err(|_| ())?;
+    Ok((planned.cols.clone(), planned))
+}
+
+/// `outcome` (the year and the dashboard's filters) with the chart's own
+/// filters (`BI-6`) in front: they are always applied, and the dashboard's can
+/// only narrow them further. `cols` are the columns of the relation *after*
+/// its calculated fields, so a chart can filter on a per-row field. `None`
+/// when one of the chart's own filters cannot apply (its column is gone or its
+/// type no longer fits): dropping it would show more rows than the author
+/// chose, so the caller reports the tile instead of building a statement.
+fn with_own_filters<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    cols: &RelationColumns<H>,
+    mut outcome: FilterOutcome,
+    read: &ReadContext<'_>,
+) -> Option<FilterOutcome> {
+    let time = read.time;
+    let own = def.shape.own_filters();
+    if own.is_empty() {
+        return Some(outcome);
+    }
+    // BI-2: a segment is replaced by its filters; one that is gone fails the
+    // tile like a filter that cannot apply, never shows more rows.
+    let own = read.fields.expand_chart_filters(def, own).ok()?;
+    let mut mine = filter_predicates(cols, &[], &own, time);
+    if !mine.skipped.is_empty() {
+        return None;
+    }
+    mine.predicates.append(&mut outcome.predicates);
+    mine.columns.append(&mut outcome.columns);
+    outcome.predicates = mine.predicates;
+    outcome.columns = mine.columns;
+    Some(outcome)
 }
 
 /// The grain, rebuilt statement and table read of one chart over `from`
@@ -946,7 +1404,7 @@ fn report_over<H: std::hash::BuildHasher>(
         predicates,
         skipped,
         columns,
-    } = outcome;
+    } = with_own_filters(&spec.def, cols, outcome, read)?;
     // BI-8 part 2: a `Fixed` aggregate is computed over the filtered rows, so
     // the filters go inside the join. Nothing is left for the outer query,
     // which also means no filter column can be mistaken for an alias there.
@@ -959,6 +1417,11 @@ fn report_over<H: std::hash::BuildHasher>(
     let from = &from;
     let (g, grain_skipped) = grained(spec, cols, read);
     let latest_limit = g.as_ref().and_then(|g| g.latest_limit);
+    // BI-10: what the tile needs to label the chart's bins, read over the same
+    // filtered rows the bins are cut from.
+    let bins = binned::all_layers(&spec.def, spec.spec.kind, cols)
+        .map(|layers| binned::reads(from, &predicates, &layers))
+        .unwrap_or_default();
     let rebuilt = rebuild(
         spec,
         from,
@@ -987,6 +1450,7 @@ fn report_over<H: std::hash::BuildHasher>(
         grain_column: g.as_ref().map(|g| g.column),
         latest_limit,
         table,
+        bins,
     })
 }
 
@@ -1045,6 +1509,7 @@ where
             grain_column: None,
             latest_limit: None,
             table: None,
+            bins: Vec::new(),
         });
     }
     let outcome = filter_predicates(source_cols, years, filters, read.time);
@@ -1094,6 +1559,17 @@ pub enum RecordsValue<'a> {
         /// The bucket as printed by the tile.
         text: &'a str,
     },
+    /// Rows whose number column falls in the clicked bin of a binned chart
+    /// (`BI-10`): `[lower, lower + width)`, closed above when that edge is the
+    /// maximum of the same filtered rows (the last bin holds the maximum).
+    Bin {
+        /// The raw number column.
+        column: &'a Ident,
+        /// The bin's lower edge.
+        lower: f64,
+        /// The bin's width.
+        width: f64,
+    },
 }
 
 /// SQL for the rows behind a clicked value, or behind a whole tile when
@@ -1126,9 +1602,28 @@ where
         skipped,
         ..
     } = filter_predicates(cols, &[], filters, time);
+    let from_sql = from.render();
     match value {
         Some(RecordsValue::Equals(column, value)) => {
             predicates.insert(0, format!("{column} = {}", SqlLiteral::from(value)));
+        }
+        Some(RecordsValue::Bin {
+            column,
+            lower,
+            width,
+        }) => {
+            // The maximum is read over the rows the other predicates leave, so
+            // the last bin is closed exactly as the tile's bins were cut.
+            let others = if predicates.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", predicates.join(" AND "))
+            };
+            let max = crate::bin::max_scalar_sql(column, &format!("{from_sql}{others}"));
+            predicates.insert(
+                0,
+                crate::bin::bin_records_predicate(column, lower, width, Some(&max)),
+            );
         }
         Some(RecordsValue::Bucket {
             column,
@@ -1152,7 +1647,6 @@ where
     } else {
         format!(" WHERE {}", predicates.join(" AND "))
     };
-    let from_sql = from.render();
     let settings = from.settings();
     RecordsSql {
         rows: format!(
@@ -1429,11 +1923,21 @@ fn rebuild<H: std::hash::BuildHasher>(
             }
             None => None,
         };
+        let bin = match &def.shape.bin {
+            Some(spec) => {
+                let (field, _) = tables::pivot_bin_field(&def.tables, ctx.cols)?;
+                Some((field, spec.mode().ok()?))
+            }
+            None => None,
+        };
         let sql = tables::pivot_sql(
             from,
             &plan,
             where_clauses,
-            grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+            (
+                grain.as_ref().map(|(g, f, k)| (*g, f, *k)),
+                bin.as_ref().map(|(f, m)| (f, *m)),
+            ),
             ctx.read.time,
         )?;
         let row_cap = tables::pivot_row_cap(from, plan.values.len());
@@ -1453,8 +1957,15 @@ fn rebuild<H: std::hash::BuildHasher>(
         });
     }
     if def.tables.compares_to_previous(kind) {
-        let plan = tables::plan_compare(&def.tables, &col_set(), ctx.cols).ok()??;
-        let tables::ComparePlan::Previous { period, .. } = &plan else {
+        let filled = crate::metrics::fill_compare(
+            &def.tables,
+            &def.measures,
+            ctx.read.fields.for_chart(def),
+        );
+        let plan = tables::plan_compare(&filled, &col_set(), ctx.cols).ok()??;
+        let (tables::ComparePlan::Previous { period, .. }
+        | tables::ComparePlan::LastYear { period, .. }) = &plan
+        else {
             return None;
         };
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
@@ -1470,55 +1981,144 @@ fn rebuild<H: std::hash::BuildHasher>(
         from,
         where_clauses,
         where_columns,
-        ctx.read,
+        (ctx.read, ctx.cols),
         ctx.grained,
     )
     .map(|sql| Rebuilt { sql, table: None })
 }
 
+/// The statement a chart that uses `BI-6`'s fields is saved with: the one the
+/// dashboard builds for it with no dashboard filter, its own filters applied,
+/// in the deployment's time settings. `from` is the relation after the
+/// chart's calculated fields, `cols` its columns. `None` when the definition
+/// cannot be built (the caller refuses the save).
+#[must_use]
+pub fn stored_sql<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    cols: &RelationColumns<H>,
+    time: &TimeContext,
+    fields: &FieldCatalog,
+) -> Option<String> {
+    // BI-2: the catalog is what expands a chart's segments; the saved
+    // statement must be buildable with them or the save is refused.
+    let read = ReadContext {
+        fields,
+        ..ReadContext::new(time)
+    };
+    let outcome = with_own_filters(&spec.def, cols, FilterOutcome::default(), &read)?;
+    let FilterOutcome {
+        predicates,
+        columns,
+        ..
+    } = outcome;
+    let (from, predicates) = from.clone().with_filters_inside(predicates);
+    let (g, _) = grained(spec, cols, &read);
+    rebuild(
+        spec,
+        &from,
+        predicates,
+        &columns,
+        &Rebuild {
+            read: &read,
+            grained: g.as_ref(),
+            cols,
+        },
+    )
+    .map(|r| r.sql)
+}
+
+/// The names a chart's statement gives its result columns, which a predicate on
+/// a column of the same name would otherwise resolve to (`BI-18·A` review
+/// BLOCKER 1).
+fn result_aliases(
+    kind: crate::specs::ChartKind,
+    def: &ChartInput,
+    measures: &[Measure],
+) -> Vec<String> {
+    match kind {
+        crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v".to_owned()],
+        crate::specs::ChartKind::Boxplot => def
+            .measures
+            .first()
+            .cloned()
+            .into_iter()
+            .chain(["__n".to_owned()])
+            .collect(),
+        crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat => {
+            def.measures.first().cloned().into_iter().collect()
+        }
+        _ => measures.iter().map(|m| m.alias.to_string()).collect(),
+    }
+}
+
 /// [`rebuild`] for the kinds that are a plain `GROUP BY` chart, a single
 /// number or a point map.
-fn rebuild_chart(
+fn rebuild_chart<H: std::hash::BuildHasher>(
     spec: &StoredChartSpec,
     from: &Relation,
     where_clauses: Vec<String>,
     where_columns: &[String],
-    read: &ReadContext<'_>,
+    (read, cols): (&ReadContext<'_>, &RelationColumns<H>),
+    grained: Option<&Grained>,
+) -> Option<String> {
+    let def: &ChartInput = &spec.def;
+    // BI-10: a chart whose dimension or breakdown is binned reads a relation
+    // in which that column already is its bin, with the predicates under it on
+    // the raw rows. Everything after this (sort, "Other", steps) is the
+    // statement the chart would have had on that column as it is.
+    let bins = binned::chart_layers(def)?;
+    if !bins.is_empty() && def.shape.groupings.is_none() {
+        let measures = shape::resolve_measures(&def.measures, from)?;
+        let groups: Vec<String> = [Some(def.dimension.as_str()), def.breakdown.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let needed = binned::needed_columns(from, &groups, &measures)?;
+        let relation = binned::binned(from, where_clauses, &bins, &needed);
+        return rebuild_chart_over(spec, &relation, Vec::new(), &[], (read, cols), None);
+    }
+    rebuild_chart_over(
+        spec,
+        from,
+        where_clauses,
+        where_columns,
+        (read, cols),
+        grained,
+    )
+}
+
+/// [`rebuild_chart`] once any bin is already in the relation.
+fn rebuild_chart_over<H: std::hash::BuildHasher>(
+    spec: &StoredChartSpec,
+    from: &Relation,
+    where_clauses: Vec<String>,
+    where_columns: &[String],
+    (read, cols): (&ReadContext<'_>, &RelationColumns<H>),
     grained: Option<&Grained>,
 ) -> Option<String> {
     let def: &ChartInput = &spec.def;
     if let Some(g) = grained {
-        let chart = GrainedChart::from_def(def, spec.spec.kind, g.grain)?;
+        let chart = GrainedChart::from_def(def, spec.spec.kind, g.grain, from)?;
         return grained_sql(from, where_clauses, &chart, g.column, read.time);
     }
+    // BI-6: the result names of the measures (a measure with its own
+    // aggregate is not named after its column).
+    let measures = shape::resolve_measures(&def.measures, from)?;
     // BI-18·A review BLOCKER 1: a predicate on a column that the SELECT also
     // names as an alias would resolve to the alias (an aggregate) in WHERE.
     // Only then are the predicates moved into an inner relation; otherwise
     // the SQL is exactly what it was before.
     if !where_clauses.is_empty() {
-        let aliases: Vec<&str> = match spec.spec.kind {
-            crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge => vec!["v"],
-            crate::specs::ChartKind::Boxplot => def
-                .measures
-                .first()
-                .map(String::as_str)
-                .into_iter()
-                .chain(["__n"])
-                .collect(),
-            crate::specs::ChartKind::Pointmap | crate::specs::ChartKind::Geoheat => def
-                .measures
-                .first()
-                .map(String::as_str)
-                .into_iter()
-                .collect(),
-            _ => def.measures.iter().map(String::as_str).collect(),
-        };
-        if where_columns.iter().any(|c| aliases.contains(&c.as_str())) {
+        let aliases = result_aliases(spec.spec.kind, def, &measures);
+        if where_columns.iter().any(|c| aliases.contains(c)) {
             let wrapped = Relation::Filtered {
                 base: Box::new(from.clone()),
                 predicates: where_clauses,
             };
-            return rebuild_chart(spec, &wrapped, Vec::new(), &[], read, None);
+            return rebuild_chart_over(spec, &wrapped, Vec::new(), &[], (read, cols), None);
         }
     }
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
@@ -1545,6 +2145,9 @@ fn rebuild_chart(
         let lat = Ident::new(def.lat.clone()?).ok()?;
         let lon = Ident::new(def.lon.clone()?).ok()?;
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        if let Some(grid) = &def.shape.grid {
+            return grid_sql(from, where_clauses, (&lat, &lon), &measure, (agg, grid));
+        }
         let label = if def.dimension.is_empty() {
             None
         } else {
@@ -1560,6 +2163,9 @@ fn rebuild_chart(
         ));
     }
 
+    if def.shape.groupings.is_some() {
+        return groupings_sql(def, from, where_clauses, (read, cols), (&measures, agg));
+    }
     let dimension = Ident::new(def.dimension.clone()).ok()?;
     if spec.spec.kind == crate::specs::ChartKind::Boxplot {
         let measure = Ident::new(def.measures.first()?.clone()).ok()?;
@@ -1568,29 +2174,227 @@ fn rebuild_chart(
             &dimension,
             &measure,
             &where_clauses,
-            def.limit.unwrap_or(20),
+            def.limit_value().unwrap_or(20),
         ));
-    }
-    let mut measures = Vec::with_capacity(def.measures.len());
-    for m in &def.measures {
-        measures.push(Ident::new(m.clone()).ok()?);
     }
     let breakdown = def
         .breakdown
         .as_ref()
         .and_then(|b| Ident::new(b.clone()).ok());
+    let steps = plan_steps_of(def, &measures, &[(dimension.to_string(), None)], cols).ok()?;
+    let sort = sort_of(
+        def,
+        &measures,
+        std::slice::from_ref(&dimension),
+        steps.as_ref(),
+    )
+    .ok()?;
+    // BI-6: a chart that names a table calculation keeps the order and the
+    // groups its calculation is defined over; a sort, "Other" or groupings
+    // saved beside one (the field changed level since) is not built.
+    let has_table_calc = measures
+        .iter()
+        .any(|m| from.table_calc(m.column.as_str()).is_some());
+    if has_table_calc && (sort.is_some() || def.shape.wants_other() || steps.is_some()) {
+        return None;
+    }
 
     let mut builder = QueryBuilder::over(from.clone())
         .dimension(dimension)
         .aggregate(agg)
         .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
-        .limit(def.limit.unwrap_or(20))
+        .limit(def.limit_value().unwrap_or(20))
         .breakdown(breakdown)
-        .measures(measures);
+        .sort(sort)
+        .steps(steps)
+        .other(def.shape.wants_other())
+        .measure_list(measures);
     for clause in where_clauses {
         // The predicates were already assembled as complete SQL fragments
         // (through `SqlLiteral`) by `filter_predicates`; pass them through
         // as-is rather than re-deriving column/values.
+        builder = builder.raw_where(clause);
+    }
+    Some(builder.build())
+}
+
+/// `BI-10`: a point map grouped by grid cell. The predicates and the
+/// coordinate null checks sit in an inner relation, so they read the raw
+/// coordinates and never the cell that is projected under their names.
+fn grid_sql(
+    from: &Relation,
+    mut predicates: Vec<String>,
+    (lat, lon): (&Ident, &Ident),
+    measure: &Ident,
+    (agg, grid): (Aggregate, &crate::bin::GridSpec),
+) -> Option<String> {
+    predicates.push(format!("{lat} IS NOT NULL"));
+    predicates.push(format!("{lon} IS NOT NULL"));
+    let src = Relation::Filtered {
+        base: Box::new(from.clone()),
+        predicates,
+    };
+    Some(crate::bin::grid_points_sql(
+        &src.render(),
+        (lat, lon),
+        measure,
+        agg,
+        grid.checked().ok()?,
+        (point_limit(from), &from.settings()),
+    ))
+}
+
+/// The sort of a stored definition as validated identifiers: `by` must be one
+/// of `groups` or a measure's result name, else `Err` (a definition that no
+/// longer checks out is not built). `Ok(None)` is no sort at all.
+fn sort_of(
+    def: &ChartInput,
+    measures: &[Measure],
+    groups: &[Ident],
+    steps: Option<&steps::StepsSql>,
+) -> Result<Option<Sort>, ()> {
+    let Some(sort) = &def.shape.sort else {
+        return Ok(None);
+    };
+    let by = Ident::new(sort.by.clone()).map_err(|_| ())?;
+    // With steps the sort names a column of the last step's result.
+    let known = match steps {
+        Some(plan) => plan.groups.contains(&by) || plan.measures.contains(&by),
+        None => groups.contains(&by) || measures.iter().any(|m| m.alias == by),
+    };
+    if known {
+        Ok(Some(Sort {
+            by,
+            desc: sort.descending(),
+        }))
+    } else {
+        Err(())
+    }
+}
+
+/// The steps of `def` planned over the groupings `groups` (each with the grain
+/// it is cut by) and `measures` of its grouped result (`BI-6` part 2); `Ok(None)`
+/// for a chart without steps, `Err` when they no longer check out.
+fn plan_steps_of<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    measures: &[Measure],
+    groups: &[(String, Option<Grain>)],
+    cols: &RelationColumns<H>,
+) -> Result<Option<steps::StepsSql>, ()> {
+    let Some(list) = &def.shape.steps else {
+        return Ok(None);
+    };
+    if def.grain.is_some() || def.breakdown.is_some() {
+        return Err(());
+    }
+    let kinds = groups
+        .iter()
+        .map(|(name, grain)| {
+            let kind = cols.get(name).copied().ok_or(())?;
+            Ok((name.clone(), steps::group_kind(kind, *grain)))
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    let names: Vec<String> = measures.iter().map(|m| m.alias.to_string()).collect();
+    steps::plan(list, &kinds, &names).map(Some).map_err(|_| ())
+}
+
+/// The statement of a table grouped by several columns (`BI-6`). A grouping
+/// with a grain is replaced by its bucket in a nested [`Relation::Bucketed`]
+/// (one per grouped column), the predicates sitting under all of them on the
+/// raw rows, as for a grained chart.
+fn groupings_sql<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    from: &Relation,
+    where_clauses: Vec<String>,
+    (read, cols): (&ReadContext<'_>, &RelationColumns<H>),
+    (measures, agg): (&[Measure], Aggregate),
+) -> Option<String> {
+    let groupings = def.shape.groupings.as_ref()?;
+    let idents: Vec<Ident> = groupings
+        .iter()
+        .map(|g| Ident::new(g.column.clone()).ok())
+        .collect::<Option<_>>()?;
+    let grains: Vec<Option<Grain>> = groupings
+        .iter()
+        .map(|g| g.grain.as_deref().map(Grain::parse))
+        .map(|g| match g {
+            None => Some(None),
+            Some(parsed) => parsed.map(Some),
+        })
+        .collect::<Option<_>>()?;
+    let steps = plan_steps_of(
+        def,
+        measures,
+        &groupings
+            .iter()
+            .zip(&grains)
+            .map(|(g, grain)| (g.column.clone(), *grain))
+            .collect::<Vec<_>>(),
+        cols,
+    )
+    .ok()?;
+    let sort = sort_of(def, measures, &idents, steps.as_ref()).ok()?;
+    let mut needed: Vec<String> = idents.iter().map(ToString::to_string).collect();
+    for m in measures {
+        match from.aggregate_field(m.column.as_str()) {
+            // As in `grained_sql`: an aggregate that reads a grouped column
+            // would read the bucket carrying that name.
+            Some(field)
+                if field
+                    .reads
+                    .iter()
+                    .any(|r| idents.iter().any(|i| i.as_str() == r)) =>
+            {
+                return None;
+            }
+            Some(field) => needed.extend(field.reads.iter().cloned()),
+            None if from.table_calc(m.column.as_str()).is_some() => return None,
+            None => needed.push(m.column.to_string()),
+        }
+    }
+    needed.dedup();
+    let mut relation = from.clone();
+    let mut predicates = where_clauses;
+    // BI-10: a grouping with a bin is replaced by its bin after the grains,
+    // over the same filtered rows.
+    let bins = binned::grouping_layers(def)?;
+    if grains.iter().any(Option::is_some) || !bins.is_empty() {
+        if !predicates.is_empty() {
+            relation = Relation::Filtered {
+                base: Box::new(relation),
+                predicates: std::mem::take(&mut predicates),
+            };
+        }
+        for ((ident, grain), group) in idents.iter().zip(&grains).zip(groupings) {
+            let Some(grain) = grain else {
+                continue;
+            };
+            // The column's kind decides whether the grain fits it.
+            let expr = grain.bucket_expr(ident, *cols.get(&group.column)?, read.time)?;
+            relation = Relation::Bucketed {
+                base: Box::new(relation),
+                dimension: ident.to_string(),
+                expr,
+                carried: needed
+                    .iter()
+                    .filter(|n| n.as_str() != ident.as_str())
+                    .cloned()
+                    .collect(),
+            };
+        }
+    }
+    for layer in &bins {
+        relation = binned::add_layer(relation, layer, &needed);
+    }
+    let mut builder = QueryBuilder::over(relation)
+        .groupings(idents)
+        .aggregate(agg)
+        .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
+        .limit(def.limit_value().unwrap_or(20))
+        .sort(sort)
+        .steps(steps)
+        .measure_list(measures.to_vec());
+    for clause in predicates {
         builder = builder.raw_where(clause);
     }
     Some(builder.build())
@@ -1606,30 +2410,38 @@ pub struct GrainedChart {
     pub dimension: Ident,
     /// The optional second dimension.
     pub breakdown: Option<Ident>,
-    /// The measure columns.
-    pub measures: Vec<Ident>,
+    /// The measures.
+    pub measures: Vec<Measure>,
     /// The aggregate.
     pub agg: Aggregate,
     /// `"none"` (by bucket), `"asc"` or `"desc"` (by value).
     pub order: String,
     /// The bucket limit.
     pub limit: u32,
+    /// `BI-6`: a sort that replaces `order`.
+    pub sort: Option<Sort>,
 }
 
 impl GrainedChart {
-    /// Read the identifiers out of a stored definition. `None` when one no
-    /// longer validates (data corruption).
+    /// Read the identifiers out of a stored definition over `from` (whose
+    /// calculated fields decide the measures' result names). `None` when one
+    /// no longer validates (data corruption).
     #[must_use]
-    pub fn from_def(def: &ChartInput, kind: crate::specs::ChartKind, grain: Grain) -> Option<Self> {
-        let mut measures = Vec::with_capacity(def.measures.len());
-        for m in &def.measures {
-            measures.push(Ident::new(m.clone()).ok()?);
-        }
-        let order = def.order.clone().unwrap_or_else(|| "none".to_owned());
-        let limit = grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit));
+    pub fn from_def(
+        def: &ChartInput,
+        kind: crate::specs::ChartKind,
+        grain: Grain,
+        from: &Relation,
+    ) -> Option<Self> {
+        let measures = shape::resolve_measures(&def.measures, from)?;
+        let dimension = Ident::new(def.dimension.clone()).ok()?;
+        let sort = sort_of(def, &measures, std::slice::from_ref(&dimension), None).ok()?;
+        let order = def.effective_order();
+        let limit =
+            grain::effective_limit(grain, &order, grain::clamp_limit(kind, def.limit_value()));
         Some(Self {
             grain,
-            dimension: Ident::new(def.dimension.clone()).ok()?,
+            dimension,
             breakdown: def
                 .breakdown
                 .as_ref()
@@ -1638,6 +2450,7 @@ impl GrainedChart {
             agg: Aggregate::from_str_lossy(def.aggregate.as_deref().unwrap_or("sum")),
             order,
             limit,
+            sort,
         })
     }
 }
@@ -1675,7 +2488,8 @@ pub fn grained_sql(
         carry(b.to_string());
     }
     for m in &chart.measures {
-        match from.aggregate_field(m.as_str()) {
+        let column = m.column.as_str();
+        match from.aggregate_field(column) {
             // BI-8: an aggregate field is computed from the columns it reads,
             // not carried by name. If it reads the grouped column itself it
             // would read the bucket that now carries that name, so no
@@ -1687,8 +2501,8 @@ pub fn grained_sql(
             Some(field) => field.reads.iter().cloned().for_each(&mut carry),
             // BI-8 part 2: a table calculation is computed from the columns its
             // hidden aggregates read, as an aggregate field is.
-            None if from.table_calc(m.as_str()).is_some() => {
-                let calc = from.table_calc(m.as_str());
+            None if from.table_calc(column).is_some() => {
+                let calc = from.table_calc(column);
                 if calc.is_some_and(|c| c.reads.iter().any(|r| r == chart.dimension.as_str())) {
                     return None;
                 }
@@ -1696,7 +2510,7 @@ pub fn grained_sql(
                     .flat_map(|c| c.reads.iter().cloned())
                     .for_each(&mut carry);
             }
-            None => carry(m.to_string()),
+            None => carry(m.column.to_string()),
         }
     }
     let bucketed = Relation::Bucketed {
@@ -1713,7 +2527,8 @@ pub fn grained_sql(
             .limit(chart.limit)
             .breakdown(chart.breakdown.clone())
             .grain(chart.grain, time.week_start())
-            .measures(chart.measures.clone())
+            .sort(chart.sort.clone())
+            .measure_list(chart.measures.clone())
             .build(),
     )
 }
@@ -3088,7 +3903,7 @@ mod tests {
     fn a_breakdown_keeps_the_latest_buckets_and_orders_by_bucket_then_series() {
         let mut spec = grained_spec(ChartKind::Line, "quarter", "none");
         spec.def.breakdown = Some("g".to_owned());
-        spec.def.limit = Some(8);
+        spec.def.limit = Some(8.into());
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert_eq!(
             got.sql,
@@ -3185,7 +4000,7 @@ mod tests {
     #[test]
     fn a_calendar_takes_day_only_and_up_to_a_thousand_buckets() {
         let mut spec = grained_spec(ChartKind::Calendar, "day", "none");
-        spec.def.limit = Some(900);
+        spec.def.limit = Some(900.into());
         let sql = sql_with_filters(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert!(
             sql.contains("toDate32(toTimeZone(d, 'Asia/Jakarta')) AS d"),
@@ -3281,7 +4096,7 @@ mod tests {
         for limit in [1, 5, 20, 1000] {
             for grain in ["hour_of_day", "day_of_month", "week_of_year", "day_of_week"] {
                 let mut spec = grained_spec(ChartKind::Bar, grain, "none");
-                spec.def.limit = Some(limit);
+                spec.def.limit = Some(limit.into());
                 let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
                 assert_eq!(got.latest_limit, None, "{grain} {limit}");
                 assert!(got.sql.contains("LIMIT 64"), "{grain} {limit}: {}", got.sql);
@@ -3298,11 +4113,11 @@ mod tests {
     #[test]
     fn a_part_with_a_value_order_keeps_the_editors_top_n_and_a_truncation_keeps_latest_n() {
         let mut spec = grained_spec(ChartKind::Bar, "hour_of_day", "desc");
-        spec.def.limit = Some(5);
+        spec.def.limit = Some(5.into());
         let got = sql_with_filters_report(&spec, &[], &[], &dated(ColumnKind::DateTime));
         assert!(got.sql.contains("ORDER BY v DESC LIMIT 5"), "{}", got.sql);
         let mut month = grained_spec(ChartKind::Bar, "month", "none");
-        month.def.limit = Some(5);
+        month.def.limit = Some(5.into());
         let got = sql_with_filters_report(&month, &[], &[], &dated(ColumnKind::Date));
         assert_eq!(got.latest_limit, Some(5));
         assert!(got.sql.contains("LIMIT 6"), "{}", got.sql);
@@ -3454,7 +4269,7 @@ mod tests {
             ChartKind::Kpi,
             r#"{"compare":{"kind":"previous","dateColumn":"d","period":"month"}}"#,
         );
-        spec.def.measures = vec!["v".to_owned()];
+        spec.def.measures = vec!["v".to_owned()].into();
         let f = filter(r#"{"column":"d","op":"between","min":"2026-01-01"}"#);
         let got = sql_with_filters_report(&spec, &[], &[f], &table_cols());
         assert!(
@@ -3473,9 +4288,528 @@ mod tests {
         );
         // A goal is the ordinary KPI statement.
         let mut goal = with_tables(ChartKind::Kpi, r#"{"compare":{"kind":"goal","value":5}}"#);
-        goal.def.measures = vec!["v".to_owned()];
+        goal.def.measures = vec!["v".to_owned()].into();
         let got = sql_with_filters_report(&goal, &[], &[], &table_cols());
         assert_eq!(got.sql, "SELECT 1");
         assert_eq!(got.table, None);
+    }
+
+    // ── BI-6: the chart builder's fields ────────────────────────────────
+
+    fn bi6_cols() -> HashMap<String, RelationColumns> {
+        HashMap::from([(
+            "mart_x".to_owned(),
+            typed(&[
+                ("kab", ColumnKind::Text),
+                ("cat", ColumnKind::Text),
+                ("d", ColumnKind::Date),
+                ("visitors", ColumnKind::Number),
+                ("stay", ColumnKind::Number),
+            ]),
+        )])
+    }
+
+    /// A stored bar chart over `mart_x` by `kab`, with `extra` (a JSON object
+    /// of `ChartInput` fields) laid over it.
+    fn bi6_spec(extra: &str) -> StoredChartSpec {
+        let mut spec = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        let mut def = serde_json::to_value(&spec.def).unwrap();
+        let extra: serde_json::Value = serde_json::from_str(extra).unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            def[k] = v.clone();
+        }
+        spec.def = serde_json::from_value(def).unwrap();
+        spec.spec.sql = "SELECT stored".to_owned();
+        spec
+    }
+
+    fn bi6_sql(extra: &str, filters: &[FilterDef]) -> String {
+        sql_with_filters_report(&bi6_spec(extra), &[], filters, &bi6_cols()).sql
+    }
+
+    #[test]
+    fn charts_saved_before_bi_6_build_the_statement_they_always_did() {
+        // Three definitions as they were stored before `BI-6` (no new field):
+        // plain, with a breakdown, and with a dashboard filter. The statements
+        // are the ones the existing tests pinned; `BI-6` changes none of them.
+        let plain = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        let filtered = sql_with_filters_report(
+            &plain,
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &HashMap::from([(
+                "mart_x".to_owned(),
+                typed(&[
+                    ("kab", ColumnKind::Text),
+                    ("cat", ColumnKind::Text),
+                    ("visitors", ColumnKind::Number),
+                ]),
+            )]),
+        );
+        assert_eq!(
+            filtered.sql,
+            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE cat IN ('a') GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+        let mut by_cat = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        by_cat.def.breakdown = Some("cat".to_owned());
+        by_cat.def.order = Some("desc".to_owned());
+        let got = sql_with_filters_report(
+            &by_cat,
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert_eq!(
+            got.sql,
+            "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE cat IN ('a') AND kab IN (SELECT kab FROM serving.mart_x WHERE cat IN ('a') \
+             GROUP BY kab ORDER BY sum(visitors) DESC LIMIT 20) GROUP BY kab, cat ORDER BY kab, cat"
+        );
+        let mut counted = stored_spec(ChartKind::Bar, "mart_x", "kab", &["visitors"]);
+        counted.def.aggregate = Some("count".to_owned());
+        counted.def.order = Some("asc".to_owned());
+        let got = sql_with_filters_report(
+            &counted,
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert_eq!(
+            got.sql,
+            "SELECT kab, count() AS visitors FROM serving.mart_x WHERE cat IN ('a') \
+             GROUP BY kab ORDER BY visitors ASC LIMIT 20"
+        );
+        // And with no filter the stored statement is returned as it was.
+        assert_eq!(
+            sql_with_filters_report(&plain, &[], &[], &bi6_cols()).sql,
+            plain.spec.sql
+        );
+    }
+
+    #[test]
+    fn two_aggregations_of_one_column_are_two_result_columns() {
+        let sql = bi6_sql(
+            r#"{"measures":["visitors",{"column":"stay","aggregate":"avg"},{"column":"stay","aggregate":"max"}]}"#,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            "SELECT kab, round(sum(visitors)) AS visitors, round(avg(stay)) AS avg_stay, \
+             round(max(stay)) AS max_stay FROM serving.mart_x GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn a_measure_beside_another_aggregation_of_its_column_is_renamed_outside_the_aggregate() {
+        // `round(sum(visitors)) AS visitors` next to `avg(visitors)` makes the
+        // engine read the second `visitors` as the first alias (error 184,
+        // measured on ClickHouse 26.8), so the aggregates carry inner names.
+        let sql = bi6_sql(
+            r#"{"measures":["visitors",{"column":"visitors","aggregate":"avg"}],"sort":{"by":"avg_visitors","dir":"desc"},"limit":5}"#,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            "SELECT kab, __m0 AS visitors, __m1 AS avg_visitors FROM \
+             (SELECT kab, round(sum(visitors)) AS __m0, round(avg(visitors)) AS __m1 \
+             FROM serving.mart_x GROUP BY kab) ORDER BY avg_visitors DESC LIMIT 5"
+        );
+    }
+
+    #[test]
+    fn an_own_count_is_a_row_count_named_after_the_column() {
+        let sql = bi6_sql(
+            r#"{"measures":[{"column":"stay","aggregate":"count"}]}"#,
+            &[],
+        );
+        assert!(sql.contains("count() AS count_stay"), "{sql}");
+    }
+
+    #[test]
+    fn a_chart_filter_and_a_dashboard_filter_on_one_column_both_apply() {
+        let own = r#"{"filters":[{"column":"kab","op":"not_in","values":["x"]}]}"#;
+        let dash = [filter(r#"{"column":"kab","values":["a","b"]}"#)];
+        // plain
+        assert_eq!(
+            bi6_sql(own, &dash),
+            "SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             WHERE kab NOT IN ('x') AND kab IN ('a','b') GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+        // with a breakdown: the same predicates in the kept-groups subquery and outside it
+        let with_breakdown = bi6_sql(
+            r#"{"breakdown":"cat","filters":[{"column":"kab","op":"not_in","values":["x"]}]}"#,
+            &dash,
+        );
+        assert_eq!(
+            with_breakdown
+                .matches("kab NOT IN ('x') AND kab IN ('a','b')")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_chart_filter_and_a_dashboard_filter_both_read_the_raw_column_under_a_grain() {
+        let sql = bi6_sql(
+            r#"{"dimension":"d","grain":"month","order":"none","filters":[{"column":"d","op":"between","min":"2026-01-01"}]}"#,
+            &[filter(
+                r#"{"column":"d","op":"between","max":"2026-06-30"}"#,
+            )],
+        );
+        assert!(
+            sql.contains(
+                "FROM (SELECT * FROM serving.mart_x WHERE d >= toDate32('2026-01-01') AND d <= toDate32('2026-06-30')) AS flt"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("date_trunc('month', d) AS d"), "{sql}");
+    }
+
+    #[test]
+    fn a_chart_filter_that_can_no_longer_apply_keeps_the_stored_statement() {
+        let mut spec = bi6_spec(r#"{"filters":[{"column":"gone","values":["a"]}]}"#);
+        spec.spec.sql = "SELECT stored".to_owned();
+        let got = sql_with_filters_report(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"kab","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        // Never the statement without the chart's own filter.
+        assert_eq!(got.sql, "SELECT stored");
+        // Over a SQL source it is the tile's error.
+        let source = sql_for_sql_source_report(
+            &spec,
+            "SELECT kab, visitors FROM serving.mart_x",
+            &typed(&[("kab", ColumnKind::Text), ("visitors", ColumnKind::Number)]),
+            &[],
+            &[],
+        );
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn a_filter_on_an_own_aggregate_name_is_applied_to_the_rows_not_the_aggregate() {
+        let mut cols = bi6_cols();
+        cols.get_mut("mart_x")
+            .unwrap()
+            .insert("avg_stay".to_owned(), ColumnKind::Number);
+        let sql = sql_with_filters_report(
+            &bi6_spec(r#"{"measures":[{"column":"stay","aggregate":"avg"}]}"#),
+            &[],
+            &[filter(r#"{"column":"avg_stay","op":"between","min":"3"}"#)],
+            &cols,
+        )
+        .sql;
+        assert_eq!(
+            sql,
+            "SELECT kab, round(avg(stay)) AS avg_stay FROM \
+             (SELECT * FROM serving.mart_x WHERE avg_stay >= 3) AS flt \
+             GROUP BY kab ORDER BY kab LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn a_sort_orders_by_any_measure_or_the_dimension_and_limit_keeps_the_first_n() {
+        let by_second = bi6_sql(
+            r#"{"measures":["visitors",{"column":"stay","aggregate":"avg"}],"sort":{"by":"avg_stay","dir":"asc"},"limit":5}"#,
+            &[],
+        );
+        assert!(
+            by_second.ends_with("GROUP BY kab ORDER BY avg_stay ASC LIMIT 5"),
+            "{by_second}"
+        );
+        let by_dimension = bi6_sql(r#"{"sort":{"by":"kab","dir":"desc"},"limit":5}"#, &[]);
+        assert!(
+            by_dimension.ends_with("GROUP BY kab ORDER BY kab DESC LIMIT 5"),
+            "{by_dimension}"
+        );
+        // A sort that names nothing the chart returns builds nothing.
+        let mut spec = bi6_spec(r#"{"sort":{"by":"nope","dir":"asc"}}"#);
+        spec.spec.sql = "SELECT stored".to_owned();
+        assert_eq!(
+            sql_with_filters_report(&spec, &[], &[], &bi6_cols()).sql,
+            "SELECT stored"
+        );
+    }
+
+    #[test]
+    fn a_grained_chart_sorted_by_its_dimension_descending_keeps_the_latest_buckets_newest_first() {
+        let sql = bi6_sql(
+            r#"{"dimension":"d","grain":"month","sort":{"by":"d","dir":"desc"},"limit":6}"#,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT d, round(sum(visitors)) AS visitors FROM \
+             (SELECT date_trunc('month', d) AS d, visitors FROM serving.mart_x) AS bkt \
+             GROUP BY d ORDER BY d DESC LIMIT 7) ORDER BY d DESC"
+        );
+    }
+
+    #[test]
+    fn a_breakdown_sorted_by_a_measure_keeps_and_shows_the_dimensions_in_that_order() {
+        let sql = bi6_sql(
+            r#"{"breakdown":"cat","sort":{"by":"visitors","dir":"desc"},"limit":5}"#,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            "SELECT kab, cat, __m0 AS visitors FROM (SELECT kab, cat, round(sum(visitors)) AS __m0, \
+             sum(sum(visitors)) OVER (PARTITION BY kab) AS __t FROM serving.mart_x \
+             WHERE kab IN (SELECT kab FROM serving.mart_x GROUP BY kab \
+             ORDER BY sum(visitors) DESC, kab LIMIT 5) GROUP BY kab, cat) \
+             ORDER BY __t DESC, kab, cat"
+        );
+    }
+
+    #[test]
+    fn other_is_aggregated_over_the_rows_outside_the_kept_groups_and_flagged() {
+        let sql = bi6_sql(
+            r#"{"sort":{"by":"visitors","dir":"desc"},"limit":5,"other":true}"#,
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+        );
+        let base = "(SELECT *, ifNull(toString(kab), '') AS __k FROM serving.mart_x WHERE cat IN ('a')) AS ob";
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT __d AS kab, __m0 AS visitors, __o AS __other FROM \
+                 (SELECT __d, __o, round(sum(visitors)) AS __m0, __m0 AS __t FROM \
+                 (SELECT *, toUInt8(NOT (__k IN (SELECT __k FROM {base} GROUP BY __k \
+                 ORDER BY sum(visitors) DESC, __k LIMIT 5))) AS __o, \
+                 if(__o = 1, 'Other', __k) AS __d FROM {base}) GROUP BY __o, __d) \
+                 ORDER BY __o, __t DESC, __d"
+            )
+        );
+    }
+
+    #[test]
+    fn other_with_a_breakdown_is_computed_per_series_and_ranks_by_the_dimension_total() {
+        let sql = bi6_sql(
+            r#"{"breakdown":"cat","sort":{"by":"visitors","dir":"desc"},"limit":5,"other":true}"#,
+            &[],
+        );
+        assert!(
+            sql.contains("sum(sum(visitors)) OVER (PARTITION BY __d) AS __t"),
+            "{sql}"
+        );
+        assert!(sql.contains("GROUP BY __o, __d, cat"), "{sql}");
+        assert!(sql.ends_with("ORDER BY __o, __t DESC, __d, cat"), "{sql}");
+    }
+
+    #[test]
+    fn other_over_an_average_averages_the_remaining_rows_not_the_hidden_averages() {
+        let sql = bi6_sql(
+            r#"{"measures":[{"column":"stay","aggregate":"avg"}],"sort":{"by":"avg_stay","dir":"desc"},"limit":3,"other":true}"#,
+            &[],
+        );
+        // The group is chosen by the average and the Other group is one
+        // `avg` over its rows, in the same `GROUP BY` as the kept groups.
+        assert!(
+            sql.contains("ORDER BY avg(stay) DESC, __k LIMIT 3"),
+            "{sql}"
+        );
+        assert!(sql.contains("round(avg(stay)) AS __m0"), "{sql}");
+        assert!(sql.contains("__m0 AS avg_stay"), "{sql}");
+    }
+
+    #[test]
+    fn a_table_grouped_by_several_columns_lists_them_in_order_with_a_grain_on_a_date() {
+        let table = |extra: &str| {
+            let mut spec = stored_spec(ChartKind::Table, "mart_x", "", &["visitors"]);
+            let mut def = serde_json::to_value(&spec.def).unwrap();
+            let extra: serde_json::Value = serde_json::from_str(extra).unwrap();
+            for (k, v) in extra.as_object().unwrap() {
+                def[k] = v.clone();
+            }
+            spec.def = serde_json::from_value(def).unwrap();
+            spec
+        };
+        let plain = table(r#"{"groupings":[{"column":"kab"},{"column":"cat"}]}"#);
+        assert_eq!(
+            sql_with_filters_report(&plain, &[], &[], &bi6_cols()).sql,
+            "SELECT kab, cat, round(sum(visitors)) AS visitors FROM serving.mart_x \
+             GROUP BY kab, cat ORDER BY kab, cat LIMIT 20"
+        );
+        let grained = table(
+            r#"{"groupings":[{"column":"d","grain":"month"},{"column":"cat"}],"sort":{"by":"visitors","dir":"desc"}}"#,
+        );
+        assert_eq!(
+            sql_with_filters_report(
+                &grained,
+                &[],
+                &[filter(r#"{"column":"cat","values":["a"]}"#)],
+                &bi6_cols()
+            )
+            .sql,
+            "SELECT d, cat, round(sum(visitors)) AS visitors FROM \
+             (SELECT date_trunc('month', d) AS d, cat, visitors FROM \
+             (SELECT * FROM serving.mart_x WHERE cat IN ('a')) AS flt) AS bkt \
+             GROUP BY d, cat ORDER BY visitors DESC, d, cat LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn steps_are_nested_statements_and_the_sort_and_limit_belong_to_the_last_one() {
+        let sql = bi6_sql(
+            r#"{"measures":["visitors"],"limit":7,"sort":{"by":"visitors","dir":"desc"},
+                "steps":[{"filter":[{"column":"visitors","op":"gt","value":"1000"}]}]}"#,
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM (SELECT kab, round(sum(visitors)) AS visitors FROM \
+             serving.mart_x WHERE cat IN ('a') GROUP BY kab) WHERE visitors > 1000) \
+             ORDER BY visitors DESC, kab LIMIT 7 \
+             SETTINGS max_rows_to_group_by = 10000, group_by_overflow_mode = 'throw'"
+        );
+        let summed = bi6_sql(
+            r#"{"measures":["visitors"],"order":"none","limit":7,
+                "steps":[{"summarise":{"by":["kab"],"measures":[{"column":"visitors","aggregate":"max"}]}}]}"#,
+            &[],
+        );
+        assert!(
+            summed.contains("SELECT kab, __s0 AS max_visitors FROM (SELECT kab, round(max(visitors)) AS __s0 FROM (SELECT kab, round(sum(visitors)) AS visitors FROM serving.mart_x GROUP BY kab) GROUP BY kab)"),
+            "{summed}"
+        );
+        assert!(summed.contains("ORDER BY kab LIMIT 7"), "{summed}");
+    }
+
+    // ── BI-10: bins and grids ───────────────────────────────────────────
+
+    #[test]
+    fn a_binned_dimension_reads_the_range_and_the_filters_under_the_bin() {
+        let got = sql_with_filters_report(
+            &bi6_spec(r#"{"dimension":"stay","bin":{"mode":"width","width":500}}"#),
+            &[],
+            &[filter(r#"{"column":"stay","op":"between","min":"10"}"#)],
+            &bi6_cols(),
+        );
+        // The bin carries the dimension's name; the filter on the same column
+        // is applied on the raw rows beneath it, and the range is read over
+        // those same rows.
+        assert!(
+            got.sql.starts_with(
+                "SELECT stay, round(sum(visitors)) AS visitors FROM (SELECT round(least(floor(toFloat64(stay) / __bw_stay)"
+            ),
+            "{}",
+            got.sql
+        );
+        assert!(
+            got.sql.contains("FROM (SELECT * FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt CROSS JOIN (SELECT w AS __bw_stay, mn AS __bmn_stay, mx AS __bmx_stay FROM (SELECT mn, mx, 500 AS w FROM (SELECT min(toFloat64(stay)) AS mn, max(toFloat64(stay)) AS mx FROM (SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt))) AS rng) AS ranged) AS bkt GROUP BY stay ORDER BY stay"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.bins.len(), 1);
+        assert_eq!(got.bins[0].column, "stay");
+        assert_eq!(got.bins[0].mode, "width");
+        assert!(
+            got.bins[0]
+                .sql
+                .starts_with("SELECT w AS width, mn AS min, mx AS max FROM")
+        );
+        // The width statement reads the same filtered rows as the bins.
+        assert!(
+            got.bins[0]
+                .sql
+                .contains("(SELECT * FROM serving.mart_x WHERE stay >= 10) AS flt")
+        );
+    }
+
+    #[test]
+    fn a_chart_without_a_bin_carries_none_and_builds_what_it_always_did() {
+        let got = sql_with_filters_report(&bi6_spec("{}"), &[], &[], &bi6_cols());
+        assert_eq!(got.sql, "SELECT stored");
+        assert!(got.bins.is_empty());
+        let filtered = sql_with_filters_report(
+            &bi6_spec("{}"),
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert!(!filtered.sql.contains("rng"), "{}", filtered.sql);
+        assert!(filtered.bins.is_empty());
+    }
+
+    #[test]
+    fn a_binned_breakdown_and_a_binned_dimension_nest_one_bin_each() {
+        let got = sql_with_filters_report(
+            &bi6_spec(
+                r#"{"dimension":"stay","bin":{"mode":"auto"},"breakdown":"visitors","breakdownBin":{"mode":"count","count":10}}"#,
+            ),
+            &[],
+            &[],
+            &bi6_cols(),
+        );
+        assert!(
+            got.sql.contains("__bw_stay") && got.sql.contains("__bw_visitors"),
+            "{}",
+            got.sql
+        );
+        assert_eq!(got.bins.len(), 2);
+        // Both groupings are read by name from the nested bins.
+        assert!(
+            got.sql.contains("GROUP BY stay, visitors") || got.sql.contains("GROUP BY stay"),
+            "{}",
+            got.sql
+        );
+    }
+
+    #[test]
+    fn a_grouped_table_bins_one_of_its_groupings() {
+        let mut spec = bi6_spec(
+            r#"{"kind":"table","dimension":"","groupings":[{"column":"stay","bin":{"mode":"width","width":5}},{"column":"cat"}]}"#,
+        );
+        spec.spec.kind = ChartKind::Table;
+        let got = sql_with_filters_report(&spec, &[], &[], &bi6_cols());
+        assert!(got.sql.contains("__bw_stay"), "{}", got.sql);
+        assert!(got.sql.contains("GROUP BY stay, cat"), "{}", got.sql);
+        assert_eq!(got.bins.len(), 1);
+    }
+
+    #[test]
+    fn a_grid_map_groups_the_points_by_cell_under_the_filters() {
+        let mut spec = stored_spec(ChartKind::Pointmap, "mart_x", "", &["visitors"]);
+        spec.def.lat = Some("stay".to_owned());
+        spec.def.lon = Some("visitors".to_owned());
+        spec.def.shape.grid = Some(serde_json::from_str(r#"{"size":1}"#).unwrap());
+        let got = sql_with_filters_report(
+            &spec,
+            &[],
+            &[filter(r#"{"column":"cat","values":["a"]}"#)],
+            &bi6_cols(),
+        );
+        assert!(
+            got.sql.contains("FROM (SELECT * FROM serving.mart_x WHERE cat IN ('a') AND stay IS NOT NULL AND visitors IS NOT NULL) AS flt) GROUP BY __cy, __cx ORDER BY visitors DESC, __cy, __cx LIMIT 5000"),
+            "{}",
+            got.sql
+        );
+        assert!(got.sql.contains("count() AS cell_points"));
+    }
+
+    #[test]
+    fn a_clicked_bin_lists_the_rows_in_its_range_and_closes_the_last_bin_at_the_maximum() {
+        let time = TimeContext::default();
+        let cols = typed(&[("v", ColumnKind::Number), ("g", ColumnKind::Text)]);
+        let v = Ident::new("v").unwrap();
+        let got = super::records_sql(
+            &Relation::Mart(Ident::new("t").unwrap()),
+            &cols,
+            &[filter(r#"{"column":"g","values":["a"]}"#)],
+            Some(RecordsValue::Bin {
+                column: &v,
+                lower: 500.0,
+                width: 500.0,
+            }),
+            50,
+            0,
+            &time,
+        );
+        assert_eq!(
+            got.rows,
+            "SELECT * FROM serving.t WHERE ((toFloat64(v) >= 500 AND toFloat64(v) < 1000) OR (toFloat64(v) = 1000 AND toFloat64(v) = (SELECT max(toFloat64(v)) FROM serving.t WHERE g IN ('a')))) AND g IN ('a') ORDER BY ALL LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(got.count.matches("SELECT max").count(), 1);
     }
 }

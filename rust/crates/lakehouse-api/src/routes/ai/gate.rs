@@ -136,6 +136,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             "Menghapus board {} berikut seluruh chart di dalamnya secara permanen.",
             s("id")
         ),
+        "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -219,6 +220,56 @@ pub async fn create_write_high_approval(
     }
 }
 
+/// The `trigger_pipeline` arm of [`summary_for`], split out because it is
+/// the only arm that inspects a nested argument rather than reading a flat
+/// key. F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+/// f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9 gate had no
+/// `trigger_pipeline` arm, so the user confirmed a call without seeing WHICH
+/// pipeline the copilot was about to run, or whether it carried a `runConfig`
+/// override (the latter being the operationally interesting half, because a
+/// non-default config is what elevates the tool's risk to `WriteHigh` — see
+/// [`effective_risk`]).
+///
+/// The format follows the same Indonesian one-liner shape every other
+/// `WriteLow` arm produces, with the pipeline id and the top-level keys of
+/// `runConfig` when one was supplied. Listing the KEYS (not the values)
+/// matches [`crate::routes::pipelines::record_pipeline_audit`]'s own
+/// `configKeys` audit shape, so the chat confirmation and the audit row agree
+/// on what the run actually carried.
+fn pipeline_summary(args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
+    // gate had no `trigger_pipeline` arm, so the user confirmed
+    // a call without seeing WHICH pipeline the copilot was
+    // about to run, or whether it carried a `runConfig`
+    // override (the latter being the operationally interesting
+    // half, because a non-default config is what elevates the
+    // tool's risk to `WriteHigh` — see [`effective_risk`]).
+    //
+    // The summary's format follows the same Indonesian one-liner
+    // shape every other `WriteLow` arm produces, with the
+    // pipeline id and the top-level keys of `runConfig` when
+    // one was supplied. Listing the KEYS (not the values)
+    // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
+    // own `configKeys` audit shape, so the chat confirmation and
+    // the audit row agree on what the run actually carried.
+    let pipeline_id = s("id");
+    match args.get("runConfig") {
+        Some(Value::Object(map)) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let keys_part = if keys.is_empty() {
+                "tanpa kunci konfigurasi".to_owned()
+            } else {
+                format!("dengan runConfig ({})", keys.join(", "))
+            };
+            format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
+        }
+        _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
+    }
+}
+
 /// A short, deterministic Indonesian sentence describing exactly what a
 /// [`Risk::WriteLow`] tool call is about to do, generated from the tool
 /// name and its (not yet stripped of `confirmed`) arguments — NEVER from
@@ -238,38 +289,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "trigger_lakehouse_build" => {
             "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
         }
-        "trigger_pipeline" => {
-            // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
-            // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
-            // gate had no `trigger_pipeline` arm, so the user confirmed
-            // a call without seeing WHICH pipeline the copilot was
-            // about to run, or whether it carried a `runConfig`
-            // override (the latter being the operationally interesting
-            // half, because a non-default config is what elevates the
-            // tool's risk to `WriteHigh` — see [`effective_risk`]).
-            //
-            // The summary's format follows the same Indonesian one-liner
-            // shape every other `WriteLow` arm produces, with the
-            // pipeline id and the top-level keys of `runConfig` when
-            // one was supplied. Listing the KEYS (not the values)
-            // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
-            // own `configKeys` audit shape, so the chat confirmation and
-            // the audit row agree on what the run actually carried.
-            let pipeline_id = s("id");
-            match args.get("runConfig") {
-                Some(Value::Object(map)) => {
-                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-                    keys.sort_unstable();
-                    let keys_part = if keys.is_empty() {
-                        "tanpa kunci konfigurasi".to_owned()
-                    } else {
-                        format!("dengan runConfig ({})", keys.join(", "))
-                    };
-                    format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
-                }
-                _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
-            }
-        }
+        "trigger_pipeline" => pipeline_summary(args),
         "create_chart" => {
             // A chart reads either a mart or a dashboard SQL source; name
             // whichever one the call actually uses.
@@ -329,6 +349,21 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "update_calculated_field" => format!(
             "Mengubah rumus kolom hitung {} menjadi {}.",
+            s("id"),
+            s("formula")
+        ),
+        "create_metric" => format!(
+            "Membuat metrik \"{}\" = {} (pada {}).",
+            s("name"),
+            s("formula"),
+            if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            }
+        ),
+        "update_metric" => format!(
+            "Mengubah metrik {} menjadi {}; semua chart yang memakainya ikut berubah.",
             s("id"),
             s("formula")
         ),

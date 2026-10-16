@@ -14,37 +14,25 @@ import { connectorService } from "@/services"
 import type {
   ConnectorDetail,
   ConnectorProbeResult,
-  IngestJobRun,
-  IngestRun,
+  ConnectorRun,
 } from "@/services/contracts/connectors"
-import {
-  RUN_STATUS_LABEL,
-  RUN_STATUS_TONE,
-  groupResultsByRun,
-  isActive,
-  scheduleLabel,
-} from "./connector-ingest-panel"
+import { runStatusLabel, runStatusTone, scheduleLabel } from "./connector-ingest-panel"
 import { connectionReviewItems } from "./connector-review"
 import { failureStreakLabel } from "./connectors-columns"
 
 /** Something about the connector that needs a look, newest source first. */
 export type Problem = { key: string; message: string; at: string | null }
 
-/** How many failed tables of one run are named before "and N more". */
-const TABLES_NAMED = 3
-
 /**
  * What currently needs attention, from real results only: the latest
  * connection test if it failed (an older failure a later pass resolved is
- * history, not a problem), and the latest finished ingest run if it failed
- * or left tables unloaded. `null` inputs (not loaded, or could not be
- * loaded) contribute nothing rather than a guess.
+ * history, not a problem), and the latest finished run if it failed (`SRC-11`:
+ * from the product's own run record, which names no table; the run's log does).
+ * A run still going, or one whose end was never reported, is not judged. `null`
+ * inputs (not loaded, or could not be loaded) contribute nothing rather than a
+ * guess.
  */
-export function recentProblems(
-  probes: ConnectorProbeResult[] | null,
-  runs: IngestJobRun[] | null,
-  results: IngestRun[] | null
-): Problem[] {
+export function recentProblems(probes: ConnectorProbeResult[] | null, runs: ConnectorRun[] | null): Problem[] {
   const problems: Problem[] = []
   const latestProbe = probes?.[0]
   if (latestProbe && !latestProbe.ok) {
@@ -54,35 +42,16 @@ export function recentProblems(
       at: latestProbe.testedAt,
     })
   }
-  if (runs) {
-    const finished = groupResultsByRun(runs, results ?? []).find((g) => g.run !== null && !isActive(g.run))
-    const run = finished?.run
-    if (finished && run) {
-      const failedTables = finished.results.filter((r) => r.status !== "succeeded")
-      if (run.status === "failed" && finished.results.length === 0) {
-        problems.push({
-          key: "run",
-          message: "The last ingest run failed before it reached any table.",
-          at: run.startedAt,
-        })
-      } else if (run.status === "failed" || failedTables.length > 0) {
-        const named = failedTables
-          .slice(0, TABLES_NAMED)
-          .map((r) => `${r.object} (${r.error || r.status})`)
-          .join(", ")
-        const more = failedTables.length > TABLES_NAMED ? ` and ${failedTables.length - TABLES_NAMED} more` : ""
-        problems.push({
-          key: "run",
-          message:
-            failedTables.length > 0
-              ? `The last ingest run did not load ${failedTables.length} ${
-                  failedTables.length === 1 ? "table" : "tables"
-                }: ${named}${more}.`
-              : "The last ingest run failed.",
-          at: run.startedAt,
-        })
-      }
-    }
+  const run = runs?.find((r) => r.status !== "running")
+  if (run?.status === "failed") {
+    problems.push({
+      key: "run",
+      message:
+        run.endReason === "table_failed"
+          ? "The last ingest run did not load every table. Its log under Runs says which."
+          : "The last ingest run failed.",
+      at: run.startedAt,
+    })
   }
   return problems
 }
@@ -107,10 +76,9 @@ export function ConnectorOverview({
   const id = detail.id
   const spec = useService((s) => connectorService.getIngestSpec(id, s), [id])
   const probes = useService((s) => connectorService.listProbeHistory(id, 1, s), [id])
-  const runs = useService((s) => connectorService.listIngestJobRuns(id, s), [id])
-  const results = useService((s) => connectorService.listIngestRuns(id, s), [id])
+  const runs = useService((s) => connectorService.listConnectorRuns(id, s), [id])
 
-  const problems = recentProblems(probes.data?.results ?? null, runs.data, results.data)
+  const problems = recentProblems(probes.data?.results ?? null, runs.data)
   const lastRun = runs.data?.[0] ?? null
   const adapter = spec.data?.adapter ?? null
   const tables = spec.data?.sourceObjects.length ?? 0
@@ -206,9 +174,9 @@ export function ConnectorOverview({
           {runs.status === "loading" ? (
             <Skeleton className="h-5 w-20" />
           ) : runs.status === "error" ? (
-            <span className="text-muted-foreground">Could not ask the orchestrator</span>
+            <span className="text-muted-foreground">Run history could not be loaded</span>
           ) : lastRun ? (
-            <Pill tone={RUN_STATUS_TONE[lastRun.status]}>{RUN_STATUS_LABEL[lastRun.status]}</Pill>
+            <Pill tone={runStatusTone(lastRun)}>{runStatusLabel(lastRun)}</Pill>
           ) : (
             <span className="text-muted-foreground">Never run</span>
           )}

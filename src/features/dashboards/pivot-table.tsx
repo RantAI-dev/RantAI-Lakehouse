@@ -1,5 +1,6 @@
 "use client";
 
+import { displayColumn } from "@/lib/chart-joins";
 import * as React from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { bucketLabel, isGrain, isTruncation } from "@/lib/time-grain";
@@ -13,7 +14,7 @@ import type { Rows } from "./tile-dialogs";
 function valueLabel(def: TableDefFields, i: number): string {
   const v = def.values?.[i];
   if (!v) return "";
-  return def.columnSettings?.[v.column]?.label ?? `${v.aggregate} of ${v.column}`;
+  return def.columnSettings?.[v.column]?.label ?? `${v.aggregate} of ${displayColumn(v.column)}`;
 }
 
 /**

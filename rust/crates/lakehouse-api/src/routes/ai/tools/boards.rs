@@ -403,8 +403,8 @@ pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
 /// The handler's `validate_filters` (limits: 20 max, op shape), the
 /// `without_inert` clean (`BI-18` review round 1), `board_edit_allowed`
 /// (Main refuses any change but a layout), and folder existence check
-/// all run inside `boards_update` (`routes/dashboard.rs:909` /
-/// `:940` / `:983` / `:932` / `:996`). The tool does NOT duplicate
+/// all run inside `boards_update` (`routes/dashboard.rs:1145` /
+/// `:1155` / `:1163` / `:1204` / `:1217`). The tool does NOT duplicate
 /// them — the principle is to call the route, not re-implement it
 /// (plan 20 Decisions, line 71-73). Only the shape decode (`serde`
 /// parsing the args into `Vec<FilterDef>`) is the tool's job; an

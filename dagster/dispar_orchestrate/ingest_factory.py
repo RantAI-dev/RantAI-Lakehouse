@@ -113,6 +113,26 @@ column list loads only those columns. An API that cannot be asked fails the
 step and loads nothing (fail closed). The run id the API stores with a change
 is the Dagster run id of the mapped step.
 
+# Retries, run reports, pause and left-out columns (`SRC-11`)
+
+A failure is classified once and retried on a 1, 5 and 15 minute schedule
+only when it is transient (`ingest_errors.py`, `_fail_or_retry`). The run
+tells `lakehouse-api` about itself (`run_reports.py`): `run_ingest` reports the
+start and, for the runs it carries out alone (a paused connector, a CDC
+connector, a Kafka micro-batch), the end; each mapped step reports each of its
+attempts. A batch run's end is reported by the API's own run sensors from
+Dagster's confirmed final status. A report that cannot be sent never fails a
+load (D5).
+
+`run_ingest` reads the connector's `paused` flag from the same
+`GET /api/connectors/ingestible` answer it already fetches, and a paused
+connector's run loads nothing and ends `paused` (D13, `SRC-18`).
+
+A source object's `excludedColumns` is applied inside the before-load gate
+(`_leave_out_columns`), AFTER the API has been shown the whole table, so a
+column left out is never reported as removed at the source (D9). Only the
+batch SQL path has such a gate.
+
 # Secrets
 
 Resolved via `secret_resolver.resolve_secret_ref`, using
@@ -125,9 +145,10 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 import requests
@@ -139,6 +160,7 @@ from dagster import (
     DynamicOutput,
     Failure,
     Field,
+    RetryRequested,
     RunRequest,
     RunsFilter,
     SensorEvaluationContext,
@@ -151,9 +173,15 @@ from dagster import (
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from dispar_orchestrate import connector_catalog, dlt_pipeline, schema_observer, secret_resolver, ssrf_guard
-from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
-from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
+from dispar_orchestrate import (
+    connector_catalog,
+    dlt_pipeline,
+    ingest_errors,
+    run_reports,
+    schema_observer,
+    secret_resolver,
+    ssrf_guard,
+)
 from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
@@ -167,22 +195,14 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+from dispar_orchestrate.ingest_errors import UnknownAdapter, UnsupportedKafkaAuth
+from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 _POSTGRES_DRIVERS = ("postgres", "postgresql")
 
 logger = logging.getLogger(__name__)
-
-
-class UnknownAdapter(Exception):
-    """`connector["adapter"]` names no dispatch arm this factory knows how
-    to run -- raised BY NAME rather than left to surface as a bare
-    `KeyError` from a dict lookup, so a future adapter added to the
-    `connector_type`/`connector` CHECK constraints (`0033_connector_ingest_spec.sql`,
-    `0043_ingest_tier2_adapters.sql`) without a matching dispatch arm here
-    fails loudly and legibly at run time, never a silent no-op."""
 
 
 def _env(name: str, default: str) -> str:
@@ -293,64 +313,9 @@ def _classify_exception(exc: Exception) -> str:
     return f"{type(exc).__module__}.{type(exc).__name__}"
 
 
-# SQLSTATE a driver reports for a refused login (class 28, "invalid
-# authorization specification"); SQL Server's error 18456 carries it.
-_SQLSTATE_LOGIN_REFUSED = "28000"
-# `pymysql.constants.ER.ACCESS_DENIED_ERROR` / Oracle `ORA-01017`.
-_MYSQL_ACCESS_DENIED = 1045
-_ORACLE_LOGON_DENIED = "ORA-01017"
-# Bounded walk: SQLAlchemy's `.orig`, `raise ... from` and implicit contexts
-# are chains of a few links; the bound only guards against a cycle.
-_MAX_CAUSE_DEPTH = 8
-
-
-def _is_authentication_refusal(exc: BaseException) -> bool:
-    """Whether `exc`, or anything it wraps, is a database driver telling us
-    the source REFUSED THE CREDENTIAL (a wrong user or password).
-
-    That answer does not change between attempts, so retrying it only burns
-    `DEFAULT_RETRY_POLICY`'s two backed-off retries (a measured 2m23s run in
-    the G6 gate, PR #101 CI) before the same refusal and delays the failure
-    alert. Decided by the driver's exception TYPE and error CODE, never by
-    matching message text (which is localised, version-dependent and can
-    carry a host or user name):
-
-    - `pymysql` (mysql/mariadb): `OperationalError` with `args[0] == 1045`
-      (`ER_ACCESS_DENIED_ERROR`).
-    - `pyodbc` (mssql): any `pyodbc.Error` whose `args[0]` (the SQLSTATE) is
-      `28000`, what SQL Server's "Login failed" (18456) maps to.
-    - `oracledb` (oracle): a `DatabaseError` whose first argument is the
-      driver's error object with `full_code == "ORA-01017"`.
-
-    The drivers are recognised by their module so this file imports none of
-    them (`pyodbc` needs a system ODBC library to import at all).
-
-    NOT covered, deliberately: `psycopg2` (postgres). Checked against the
-    pinned `psycopg2` 2.9.10 with a refused login: `pgcode` and
-    `diag.sqlstate` are `None` for an error raised while connecting (libpq
-    gives no SQLSTATE there), so the only signal is the message text, which
-    this function will not read. A Postgres credential failure therefore
-    still retries until a verifiable signal exists.
-    """
-    seen: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    for _ in range(_MAX_CAUSE_DEPTH):
-        if not pending:
-            break
-        current = pending.pop(0)
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        root = type(current).__module__.split(".")[0]
-        first = current.args[0] if current.args else None
-        if root == "pymysql" and first == _MYSQL_ACCESS_DENIED:
-            return True
-        if root == "pyodbc" and first == _SQLSTATE_LOGIN_REFUSED:
-            return True
-        if root == "oracledb" and getattr(first, "full_code", None) == _ORACLE_LOGON_DENIED:
-            return True
-        pending.extend([getattr(current, "orig", None), current.__cause__, current.__context__])
-    return False
+# `ingest_errors.is_authentication_refusal` is the one reader of a driver's
+# refused sign-in (SRC-11 D2, SRC-19); the old name stays for its callers.
+_is_authentication_refusal = ingest_errors.is_authentication_refusal
 
 
 def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> dict[str, str]:
@@ -378,7 +343,17 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
         return {}
     values = [secret_resolver.resolve_secret_ref(connector.get("secretRef"))]
     if len(fields) == 2:
-        values.append(secret_resolver.resolve_secret_ref(connector.get("secretRefSecondary")))
+        try:
+            values.append(secret_resolver.resolve_secret_ref(connector.get("secretRefSecondary")))
+        except secret_resolver.SecretRefRejected:
+            if auth_type != "oauth2_authorization_code":
+                raise
+            # SRC-12 part C: the second credential of an authorization-code
+            # connector is the refresh token, written by the person's sign-in.
+            # One that is missing or cannot be opened is a connector nobody has
+            # signed in to (or whose token was removed): "sign in again", not a
+            # rejected setting. The reason is not carried (decision 12).
+            raise rest_adapter.OAuthSignInRefused() from None
     return dict(zip(fields, values))
 
 
@@ -545,6 +520,55 @@ def _discover_new_tables(connector: dict, run_id: str | None) -> bool:
         return False
 
 
+@dataclass
+class AttemptNotes:
+    """What one attempt at one table learned that its return value does not
+    say, for the run report: the `ingest_run` status `_record` wrote
+    (`waiting`, `unsupported`, `cleared`, ...) and how many columns the source
+    object's `excludedColumns` left out of the load."""
+
+    status: str | None = None
+    columns_left_out: int = 0
+
+
+# Set by `ingest_source_object` around its call of `_run_one_object` and read
+# back after it. A context variable rather than a new return value or
+# parameter: `_run_one_object` returns the row count that callers and tests
+# rely on, and a direct call (no step around it) simply has nobody to tell.
+_NOTES: ContextVar[AttemptNotes | None] = ContextVar("ingest_attempt_notes", default=None)
+
+
+def _leave_out_columns(
+    decision: schema_observer.Decision,
+    reflected: schema_observer.ReflectedTable,
+    excluded: frozenset[str],
+) -> tuple[schema_observer.Decision, int]:
+    """Apply a source object's `excludedColumns` to the API's decision (D9).
+
+    Runs AFTER the API was shown the whole table, so what is left out is never
+    reported as removed at the source. The columns to load are the ones the
+    decision names (or all reflected ones when it names none) minus the
+    excluded ones, by the source's own spelling. Returns the decision to obey
+    and how many columns were actually left out (a name the table does not
+    have counts for nothing: the API does not check names at save time).
+
+    # Errors
+
+    Raises `schema_observer.ObservationRefused` when nothing would be left to
+    load (every column excluded): not retried, and nothing is loaded.
+    """
+    if decision.action != "load" or not excluded:
+        return decision, 0
+    names = [c.name for c in reflected.columns] if decision.columns is None else list(decision.columns)
+    kept = [name for name in names if name not in excluded]
+    left_out = len(names) - len(kept)
+    if left_out == 0:
+        return decision, 0
+    if not kept:
+        raise schema_observer.ObservationRefused("every column of the table is left out, so there is nothing to load")
+    return schema_observer.Decision(action=decision.action, columns=kept, changes=decision.changes), left_out
+
+
 # What an `ingest_run` row says when a table waits for a schema-change
 # decision (SRC-8, D7). Fixed text: nothing from the source or the API.
 _WAITING_MESSAGE = "waiting for a decision on a schema change at the source"
@@ -554,8 +578,11 @@ def _make_gate(connector: dict, obj: dict, run_id: str | None):
     """The `before_load` observation for one source object (SRC-8, D4): what
     `dlt` reflected goes to the API and its decision comes back."""
 
+    excluded_names = obj.get("excludedColumns") or []
+    excluded = frozenset(n for n in excluded_names if isinstance(n, str))
+
     def gate(reflected: schema_observer.ReflectedTable) -> schema_observer.Decision:
-        return schema_observer.post_observation(
+        decision = schema_observer.post_observation(
             schema_observer.ObserverConfig.from_env(),
             connector["id"],
             obj["name"],
@@ -564,6 +591,13 @@ def _make_gate(connector: dict, obj: dict, run_id: str | None):
             "before_load",
             run_id,
         )
+        # SRC-11 D9: the observation above saw the whole table; only what is
+        # loaded is narrowed.
+        decision, left_out = _leave_out_columns(decision, reflected, excluded)
+        notes = _NOTES.get()
+        if notes is not None:
+            notes.columns_left_out = left_out
+        return decision
 
     return gate
 
@@ -664,6 +698,9 @@ def _run_one_object(
     started_at = datetime.now(timezone.utc).isoformat()
 
     def _record(*, rows, status, error=""):
+        notes = _NOTES.get()
+        if notes is not None:
+            notes.status = status
         record_ingest_run(
             connector_id=connector_id,
             job=job_name,
@@ -691,6 +728,11 @@ def _run_one_object(
         secrets = _resolve_object_secrets(connector, adapter_name, dial)
     except SecretRefRejected as exc:
         _record(rows=None, status="rejected", error=str(exc))
+        raise
+    except rest_adapter.OAuthSignInRefused as exc:
+        # SRC-12 part C: nobody has signed in (no refresh token to read). A failure,
+        # not a rejected setting; the row names the type only, like every other.
+        _record(rows=None, status="failed", error=_classify_exception(exc))
         raise
 
     try:
@@ -793,6 +835,11 @@ def _run_one_object(
                 _record(rows=None, status="waiting", error=_WAITING_MESSAGE)
                 return None
             source, resolved = result.source, result.resolved
+        elif adapter_name == "rest":
+            # SRC-12 part C: the connector's id lets a REST load report a refresh
+            # token the provider rotated (`adapters/rest.py`, OAUTH).
+            result = adapter.build_source(dial, secrets, [obj], connector_id=connector_id)
+            source, resolved = result.source, result.resolved
         else:
             result = adapter.build_source(dial, secrets, [obj])
             source, resolved = result.source, result.resolved
@@ -828,11 +875,6 @@ def _run_one_object(
     except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)
         _record(rows=None, status="failed", error=_classify_exception(exc))
         raise
-
-
-class UnsupportedKafkaAuth(Exception):
-    """The dial names a Kafka auth type this consumer cannot honour. Raised
-    before any connection is attempted."""
 
 
 def kafka_security_kwargs(spec: dict, secrets: dict) -> dict:
@@ -878,7 +920,7 @@ def run_kafka_stream_batch(
     source_objects: list[dict],
     consumer: "KafkaConsumer | None" = None,
     run_id: str | None = None,
-) -> None:
+) -> int:
     """One scheduled micro-batch for a `kafka`-adapter, `ingest_mode='stream'`
     connector. At-least-once, stated explicitly:
     `consume_one_batch` returns rows plus the last offset
@@ -895,6 +937,9 @@ def run_kafka_stream_batch(
     append path is not deduplicated), never a silent skip.
 
     `run_id` is the Dagster run id sent with the after-load schema observation.
+
+    Returns the rows the micro-batch loaded (0 for an empty poll), for the run
+    report (SRC-11 D5).
 
     A micro-batch that loaded also registers (or refreshes) its Bronze
     table in the console catalog (`_register_in_catalog`), like every batch
@@ -963,7 +1008,7 @@ def run_kafka_stream_batch(
         try:
             batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
             if not batch.rows:
-                return
+                return 0
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
             outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
             # Committed ONLY after the sink write above returned
@@ -992,6 +1037,7 @@ def run_kafka_stream_batch(
             # already committed; a failed post changes nothing (see
             # `_observe_after_load`).
             _observe_after_load(connector_id, source_objects[0].get("name") or topic, outcome.columns, run_id)
+            return outcome.rows
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
             raise
@@ -1003,7 +1049,7 @@ def run_kafka_stream_batch(
             consumer.close()
 
 
-def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
+def _run_stream_connector(connector: dict, run_id: str | None = None) -> int:
     """Dispatch a `kafka`-adapter, `ingest_mode="stream"` connector
     (`connector_ingest_mode_check`, widened to admit `"stream"` by
     `0043_ingest_tier2_adapters.sql`) to `run_kafka_stream_batch` -- the
@@ -1025,13 +1071,143 @@ def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
     secrets = secret_resolver.resolve_secrets(
         "kafka", auth_type, connector.get("secretRef"), connector.get("secretRefSecondary")
     )
-    run_kafka_stream_batch(
+    return run_kafka_stream_batch(
         connector_id=connector["id"],
         spec=dial,
         secrets=secrets,
         source_objects=connector.get("sourceObjects", []),
         run_id=run_id,
     )
+
+
+def _retry_number(context: Any) -> int:
+    """Which attempt of this step is running (0 for the first). A context built
+    for a direct call of the op in a unit test has no step behind it and so no
+    attempt count: it is the first attempt."""
+    try:
+        return int(context.retry_number)
+    except AttributeError:
+        return 0
+
+
+def _fetch_connector_for_run(cfg: IngestFactoryConfig, connector_id: str, retry_number: int) -> dict[str, Any]:
+    """`_fetch_one_connector` for `run_ingest`, with its failures named by the
+    one classification (SRC-11 D2): the product's own API not answering is
+    `api_unreachable` and is retried; an answer that cannot run the connector
+    (a 4xx, a connector that is no longer ingestible) is not.
+
+    # Errors
+
+    Raises what `_fail_or_retry` raises.
+    """
+    try:
+        return _fetch_one_connector(cfg, connector_id)
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            refused: Exception = ingest_errors.ApiRefused("the API refused the connector request")
+        else:
+            refused = ingest_errors.ApiUnreachable("the API failed on the connector request")
+        _fail_or_retry(refused, label=repr(connector_id), retry_number=retry_number)
+    except StopIteration:
+        _fail_or_retry(
+            ingest_errors.ApiRefused("the connector is not ingestible"), label=repr(connector_id), retry_number=retry_number
+        )
+    except requests.RequestException:
+        _fail_or_retry(
+            ingest_errors.ApiUnreachable("the API could not be reached"), label=repr(connector_id), retry_number=retry_number
+        )
+
+
+@dataclass(frozen=True)
+class RetryDecision:
+    """What `_decide` says about a failed attempt: its verdict, and the wait
+    before the next attempt when there is one (`None`: the step ends)."""
+
+    verdict: ingest_errors.Classified
+    wait_seconds: int | None
+
+
+def _decide(exc: BaseException, retry_number: int) -> RetryDecision:
+    """Classify `exc` and pick the wait for the next attempt (SRC-11 D1, D2)."""
+    verdict = ingest_errors.classify(exc)
+    wait = ingest_errors.RetrySettings.from_env().delay_for(retry_number) if verdict.retried else None
+    return RetryDecision(verdict, wait)
+
+
+def _fail_or_retry(
+    exc: Exception, *, label: str, retry_number: int, decision: RetryDecision | None = None
+) -> NoReturn:
+    """Turn a failed attempt into what Dagster should do next (SRC-11 D1, D2).
+
+    `ingest_errors.classify` is the only place that decides. A transient
+    class with a retry left raises `RetryRequested` carrying that attempt's
+    wait (`INGEST_RETRY_DELAYS_SECONDS`, 1, 5 and 15 minutes by default);
+    Dagster's `RetryPolicy` cannot express a different wait per attempt. The
+    step is the unit that retries, so for the mapped per-table step only the
+    failing table is tried again; the tables that loaded are not touched.
+
+    Everything else ends the step: a refused credential with a fixed text
+    (nothing from the driver: it names the user and the client address), the
+    other classes with the message their own type gave (as before SRC-11), a
+    transient class whose retries are used up with the class's fixed phrase,
+    and an unexplained failure (`other`) as itself, so its traceback is in the
+    step log.
+
+    `decision` is the caller's own `_decide(exc, retry_number)` when it has
+    already used it (to report the attempt), so both see the same answer.
+
+    # Errors
+
+    Always raises: `RetryRequested`, `Failure(allow_retries=False)`, or `exc`.
+    """
+    decision = decision or _decide(exc, retry_number)
+    verdict, wait = decision.verdict, decision.wait_seconds
+    if wait is not None:
+        raise RetryRequested(
+            max_retries=ingest_errors.RetrySettings.from_env().max_retries, seconds_to_wait=wait
+        ) from exc
+    phrase = ingest_errors.CLASS_PHRASES[verdict.error_class]
+    if verdict.error_class == ingest_errors.SIGN_IN_REFUSED:
+        raise Failure(description=f"ingest of {label}: {phrase}", allow_retries=False) from exc
+    if verdict.retried:
+        raise Failure(
+            description=f"ingest of {label}: {phrase}; gave up after {retry_number + 1} attempts",
+            allow_retries=False,
+        ) from exc
+    if verdict.error_class != ingest_errors.OTHER:
+        raise Failure(description=f"ingest of {label}: {exc}", allow_retries=False) from exc
+    raise exc
+
+
+def _trigger_of(context: Any, action: Any) -> str:
+    """What started this run, one of `run_reports.TRIGGERS` (SRC-11 D7).
+
+    A run of one table carries its action in the run config, which says
+    `refresh` or `clear` whoever pressed the button. Otherwise the run's
+    `lakehouse/trigger` tag, which `ingest_schedule_sensor` sets to `schedule`.
+    A run launched through `POST .../ingest/run` carries `user` (the API tags
+    its launches, SRC-11 review 1 SHOULD-FIX 1); one launched from the
+    orchestrator's own screen carries no tag and is reported as `other`: this
+    function invents nothing.
+    """
+    if action == ACTION_CLEAR:
+        return "clear"
+    if action in _REFRESH_OF_ACTION:
+        return "refresh"
+    try:
+        tag = (context.dagster_run.tags or {}).get("lakehouse/trigger")
+    except Exception:  # noqa: BLE001 -- a directly invoked op has no run, and Dagster raises its own error type
+        tag = None
+    return tag if tag in run_reports.TRIGGERS else "other"
+
+
+def _table_label(connector: dict) -> str:
+    """The name a stream connector's one table goes by in a report: its first
+    source object, else its topic, else the connector."""
+    objects = connector.get("sourceObjects") or []
+    first = objects[0].get("name") if objects else None
+    return first or (connector.get("dial") or {}).get("topic") or connector["id"]
 
 
 @op(
@@ -1051,7 +1227,8 @@ def _run_stream_connector(connector: dict, run_id: str | None = None) -> None:
         ),
     },
     out=DynamicOut(),
-    retry_policy=DEFAULT_RETRY_POLICY,
+    # SRC-11 D1: no `retry_policy`. `_fail_or_retry` raises `RetryRequested` with
+    # the attempt's own wait (a policy cannot), and everything else ends the step.
     tags=source_metadata(
         "dispar_orchestrate/ingest_factory.py::run_ingest",
         reads=["Connector source objects (per its ingest spec)"],
@@ -1111,9 +1288,27 @@ def run_ingest(context) -> Any:
     `Failure(allow_retries=False)`; the API refuses both before launching.
     """
     connector_id: str = context.op_config["connector_id"]
+    # SRC-11 D5, D7: the run's start, before anything can fail. A retry of this
+    # op sends it again; the API answers `recorded: false` and changes nothing.
+    reporter = run_reports.RunReporter.for_run(connector_id, context.run_id)
+    trigger = _trigger_of(context, context.op_config.get("action"))
+    # SRC-11 review 1 BLOCKER 2: a refresh or clear names its table in the
+    # start report, so the run list can say "Clear · public.orders"
+    # (SRC-10 decision 5). Other runs are about every table and send none.
+    object_name = context.op_config.get("object")
+    reporter.start(trigger, table=object_name if trigger in ("refresh", "clear") else None)
     single = _single_table_request(connector_id, context.op_config.get("object"), context.op_config.get("action"))
     cfg = IngestFactoryConfig.from_env()
-    connector = _fetch_one_connector(cfg, connector_id)
+    connector = _fetch_connector_for_run(cfg, connector_id, _retry_number(context))
+    if connector.get("paused") is True:
+        # SRC-11 D13, SRC-18: a paused connector loads nothing, whoever started
+        # the run (a run queued before the pause, one started from the
+        # orchestrator's screen). Only an explicit `true` pauses: the flag is
+        # the API's own boolean, and an older API that does not send it has no
+        # pause to honour.
+        context.log.info(f"connector {connector_id!r} is paused; this run loads nothing")
+        reporter.end("paused", "connector_paused")
+        return
     if single is not None and (connector["adapter"] == "cdc" or connector.get("ingestMode") == "stream"):
         raise Failure(
             f"connector {connector_id!r} streams its rows; a run of one table with an action is for batch connectors",
@@ -1125,19 +1320,46 @@ def run_ingest(context) -> Any:
             "snapshot.mode=initial (ADR 0008) runs ingestion automatically once its compose "
             "service starts, outside this job entirely"
         )
+        reporter.end("succeeded", "completed")
         return
     if connector.get("ingestMode") == "stream":
         # The only ingest_mode a batch-shaped per-object loop below
         # cannot run: a kafka connector's rows arrive from one bounded
         # consumer.poll() loop over the whole topic, not from a
         # build_source() call per sourceObjects entry.
-        _run_stream_connector(connector, run_id=context.run_id)
+        attempt_number = _retry_number(context) + 1
+        table = _table_label(connector)
+        started_at = run_reports.now()
+        try:
+            rows = _run_stream_connector(connector, run_id=context.run_id)
+        except Exception as exc:  # noqa: BLE001 -- classified by `_decide`, then `_fail_or_retry` always raises
+            # The Kafka path gets the same rule as a table (SRC-11 D2).
+            decision = _decide(exc, attempt_number - 1)
+            reporter.attempt(
+                table=table,
+                attempt=attempt_number,
+                started_at=started_at,
+                ended_at=run_reports.now(),
+                error_class=decision.verdict.error_class,
+                wait_seconds=decision.wait_seconds,
+            )
+            if decision.wait_seconds is None:
+                reporter.end("failed", "table_failed")
+            _fail_or_retry(exc, label=repr(connector_id), retry_number=attempt_number - 1, decision=decision)
+        reporter.attempt(
+            table=table,
+            attempt=attempt_number,
+            started_at=started_at,
+            ended_at=run_reports.now(),
+            rows_loaded=rows if isinstance(rows, int) else 0,
+        )
+        reporter.end("succeeded", "completed")
         return
     if single is None and _discover_new_tables(connector, context.run_id):
         # Added in this run, loaded in this run: the API wrote them to the
         # connector's tables, so one more read of the connector (the same call
         # that started this run) fans out over the new list.
-        connector = _fetch_one_connector(cfg, connector_id)
+        connector = _fetch_connector_for_run(cfg, connector_id, _retry_number(context))
     objects = connector.get("sourceObjects", [])
     action = None
     if single is not None:
@@ -1167,8 +1389,37 @@ def run_ingest(context) -> Any:
         )
 
 
+def _report_attempt(
+    reporter: run_reports.RunReporter,
+    obj: dict,
+    attempt: int,
+    started_at: str,
+    *,
+    rows: int,
+    error_class: str | None = None,
+    wait_seconds: int | None = None,
+    columns_left_out: int = 0,
+) -> None:
+    """Report one attempt at one table and the log lines it earned (D5, D9).
+    Never raises (`RunReporter` swallows its own failures)."""
+    table = obj["name"]
+    reporter.attempt(
+        table=table,
+        attempt=attempt,
+        started_at=started_at,
+        ended_at=run_reports.now(),
+        rows_loaded=rows,
+        error_class=error_class,
+        wait_seconds=wait_seconds,
+    )
+    if error_class == ingest_errors.SCHEMA_DECISION_PENDING:
+        reporter.log("schema_decision_pending", table=table)
+    if columns_left_out > 0:
+        reporter.log("columns_left_out", table=table, count=columns_left_out)
+
+
 @op(
-    retry_policy=DEFAULT_RETRY_POLICY,
+    # SRC-11 D1: no `retry_policy`; see `run_ingest` and `_fail_or_retry`.
     tags=source_metadata(
         "dispar_orchestrate/ingest_factory.py::ingest_source_object",
         reads=["Connector source object spec"],
@@ -1189,75 +1440,54 @@ def ingest_source_object(context, payload: dict[str, Any]) -> Any:
     `run_ingest` emitted; the per-step failure unit is the only thing
     that changed.
 
-PART D: a config-shaped failure retries with the same input and
-    gets the same answer -- so it is wrapped in
-    `Failure(allow_retries=False)` at this op's boundary, which lets
-    the `DEFAULT_RETRY_POLICY` keep absorbing transient network blips
-    without wasting its two retries on a config that will never change
-    between attempts. The set is closed by `UnsupportedKafkaAuth` /
-    `OracleTlsConfigError` / `HostKeyMismatch` / `MongoConfigRejected`
-    (each adapter's own config-rejection contract) and by `ValueError`
-    (broader catch -- see comment below). Other exceptions
-    (HTTP/connection/transient) propagate so the policy does what it
-    says it says."""
+A failure is classified by `ingest_errors.classify` and either retried or
+    ends the step (`_fail_or_retry`, SRC-11 D1 and D2): up to three retries of
+    THIS table, after 1, 5 and 15 minutes, for an unreachable source, a
+    timeout, a busy or failing source or an unreachable product API; never for
+    a refused credential (PostgreSQL's included, SRC-19), a refused address, an
+    unsupported table or mode, a rejected setting or an unexplained failure.
+    The other tables of the run are separate steps and are not repeated."""
     connector, obj = payload["connector"], payload["obj"]
+    retry_number = _retry_number(context)
+    reporter = run_reports.RunReporter.for_run(connector["id"], context.run_id)
+    notes = AttemptNotes()
+    token = _NOTES.set(notes)
+    started_at = run_reports.now()
     try:
         # `action` only when set: an ordinary run calls `_run_one_object` exactly as
         # it did before SRC-10.
         action = payload.get("action")
         rows = _run_one_object(connector, obj, run_id=context.run_id, **({"action": action} if action else {}))
-    except schema_observer.ObservationUnreachable as exc:
-        # SRC-8, fail closed: the API could not be asked, so the table was
-        # NOT loaded unchecked. Transient (a connection error or a 5xx), so
-        # `allow_retries` stays True and `DEFAULT_RETRY_POLICY` retries it.
-        raise Failure(description=f"ingest of {obj.get('target')!r}: {exc}") from exc
-    except (
-        schema_observer.ObservationRefused,
-        UnknownAdapter,
-        SecretRefRejected,
-        ssrf_guard.SsrfBlocked,
-        UnsupportedColumnType,
-        UnsupportedKafkaAuth,
-        oracle_adapter.OracleTlsConfigError,
-        ssrf_guard_sftp_module.HostKeyMismatch,
-        ssrf_guard_mongo_module.MongoConfigRejected,
-        # `ValueError` is the broad one. Every adapter raises
-        # `ValueError` exclusively for rejected adapter configuration:
-        #   - sql.py:134 hostname, :139 control char, :210 driver
-        #     reroute, :226 unknown driver
-        #   - rest.py:128 unknown auth type, :184 unknown pagination type
-        #   - sftp.py:90 unsupported auth type, :120 unsupported fileFormat
-        #   - files.py:110 unsupported format
-        #   - secret_map.py:82 no secret field mapping
-        # `files.py:84` (object-size cap) is the one site where
-        # `ValueError` is data-shaped, not config-shaped -- a future
-        # object exceeding the cap should retry cleanly with the same
-        # object, so we do NOT treat it as non-retryable; the catch
-        # here would over-claim that one as a config failure. The
-        # trade-off is acceptable: the mapped step still records its
-        # `ingest_run` failure row (in `_run_one_object`'s own
-        # `except Exception` branch), and the cap is a project-level
-        # Tier 1 invariant -- a `ValueError` that surfaces after the
-        # retry policy's two attempts is no worse than one that
-        # surfaces after a single attempt, and the message is
-        # preserved.
-        ValueError,
-    ) as exc:
-        raise Failure(
-            description=f"ingest of {obj.get('target')!r}: {exc}",
-            allow_retries=False,
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 -- re-raised unless it is a refused credential
-        if not _is_authentication_refusal(exc):
-            raise
-        # PR #101 CI (G6 `g6-mysql-wrong-password`): the source said the
-        # credential is wrong. Retrying cannot change that answer, and the
-        # two retries turned a 10-second failure into a 2m23s one. Fixed
-        # text: nothing from the driver (it names user and client address).
-        raise Failure(
-            description=f"ingest of {obj.get('target')!r}: the source refused the connector's credential",
-            allow_retries=False,
-        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- classified by `_decide`, then `_fail_or_retry` always raises
+        decision = _decide(exc, retry_number)
+        _report_attempt(
+            reporter,
+            obj,
+            retry_number + 1,
+            started_at,
+            rows=0,
+            error_class=decision.verdict.error_class,
+            wait_seconds=decision.wait_seconds,
+            columns_left_out=notes.columns_left_out if decision.wait_seconds is None else 0,
+        )
+        _fail_or_retry(exc, label=repr(obj.get("target")), retry_number=retry_number, decision=decision)
+    finally:
+        _NOTES.reset(token)
+    # A table that waits for a schema decision, and one a source cannot load
+    # (`unsupported`: a Google Sheet), return without raising and the step
+    # succeeds (SRC-8 D7); the report says why no rows came.
+    held = {"waiting": ingest_errors.SCHEMA_DECISION_PENDING, "unsupported": ingest_errors.UNSUPPORTED}.get(
+        notes.status or ""
+    )
+    _report_attempt(
+        reporter,
+        obj,
+        retry_number + 1,
+        started_at,
+        rows=rows if isinstance(rows, int) else 0,
+        error_class=held,
+        columns_left_out=notes.columns_left_out,
+    )
     if isinstance(rows, int):
         context.log_event(
             AssetMaterialization(asset_key=f"bronze.{obj['target']}", metadata={"rows": rows})
@@ -1329,7 +1559,8 @@ def _fetch_due_connectors(cfg: IngestFactoryConfig, after: datetime, until: date
 def _busy_connector_ids(instance: Any) -> set[str]:
     """Every connector with an `ingest_job` run still queued or going,
     read from each run's own `connector_id` config (a run launched by
-    `POST .../ingest/run` carries no tag, only that config)."""
+    `POST .../ingest/run` carries only the `user` trigger tag, not the
+    connector's id)."""
     busy: set[str] = set()
     for run in instance.get_runs(filters=RunsFilter(job_name=ingest_job.name, statuses=_IN_PROGRESS)):
         config = (run.run_config or {}).get("ops", {}).get("run_ingest", {}).get("config", {})

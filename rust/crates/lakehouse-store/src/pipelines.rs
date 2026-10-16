@@ -106,6 +106,17 @@ pub struct Pipeline {
     /// every other `skip_serializing_if` field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), the
+    /// `app_user` this pipeline reads as. The orchestrator rewrites the
+    /// source `SELECT` through `sql_rewrite::enforce` as this user before
+    /// it runs, so a masked column arrives masked in the target.
+    ///
+    /// `None` is a real state, not a placeholder: the pipeline has no
+    /// author to read as and does not run (D2) until a Platform Admin
+    /// assigns one. `owner` cannot stand in for it — that column is free
+    /// text a human typed, never an identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<Uuid>,
 }
 
 /// The full stored shape of an authored pipeline's definition, returned by
@@ -165,6 +176,10 @@ struct PipelineRow {
     /// needs the value, but exposing it on the public type would be a
     /// new wire field that no current caller wants.
     tenant_id: Option<Uuid>,
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
+    /// here so the `runnable`/`enforce` paths can decide whether this
+    /// pipeline has an author at all without a separate read.
+    run_as: Option<Uuid>,
 }
 
 /// A row shape for [`get_definition`], carrying the three columns migration
@@ -216,13 +231,16 @@ impl From<PipelineRow> for Pipeline {
             // to the pre-F2.3 shape (see `tenant_id`'s `skip_serializing_if`
             // on the struct).
             tenant_id: row.tenant_id,
+            // BLD-1 / D1: copied from the same row so the enforce route
+            // reads the author off the pipeline it already loaded.
+            run_as: row.run_as,
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
-freshness_lag_seconds, max_retries, description, depends_on, tenant_id";
+freshness_lag_seconds, max_retries, description, depends_on, tenant_id, run_as";
 
 /// `RETURNING` clause for the transactional `create_pipeline` /
 /// `update_pipeline` / `delete_pipeline`-read paths. Wider than
@@ -233,7 +251,7 @@ freshness_lag_seconds, max_retries, description, depends_on, tenant_id";
 const FULL_PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
 freshness_lag_seconds, max_retries, description, depends_on, incremental_column, \
-     transforms, fbic_enabled, tenant_id";
+     transforms, fbic_enabled, tenant_id, run_as";
 
 /// The full editable state of a pipeline at one point in time. Persisted
 /// to `pipeline_definition_version.snapshot` (migration `0053`) inside
@@ -454,6 +472,11 @@ struct FullPipelineRow {
     /// value, and threading it as a separate query at write time would
     /// race against the live row's own tenant reassignment.
     tenant_id: Option<Uuid>,
+    /// BLD-1 / D1: `pipeline_definition.run_as` (migration `0076`), read
+    /// here so the create path can return the author it actually stored
+    /// from the same `RETURNING` that built the `Pipeline`, instead of
+    /// echoing back the value it hoped to write.
+    run_as: Option<Uuid>,
 }
 
 impl From<FullPipelineRow> for Pipeline {
@@ -483,6 +506,11 @@ impl From<FullPipelineRow> for Pipeline {
             // "Option::is_none"`) so the wire shape is unchanged for
             // every pre-0055 caller.
             tenant_id: row.tenant_id,
+            // BLD-1 / D1: `run_as` is NOT part of
+            // `PipelineDefinitionSnapshot` on purpose — D1 says updating or
+            // restoring a definition must not change who it reads as, so
+            // there is nothing for a snapshot to restore here.
+            run_as: row.run_as,
         }
     }
 }
@@ -592,6 +620,38 @@ pub async fn list_pipelines(
 pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(), StoreError> {
     let result = sqlx::query("UPDATE pipeline_definition SET tenant_id = $1 WHERE id = $2")
         .bind(tenant_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// BLD-1 / D2: assign the `app_user` a pipeline reads as
+/// (`pipeline_definition.run_as`, migration `0076`).
+///
+/// This is the only way `run_as` changes after create: `update_pipeline`
+/// and `restore_version` never write the column, so editing someone's
+/// pipeline cannot quietly reassign who it reads as.
+///
+/// The value is bound, never interpolated. A `Dagster`-backed pipeline id
+/// has no such row, so it takes the same [`StoreError::NotFound`] path as
+/// [`assign_tenant`] — never a fabricated success.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no pipeline with `id` exists, or
+/// [`StoreError::ForeignKeyViolation`] if `run_as` names a user that does
+/// not exist (the route checks first, so this only covers a race).
+/// A user deleted afterwards does NOT raise: the column is `ON DELETE SET
+/// NULL`, so the row survives and simply loses its author — which is the
+/// D2 "does not run" state again, reached without anyone deciding it.
+/// [`StoreError::Database`] on any other failure.
+pub async fn assign_run_as(pool: &PgPool, id: &str, run_as: Uuid) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE pipeline_definition SET run_as = $1 WHERE id = $2")
+        .bind(run_as)
         .bind(id)
         .execute(pool)
         .await?;
@@ -773,6 +833,16 @@ pub struct CreatePipelineInput {
     /// itself via [`crate::pipelines::slug_id`], so existing callers
     /// (tests, internal callers) keep working unchanged.
     pub id: Option<String>,
+    /// BLD-1 / D1: the `app_user` the pipeline reads as (migration
+    /// `0076`). The route layer passes the creating principal's id only
+    /// when that principal is a human (`PrincipalId::User`) — a service
+    /// identity has no `app_user` row, so it has no author to read as and
+    /// stores `None`, which D2 turns into "this pipeline does not run"
+    /// rather than a foreign-key violation on a service identity's uuid.
+    ///
+    /// Never re-read by update or restore: editing someone's pipeline
+    /// does not change who it reads as.
+    pub run_as: Option<Uuid>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -820,8 +890,8 @@ pub async fn create_pipeline(
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
 schedule, description, incremental_column, fbic_enabled, transforms, \
-         max_retries, tenant_id, depends_on, connector_id) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+         max_retries, tenant_id, depends_on, connector_id, run_as) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
          RETURNING {FULL_PIPELINE_COLUMNS}"
     );
     let mut tx = pool.begin().await?;
@@ -841,6 +911,10 @@ schedule, description, incremental_column, fbic_enabled, transforms, \
         .bind(input.tenant_id)
         .bind(&input.depends_on)
         .bind(&input.connector_id)
+        // BLD-1 / D1: bound as given, never defaulted here — a `None` must
+        // stay a `None` so the row honestly records "no author" and D2 can
+        // refuse to run it.
+        .bind(input.run_as)
         .fetch_one(&mut *tx)
         .await?;
     let snapshot = PipelineDefinitionSnapshot::from(&row);
@@ -1475,6 +1549,11 @@ mod tests {
             // keeps `tenantId` out of the wire payload, matching the
             // pre-F2.3 assertion that only the listed fields appear.
             tenant_id: None,
+            // BLD-1 / D1: `None` for the same reason as `tenant_id` above —
+            // the `skip_serializing_if` keeps `runAs` out of the payload when
+            // no author is assigned, so this assertion still holds for an
+            // unassigned pipeline.
+            run_as: None,
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [
@@ -1529,6 +1608,8 @@ mod tests {
             // `None` here matches the "never been assigned a tenant"
             // fixture this test stands for.
             tenant_id: None,
+            // BLD-1 / D1: no author assigned (the D2 "does not run" state).
+            run_as: None,
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, None);
@@ -1574,11 +1655,15 @@ mod tests {
             // serialization path; `serialized_field_names_match_…` above
             // exercises the `None` / no-serialization path.
             tenant_id: Some(uuid::Uuid::from_u128(42)),
+            // BLD-1 / D1: an assigned author round-trips through the row
+            // exactly as `tenant_id` above does.
+            run_as: Some(uuid::Uuid::from_u128(43)),
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, Some(iso_millis(ran_at)));
         assert_eq!(pipeline.sla_ok, None);
         assert_eq!(pipeline.freshness_lag_seconds, Some(42));
+        assert_eq!(pipeline.run_as, Some(uuid::Uuid::from_u128(43)));
         assert_eq!(pipeline.description.as_deref(), Some("does a thing"));
         assert_eq!(
             pipeline.depends_on,
