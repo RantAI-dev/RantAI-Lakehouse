@@ -103,7 +103,7 @@ SAML, SCIM, OIDC sign-in throttling, any Rust change (E6), changing
 
 Base `origin/main` = `53d05f0024a6`; branch `feat/sec-3-sso-real-idp`, worktree
 `/home/shiro/rantai/wt/sec-3`, pushed to `origin` as
-`36ce01c548a66570e00c739df49f058d35dab8f8`. One commit per task:
+`36ce01c548a6`. One commit per task:
 
 ```
 36ce01c548a6 docs(sso): add the per-provider single sign-on runbook and SEC-3 results
@@ -213,9 +213,34 @@ b54f0ede ci(sso): run the G10 Keycloak sign-in gate on pull requests
 fa15bb53 docs(plan): SEC-3 spec and plan, single sign-on against real identity providers
 
 $ git ls-remote --heads origin feat/sec-3-sso-real-idp
-36ce01c548a66570e00c739df49f058d35dab8f8	refs/heads/feat/sec-3-sso-real-idp
+36ce01c548a6	refs/heads/feat/sec-3-sso-real-idp
 ```
 
 ## 7. Review
 
-(planner)
+Round 1, reviewed 2026-10-16 at `03295020` (developer: DeepSeek v4.1 flash,
+opencode free). No `BLOCKER`.
+
+Checked and found right: the override runs only under the `sso` profile
+and only with `-f`; every secret is `${X:?}` and generated at run time by
+the gate script, none committed (gitleaks `git` over `origin/main..HEAD`:
+no leaks); Keycloak pinned by tag and digest; no host ports; the gate
+(`ops/g10/g10_sso_test.py`) follows CODE-STANDARD §5 and its run log
+(`review-logs/sec3-t2b.log`) shows every step and `[g10] PASS`,
+`GATE_EXIT=0`: alice signs in with the mapped Analyst role, bob gets no
+role, a wrong-audience token and an expired token are refused with 401.
+The CI job is wired into `ci-required` as the gate test requires. The
+Entra ID and Google runbooks match the vendors' current behaviour.
+
+Fixed by the planner (docs only): the two vendor citations were bare
+paths; they are now full links. The handoff pasted full 40-character
+hashes twice (cut to 12 here; rule in `dev-rules.md`).
+
+Filed from the developer's finding and the Entra limit: `SEC-38` (read
+`jwks_uri` from the provider's discovery document so `OIDC_JWKS_URL` is
+not needed) and `SEC-39` (an Entra user whose groups overflow the claim
+gets no mapped role, silently; at least log and show it).
+
+`SEC-3` stays In Progress after merge: AC2 and AC3 are the product
+owner's sign-in tests with Entra ID and Google, recorded in
+`docs/plans/SEC-3-RESULT.md`.

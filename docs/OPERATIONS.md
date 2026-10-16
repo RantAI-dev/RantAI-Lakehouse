@@ -1115,7 +1115,8 @@ than the claim can hold, Entra replaces the claim with an overage marker
 (`_claim_names`/`_claim_sources`, or `hasgroups`) and the group list must be
 fetched from Microsoft Graph instead — the console does not follow that, so a
 role mapping for such a user silently does not apply. (Microsoft docs:
-`entra/identity-platform/access-token-claims-reference`.)
+<https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>,
+the `groups` and overage claims.) Backlog `SEC-39` makes this case visible.
 
 ### Google
 
@@ -1141,7 +1142,7 @@ map anything for Google: a Google sign-in gets whatever its local
 `app_user_role` rows grant, and a JIT-provisioned account starts with none
 until an administrator assigns a role. Group-based authorization on Google
 is therefore not supported. (Google docs:
-`identity/openid-connect/reference`.)
+<https://developers.google.com/identity/openid-connect/reference>.)
 
 ## Postgres backup / restore
 
