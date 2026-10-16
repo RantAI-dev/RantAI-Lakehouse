@@ -34,7 +34,7 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-ClaimedTable, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload, attach_run,
+    ClaimedTable, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload, attach_run,
     claim_table, delete, find_by_sha256, get, get_by_run_id, insert, list, list_claims,
     loads_under_limits, mark_finished, mark_ingesting, mark_ingesting_within_limits,
     table_being_loaded, table_claim, table_claimed, upload_in_tenants,

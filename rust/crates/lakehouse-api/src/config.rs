@@ -55,7 +55,7 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
-/// `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set but
+    /// `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set but
     /// is not a whole number of 1 or more (`SEC-17`).
     ///
     /// Fails config resolution, unlike the login-throttle numbers: a limit

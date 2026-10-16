@@ -1220,7 +1220,7 @@ pub async fn preview(
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
-// `SEC-17`: a header with more than `MAX_COLUMNS` cells is refused here,
+    // `SEC-17`: a header with more than `MAX_COLUMNS` cells is refused here,
     // not shown. The 400 is per reading, so the Check step can still change
     // the delimiter or header row (a wrong guess must not lock a good file
     // out). Workbook and Parquet paths run their own refusal (`upload_workbook`
@@ -1780,7 +1780,7 @@ pub async fn ingest(
         "delimiter": request.delimiter.to_string(),
         "headerRow": request.header_row,
     });
-if let (
+    if let (
         Value::Object(map),
         Some(Converted {
             sheet: Some(sheet), ..

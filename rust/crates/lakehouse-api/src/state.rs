@@ -202,7 +202,7 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
-/// Counts the files being received by `POST /api/uploads` (`SEC-17`),
+    /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
@@ -614,7 +614,7 @@ impl AppState {
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
-upload_receive,
+            upload_receive,
             #[cfg(test)]
             webhook_sender_override: None,
         }
