@@ -340,6 +340,123 @@ All checks executed from `/home/shiro/rantai/wt-bld-2` under `/home/shiro/rantai
 
 None. Every required verification step ran in the foreground and passed cleanly.
 
+### Handoff round 1 (developer)
+
+Fix round for the reviewer's round 1. Every row below was checked against the
+code on this branch. The commit column names the commit where the code that
+satisfies the finding first appears, verified with `git log -S` on this
+branch — not the commit whose subject line mentions it.
+
+**`1bc2e332` is the previous session's catch-all commit** ("wip: BLD-2 review
+round 1 fixes in progress"): the work that was in its working tree when the
+reviewer stopped it. It carries `pipeline_lag.rs` (+1044 lines), the store's
+R1/R2 columns' reader/writer, the `route_auth.rs` assertions, the Python
+sensor, the console contracts and the panel. The per-finding commits after it
+carry the rest, and two rows below (`R1`, the lost-request settle) are split
+between `1bc2e332` and `9a35995e`. A reviewer reading only commit subjects
+will therefore find fewer changes under a finding's name than there are;
+this table is the mapping.
+
+| Finding / decision | Fixing commit | Note |
+| --- | --- | --- |
+| R1 lost request after 4 checks | `c3bd5843`, `1bc2e332`, `9a35995e` | `requested_at` column in the migration; the reader/writer; `LOST_REQUEST_SECONDS = 120` and the settle branch in `9a35995e`; test `lost_request_is_cleared_after_two_minutes_and_decided_again` |
+| R2 run key carries the attempt | `c3bd5843`, `1bc2e332` | `request_attempt` column; `run_key_for(id, tokens, attempt)` and the `maxRetries + 1` stop; tests `the_run_key_carries_the_attempt_so_a_retry_is_a_new_key`, `failed_run_retries_with_real_derived_key_and_stops_at_max_retries` |
+| R3 links stay inside the tenant | `1bc2e332`, `c7be9323` | `tenant_id IS NULL` links to nothing; `targets_for`, `upstream_downstream_chain`, `count_lag_pipelines_reading` all take the tenant; `c7be9323` adds the tenant fixtures the tests need |
+| R4 migration number `0084` | `c3bd5843` | rename + header + the R1/R2 columns; `8332b812` fixes the store comments that still named the old file |
+| R5 `SELECT … FOR UPDATE` | `1bc2e332` | `get_lag_state_for_update` inside the transaction that writes the row (`rust/crates/lakehouse-store/src/pipelines.rs:1990`) |
+| R6a budget is request-to-land | `64885934` | median `creationTime → endTime` + two check intervals; 3 tests, each red before it |
+| R6b 2-minute floor | `05137df1` | gate at target 2 min: all five samples met it (worst 95.13 s); floor NOT raised again |
+| R6c both earlier measurements in the result file | `05137df1` | 1-min and 2-min pre-R6a runs recorded with commit and with what evidence survives on disk |
+| BLOCKER 1 tool crosses tenants | `2605e136` | both checks inside `apply_set_target_lag`; test by id and by name |
+| BLOCKER 2 sensor ignores `jobName` (Rust half) | `9a35995e` | `settle_request` compares the found run's `jobName`; test `settle_request_ignores_run_with_different_job_name` |
+| BLOCKER 2 sensor ignores `jobName` (Python half) | `1bc2e332` | `authored_factory.build_authored_lag_sensor` uses `body["jobName"]`, `jobs=[own + downstream]`, skips an unknown job or a missing `runKey` with a log; 3 tests, re-run in this round: `test_sensor_yields_run_request_with_different_allowed_job_name`, `test_sensor_skips_when_job_name_not_allowed`, `test_sensor_skips_when_run_key_missing` |
+| BLOCKER 3 a lost request blocks forever | `9a35995e` | see R1 |
+| BLOCKER 4 a failed run is never retried | `1bc2e332`, `9a35995e` | see R2 |
+| BLOCKER 5 downstream discards P's request | `1bc2e332` | the D7 early returns keep `requested_run_key`/`requested_tokens`/`requested_at`/`request_attempt`; test `downstream_preserves_outstanding_request_when_upstream_has_work` |
+| BLOCKER 6 only one downstream upstream walked | `1bc2e332`, `c7be9323` | `visit_downstream_chain` walks every downstream input; test `upstream_downstream_chain_walks_every_downstream_input` (runnable only after `c7be9323`'s fixtures) |
+| BLOCKER 7 `lag-check` not in `route_auth.rs` | `1bc2e332` | `lag_check_route_authorization_asserted_both_ways` |
+| BLOCKER 8 gate cannot run in CI / cannot fail | `290ff90a` | `:?` must-set reads, `G7Failure` on a driver error, pinned `ops/g7/Dockerfile`, and a sample over the target raises |
+| BLOCKER 9 result file not backed by a run | `05137df1` | rewritten from `/home/shiro/rantai/review/bld2-gate-r6.log` only |
+| BLOCKER 10 TypeScript rules | `1bc2e332`, `916e4330` | `\| string` widening and the panel's `useServiceAction` in `916e4330` |
+| SHOULD-FIX 1 unreadable downstream input | `1bc2e332` | writes `not_measured` + streak 0; test `downstream_unreadable_token_persists_not_measured` |
+| SHOULD-FIX 2 never write an unmeasured status | `1bc2e332` | never-measured U keeps `not_measured`; a run request increments the streak |
+| SHOULD-FIX 3 reader map missed `dependsOn` | `1bc2e332`, `47fcf9ad` | both sides call `count_lag_pipelines_reading`; test `downstream_read_only_through_depends_on_is_recognized_as_read`; the doc, which still described the batched version, in `47fcf9ad` |
+| SHOULD-FIX 4 `pending_since` after SUCCESS | `1bc2e332` | cleared on SUCCESS |
+| SHOULD-FIX 5 budget median of 5 successful runs | `1bc2e332` | `list_runs_for_job(job, 25)` filtered to `SUCCESS`; the `#[allow]` that covered a `try_from` is gone; R6a reworked the arithmetic in `64885934` |
+| SHOULD-FIX 6 a pipeline with no target lag | `1bc2e332` (guard), `0da70138` (test) | the test is red without the guard: it answers `Run` |
+| SHOULD-FIX 7 concurrency | `1bc2e332` | see R5 |
+| SHOULD-FIX 8 `update_pipeline` cycle check | `1bc2e332`, `c7be9323` | a change to a lag pipeline's source/target/`depends_on` runs the cycle check; test `update_pipeline_refuses_target_lag_cycle`, which could only run after `c7be9323`'s tenant fixtures (R3 makes a `tenant_id IS NULL` pipeline link to nothing) |
+| SHOULD-FIX 9 tenant scope of links | `1bc2e332`, `c7be9323` | see R3 |
+| SHOULD-FIX 10 duplicated helper / duplicated doc | `c7be9323` | one `targets_for`; `dfs_cycle`'s doc says once what it does |
+| SHOULD-FIX 11 `find_run_by_run_key` | `1bc2e332` | orders by `creationTime`; the doc names the `dagster/run_key` tag it filters on |
+| SHOULD-FIX 12 tests (3 parts) | `1252c077`, `1bc2e332` | the audit row's column in `1252c077`; `three_consecutive_behind_checks_drive_alert_due` and the tool's refusal of an omitted `targetLag` in `1bc2e332` |
+| SHOULD-FIX 13 small | `1bc2e332` | `inputs_of` answers `not_measured`; `run_one`'s `PipelineBehindTarget` skip names the lag-check route; the audit action is `pipeline.target_lag.set` |
+| SHOULD-FIX 14 gate sensor asserted RUNNING | `1bc2e332`, `290ff90a` | no `startSensor`, `raise_for_status()`, and `lag_sensor_name` shared with the factory |
+| SHOULD-FIX 15 gate timer bias | `290ff90a` | the gate prints the bias on every sample line; the result file repeats it |
+| SHOULD-FIX 16 job timeout | `290ff90a` | `g3a-dagster` `timeout-minutes: 45` with the reason |
+| SHOULD-FIX 17 silent skip when the run token is unset | `1bc2e332` | `authored_factory` logs the warning; test `test_sensor_logs_warning_when_run_token_unset`, re-run in this round |
+| SHOULD-FIX 18 comment next to its assignments | `1bc2e332` | the "Three plain assignments" comment sits on them again |
+| SHOULD-FIX 19 lag cell says "Not measured" | `916e4330` | `pipeline-columns.test.tsx` covers it |
+| SHOULD-FIX 20 `ops/ai_eval/cases.json` | `1bc2e332` | case 1 asserts `minutes: 10`; both BLD-2 cases carry `"note": "not run in CI"` |
+| SHOULD-FIX 21 CHANGELOG wording | `1bc2e332` | describes what D7 built (on demand, upstream first), not "topological order" |
+| SHOULD-FIX 22 fingerprint timing claim | `05137df1` | measured: `clickhouse-client --time` on the largest Silver table the gate left (2005 rows) returned 0.006 s and 0.007 s; the result file says what that does and does not cover |
+
+Found while running the round-1 verification block, not in the review:
+
+| Finding | Fixing commit | Note |
+| --- | --- | --- |
+| `pipeline-freshness-panel.test.tsx`'s `mock.module` replaced the whole auth module, so `bun test src/features` was 34 failures on this branch and 0 on `origin/main` | `f7bcf57d` | same fix PR #160 used in `chart-builder.test.tsx`: keep the real exports, restore in `afterAll` |
+| the previous session's uncommitted `ops/g7/g7_pipeline_test.py` edit added a 30 s "notice budget" to the gate's pass threshold | reverted, not committed | it is a change to what BLOCKER 8 asks the gate to assert, and R6b says to prove the floor, not widen it (rule 2) |
+| `downstream_without_readers`'s doc described the batched implementation the SHOULD-FIX 3 fix removed | `47fcf9ad` | doc only |
+| `evaluate_upstream_chain`'s `map_err` closure sat at the outer indentation | `c4f2f5d8` | whitespace only; `cargo fmt` cannot reindent that chain |
+
+#### Commands run in this round (foreground, on the commits named)
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p lakehouse-api --lib pipeline_lag::tests` (tests before the R6a fix) | 28 passed, **3 failed**: `the_run_budget_is_the_request_to_land_median_plus_two_intervals` (40 vs 70), `the_run_budget_counts_the_queue_before_the_run_started` (90 vs 220), `changes_inside_one_window_are_batched_into_a_single_run` (`Wait` vs `Run`) |
+| `cargo test -p lakehouse-api --lib pipeline_lag::tests` (after R6a) | 31 passed, 0 failed |
+| `cargo test -p lakehouse-api --lib pipeline_lag::tests::a_pipeline_without_a_target_lag_is_never_decided` (guard removed) | 0 passed, **1 failed**: `left: Run, right: Wait` |
+| `cargo test -p lakehouse-api --lib pipeline_lag::tests` (final) | 32 passed, 0 failed |
+| `cargo fmt --check` | rc 0, on `05137df1` and again on `f7bcf57d` |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | rc 0 ("Finished dev profile … in 2m 42s"), on `05137df1`; no Rust changed after it |
+| `cargo-locked test -j 2 --workspace --no-fail-fast > /home/shiro/rantai/review/bld2-r1-ws.log` | rc 0; **116** `test result:` lines; 6132 passed, 0 failed, 38 ignored |
+| gate: `docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster build lakehouse-api dagster-code-location oidc-mock g7-test-runner`, `up -d --no-build`, `run --rm g3a-test-runner`, `run --rm g7-test-runner`, `down -v` (one `flock /home/shiro/rantai/.heavy.lock`) | rc 0 on commit `47fcf9ad4618`, project `bld2r6q`, started 2026-10-16T20:32:16+00:00; `[g3a] PASS`, `[g7] PASS`, samples `[77.2, 95.13, 68.9, 71.11, 89.1]s`, avg 80.29 s, all ≤ 120 s; 5 unchanged checks, 0 new runs; fingerprint 0.006 s / 0.007 s; teardown removed the project. Full log: `/home/shiro/rantai/review/bld2-gate-r6.log` |
+| `bun test src/features` | 1035 passed, 0 failed (90 files) — after `f7bcf57d`; before it: 1001 passed, **34 failed** |
+| `bun test src/services` | 85 passed, 0 failed (13 files) |
+| `bun test src/lib` | 748 tests, 1 skipped, 0 failed (84 files) |
+| `bun test src/components` | 27 passed, 0 failed (5 files) |
+| `bun run typecheck` | rc 0 |
+| `bun run lint` | rc 0; `✖ 9 problems (0 errors, 9 warnings)` — unchanged by this branch |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `venv-bld3/bin/python -m pytest dispar_orchestrate -q` (from `dagster/`) | **1514 passed**, 33 subtests passed, 0 failed (963.85 s) |
+| `venv-bld3/bin/python -m pytest dagster/dispar_orchestrate/test_authored_factory.py -q` | 85 passed (the BLOCKER 2 Python half and SHOULD-FIX 17) |
+| `vars=$(grep -oE '\$\{[A-Z0-9_]+:\?' docker-compose.yml \| …); env $(for v in $vars; do echo "$v=dummy-value-0001"; done) docker compose --profile '*' config --quiet` | `COMPOSE_OK` |
+
+`bun test <folder>` must run from the repository root: `bunfig.toml`'s
+`preload` (HappyDOM, testing cleanup) is only read from the working
+directory, and a run started inside `src/features` misses it and fails
+almost everything.
+
+#### Not verified
+
+- The 34 `src/features` failures were reproduced on this branch and
+  absent on `origin/main` (a throwaway worktree at `origin/main`, since
+  removed); the cause and the fix are in `f7bcf57d`. The rest of the
+  TypeScript suite was not re-run against `origin/main`, so a failure that
+  `origin/main` also has would not have been found — none was seen.
+- `1bc2e332` ("wip: BLD-2 review round 1 fixes in progress") is the
+  previous session's catch-all commit and stays in the history; this round
+  did not rewrite it.
+- The reviewer's 1-minute and 2-minute pre-R6a samples survive only as the
+  numbers quoted in the plan's R6 (and, for the 2-minute run, one sample in
+  `bld2-gate-r1.log`). They were not re-measured here.
+- The gate run's stack was the compose `dagster` profile on this machine,
+  not CI's runner: the images were built locally from this head rather than
+  loaded as artifacts.
+- Nothing was verified in a browser.
+
 ## 8. Review
 
 ### Round 1 (planner, at `5c5a85ffde6f`)
