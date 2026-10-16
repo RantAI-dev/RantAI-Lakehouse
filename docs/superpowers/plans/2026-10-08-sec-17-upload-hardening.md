@@ -371,3 +371,100 @@ the test to drive the current wizard to the same point (the refusal is
 shown, and pressing again sends again); do not change the component to fit
 the test, and do not weaken what the test asserts (rule 2). Check:
 `bun test src/features/connectors` 0 fail, the count quoted.
+
+### Handoff (2026-10-16, round 3)
+
+#### 1. Commits
+
+- `5792792e5d8c` `fix(frontend): drive the SEC-17 429 test through main's upload wizard` — PR #86 review round 2, BLOCKER 1, the only code change of this round.
+- This commit: `docs(plan): record round 3 handoff (SEC-17)`.
+
+Full log `git log --oneline --abbrev=12 origin/main..HEAD`, captured before this commit:
+
+```
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+b510f7948251 docs(plan): SEC-17 round 2, bring the branch up to main
+f43a1b777470 fix(store): a load shown as running for over 6 hours no longer counts
+98bff7e8a413 docs(security): first review of SEC-17
+1a6b7afc7c57 docs(security): handoff of SEC-17
+deaa69bd33b4 docs(ops): gate step, changelog and settings for the SEC-17 upload limits
+```
+
+#### 2. What BLOCKER 1 was, and the fix
+
+The test `UploadFilePage, limits > shows the too-many-uploads sentence for a
+file that was not accepted and sends again on the next press`
+(`src/features/connectors/upload-file-page.test.tsx`) failed at line 996 with
+`Unable to find a label with the text of: Choose a file`. `main`'s reworked
+wizard (`upload-file-step.tsx`) labels the real file input "Choose a file" only
+before a file is picked and "Choose another" once one is, so the test's second
+assertion looked for a label that state does not render.
+
+The component is correct; the assertion was stale. It now checks the
+picked-state control (`getByLabelText("Choose another")`) and that the chosen
+file (`stock.csv`) is still shown — the same "the form is as it was" claim, not
+a weaker one. `next()` staying enabled and the second press sending a second
+POST are unchanged. No component code was changed (AGENTS.md rule 2).
+
+#### 3. Verification commands, verbatim, with counts
+
+- `flock /home/shiro/rantai/.locks/heavy.lock bun test src/features/connectors`:
+
+```
+242 pass
+0 fail
+1036 expect() calls
+Ran 242 tests across 14 files. [10.68s]
+```
+
+- `bun run typecheck` (`bun --bun tsc --noEmit`): no output, exit 0.
+- `bun run lint`: `✖ 8 problems (0 errors, 8 warnings)`. The 8 warnings are the
+  pre-existing ones (react-hooks/exhaustive-deps, no-unused-vars,
+  no-location-assign-relative-destination); none is in
+  `upload-file-page.test.tsx`.
+- gitleaks
+  (`docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`):
+  `scanned ~24731097 bytes (24.73 MB) in 4.57s` / `no leaks found`.
+
+#### 4. Skipped, and premises
+
+- Rust, Python and docker: out of scope this round; no file of those languages
+  was touched, so *not verified* here.
+- Whole `bun run test` / `bun test src`: *not run* (dev-rules forbid them);
+  only the touched folder `src/features/connectors` was run.
+- No premise of the plan turned out wrong. The plan's §10 BLOCKER 1 described
+  the code exactly: the label is in `upload-file-step.tsx` and is rendered only
+  in the no-file state.
+
+#### 5. Repository state
+
+`git status --short` (empty):
+
+```
+```
+
+`git log --oneline --abbrev=12 origin/main..HEAD | head`:
+
+```
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+b510f7948251 docs(plan): SEC-17 round 2, bring the branch up to main
+f43a1b777470 fix(store): a load shown as running for over 6 hours no longer counts
+98bff7e8a413 docs(security): first review of SEC-17
+1a6b7afc7c57 docs(security): handoff of SEC-17
+deaa69bd33b4 docs(ops): gate step, changelog and settings for the SEC-17 upload limits
+```
+
+`git ls-remote --heads origin fix/sec-17-upload-hardening` (12-char prefix of the
+full output):
+
+```
+5792792e5d8c	refs/heads/fix/sec-17-upload-hardening
+```
