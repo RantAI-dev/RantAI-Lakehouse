@@ -126,7 +126,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
 | `OPS-8` | Feature | Usage and cost view | Operations | P2 | Idea |  | PRODUCT §2 |
 | `SEC-2` | Feature | Login rate limiting | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
-| `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | In Progress | #TBD | PRODUCT §2 |
+| `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | In Progress | #181 | PRODUCT §2 |
 | `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
 | `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/OPERATIONS.md` |
 | `SEC-7` | Task | A monitored security contact address | Administration & Security | P2 | Todo |  | `SECURITY.md` |
