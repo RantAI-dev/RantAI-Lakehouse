@@ -44,6 +44,8 @@ use crate::state::AppState;
 
 // One more record: what each table was last built from (see the module).
 mod builds;
+// Column-level lineage (`DATA-13`): producers, and the route that reads it.
+pub(crate) mod columns;
 
 /// Most nodes one response carries, so a focus on a hub table cannot
 /// return the whole warehouse.

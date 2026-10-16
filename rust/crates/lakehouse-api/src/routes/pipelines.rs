@@ -2730,6 +2730,10 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
+    // the pipeline's column lineage. A failed run was refused above and
+    // writes nothing.
+    super::lineage::columns::record_pipeline_run(&state, pool, &pipeline_id).await;
     // Plan 1f: compute the two per-run outcomes from the run's own data
     // and the pipeline's `pipeline_sla` row, then hand them to the
     // evaluator. `slow` is `None` when no duration SLA is configured
