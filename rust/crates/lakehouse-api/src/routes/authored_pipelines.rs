@@ -4226,9 +4226,11 @@ mod tests {
                 .unwrap();
             assert_eq!(stored.target_lag, Some(TargetLag::Lag { minutes: 15 }));
 
-            // BLD-2 review R1 SHOULD-FIX 12: assert audit row
+            // BLD-2 review R1 SHOULD-FIX 12: assert the audit row the PUT
+            // wrote — `audit_event`'s timestamp column is `at`, not
+            // `created_at`.
             let audit_rows: Vec<(String, Value)> = sqlx::query_as(
-                "SELECT action, args FROM audit_event WHERE resource_id = $1 ORDER BY created_at ASC",
+                "SELECT action, args FROM audit_event WHERE resource_id = $1 ORDER BY at ASC",
             )
             .bind(&pl.id)
             .fetch_all(&pool)
