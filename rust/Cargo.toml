@@ -33,6 +33,12 @@ hmac = "0.13"
 sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
+# `SRC-12` decision 4: AES-256-GCM for managed connector credentials at rest
+# (`lakehouse-api::secret_crypto`). RustCrypto, already in the lockfile
+# (0.10.3) through `iceberg`, so no new crate enters the dependency check;
+# `alloc` for the `Vec`-returning AEAD calls, `aes` for the cipher; the
+# `getrandom` feature is left off, nonces come from `rand`.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # `routes::auth::oidc_start` builds the IdP authorize
 # redirect via `url::Url`'s query-pair encoder rather than hand-formatting
 # a query string, so a param value can never break the URL's structure.

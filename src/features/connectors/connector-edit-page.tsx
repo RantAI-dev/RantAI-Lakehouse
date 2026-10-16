@@ -22,6 +22,7 @@ import type {
   ConnectorTestResult,
   ConnectorType,
   CredentialKind,
+  CredentialSettings,
   IngestSpec,
   IngestSpecInput,
   SetConnectorCredentialRequest,
@@ -54,7 +55,13 @@ const STEPS: FormStep[] = [
   { id: "review", label: "Review", description: "Confirm changes" },
 ]
 
-type Loaded = { detail: ConnectorDetail; spec: IngestSpec; type: ConnectorType | null }
+type Loaded = {
+  detail: ConnectorDetail
+  spec: IngestSpec
+  type: ConnectorType | null
+  /** What this installation offers for a credential (`SRC-12` part B). */
+  settings: CredentialSettings
+}
 
 /** One part of a save, reported back to the user in order. A `note` on a
  * saved part says something the user should still know (e.g. a credential
@@ -82,12 +89,13 @@ type SaveStep = { label: string; status: "done" | "failed"; message?: string; no
 export function ConnectorEditPage({ connectorId }: { connectorId: string }) {
   const loaded = useService<Loaded>(
     async (signal) => {
-      const [detail, spec, types] = await Promise.all([
+      const [detail, spec, types, settings] = await Promise.all([
         connectorService.getConnector(connectorId, signal),
         connectorService.getIngestSpec(connectorId, signal),
         connectorService.listTypes(signal),
+        connectorService.getCredentialSettings(signal),
       ])
-      return { detail, spec, type: types.find((t) => t.name === detail.type) ?? null }
+      return { detail, spec, type: types.find((t) => t.name === detail.type) ?? null, settings }
     },
     [connectorId]
   )
@@ -98,7 +106,7 @@ export function ConnectorEditPage({ connectorId }: { connectorId: string }) {
 }
 
 function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }) {
-  const { detail, spec, type } = loaded
+  const { detail, spec, type, settings } = loaded
   const { user } = useAuth()
   const adapter = spec.adapter ?? type?.adapter ?? null
   const originalDial = React.useMemo(() => (spec.dial ?? {}) as Record<string, unknown>, [spec.dial])
@@ -122,10 +130,15 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   // Write-only: sent once on save, cleared right after, never rendered back.
   const [primaryValue, setPrimaryValue] = React.useState("")
   const [secondaryValue, setSecondaryValue] = React.useState("")
+  // `SRC-12` part B: with a secret manager set up, the credential may be a
+  // reference to a secret in it instead of a typed value. The operator can
+  // turn typing off, which leaves only the reference.
+  const [referenceChosen, setReferenceChosen] = React.useState(false)
+  const referenceMode = settings.secretManager !== null && (referenceChosen || !settings.typedCredentials)
   React.useEffect(() => {
     setPrimaryValue("")
     setSecondaryValue("")
-  }, [slotsKey])
+  }, [slotsKey, referenceMode])
   const [environment, setEnvironment] = React.useState(detail.environment)
   const [tenantId, setTenantId] = React.useState(detail.tenantId ?? "")
   const [residency, setResidency] = React.useState(detail.residency)
@@ -147,6 +160,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     slots,
     primaryValue,
     secondaryValue,
+    referenceManager: referenceMode ? settings.secretManager : null,
   })
 
   // ── What changed ──────────────────────────────────────────────────────
@@ -202,9 +216,14 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
       }
     }
     const values: Pick<SetConnectorCredentialRequest, "primary" | "secondary"> = {}
-    if (credentialTyped) {
+    if (credentialTyped && referenceMode) {
+      // A reference names a place and is sent as it is; the server reads it
+      // once and tests the connection before saving it.
+      values.primary = { reference: primaryValue }
+      if (slots.secondary && !slots.secondary.signIn) values.secondary = { reference: secondaryValue }
+    } else if (credentialTyped) {
       values.primary = { kind: slots.primary.kind, value: normalizedCredential(slots.primary, primaryValue) }
-      if (slots.secondary) {
+      if (slots.secondary && !slots.secondary.signIn) {
         values.secondary = {
           kind: slots.secondary.kind,
           value: normalizedCredential(slots.secondary, secondaryValue),
@@ -368,7 +387,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
       ? [
           {
             label: "Credential",
-            value: `New ${slots.primary.label.toLowerCase()}${
+            value: `${referenceMode ? "Reference to a secret for the" : "New"} ${slots.primary.label.toLowerCase()}${
               slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
             } · ${
               repoints ? "sent with the new connection settings and tested against them" : "tested before it replaces the current one"
@@ -434,7 +453,13 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 title="Connection details"
                 description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
               />
-              <DialFormFor adapter={adapter} typeName={detail.type} dial={dial} onChange={setDial} />
+              <DialFormFor
+                adapter={adapter}
+                typeName={detail.type}
+                dial={dial}
+                onChange={setDial}
+                oauthCallbackUrl={settings.oauthCallbackUrl}
+              />
             </section>
             <section className="space-y-3 border-t border-border pt-5">
               <StepSectionHeading
@@ -452,12 +477,16 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
                 noCredential={noCredential}
                 optional={!signInChanged && !repoints}
                 credentialManaged={detail.credentialManaged}
+                credentialSource={detail.credentialSource}
                 slots={slots}
                 primaryValue={primaryValue}
                 onPrimaryValueChange={setPrimaryValue}
                 secondaryValue={secondaryValue}
                 onSecondaryValueChange={setSecondaryValue}
                 problems={problems}
+                settings={settings}
+                referenceMode={referenceMode}
+                onReferenceModeChange={setReferenceChosen}
               />
             </section>
           </div>

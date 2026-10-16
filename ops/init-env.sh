@@ -14,6 +14,11 @@
 # hex from `openssl rand` (or /dev/urandom when openssl is absent), which is
 # safe inside the connection strings compose builds from them.
 #
+# CONNECTOR_SECRETS_KEY (SRC-12) is the one value that is NOT hex: it must
+# be 32 random bytes in base64 (`openssl rand -base64 32`), and compose
+# refuses to start while it is empty. Keep a copy of it: losing it loses
+# every stored connector credential (docs/OPERATIONS.md).
+#
 # AUTH_BOOTSTRAP_PASSWORD is generated too, so the first login works: read
 # it from `.env` once, then change it in the console. The SeaweedFS keys are
 # filled so `--profile seaweedfs` starts; they are unused otherwise.
@@ -47,6 +52,14 @@ tmp=$(mktemp "$root/.env.init.XXXXXX")
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 cp "$example" "$tmp"
 
+gen_b64() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32
+  else
+    head -c 32 /dev/urandom | base64
+  fi
+}
+
 filled=""
 for var in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
   LAKEKEEPER_ENCRYPTION_KEY SEAWEEDFS_ACCESS_KEY SEAWEEDFS_SECRET_KEY \
@@ -64,6 +77,17 @@ for var in POSTGRES_PASSWORD RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY \
     filled="$filled $var"
   fi
 done
+
+# SRC-12 merge fix: the connector credential key, in base64 (see header).
+if grep -q '^CONNECTOR_SECRETS_KEY=$' "$tmp"; then
+  VALUE=$(gen_b64) awk '
+    BEGIN { value = ENVIRON["VALUE"] }
+    $0 == "CONNECTOR_SECRETS_KEY=" { print "CONNECTOR_SECRETS_KEY=" value; next }
+    { print }
+  ' "$tmp" > "$tmp.next"
+  mv "$tmp.next" "$tmp"
+  filled="$filled CONNECTOR_SECRETS_KEY"
+fi
 
 # Local dev only: the tenant warehouse pair may equal the RustFS pair (ADR 0002
 # Addendum 2, "may equal, must never alias"), as .env.example used to say.

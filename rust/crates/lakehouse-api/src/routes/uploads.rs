@@ -39,7 +39,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   seven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   eight the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -103,7 +103,9 @@ use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, TableClaim, Upload};
+use lakehouse_store::uploads::{
+    self, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -118,6 +120,7 @@ use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet::{self, ParquetInfo};
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
@@ -263,10 +266,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these seven (review finding
+// shows a recorded reason only when it is one of these eight (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same seven as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same eight as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -278,10 +281,14 @@ const JOB_NO_ROWS: &str = "The file has no rows below the header row.";
 const JOB_TOO_MANY_ROWS: &str = "The file has more than 2,000,000 rows.";
 const JOB_LOAD_FAILED: &str = "The load into the table failed.";
 const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be registered in the catalog.";
+// `SEC-17`: the one sentence for the column cap, as the preview's and the
+// ingest's 400 and as the job's failure reason (`TOO_MANY_COLUMNS` in
+// `file_ingest.py`). One constant, so the three cannot word it differently.
+const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 7] = [
+const JOB_FAILURE_REASONS: [&str; 8] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -289,6 +296,7 @@ const JOB_FAILURE_REASONS: [&str; 7] = [
     JOB_TOO_MANY_ROWS,
     JOB_LOAD_FAILED,
     JOB_NOT_REGISTERED,
+    JOB_TOO_MANY_COLUMNS,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -675,12 +683,15 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
 ///
 /// # Errors
 ///
-/// 400 for a caller in no tenant, a request that is not a multipart form, no
+/// 429 (`Retry-After: 5`) when the caller already has the configured number of
+/// files being received, or the installation has (`SEC-17`); 400 for a caller
+/// in no tenant, a request that is not a multipart form, no
 /// `file` part, an empty file, a file over [`MAX_UPLOAD_BYTES`], a workbook
 /// that is not an `.xls` or `.xlsx` or does not open (damaged, password
 /// protected, no sheet), a Parquet file that is not named `.parquet` or does
 /// not open (damaged, encrypted, a binary or nested column, over the cell cap)
-/// or another binary (each with its own fixed sentence); 404 if `X-Tenant` names a tenant the caller does not belong to;
+/// or another binary (each with its own fixed sentence), and a header with
+/// more than 1,000 columns (`SEC-17`); 404 if `X-Tenant` names a tenant the caller does not belong to;
 /// 503 when Postgres or the object store is unavailable.
 pub async fn create(
     State(state): State<AppState>,
@@ -693,6 +704,14 @@ pub async fn create(
     };
     let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
         return Err(ApiError::BadRequest(NO_TENANT.to_owned()).into());
+    };
+    // `SEC-17`: a place is taken before the body is read, because each file
+    // being received is held in memory (up to 50 MB), and is given back when
+    // `_place` drops at the end of the handler, on every path. Keyed by the
+    // display name, the same text `uploaded_by` records, so the per-user
+    // number means the same for receiving and for loading.
+    let Some(_place) = state.upload_receive.try_acquire(&principal.display_name) else {
+        return Err(too_many_uploads().into());
     };
     let pool = pool(&state)?;
     let store = UploadStore::connect(&state.config).await?;
@@ -1168,7 +1187,8 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// 400 for an `encoding`, `delimiter` or `headerRow` that is not valid, and
 /// for a workbook or Parquet file that cannot be read, a `sheet` a workbook
 /// does not have or a sheet or file over the cell limit (each with its own
-/// fixed sentence); 404
+/// fixed sentence), and for a text file with a header of more than 1,000
+/// columns (`SEC-17`); 404
 /// for an unknown upload or another tenant's; 503 when Postgres or the object
 /// store is unavailable.
 pub async fn preview(
@@ -1200,6 +1220,14 @@ pub async fn preview(
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    // `SEC-17`: a header with more than `MAX_COLUMNS` cells is refused here,
+    // not shown. The 400 is per reading, so the Check step can still change
+    // the delimiter or header row (a wrong guess must not lock a good file
+    // out). Workbook and Parquet paths run their own refusal (`upload_workbook`
+    // and `upload_parquet`), so the column cap is checked only for text.
+    if upload_parse::header_width(&head, head_is_truncated, overrides) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
     Ok(ApiJson(PreviewResponse {
         preview: upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS),
         workbook: None,
@@ -1537,6 +1565,51 @@ fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str) -> Value
     })
 }
 
+/// The load limits of `SEC-17`, from the configuration.
+fn load_limits(state: &AppState) -> LoadLimits {
+    LoadLimits {
+        per_user: i64::from(state.config.upload_max_concurrent_per_user),
+        total: i64::from(state.config.upload_max_concurrent),
+    }
+}
+
+/// `SEC-17`: count the header's cells under the reading the user confirmed,
+/// AND ask the load limit, before any claim, mark or launch. A file the job
+/// would refuse leaves no table claim behind, and a request that passes
+/// the read but loses the locked count in `mark_ingesting_within_limits`
+/// below keeps its claim, as a claim does when a launch fails (a claim
+/// is never released).
+///
+/// # Errors
+///
+/// 429 (`Retry-After: 5`) when the `uploaded_by` already has the configured
+/// number of loads running, or the installation has; 400 when the header
+/// has more than 1,000 columns under the confirmed reading; 503 when the
+/// object store cannot serve the head.
+async fn check_within_limits_and_column_cap(
+    state: &AppState,
+    pool: &PgPool,
+    row: &Upload,
+    request: &IngestRequest,
+) -> ApiResult<LoadLimits> {
+    let limits = load_limits(state);
+    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
+        return Err(too_many_uploads().into());
+    }
+    let store = UploadStore::connect(&state.config).await?;
+    let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
+    let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    let confirmed = Overrides {
+        encoding: Some(request.encoding),
+        delimiter: Some(request.delimiter),
+        header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+    };
+    if upload_parse::header_width(&head, head_is_truncated, confirmed) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
+    Ok(limits)
+}
+
 /// Launch `file_ingest_job` for the claimed upload and return the run id. A
 /// launch that does not happen settles the claim as failed
 /// ([`COULD_NOT_START`]) before the error is returned, so the upload is not
@@ -1643,7 +1716,7 @@ async fn convert_upload(
 /// finished must not block the next one); check the table is free
 /// ([`ensure_table_free`]) and not being loaded by another upload; CLAIM THE
 /// TABLE NAME ([`uploads::claim_table`]); CLAIM the row
-/// ([`uploads::mark_ingesting`], no run id); launch; attach the run
+/// ([`uploads::mark_ingesting_within_limits`], no run id); launch; attach the run
 /// ([`uploads::attach_run`]).
 ///
 /// The table claim comes just before the row claim (review finding B4): the
@@ -1659,10 +1732,13 @@ async fn convert_upload(
 ///
 /// # Errors
 ///
-/// 400 for a body that is not valid (each field has its own sentence), and
-/// for a workbook or Parquet file that cannot be read, a sheet a workbook does
-/// not have, a sheet or file over the cell limit, an empty sheet or a Parquet
-/// file with no rows; 404
+/// 429 (`Retry-After: 5`) when the person who uploaded the file already has
+/// the configured number of loads running, or the installation has (`SEC-17`);
+/// 400 for a body that is not valid (each field has its own sentence), for a
+/// workbook or Parquet file that cannot be read, a sheet a workbook does not
+/// have, a sheet or file over the cell limit, an empty sheet or a Parquet
+/// file with no rows, and for a header with more than 1,000 columns under the
+/// confirmed reading (`SEC-17`, checked before any claim); 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
 /// loading, another is loading into that table, a connector loads it, or the
 /// name cannot be used ([`TABLE_NOT_FREE`]: another tenant's connector loads
@@ -1692,6 +1768,7 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
+    let limits = check_within_limits_and_column_cap(&state, pool, &row, &request).await?;
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
@@ -1726,25 +1803,66 @@ pub async fn ingest(
     {
         map.insert("sheet".to_owned(), json!(sheet));
     }
-    let Some(claimed) = uploads::mark_ingesting(
+    // `SEC-17`: counts and marks in one locked transaction, so two starts at
+    // the same moment cannot both take the last place.
+    let claimed = match uploads::mark_ingesting_within_limits(
         pool,
         &row.id,
         &parse_options,
         &request.table,
         request.mode,
-        None,
+        limits,
     )
     .await?
-    else {
-        // Lost the race to another request, or the upload went away.
-        return Err(match uploads::get(pool, &row.id).await? {
-            Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
-            None => not_found(),
+    {
+        MarkOutcome::Marked(claimed) => *claimed,
+        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        MarkOutcome::NotMarked => {
+            // Lost the race to another request, or the upload went away.
+            return Err(match uploads::get(pool, &row.id).await? {
+                Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
+                None => not_found(),
+            }
+            .into());
         }
-        .into());
     };
 
     let run_id = launch(&state, pool, &claimed, &request, load_key).await?;
+    let attached = finish_launch_and_audit(
+        pool,
+        &principal,
+        &claimed,
+        run_id.clone(),
+        &request,
+        converted.as_ref(),
+        conversion,
+    )
+    .await?;
+    Ok(ApiJson(IngestResponse {
+        upload: attached.into(),
+        run_id,
+    }))
+}
+
+/// Attach the run the launch gave us to the `ingesting` row, and record the
+/// `upload.ingest` audit event the rest of the system reads. Extracted from
+/// `ingest` so the handler stays under the clippy `too_many_lines` cap.
+///
+/// # Errors
+///
+/// 500 when the launched run could not be attached to its upload (an
+/// `ingesting` row with no run is the only one that takes a run, so the only
+/// way this happens is a row settled or was deleted between the launch and
+/// the attach — a logged error, not a panic).
+async fn finish_launch_and_audit(
+    pool: &PgPool,
+    principal: &Principal,
+    claimed: &Upload,
+    run_id: String,
+    request: &IngestRequest,
+    converted: Option<&Converted>,
+    conversion: Option<Conversion>,
+) -> ApiResult<Upload> {
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -1760,7 +1878,7 @@ pub async fn ingest(
         "mode": request.mode.as_str(),
     });
     if let Value::Object(map) = &mut args {
-        match (&converted, conversion) {
+        match (converted, conversion) {
             (
                 Some(Converted {
                     sheet: Some(sheet), ..
@@ -1775,12 +1893,9 @@ pub async fn ingest(
             _ => {}
         }
     }
-    let event = upload_audit_event(&principal, "upload.ingest", &attached.id, args, "executed");
+    let event = upload_audit_event(principal, "upload.ingest", &attached.id, args, "executed");
     record_audit(pool, event).await;
-    Ok(ApiJson(IngestResponse {
-        upload: attached.into(),
-        run_id,
-    }))
+    Ok(attached)
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────
@@ -2560,8 +2675,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the seven the API knows (six before finding C2). Each of the
-    /// seven is kept; text that is near one of them, text with detail added,
+    /// one of the eight the API knows (six before finding C2). Each of the
+    /// eight is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -2596,8 +2711,8 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the seven reasons the API knows are the
-    /// seven in the file the job's own tests assert its constants against
+    /// Review findings B6 and C2: the eight reasons the API knows are the
+    /// eight in the file the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -2613,7 +2728,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 7, "seven different reasons");
+        assert_eq!(distinct.len(), 8, "eight different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

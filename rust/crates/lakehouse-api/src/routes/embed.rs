@@ -22,7 +22,8 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
-    mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
+    annotate_metric_labels, mart_columns, render_stored_spec, run_spec_sql, sources_for,
+    stored_chart_sql,
 };
 use crate::state::AppState;
 use crate::upstream_error;
@@ -410,6 +411,95 @@ pub async fn public_dashboard(
     }
 }
 
+/// A chart as an embed or a public link shows it: the render spec of the
+/// chart as this read sees it (`BI-11`: the columns its parameters gave its
+/// slots), the editor's definition, and no click setting. `BI-18`·B: embeds
+/// and public links have no click menu and no destinations, so the editor's
+/// click setting (a board id, a column or a URL) is not sent to someone who
+/// cannot use it.
+fn embed_rendered(original: &StoredChartSpec, effective: &StoredChartSpec) -> Value {
+    let mut rendered = render_stored_spec(&effective.spec, effective.source);
+    rendered["board"] = json!(original.board);
+    rendered["def"] = serde_json::to_value(&original.def).unwrap_or_else(|_| json!({}));
+    if let Some(def) = rendered["def"].as_object_mut() {
+        def.remove("click");
+    }
+    rendered
+}
+
+/// The board's tile layout as the payload carries it.
+fn layout_json(board: &Board) -> Value {
+    board.layout.as_ref().map_or_else(
+        || json!({}),
+        |l| {
+            let mut m = serde_json::Map::new();
+            for (k, b) in l {
+                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
+            }
+            Value::Object(m)
+        },
+    )
+}
+
+/// The calculated fields of every source.
+///
+/// BI-8: an embed or a public link shows a chart that uses a calculated field
+/// exactly as the dashboard does (same builder, same role rewrite with the
+/// embed viewer's role).
+///
+/// PR #104 CI fix: a catalog that cannot be read must not take the whole embed
+/// down (it used to render, with a per-tile fixed message for a tile that
+/// failed). Like the dashboard route, a failed read leaves the catalog empty: a
+/// chart that names a calculated field then fails on its own statement with the
+/// fixed tile message and a reference, never showing a wrong number, and the
+/// failure is logged under its own reference.
+async fn catalog_or_empty(ch: &ChClient) -> lakehouse_bi::fields::FieldCatalog {
+    match lakehouse_bi::fields::list_catalog_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            lakehouse_bi::fields::FieldCatalog::default()
+        }
+    }
+}
+
+/// The columns of every table, read only when something on the board needs
+/// them. Column types are what decides whether a chart's grain still fits its
+/// dimension (BI-9), and which filters apply.
+///
+/// BI-13: the questions of a combined chart need the columns of their own
+/// sources. That read is optional for the board (PR #104 lesson): when it
+/// fails the questions that need it say so and everything else renders.
+async fn board_columns(
+    ch: &ChClient,
+    charts: &[&StoredChartSpec],
+    filters: &[FilterDef],
+    fields: &lakehouse_bi::fields::FieldCatalog,
+) -> Result<
+    std::collections::HashMap<String, lakehouse_bi::builder::RelationColumns>,
+    lakehouse_clickhouse::ChError,
+> {
+    let need_cols = filters.iter().any(FilterDef::is_active)
+        || charts.iter().any(|c| {
+            c.def.needs_columns()
+                || fields.chart_uses(&c.def)
+                || lakehouse_bi::params::changes_statement(&c.def)
+        });
+    if need_cols {
+        return mart_columns(ch).await;
+    }
+    if charts.iter().any(|c| !c.def.shape.layers_list().is_empty()) {
+        return Ok(match mart_columns(ch).await {
+            Ok(found) => found,
+            Err(err) => {
+                let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+                std::collections::HashMap::new()
+            }
+        });
+    }
+    Ok(std::collections::HashMap::new())
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -425,23 +515,7 @@ async fn render_board_payload(
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     let stored = store::list_stored_charts(ch).await?;
-    // BI-8: an embed or a public link shows a chart that uses a calculated
-    // field exactly as the dashboard does (same builder, same role rewrite
-    // with the embed viewer's role).
-    //
-    // PR #104 CI fix: a catalog that cannot be read must not take the whole
-    // embed down (it used to render, with a per-tile fixed message for a tile
-    // that failed). Like the dashboard route, a failed read leaves the catalog
-    // empty: a chart that names a calculated field then fails on its own
-    // statement with the fixed tile message and a reference, never showing a
-    // wrong number, and the failure is logged under its own reference.
-    let field_catalog = match lakehouse_bi::fields::list_fields(ch).await {
-        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
-        Err(err) => {
-            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
-            lakehouse_bi::fields::FieldCatalog::default()
-        }
-    };
+    let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
         .filter(|c| {
@@ -453,25 +527,21 @@ async fn render_board_payload(
         })
         .collect();
 
-    // Column types are also what decides whether a chart's grain still fits
-    // its dimension (BI-9).
-    let need_cols = filters.iter().any(FilterDef::is_active)
-        || stored_for_board
-            .iter()
-            .any(|c| c.def.needs_columns() || field_catalog.chart_uses(&c.def));
-    let cols = if need_cols {
-        mart_columns(ch).await?
-    } else {
-        std::collections::HashMap::new()
-    };
+    let cols = board_columns(ch, &stored_for_board, filters, &field_catalog).await?;
 
     let mut results = serde_json::Map::new();
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     // BI-9: embeds and public links offer no grain switch; they use the one
     // the board saved, and each chart's own where there is none.
+    // BI-11: an embed or a public link offers no control; it uses the values
+    // the board saved, else each parameter's default. A store that cannot be
+    // read leaves the values empty, so only a chart that names a parameter
+    // shows an error (fail closed per tile).
+    let values = crate::routes::params::saved_or_default(ch, board).await;
+    let time_with_params = time.clone().with_params(values.clone());
     let read = lakehouse_bi::builder::ReadContext {
-        time,
+        time: &time_with_params,
         grain: board
             .grain
             .as_deref()
@@ -479,7 +549,33 @@ async fn render_board_payload(
             .filter(|g| g.is_truncation()),
         fields: &field_catalog,
     };
-    for c in &stored_for_board {
+    let layer_sources =
+        crate::routes::layers::layer_sources(ch, stored_for_board.iter().copied()).await;
+    let layer_runner = crate::routes::layers::RoleRunner {
+        ch,
+        roles: &roles,
+        placeholders: &placeholders,
+        obligations,
+    };
+    let layer_ctx = crate::routes::layers::LayerContext {
+        runner: &layer_runner,
+        years: &[],
+        filters,
+        cols: &cols,
+        chart_sources: &sources,
+        layer_sources: &layer_sources,
+        read: &read,
+    };
+    for original in &stored_for_board {
+        let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
+        let c = match &effective {
+            Ok(e) => &**e,
+            Err(msg) => {
+                results.insert(original.spec.id.clone(), json!({ "error": msg }));
+                charts_out.push(embed_rendered(original, original));
+                continue;
+            }
+        };
         match stored_chart_sql(c, &[], filters, &cols, &sources, &read) {
             Ok(filtered) => {
                 let (id, mut val) = run_spec_sql(
@@ -491,6 +587,7 @@ async fn render_board_payload(
                     obligations,
                 )
                 .await;
+                crate::routes::support::annotate_params(&mut val, c, &values);
                 crate::routes::support::annotate_grain(&mut val, &filtered, c);
                 // BI-16 part A: the first page of a raw table, with its
                 // total; an embed and a public link offer no paging.
@@ -501,6 +598,9 @@ async fn render_board_payload(
                     (&roles, &placeholders, obligations),
                 )
                 .await;
+                crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain)
+                    .await;
+                annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
                 results.insert(id, val);
             }
             Err(msg) => {
@@ -508,28 +608,10 @@ async fn render_board_payload(
             }
         }
 
-        let mut rendered = render_stored_spec(&c.spec, c.source);
-        rendered["board"] = json!(c.board);
-        rendered["def"] = serde_json::to_value(&c.def).unwrap_or_else(|_| json!({}));
-        // BI-18·B: embeds and public links have no click menu and no
-        // destinations, so the editor's click setting (a board id, a column
-        // or a URL) is not sent to someone who cannot use it.
-        if let Some(def) = rendered["def"].as_object_mut() {
-            def.remove("click");
-        }
-        charts_out.push(rendered);
+        charts_out.push(embed_rendered(original, c));
     }
 
-    let layout = board.layout.as_ref().map_or_else(
-        || json!({}),
-        |l| {
-            let mut m = serde_json::Map::new();
-            for (k, b) in l {
-                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-            }
-            Value::Object(m)
-        },
-    );
+    let layout = layout_json(board);
 
     Ok(json!({
         "board": { "id": board.id, "name": board.name },
@@ -658,6 +740,7 @@ mod typed_filters {
             filters: Some(filters.clone()),
             refresh_seconds: None,
             grain: None,
+            params: None,
             created_at: None,
             updated_at: None,
             public_token: None,
@@ -700,6 +783,99 @@ mod typed_filters {
             tile.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub') > 0"),
             "{tile}"
         );
+    }
+
+    /// BI-6: a chart's own filters apply on an embed or a public link whatever
+    /// the board's saved filters are, and the tile can list them.
+    #[tokio::test]
+    async fn an_embed_applies_a_charts_own_filters_with_the_boards() {
+        let server = MockServer::start().await;
+        let spec = json!({
+            "id": "c1", "title": "T", "kind": "bar", "mart": "mart_a",
+            "sql": "SELECT stored_sql_marker", "x": "kab", "y": "visitors"
+        });
+        let def = json!({
+            "title": "T", "mart": "mart_a", "kind": "bar", "dimension": "kab",
+            "measures": ["visitors"],
+            "filters": [{ "column": "kab", "values": ["a", "b"] }]
+        });
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            vec![json!({
+                "id": "c1", "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })],
+        )
+        .await;
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            vec![
+                json!({ "table": "mart_a", "name": "kab", "type": "String" }),
+                json!({ "table": "mart_a", "name": "visitors", "type": "UInt32" }),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        // No filter is active on the board: the chart's own still rebuild its statement.
+        let board = Board {
+            id: "b1".to_owned(),
+            name: "B".to_owned(),
+            description: None,
+            created_by: None,
+            layout: None,
+            filters: None,
+            refresh_seconds: None,
+            grain: None,
+            params: None,
+            created_at: None,
+            updated_at: None,
+            public_token: None,
+            embed_enabled: None,
+            folder_id: None,
+            embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
+        };
+        let locked: Vec<FilterDef> =
+            serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
+
+        let body = render_board_payload(
+            &ch,
+            &PolicyEngineObligations::new(None, &ch),
+            &board,
+            "b1",
+            &locked,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["charts"][0]["def"]["filters"][0]["column"], "kab");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let tile = sent
+            .iter()
+            .find(|s| s.contains("FROM serving.mart_a WHERE"))
+            .unwrap_or_else(|| panic!("tile query not sent: {sent:?}"));
+        assert!(
+            tile.contains("kab IN ('a', 'b') AND kab IN ('b', 'c')"),
+            "{tile}"
+        );
+        assert!(!tile.contains("stored_sql_marker"), "{tile}");
     }
 
     /// BI-9: an embed or public link has no grain switch; it uses the grain
@@ -753,6 +929,7 @@ mod typed_filters {
             filters: None,
             refresh_seconds: None,
             grain: Some("month".to_owned()),
+            params: None,
             created_at: None,
             updated_at: None,
             public_token: None,

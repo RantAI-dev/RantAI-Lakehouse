@@ -74,3 +74,25 @@ test("fractional data keeps the charts' decimals on the change", () => {
   assert.equal(signedAmount(2.5, 2), "+2.5")
   assert.equal(signedAmount(-20459.4), "-20,459")
 })
+
+test("same period last year finds the bucket a year earlier and also reads the change against the previous period (BI-2)", async () => {
+  const { readKpi, yearAgoKey } = await import("./kpi-compare")
+  const rows = [
+    { d: "2025-10-01", v: 100 }, { d: "2025-11-01", v: 200 }, { d: "2026-09-01", v: 300 }, { d: "2026-10-01", v: 150 }, { d: "2026-11-01", v: 250 },
+  ]
+  const r = readKpi(rows, { kind: "last_year", dateColumn: "d", period: "month" }, "up", "month")
+  assert.equal(r.mode, "last_year")
+  assert.equal(r.value, 250)
+  assert.equal(r.reference, 200)
+  assert.equal(r.delta, 50)
+  assert.equal(r.percent, 25)
+  assert.equal(r.previous?.reference, 150)
+  assert.equal(r.previous?.delta, 100)
+  // No date column named (a metric's default): the bucket is the column that is not `v`.
+  assert.equal(readKpi(rows, { kind: "last_year" }, "up", "month").reference, 200)
+  // A year with no data a year earlier compares with nothing.
+  assert.equal(readKpi(rows.slice(2), { kind: "last_year" }, "up", "month").delta, null)
+  // A week is shifted by 52 weeks, not by a year.
+  assert.equal(yearAgoKey("2026-11-02", "week"), "2025-11-03")
+  assert.equal(yearAgoKey("2026-11-02", "day"), "2025-11-02")
+})

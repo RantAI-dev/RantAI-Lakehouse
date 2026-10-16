@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use lakehouse_core::ident::Ident;
 use serde::{Deserialize, Serialize};
 
+use crate::bin::BinMode;
 use crate::builder::{Relation, RelationColumns};
 use crate::filters::ColumnKind;
 use crate::grain::{Grain, TimeContext};
@@ -128,7 +129,7 @@ pub struct PivotValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Compare {
-    /// `previous` or `goal`.
+    /// `previous`, `last_year` (`BI-2`) or `goal`.
     pub kind: String,
     /// `previous`: the date or timestamp column the periods are cut from.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -206,7 +207,11 @@ impl TableFields {
     /// the deployment's time settings, so it is rebuilt at read time).
     #[must_use]
     pub fn compares_to_previous(&self, kind: ChartKind) -> bool {
-        kind == ChartKind::Kpi && self.compare.as_ref().is_some_and(|c| c.kind == "previous")
+        kind == ChartKind::Kpi
+            && self
+                .compare
+                .as_ref()
+                .is_some_and(|c| c.kind == "previous" || c.kind == "last_year")
     }
 }
 
@@ -476,6 +481,27 @@ pub fn pivot_grain_field<H: std::hash::BuildHasher>(
     first_date_field(names.map(String::as_str), cols)
 }
 
+/// The first row or column field of a pivot that is a number column, the one a
+/// `BI-10` bin applies to (a pivot carries one bin, as it carries one grain).
+#[must_use]
+pub fn pivot_bin_field<H: std::hash::BuildHasher>(
+    fields: &TableFields,
+    cols: &RelationColumns<H>,
+) -> Option<(Ident, ColumnKind)> {
+    fields
+        .rows
+        .iter()
+        .flatten()
+        .chain(fields.columns.iter().flatten())
+        .find_map(|name| {
+            let kind = cols
+                .get(name.as_str())
+                .copied()
+                .filter(|k| *k == ColumnKind::Number)?;
+            Some((Ident::new(name.as_str()).ok()?, kind))
+        })
+}
+
 /// Check a pivot's definition against the relation.
 ///
 /// # Errors
@@ -554,9 +580,10 @@ pub fn pivot_cap(over_sql_source: bool, values: usize) -> u32 {
 pub fn pivot_row_cap(from: &Relation, values: usize) -> u32 {
     fn is_sql(from: &Relation) -> bool {
         match from {
-            Relation::Mart(_) => false,
+            Relation::Mart(_) | Relation::Joined { .. } => false,
             Relation::Sql(_) => true,
             Relation::Filtered { base, .. }
+            | Relation::Ranged { base, .. }
             | Relation::Bucketed { base, .. }
             | Relation::Calculated { base, .. }
             | Relation::Fixed { base, .. } => is_sql(base),
@@ -605,6 +632,13 @@ fn grouping_sets(plan: &PivotPlan) -> Vec<Vec<String>> {
     sets
 }
 
+/// What a pivot's rows are cut by before they are grouped: the field a `BI-9`
+/// grain applies to, and the one a `BI-10` bin applies to.
+pub type PivotInner<'a> = (
+    Option<(Grain, &'a Ident, ColumnKind)>,
+    Option<(&'a Ident, BinMode)>,
+);
+
 /// Pivot SQL over `from`: the key fields, one `__v<i>` per value, and one
 /// `__g<j>` flag per key field that is `1` when that field is rolled up in
 /// the row (a total), `0` when the row is a group of it.
@@ -620,48 +654,60 @@ pub fn pivot_sql(
     from: &Relation,
     plan: &PivotPlan,
     predicates: Vec<String>,
-    grain: Option<(Grain, &Ident, ColumnKind)>,
+    inner: PivotInner<'_>,
     time: &TimeContext,
 ) -> Option<String> {
-    let (relation, where_sql) = match grain {
-        Some((g, field, kind)) => {
-            let expr = g.bucket_expr(field, kind, time)?;
-            let base = if predicates.is_empty() {
-                from.clone()
-            } else {
-                Relation::Filtered {
-                    base: Box::new(from.clone()),
-                    predicates,
-                }
-            };
-            let mut carried: Vec<String> = Vec::new();
-            for name in plan
-                .fields()
-                .chain(plan.values.iter().map(|(c, _)| c))
-                .map(ToString::to_string)
-            {
-                if name != field.as_str() && !carried.contains(&name) {
-                    carried.push(name);
-                }
-            }
-            (
-                Relation::Bucketed {
-                    base: Box::new(base),
-                    dimension: field.to_string(),
-                    expr,
-                    carried,
-                },
-                String::new(),
-            )
-        }
-        None => (
+    let (grain, bin) = inner;
+    let (relation, where_sql) = if grain.is_none() && bin.is_none() {
+        (
             from.clone(),
             if predicates.is_empty() {
                 String::new()
             } else {
                 format!(" WHERE {}", predicates.join(" AND "))
             },
-        ),
+        )
+    } else {
+        let mut relation = if predicates.is_empty() {
+            from.clone()
+        } else {
+            Relation::Filtered {
+                base: Box::new(from.clone()),
+                predicates,
+            }
+        };
+        let needed: Vec<String> = {
+            let mut names: Vec<String> = Vec::new();
+            for name in plan
+                .fields()
+                .chain(plan.values.iter().map(|(c, _)| c))
+                .map(ToString::to_string)
+            {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            names
+        };
+        if let Some((g, field, kind)) = grain {
+            let expr = g.bucket_expr(field, kind, time)?;
+            relation = Relation::Bucketed {
+                base: Box::new(relation),
+                dimension: field.to_string(),
+                expr,
+                carried: needed
+                    .iter()
+                    .filter(|n| n.as_str() != field.as_str())
+                    .cloned()
+                    .collect(),
+            };
+        }
+        // BI-10: the pivot's number field replaced by its bin, over the same
+        // filtered rows (the range is read under the pivot's predicates).
+        if let Some((field, mode)) = bin {
+            relation = crate::builder::binned_layer(relation, field, mode, &needed);
+        }
+        (relation, String::new())
     };
     let keys: Vec<String> = plan.fields().map(ToString::to_string).collect();
     let values = plan
@@ -715,6 +761,17 @@ pub enum ComparePlan {
         /// The period.
         period: Grain,
     },
+    /// `BI-2`: the latest period that has data against the same period one
+    /// year earlier (a calendar shift; a week is 52 weeks back, as
+    /// `SamePeriodLastYear` does).
+    LastYear {
+        /// The date or timestamp column the periods are cut from.
+        column: Ident,
+        /// Its kind.
+        kind: ColumnKind,
+        /// The period.
+        period: Grain,
+    },
     /// The KPI against a number.
     Goal(f64),
 }
@@ -739,9 +796,9 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
         return Ok(None);
     };
     match c.kind.as_str() {
-        "previous" => {
+        "previous" | "last_year" => {
             if c.value.is_some() {
-                return Err("a comparison with the previous period takes no value.".to_owned());
+                return Err("a comparison with a period takes no value.".to_owned());
             }
             let (Some(column), Some(period)) = (c.date_column.as_deref(), c.period.as_deref())
             else {
@@ -765,6 +822,18 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
             if !matches!(kind, ColumnKind::Date | ColumnKind::DateTime) {
                 return Err("a comparison needs a date or timestamp column.".to_owned());
             }
+            if c.kind == "last_year" {
+                if matches!(period, Grain::Year) {
+                    return Err(
+                        "the same period last year needs a period shorter than a year.".to_owned(),
+                    );
+                }
+                return Ok(Some(ComparePlan::LastYear {
+                    column: ident,
+                    kind,
+                    period,
+                }));
+            }
             Ok(Some(ComparePlan::Previous {
                 column: ident,
                 kind,
@@ -781,7 +850,7 @@ pub fn plan_compare<H: std::hash::BuildHasher, S: std::hash::BuildHasher>(
             }
         }
         other => Err(format!(
-            "invalid comparison '{other}': use previous or goal."
+            "invalid comparison '{other}': use previous, last_year or goal."
         )),
     }
 }
@@ -801,13 +870,20 @@ pub fn kpi_trend_sql(
     compare: &ComparePlan,
     time: &TimeContext,
 ) -> Option<String> {
-    let ComparePlan::Previous {
-        column,
-        kind,
-        period,
-    } = compare
-    else {
-        return None;
+    let (column, kind, period, limit) = match compare {
+        ComparePlan::Previous {
+            column,
+            kind,
+            period,
+        } => (column, kind, period, TREND_PERIODS),
+        // BI-2: enough periods with data to reach back a year from the
+        // latest; gaps in the data only reach further back.
+        ComparePlan::LastYear {
+            column,
+            kind,
+            period,
+        } => (column, kind, period, last_year_periods(*period)),
+        ComparePlan::Goal(_) => return None,
     };
     let expr = period.bucket_expr(column, *kind, time)?;
     let base = if predicates.is_empty() {
@@ -818,10 +894,18 @@ pub fn kpi_trend_sql(
             predicates,
         }
     };
-    let carried = if measure.as_str() == column.as_str() {
-        Vec::new()
-    } else {
-        vec![measure.to_string()]
+    // BI-2: a metric (or any aggregate field) is the number itself; the
+    // bucketing query must carry the columns it reads.
+    let aggregate = from.aggregate_field(measure.as_str());
+    let carried = match aggregate {
+        Some(a) => a
+            .reads
+            .iter()
+            .filter(|c| c.as_str() != column.as_str())
+            .cloned()
+            .collect(),
+        None if measure.as_str() == column.as_str() => Vec::new(),
+        None => vec![measure.to_string()],
     };
     let bucketed = Relation::Bucketed {
         base: Box::new(base),
@@ -829,17 +913,30 @@ pub fn kpi_trend_sql(
         expr,
         carried,
     };
-    let value = if agg == Aggregate::Count {
+    let value = if let Some(a) = aggregate {
+        a.sql.clone()
+    } else if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
         format!("round({agg}({measure}))")
     };
     Some(format!(
         "SELECT * FROM (SELECT {column}, {value} AS v FROM {} WHERE {column} IS NOT NULL \
-         GROUP BY {column} ORDER BY {column} DESC LIMIT {TREND_PERIODS}) ORDER BY {column}{}",
+         GROUP BY {column} ORDER BY {column} DESC LIMIT {limit}) ORDER BY {column}{}",
         bucketed.render(),
         bucketed.settings(),
     ))
+}
+
+/// How many periods with data reach back a year from the latest one.
+fn last_year_periods(period: Grain) -> u32 {
+    match period {
+        Grain::Day => 400,
+        Grain::Week => 60,
+        Grain::Month => 14,
+        Grain::Quarter => 6,
+        _ => 2,
+    }
 }
 
 #[cfg(test)]
@@ -1039,7 +1136,7 @@ mod tests {
             &mart(),
             &plan,
             vec!["v > 0".to_owned()],
-            None,
+            (None, None),
             &TimeContext::default(),
         )
         .unwrap();
@@ -1075,7 +1172,7 @@ mod tests {
             &mart(),
             &plan,
             vec!["p = 'a'".to_owned()],
-            Some((Grain::Month, &m, ColumnKind::Date)),
+            (Some((Grain::Month, &m, ColumnKind::Date)), None),
             &TimeContext::default(),
         )
         .unwrap();
@@ -1092,7 +1189,7 @@ mod tests {
                 &mart(),
                 &plan,
                 Vec::new(),
-                Some((Grain::Hour, &m, ColumnKind::Date)),
+                (Some((Grain::Hour, &m, ColumnKind::Date)), None),
                 &TimeContext::default()
             )
             .is_none()

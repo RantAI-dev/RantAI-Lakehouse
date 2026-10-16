@@ -103,12 +103,10 @@ async fn an_oracle_credential_is_saved_unverified_and_its_test_leaves_health_alo
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["saved"], true);
     assert_eq!(body["verified"], false);
-    let stored = std::fs::read_to_string(
-        secrets
-            .path()
-            .join("connector_managed_conn_src6_oracle_password"),
-    )
-    .unwrap();
+    let stored = common::stored_credential(
+        secrets.path(),
+        "connector_managed_conn_src6_oracle_password",
+    );
     assert_eq!(stored, "a-new-oracle-password");
 
     let (status, body) = send(

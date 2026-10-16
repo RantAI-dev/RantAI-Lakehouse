@@ -1,5 +1,6 @@
 "use client";
 
+import { displayColumn } from "@/lib/chart-joins";
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,11 @@ import { fetchRecordsPage, hasNextPage, pageRange, splitReference, type RecordsP
 type Sort = { column: string; dir: "asc" | "desc" };
 
 /** Where a raw table reads its rows from, and what it lists. */
-export type RawTableSpec = { mart: string; sqlSource?: string; title: string; def?: TableDefFields };
+/**
+ * `chart`: the tile's id when it has filters of its own (BI-6) or joined tables (BI-7), so a later page
+ * or another sort lists the same relation the first page came from.
+ */
+export type RawTableSpec = { mart: string; sqlSource?: string; title: string; def?: TableDefFields; chart?: string };
 
 /** The sort the viewer chose, else the saved one. */
 function effectiveSort(chosen: Sort | null, def: TableDefFields | undefined): Sort | null {
@@ -50,7 +55,7 @@ export function RawTable({
   // The payload's page is the first page in the saved order; anything else is fetched.
   const needsFetch = canPage && (offset > 0 || chosen !== null);
   const request: RecordsRequest = {
-    title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, filters: paging?.filters ?? [],
+    title: spec.title, mart: spec.mart, sqlSource: spec.sqlSource, chart: spec.chart, filters: paging?.filters ?? [],
     columns: shown, sortColumn: sort?.column, sortDir: sort?.dir,
   };
   const requestKey = JSON.stringify(request);
@@ -84,7 +89,7 @@ export function RawTable({
           <thead className="sticky top-0 bg-card">
             <tr className="border-b border-border">
               {shown.map((c) => {
-                const label = settings[c]?.label ?? c;
+                const label = settings[c]?.label ?? displayColumn(c);
                 const active = sort?.column === c;
                 return (
                   <th key={c} style={columnStyle(settings[c])} className="px-2 py-1.5 text-left font-medium text-muted-foreground" aria-sort={active ? (sort?.dir === "desc" ? "descending" : "ascending") : undefined}>

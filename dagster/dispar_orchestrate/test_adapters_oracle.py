@@ -178,3 +178,55 @@ def test_build_source_sends_the_database_as_a_service_name_not_a_sid(monkeypatch
     _args, kwargs = dialect.create_connect_args(url)
     assert "SERVICE_NAME=FREEPDB1" in kwargs["dsn"] and "SID=" not in kwargs["dsn"]
     assert "10.0.0.9" in kwargs["dsn"] and "ora.invalid" not in kwargs["dsn"]
+
+
+def _capture(monkeypatch):
+    captured = []
+    monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.append(kwargs) or "src")
+    return captured
+
+
+_SPEC = {"driver": "oracle", "host": "ora.invalid", "port": 1521, "database": "ORCLPDB1", "user": "reader"}
+
+
+def _resolve(h, p):
+    return ResolvedAddress(ip="10.0.0.9", port=p, family=2)
+
+
+def test_a_schema_qualified_object_is_read_from_that_schema(monkeypatch):
+    # SRC-13 review 1 SHOULD-FIX 1: what the listing offers (`HR.EMPLOYEES`, a schema
+    # other than the login's own) must load from that owner, by table name.
+    captured = _capture(monkeypatch)
+    build_source(_SPEC, {"password": "x"}, [{"name": "HR.EMPLOYEES", "target": "employees"}], resolve_checked=_resolve)
+    assert captured[0]["schema"] == "HR"
+    # Oracle's own spelling, as the listing shows it, is mapped to the one SQLAlchemy reflects by (lower case).
+    assert captured[0]["table_names"] == ["employees"]
+
+
+def test_a_bare_table_name_keeps_the_logins_own_schema(monkeypatch):
+    captured = _capture(monkeypatch)
+    build_source(_SPEC, {"password": "x"}, [{"name": "orders", "target": "orders"}], resolve_checked=_resolve)
+    assert "schema" not in captured[0]
+
+
+def test_objects_of_two_schemas_in_one_call_are_refused_not_half_loaded(monkeypatch):
+    _capture(monkeypatch)
+    with pytest.raises(ValueError, match="one schema per call"):
+        build_source(
+            _SPEC, {"password": "x"},
+            [{"name": "HR.A", "target": "a"}, {"name": "SALES.B", "target": "b"}],
+            resolve_checked=_resolve,
+        )
+
+
+def test_a_listed_upper_case_table_name_is_spelled_the_way_sqlalchemy_reflects_it(monkeypatch):
+    # `MetaData.reflect(only=...)` compares against `Inspector.get_table_names`, which reports Oracle's
+    # all-upper-case names in lower case; a name given as listed would be "not available". A mixed-case name
+    # (created quoted in Oracle) is reported as it is and so is passed as it is.
+    captured = _capture(monkeypatch)
+    build_source(
+        _SPEC, {"password": "x"},
+        [{"name": "HR.EMPLOYEES", "target": "e"}, {"name": "HR.MixedCase", "target": "m"}, {"name": "HR.orders", "target": "o"}],
+        resolve_checked=_resolve,
+    )
+    assert captured[0]["table_names"] == ["employees", "MixedCase", "orders"]

@@ -70,3 +70,18 @@ describe("splitReference", () => {
     expect(splitReference("column 'x' does not exist")).toEqual({ message: "column 'x' does not exist" })
   })
 })
+
+describe("recordsQuery for a question of a combined chart (BI-13)", () => {
+  it("names the chart and the question, with that question's own source and column", () => {
+    const q = recordsQuery({ title: "Rooms", mart: "mart_rooms", column: "month", value: "2026-02-01", filters: [], chart: "c_1", layer: 0 }, 0)
+    expect(q.get("mart")).toBe("mart_rooms")
+    expect(q.get("column")).toBe("month")
+    expect(q.get("chart")).toBe("c_1")
+    expect(q.get("layer")).toBe("0")
+  })
+
+  it("sends no layer for the chart's own question, and none without a chart", () => {
+    expect(recordsQuery({ ...base, chart: "c_1" }, 0).has("layer")).toBe(false)
+    expect(recordsQuery({ ...base, layer: 1 }, 0).has("layer")).toBe(false)
+  })
+})

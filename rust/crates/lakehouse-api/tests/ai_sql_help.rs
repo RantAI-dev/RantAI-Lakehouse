@@ -338,10 +338,17 @@ async fn with_the_switch_off_a_direct_tool_call_is_refused_and_runs_nothing() {
 /// feature, and its system prompt is the same bytes as before. The values are
 /// pinned here, not computed from the code under test: a change to either is
 /// an intended change, and this fixture is then updated by hand.
+//
+// Updated by hand in the merge of phase 2 into main's `propose_sql` work: `BI-2`
+// (plan 2026-10-11-bi-2-reusable-metrics.md, section 7) puts `list_metrics`,
+// `describe_metric` and `query_metric` in `ALWAYS` on purpose, so a question for
+// a number is answered from a named metric. `propose_sql` itself is still
+// absent: only an allowlist naming it offers it.
 const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "ask_user",
     "describe_dataset",
     "describe_mart",
+    "describe_metric",
     "get_cdc_health",
     "get_lineage",
     "get_quality",
@@ -350,7 +357,9 @@ const OFFERED_WITHOUT_ALLOWLIST: &[&str] = &[
     "list_boards",
     "list_connectors",
     "list_datasets",
+    "list_metrics",
     "list_pipelines",
+    "query_metric",
     "run_sql",
 ];
 const SYSTEM_SHA256_WITHOUT_ALLOWLIST: &str =

@@ -75,6 +75,8 @@ export type FilterDef = {
   maxExclusive?: boolean;
   /** The filter cannot be removed in the console. Meaningful only on a board's saved default. */
   required?: boolean;
+  /** BI-2: a reference to a saved segment of the chart's table, `{ column: "", values: [], segment }`; it stands for the segment's filters. */
+  segment?: string;
 };
 /** A column a filter can target, with how many tiles of the board have it. */
 export type FilterField = { column: string; kind: FilterKind | string; tiles: number };

@@ -167,6 +167,11 @@ pub struct Scope<'a> {
     fields: BTreeMap<String, String>,
     time: &'a TimeContext,
     chart: Option<ChartCtx>,
+    /// `BI-2`: a SQL condition every aggregate of the formula takes (the
+    /// engine's conditional form of that aggregate), so a metric's own filters
+    /// narrow that metric's number alone. Built by the predicate builder from
+    /// validated filters, never from formula text.
+    condition: Option<String>,
 }
 
 /// What a formula needs to know about the chart it is built into, for the
@@ -195,7 +200,16 @@ impl<'a> Scope<'a> {
             fields: BTreeMap::new(),
             time,
             chart: None,
+            condition: None,
         }
+    }
+
+    /// `BI-2`: make every aggregate of the formula count only the rows that
+    /// meet `condition` (a predicate over the source's columns).
+    #[must_use]
+    pub fn with_condition(mut self, condition: String) -> Self {
+        self.condition = Some(condition);
+        self
     }
 
     /// Build the formula into this chart.
@@ -232,6 +246,8 @@ pub struct Compiled {
     pub reads: BTreeSet<String>,
     /// The fields it uses, directly or through others, sorted.
     pub fields: BTreeSet<String>,
+    /// The parameters it uses, directly or through fields, sorted (`BI-11`).
+    pub params: BTreeSet<String>,
     /// What the chart must compute around the expression: hidden aggregates,
     /// shifted copies and `Fixed` joins (`BI-8` part 2). Empty for part 1.
     pub staged: Staged,
@@ -307,6 +323,7 @@ pub fn compile(
         produced: 0,
         reads: BTreeSet::new(),
         fields: BTreeSet::new(),
+        params: BTreeSet::new(),
         staged: Staged::default(),
     };
     let typed = cx.node(&tree)?;
@@ -320,8 +337,34 @@ pub fn compile(
         },
         reads: cx.reads,
         fields: cx.fields,
+        params: cx.params,
         staged: cx.staged,
     })
+}
+
+/// The parameters a formula names, by syntax alone (no scope): what the
+/// delete-in-use rule needs. A formula that does not parse names none.
+#[must_use]
+pub fn params_in(formula: &str) -> BTreeSet<String> {
+    fn walk(n: &Node, out: &mut BTreeSet<String>) {
+        match &n.kind {
+            Kind::Param(name) => {
+                out.insert(name.clone());
+            }
+            Kind::Call { args, .. } => args.iter().for_each(|a| walk(a, out)),
+            Kind::Neg(a) | Kind::Not(a) => walk(a, out),
+            Kind::Bin(_, l, r) => {
+                walk(l, out);
+                walk(r, out);
+            }
+            Kind::Num(_) | Kind::Str(_) | Kind::Bool(_) | Kind::Name(_) => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Ok(tree) = parse(formula) {
+        walk(&tree, &mut out);
+    }
+    out
 }
 
 /// A number as SQL, from its parsed value: whole numbers as integers, the rest
@@ -355,6 +398,7 @@ struct Cx<'a> {
     produced: usize,
     reads: BTreeSet<String>,
     fields: BTreeSet<String>,
+    params: BTreeSet<String>,
     staged: Staged,
 }
 
@@ -503,6 +547,7 @@ impl Cx<'_> {
                 level: Level::Constant,
             }),
             Kind::Name(name) => self.name(name, n),
+            Kind::Param(name) => self.param(name, n),
             Kind::Neg(inner) => {
                 let t = self.node(inner)?;
                 want(&t, inner, FType::Number)?;
@@ -522,6 +567,21 @@ impl Cx<'_> {
             Kind::Bin(op, l, r) => self.binary(*op, l, r),
             Kind::Call { name, args } => self.call(name, n, args),
         }
+    }
+
+    /// `{name}`: a literal of the parameter's type, printed from the checked
+    /// value ([`crate::params::ParamValue::sql`]), never from any text of the
+    /// request.
+    fn param(&mut self, name: &str, node: &Node) -> Result<Typed, FormulaError> {
+        let Some(found) = self.scope.time.params().get(name) else {
+            return Err(err(node, format!("'{}' is not a parameter.", clip(name))));
+        };
+        self.params.insert(name.to_owned());
+        Ok(Typed {
+            sql: found.value.sql(),
+            ty: found.value.ftype(),
+            level: Level::Constant,
+        })
     }
 
     fn name(&mut self, name: &str, node: &Node) -> Result<Typed, FormulaError> {
@@ -684,7 +744,8 @@ impl Cx<'_> {
             {
                 return Err(err(n, "an aggregate cannot be inside another aggregate."));
             }
-            let (sql, ty) = Self::aggregate(info.name, &args, nodes)?;
+            let (sql, ty) =
+                Self::aggregate(self.scope.condition.as_deref(), info.name, &args, nodes)?;
             (sql, ty, Level::Aggregate)
         } else {
             let level = join_levels(&pairs)?;
@@ -989,51 +1050,77 @@ impl Cx<'_> {
         }
     }
 
-    fn aggregate(name: &str, a: &[Typed], n: &[Node]) -> Result<(String, FType), FormulaError> {
-        let cond = |i: usize| want(&a[i], &n[i], FType::Boolean);
+    /// The SQL of aggregate `name`. With a `cond` (BI-2: a metric's filters)
+    /// the engine's `-If` form is used, so only the rows meeting it count; the
+    /// formula's own condition, when the function has one (`SumIf`), is
+    /// AND-ed with it.
+    fn aggregate(
+        cond: Option<&str>,
+        name: &str,
+        a: &[Typed],
+        n: &[Node],
+    ) -> Result<(String, FType), FormulaError> {
+        let test = |i: usize| want(&a[i], &n[i], FType::Boolean);
+        // `f(x)` or, under a condition, `fIf(x, cond)`.
+        let one = |func: &str, arg: &str| match cond {
+            Some(c) => format!("{func}If({arg}, {c})"),
+            None => format!("{func}({arg})"),
+        };
         match name {
             "Count" => Ok((
-                a.first()
-                    .map_or_else(|| "count()".to_owned(), |t| format!("count({})", t.sql)),
+                match (a.first(), cond) {
+                    (None, None) => "count()".to_owned(),
+                    (None, Some(c)) => format!("countIf({c})"),
+                    (Some(t), _) => one("count", &t.sql),
+                },
                 FType::Number,
             )),
-            "CountDistinct" => Ok((format!("uniqExact({})", a[0].sql), FType::Number)),
+            "CountDistinct" => Ok((one("uniqExact", &a[0].sql), FType::Number)),
             "CountIf" => {
-                cond(0)?;
-                Ok((format!("countIf({})", a[0].sql), FType::Number))
+                test(0)?;
+                let sql = match cond {
+                    Some(c) => format!("countIf(({}) AND ({c}))", a[0].sql),
+                    None => format!("countIf({})", a[0].sql),
+                };
+                Ok((sql, FType::Number))
             }
             "Min" | "Max" => {
                 if a[0].ty == FType::Boolean {
                     return Err(err(&n[0], "Min and Max read numbers, text or dates."));
                 }
-                Ok((
-                    format!("{}({})", name.to_ascii_lowercase(), a[0].sql),
-                    a[0].ty,
-                ))
+                Ok((one(&name.to_ascii_lowercase(), &a[0].sql), a[0].ty))
             }
             _ => {
                 want(&a[0], &n[0], FType::Number)?;
-                let x = &a[0].sql;
+                let col = &a[0].sql;
                 let sql = match name {
-                    "Sum" => format!("sum({x})"),
-                    "Avg" => format!("avg({x})"),
-                    "Median" => format!("medianExact({x})"),
-                    "StdDev" => format!("stddevSamp({x})"),
+                    "Sum" => one("sum", col),
+                    "Avg" => one("avg", col),
+                    "Median" => one("medianExact", col),
+                    "StdDev" => one("stddevSamp", col),
                     "Percentile" => {
-                        let p = literal_number(&n[1])
-                            .filter(|p| (0.0..=1.0).contains(p))
+                        let share = literal_number(&n[1])
+                            .filter(|v| (0.0..=1.0).contains(v))
                             .ok_or_else(|| {
                                 err(
                                     &n[1],
                                     "write the share as a number from 0 to 1, such as 0.9.",
                                 )
                             })?;
-                        format!("quantileExact({})({x})", print_number(p))
+                        match cond {
+                            Some(c) => {
+                                format!("quantileExactIf({})({col}, {c})", print_number(share))
+                            }
+                            None => format!("quantileExact({})({col})", print_number(share)),
+                        }
                     }
                     "SumIf" | "AvgIf" => {
-                        cond(1)?;
-                        let f = if name == "SumIf" { "sumIf" } else { "avgIf" };
-                        format!("{f}({x}, {})", a[1].sql)
+                        test(1)?;
+                        let func = if name == "SumIf" { "sumIf" } else { "avgIf" };
+                        match cond {
+                            Some(c) => format!("{func}({col}, ({}) AND ({c}))", a[1].sql),
+                            None => format!("{func}({col}, {})", a[1].sql),
+                        }
                     }
                     _ => return Err(unsupported(&n[0])),
                 };
@@ -1138,6 +1225,30 @@ mod tests {
 
     fn err_at(formula: &str) -> FormulaError {
         run(formula).expect_err(formula)
+    }
+
+    /// BI-2: every aggregate of the catalog takes a condition: its conditional
+    /// form carries the condition and the formula's own test, and nothing is
+    /// left unconditioned.
+    #[test]
+    fn every_aggregate_in_the_catalog_compiles_under_a_condition() {
+        let cols = sample_columns();
+        let time = TimeContext::default();
+        let cond = "(qty > 3)";
+        for f in catalog::CATALOG.iter().filter(|f| f.aggregate) {
+            let scope = Scope::new(&cols, &time).with_condition(cond.to_owned());
+            let c = compile(f.example, &scope, None).unwrap_or_else(|e| panic!("{}: {e}", f.name));
+            assert_eq!(c.level, Level::Aggregate, "{}", f.name);
+            assert!(c.sql.contains(cond), "{}: {}", f.name, c.sql);
+            assert!(c.sql.contains("If("), "{}: {}", f.name, c.sql);
+        }
+        let scope = Scope::new(&cols, &time).with_condition(cond.to_owned());
+        let sum_if = compile("SumIf(amount, qty = 1)", &scope, None).unwrap();
+        assert_eq!(sum_if.sql, "sumIf(amount, ((qty = 1)) AND ((qty > 3)))");
+        assert_eq!(
+            compile("Count()", &scope, None).unwrap().sql,
+            "countIf((qty > 3))"
+        );
     }
 
     #[test]
@@ -1578,6 +1689,153 @@ mod tests {
         assert!(
             compiled > 20_000 && refused > 10_000,
             "{compiled} compiled, {refused} refused"
+        );
+    }
+
+    // ── BI-11: parameters ────────────────────────────────────────────────
+
+    use crate::params::{ListEntry, ParamDef, ParamType, ParamValues};
+
+    fn def(name: &str, ty: ParamType, default: serde_json::Value) -> ParamDef {
+        ParamDef {
+            id: String::new(),
+            name: name.to_owned(),
+            label: name.to_owned(),
+            ty,
+            default,
+            min: None,
+            max: None,
+            max_length: None,
+            values: None,
+            created_by: String::new(),
+            updated_at: None,
+        }
+    }
+
+    fn with_params(defs: &[ParamDef], formula: &str) -> Result<Compiled, FormulaError> {
+        let cols = sample_columns();
+        let time = TimeContext::default().with_params(ParamValues::from_defaults(defs));
+        compile(formula, &Scope::new(&cols, &time), None)
+    }
+
+    #[test]
+    fn a_parameter_compiles_to_a_literal_of_its_type() {
+        let defs = [
+            def("target", ParamType::Number, serde_json::json!(1000)),
+            def("who", ParamType::Text, serde_json::json!("O'Brien")),
+            def("since", ParamType::Date, serde_json::json!("2026-03-05")),
+        ];
+        let c = with_params(&defs, "amount / {target}").unwrap();
+        assert_eq!(c.sql, "(amount / nullIf(1000, 0))");
+        assert_eq!(c.ty, FType::Number);
+        assert!(c.params.contains("target"));
+        let c = with_params(&defs, "Concat({who}, label)").unwrap();
+        assert!(c.sql.contains("'O''Brien'"), "{}", c.sql);
+        let c = with_params(&defs, "day >= {since}").unwrap();
+        assert_eq!(c.sql, "(day >= toDate32('2026-03-05'))");
+        assert_eq!(c.ty, FType::Boolean);
+    }
+
+    #[test]
+    fn an_unknown_parameter_is_a_positioned_error_and_a_type_mismatch_is_refused() {
+        let defs = [def("target", ParamType::Number, serde_json::json!(5))];
+        let e = with_params(&defs, "amount + {nope}").unwrap_err();
+        assert_eq!(e.position, 9, "{e:?}");
+        assert!(e.message.contains("not a parameter"));
+        let e = with_params(&defs, "If({target}, 1, 2)").unwrap_err();
+        assert!(e.message.contains("true or false"), "{e:?}");
+        assert!(run("{target}").is_err(), "no parameters in scope at all");
+        assert!(
+            tokenize_err("{ba d}")
+                && tokenize_err("{}")
+                && tokenize_err("{1a}")
+                && tokenize_err("{a")
+        );
+    }
+
+    fn tokenize_err(src: &str) -> bool {
+        crate::formula::lex::tokenize(src).is_err()
+    }
+
+    #[test]
+    fn a_list_parameter_has_the_type_of_its_values() {
+        let mut numbers = def("n", ParamType::List, serde_json::json!(2));
+        numbers.values = Some(vec![
+            ListEntry {
+                value: serde_json::json!(1),
+                label: "one".into(),
+            },
+            ListEntry {
+                value: serde_json::json!(2),
+                label: "two".into(),
+            },
+        ]);
+        let mut texts = def("t", ParamType::List, serde_json::json!("a"));
+        texts.values = Some(vec![ListEntry {
+            value: serde_json::json!("a"),
+            label: "a".into(),
+        }]);
+        let defs = [numbers, texts];
+        assert_eq!(with_params(&defs, "{n} + 1").unwrap().ty, FType::Number);
+        assert_eq!(
+            with_params(&defs, "Concat({t}, label)").unwrap().ty,
+            FType::Text
+        );
+    }
+
+    #[test]
+    fn params_in_finds_names_by_syntax_alone() {
+        let names = params_in("If({a} > 1, [x] * {b}, {a})");
+        assert_eq!(names.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+        assert!(params_in("amount +").is_empty());
+    }
+
+    /// BI-11: the property test of the compiler, extended to parameter values.
+    /// Hostile text is a text parameter's value (the definition refuses control
+    /// characters, so those never get as far as a statement); every value that
+    /// passes comes out inside one escaped literal and decodes to itself. A
+    /// number or a date that is not one is refused before any statement is built.
+    #[test]
+    fn generated_hostile_parameter_values_never_reach_sql_outside_an_escaped_literal() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let (mut accepted, mut refused) = (0_u32, 0_u32);
+        let text_def = def("t", ParamType::Text, serde_json::json!("x"));
+        let number_def = def("n", ParamType::Number, serde_json::json!(1));
+        let date_def = def("d", ParamType::Date, serde_json::json!("2026-01-01"));
+        for _ in 0..20_000 {
+            let text = nasty(&mut rng, 40);
+            for (d, source) in [
+                (&text_def, "Concat({t}, label)"),
+                (&number_def, "{n} + 1"),
+                (&date_def, "day >= {d}"),
+            ] {
+                let Ok(value) = crate::params::check_value(d, &serde_json::json!(text)) else {
+                    refused += 1;
+                    continue;
+                };
+                let _ = value;
+                let cols = sample_columns();
+                let defs = [text_def.clone(), number_def.clone(), date_def.clone()];
+                // The request: this parameter takes the hostile value.
+                let request: serde_json::Map<String, serde_json::Value> =
+                    [(d.name.clone(), serde_json::json!(text))]
+                        .into_iter()
+                        .collect();
+                let resolved = ParamValues::resolve(&defs, &[], Some(&request))
+                    .unwrap_or_else(|e| panic!("accepted by check_value, refused by resolve: {e}"));
+                let time = TimeContext::default().with_params(resolved);
+                let c = compile(source, &Scope::new(&cols, &time), None)
+                    .unwrap_or_else(|e| panic!("{source}: {e}"));
+                let literals = audit_sql(&c.sql);
+                if d.ty == ParamType::Text {
+                    assert_eq!(literals[0], text, "{}", c.sql);
+                }
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted > 5_000 && refused > 10_000,
+            "{accepted} accepted, {refused} refused"
         );
     }
 
