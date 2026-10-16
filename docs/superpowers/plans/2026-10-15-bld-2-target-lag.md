@@ -534,3 +534,36 @@ downstream note; 70370204 is a real fix, not a weakened test.
 Section 6.4 still stands: `BLD-2-AC4` as written cannot pass; the proposed
 wording there needs the owner's signature on the feature page before
 acceptance.
+
+#### Decision R6 (planner, during round 1, at `9a59250c`): the run budget is request-to-land
+
+The gate on the fixed head measured a 1-minute target at
+`[40.7, 68.94, 56.85, 56.9, 52.82]` s, and then — after `9a59250c` raised
+the floor to 2 minutes per D11 — a 2-minute target at
+`[103.33, 111.42, 121.44, 123.77, 123.76]` s
+(`/home/shiro/rantai/review/bld2-gate-r1.log`). The lag grows with the
+target, so raising the floor again repeats the miss: the batching rule runs
+when `lag >= target - budget`, and the budget (`run_budget_seconds`:
+median of `startTime → endTime` + 30 s) leaves out the time between the
+sensor's `RunRequest` and the run starting (daemon queue, run-worker
+launch) and the check that has to notice the change first. Every batched
+run therefore lands late by about that gap, whatever the target.
+
+- **R6a.** The budget is the median, over the last 5 SUCCESS runs of the
+  job, of **`creationTime → endTime`** (request to landed, which includes
+  queue and launch), plus **two** check intervals (60 s: up to one interval
+  before a check sees the change, and one for the tick that requests the
+  run). Keep the 60 s first-run fallback for the run part. Document why at
+  the constant (principle 1), and test it with runs whose creation and
+  start times differ.
+- **R6b.** D11's floor is the smallest whole-minute target that **every**
+  gate sample meets **with R6a in place**. Keep the 2-minute floor from
+  `9a59250c` and prove it: the gate (target 2 minutes) must pass all 5
+  samples. If it still does not, do not raise the floor again in this PR:
+  record the samples, leave the floor at 2 minutes, mark the gate result
+  *not met* in the result file and the Handoff, and stop — the planner
+  decides next (it is a product decision against the owner's signed
+  1-minute target).
+- **R6c.** The result file states both measurements above (1-minute and
+  2-minute targets before R6a) and the final one, each with its commit,
+  so the floor is shown as measured, not chosen.
