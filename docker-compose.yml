@@ -2143,6 +2143,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       # Not a credential -- a retention window -- so a dev default is fine
       # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
@@ -2155,6 +2157,12 @@ services:
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # OPS-7 E6: warehouse source endpoint/bucket and ClickHouse connection (non-secret).
+      BACKUP_WAREHOUSE_ENDPOINT: ${BACKUP_WAREHOUSE_ENDPOINT:-${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}}
+      BACKUP_WAREHOUSE_BUCKET: ${BACKUP_WAREHOUSE_BUCKET:-${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
     command: ["python", "-m", "dispar_orchestrate.backup_job"]
     restart: "no"
 
