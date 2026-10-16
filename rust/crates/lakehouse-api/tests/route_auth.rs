@@ -336,14 +336,30 @@ async fn a_seeded_analyst_is_not_denied_catalog_annotation_read() {
     .await;
     assert_ne!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "a seeded Analyst holding catalog:read must not be denied"
-    );
-    assert_ne!(
-        resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+    // SEC-16: the read now runs the catalog tenant gate too, and the seeded
+    // app has several tenants and no `CATALOG_TENANT_ID`, so it answers 403
+    // with the gate's fixed reason. Only that 403 is allowed here: the
+    // permission middleware's body names the missing permission instead, so
+    // the assertion still fails if the middleware denies the Analyst.
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "a seeded Analyst holding catalog:read must not be denied by the permission \
+             middleware; the only 403 allowed here is the tenant gate's, got {error:?}"
+        );
+    }
 }
 
 /// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied

@@ -154,10 +154,13 @@ This project runs on **Bun**, not Node.js. You need Bun `>= 1.3.0`
 curl -fsSL https://bun.sh/install | bash
 ```
 
-All scripts (`dev`, `build`, `start`, `lint`, `typecheck`) use the `--bun`
-flag so Next.js executes under the Bun runtime, not Node. The lockfile is
-`bun.lock` — don't use `npm install`, it will create an out-of-sync
-`package-lock.json`.
+Most scripts (`dev`, `start`, `lint`, `typecheck`) use the `--bun`
+flag so Next.js executes under the Bun runtime, not Node. `bun run build`
+runs `next build` under Node (Node 20.9 or newer must be installed).
+It runs under Node because Bun's Turbopack runtime fails with "Expected
+CommonJS module to have a function wrapper" (`REL-8`, PR #170 review round 1,
+SHOULD-FIX 2). The lockfile is `bun.lock` — don't use `npm install`, it will
+create an out-of-sync `package-lock.json`.
 
 > Note: in `ps`, the server process shows up as `node` because Bun
 > intentionally masquerades as Node for tooling compatibility. To confirm
