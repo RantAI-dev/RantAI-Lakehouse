@@ -38,8 +38,8 @@ was corrected by `DOC-1`, #171.)
 ## Acceptance checklist
 
 - `SEC-3-AC1` The Keycloak gate signs in a user, maps a group to a role, and refuses a user with a wrong audience or an expired token
-- `SEC-3-AC2` A test user signs in with Microsoft Entra ID and lands with the mapped role
-- `SEC-3-AC3` A test user signs in with Google
+- `SEC-3-AC2` A test user signs in with Microsoft Entra ID and lands with the mapped role (moved to `SEC-40`, the product owner's test, 2026-10-16)
+- `SEC-3-AC3` A test user signs in with Google (moved to `SEC-40`)
 - `SEC-3-AC4` `docs/OPERATIONS.md` lets an operator set up each of the three without reading code
 
 ## Not included
