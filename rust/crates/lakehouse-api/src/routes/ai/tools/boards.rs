@@ -4,11 +4,24 @@
 //!
 //! Five of the six route through the same console route handlers
 //! `calc_fields::run` calls (`routes::dashboard::{boards_update,
-//! boards_delete, specs_update}`) so the assistant gets every check the
+//! boards_delete}`) so the assistant gets every check the
 //! console already runs — `board_edit_allowed`, `validate_filters`, the
 //! folder existence check, the Main-board guard, the last-write-wins on
 //! layout, the chart-cascade delete — and so a guard added to the
 //! console route is automatically applied to the tool too.
+//!
+//! `set_board_view_filters` is the exception and saves nothing by design
+//! (`AI-2`), so it has no handler to call.
+//!
+//! One seam is not that: `move_chart` saves the chart itself through
+//! `store::spec_from_input` + `store::insert_chart`, not through
+//! `routes::dashboard::specs_update`. Plan 20 has it save on the new
+//! board *before* removing the tile from the old one, so a failure
+//! leaves the chart readable rather than on two boards, and that
+//! ordering needs the two writes split. `spec_from_input` still runs
+//! its own smoke test, so the chart is validated — but a guard added to
+//! the `specs_update` handler later would not reach this path, and that
+//! is the one place to look when it changes.
 //!
 //! Plan 20 assigns two new rules to the tool (not the handler), and
 //! because they are tool-specific they live here:
@@ -561,26 +574,16 @@ mod tests {
         );
     }
 
-    /// `save_board_filters`: 21 filters is refused by the route's own
-    /// `validate_filters` call (`routes/dashboard.rs:942`). The tool
-    /// no longer duplicates that check (D4): the route is the single
-    /// source of truth. This test pins the *library* check the route
-    /// runs, which is what proves 21 filters are refused through the
-    /// console's own check — the test harness's `ClickHouse` is a
-    /// dead upstream, so driving the route end-to-end here would
-    /// only prove `ch.exec` returned an error, not the 21-filters
-    /// refusal. A future integration test with a real `ClickHouse`
-    /// is left to assert the route's `BadRequest("at most 20
-    /// filters")` response directly.
-    #[test]
-    fn save_board_filters_route_refuses_more_than_max_filters() {
-        let many: Vec<lakehouse_bi::filters::FilterDef> = (0..21)
-            .map(|i| {
-                lakehouse_bi::filters::FilterDef::in_values(format!("c{i}"), vec!["x".to_owned()])
-            })
-            .collect();
-        let err = lakehouse_bi::filters::validate_filters(&many)
-            .expect_err("21 filters must be refused by the route's check");
-        assert!(err.contains("at most 20"), "the route's own message: {err}");
-    }
+    // `save_board_filters` does NOT get a 21-filters test here, and
+    // deliberately so. The limit lives in the route
+    // (`routes/dashboard.rs:942`, `validate_filters`), the tool does not
+    // duplicate it, and this test would have to call `save_board_filters`
+    // — which needs an `&AppState`, so a live `ClickHouse` that this
+    // harness does not have. A test that calls
+    // `lakehouse_bi::filters::validate_filters` instead would only
+    // re-assert the library against itself and stay green if the route's
+    // call were deleted, so it is not worth having. The limit is covered
+    // where it lives, by `lakehouse_bi::filters`' own tests; the refusal
+    // *message* is covered through a real call path by
+    // `set_board_view_filters_refuses_more_than_max_filters` above.
 }

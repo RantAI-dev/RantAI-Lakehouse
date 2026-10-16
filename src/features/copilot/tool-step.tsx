@@ -76,7 +76,8 @@ export const TOOL_LABEL: Record<string, string> = {
 /**
  * The board the dashboard page is showing, extracted from `/dashboards/<id>`.
  * Returns `null` for any other path (e.g. the assistant panel's edge cases).
- * Exported for the test, not for callers.
+ * Exported so its own tests can pin the parse directly: every rule that
+ * decides whether a step's board is the one on screen rests on it.
  */
 export function boardFromPath(pathname: string | null): string | null {
   if (!pathname) return null

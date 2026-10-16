@@ -54,9 +54,11 @@ grain answers from the chart's own grain or not at all.
 
 ## Asking the assistant
 
-Six tools cover the four existing kinds of board and column. Each calls
-the same handler the console calls, so validation, permissions, audit
-and the console's own refusals all carry through unchanged.
+Six tools cover the things a person can already do to a dashboard from the
+console: rename it, delete it, arrange its tiles, move a chart, change the
+filters this viewer sees, and save a board's default filters. Five of the six
+call the same route handler the console calls, so validation, permissions,
+audit and the console's own refusals all carry through unchanged.
 
 - `rename_board` (`dashboard:write`, WriteLow): renames a board; the
   built-in Main board is refused.
@@ -99,7 +101,7 @@ than the chart's own.
 | 4 | `move_chart` reads the stored chart, changes only its board, saves through the path `specs_update` uses, and removes the chart's tile from the old board's layout | Planner default | Owner to confirm at QA |
 | 5 | `set_board_view_filters` validates filters and writes nothing; returns `{applyViewFilters: true, board, filters}` (the full list that should be active; an empty list clears). Read risk, so it is offered in Ask mode too | Planner default | Owner to confirm at QA |
 | 6 | The dashboard page applies a view-filter result. When a chat reply's trace holds a `set_board_view_filters` step with `ok: true` and its `board` is the board on screen, the page writes the filters into the address with the existing helpers (`encodeFilters` / `filtersToParam`). On any other page or another board the step card shows a link to that board with the filters in the address, built with the same helpers. The hook sits beside the existing way the dock tells the page about a tool result (`use-copilot.ts:301`, `:405`); no new channel | Planner default | Owner to confirm at QA |
-| 7 | `save_board_filters` saves the default and is used only when the person asks to save or to make it the default for everyone. On the built-in Main board it fails as the console does | Planner default | Owner to confirm at QA |
+| 7 | `save_board_filters` saves the default and is used only when the person asks to save or to make it the default for everyone. On the built-in Main board it fails as the console does. **The plan named a `grain?` argument alongside `board` and `filters`; the schema and implementation carry `board` + `filters` only — saving the time grain is not part of the tool** | Planner default | Owner to confirm at QA |
 | 8 | The page context carries what the tools need: for `AI-2`, the active filters also as compact JSON (`FilterDef[]`), within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap; when over, the JSON is left out and the chip summary stays. For `AI-20`, the on-screen time grain and the board's saved grain (`summarizeGrain`, new, beside `summarizeFilters`), and the page effect's dependency list gains them | Planner default | Owner to confirm at QA |
 | 9 | `AI-2` is two tools, not one: `set_board_view_filters` changes only the person's view (the active filters in the address, nothing saved) by default, and `save_board_filters` saves the board's default only on an explicit request, through Confirm. A single tool that saved by default would change the dashboard for everyone without a second prompt | — | Owner, 2026-10-15 |
 | 10 | "Undo in one step" is not built. Boards have no version history yet, so the assistant cannot undo a rename, a deletion, an arrange, a move or a saved-filters change. It is written as an unmet target, and the backlog gains a row that waits for `BI-18` (version history part) | — | Owner, 2026-10-15 |

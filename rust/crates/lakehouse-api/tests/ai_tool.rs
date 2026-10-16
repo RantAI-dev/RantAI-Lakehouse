@@ -356,22 +356,58 @@ async fn unauthenticated_request_is_refused_by_the_policy_layer() {
 //
 // Every test in this section is an HTTP-level exercise of `POST
 // /api/ai/tool` for one of the six new tools. The harness points
-// `ClickHouse` at a dead upstream, so a tool whose success path runs a
-// route that touches ClickHouse (`rename_board`, `delete_board`,
+// `ClickHouse` at a dead upstream (port 1 — a TCP RST, no DNS, no
+// wait: see `tests/common/mod.rs`), so a tool whose success path runs
+// a route that touches ClickHouse (`rename_board`, `delete_board`,
 // `arrange_board`, `move_chart`, `save_board_filters`) lands at
 // `outcome: "failed"` with the upstream error in the result. What each
-// test can still prove without a live ClickHouse is what plan 20
-// exercises in review:
+// test here CAN still prove without a live ClickHouse:
 //
 // - the gate's decision: refusal, `needs_confirmation`, or `failed`;
-// - the route's own refusals (the `board_edit_allowed` "invalid
-//   dashboard" 400, the `?id=default` DELETE refusal, the tool's own
-//   bounds / off-board / 21-filter / invalid-op pre-checks);
-// - the audit row's `action` and `outcome`.
-// Tests that genuinely need a real `bi_board` row to assert a state
-// change (e.g. "the tile left the old board's layout") are marked
-// `#[ignore]` so the future harness with a real `ClickHouse` can run
-// them, and so a CI run today still passes.
+// - the route's own CPU-side refusals (the `board_edit_allowed`
+//   "invalid dashboard" 400 on the built-in Main board, the tool's
+//   own "id/board/name/filters required" pre-checks);
+// - the audit row's `action` and `outcome`;
+// - the `Read` view-filter payload, which is built locally and never
+//   reaches ClickHouse.
+//
+// Plan 20's end-to-end state-change assertions are NOT in this file:
+// they need real `bi_board` / `bi_chart` rows in ClickHouse, which
+// the harness cannot produce, and are recorded as gaps here so a
+// reader is not left guessing:
+//
+//   * `move_chart` (plan 132): "the chart's board changes, its tile
+//     leaves the old board's layout, its other fields are unchanged"
+//     — needs a real `bi_chart` row (to read+re-write the chart) and a
+//     real `bi_board` row (to remove the tile from the old board's
+//     layout). The tool's first store call is `list_stored_charts`,
+//     which the dead upstream turns into a 502-class failure before
+//     any "chart not found" CPU check is reachable.
+//   * `arrange_board` (plan 130-131): "the listed tile moves, the
+//     others keep their boxes" and "a chart from another board is
+//     refused" — both need a real `bi_board` row (to read the current
+//     layout, merge the new tiles, and save the merged layout) and a
+//     real `bi_chart` row (to check the off-board chart id is on the
+//     named board). The CPU-only bounds / off-grid /
+//     `w`-or-`h`-below-1 checks are covered by `parse_arrange_tiles`'s
+//     unit tests in `tools/boards.rs`.
+//   * `save_board_filters` (plan 133): "valid filters are saved"
+//     needs a real `bi_board` row whose `filters_json` the call would
+//     write through `store::update_board_filters`. The "Main refuses"
+//     half IS testable here (the route's `board_edit_allowed` returns
+//     400 before any ClickHouse call) — see
+//     `save_board_filters_on_main_fails_with_the_console_message`.
+//   * `set_board_view_filters` / `AI-2-AC2` (plan 134): "the board's
+//     saved filters are unchanged after the call" needs to read
+//     `bi_board.filters_json` before and after to establish a
+//     baseline. The tool itself is local: `pub(super) fn
+//     set_board_view_filters(args) -> Value` (no async, no `&state`,
+//     no ClickHouse ref) and only its returned payload is observable
+//     through the HTTP layer.
+//
+// No `#[ignore]` placeholders are left for this work, because each
+// gap is a real fixture (a `bi_board` row, a `bi_chart` row, a
+// layout) this harness cannot produce, not a skipped assertion.
 
 /// `rename_board` (WriteLow): without `confirmed: true` the gate returns
 /// `needs_confirmation` and nothing reaches the route.
@@ -541,15 +577,55 @@ async fn save_board_filters_without_confirmed_needs_confirmation() {
     );
 }
 
+/// `save_board_filters` on the built-in Main board is refused by the
+/// route's own `board_edit_allowed`. The test harness's `ClickHouse` is
+/// dead, but the route's check runs before any `ClickHouse` call (same
+/// shape as `rename_board_on_default_fails_with_the_console_message`),
+/// so the 400 surfaces cleanly. The "valid filters are saved" half of
+/// the plan's Save-filters line is not in this file: it would write to
+/// `bi_board.filters_json` and the harness cannot observe that — see
+/// this section's header.
+#[tokio::test]
+async fn save_board_filters_on_main_fails_with_the_console_message() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": {
+                "board": "default",
+                "filters": [{ "column": "kabupaten", "values": ["A"] }],
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    assert_eq!(
+        body["result"]["error"],
+        json!("invalid dashboard"),
+        "route's own message must surface through the tool"
+    );
+}
+
 /// `set_board_view_filters` (Read): passes the gate in any mode; the
 /// tool is local, so the result is the validated view-filter payload
 /// the page will apply — `applyViewFilters: true`, the board id, and
-/// the cleaned filter list. The board's saved filters are untouched
-/// (this test only proves the returned shape; the "nothing saved"
-/// half is the gate's `Read` posture, pinned here by the absence of
-/// an `error` key and by the audit row's outcome).
+/// the cleaned filter list. What the test proves is the returned
+/// shape; the "nothing was saved" half of that claim is a property of
+/// the tool's implementation, not something observable through this
+/// harness (the saved `bi_board.filters_json` row is in `ClickHouse`,
+/// and the harness's `ClickHouse` is a dead upstream — see this
+/// section's header).
 #[tokio::test]
-async fn set_board_view_filters_returns_the_view_payload_without_saving() {
+async fn set_board_view_filters_returns_the_view_payload() {
     let TestApp { router, pool } = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
 

@@ -100,13 +100,17 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
 ///
-/// The exhaustive match is intentionally kept in one place: each new
-/// `ToolSpec` is a one-line arm here, and any future refactor that would
-/// split it (e.g. a per-subsystem map) gets to carry the migration
-/// cost — splitting today would be premature.
+/// The match is the registry-to-domain table and nothing else: every arm is a
+/// one-line delegation into the per-domain module that already owns the tool
+/// (`data::`, `ask::`, `propose::`, `pipelines::`, `dashboards::`,
+/// `calc_fields::`). The domain split this lint pushes for is already done, so
+/// splitting the table itself would only scatter one lookup across helpers
+/// with no independent reuse.
 #[allow(
     clippy::too_many_lines,
-    reason = "single exhaustive match on the tool registry; plan 20 keeps it here on purpose"
+    reason = "the match is a pure registry-to-domain table whose arms already \
+              delegate to per-domain modules; splitting it would scatter one \
+              lookup across helpers with no independent reuse"
 )]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,

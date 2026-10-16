@@ -581,8 +581,8 @@ async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
         "summary must name the board, got: {summary}"
     );
     assert!(
-        summary.contains("chart") || summary.contains("board"),
-        "summary must mention the chart cascade, got: {summary}"
+        summary.contains("chart"),
+        "the approval must warn that the board's charts go too, not just name the board, got: {summary}"
     );
 
     let approvals = lakehouse_store::agents::list_approvals(&pool, None)

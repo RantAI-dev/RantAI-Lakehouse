@@ -362,11 +362,11 @@ mod tests {
         );
     }
 
-    /// AI-1 / AI-2 / AI-20 (plan 20): board tools record under the
-    /// board, with `id` preferred (it is the `args` key on rename /
-    /// delete / arrange / save-filters) and `board` the fallback for
-    /// the ones that name the target with that key. `move_chart`
-    /// records the chart it moves, exactly like `update_chart`.
+    /// AI-1 / AI-2 / AI-20 (plan 20): board tools record under the board
+    /// they actually changed, under the arg key each tool really reads:
+    /// `id` for rename / delete, `board` for arrange / save-filters /
+    /// set-view-filters. `move_chart` records the chart it moves,
+    /// exactly like `update_chart`.
     #[test]
     fn resource_for_records_the_board_the_tool_actually_changed() {
         let mut id_args = Map::new();

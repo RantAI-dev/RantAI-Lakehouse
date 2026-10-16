@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock } from "bun:test"
-import { ToolStepCard, toolLabel } from "./tool-step"
+import { ToolStepCard, boardFromPath, toolLabel } from "./tool-step"
 import type { ToolStep } from "./tool-step"
 
 afterEach(cleanup)
@@ -13,6 +13,26 @@ let mockPathname = "/dashboards/main-board"
 mock.module("next/navigation", () => ({
   usePathname: () => mockPathname,
 }))
+
+describe("boardFromPath reads the board the page is showing", () => {
+  it("takes the id out of a dashboard path and refuses every other path", () => {
+    expect(boardFromPath("/dashboards/sales-board")).toBe("sales-board")
+    expect(boardFromPath("/dashboards/sales-board/edit")).toBe("sales-board")
+    expect(boardFromPath("/dashboards/other-board")).toBe("other-board")
+    // The whole "for another board it does not" rule rests on this returning
+    // something other than the step's board, so a similar path must not match.
+    // An empty segment is not a board id, and `null` is the answer that keeps
+    // it from ever comparing equal to a step's board.
+    expect(boardFromPath("/dashboards/")).toBeNull()
+    expect(boardFromPath("/dash/boards/sales-board")).toBeNull()
+    expect(boardFromPath("/copilot")).toBeNull()
+    expect(boardFromPath(null)).toBeNull()
+  })
+
+  it("decodes a percent-encoded board id", () => {
+    expect(boardFromPath("/dashboards/board%20one")).toBe("board one")
+  })
+})
 
 describe("toolLabel covers the six dashboard tools", () => {
   it("names each new dashboard tool so the Copilot does not fall back to its capitalized rule", () => {
