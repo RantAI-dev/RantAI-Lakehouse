@@ -342,4 +342,195 @@ None. Every required verification step ran in the foreground and passed cleanly.
 
 ## 8. Review
 
-(Reviewer.)
+### Round 1 (planner, at `5c5a85ffde6f`)
+
+Read the whole diff against this plan and `AGENTS.md`. The reviewer's own
+verification run was stopped before it ran: the blockers below change the
+code, so the full block runs on the fix head instead. Merge resolution is
+clean (BLD-1 `run_as`, #144's migrations and route tests, `enforce` and
+`runnable` are intact). `docs/core/` is untouched.
+
+Checked and correct: D1's CHECKs, cascade, tenant column and the T1 store
+tests; D2's tagged enum; D4 reuses `mart_content_fingerprint` and
+`load_table_summary` and classifies their errors; D5's core path
+(met/batching/budget fallback/never-run/consumed start time/run key/
+`jobName` in the response); the lag-check route's policy row and same-404;
+D8's PUT (validation, scope, audit, reload) and the 90 s staleness rule;
+D9's constant and `== 3`, silences honoured; D3 and D6's sensor shape and
+error handling; the console panel's permission gate, honest error text and
+downstream note; 70370204 is a real fix, not a weakened test.
+
+#### Decisions for this round (planner)
+
+- **R1.** A requested run that Dagster does not have after **4 checks
+  (2 minutes)** is treated as lost: clear the request, log it, and decide
+  again on the same tick. Store the request time
+  (`requested_at TIMESTAMPTZ`) to count it.
+- **R2.** The run key carries the attempt:
+  `lag:<pipeline id>:<hash of requested tokens>:<n>`, where `n` is the
+  number of requests already made for those tokens (store
+  `request_attempt INTEGER NOT NULL DEFAULT 0`, reset when the tokens
+  change). A failed run is asked again on the next check with `n+1`; it
+  stops after the pipeline's `maxRetries` + 1 attempts for the same tokens
+  and the status stays `behind` (so the D9 alert fires), not a spin.
+- **R3.** All pipeline-to-pipeline links the lag check follows (source ↔
+  target, `dependsOn`, the cycle check, "who reads this") are within the
+  pipeline's own tenant. A pipeline with `tenant_id IS NULL` links to
+  nothing (fail closed, as 0042).
+- **R4.** The migration takes the next free number, **`0084`**
+  (`0080` is on `main`; `0078`–`0083` are on #106's open branch), per D1.
+  Rename the file, fix its header (it still says #144 and BLD-1 are
+  unmerged) and the garbled `target_lag_downstream` comment. The two
+  new R1/R2 columns go in the same file (it has never been applied).
+- **R5.** Concurrency: the lag check reads its state row with
+  `SELECT … FOR UPDATE` inside the transaction that writes it, so two
+  overlapping checks of the same pipeline serialize.
+
+#### BLOCKER
+
+1. **The assistant tool crosses tenants.** `routes/ai/tools/pipelines.rs`
+   `set_pipeline_target_lag` resolves a name with
+   `SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1`
+   across every tenant and calls `apply_set_target_lag`, which has no
+   `authored_only`/`in_scope` (only the PUT handler does). A
+   `pipeline:write` user in tenant A can set tenant B's lag by id or name.
+   Move both checks *into* `apply_set_target_lag` (one function, two
+   callers, D10), scope the name lookup to the caller's tenant, and stop
+   `.unwrap_or(None)` from turning a database error into "use the name as
+   an id". Test: the tool, called by a tenant-A user with a tenant-B id and
+   with a tenant-B name, gets the same not-found as an unknown pipeline and
+   changes nothing.
+2. **The sensor ignores `jobName` (D7 broken end to end).**
+   `authored_factory.py` yields `RunRequest(run_key=…, job_name=authored_job.name)`
+   and its `@sensor(job=authored_job)` can only launch its own job. When the
+   API says "run U first", P's job runs under U's key and the next check
+   marks U consumed although U never ran. Use `body["jobName"]`, give the
+   sensor every job it may name (`jobs=[…]` of the pipeline and the
+   downstream pipelines it reads), and skip with a log if the name is not
+   one of them or `runKey` is missing. In Rust, `settle_request` must also
+   check the found run's `jobName` is the one requested. Test with a
+   `jobName` different from the sensor's own job.
+3. **A lost request blocks the pipeline forever.** `pipeline_lag.rs`
+   `settle_request` waits forever when Dagster has no run for the key
+   (sensor timed out after the state was written, tick crashed, a manual
+   call). Fix per R1, with a test.
+4. **A failed run is never retried for the same change.** The run key
+   depends only on the tokens, Dagster de-duplicates the key, and the next
+   lookup finds the old FAILURE again, every tick. The comment saying it
+   "may ask again" is false (rule 1). Fix per R2, with a test that uses the
+   real derived key (the current test seeds `"lag:pl-x:abc"`).
+5. **The downstream branch discards P's outstanding request.** The D7 early
+   returns write P's state with `requested_run_key: None,
+   requested_tokens: None` even while P's run is queued or running (D5
+   step 2). Keep P's request; test it.
+6. **Only the first downstream upstream is walked.**
+   `lakehouse-store/src/pipelines.rs` `upstream_downstream_chain` follows
+   one upstream per level (`find`). Walk every downstream input (D7),
+   with a test where P reads two downstream pipelines.
+7. **`lag-check` is not asserted in `tests/route_auth.rs`.** AGENTS.md
+   requires every route asserted both ways there; the cases live only in
+   `pipeline_lag_check.rs`. Add them to `route_auth.rs`.
+8. **The gate cannot run in CI and cannot fail on its number.**
+   `ops/g7/g7_pipeline_test.py`:
+   - `psql_insert_order` falls back to the password `"lakehouse"`
+     (rule 5: no default credentials) and `g7-test-runner` passes no
+     Postgres variables, so in CI (`POSTGRES_PASSWORD=ci-only-…`) it
+     fails with a traceback that is not a `G7Failure`. Pass the variables
+     through compose, use `${X:?}`-style must-set reads (no fallback), and
+     turn connection errors into `G7Failure`.
+   - It `pip install`s `psycopg2-binary` at run time, unpinned. Put the
+     dependency in the runner image the way its other dependencies are
+     pinned, or load Bronze the way g7 already does without a new client.
+   - A sample over 60 s only prints "NOT ALL SAMPLES MET" and the gate
+     passes. It must fail (D11: the floor is reported and the minimum
+     raised in the same PR, never a pass).
+9. **The result file is not backed by a quoted run, and predates HEAD.**
+   `docs/plans/BLD-2-TARGET-LAG-RESULT.md` names no commit, command or
+   date; its section 2 "Reason: within target lag" is not something the
+   gate prints, and its 18.75 s is not quoted from the gate's own
+   `avg = … s` line. It was measured on 51a1d2b2, before three merges
+   (BLD-1 alone changed `authored_factory.py` by ~350 lines). After the
+   fixes, run the `g3a-dagster` sequence from a clean project on the final
+   head, save the full output under `/home/shiro/rantai/review/`, and
+   rewrite the file from that output only: commit, date, command, the
+   quoted `[g7] …` lines, the 30 s measurement caveat (6.1) and the timer
+   caveat (SHOULD-FIX 10).
+10. **TypeScript rules.** `src/services/contracts/pipelines.ts`:
+    `TargetLag.kind` and `PipelineLag.status` need `| string` widening
+    (D2). `pipeline-freshness-panel.tsx` saves through
+    `pipelineService.setTargetLag` with its own `saving`/`error` state;
+    use `useServiceAction` like every other mutation in
+    `src/features/pipelines/`.
+
+#### SHOULD-FIX
+
+1. When a downstream input cannot be read, write P's state as
+   `not_measured` (and reset the streak) instead of returning without a
+   write; the page otherwise shows the old status, possibly "met" (D4).
+2. Never write a status the check did not measure: a never-measured U is
+   not `met`, and "behind" with streak 0 is inconsistent.
+3. The "no pipeline with a target lag reads this table" note looks up the
+   reader's id in a map keyed by upstream id, so a pipeline read only
+   through `dependsOn` gets the note wrongly. Use the same function as
+   `count_lag_pipelines_reading`; test the `dependsOn` edge.
+4. On SUCCESS, set `pending_since` to no earlier than `consumed_at`
+   (or clear it), so the lag after a run is not measured from the old
+   change.
+5. Budget: median of the last 5 **successful** runs (page further when
+   failures are in the first 5); fix the doc link to the non-existent
+   `BUDGET_WINDOW_RUNS` and drop the `allow(cast_possible_truncation)`
+   that covers no cast.
+6. `lag_check` on a pipeline with no target lag must not decide `run` /
+   `behind`: answer `wait` with `not_measured` and touch nothing.
+7. Concurrency per R5.
+8. `update_pipeline` must run the target-lag cycle check when it changes a
+   lag pipeline's source, target or `dependsOn` (D7 "refused at write").
+9. Tenant scope of links per R3.
+10. `targets_for` and `pipelines_targets` are the same helper (rule 4);
+    fix the duplicated doc comment on `dfs_cycle`.
+11. `find_run_by_run_key`: order by `creationTime`, not `startTime`; its
+    docs say `runKeys` but it filters by tags (rule 1).
+12. Tests: `put_target_lag_sets_lag_and_records_audit` must assert the
+    audit row; a test drives three consecutive behind checks through
+    `run_lag_check` to the alert; the tool must refuse a call that omits
+    `targetLag` (only an explicit `null` clears).
+13. Small: `inputs_of` returns 500 for an unparseable source while
+    `InputTable::parse`'s doc says `not_measured` (make them agree);
+    `run_one`'s skip message for `PipelineBehindTarget` names the wrong
+    route; audit action name `pipeline.target_lag` vs the store doc's
+    `pipeline.target_lag.set`.
+14. Gate: assert the lag sensor is RUNNING instead of starting it
+    (`startSensor` hides whether D6's `default_status` works);
+    `raise_for_status()` on its Dagster calls; remove the unused `ticks`
+    fetch and the `; print(...)` one-liner; build the sensor name with the
+    same helper as the factory, not `.replace('-', '_')`.
+15. Gate timer: `commit_t` is taken after the ingest run was polled to
+    SUCCESS (2 s poll), so samples read low; take the commit time from
+    Iceberg `last_updated_ms`, or state the bias in the result file.
+16. Docs: the g7 module doc and the `ci.yml` comment ("G7 measured 30 s")
+    do not mention the new step, which can take ~20 minutes worst case
+    inside the job's 30-minute timeout; say so, or raise the timeout with
+    the reason.
+17. The sensor returns silently when the run token is unset; log once why
+    no checks happen (it already fails closed).
+18. Move the "Three plain assignments…" comment back next to its
+    assignments in `authored_factory.py`.
+19. `pipeline-columns.tsx`: with a target lag and no `lag`, the cell shows
+    "—" while its accessor says `not_measured`; render "Not measured" and
+    test it.
+20. `ops/ai_eval/cases.json`: case 1 must check `minutes: 10`, not only
+    the pipeline; say "not run in CI" next to the cases, not only in the
+    CHANGELOG.
+21. `CHANGELOG.md`: "Downstream pipelines refresh in topological order when
+    their upstreams land" is not what D7 built; describe it as built.
+22. Handoff 5.2: the fingerprint is `count()` + `sum(cityHash64(*))`, a
+    full scan, not `max(_content_hash)`, and "< 10 ms" has no measurement.
+    Quote the query and its time on the largest Silver table in the seed
+    (`system.query_log` or `clickhouse-client --time`), or write *not
+    verified*.
+
+#### For the product owner
+
+Section 6.4 still stands: `BLD-2-AC4` as written cannot pass; the proposed
+wording there needs the owner's signature on the feature page before
+acceptance.
