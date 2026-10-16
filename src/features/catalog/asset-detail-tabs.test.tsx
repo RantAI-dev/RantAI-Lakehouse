@@ -183,6 +183,33 @@ function json(body: unknown, status = 200) {
   })
 }
 
+const LEARNING = {
+  asset: "bronze.demo_orders",
+  learned: false,
+  days: 3,
+  loads: 7,
+  requiredDays: 14,
+  requiredLoads: 5,
+  message: "learning: 3 days and 7 loads so far; anomalies start after 14 days and 5 loads",
+  firstLoadAt: "2026-10-13T09:00:00.000Z",
+  lastLoadAt: "2026-10-16T09:00:00.000Z",
+}
+
+const INCIDENT = {
+  id: "inc-1",
+  asset: "bronze.demo_orders",
+  ruleId: "q2",
+  ruleName: "id_unique",
+  kind: "check",
+  openedAt: "2026-10-15T09:00:00.000Z",
+  lastSeenAt: "2026-10-16T09:00:00.000Z",
+  detail: "id_unique — 3 repeated values in 50 rows (threshold: id unique)",
+  status: "open",
+  resolvedAt: null,
+  resolvedBy: null,
+  resolution: null,
+}
+
 /** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
 type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
 
@@ -198,6 +225,9 @@ function stubApi({
   tableMissing = false,
   snapshotAuthor = null,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
+  incidents = [],
+  schedules = [],
+  learning = LEARNING,
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -217,6 +247,12 @@ function stubApi({
   snapshotAuthor?: string | null
   /** What `GET .../restore` answers. */
   restore?: unknown
+  /** The quality incidents `GET /api/governance/quality/incidents` answers. */
+  incidents?: unknown[]
+  /** The quality schedules `GET /api/governance/quality/schedules` answers. */
+  schedules?: unknown[]
+  /** What `GET /api/governance/quality/learning/{asset}` answers. */
+  learning?: unknown
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -233,6 +269,18 @@ function stubApi({
       if (method === "DELETE") return json({ ok: true })
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
+    // DATA-14: the Quality tab's incidents, schedule and learning state.
+    if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
+    if (method === "GET" && path.endsWith("/api/governance/quality/schedules")) {
+      return json({ schedules, defaultIntervalMinutes: 60 })
+    }
+    if (method === "PUT" && path.includes("/api/governance/quality/schedules/")) {
+      return json({ asset: "bronze.demo_orders", updatedBy: "Reader", updatedAt: "2026-10-16T09:00:00.000Z", ...JSON.parse(String(init?.body)) })
+    }
+    if (method === "GET" && path.includes("/api/governance/quality/learning/")) return json(learning)
+    if (method === "POST" && path.includes("/api/governance/quality/incidents/")) {
+      return json({ ...INCIDENT, status: "resolved", resolution: JSON.parse(String(init?.body)).resolution, resolvedBy: "Reader", resolvedAt: "2026-10-16T10:00:00.000Z" })
+    }
     if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/quality/")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/sla/")) return json({ ok: true })
@@ -561,13 +609,116 @@ describe("Quality tab", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    // DATA-14 (AC1): the new rule is run once at once (the stub's answer to the
+    // create carries no `evaluable: false`), so a check that already fails opens
+    // its incident without waiting for the schedule. This test pinned the POST alone.
     expect(writes(fetchSpy)).toEqual([
       [
         "POST",
         "/api/governance/quality",
         { name: "demo_orders_id_unique", asset: "bronze.demo_orders", dimension: "uniqueness", threshold: "id unique", severity: "medium" },
       ],
+      ["POST", "/api/governance/quality/new/run", undefined],
     ])
+  })
+})
+
+describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
+  it("lists the table's open incidents and resolves one with a reason", async () => {
+    const fetchSpy = stubApi({ incidents: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/3 repeated values in 50 rows \(threshold: id unique\)/)).toBeTruthy()
+    expect(screen.getByText("Check failed")).toBeTruthy()
+    const incidentsRequest = fetchSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes("/quality/incidents"))
+    expect(incidentsRequest).toBe("/api/governance/quality/incidents?status=open&asset=bronze.demo_orders")
+
+    fireEvent.click(screen.getByRole("button", { name: "Resolve" }))
+    const confirm = screen.getAllByRole("button", { name: "Resolve" }).at(-1) as HTMLButtonElement
+    // A reason is required.
+    expect(confirm.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Why is it resolved?"), { target: { value: "  Source fixed  " } })
+    expect(confirm.disabled).toBe(false)
+    fireEvent.click(confirm)
+
+    await waitFor(() =>
+      expect(writes(fetchSpy)).toEqual([
+        ["POST", "/api/governance/quality/incidents/inc-1/resolve", { resolution: "Source fixed" }],
+      ])
+    )
+  })
+
+  it("offers no Resolve without governance:write", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read"], incidents: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    await screen.findByText(/3 repeated values in 50 rows/)
+    expect(screen.queryByRole("button", { name: "Resolve" })).toBeNull()
+  })
+
+  it("says honestly when the incidents could not be loaded", async () => {
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Reader", email: null, roles: [], permissions: ["*:*"], tenants: [] })
+      }
+      if (path.includes("/quality/incidents")) return json({ error: "boom" }, 503)
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/The incidents could not be loaded/)).toBeTruthy()
+  })
+
+  it("says a table is still learning, and how far along it is", async () => {
+    stubApi()
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(
+      await screen.findByText("learning: 3 days and 7 loads so far; anomalies start after 14 days and 5 loads")
+    ).toBeTruthy()
+    // No schedule is saved: the default is said.
+    expect(screen.getByText("Every 1 hour (the default).")).toBeTruthy()
+  })
+
+  it("says a learned table is watched", async () => {
+    stubApi({ learning: { ...LEARNING, learned: true, days: 20, loads: 40, message: null } })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/Learned from 20 days and 40 loads/)).toBeTruthy()
+  })
+
+  it("saves a schedule: on every load, with the backstop interval", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    fireEvent.change(await screen.findByLabelText("Run the checks"), { target: { value: "on_load" } })
+    fireEvent.change(screen.getByLabelText("And at least every"), { target: { value: "360" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
+
+    await waitFor(() =>
+      expect(writes(fetchSpy)).toEqual([
+        ["PUT", "/api/governance/quality/schedules/bronze.demo_orders", { mode: "on_load", intervalMinutes: 360 }],
+      ])
+    )
+  })
+
+  it("shows the saved schedule, and no control without governance:write", async () => {
+    stubApi({
+      permissions: ["catalog:read", "query:read"],
+      schedules: [{ asset: "bronze.demo_orders", mode: "interval", intervalMinutes: 180, updatedBy: "Rina", updatedAt: "2026-10-15T09:00:00.000Z" }],
+    })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText("Every 3 hours.")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Save schedule" })).toBeNull()
   })
 })
 
@@ -1801,7 +1952,7 @@ describe("Quality tab: rewriting a rule", () => {
     const save = screen.getByRole("button", { name: "Save rule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Threshold"), { target: { value: " amount not null >= 95% " } })
-    expect(screen.getByText(/results recorded for this rule are cleared/)).toBeTruthy()
+    expect(screen.getByText(/results recorded for this rule are kept in its history/)).toBeTruthy()
     fireEvent.click(save)
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())

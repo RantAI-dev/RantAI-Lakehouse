@@ -59,6 +59,84 @@ export type QualityRule = {
   hint?: string | null
 }
 
+/** The kind of finding a quality incident records (`DATA-14`). */
+export type QualityIncidentKind = "check" | "volume_anomaly" | "freshness_anomaly" | string
+
+/**
+ * One quality incident (`GET /api/governance/quality/incidents`): a failed
+ * run of an authored rule, or a learned volume or freshness anomaly. It stays
+ * `open` until a person resolves it with a reason.
+ */
+export type QualityIncident = {
+  id: string
+  /** The table, lower-cased (`silver.orders`). */
+  asset: string
+  /** The rule that failed; `null` for an anomaly. */
+  ruleId: string | null
+  /** The rule's name while it still exists. */
+  ruleName: string | null
+  kind: QualityIncidentKind
+  openedAt: string
+  /** When a run or a pass last found it still broken. */
+  lastSeenAt: string
+  detail: string
+  status: "open" | "resolved" | string
+  resolvedAt: string | null
+  resolvedBy: string | null
+  resolution: string | null
+}
+
+/** Which incidents to list; open by default. */
+export type QualityIncidentFilter = { status?: "open" | "resolved" | "all"; asset?: string }
+
+/** When a table's rules run (`PUT /api/governance/quality/schedules/{asset}`). */
+export type QualitySchedule = {
+  asset: string
+  mode: "on_load" | "interval" | string
+  /** Minutes between runs; the backstop for `on_load`. 60 to 1440. */
+  intervalMinutes: number
+  updatedBy: string | null
+  updatedAt: string
+}
+
+export type QualitySchedules = {
+  schedules: QualitySchedule[]
+  /** The interval of a table with no schedule. */
+  defaultIntervalMinutes: number
+}
+
+export type SetQualityScheduleInput =
+  | { mode: "interval"; intervalMinutes: number }
+  | { mode: "on_load"; intervalMinutes?: number }
+
+/**
+ * Whether a table's anomalies are being raised yet
+ * (`GET /api/governance/quality/learning/{asset}`). `message` is the
+ * sentence to show while it is still learning, `null` once it has learned.
+ */
+export type QualityLearning = {
+  asset: string
+  learned: boolean
+  days: number
+  loads: number
+  requiredDays: number
+  requiredLoads: number
+  message: string | null
+  firstLoadAt: string | null
+  lastLoadAt: string | null
+}
+
+/** One recorded run of a rule (`GET /api/governance/quality/{id}/runs`). */
+export type QualityRunRecord = {
+  status: CheckStatus
+  value: string
+  /** A person's display name, `schedule` or `load`. */
+  runBy: string
+  at: string
+  /** What the rule said when it ran; `null` for a run from before it was kept. */
+  threshold: string | null
+}
+
 /** What one run of a rule found (`routes::quality::run_rule`). */
 export type QualityRunResult = {
   id: string
@@ -276,15 +354,42 @@ export interface GovernanceService {
   runQualityRule(id: string, signal?: AbortSignal): Promise<QualityRunResult>
   /**
    * Rewrite an authored rule; needs `governance:write`. Changing its table
-   * or threshold clears the results recorded for it.
+   * or threshold leaves it without a result until it runs again; the runs it
+   * had stay in its history.
    */
   updateQualityRule(
     id: string,
     input: UpdateQualityRuleInput,
     signal?: AbortSignal
   ): Promise<QualityRule>
-  /** Remove an authored rule and its recorded runs; needs `governance:write`. */
+  /**
+   * Remove an authored rule and its recorded runs; needs `governance:write`.
+   * Its open incidents are resolved as "rule deleted".
+   */
   deleteQualityRule(id: string, signal?: AbortSignal): Promise<void>
+  /** The last 50 runs of a rule, newest first, with the threshold each ran with. */
+  listQualityRuns(id: string, signal?: AbortSignal): Promise<QualityRunRecord[]>
+  /** Quality incidents, newest first (open by default). */
+  listQualityIncidents(
+    filter?: QualityIncidentFilter,
+    signal?: AbortSignal
+  ): Promise<QualityIncident[]>
+  /** Resolve an open incident with a reason; needs `governance:write`. */
+  resolveQualityIncident(
+    id: string,
+    resolution: string,
+    signal?: AbortSignal
+  ): Promise<QualityIncident>
+  /** Every table's schedule; a table not listed runs every default interval. */
+  listQualitySchedules(signal?: AbortSignal): Promise<QualitySchedules>
+  /** Run a table's rules on every load, or every N minutes; needs `governance:write`. */
+  setQualitySchedule(
+    asset: string,
+    input: SetQualityScheduleInput,
+    signal?: AbortSignal
+  ): Promise<QualitySchedule>
+  /** Whether a table's volume and freshness anomalies are being raised yet. */
+  getQualityLearning(asset: string, signal?: AbortSignal): Promise<QualityLearning>
   createClassificationRule(
     input: CreateClassificationRuleInput,
     signal?: AbortSignal

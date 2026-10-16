@@ -91,6 +91,9 @@ const RULES_UNAVAILABLE: &str = "the alert rules could not be read";
 const CONNECTOR_SOURCE: &str = "Connector runs";
 /// The `source` label of an `alert_instance` written for an upload event.
 const UPLOAD_SOURCE: &str = "File uploads";
+/// The `source` label of an `alert_instance` written for an opened quality
+/// incident (`DATA-14`).
+const QUALITY_SOURCE: &str = "Data quality";
 
 /// Which half of the run sensors an event came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,13 +132,13 @@ impl Outcome {
 }
 
 /// Where a run's dedupe, summary and alerts hang: a connector that exists.
-struct ConnectorRef {
-    id: String,
-    name: String,
+pub(super) struct ConnectorRef {
+    pub(super) id: String,
+    pub(super) name: String,
 }
 
 /// What looking for the thing a run belongs to found.
-enum Found<T> {
+pub(super) enum Found<T> {
     This(T),
     /// Nothing to do, with the reason the response carries (`{"matched": 0}`
     /// as an unknown job answers today).
@@ -165,7 +168,7 @@ fn run_end(end_time: Option<f64>) -> OffsetDateTime {
 
 /// Read the connector a run belongs to from the run's config, and check it
 /// exists.
-async fn find_connector(
+pub(super) async fn find_connector(
     state: &AppState,
     pool: &PgPool,
     run_id: &str,
@@ -210,7 +213,7 @@ async fn find_connector(
 
 /// The orchestrator's status for `run_id`, refused with 409 when it is not
 /// the one the sensor claims, as the pipeline path does.
-async fn confirm_status(
+pub(super) async fn confirm_status(
     state: &AppState,
     run_id: &str,
     outcome: Outcome,
@@ -308,6 +311,39 @@ async fn deliver_with_rules(
     if let Some(source) = persist_as {
         persist_instances(pool, &attempted, source, scope_id, text).await;
     }
+    attempted.len()
+}
+
+/// Delivers an opened quality incident (`DATA-14`) to the `quality_incident`
+/// rules of its table (or `*`), through the same address-checking sender,
+/// silences and instance records as the connector events. `text` holds the
+/// table, the rule's name, what was measured and a relative console link;
+/// never upstream error text. A rule store that cannot be read is logged and
+/// delivers nothing: the incident is already open and listed. Returns how
+/// many deliveries were attempted.
+pub(super) async fn deliver_quality_incident(
+    state: &AppState,
+    pool: &PgPool,
+    asset: &str,
+    text: &str,
+) -> usize {
+    let Ok(rules) = read_rules(state).await else {
+        return 0;
+    };
+    let http = state.webhook_sender();
+    let email = EmailSender::new(smtp_config(&state.config));
+    let silence = ApiSilenceSource { pg: pool };
+    let attempted = lakehouse_alerts::deliver_quality_incident_to(
+        &rules,
+        &http,
+        &email,
+        asset,
+        "Quality incident",
+        text,
+        Some(&silence as &dyn SilenceSource),
+    )
+    .await;
+    persist_instances(pool, &attempted, QUALITY_SOURCE, asset, text).await;
     attempted.len()
 }
 

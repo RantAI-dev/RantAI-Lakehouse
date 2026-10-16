@@ -321,6 +321,22 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/governance/tag-keys",        Policy::RequiresPermission("governance:write")),
     ("PUT",  "/api/governance/tag-keys/{key}",  Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/tag-keys/{key}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F2): quality incidents. Listing them is open to any login
+    // like the rule list; resolving one is a governance decision, like
+    // editing or deleting a rule.
+    ("GET",  "/api/governance/quality/incidents", Policy::RequiresAuth),
+    ("POST", "/api/governance/quality/incidents/{id}/resolve", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F3): per-table schedules. Reading is open to any login like
+    // the rule list; setting one changes when real checks (and their
+    // incidents and alerts) run, so it is a governance decision.
+    ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
+    ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F5): a table's learned-or-learning state; open to any login
+    // like the quality list it is shown beside.
+    ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
+    // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
+    // any login, and the history shows what that list shows (a verdict).
+    ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -996,6 +1012,52 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// `DATA-14` (F2): listing quality incidents needs only a login, like the
+    /// quality list; resolving one needs `governance:write`.
+    #[test]
+    fn quality_incidents_are_listed_by_any_login_and_resolved_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/incidents"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/incidents/{id}/resolve"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F3): reading schedules needs only a login; setting one needs
+    /// `governance:write`.
+    #[test]
+    fn quality_schedules_are_read_by_any_login_and_set_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/schedules"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F7): a rule's run history is readable by any login.
+    #[test]
+    fn a_rules_run_history_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/{id}/runs"),
+            Some(Policy::RequiresAuth)
+        );
+    }
+
+    /// `DATA-14` (F5): the learning state is readable by any login.
+    #[test]
+    fn the_learning_state_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/learning/{asset}"),
+            Some(Policy::RequiresAuth)
+        );
     }
 
     #[test]

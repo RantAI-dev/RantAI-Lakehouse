@@ -46,6 +46,10 @@ mod overview;
 pub(crate) mod params;
 mod pipelines;
 mod quality;
+mod quality_anomaly;
+mod quality_incidents;
+mod quality_load;
+mod quality_schedules;
 mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -430,6 +434,34 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/lineage/columns",
             get(governance::column_lineage),
         )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
+        )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(

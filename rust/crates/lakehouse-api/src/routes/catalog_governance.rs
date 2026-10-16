@@ -1006,7 +1006,15 @@ impl QualityIndex {
                 self.rules
                     .iter()
                     .filter(|r| is_one_of(&r.asset, names))
-                    .map(|r| rule_check(r, self.runs.get(&r.id))),
+                    // DATA-14 (F2): an older run of an edited rule is history,
+                    // not this rule's result.
+                    .map(|r| {
+                        let run = self
+                            .runs
+                            .get(&r.id)
+                            .filter(|run| run.describes(&r.asset, &r.threshold));
+                        rule_check(r, run)
+                    }),
             )
             .collect()
     }
@@ -1312,6 +1320,8 @@ mod tests {
             status: "failed".to_owned(),
             value: "3 repeated values in 50 rows".to_owned(),
             at: "2026-10-01T09:00:00Z".to_owned(),
+            asset: rule.asset.clone(),
+            threshold: rule.threshold.clone(),
         };
         let ran = rule_check(&rule, Some(&run));
         assert_eq!(ran["status"], "failed");
