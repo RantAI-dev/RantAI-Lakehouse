@@ -36,6 +36,7 @@ mod ops;
 mod overview;
 mod pipelines;
 mod quality;
+mod quality_incidents;
 mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -402,6 +403,16 @@ fn governance_static_router() -> Router<AppState> {
         .route(
             "/api/governance/lineage/columns",
             get(governance::column_lineage),
+        )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
         )
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.

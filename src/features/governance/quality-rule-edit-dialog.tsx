@@ -73,7 +73,8 @@ export function EditRuleDialog({
     governanceService.updateQualityRule(rule.id, input, signal)
   )
   const rewrite = ruleRewrite(rule, { asset, threshold, severity })
-  // Results describe what the rule checked; a different check has none yet.
+  // DATA-14 (F2): the results stay in the rule's history, but they describe
+  // what it checked before, so a different check shows none yet.
   const clearsResults =
     asset.trim() !== rule.asset || threshold.trim() !== rule.threshold
 
@@ -141,8 +142,8 @@ export function EditRuleDialog({
           </div>
           {clearsResults ? (
             <p className="text-xs text-muted-foreground">
-              The results recorded for this rule are cleared: they describe what it checked
-              before. It reads &quot;not run yet&quot; until it runs again.
+              The results recorded for this rule are kept in its history, but they describe what
+              it checked before. It reads &quot;not run yet&quot; until it runs again.
             </p>
           ) : null}
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}

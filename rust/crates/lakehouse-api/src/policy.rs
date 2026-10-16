@@ -298,6 +298,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/governance/tag-keys",        Policy::RequiresPermission("governance:write")),
     ("PUT",  "/api/governance/tag-keys/{key}",  Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/tag-keys/{key}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F2): quality incidents. Listing them is open to any login
+    // like the rule list; resolving one is a governance decision, like
+    // editing or deleting a rule.
+    ("GET",  "/api/governance/quality/incidents", Policy::RequiresAuth),
+    ("POST", "/api/governance/quality/incidents/{id}/resolve", Policy::RequiresPermission("governance:write")),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -872,6 +877,20 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// `DATA-14` (F2): listing quality incidents needs only a login, like the
+    /// quality list; resolving one needs `governance:write`.
+    #[test]
+    fn quality_incidents_are_listed_by_any_login_and_resolved_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/incidents"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/incidents/{id}/resolve"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
     }
 
     #[test]

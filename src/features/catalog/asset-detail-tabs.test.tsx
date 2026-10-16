@@ -1557,7 +1557,7 @@ describe("Quality tab: rewriting a rule", () => {
     const save = screen.getByRole("button", { name: "Save rule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Threshold"), { target: { value: " amount not null >= 95% " } })
-    expect(screen.getByText(/results recorded for this rule are cleared/)).toBeTruthy()
+    expect(screen.getByText(/results recorded for this rule are kept in its history/)).toBeTruthy()
     fireEvent.click(save)
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())

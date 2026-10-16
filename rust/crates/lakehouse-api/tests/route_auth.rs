@@ -1629,6 +1629,64 @@ async fn tag_key_routes_are_gated_in_both_directions() {
     assert_eq!(stored, 0, "no empty-bodied request may store a key");
 }
 
+// ── Quality incidents (DATA-14) ─────────────────────────────────────────
+
+/// The two `/api/governance/quality/incidents` routes, asserted in both
+/// directions: any login may list incidents (like the quality rule list), a
+/// principal without `governance:write` is refused the resolve (403) and
+/// nothing changes, and one holding `governance:write` alone is past the gate
+/// (the unknown incident then answers 404, not 401/403).
+#[tokio::test]
+async fn quality_incident_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let resolve = "/api/governance/quality/incidents/00000000-0000-4000-8000-000000000000/resolve";
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/quality/incidents",
+        &reader_cookie,
+    )
+    .await;
+    assert_ne!(
+        listed.status(),
+        StatusCode::FORBIDDEN,
+        "any login may list incidents"
+    );
+    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
+    let refused = request_with_cookie(&router, "POST", resolve, &reader_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to resolve an incident"
+    );
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "POST", resolve, &admin_cookie).await;
+    assert_ne!(
+        allowed.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write must be enough to resolve an incident"
+    );
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/quality/incidents")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
 /// policies the plan names, so the table-driven loops above walk them both
 /// ways (a `dashboard:read`-only principal is refused on the withdrawal; the

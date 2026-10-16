@@ -709,6 +709,14 @@ async fn ensure_table(ch: &ChClient) -> Result<(), ChError> {
                  ) ENGINE = MergeTree ORDER BY (rule_id, at)",
                 None,
             )
+            .await?;
+            // DATA-14 (F2): a kept run says what it checked, since an
+            // edited rule's older runs are no longer erased. Rows from
+            // before this column read as empty: their threshold is unknown.
+            ch.exec(
+                "ALTER TABLE console.quality_run ADD COLUMN IF NOT EXISTS threshold String",
+                None,
+            )
             .await
         })
         .await
@@ -723,13 +731,14 @@ async fn record_run(
 ) -> Result<(), ChError> {
     ensure_table(ch).await?;
     let sql = format!(
-        "INSERT INTO console.quality_run (rule_id, asset, status, value, run_by, at) \
-         VALUES ({}, {}, {}, {}, {}, now64(3))",
+        "INSERT INTO console.quality_run (rule_id, asset, status, value, run_by, at, threshold) \
+         VALUES ({}, {}, {}, {}, {}, now64(3), {})",
         SqlLiteral::from(rule.id.as_str()),
         SqlLiteral::from(rule.asset.as_str()),
         SqlLiteral::from(verdict.status),
         SqlLiteral::from(verdict.value.as_str()),
         SqlLiteral::from(run_by),
+        SqlLiteral::from(rule.threshold.as_str()),
     );
     ch.exec(&sql, None).await
 }
@@ -741,6 +750,23 @@ pub(crate) struct LatestRun {
     pub(crate) value: String,
     /// `YYYY-MM-DDTHH:MM:SSZ`.
     pub(crate) at: String,
+    /// The table the run checked (`quality_run.asset`).
+    pub(crate) asset: String,
+    /// What the rule said when it ran; empty for a run from before the
+    /// column existed.
+    pub(crate) threshold: String,
+}
+
+impl LatestRun {
+    /// Whether this run is a verdict on the rule as it reads now.
+    /// `DATA-14` (F2): an edited rule keeps its older runs as history, but
+    /// they describe what it checked before, so they are not its verdict
+    /// (principle 2: no stale result under a new threshold). A run from
+    /// before `threshold` was recorded cannot be told apart and counts.
+    pub(crate) fn describes(&self, asset: &str, threshold: &str) -> bool {
+        self.asset.eq_ignore_ascii_case(asset)
+            && (self.threshold.is_empty() || self.threshold == threshold)
+    }
 }
 
 /// The latest run of every rule that has one, by rule id. A table nothing
@@ -748,14 +774,20 @@ pub(crate) struct LatestRun {
 /// is; any other failure is logged and reads the same, so a list never
 /// fails over its verdict column.
 pub(crate) async fn latest_runs(ch: &ChClient) -> HashMap<String, LatestRun> {
-    let result = ch
-        .rows(
-            "SELECT rule_id, argMax(status, at) AS status, argMax(value, at) AS value, \
-                    formatDateTime(max(at), '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS ran_at \
-             FROM console.quality_run GROUP BY rule_id",
-            None,
-        )
-        .await;
+    // The table may predate the `threshold` column; add it before reading.
+    let result = match ensure_table(ch).await {
+        Ok(()) => {
+            ch.rows(
+                "SELECT rule_id, argMax(status, at) AS status, argMax(value, at) AS value, \
+                        argMax(asset, at) AS asset, argMax(threshold, at) AS threshold, \
+                        formatDateTime(max(at), '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS ran_at \
+                 FROM console.quality_run GROUP BY rule_id",
+                None,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
     match result {
         Ok(rows) => rows
             .iter()
@@ -766,6 +798,8 @@ pub(crate) async fn latest_runs(ch: &ChClient) -> HashMap<String, LatestRun> {
                         status: str_col(r, "status").to_owned(),
                         value: str_col(r, "value").to_owned(),
                         at: str_col(r, "ran_at").to_owned(),
+                        asset: str_col(r, "asset").to_owned(),
+                        threshold: str_col(r, "threshold").to_owned(),
                     },
                 )
             })
@@ -794,10 +828,17 @@ pub(crate) fn annotate_rule(rule: &mut Value, runs: &HashMap<String, LatestRun>)
         .and_then(threshold_hint);
     o.insert("evaluable".to_owned(), json!(hint.is_none()));
     o.insert("hint".to_owned(), json!(hint));
+    let (asset, threshold) = (
+        o.get("asset").and_then(Value::as_str).unwrap_or_default(),
+        o.get("threshold")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
     let run = o
         .get("id")
         .and_then(Value::as_str)
-        .and_then(|id| runs.get(id));
+        .and_then(|id| runs.get(id))
+        .filter(|run| run.describes(asset, threshold));
     if let Some(run) = run {
         o.insert("lastStatus".to_owned(), json!(run.status));
         o.insert("lastRunAt".to_owned(), json!(run.at));
@@ -874,6 +915,12 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
             tracing::warn!(?err, rule = %rule.name, "quality: recording the run failed");
             RunError::Failed("The check ran, but its result could not be saved.".to_owned())
         })?;
+    if verdict.status == "failed" {
+        // DATA-14 (F2): a failure opens an incident, kept open until a
+        // person resolves it. Bookkeeping after the verdict is saved: if it
+        // fails the run still succeeded, and the next failed run tries again.
+        crate::routes::quality_incidents::open_for_failed_run(state, rule, &verdict.value).await;
+    }
     Ok(verdict)
 }
 
@@ -912,7 +959,7 @@ pub async fn run_rule(
     })))
 }
 
-fn pool(state: &AppState) -> Result<&lakehouse_store::PgPool, ApiError> {
+pub(crate) fn pool(state: &AppState) -> Result<&lakehouse_store::PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "quality rules unavailable: no Postgres pool is configured".to_owned(),
@@ -921,10 +968,14 @@ fn pool(state: &AppState) -> Result<&lakehouse_store::PgPool, ApiError> {
 }
 
 /// Forgets every run recorded for `rule`: its verdicts describe a rule
-/// that no longer exists, or no longer reads the way it did. Waits for the
-/// delete (`mutations_sync`), so the next list does not show a verdict
-/// that is already gone. Best-effort: a table nothing created yet, or a
-/// failed delete, is logged and left.
+/// that no longer exists. Waits for the delete (`mutations_sync`), so the
+/// next list does not show a verdict that is already gone. Best-effort: a
+/// table nothing created yet, or a failed delete, is logged and left.
+///
+/// `DATA-14` (F2): called on delete only. An edit used to call it too,
+/// which erased the rule's history; edited rules now keep their runs, each
+/// with the threshold it ran with ([`LatestRun::describes`] keeps an old
+/// run from passing as the new rule's verdict).
 async fn forget_runs(ch: &ChClient, rule: &QualityRule) {
     let sql = format!(
         "ALTER TABLE console.quality_run DELETE WHERE rule_id = {} SETTINGS mutations_sync = 1",
@@ -951,9 +1002,10 @@ pub struct UpdateRuleBody {
 /// evaluator cannot read is made one it can, without losing the rule.
 ///
 /// A rule that now checks something else has no verdict: when its table
-/// or its threshold changed, the runs recorded for it are forgotten and it
-/// reads "not run yet" until it is run again. The answer is the rule as
-/// the lists show it, with `evaluable` and the `hint` when it is not.
+/// or its threshold changed it reads "not run yet" until it is run again,
+/// while the runs recorded for it stay as its history (`DATA-14`, F2). The
+/// answer is the rule as the lists show it, with `evaluable` and the `hint`
+/// when it is not.
 ///
 /// # Errors
 ///
@@ -993,10 +1045,6 @@ pub async fn update_rule(
         .await?
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
 
-    let checks_something_else = before.asset != rule.asset || before.threshold != rule.threshold;
-    if checks_something_else {
-        forget_runs(&state.clickhouse, &rule).await;
-    }
     // Which of its parts the rewrite changed — what the history says.
     let changed: Vec<&str> = [
         ("threshold", before.threshold != rule.threshold),
@@ -1030,18 +1078,17 @@ pub async fn update_rule(
         .await;
     }
 
-    let runs = if checks_something_else {
-        HashMap::new()
-    } else {
-        latest_runs(&state.clickhouse).await
-    };
+    // An older run of a different asset or threshold is not this rule's
+    // verdict; `annotate_rule` leaves it out.
+    let runs = latest_runs(&state.clickhouse).await;
     let mut out = serde_json::to_value(&rule).unwrap_or(Value::Null);
     annotate_rule(&mut out, &runs);
     Ok(ApiJson(out))
 }
 
-/// `DELETE /api/governance/quality/{id}` — remove an authored rule, and
-/// the runs recorded for it. The seeded demo rules name tables that do
+/// `DELETE /api/governance/quality/{id}` — remove an authored rule, the
+/// runs recorded for it, and resolve its open incidents ("rule deleted",
+/// by the deleting user; `DATA-14`, F2). The seeded demo rules name tables that do
 /// not exist and can never run; before this, nothing could remove a rule.
 ///
 /// # Errors
@@ -1057,6 +1104,7 @@ pub async fn delete_rule(
         .await?
         .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
     forget_runs(&state.clickhouse, &rule).await;
+    crate::routes::quality_incidents::resolve_for_deleted_rule(&state, &rule, &principal).await;
     crate::routes::governance::audit_table_change(
         &state,
         Some(&principal),
@@ -1136,7 +1184,10 @@ fn due_rules<'a>(
         .iter()
         .filter(|r| threshold_hint(&r.threshold).is_none())
         .filter_map(|r| {
-            let ran = runs.get(&r.id).map_or("", |run| run.at.as_str());
+            let ran = runs
+                .get(&r.id)
+                .filter(|run| run.describes(&r.asset, &r.threshold))
+                .map_or("", |run| run.at.as_str());
             let skipped = skipped.get(&r.id).map_or("", String::as_str);
             let last = ran.max(skipped);
             (last < due_before).then_some((last, r))
@@ -1464,6 +1515,8 @@ mod tests {
             status: "passed".to_owned(),
             value: "1 rows".to_owned(),
             at: at.to_owned(),
+            asset: "silver.orders".to_owned(),
+            threshold: String::new(),
         }
     }
 
@@ -1542,9 +1595,13 @@ mod tests {
                 status: "failed".to_owned(),
                 value: "3 repeated values in 50 rows".to_owned(),
                 at: "2026-10-01T09:00:00Z".to_owned(),
+                asset: "silver.orders".to_owned(),
+                threshold: "payment_id unique".to_owned(),
             },
         );
-        let mut ran = json!({ "id": "r1", "threshold": "payment_id unique", "lastStatus": null });
+        let mut ran = json!({
+            "id": "r1", "asset": "silver.orders", "threshold": "payment_id unique", "lastStatus": null
+        });
         annotate_rule(&mut ran, &runs);
         assert_eq!(ran["evaluable"], true);
         assert_eq!(ran["hint"], Value::Null);
@@ -1557,6 +1614,53 @@ mod tests {
         assert_eq!(prose["evaluable"], false);
         assert_eq!(prose["hint"], GRAMMAR_HINT);
         assert_eq!(prose["lastStatus"], Value::Null);
+    }
+
+    /// `DATA-14` (F2): an edited rule keeps its older runs as history, but
+    /// they are not its verdict, and it is due again at once.
+    #[test]
+    fn a_run_of_an_earlier_threshold_is_not_the_edited_rules_result() {
+        let mut runs = HashMap::new();
+        runs.insert(
+            "r1".to_owned(),
+            LatestRun {
+                status: "failed".to_owned(),
+                value: "3 repeated values in 50 rows".to_owned(),
+                at: "2026-10-01T09:30:00Z".to_owned(),
+                asset: "silver.orders".to_owned(),
+                threshold: "payment_id unique".to_owned(),
+            },
+        );
+        // Same threshold, and the asset compared without case: its result.
+        let mut same =
+            json!({ "id": "r1", "asset": "Silver.Orders", "threshold": "payment_id unique" });
+        annotate_rule(&mut same, &runs);
+        assert_eq!(same["lastStatus"], "failed");
+        // Edited threshold, or a different table: no result under the new rule.
+        for edited in [
+            json!({ "id": "r1", "asset": "silver.orders", "threshold": "payment_id duplicates <= 5" }),
+            json!({ "id": "r1", "asset": "silver.payments", "threshold": "payment_id unique" }),
+        ] {
+            let mut edited = edited;
+            annotate_rule(&mut edited, &runs);
+            assert!(edited.get("lastStatus").is_none(), "{edited}");
+            assert_eq!(edited["evaluable"], true);
+        }
+        // A run from before the threshold was recorded cannot be told apart.
+        runs.get_mut("r1").unwrap().threshold = String::new();
+        let mut legacy = json!({ "id": "r1", "asset": "silver.orders", "threshold": "anything" });
+        annotate_rule(&mut legacy, &runs);
+        assert_eq!(legacy["lastStatus"], "failed");
+
+        // Due: the edited rule is due though its old run is recent.
+        runs.get_mut("r1").unwrap().threshold = "payment_id unique".to_owned();
+        let edited_rule = QualityRule {
+            threshold: "payment_id duplicates <= 5".to_owned(),
+            ..rule("r1", "payment_id unique")
+        };
+        let rules = [edited_rule];
+        let due = due_rules(&rules, &runs, &HashMap::new(), "2026-10-01T09:00:00Z");
+        assert_eq!(due.len(), 1);
     }
 
     // ── DATA-14 (F1): the rest of the ready library ────────────────────
