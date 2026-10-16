@@ -18,6 +18,7 @@ use axum::body::Bytes;
 use axum::extract::{Json, Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
+use uuid::Uuid;
 
 use axum::response::IntoResponse;
 
@@ -557,38 +558,49 @@ pub(super) async fn set_pipeline_target_lag(
         // own classified body, never this error value's text copied by hand.
         Err(err) => return api_result_to_value::<()>(Err(crate::error::ApiRejection(err))).await,
     };
-    // BLD-2 review R1 BLOCKER 1: name lookup scoped to caller's tenant; db errors propagated
+    // BLD-2 review R1 BLOCKER 1: the name/target lookup is scoped to the
+    // caller's own scope, and a database failure is propagated instead of
+    // being folded into "resolve it as an id". No request headers reach a
+    // tool call, so the scope resolves the way `create_pipeline` above
+    // resolves a new pipeline's tenant: the principal's first tenant, and
+    // `Unrestricted` only for a Platform Admin who sent no `X-Tenant`.
+    // `apply_set_target_lag` re-checks `in_scope` on the id this produces,
+    // so a name that resolves to another tenant's row is answered with the
+    // same not-found as an unknown pipeline.
     let pipeline_id = if pipeline_arg.starts_with("pl-") {
         pipeline_arg.clone()
     } else {
-        let query_res = match principal.tenant_id {
-            Some(tenant_id) => {
-                sqlx::query_as::<_, (String,)>(
-                    "SELECT id FROM pipeline_definition WHERE (name = $1 OR target = $1) AND tenant_id = $2 LIMIT 1",
-                )
-                .bind(&pipeline_arg)
-                .bind(tenant_id)
-                .fetch_optional(pool)
-                .await
-            }
-            None => {
-                sqlx::query_as::<_, (String,)>(
-                    "SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1 LIMIT 1",
-                )
-                .bind(&pipeline_arg)
-                .fetch_optional(pool)
-                .await
-            }
+        let scope = match crate::routes::authored_pipelines::resolve_caller_scope(
+            principal,
+            &HeaderMap::new(),
+        ) {
+            Ok(scope) => scope,
+            Err(err) => return api_result_to_value::<()>(Err(err)).await,
         };
-        match query_res {
-            Ok(Some((id,))) => id,
-            Ok(None) => pipeline_arg.clone(),
-            Err(err) => {
-                return api_result_to_value::<()>(Err(
-                    lakehouse_store::StoreError::from(err).into()
-                ))
-                .await;
-            }
+        let candidates: Vec<(String, Option<Uuid>)> =
+            match sqlx::query_as::<_, (String, Option<Uuid>)>(
+                "SELECT id, tenant_id FROM pipeline_definition WHERE name = $1 OR target = $1",
+            )
+            .bind(&pipeline_arg)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    return api_result_to_value::<()>(Err(
+                        lakehouse_store::StoreError::from(err).into()
+                    ))
+                    .await;
+                }
+            };
+        match candidates.into_iter().find(|(_, row_tenant)| {
+            crate::routes::authored_pipelines::matches_scope(scope, *row_tenant)
+        }) {
+            Some((id, _)) => id,
+            // An unknown name stays the name: `apply_set_target_lag`'s
+            // `authored_only` answers `Pipeline <name> not found`, the
+            // same body as a name that exists in another tenant.
+            None => pipeline_arg.clone(),
         }
     };
     let res = crate::routes::authored_pipelines::apply_set_target_lag(
@@ -615,7 +627,10 @@ mod t1_3_tests {
 
     use lakehouse_auth::{PermissionSet, PrincipalId};
     use lakehouse_dagster::LaunchFailure;
+    use sqlx::PgPool;
     use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::config::Config;
@@ -1103,14 +1118,68 @@ mod t1_3_tests {
         );
     }
 
+    /// A real `tenant` row: `pipeline_definition.tenant_id` references
+    /// `tenant (id)`, so a test that seeds a pipeline in a tenant has to
+    /// create the tenant first.
+    async fn seed_tenant(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, 'Fixture tenant', $2, 'Standard', 'US')",
+        )
+        .bind(id)
+        .bind(format!("fixture-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed a tenant row");
+        id
+    }
+
+    /// A [`AppState`] whose Postgres pool is `pool`, built the way
+    /// `Config::DATABASE_URL` builds it in production (so the test does
+    /// not reach past the config choke point), plus a Dagster mock that
+    /// answers a workspace reload.
+    async fn state_with_pg(pool: &sqlx::PgPool) -> AppState {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("reloadWorkspace"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "data": { "reloadWorkspace": { "__typename": "Workspace" } } }),
+            ))
+            .mount(&server)
+            .await;
+        let options = pool.connect_options();
+        let url = format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database")
+        );
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), url);
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            format!("{}/graphql", server.uri()),
+        );
+        AppState::new(Config::from_map(&env).expect("valid test Config"))
+    }
+
     /// BLD-2 review R1 BLOCKER 1: the assistant tool refuses cross-tenant pipelines
     /// by id and by name, returning 404 and leaving state untouched.
     #[sqlx::test(migrations = "../../migrations")]
     async fn set_pipeline_target_lag_refuses_cross_tenant_by_id_and_by_name(pool: PgPool) {
-        let mut cfg = HashMap::new();
-        let state = AppState::new(Config::from_map(&cfg).unwrap()).with_pg(pool.clone());
-        let tenant_a = Uuid::new_v4();
-        let tenant_b = Uuid::new_v4();
+        // No request headers reach a tool call, so the state is built from
+        // the test pool alone; the Dagster mock is here because a
+        // successful write would reload the orchestrator, and this test
+        // asserts nothing was written.
+        let state = state_with_pg(&pool).await;
+        // `pipeline_definition.tenant_id` references `tenant (id)`, so both
+        // sides of the attempt are real rows rather than bare UUIDs.
+        let tenant_a = seed_tenant(&pool).await;
+        let tenant_b = seed_tenant(&pool).await;
 
         // Seed tenant B's pipeline
         let created = lakehouse_store::pipelines::create_pipeline(
@@ -1141,16 +1210,17 @@ mod t1_3_tests {
         .await
         .expect("create pipeline for tenant B");
 
-        // Tenant A principal
+        // Tenant A principal: `pipeline:write` in tenant A only. The scope
+        // check a tool call gets is `resolve_caller_scope` with no
+        // `X-Tenant`, which resolves to the principal's first tenant.
         let principal_a = Principal {
             id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: vec![tenant_a],
             display_name: "User A".to_owned(),
-            email: "user_a@example.com".to_owned(),
-            tenant_id: Some(tenant_a),
-            permissions: PermissionSet::from_iter([
-                "pipeline:read".parse().unwrap(),
-                "pipeline:write".parse().unwrap(),
-            ]),
+            permissions: PermissionSet::parse("pipeline:read,pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
         };
 
         // 1. Try to set by tenant B's id
