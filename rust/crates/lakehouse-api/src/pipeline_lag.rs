@@ -611,10 +611,9 @@ async fn settle_request(
             );
             state.requested_run_key = None;
             state.requested_at = None;
-            // BLD-2 review R1 decision R2: as on a failed run, the tokens
-            // stay — they are what makes the NEXT key (attempt + 1)
-            // distinct, so the retry is a request `Dagster` has not seen.
-            state.request_attempt += 1;
+            // BLD-2 review R2 decision R9: a lost request (R1) is not an attempt (R2).
+            // Only a run that Dagster created and that ended FAILURE/CANCELED counts
+            // toward request_attempt.
             return Ok(false);
         }
         tracing::info!(%run_key, "target lag: requested run not created yet; waiting");
@@ -3046,9 +3045,10 @@ mod tests {
             "decides to run again after lost request is cleared"
         );
         let new_key = decided_again.run_key.expect("a new run key");
+        // BLD-2 review R2 decision R9: lost request does not count toward attempt
         assert!(
-            new_key.ends_with(":1"),
-            "the lost request counted as attempt 0, so the new key is attempt 1: {new_key}"
+            new_key.ends_with(":0"),
+            "the lost request is not an attempt, so the new key remains attempt 0: {new_key}"
         );
     }
 
