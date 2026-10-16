@@ -3055,6 +3055,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
+                run_as: None,
+                // BLD-1 / D1: no author — this fixture seeds a row that
+                // the update and restore routes then refuse, so it never
+                // reaches the orchestrator.
             }
         }
 
