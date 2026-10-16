@@ -116,6 +116,19 @@ the same kind of one-time, guarded record fix as above (version 70 → 72 for
 asset_certification, 71 → 73 for governed_tags, each `WHERE version = <old> AND
 description LIKE '%<name>%'`); none was run here.
 
+**Renumbered a third time (2026-10-16).** `main` took `0072_connector_run_record.sql`
+and `0073_connector_inactive_column_reason.sql` in #144, so by the same rule
+this branch's moved above main's range, content unchanged:
+
+- `0072_asset_certification.sql` -> `0082_asset_certification.sql`
+- `0073_governed_tags.sql` -> `0083_governed_tags.sql`
+
+`0077`-`0081` are reserved for other work. The `CHANGELOG.md` entry and the
+code comments (`lakehouse-store/src/lib.rs`, `governed_tag.rs`,
+`routes/governance.rs`) say `0082`/`0083` now; the older paragraphs above keep
+the numbers as they stood. A database that applied them under `0072`/`0073`
+needs the same guarded record fix (72 -> 82, 73 -> 83); none was run here.
+
 - **Catalog overlay** — rows and detail carry `governedTags` (object, keys
   sorted) next to `tags`, via the annotation overlay in
   `routes/catalog.rs:1481-1490`; absent when empty, like part 1's fields.
