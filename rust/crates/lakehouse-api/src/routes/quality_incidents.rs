@@ -178,7 +178,8 @@ pub async fn resolve_incident(
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let body: ResolveBody = serde_json::from_slice(&body)
-        .map_err(|err| ApiError::BadRequest(format!("Invalid request body: {err}")))?;
+        // SEC-11 (CI run on DATA-14): a fixed sentence, not serde's text.
+        .map_err(|_| ApiError::BadRequest("Body must be JSON {resolution}.".to_owned()))?;
     let incident = match quality::resolve(pool(&state)?, &id, principal.id.uuid(), &body.resolution)
         .await?
     {

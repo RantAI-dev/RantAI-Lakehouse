@@ -80,7 +80,10 @@ pub async fn put_schedule(
     body: axum::body::Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let body: ScheduleBody = serde_json::from_slice(&body)
-        .map_err(|err| ApiError::BadRequest(format!("Invalid request body: {err}")))?;
+        // SEC-11 (CI run on DATA-14): a fixed sentence, not serde's text.
+        .map_err(|_| {
+            ApiError::BadRequest("Body must be JSON {mode, intervalMinutes}.".to_owned())
+        })?;
     let key = table_key(&asset).ok_or_else(|| {
         ApiError::BadRequest(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),
