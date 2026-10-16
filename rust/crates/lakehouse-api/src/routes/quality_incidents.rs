@@ -51,6 +51,12 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     .await
     {
         Ok(recorded) => {
+            // DATA-14 review BLOCKER 1: an incident that OPENS is delivered to
+            // the `quality_incident` rules, as `open_anomaly` does; one seen
+            // again (`opened` false) is the same incident and sends nothing.
+            if recorded.opened {
+                notify_opened(state, &rule.asset, &detail);
+            }
             tracing::debug!(rule = %rule.name, opened = recorded.opened, "quality: incident recorded");
         }
         Err(err) => {
