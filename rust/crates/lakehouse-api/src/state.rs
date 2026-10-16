@@ -533,6 +533,18 @@ fn connector_secret_resolver(
     ))
 }
 
+/// `SRC-12` decision 4: one keyring for the store (seals) and the resolver
+/// (opens), built once by [`AppState::new`]. A missing or malformed key is
+/// kept as its error, not dropped: `main` refuses to start on it, and any
+/// credential read or write names the setting.
+fn connector_secrets_keyring(config: &Config) -> SharedKeyring {
+    Keyring::from_values(
+        config.connector_secrets_key.as_deref(),
+        config.connector_secrets_key_previous.as_deref(),
+    )
+    .map(Arc::new)
+}
+
 /// `SRC-12 review B1 BLOCKER 1`: with a secret manager set and no allowed
 /// prefix, no reference is accepted (fail closed); say so once at start-up.
 fn warn_if_no_reference_prefixes(settings: &SecretManagerSettings) {
@@ -682,15 +694,7 @@ impl AppState {
         let secrets_dir = config.connector_secrets_dir.clone();
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
-        // SRC-12 decision 4: one keyring for the store (seals) and the
-        // resolver (opens). A missing or malformed key is kept as its
-        // error, not dropped: `main` refuses to start on it, and any
-        // credential read or write names the setting.
-        let secrets_keyring: SharedKeyring = Keyring::from_values(
-            config.connector_secrets_key.as_deref(),
-            config.connector_secrets_key_previous.as_deref(),
-        )
-        .map(Arc::new);
+        let secrets_keyring = connector_secrets_keyring(&config);
         let throttle_policy = ThrottlePolicy {
             max_failures: config.login_max_failures,
             window: Duration::seconds(i64::from(config.login_failure_window_secs)),
