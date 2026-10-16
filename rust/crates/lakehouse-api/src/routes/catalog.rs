@@ -1904,20 +1904,23 @@ async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(Strin
 /// `policySummary` (policies bound to `tables`, qualified as policies name
 /// them), `qualityChecks` (checks naming the asset by any of `names`),
 /// `dependents` (saved queries and dashboards reading `tables`), and
-/// `usage`/`recentQueries` (the last week's queries on them).
+/// `usage`/`recentQueries` (the last 30 days' queries on them; `columns`
+/// are the table's columns, for the column-popularity list, `DATA-15` F2).
 async fn mark_governance(
     state: &AppState,
     principal: &Principal,
     body: &mut Value,
     tables: &[String],
     names: &[String],
+    columns: &[String],
 ) {
     let policies = catalog_governance::policy_summary(state, principal, tables).await;
     let checks = catalog_governance::QualityIndex::load(state, Some(names))
         .await
         .checks_for(names);
     let dependents = catalog_governance::dependents(state, principal, tables).await;
-    let (usage, recent_queries) = catalog_governance::usage(state, principal, tables).await;
+    let (usage, recent_queries) =
+        catalog_governance::usage(state, principal, tables, columns).await;
     if let Some(o) = body.as_object_mut() {
         o.insert("policySummary".to_owned(), Value::Array(policies));
         o.insert("qualityChecks".to_owned(), Value::Array(checks));
@@ -1925,6 +1928,17 @@ async fn mark_governance(
         o.insert("usage".to_owned(), usage);
         o.insert("recentQueries".to_owned(), Value::Array(recent_queries));
     }
+}
+
+/// The names of the columns `source` reads, without the loader's
+/// underscore-prefixed bookkeeping ones (hidden from the page as well).
+fn source_column_names(source: Option<&ReadSource>) -> Vec<String> {
+    source
+        .into_iter()
+        .flat_map(|s| s.columns.iter())
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.starts_with('_'))
+        .collect()
 }
 
 /// Tells the console what to put after `FROM` to query this asset in
@@ -1952,7 +1966,7 @@ const DETAIL_SAMPLE_ROWS: u32 = 5;
 /// 1,000 rows (`data-15.md` "Data preview"), up from 100; the console
 /// pages them 100 at a time.
 const SAMPLE_MAX_ROWS: u32 = 1000;
-/// Seconds a sample read may run before ClickHouse stops it. `DATA-15` F1:
+/// Seconds a sample read may run before `ClickHouse` stops it. `DATA-15` F1:
 /// a 1,000-row read of a wide Iceberg table is the first sample that can
 /// be slow, and it had no time limit at all.
 const SAMPLE_MAX_SECONDS: u32 = 30;
@@ -2207,6 +2221,7 @@ async fn clickhouse_asset_detail(
         &mut body,
         std::slice::from_ref(&key),
         &[key.clone(), table.clone()],
+        &source_column_names(Some(&source)),
     )
     .await;
     mark_badges(
@@ -2424,7 +2439,15 @@ async fn bronze_asset_detail_body(
     if !table.is_empty() {
         names.push(table.to_owned());
     }
-    mark_governance(state, principal, &mut body, &tables, &names).await;
+    mark_governance(
+        state,
+        principal,
+        &mut body,
+        &tables,
+        &names,
+        &source_column_names(source.as_ref()),
+    )
+    .await;
     mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))

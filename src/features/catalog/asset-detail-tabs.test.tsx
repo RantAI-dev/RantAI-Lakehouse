@@ -547,20 +547,39 @@ describe("Access tab", () => {
   })
 })
 
+/** A usage answer: the figures given, and nothing else listed. */
+function usageOf(figures: Partial<NonNullable<AssetDetail["usage"]>>): NonNullable<AssetDetail["usage"]> {
+  return {
+    days: 30,
+    queries: 0,
+    users: 0,
+    avgLatencyMs: 0,
+    basedOn: 0,
+    truncated: false,
+    frequentUsers: [],
+    frequentQueries: [],
+    unparsed: 0,
+    joinedTables: [],
+    columns: [],
+    columnsNote: "Counted from the queries that read only this table.",
+    ...figures,
+  }
+}
+
 describe("Activity tab: usage and history", () => {
   it("counts everyone's queries, lists only the reader's own, and shows who changed what", async () => {
     stubApi()
     url.search = "tab=activity"
     renderTabs({
       ...BRONZE,
-      usage: { queries7d: 12, users7d: 3, avgLatencyMs: 240 },
+      usage: usageOf({ queries: 12, users: 3, avgLatencyMs: 240 }),
       recentQueries: [
         { id: "q-9", sql: "SELECT count() FROM bronze.demo_orders", user: "Reader", at: "2026-09-30T08:00:00Z", status: "completed", auditEventId: "audit-77" },
       ],
       changeHistory: [{ id: "audit-1", at: "2026-09-30T09:00:00Z", actor: "Rina", summary: "Edited description, owner" }],
     })
 
-    const usage = screen.getByText("Usage (7d)").closest("[data-slot=card]") as HTMLElement
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
     expect(within(usage).getByText("12")).toBeTruthy()
     expect(within(usage).getByText("240 ms")).toBeTruthy()
     const mine = within(usage).getByText("SELECT count() FROM bronze.demo_orders").closest("li") as HTMLElement
@@ -571,11 +590,48 @@ describe("Activity tab: usage and history", () => {
     expect(within(history).getByText("Edited description, owner")).toBeTruthy()
   })
 
+  it("lists frequent users, frequent queries without values, joined tables and column popularity over 30 days", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: usageOf({
+        queries: 340,
+        users: 4,
+        avgLatencyMs: 90,
+        basedOn: 5000,
+        truncated: true,
+        unparsed: 2,
+        frequentUsers: [{ name: "Rina Wijaya", queries: 210 }],
+        frequentQueries: [{ sql: "SELECT id FROM bronze.demo_orders WHERE x = ?", runs: 77, lastAt: "2026-09-30T08:00:00Z" }],
+        joinedTables: [
+          { table: "silver.customers", assetId: "silver.customers", queries: 31 },
+          { table: "bronze.unlisted", assetId: null, queries: 3 },
+        ],
+        columns: [{ name: "amount", queries: 55 }],
+        columnsNote: "Counted from the queries that read only this table. 4 queries that read several tables are not counted.",
+      }),
+    })
+
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
+    expect(within(usage).getByText(/Based on the newest 5,000 queries/)).toBeTruthy()
+    expect(within(usage).getByText("Rina Wijaya")).toBeTruthy()
+    expect(within(usage).getByText("210 queries")).toBeTruthy()
+    expect(within(usage).getByText("SELECT id FROM bronze.demo_orders WHERE x = ?")).toBeTruthy()
+    expect(within(usage).getByText("77 runs")).toBeTruthy()
+    expect(within(usage).getByText(/2 queries could not be read as SQL and are left out/)).toBeTruthy()
+    // A joined table that is a catalog asset links to its page; one that is not is plain text.
+    expect(within(usage).getByText("silver.customers").closest("a")?.getAttribute("href")).toBe("/data/assets/silver.customers")
+    expect(within(usage).getByText("bronze.unlisted").closest("a")).toBeNull()
+    expect(within(usage).getByText("amount")).toBeTruthy()
+    expect(within(usage).getByText(/4 queries that read several tables are not counted/)).toBeTruthy()
+  })
+
   it("says nobody queried the table, rather than that usage is unknown", () => {
     stubApi()
     url.search = "tab=activity"
-    renderTabs({ ...BRONZE, usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 } })
-    expect(screen.getByText("No Query Studio or copilot query in the last 7 days")).toBeTruthy()
+    renderTabs({ ...BRONZE, usage: usageOf({ queries: 0, users: 0, avgLatencyMs: 0 }) })
+    expect(screen.getByText("No Query Studio or copilot query in the last 30 days")).toBeTruthy()
     expect(screen.queryByText(/Not counted/)).toBeNull()
   })
 
@@ -585,7 +641,7 @@ describe("Activity tab: usage and history", () => {
     url.search = "tab=activity"
     renderTabs({
       ...BRONZE,
-      usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 },
+      usage: usageOf({ queries: 0, users: 0, avgLatencyMs: 0 }),
       dependents: [
         { id: "default", name: "default", kind: "dashboard", detail: "2 charts" },
         { id: "b_42", name: "Sales board", kind: "dashboard" },

@@ -320,9 +320,26 @@ function buildDetail(asset: Asset): AssetDetail {
       { id: "pol-residency", name: "Residency", effect: `Scans restricted to ${asset.residency}` },
     ],
     usage: {
-      queries7d: 400 + (h % 4200),
-      users7d: 4 + (h % 38),
+      days: 30,
+      queries: 400 + (h % 4200),
+      users: 4 + (h % 38),
       avgLatencyMs: 120 + (h % 700),
+      basedOn: 400 + (h % 4200),
+      truncated: false,
+      frequentUsers: [
+        { name: "Rina Wijaya", queries: 120 + (h % 90) },
+        { name: "Bayu Pratama", queries: 60 + (h % 50) },
+      ],
+      frequentQueries: [
+        { sql: `SELECT status, count() FROM ${asset.name} GROUP BY status`, runs: 40 + (h % 30), lastAt: agoIso(35) },
+      ],
+      unparsed: 0,
+      joinedTables: [{ table: "silver.customers", assetId: "silver.customers", queries: 12 + (h % 20) }],
+      columns: [
+        { name: "status", queries: 80 + (h % 40) },
+        { name: "amount", queries: 45 + (h % 30) },
+      ],
+      columnsNote: "Counted from the queries that read only this table.",
     },
     recentQueries: [
       { id: "qh-1", sql: `SELECT status, count() FROM ${asset.name} GROUP BY status`, user: "Rina Wijaya", at: agoIso(35) },

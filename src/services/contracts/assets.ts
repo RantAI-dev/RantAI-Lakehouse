@@ -151,6 +151,32 @@ export type AssetColumn = {
   inactiveSince?: string | null
 }
 
+/**
+ * What the query history says about an asset over `days` days (`DATA-15`).
+ * Query text appears only without its literals (`frequentQueries`), because
+ * SQL can carry a customer id or a name.
+ */
+export type AssetUsage = {
+  days: number
+  queries: number
+  users: number
+  avgLatencyMs: number
+  /** How many history rows the figures were read from. */
+  basedOn: number
+  /** True when that read was full, so the oldest queries of the window are not in the figures. */
+  truncated: boolean
+  frequentUsers: { name: string; queries: number }[]
+  /** `sql` has every literal replaced by `?`; queries are grouped by that form. */
+  frequentQueries: { sql: string; runs: number; lastAt: string }[]
+  /** Queries left out of `frequentQueries` because they do not parse. */
+  unparsed: number
+  /** Other tables read in the same statement; `assetId` when the table is a catalog asset. */
+  joinedTables: { table: string; assetId: string | null; queries: number }[]
+  /** Counted only from statements that read this table alone. */
+  columns: { name: string; queries: number }[]
+  columnsNote: string
+}
+
 export type AssetDetail = Asset & {
   schema: AssetColumn[]
   /**
@@ -204,12 +230,13 @@ export type AssetDetail = Asset & {
     rowFilter?: string | null
   }[]
   /**
-   * Queries that read this asset in the last seven days, by anyone:
+   * Queries that read this asset in the last `days` (30) days, by anyone:
    * how many, by how many people, and the average latency of the completed
-   * ones. `null` only when the query history could not be read — a table
-   * nobody queried is a measured zero.
+   * ones, and who runs them, what they run, what they join and which
+   * columns they use. `null` only when the query history could not be
+   * read — a table nobody queried is a measured zero.
    */
-  usage: { queries7d: number; users7d: number; avgLatencyMs: number } | null
+  usage: AssetUsage | null
   /**
    * The caller's own recent queries on this asset. Other people's query
    * text is never sent: SQL can carry literals.
