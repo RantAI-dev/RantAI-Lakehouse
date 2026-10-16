@@ -126,8 +126,9 @@ pub struct HistoryMention {
 
 /// The most [`history_mentioning`] reads in one call. A table queried more
 /// often than this inside the window is under-counted, not mis-reported
-/// per row.
-const HISTORY_MENTION_LIMIT: i64 = 5000;
+/// per row. Public so the asset page can say "based on the newest 5,000
+/// queries" when a read came back full (`DATA-15` F2).
+pub const HISTORY_MENTION_LIMIT: i64 = 5000;
 
 /// Every query run in the last `days` days, by anyone, whose SQL contains
 /// one of `needles` (case-insensitively), newest first.

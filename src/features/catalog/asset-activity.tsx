@@ -28,11 +28,13 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useAuth } from "@/features/auth/auth-provider"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
+import { cn } from "@/lib/utils"
 import { snapshotRetentionText } from "@/lib/snapshot-picker"
 import {
   formatCompactNumber,
+  formatDate,
   formatDateTime,
   formatLagSeconds,
   formatNumber,
@@ -47,7 +49,7 @@ import {
 import { fmtMeasured, type Measured } from "@/lib/measured"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
-import { governanceService } from "@/services"
+import { assetService, governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { DatasetSla } from "@/services/contracts/governance"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
@@ -67,9 +69,100 @@ function QuietEmpty({ title, description }: { title: string; description?: strin
   return <EmptyState title={title} description={description} className="py-4" />
 }
 
+/** One list of the usage card: a quiet heading, an optional note under it, rows or the empty sentence. */
+function UsageList({
+  title,
+  note,
+  empty,
+  children,
+}: {
+  title: string
+  note?: string
+  empty: string
+  children: React.ReactNode[]
+}) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-muted-foreground">{title}</div>
+      {note ? <p className="mb-1 text-xs text-muted-foreground">{note}</p> : null}
+      {children.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{empty}</p>
+      ) : (
+        <ul className="divide-y divide-border text-sm">{children}</ul>
+      )}
+    </div>
+  )
+}
+
+function UsageRow({ children, count, when }: { children: React.ReactNode; count: string; when?: string }) {
+  return (
+    <li className="flex items-center gap-2 py-1.5">
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{count}</span>
+      {when ? <span className="shrink-0 text-xs text-muted-foreground">{formatRelativeTime(when)}</span> : null}
+    </li>
+  )
+}
+
 /** `+1,200` for rows a snapshot added; a dash when it added none or did not say. */
 function signed(value: Measured, sign: "+" | "−") {
   return value === null || value === 0 ? "—" : `${sign}${formatNumber(value)}`
+}
+
+/**
+ * Where the asset's Iceberg table is missing: says so and, when the catalog
+ * still keeps a dropped copy, when it was dropped and until when it can come
+ * back (`DATA-15` F4). A holder of `governance:write` gets Restore; after it
+ * the page reloads the table. Where restore does not apply, or nothing is
+ * kept, only the plain sentence shows, with the reason when there is one.
+ */
+function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored: () => void }) {
+  const { hasPermission } = useAuth()
+  const status = useService(
+    (s) => (assetService.getRestoreStatus ? assetService.getRestoreStatus(a.id, s) : Promise.resolve(null)),
+    [a.id]
+  )
+  const restore = useServiceAction((signal) => {
+    if (!assetService.restoreTable) return Promise.reject(new Error("This deployment cannot restore a table."))
+    return assetService.restoreTable(a.id, signal)
+  })
+  const restorable = status.status === "success" && status.data && status.data.supported === undefined && status.data.restorable
+    ? status.data
+    : null
+  const reason =
+    status.status === "success" && status.data && !restorable
+      ? status.data.reason
+      : undefined
+
+  async function run() {
+    if ((await restore.run()) === null) {
+      notifyError("Failed to restore the table", restore.error)
+      return
+    }
+    notifySuccess("Table restored")
+    onRestored()
+  }
+
+  return (
+    <EmptyState
+      title="No Iceberg table for this asset"
+      description={
+        restorable?.droppedAt
+          ? `It was dropped on ${formatDate(restorable.droppedAt)}.${
+              restorable.expiresAt ? ` It can be restored until ${formatDate(restorable.expiresAt)}.` : ""
+            }`
+          : reason
+      }
+      action={
+        restorable && hasPermission("governance:write") ? (
+          <Button size="sm" onClick={() => void run()} disabled={restore.status === "pending"}>
+            {`Restore${restorable.expiresAt ? ` (until ${formatDate(restorable.expiresAt)})` : ""}`}
+          </Button>
+        ) : undefined
+      }
+      className="py-4"
+    />
+  )
 }
 
 /**
@@ -92,7 +185,7 @@ function IcebergSnapshots({
   if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
   if (state.status === "error") {
     if (state.error.code === "not_found") {
-      return <QuietEmpty title="No Iceberg table for this asset" />
+      return <DroppedTable asset={a} onRestored={state.reload} />
     }
     return <ErrorState error={state.error} onRetry={state.reload} />
   }
@@ -107,6 +200,7 @@ function IcebergSnapshots({
           <TableRow className="hover:bg-transparent">
             <TableHead className="text-xs">Committed</TableHead>
             <TableHead className="text-xs">Operation</TableHead>
+            <TableHead className="text-xs">Author</TableHead>
             <TableHead className="text-right text-xs">Added</TableHead>
             <TableHead className="text-right text-xs">Deleted</TableHead>
             <TableHead className="text-right text-xs">Rows after</TableHead>
@@ -129,6 +223,10 @@ function IcebergSnapshots({
                   ) : null}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{s.operation}</TableCell>
+                {/* DATA-15 F5: only the author a commit recorded; a load through dlt records none. */}
+                <TableCell className={cn("py-1.5 text-xs", s.author ? undefined : "text-muted-foreground")}>
+                  {s.author ?? "unknown"}
+                </TableCell>
                 <TableCell className="py-1.5 text-right text-xs tabular-nums">
                   {signed(s.summary.addedRecords, "+")}
                 </TableCell>
@@ -497,14 +595,14 @@ export function AssetActivity({
         </SectionCard>
         <SectionCard
           size="sm"
-          title="Usage (7d)"
-          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown."
+          title={`Usage (${a.usage?.days ?? 30}d)`}
+          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown in full; everyone's frequent queries are shown without their values."
         >
           {a.usage === null ? (
             <QuietEmpty title="Usage not measured" description="The query history could not be read." />
-          ) : a.usage.queries7d === 0 ? (
+          ) : a.usage.queries === 0 ? (
             <QuietEmpty
-              title="No Query Studio or copilot query in the last 7 days"
+              title={`No Query Studio or copilot query in the last ${a.usage.days} days`}
               description={uncounted ?? undefined}
             />
           ) : (
@@ -512,8 +610,8 @@ export function AssetActivity({
               <dl className="grid grid-cols-3 gap-2 text-sm">
                 {(
                   [
-                    ["Queries", formatNumber(a.usage.queries7d)],
-                    ["People", formatNumber(a.usage.users7d)],
+                    ["Queries", formatNumber(a.usage.queries)],
+                    ["People", formatNumber(a.usage.users)],
                     ["Avg latency", `${formatNumber(a.usage.avgLatencyMs)} ms`],
                   ] as const
                 ).map(([label, value]) => (
@@ -523,6 +621,58 @@ export function AssetActivity({
                   </div>
                 ))}
               </dl>
+              {a.usage.truncated ? (
+                <p className="text-xs text-muted-foreground">
+                  {`Based on the newest ${formatNumber(a.usage.basedOn)} queries that mention this table; older ones in the ${a.usage.days} days are not counted.`}
+                </p>
+              ) : null}
+              <UsageList title="Frequent users" empty="No one yet.">
+                {a.usage.frequentUsers.map((u) => (
+                  <UsageRow key={u.name} count={`${formatNumber(u.queries)} quer${u.queries === 1 ? "y" : "ies"}`}>
+                    {u.name}
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList
+                title="Frequent queries"
+                note={
+                  a.usage.unparsed > 0
+                    ? `${formatNumber(a.usage.unparsed)} quer${a.usage.unparsed === 1 ? "y" : "ies"} could not be read as SQL and ${a.usage.unparsed === 1 ? "is" : "are"} left out. Values are shown as ?.`
+                    : "Values are shown as ?."
+                }
+                empty="None."
+              >
+                {a.usage.frequentQueries.map((q) => (
+                  <UsageRow key={q.sql} count={`${formatNumber(q.runs)} run${q.runs === 1 ? "" : "s"}`} when={q.lastAt}>
+                    <span className="font-mono text-xs" title={q.sql}>
+                      {q.sql}
+                    </span>
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList title="Tables joined with it" empty="No query read it together with another table.">
+                {a.usage.joinedTables.map((t) => (
+                  <UsageRow key={t.table} count={`${formatNumber(t.queries)} quer${t.queries === 1 ? "y" : "ies"}`}>
+                    {t.assetId ? (
+                      <Link
+                        href={`/data/assets/${encodeURIComponent(t.assetId)}`}
+                        className="font-mono text-xs text-primary hover:underline"
+                      >
+                        {t.table}
+                      </Link>
+                    ) : (
+                      <span className="font-mono text-xs">{t.table}</span>
+                    )}
+                  </UsageRow>
+                ))}
+              </UsageList>
+              <UsageList title="Column popularity" note={a.usage.columnsNote} empty="No column was named by a query on this table alone.">
+                {a.usage.columns.map((c) => (
+                  <UsageRow key={c.name} count={`${formatNumber(c.queries)} quer${c.queries === 1 ? "y" : "ies"}`}>
+                    <span className="font-mono text-xs">{c.name}</span>
+                  </UsageRow>
+                ))}
+              </UsageList>
               <div>
                 {uncounted ? <p className="mb-2 text-xs text-muted-foreground">{uncounted}</p> : null}
                 <div className="mb-1 text-xs font-medium text-muted-foreground">Your recent queries</div>

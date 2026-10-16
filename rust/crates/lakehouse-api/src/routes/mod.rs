@@ -13,8 +13,10 @@ mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
+mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_restore;
 mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
@@ -504,6 +506,20 @@ fn catalog_access_router() -> Router<AppState> {
         .route(
             "/api/catalog/access-requests/{id}/decide",
             axum::routing::post(catalog::decide_access_request),
+        )
+        // `DATA-15` F3: grant and revoke from the asset's page.
+        .route(
+            "/api/catalog/{id}/grants",
+            get(catalog_grants::list).post(catalog_grants::create),
+        )
+        .route(
+            "/api/catalog/{id}/grants/{grant_id}",
+            axum::routing::delete(catalog_grants::revoke),
+        )
+        // `DATA-15` F4: undrop a dropped Iceberg table within its window.
+        .route(
+            "/api/catalog/{id}/restore",
+            get(catalog_restore::status).post(catalog_restore::restore),
         )
 }
 

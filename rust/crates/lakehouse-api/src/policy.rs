@@ -234,6 +234,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    governance authority from `agent:approve` that decides it. ───────
     ("POST", "/api/catalog/{id}/access-request",         Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/catalog/access-requests/{id}/decide", Policy::RequiresPermission("access:approve")),
+    // DATA-15 F3: grant and revoke from the asset's page. The same
+    // authority as deciding a request, and no weaker: listing shows who
+    // holds what, so it is not `catalog:read`.
+    ("GET", "/api/catalog/{id}/grants",                  Policy::RequiresPermission("access:approve")),
+    ("POST", "/api/catalog/{id}/grants",                 Policy::RequiresPermission("access:approve")),
+    ("DELETE", "/api/catalog/{id}/grants/{grant_id}",    Policy::RequiresPermission("access:approve")),
+
+    // DATA-15 F4: whether a dropped table can come back (anyone who can see
+    // the asset), and bringing it back (a governance decision, like the
+    // certification mark and unlike an edit of the details).
+    ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
@@ -931,6 +943,37 @@ mod tests {
             policy_for("GET", "/api/governance/lineage/columns"),
             Some(Policy::RequiresPermission("lineage:read"))
         );
+    }
+
+    /// `DATA-15` F4: the restore status is `catalog:read`; undropping a table
+    /// is `governance:write`.
+    #[test]
+    fn restore_status_needs_catalog_read_and_the_undrop_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-15` F3: listing, making and ending a grant from an asset's page
+    /// all need `access:approve`, the authority that decides a request.
+    #[test]
+    fn the_grant_routes_need_access_approve() {
+        for (method, path) in [
+            ("GET", "/api/catalog/{id}/grants"),
+            ("POST", "/api/catalog/{id}/grants"),
+            ("DELETE", "/api/catalog/{id}/grants/{grant_id}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("access:approve")),
+                "{method} {path}"
+            );
+        }
     }
 
     /// `DATA-12` part 2: reading the tag-key list is `catalog:read` (editors

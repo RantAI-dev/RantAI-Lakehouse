@@ -1904,20 +1904,23 @@ async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(Strin
 /// `policySummary` (policies bound to `tables`, qualified as policies name
 /// them), `qualityChecks` (checks naming the asset by any of `names`),
 /// `dependents` (saved queries and dashboards reading `tables`), and
-/// `usage`/`recentQueries` (the last week's queries on them).
+/// `usage`/`recentQueries` (the last 30 days' queries on them; `columns`
+/// are the table's columns, for the column-popularity list, `DATA-15` F2).
 async fn mark_governance(
     state: &AppState,
     principal: &Principal,
     body: &mut Value,
     tables: &[String],
     names: &[String],
+    columns: &[String],
 ) {
     let policies = catalog_governance::policy_summary(state, principal, tables).await;
     let checks = catalog_governance::QualityIndex::load(state, Some(names))
         .await
         .checks_for(names);
     let dependents = catalog_governance::dependents(state, principal, tables).await;
-    let (usage, recent_queries) = catalog_governance::usage(state, principal, tables).await;
+    let (usage, recent_queries) =
+        catalog_governance::usage(state, principal, tables, columns).await;
     if let Some(o) = body.as_object_mut() {
         o.insert("policySummary".to_owned(), Value::Array(policies));
         o.insert("qualityChecks".to_owned(), Value::Array(checks));
@@ -1925,6 +1928,17 @@ async fn mark_governance(
         o.insert("usage".to_owned(), usage);
         o.insert("recentQueries".to_owned(), Value::Array(recent_queries));
     }
+}
+
+/// The names of the columns `source` reads, without the loader's
+/// underscore-prefixed bookkeeping ones (hidden from the page as well).
+fn source_column_names(source: Option<&ReadSource>) -> Vec<String> {
+    source
+        .into_iter()
+        .flat_map(|s| s.columns.iter())
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.starts_with('_'))
+        .collect()
 }
 
 /// Tells the console what to put after `FROM` to query this asset in
@@ -1948,8 +1962,14 @@ fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
 /// How many sample rows the detail body itself carries.
 const DETAIL_SAMPLE_ROWS: u32 = 5;
 /// The most `GET /api/catalog/{id}/sample` returns: a look at the data,
-/// not an export — Query Studio is one click away for more.
-const SAMPLE_MAX_ROWS: u32 = 100;
+/// not an export — Query Studio is one click away for more. `DATA-15` F1:
+/// 1,000 rows (`data-15.md` "Data preview"), up from 100; the console
+/// pages them 100 at a time.
+const SAMPLE_MAX_ROWS: u32 = 1000;
+/// Seconds a sample read may run before `ClickHouse` stops it. `DATA-15` F1:
+/// a 1,000-row read of a wide Iceberg table is the first sample that can
+/// be slow, and it had no time limit at all.
+const SAMPLE_MAX_SECONDS: u32 = 30;
 
 /// Query parameters accepted by `GET /api/catalog/{id}/sample`.
 #[derive(Debug, Deserialize)]
@@ -2027,7 +2047,13 @@ async fn governed_sample(
     if !principal.has(SAMPLE_PERMISSION) {
         return (Vec::new(), masked);
     }
-    let raw_sql = format!("SELECT * FROM {} LIMIT {limit}", source.from);
+    // `DATA-15` F1: the trailing `SETTINGS` survives the rewrite (it is
+    // kept as the pinned-version clause is), so the limit binds the read
+    // ClickHouse actually runs.
+    let raw_sql = format!(
+        "SELECT * FROM {} LIMIT {limit} SETTINGS max_execution_time = {SAMPLE_MAX_SECONDS}",
+        source.from
+    );
     let sql = match crate::routes::query::rewrite_sql_for_principal(
         state,
         &raw_sql,
@@ -2195,6 +2221,7 @@ async fn clickhouse_asset_detail(
         &mut body,
         std::slice::from_ref(&key),
         &[key.clone(), table.clone()],
+        &source_column_names(Some(&source)),
     )
     .await;
     mark_badges(
@@ -2412,7 +2439,15 @@ async fn bronze_asset_detail_body(
     if !table.is_empty() {
         names.push(table.to_owned());
     }
-    mark_governance(state, principal, &mut body, &tables, &names).await;
+    mark_governance(
+        state,
+        principal,
+        &mut body,
+        &tables,
+        &names,
+        &source_column_names(source.as_ref()),
+    )
+    .await;
     mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
@@ -2730,7 +2765,7 @@ const ANNOTATION_DESCRIPTION_MAX_LEN: usize = 4000;
 const ANNOTATION_TAGS_MAX_COUNT: usize = 20;
 const ANNOTATION_TAG_MAX_LEN: usize = 64;
 
-fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
+pub(crate) fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "annotation store unavailable: no Postgres pool is configured".to_owned(),
@@ -2760,7 +2795,7 @@ fn tag_is_valid(tag: &str) -> bool {
 /// # Errors
 /// [`ApiError::BadRequest`] if `id` exceeds [`ANNOTATION_ID_MAX_LEN`]
 /// characters.
-fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
     if id.chars().count() > ANNOTATION_ID_MAX_LEN {
         return Err(ApiError::BadRequest(format!(
             "id must be at most {ANNOTATION_ID_MAX_LEN} characters"
@@ -3404,7 +3439,7 @@ pub async fn access_request(
 /// a value, so this uses the same 30-day window its own store-layer test
 /// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
 /// exercises.
-const GRANT_DAYS: i64 = 30;
+pub(crate) const GRANT_DAYS: i64 = 30;
 
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
@@ -5849,17 +5884,25 @@ mod tests {
             .await
             .expect("sample answers");
 
-            assert_eq!(body["limit"], json!(100));
+            // `DATA-15` F1: the cap was 100 and is now 1,000 (the spec's
+            // "up to 1,000 rows"), so the old pin moved with it.
+            assert_eq!(body["limit"], json!(1000));
             assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
             let requests = server.received_requests().await.expect("recorded");
             let reads: Vec<String> = requests
                 .iter()
                 .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-                .filter(|b| b.contains("LIMIT 100"))
+                .filter(|b| b.contains("LIMIT 1000"))
                 .collect();
             assert!(
                 !reads.is_empty(),
                 "the sample must be read at the capped limit"
+            );
+            assert!(
+                reads
+                    .iter()
+                    .all(|b| b.contains("SETTINGS max_execution_time = 30")),
+                "the sample read must carry its time limit through the rewrite"
             );
             assert!(
                 reads.iter().all(|b| b.contains("replaceRegexpOne")),

@@ -290,7 +290,7 @@ def step_verify_catalog_visibility() -> None:
     print(f"[g3a] {slug!r} is visible in GET /api/catalog")
 
 
-def _mint_lakekeeper_read_token() -> str | None:
+def _mint_lakekeeper_read_token(client_id: str | None = None) -> str | None:
     """Mint a short-lived bearer token from `ops/oidc-mock`'s
     client-credentials endpoint (see that module's own doc: it exists so
     ClickHouse's `oauth_server_uri` has something to call, but any
@@ -303,7 +303,7 @@ def _mint_lakekeeper_read_token() -> str | None:
     if not CH_OAUTH_CLIENT_ID:
         return None
     resp = requests.post(
-        CH_OAUTH_SERVER_URI, data={"client_id": CH_OAUTH_CLIENT_ID}, timeout=10
+        CH_OAUTH_SERVER_URI, data={"client_id": client_id or CH_OAUTH_CLIENT_ID}, timeout=10
     )
     if not resp.ok:
         raise G3aFailure(f"minting a Lakekeeper read token failed: {resp.status_code} {resp.text}")
@@ -458,6 +458,83 @@ def step_verify_lineage_is_recorded_not_guessed() -> None:
     )
 
 
+def _table_record_count() -> int:
+    """The table's row count as the console API reads it from the Iceberg
+    snapshot summary (`GET /api/lakehouse/tables/{ns}/{table}`), not through
+    ClickHouse: the restore proof must not depend on ClickHouse's own
+    Iceberg metadata cache."""
+    resp = API.get(f"{API_URL}/api/lakehouse/tables/bronze/{BRONZE_TABLE_NAME}", timeout=15)
+    if not resp.ok:
+        raise G3aFailure(f"GET lakehouse table failed: {resp.status_code} {resp.text}")
+    count = (resp.json().get("stats") or {}).get("recordCount")
+    if not isinstance(count, int):
+        raise G3aFailure(f"table detail carries no integer stats.recordCount: {resp.json().get('stats')}")
+    return count
+
+
+def step_drop_and_restore_the_bronze_table() -> None:
+    """`DATA-15-AC3`: a dropped table is restored from its page within the
+    retention window. Drops the gate's own Bronze table through the Iceberg
+    REST catalog as `dlt` (the principal that created it, so it owns it),
+    sees `GET /api/catalog/{slug}/restore` report it restorable, restores it
+    with `POST`, and reads the same row count back through the API.
+
+    This only works because the warehouse is on a soft delete profile
+    (`lakekeeper-warehouse-init`); on a hard-delete warehouse the table would
+    be gone and this step would fail at "restorable", which is the point.
+    Skipped, with the reason, on a stack with no OAuth client (pre-R1 or
+    authz-disabled), where no token can drop the table.
+    """
+    token = _mint_lakekeeper_read_token("dlt")
+    if not token:
+        print("[g3a] no CH_OAUTH_CLIENT_ID set - skipping the drop and restore check")
+        return
+    headers = {"Authorization": f"Bearer {token}"}
+    slug = BRONZE_TABLE_NAME.replace("_", "-")
+    before = _table_record_count()
+
+    config_resp = requests.get(
+        f"{LAKEKEEPER_CATALOG_URI}/v1/config",
+        params={"warehouse": LAKEKEEPER_WAREHOUSE},
+        headers=headers,
+        timeout=10,
+    )
+    if not config_resp.ok:
+        raise G3aFailure(f"catalog /v1/config failed: {config_resp.status_code} {config_resp.text}")
+    config_body = config_resp.json()
+    prefix = {**config_body.get("defaults", {}), **config_body.get("overrides", {})}.get("prefix")
+    if not prefix:
+        raise G3aFailure(f"catalog /v1/config returned no warehouse prefix: {config_body}")
+
+    dropped = requests.delete(
+        f"{LAKEKEEPER_CATALOG_URI}/v1/{prefix}/namespaces/bronze/tables/{BRONZE_TABLE_NAME}",
+        headers=headers,
+        timeout=15,
+    )
+    if dropped.status_code not in (200, 204):
+        raise G3aFailure(f"dropping bronze.{BRONZE_TABLE_NAME} failed: {dropped.status_code} {dropped.text}")
+    print(f"[g3a] dropped bronze.{BRONZE_TABLE_NAME} through the Iceberg REST catalog")
+
+    def restorable() -> bool:
+        resp = API.get(f"{API_URL}/api/catalog/{slug}/restore", timeout=15)
+        if not resp.ok:
+            raise G3aFailure(f"GET restore status failed: {resp.status_code} {resp.text}")
+        body = resp.json()
+        if body.get("supported") is False:
+            raise G3aFailure(f"restore is unsupported on this stack: {body.get('reason')}")
+        return body.get("restorable") is True
+
+    _wait_for("the dropped table to be reported restorable", restorable, 60)
+
+    restored = API.post(f"{API_URL}/api/catalog/{slug}/restore", timeout=30)
+    if not restored.ok:
+        raise G3aFailure(f"POST restore failed: {restored.status_code} {restored.text}")
+    after = _table_record_count()
+    if after != before:
+        raise G3aFailure(f"row count changed across drop and restore: {before} -> {after}")
+    print(f"[g3a] restored bronze.{BRONZE_TABLE_NAME}: {after} rows read back through the API")
+
+
 def main() -> int:
     try:
         step_wait_for_services()
@@ -470,6 +547,7 @@ def main() -> int:
         step_verify_catalog_visibility()
         step_verify_run_audited()
         step_verify_lineage_is_recorded_not_guessed()
+        step_drop_and_restore_the_bronze_table()
     except G3aFailure as exc:
         print(f"[g3a] FAILED: {exc}", file=sys.stderr)
         return 1

@@ -139,6 +139,92 @@ pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>
     Some(out.into_iter().collect())
 }
 
+/// Replaces every literal of a statement with a `?` placeholder.
+/// [`literal_free_form`].
+struct LiteralMasker;
+
+impl sqlparser::ast::VisitorMut for LiteralMasker {
+    type Break = Infallible;
+
+    fn pre_visit_value(
+        &mut self,
+        value: &mut sqlparser::ast::ValueWithSpan,
+    ) -> ControlFlow<Infallible> {
+        // `NULL` carries no information about a person; every other value
+        // (strings, numbers, booleans, dates) can.
+        if !matches!(value.value, sqlparser::ast::Value::Null) {
+            value.value = sqlparser::ast::Value::Placeholder("?".to_owned());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// `sql` with every literal replaced by `?`, printed back from its parse
+/// (`DATA-15` F2): `WHERE id = 42 AND name IN ('a', 'b')` becomes
+/// `WHERE id = ? AND name IN (?, ?)`, so two runs of one query that differ
+/// only in their values have one form, and the form can be shown to
+/// people who must not see the values (a customer id, a name). Comments
+/// are dropped by the parse. `None` when `sql` does not parse under
+/// `dialect`: the caller leaves that query out rather than show its text.
+#[must_use]
+pub fn literal_free_form(sql: &str, dialect: &dyn Dialect) -> Option<String> {
+    let mut statements = Parser::parse_sql(dialect, sql).ok()?;
+    for stmt in &mut statements {
+        let _: ControlFlow<Infallible> = sqlparser::ast::VisitMut::visit(stmt, &mut LiteralMasker);
+    }
+    Some(
+        statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Collects the last part of every column-like identifier of a statement.
+/// [`identifiers_used`].
+struct IdentCollector {
+    found: HashSet<String>,
+}
+
+impl Visitor for IdentCollector {
+    type Break = Infallible;
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<Infallible> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Identifier(ident) => {
+                self.found.insert(ident.value.to_ascii_lowercase());
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    self.found.insert(last.value.to_ascii_lowercase());
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Every identifier `sql` uses as an expression (a column, or an alias used
+/// like one), lower-cased and reduced to its last part, so `o.amount` is
+/// `amount` (`DATA-15` F2, column popularity). Table names are not
+/// expressions and are not included; a name in `USING (...)` is not an
+/// expression either and is missed. `None` when `sql` does not parse under
+/// `dialect`.
+#[must_use]
+pub fn identifiers_used(sql: &str, dialect: &dyn Dialect) -> Option<HashSet<String>> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    let mut collector = IdentCollector {
+        found: HashSet::new(),
+    };
+    for stmt in &statements {
+        let _: ControlFlow<Infallible> = stmt.visit(&mut collector);
+    }
+    Some(collector.found)
+}
+
 /// `query.body`'s own top-level `FROM` clause, unwrapping a
 /// parenthesized `SetExpr::Query` (`(SELECT ... )` around a whole
 /// query body, distinct from a derived-table subquery — both cases are
@@ -233,6 +319,59 @@ pub(crate) fn canonicalize(parts: &[String]) -> String {
         1 => parts[0].to_owned(),
         2 => parts.join("."),
         _ => parts[parts.len() - 2..].join("."),
+    }
+}
+
+/// `DATA-15` F2: the literal-free form of a query and the identifiers it
+/// uses, which the asset page's usage figures are built from.
+#[cfg(test)]
+mod usage_forms {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::{identifiers_used, literal_free_form};
+
+    #[test]
+    fn literals_of_every_kind_become_placeholders() {
+        let form = literal_free_form(
+            "SELECT * FROM silver.orders WHERE name = 'Rina' AND id = 42 AND city IN (1, 2)",
+            &ClickHouseDialect {},
+        )
+        .unwrap();
+        assert_eq!(
+            form,
+            "SELECT * FROM silver.orders WHERE name = ? AND id = ? AND city IN (?, ?)"
+        );
+        assert!(!form.contains("Rina") && !form.contains("42"));
+    }
+
+    #[test]
+    fn two_queries_that_differ_only_in_their_values_have_one_form() {
+        let a = literal_free_form("SELECT id FROM t WHERE x = 'a'", &ClickHouseDialect {});
+        let b = literal_free_form("SELECT id FROM t WHERE x = 'b'", &ClickHouseDialect {});
+        assert_eq!(a, b);
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn sql_that_does_not_parse_has_no_form() {
+        assert_eq!(
+            literal_free_form("orders, please", &ClickHouseDialect {}),
+            None
+        );
+    }
+
+    #[test]
+    fn identifiers_are_lowercased_and_reduced_to_their_last_part() {
+        let used = identifiers_used(
+            "SELECT o.Amount, id FROM silver.orders o WHERE o.status = 'x' ORDER BY id",
+            &ClickHouseDialect {},
+        )
+        .unwrap();
+        let mut used: Vec<String> = used.into_iter().collect();
+        used.sort();
+        assert_eq!(used, vec!["amount", "id", "status"]);
     }
 }
 

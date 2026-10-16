@@ -2,6 +2,8 @@ import type {
   AssetService,
   Asset,
   AssetDetail,
+  AssetGrant,
+  AssetRestoreStatus,
   AssetProfile,
   AssetFilter,
   CatalogNamespace,
@@ -165,5 +167,43 @@ export const clickhouseAssetService: AssetService = {
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to decide access request");
     return json as DecideAccessRequestResult;
+  },
+  async listGrants(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/grants`, { signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load the grants");
+    return (json?.grants ?? []) as AssetGrant[];
+  },
+  async grantAccess(id, input, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/grants`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to grant access");
+  },
+  async getRestoreStatus(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/restore`, { signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to check whether the table can be restored");
+    return json as AssetRestoreStatus;
+  },
+  async restoreTable(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/restore`, {
+      method: "POST",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to restore the table");
+  },
+  async revokeGrant(id, grantId, signal) {
+    const res = await apiFetch(
+      `/api/catalog/${encodeURIComponent(id)}/grants/${encodeURIComponent(grantId)}`,
+      { method: "DELETE", signal }
+    );
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to revoke the grant");
   },
 };

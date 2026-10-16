@@ -22,6 +22,7 @@ function snapshot(partial: Partial<LakehouseSnapshot>): LakehouseSnapshot {
     parentId: null,
     timestampMs: 0,
     operation: "append",
+    author: null,
     summary: {
       addedRecords: null,
       deletedRecords: null,

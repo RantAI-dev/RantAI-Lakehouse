@@ -12,7 +12,7 @@
 //!
 //! It also answers who uses the asset: the saved queries and dashboards
 //! whose SQL reads it ([`dependents`]) and the queries run against it in
-//! the last week ([`usage`]). Nothing records which tables a query
+//! the last 30 days ([`usage`]). Nothing records which tables a query
 //! touched, so both parse the SQL itself with the same table resolver the
 //! policy rewrite uses, and count a query only when it really reads the
 //! table — not when the name merely appears in it.
@@ -274,52 +274,221 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
 /// The board every deployment has, with no row in `console.bi_board`.
 const DEFAULT_BOARD: &str = "default";
 
-/// The window [`usage`] looks back over.
-pub(crate) const USAGE_DAYS: i32 = 7;
+/// The window the asset page's [`usage`] looks back over (`DATA-15` F2,
+/// the spec's "30 days").
+pub(crate) const ASSET_USAGE_DAYS: i32 = 30;
+/// The window the search ranking's [`use_by_asset`] looks back over. It
+/// kept the 7 days it always had when the asset page went to 30, so
+/// `DATA-11`'s ranking does not change.
+pub(crate) const USE_RANKING_DAYS: i32 = 7;
 /// How many of the caller's own recent queries [`usage`] returns.
 const RECENT_QUERIES: usize = 5;
+/// Rows in each of the frequent-users / frequent-queries / joined-tables
+/// lists.
+const TOP_LIST: usize = 10;
+/// Rows in the column-popularity list.
+const TOP_COLUMNS: usize = 20;
 
-/// `usage` (queries, distinct people and average latency over the last
-/// seven days) and `recentQueries` from the rows that really read one of
-/// `tables`.
+/// The `n` biggest entries of `counts`, biggest first; equal counts are
+/// ordered by `tie` so the list does not shuffle between requests.
+fn top<K: Clone, T: Ord>(
+    counts: &HashMap<K, u32>,
+    n: usize,
+    tie: impl Fn(&K) -> T,
+) -> Vec<(K, u32)> {
+    let mut all: Vec<(K, u32)> = counts.iter().map(|(k, c)| (k.clone(), *c)).collect();
+    all.sort_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then_with(|| tie(ka).cmp(&tie(kb))));
+    all.truncate(n);
+    all
+}
+
+/// A history row that really reads the asset, with every table it reads.
+type Read<'a> = (&'a HistoryMention, Vec<String>);
+
+/// Who ran a query: the user id where the history has one, else the name.
+fn person_key(m: &HistoryMention) -> String {
+    m.owner_id
+        .map_or_else(|| m.user_name.clone(), |id| id.to_string())
+}
+
+/// Queries per person, most active first, named as the history recorded
+/// them (`DATA-15` F2).
+fn frequent_users(reads: &[Read<'_>]) -> Vec<Value> {
+    let mut by_person: HashMap<String, u32> = HashMap::new();
+    let mut name_of: HashMap<String, String> = HashMap::new();
+    for (m, _) in reads {
+        let key = person_key(m);
+        *by_person.entry(key.clone()).or_insert(0) += 1;
+        // Newest first, so the first name seen is the latest one.
+        name_of.entry(key).or_insert_with(|| m.user_name.clone());
+    }
+    top(&by_person, TOP_LIST, |k| name_of[k].clone())
+        .into_iter()
+        .map(|(key, queries)| json!({ "name": name_of[&key], "queries": queries }))
+        .collect()
+}
+
+/// Runs per literal-free form, and how many reads could not be given one
+/// (`DATA-15` F2). Rows are newest first, so the first `at` kept for a form
+/// is its latest run.
+fn frequent_queries(reads: &[Read<'_>]) -> (Vec<Value>, u32) {
+    let mut by_form: HashMap<String, (u32, String)> = HashMap::new();
+    let mut unparsed = 0_u32;
+    for (m, _) in reads {
+        let form = crate::sql_rewrite::literal_free_form(&m.sql, &ClickHouseDialect {})
+            .or_else(|| crate::sql_rewrite::literal_free_form(&m.sql, &GenericDialect {}));
+        match form {
+            Some(form) => by_form.entry(form).or_insert((0, m.at.clone())).0 += 1,
+            None => unparsed += 1,
+        }
+    }
+    let counts: HashMap<String, u32> = by_form.iter().map(|(f, (n, _))| (f.clone(), *n)).collect();
+    let list = top(&counts, TOP_LIST, Clone::clone)
+        .into_iter()
+        .map(|(sql, runs)| json!({ "sql": sql, "runs": runs, "lastAt": by_form[&sql].1 }))
+        .collect();
+    (list, unparsed)
+}
+
+/// The other tables read in the same statement as the asset, once per
+/// statement however often it names them; `assetId` is filled in by
+/// [`usage`] (`DATA-15` F2).
+fn joined_tables(reads: &[Read<'_>], tables: &[String]) -> Vec<Value> {
+    let mut joined: HashMap<String, u32> = HashMap::new();
+    for (_, names) in reads {
+        for name in names.iter().filter(|n| !is_one_of(n, tables)) {
+            *joined.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    top(&joined, TOP_LIST, Clone::clone)
+        .into_iter()
+        .map(|(table, queries)| json!({ "table": table, "assetId": Value::Null, "queries": queries }))
+        .collect()
+}
+
+/// Statements that read this table alone count each of its `columns` they
+/// name once; the second value is how many statements were left out for
+/// reading several tables (`DATA-15` F2).
+fn column_popularity(
+    reads: &[Read<'_>],
+    tables: &[String],
+    columns: &[String],
+) -> (Vec<Value>, u32) {
+    let real: HashMap<String, &String> = columns.iter().map(|c| (c.to_lowercase(), c)).collect();
+    let mut by_column: HashMap<String, u32> = HashMap::new();
+    let mut skipped = 0_u32;
+    for (m, names) in reads {
+        if !names.iter().all(|n| is_one_of(n, tables)) {
+            skipped += 1;
+            continue;
+        }
+        let used = crate::sql_rewrite::identifiers_used(&m.sql, &ClickHouseDialect {})
+            .or_else(|| crate::sql_rewrite::identifiers_used(&m.sql, &GenericDialect {}));
+        for ident in used.iter().flatten() {
+            if let Some(column) = real.get(ident) {
+                *by_column.entry((*column).clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let list = top(&by_column, TOP_COLUMNS, Clone::clone)
+        .into_iter()
+        .map(|(name, queries)| json!({ "name": name, "queries": queries }))
+        .collect();
+    (list, skipped)
+}
+
+/// The asset page's `usage` (queries, distinct people, average latency,
+/// frequent users, frequent queries, joined tables and column popularity,
+/// over [`ASSET_USAGE_DAYS`] days) and `recentQueries`, from the rows that
+/// really read one of `tables`.
 ///
 /// The counts cover everyone's queries; the query text does not. SQL can
 /// carry literals — a customer id, a name — so `recentQueries` lists only
-/// the caller's own. Latency averages completed runs only: a query that
+/// the caller's own, and `frequentQueries` lists everyone's only in its
+/// literal-free form (`sql_rewrite::literal_free_form`), grouped by that
+/// form. A query that does not parse is left out of `frequentQueries` and
+/// counted in `unparsed`: showing its text raw would be the leak the form
+/// exists to prevent. Latency averages completed runs only: a query that
 /// failed or was blocked took no time to answer.
+///
+/// `columns` are the table's column names. A column is counted only from
+/// statements that read this table and nothing else: in a join, a bare
+/// column name cannot be assigned to one of the tables, so those statements
+/// are left out of `columns` and counted in `columnsNote`. The
+/// `assetId` of each joined table is filled in by [`usage`], which can
+/// look the catalog up; here it is `null`.
+///
+/// `truncated` is true when the history read came back full, so older
+/// queries of the window are not in the figures (`basedOn` says how many
+/// rows were read).
 fn summarize_usage(
     mentions: &[HistoryMention],
     tables: &[String],
+    columns: &[String],
     caller: uuid::Uuid,
+    truncated: bool,
 ) -> (Value, Vec<Value>) {
-    let reads: Vec<&HistoryMention> = mentions
+    // Each mention that really reads one of `tables`, with every table it
+    // reads. The parse is the expensive part: skip it when no table's own
+    // name even appears in the text.
+    let reads: Vec<Read<'_>> = mentions
         .iter()
-        .filter(|m| reads_any(&m.sql, tables))
-        .collect();
-    let people: std::collections::HashSet<String> = reads
-        .iter()
-        .map(|m| {
-            m.owner_id
-                .map_or_else(|| m.user_name.clone(), |id| id.to_string())
+        .filter_map(|m| {
+            let lower = m.sql.to_lowercase();
+            if !tables
+                .iter()
+                .any(|t| lower.contains(&bare_name(t).to_lowercase()))
+            {
+                return None;
+            }
+            let names = referenced(&m.sql)?;
+            names
+                .iter()
+                .any(|name| is_one_of(name, tables))
+                .then_some((m, names))
         })
         .collect();
+    let people: std::collections::HashSet<String> =
+        reads.iter().map(|(m, _)| person_key(m)).collect();
     let completed: Vec<i64> = reads
         .iter()
-        .filter(|m| m.status == "completed")
-        .map(|m| m.duration_ms)
+        .filter(|(m, _)| m.status == "completed")
+        .map(|(m, _)| m.duration_ms)
         .collect();
     let avg_ms = if completed.is_empty() {
         0
     } else {
         completed.iter().sum::<i64>() / i64::try_from(completed.len()).unwrap_or(1)
     };
+
+    let frequent_users = frequent_users(&reads);
+    let (frequent_queries, unparsed) = frequent_queries(&reads);
+    let joined_tables = joined_tables(&reads, tables);
+    let (column_list, skipped) = column_popularity(&reads, tables, columns);
+    let columns_note = format!(
+        "Counted from the queries that read only this table. {skipped} quer{} that read several \
+         tables are not counted, because a column name in a join cannot be assigned to one of \
+         them. A name used as an alias counts as the column it shares a name with.",
+        if skipped == 1 { "y" } else { "ies" }
+    );
+
     let usage = json!({
-        "queries7d": reads.len(),
-        "users7d": people.len(),
+        "days": ASSET_USAGE_DAYS,
+        "queries": reads.len(),
+        "users": people.len(),
         "avgLatencyMs": avg_ms,
+        "basedOn": mentions.len(),
+        "truncated": truncated,
+        "frequentUsers": frequent_users,
+        "frequentQueries": frequent_queries,
+        "unparsed": unparsed,
+        "joinedTables": joined_tables,
+        "columns": column_list,
+        "columnsNote": columns_note,
     });
     let recent = reads
         .iter()
+        .map(|(m, _)| *m)
         .filter(|m| m.owner_id == Some(caller))
         .take(RECENT_QUERIES)
         .map(|m| {
@@ -336,20 +505,114 @@ fn summarize_usage(
     (usage, recent)
 }
 
+/// The catalog asset id of each table key in `keys` that is one, lower-cased
+/// key to id (`DATA-15` F2, "tables joined with it" link to their pages).
+/// A `silver.`/`serving.` table is its own asset, found in
+/// `system.tables` so the id has the table's real case; a `bronze.<table>`
+/// is the dataset whose registry row names that table. Both are one read
+/// each; a failed read gives no ids (the table is listed without a link),
+/// never an error.
+async fn asset_ids_of(state: &AppState, keys: &[String]) -> HashMap<String, String> {
+    use crate::routes::support::str_col;
+    use lakehouse_core::ident::SqlLiteral;
+
+    let literals = |parts: Vec<String>| {
+        parts
+            .iter()
+            .map(|p| SqlLiteral::from(p.as_str()).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = HashMap::new();
+    let served: Vec<String> = keys
+        .iter()
+        .filter(|k| k.starts_with("silver.") || k.starts_with("serving."))
+        .map(|k| k.to_lowercase())
+        .collect();
+    if !served.is_empty() {
+        let sql = format!(
+            "SELECT database, name FROM system.tables WHERE database IN ('silver','serving') \
+             AND lower(concat(database, '.', name)) IN ({})",
+            literals(served)
+        );
+        match state.clickhouse.rows(&sql, None).await {
+            Ok(rows) => {
+                for row in &rows {
+                    let id = format!("{}.{}", str_col(row, "database"), str_col(row, "name"));
+                    out.insert(id.to_lowercase(), id);
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: joined tables not resolved"),
+        }
+    }
+    let bronze: Vec<String> = keys
+        .iter()
+        .filter_map(|k| k.strip_prefix("bronze."))
+        .map(str::to_lowercase)
+        .collect();
+    if !bronze.is_empty() {
+        let list = literals(bronze);
+        let sql = format!(
+            "SELECT slug, table_name FROM lake.`bronze_meta.dataset_sync` \
+               WHERE lower(table_name) IN ({list}) \
+             UNION ALL SELECT slug, table_name FROM lake.`bronze_meta_sec.dataset_sync` \
+               WHERE lower(table_name) IN ({list})"
+        );
+        match state.clickhouse.rows(&sql, None).await {
+            Ok(rows) => {
+                for row in &rows {
+                    out.insert(
+                        format!("bronze.{}", str_col(row, "table_name")).to_lowercase(),
+                        str_col(row, "slug").to_owned(),
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(?err, "catalog usage: joined datasets not resolved"),
+        }
+    }
+    out
+}
+
 /// [`summarize_usage`] over the query history. `usage` is `null` — "not
 /// measured" — only when the history cannot be read at all; a table nobody
-/// queried this week is a measured zero.
+/// queried this month is a measured zero.
 pub(crate) async fn usage(
     state: &AppState,
     principal: &Principal,
     tables: &[String],
+    columns: &[String],
 ) -> (Value, Vec<Value>) {
     let Some(pg) = state.pg.as_deref() else {
         return (Value::Null, Vec::new());
     };
     let needles: Vec<String> = tables.iter().map(|t| bare_name(t).to_owned()).collect();
-    match lakehouse_store::queries::history_mentioning(pg, USAGE_DAYS, &needles).await {
-        Ok(mentions) => summarize_usage(&mentions, tables, principal.id.uuid()),
+    match lakehouse_store::queries::history_mentioning(pg, ASSET_USAGE_DAYS, &needles).await {
+        Ok(mentions) => {
+            let truncated = i64::try_from(mentions.len())
+                .is_ok_and(|n| n >= lakehouse_store::queries::HISTORY_MENTION_LIMIT);
+            let (mut usage, recent) =
+                summarize_usage(&mentions, tables, columns, principal.id.uuid(), truncated);
+            let keys: Vec<String> = usage["joinedTables"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["table"].as_str().map(str::to_owned))
+                .collect();
+            if !keys.is_empty() {
+                let ids = asset_ids_of(state, &keys).await;
+                if let Some(list) = usage["joinedTables"].as_array_mut() {
+                    for entry in list {
+                        let id = entry["table"]
+                            .as_str()
+                            .and_then(|t| ids.get(&t.to_lowercase()));
+                        if let Some(id) = id {
+                            entry["assetId"] = json!(id);
+                        }
+                    }
+                }
+            }
+            (usage, recent)
+        }
         Err(err) => {
             tracing::warn!(?err, "catalog detail: query history unavailable");
             (Value::Null, Vec::new())
@@ -363,7 +626,7 @@ pub(crate) async fn usage(
 /// assets match.
 const USE_RANKING_ROWS: i64 = 5000;
 
-/// Queries per asset id over the last [`USAGE_DAYS`] days, for the search
+/// Queries per asset id over the last [`USE_RANKING_DAYS`] days, for the search
 /// copy's tie-break. Without Postgres, or when the history cannot be read,
 /// every count is 0 and a warning is logged: ranking is then by relevance
 /// alone, not an error (`DATA-11` D4).
@@ -375,7 +638,7 @@ pub(crate) async fn use_by_asset(
     let Some(pg) = state.pg.as_deref() else {
         return HashMap::new();
     };
-    match lakehouse_store::queries::history_recent(pg, USAGE_DAYS, USE_RANKING_ROWS).await {
+    match lakehouse_store::queries::history_recent(pg, USE_RANKING_DAYS, USE_RANKING_ROWS).await {
         Ok(sqls) => use_counts(
             &sqls,
             &use_keys(
@@ -414,6 +677,21 @@ fn mark_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> Stri
     }
 }
 
+/// The history line of a grant or revoke made from the asset's page
+/// (`DATA-15` F3): the permission, the grantee, and for a grant the day it
+/// ends (the day, not the instant). The actor is the entry's own `actor`, so
+/// the history names both people.
+fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> String {
+    let permission = arg("permission").unwrap_or("a permission");
+    let grantee = arg("grantee").unwrap_or("a user");
+    if action == "catalog.grant" {
+        let until = arg("expiresAt").map_or("its expiry", |at| at.get(..10).unwrap_or(at));
+        format!("Granted {permission} to {grantee} until {until}")
+    } else {
+        format!("Revoked {permission} from {grantee}")
+    }
+}
+
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
@@ -449,6 +727,7 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
         "catalog.certify" | "catalog.deprecate" | "catalog.uncertify" => {
             mark_summary(event.action.as_str(), arg)
         }
+        "catalog.grant" | "catalog.revoke" => grant_summary(event.action.as_str(), arg),
         "catalog.sla_remove" => "Removed the freshness target".to_owned(),
         "catalog.sla_set" => event
             .args
@@ -1214,6 +1493,10 @@ mod tests {
         }
     }
 
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
     /// Counts cover everyone who really read the table; the query text
     /// shown back is only the caller's own.
     #[test]
@@ -1238,11 +1521,17 @@ mod tests {
                 50,
             ),
         ];
-        let (usage, recent) = summarize_usage(&mentions, &tables(&["silver.orders"]), me);
-        assert_eq!(usage["queries7d"], 3);
-        assert_eq!(usage["users7d"], 2);
+        let (usage, recent) =
+            summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, false);
+        // `DATA-15` F2: the keys were `queries7d` / `users7d`; the window is
+        // 30 days now and the keys say no number of days.
+        assert_eq!(usage["days"], 30);
+        assert_eq!(usage["queries"], 3);
+        assert_eq!(usage["users"], 2);
         // The failed run's nine seconds are not a latency.
         assert_eq!(usage["avgLatencyMs"], 200);
+        assert_eq!(usage["basedOn"], 4);
+        assert_eq!(usage["truncated"], false);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["id"], "q1");
         assert_eq!(recent[0]["auditEventId"], "audit-q1");
@@ -1251,11 +1540,174 @@ mod tests {
     /// A table nobody queried is a measured zero, not "not measured".
     #[test]
     fn usage_of_an_unqueried_table_is_zero() {
-        let (usage, recent) =
-            summarize_usage(&[], &tables(&["silver.orders"]), uuid::Uuid::from_u128(1));
-        assert_eq!(usage["queries7d"], 0);
+        let (usage, recent) = summarize_usage(
+            &[],
+            &tables(&["silver.orders"]),
+            &[],
+            uuid::Uuid::from_u128(1),
+            false,
+        );
+        assert_eq!(usage["queries"], 0);
         assert_eq!(usage["avgLatencyMs"], 0);
+        assert_eq!(usage["frequentUsers"], json!([]));
+        assert_eq!(usage["frequentQueries"], json!([]));
         assert!(recent.is_empty());
+    }
+
+    /// `DATA-15` F2: queries that differ only in their literals are one
+    /// frequent query, and no literal reaches the answer.
+    #[test]
+    fn frequent_queries_group_by_literal_free_form_and_show_no_literal() {
+        let (me, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let mentions = [
+            mention(
+                "q1",
+                "SELECT id FROM silver.orders WHERE name = 'Rina' AND n IN (1, 2)",
+                other,
+                "completed",
+                10,
+            ),
+            mention(
+                "q2",
+                "SELECT id FROM silver.orders WHERE name = 'Budi' AND n IN (3, 4)",
+                me,
+                "completed",
+                10,
+            ),
+            mention(
+                "q3",
+                "SELECT count() FROM silver.orders",
+                me,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, false);
+        let frequent = usage["frequentQueries"].as_array().expect("a list");
+        assert_eq!(frequent.len(), 2);
+        assert_eq!(
+            frequent[0]["sql"],
+            "SELECT id FROM silver.orders WHERE name = ? AND n IN (?, ?)"
+        );
+        assert_eq!(frequent[0]["runs"], 2);
+        assert_eq!(frequent[0]["lastAt"], "2026-10-01T08:00:00Z");
+        let text = usage["frequentQueries"].to_string();
+        assert!(!text.contains("Rina") && !text.contains("Budi"));
+        assert_eq!(usage["unparsed"], 0);
+    }
+
+    /// `DATA-15` F2: frequent users are counted per person, most active
+    /// first, named as the history recorded them.
+    #[test]
+    fn frequent_users_rank_people_by_their_queries() {
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let mut quiet = mention("q1", "SELECT * FROM silver.orders", a, "completed", 1);
+        quiet.user_name = "Quiet".to_owned();
+        let mut busy_1 = mention("q2", "SELECT * FROM silver.orders", b, "completed", 1);
+        busy_1.user_name = "Busy".to_owned();
+        let busy_2 = busy_1.clone();
+        let (usage, _) = summarize_usage(
+            &[quiet, busy_1, busy_2],
+            &tables(&["silver.orders"]),
+            &[],
+            a,
+            false,
+        );
+        assert_eq!(
+            usage["frequentUsers"],
+            json!([{"name": "Busy", "queries": 2}, {"name": "Quiet", "queries": 1}])
+        );
+    }
+
+    /// `DATA-15` F2: a join adds the other table to `joinedTables`, once
+    /// per statement, and adds nothing to the column counts.
+    #[test]
+    fn a_join_lists_the_other_table_and_counts_no_column() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [mention(
+            "q1",
+            "SELECT o.amount FROM silver.orders o JOIN silver.customers c ON c.id = o.cid \
+             JOIN silver.customers d ON d.id = o.cid",
+            me,
+            "completed",
+            10,
+        )];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &columns(&["amount", "cid"]),
+            me,
+            false,
+        );
+        assert_eq!(
+            usage["joinedTables"],
+            json!([{"table": "silver.customers", "assetId": null, "queries": 1}])
+        );
+        assert_eq!(usage["columns"], json!([]));
+        assert!(
+            usage["columnsNote"]
+                .as_str()
+                .is_some_and(|n| n.contains("1 query that read several tables"))
+        );
+    }
+
+    /// `DATA-15` F2: a statement that reads this table alone counts each
+    /// of its columns once, however often the statement names it.
+    #[test]
+    fn a_single_table_statement_counts_each_column_once() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [
+            mention(
+                "q1",
+                "SELECT amount, amount + 1 FROM silver.orders WHERE amount > 5 ORDER BY id",
+                me,
+                "completed",
+                10,
+            ),
+            mention(
+                "q2",
+                "SELECT o.Amount FROM silver.orders o",
+                me,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &columns(&["amount", "id", "city"]),
+            me,
+            false,
+        );
+        assert_eq!(
+            usage["columns"],
+            json!([{"name": "amount", "queries": 2}, {"name": "id", "queries": 1}])
+        );
+    }
+
+    /// `DATA-15` F2: `truncated` is the caller's word that the history read
+    /// came back full; `basedOn` is the rows read.
+    #[test]
+    fn a_full_history_read_is_reported_as_truncated() {
+        let me = uuid::Uuid::from_u128(1);
+        let mentions = [mention(
+            "q1",
+            "SELECT * FROM silver.orders",
+            me,
+            "completed",
+            1,
+        )];
+        let (usage, _) = summarize_usage(&mentions, &tables(&["silver.orders"]), &[], me, true);
+        assert_eq!(usage["truncated"], true);
+        assert_eq!(usage["basedOn"], 1);
+    }
+
+    /// `DATA-15` F2: the asset page looks back 30 days, the search ranking
+    /// keeps its 7.
+    #[test]
+    fn the_asset_page_and_the_ranking_have_their_own_windows() {
+        assert_eq!(ASSET_USAGE_DAYS, 30);
+        assert_eq!(USE_RANKING_DAYS, 7);
     }
 
     fn audit_event(action: &str, args: Value) -> lakehouse_store::audit::AuditEvent {
@@ -1275,6 +1727,32 @@ mod tests {
             approval_id: None,
             session_id: None,
         }
+    }
+
+    /// `DATA-15` F3: the history names both people (the actor, and the
+    /// grantee in the sentence), the permission and the day a grant ends.
+    #[test]
+    fn change_entries_name_a_grant_and_a_revoke_with_both_people() {
+        let grant = change_entry(&audit_event(
+            "catalog.grant",
+            json!({
+                "permission": "query:read",
+                "grantee": "Bayu",
+                "expiresAt": "2026-11-15T08:00:00.000Z",
+            }),
+        ));
+        assert_eq!(grant["actor"], "Rina");
+        assert_eq!(
+            grant["summary"],
+            "Granted query:read to Bayu until 2026-11-15"
+        );
+
+        let revoke = change_entry(&audit_event(
+            "catalog.revoke",
+            json!({ "permission": "query:read", "grantee": "Bayu" }),
+        ));
+        assert_eq!(revoke["actor"], "Rina");
+        assert_eq!(revoke["summary"], "Revoked query:read from Bayu");
     }
 
     /// The history line says what was done in plain words, from the

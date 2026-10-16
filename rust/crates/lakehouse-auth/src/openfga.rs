@@ -55,6 +55,10 @@ use crate::secret::Secret;
 /// service accounts every warehouse needs regardless of who provisioned
 /// it. Matches `docker-compose.yml`'s `lakekeeper-authz-init`
 /// `grant()` calls exactly (verb sets included).
+/// How long a dropped table can be undropped: 7 days, the spec's retention
+/// window (`DATA-15` F4). The compose warehouse inits write the same number.
+pub const DELETE_RETENTION_SECONDS: u64 = 604_800;
+
 const MACHINE_GRANTS: &[(&str, &[&str])] = &[
     ("rust-iceberg", &["create", "modify", "select"]),
     ("debezium", &["create", "modify", "select"]),
@@ -114,6 +118,41 @@ struct WarehouseListResponse {
 struct WarehouseEntry {
     id: String,
     name: String,
+}
+
+/// A soft-deleted table `Lakekeeper` still lists (`DATA-15` F4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedTabular {
+    /// The table's id, which `undrop` takes.
+    pub id: String,
+    /// When it was dropped, RFC 3339.
+    pub deleted_at: String,
+    /// When it stops being recoverable, RFC 3339.
+    pub expires_at: String,
+}
+
+/// Pages of 100 `find_deleted_table` reads before it stops looking: a
+/// warehouse with more than 2,000 soft-deleted tables inside the window is
+/// not a case this lookup serves.
+const DELETED_LIST_MAX_PAGES: usize = 20;
+
+#[derive(Debug, Deserialize)]
+struct DeletedTabularsPage {
+    tabulars: Vec<DeletedTabularEntry>,
+    #[serde(rename = "next-page-token")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletedTabularEntry {
+    id: String,
+    name: String,
+    namespace: Vec<String>,
+    typ: String,
+    #[serde(rename = "deleted-at")]
+    deleted_at: String,
+    #[serde(rename = "expiration-date")]
+    expiration_date: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,20 +291,12 @@ impl LakekeeperAdminClient {
         storage_prefix: &str,
         storage: &TenantWarehouseStorage,
     ) -> Result<String, OpenfgaError> {
-        let list_response = self
-            .http
-            .get(format!("{}/management/v1/warehouse", self.base_url))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(|_| OpenfgaError::Transport)?;
-        classify_status(list_response.status())?;
-        let list: WarehouseListResponse = list_response
-            .json()
-            .await
-            .map_err(|_| OpenfgaError::Server)?;
-        if let Some(existing) = list.warehouses.iter().find(|w| w.name == name) {
-            return Ok(existing.id.clone());
+        if let Some(existing) = self.find_warehouse_id(name).await? {
+            // `DATA-15` F4: also on a warehouse that already exists, so a
+            // tenant warehouse made before soft delete shipped gets it on
+            // its next provisioning call.
+            self.set_soft_delete_profile(&existing).await?;
+            return Ok(existing);
         }
 
         let create_response = self
@@ -299,7 +330,162 @@ impl LakekeeperAdminClient {
             .json()
             .await
             .map_err(|_| OpenfgaError::Server)?;
+        self.set_soft_delete_profile(&created.warehouse_id).await?;
         Ok(created.warehouse_id)
+    }
+
+    /// The id of the warehouse called `name`, or `None` when there is none.
+    /// The lookup half of [`Self::ensure_warehouse`], also used by the asset
+    /// page's restore (`DATA-15` F4) to find the configured warehouse.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx` or a body that does not parse.
+    pub async fn find_warehouse_id(&self, name: &str) -> Result<Option<String>, OpenfgaError> {
+        let response = self
+            .http
+            .get(format!("{}/management/v1/warehouse", self.base_url))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())?;
+        let list: WarehouseListResponse =
+            response.json().await.map_err(|_| OpenfgaError::Server)?;
+        Ok(list
+            .warehouses
+            .into_iter()
+            .find(|w| w.name == name)
+            .map(|w| w.id))
+    }
+
+    /// The newest soft-deleted table `namespace.table` in `warehouse_id`, if
+    /// `Lakekeeper` still lists one (`DATA-15` F4). Lists the warehouse's
+    /// deleted tabulars page by page (at most [`DELETED_LIST_MAX_PAGES`]
+    /// pages of 100) and matches on the namespace and name here: the
+    /// endpoint filters by namespace *id*, which the product does not hold.
+    /// An entry whose `expires_at` has passed may still be listed until
+    /// `Lakekeeper` purges it; the caller compares the date.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if a request never reaches `Lakekeeper`;
+    /// [`OpenfgaError::Rejected`] on a `4xx`; [`OpenfgaError::Server`] on a
+    /// `5xx` or a body that does not parse.
+    pub async fn find_deleted_table(
+        &self,
+        warehouse_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Option<DeletedTabular>, OpenfgaError> {
+        let mut found: Option<DeletedTabular> = None;
+        let mut token: Option<String> = None;
+        for _ in 0..DELETED_LIST_MAX_PAGES {
+            let mut request = self
+                .http
+                .get(format!(
+                    "{}/management/v1/warehouse/{warehouse_id}/deleted-tabulars",
+                    self.base_url
+                ))
+                .header("Authorization", self.auth_header())
+                .query(&[("pageSize", "100")]);
+            if let Some(token) = &token {
+                request = request.query(&[("pageToken", token.as_str())]);
+            }
+            let response = request.send().await.map_err(|_| OpenfgaError::Transport)?;
+            classify_status(response.status())?;
+            let page: DeletedTabularsPage =
+                response.json().await.map_err(|_| OpenfgaError::Server)?;
+            for t in page.tabulars {
+                let matches = t.typ == "table"
+                    && t.name == table
+                    && t.namespace.len() == 1
+                    && t.namespace[0] == namespace;
+                if !matches {
+                    continue;
+                }
+                let candidate = DeletedTabular {
+                    id: t.id,
+                    deleted_at: t.deleted_at,
+                    expires_at: t.expiration_date,
+                };
+                // Dropped and recreated more than once: the newest drop.
+                if found
+                    .as_ref()
+                    .is_none_or(|best| candidate.deleted_at > best.deleted_at)
+                {
+                    found = Some(candidate);
+                }
+            }
+            match page.next_page_token {
+                Some(next) if !next.is_empty() => token = Some(next),
+                _ => break,
+            }
+        }
+        Ok(found)
+    }
+
+    /// Undrops the soft-deleted table `tabular_id` in `warehouse_id`
+    /// (`DATA-15` F4). A `4xx` (for instance a table of that name exists
+    /// again) is [`OpenfgaError::Rejected`].
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn undrop_table(
+        &self,
+        warehouse_id: &str,
+        tabular_id: &str,
+    ) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/warehouse/{warehouse_id}/deleted-tabulars/undrop",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({ "targets": [{ "id": tabular_id, "type": "table" }] }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())
+    }
+
+    /// Makes a dropped table in `warehouse_id` soft-deleted for
+    /// [`DELETE_RETENTION_SECONDS`] (7 days) instead of hard-deleted, so it
+    /// can be undropped (`DATA-15` F4). `Lakekeeper` 0.13.3 defaults to a
+    /// hard delete, which cannot come back. Idempotent: the same profile
+    /// written twice is the same profile. A failure is returned, not
+    /// swallowed: a warehouse left on hard delete would silently lose the
+    /// restore the asset page promises.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenfgaError::Transport`] if the request never reaches
+    /// `Lakekeeper`; [`OpenfgaError::Rejected`] on a `4xx`;
+    /// [`OpenfgaError::Server`] on a `5xx`.
+    pub async fn set_soft_delete_profile(&self, warehouse_id: &str) -> Result<(), OpenfgaError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/management/v1/warehouse/{warehouse_id}/delete-profile",
+                self.base_url
+            ))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "delete-profile": {
+                    "type": "soft",
+                    "expiration-seconds": DELETE_RETENTION_SECONDS
+                }
+            }))
+            .send()
+            .await
+            .map_err(|_| OpenfgaError::Transport)?;
+        classify_status(response.status())
     }
 
     /// Grant [`MACHINE_GRANTS`] onto `warehouse_id`. A `409` response (an
