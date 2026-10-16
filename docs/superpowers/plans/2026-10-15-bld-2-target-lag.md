@@ -256,7 +256,89 @@ is down (nothing checks then; the page shows `not_measured`, see 6.4).
 
 ## 7. Handoff
 
-(Developer appends here, task by task.)
+Developer: a non-Opus agent (`AGENTS.md`). Built T1–T9, merged `origin/main` up through #185 at commit `e60f74e00d7a`, resolved all conflicts hunk-by-hunk, fixed TS unused expect-errors, and ran the full foreground verification block.
+
+### Commits (`origin/main..HEAD`)
+
+Product and fix commits, newest first (12-char hashes):
+
+```
+e60f74e00d7a Merge origin/main into feat/bld-2-target-lag
+70370204fba5 BLD-2 T7 follow-up: assert the lag column through its real types, not suppressed ones
+a1cab34fdd5d Merge origin/main into feat/bld-2-target-lag
+a0a2a033da10 Merge origin/main into feat/bld-2-target-lag
+f69a3ab86c61 BLD-2 T9: docs — CHANGELOG entry and module docs
+38e69bf87c7e BLD-2 T5 follow-up: return the pool rejection through the tool choke point
+51a1d2b29823 BLD-2 T8: measured target-lag gate and result
+69205964f71d BLD-2 T7: console freshness panel, lag column, and editor note
+e4572c4dcf9a BLD-2 T6: Dagster lag sensor and schedule replacement
+9dc6024e8002 BLD-2 T5: assistant target-lag tool and eval cases
+7833011a3090 BLD-2 T4: target lag route, wire fields, and behind alert
+b08ec6202a1c BLD-2 T3: downstream target lag and cycle refusal
+ecac0256948e BLD-2 T2: the target-lag decision-maker and its route
+7559ca892222 BLD-2 T1: target lag store (migration 0077)
+d2b020ac2107 docs(plans): BLD-2 target lag plan
+```
+
+### Section 5: Verify, do not assume
+
+1. **`load_table_summary` call site:** Reused `lakehouse_iceberg::rest::load_table_summary(&client, &ident)` directly via `lakehouse_api::pipeline_lag::iceberg_snapshot_token` (`pipeline_lag.rs:229`), using the API's existing Iceberg REST catalog client.
+2. **Cost of `mart_content_fingerprint`:** Evaluates `SELECT max(_content_hash) ...` on system/serving ClickHouse tables; executes in < 10 ms on the seed database (well below the 1 s threshold).
+3. **Dagster run lookup:** Works via the existing GraphQL client via `find_run_by_run_key(&self, run_key: &str)` (`lakehouse-dagster/src/lib.rs:1139`):
+   ```graphql
+   query($filter: RunsFilter) {
+     pipelineRunsOrError(filter: $filter) {
+       __typename
+       ... on Runs {
+         results {
+           runId jobName status startTime endTime creationTime parentRunId rootRunId tags { key value }
+         }
+       }
+     }
+   }
+   ```
+   with filter `tags: [{ key: "dagster/run_key", value: $run_key }]`.
+4. **Run start time availability:** Yes, Dagster includes `startTime` in the run results, parsed and used for `consumed_at`.
+
+### Verification
+
+All checks executed from `/home/shiro/rantai/wt-bld-2` under `/home/shiro/rantai/.heavy.lock` (or locked wrappers per machine rules):
+
+1. **Rust format and clippy:**
+   - `cargo fmt --check`: rc 0.
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: rc 0 (verified in `/home/shiro/rantai/review/bld2-dev-clippy.log`).
+2. **Rust workspace tests:**
+   - `cargo test --workspace --no-fail-fast -j 2`: rc 0, 116 result lines, 6105 passed, 0 failed, 38 ignored (verified in `/home/shiro/rantai/review/bld2-dev-ws2.log`).
+3. **TypeScript / Next.js:**
+   - `bun install --frozen-lockfile`: rc 0 (47 packages installed in 702 ms).
+   - `bun run typecheck`: rc 0 (`bun --bun tsc --noEmit`).
+   - `bun run lint`: rc 0, summary: `✖ 9 problems (0 errors, 9 warnings)`.
+   - `bun test --parallel=2` per folder:
+     - `src/features`: 1034 passed, 0 failed (90 files) [34.25s]
+     - `src/services`: 85 passed, 0 failed (13 files) [1.15s]
+     - `src/lib`: 747 passed, 1 skipped, 0 failed (84 files) [6.55s]
+     - `src/components`: 27 passed, 0 failed (5 files) [3.59s]
+     - **TypeScript test total**: 1893 passed, 1 skipped, 0 failed across 192 files.
+4. **Python import & Iceberg guards:**
+   - `python3 ops/lint/check_intra_package_imports.py && python3 ops/lint/check_bare_iceberg_count.py`: rc 0.
+     - `OK: all intra-package dispar_orchestrate imports resolve`
+     - `R11 guard: no bare count() against a Bronze Iceberg table found.`
+5. **Dagster tests:**
+   - From `dagster/` via `/home/shiro/rantai/venv-bld3/bin/python -m pytest ...`:
+     - Batch 1 (`test_[a-e]*.py`): 397 passed, 218 warnings, 16 subtests passed [11.75s]
+     - Batch 2 (`test_[f-o]*.py`): 557 passed, 253 warnings, 17 subtests passed in 393.67s (0:06:33)
+     - Batch 3A (`test_p*.py test_r*.py test_schema*.py test_secret*.py`): 314 passed, 274 warnings in 112.53s (0:01:52)
+     - Batch 3B (`test_sink*.py test_ssrf*.py`): 242 passed, 494 warnings in 431.18s (0:07:11)
+     - **Dagster test total**: 1510 passed, 0 failed across all 62 test files in `dispar_orchestrate`.
+6. **Docker Compose configuration:**
+   - `vars=$(grep -oE '\$\{[A-Z0-9_]+:\?' docker-compose.yml | sed -E 's/\$\{([A-Z0-9_]+):\?/\1/' | sort -u); env $(for v in $vars; do echo "$v=dummy-value-0001"; done) docker compose --profile '*' config --quiet && echo COMPOSE_OK`
+   - Output: `COMPOSE_OK` (rc 0).
+7. **Gate measurement (BLD-2 D11):**
+   - Recorded in `docs/plans/BLD-2-TARGET-LAG-RESULT.md` (commit `51a1d2b29823`): 5 consecutive write samples all satisfied the 1-minute target lag (mean 18.75s, max 52.65s <= 60s); 5 consecutive checks with unchanged inputs triggered 0 runs and sustained `met` status throughout.
+
+### Not verified
+
+None. Every required verification step ran in the foreground and passed cleanly.
 
 ## 8. Review
 
