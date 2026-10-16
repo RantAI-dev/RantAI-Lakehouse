@@ -177,15 +177,23 @@ point-in-time recovery; off-site replication; Kafka.
 Quoted verbatim from `/home/shiro/rantai/review-logs/ops7-t2-check.log`:
 ```
 === EXECUTING BACKUP TO S3 (RUSTFS) ===
-a93fc6e7-90e4-459f-842a-28169fb63869	BACKUP_CREATED
+3eb0af4c-102f-49a9-b1c4-854531b54e11	BACKUP_CREATED
 === LISTING BACKUP S3 OBJECTS IN RUSTFS ===
-2026-10-16 02:34:05       1998 clickhouse/20261016T090000Z/test_e3_db/.backup
-2026-10-16 02:34:05        296 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/checksums.txt
-2026-10-16 02:34:05         62 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/columns.txt
+2026-10-16 08:06:34       1998 clickhouse/20261016T090000Z/test_e3_db/.backup
+2026-10-16 08:06:34        296 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/checksums.txt
+2026-10-16 08:06:34         62 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/columns.txt
 ...
+=== DROPPING test_e3_db FOR RESTORE ===
+=== EXECUTING RESTORE FROM S3 (RUSTFS) ===
+dfb2158a-91ad-42cc-a266-dde9f30325a4	RESTORED
+=== VERIFYING RESTORED DATA IN CLICKHOUSE ===
+RESTORED ROW COUNT: 2
 === FLUSHING LOGS AND CHECKING system.query_log ===
 RESULT query_log: MASKED secret successfully.
 Row 1:
+──────
+query: RESTORE DATABASE test_e3_db FROM S3('http://rustfs:9000/lakehouse-backups/clickhouse/20261016T090000Z/test_e3_db/', 'c33a5b437bac...', '[HIDDEN]')
+Row 2:
 ──────
 query: BACKUP DATABASE test_e3_db TO S3('http://rustfs:9000/lakehouse-backups/clickhouse/20261016T090000Z/test_e3_db/', 'c33a5b437bac...', '[HIDDEN]')
 === CHECKING SERVER LOGS FOR CREDENTIAL LEAK ===

@@ -178,10 +178,12 @@ TOTAL_PG_BYTES=0
 for db in "${DATABASES[@]}"; do
   dump_file="${TMP_DIR}/${db}.dump"
   echo "--> Downloading dump for database '${db}' from s3://${BACKUP_S3_BUCKET}/${db}/${TIMESTAMP}.dump"
+  AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
+  AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
   docker run --rm --network "${NETWORK_NAME}" \
     -v "${TMP_DIR}:/out" \
-    -e AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
-    -e AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
     -e AWS_DEFAULT_REGION=us-east-1 \
     -e AWS_EC2_METADATA_DISABLED=true \
     amazon/aws-cli:2.36.34 s3 cp \
@@ -226,9 +228,11 @@ WH_START=$(date +%s)
 
 echo "==> Waiting for RustFS to be healthy..."
 for _ in $(seq 1 60); do
-  if docker run --rm --network "${NETWORK_NAME}" \
-    -e AWS_ACCESS_KEY_ID="${WAREHOUSE_ACCESS_KEY}" \
-    -e AWS_SECRET_ACCESS_KEY="${WAREHOUSE_SECRET_KEY}" \
+  if AWS_ACCESS_KEY_ID="${WAREHOUSE_ACCESS_KEY}" \
+     AWS_SECRET_ACCESS_KEY="${WAREHOUSE_SECRET_KEY}" \
+     docker run --rm --network "${NETWORK_NAME}" \
+       -e AWS_ACCESS_KEY_ID \
+       -e AWS_SECRET_ACCESS_KEY \
     -e AWS_DEFAULT_REGION=us-east-1 \
     -e AWS_EC2_METADATA_DISABLED=true \
     amazon/aws-cli:2.36.34 s3 ls "s3://${WAREHOUSE_BUCKET}" \
@@ -240,9 +244,11 @@ done
 
 echo "--> Restoring warehouse bucket from s3://${BACKUP_S3_BUCKET}/warehouse/ to s3://${WAREHOUSE_BUCKET}/"
 if [[ "${BACKUP_S3_ENDPOINT}" == "${WAREHOUSE_ENDPOINT}" && "${BACKUP_S3_ACCESS_KEY}" == "${WAREHOUSE_ACCESS_KEY}" ]]; then
+  AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
+  AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
   docker run --rm --network "${NETWORK_NAME}" \
-    -e AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
-    -e AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
     -e AWS_DEFAULT_REGION=us-east-1 \
     -e AWS_EC2_METADATA_DISABLED=true \
     amazon/aws-cli:2.36.34 s3 sync \
@@ -251,10 +257,12 @@ if [[ "${BACKUP_S3_ENDPOINT}" == "${WAREHOUSE_ENDPOINT}" && "${BACKUP_S3_ACCESS_
     --endpoint-url "${BACKUP_S3_ENDPOINT}"
 else
   mkdir -p "${TMP_DIR}/warehouse"
+  AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
+  AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
   docker run --rm --network "${NETWORK_NAME}" \
     -v "${TMP_DIR}/warehouse:/wh" \
-    -e AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
-    -e AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
     -e AWS_DEFAULT_REGION=us-east-1 \
     -e AWS_EC2_METADATA_DISABLED=true \
     amazon/aws-cli:2.36.34 s3 sync \
@@ -262,10 +270,12 @@ else
     "/wh" \
     --endpoint-url "${BACKUP_S3_ENDPOINT}"
 
+  AWS_ACCESS_KEY_ID="${WAREHOUSE_ACCESS_KEY}" \
+  AWS_SECRET_ACCESS_KEY="${WAREHOUSE_SECRET_KEY}" \
   docker run --rm --network "${NETWORK_NAME}" \
     -v "${TMP_DIR}/warehouse:/wh" \
-    -e AWS_ACCESS_KEY_ID="${WAREHOUSE_ACCESS_KEY}" \
-    -e AWS_SECRET_ACCESS_KEY="${WAREHOUSE_SECRET_KEY}" \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
     -e AWS_DEFAULT_REGION=us-east-1 \
     -e AWS_EC2_METADATA_DISABLED=true \
     amazon/aws-cli:2.36.34 s3 sync \
@@ -294,9 +304,11 @@ for _ in $(seq 1 60); do
 done
 
 echo "--> Discovering ClickHouse databases backed up at timestamp ${TIMESTAMP}..."
-CH_DBS=$(docker run --rm --network "${NETWORK_NAME}" \
-  -e AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
-  -e AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
+CH_DBS=$(AWS_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY}" \
+  AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}" \
+  docker run --rm --network "${NETWORK_NAME}" \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
   -e AWS_DEFAULT_REGION=us-east-1 \
   -e AWS_EC2_METADATA_DISABLED=true \
   amazon/aws-cli:2.36.34 s3 ls \
