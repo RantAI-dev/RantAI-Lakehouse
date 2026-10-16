@@ -419,3 +419,41 @@ Run it once after the fixes and quote the totals.
 
 Cite `BLD-1 review BLOCKER 1` / `SHOULD-FIX <n>` at each fix site and in the
 commit bodies.
+
+### Round 2 (planner/reviewer, Claude Opus), at `3f6b4e243366`
+
+Re-read the fixes and the merge of `main` (#165, #87).
+
+- **BLOCKER 1: fixed** (`83452ab1`). The author-load failure is classified
+  through `upstream_error` (`report_sqlx` for `AuthError::Database`,
+  `internal_error` for the rest), cited at the site, with a test
+  (`pipeline_enforce.rs`) that the 500 body carries no upstream text. The
+  branch adds no `ApiError::Internal(err.to_string())` (grep of the diff
+  against `main`: none).
+- **SHOULD-FIX 1: fixed** (`189d7b29`). `pipeline_enforce_router` and
+  `pipelines_router` each carry their own doc.
+- **SHOULD-FIX 2: fixed** (`3eace57d`). Section 6 answer 2 quotes the
+  four-argument call and `role_names`.
+- **SHOULD-FIX 3: fixed.** The workspace run is in the handoff, and I ran
+  the full block myself below.
+- **The merge.** The one conflict (`authored_factory.py` imports) keeps both
+  sides: DATA-19's `FILE_INGEST_JOB` and BLD-1 D5's removal of
+  `ensure_catalog_database`. `4de93ade` adds `run_as: None` to the fixture
+  #87 brought in; it compiles a tree that did not, and changes no behaviour.
+
+Reviewer verification on `3f6b4e243366` (one foreground run under the heavy
+lock, `review/review-pr.sh`): `cargo fmt --check` clean; `clippy --workspace
+--all-targets --all-features -D warnings` clean; `cargo test --workspace
+--no-fail-fast` 108 suites, 5319 passed, 0 failed, 9 ignored; `bun run
+typecheck` clean; `bun test` per folder 1646 pass, 0 fail, 2 skip; both
+`ops/lint` checks OK; Dagster `pytest` 1081 passed; `docker compose
+--profile '*' config --quiet` OK (dummy must-set values); gitleaks working
+tree: no leaks.
+
+CI on `3f6b4e243366`: one failure, `Rust · test (stable)`, in
+`gold_publication.rs` while pulling the ClickHouse testcontainer image
+(`PullImage ... bytes remaining on stream`): a registry pull, not this
+branch. The same tree minus this docs commit (`4de93ade`) passed CI. Failed
+jobs re-run.
+
+No open BLOCKER. Merge once the re-run is green.
