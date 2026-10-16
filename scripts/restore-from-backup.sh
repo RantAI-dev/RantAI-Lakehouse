@@ -287,8 +287,7 @@ CH_START=$(date +%s)
 
 echo "==> Waiting for ClickHouse to be healthy..."
 for _ in $(seq 1 60); do
-  ch_ping=$("${COMPOSE[@]}" exec -T clickhouse wget -qO- http://127.0.0.1:8123/ping 2>/dev/null || true)
-  if [[ "${ch_ping}" == *"Ok"* ]]; then
+  if "${COMPOSE[@]}" exec -T clickhouse clickhouse-client -q "SELECT 1" >/dev/null 2>&1; then
     break
   fi
   sleep 1
