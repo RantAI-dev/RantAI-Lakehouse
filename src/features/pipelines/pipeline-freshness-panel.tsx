@@ -13,6 +13,18 @@ import { pipelineService } from "@/services"
 import type { PipelineDetail, TargetLag } from "@/services/contracts/pipelines"
 
 /**
+ * The bounds the console offers, and the API accepts.
+ *
+ * BLD-2 review round 1 / plan D11: the floor is 2 minutes because the
+ * acceptance gate measured a worst sample of 68.94 s on the compose stack
+ * and a 1-minute target is not met there. They live here, next to the input
+ * that uses them, so the panel, its validation message and the API's own
+ * bound (`MIN_TARGET_LAG_MINUTES`) name the same number.
+ */
+const MIN_MINUTES = 2
+const MAX_MINUTES = 10080
+
+/**
  * The minutes a `lag` target lag carries, or `null` when it carries none.
  *
  * `TargetLag` is widened with `| string` (D2, review R1 BLOCKER 10), so a
@@ -118,8 +130,10 @@ export function PipelineFreshnessPanel({
     let payload: TargetLag | null = null
     if (mode === "lag") {
       const parsedMinutes = Number(minutes)
-      if (isNaN(parsedMinutes) || parsedMinutes < 1 || parsedMinutes > 10080) {
-        setLocalError("Minutes must be between 1 and 10080")
+      // BLD-2 review round 1 / D11: the floor is the measured one (the gate
+      // did not meet 1 minute on this stack), not the spec's 1.
+      if (isNaN(parsedMinutes) || parsedMinutes < MIN_MINUTES || parsedMinutes > MAX_MINUTES) {
+        setLocalError(`Minutes must be between ${MIN_MINUTES} and ${MAX_MINUTES}`)
         return
       }
       payload = { kind: "lag", minutes: parsedMinutes }
@@ -221,12 +235,14 @@ export function PipelineFreshnessPanel({
 
           {mode === "lag" ? (
             <div className="flex flex-col gap-1.5 max-w-xs">
-              <Label htmlFor="target-lag-minutes" className="text-xs">Minutes (1 - 10080)</Label>
+              <Label htmlFor="target-lag-minutes" className="text-xs">
+                Minutes ({MIN_MINUTES} - {MAX_MINUTES})
+              </Label>
               <Input
                 id="target-lag-minutes"
                 type="number"
-                min={1}
-                max={10080}
+                min={MIN_MINUTES}
+                max={MAX_MINUTES}
                 value={minutes}
                 onChange={(e) => setMinutes(Number(e.target.value))}
                 className="h-8 text-xs font-mono"

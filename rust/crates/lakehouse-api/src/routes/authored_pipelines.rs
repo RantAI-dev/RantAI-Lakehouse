@@ -1131,19 +1131,36 @@ pub struct SetTargetLagBody {
     pub target_lag: Option<pipelines::TargetLag>,
 }
 
-/// Validates an optional `target_lag` value. Minutes must be between 1 and
-/// 10080 (1 minute to 7 days, matching Snowflake's bounds).
+/// The smallest target lag a pipeline may be given, in whole minutes.
+///
+/// BLD-2 review round 1, plan D11: the spec's floor is 1 minute, but the
+/// gate's measurement on this stack did not support it (worst of five
+/// samples 68.94 s), so the floor is raised to the next whole minute above
+/// the measurement. It is a measured floor, not a preference: change it
+/// only with a new measurement behind it, and change
+/// `0084_pipeline_target_lag.sql`'s CHECK in the same PR so the route and
+/// the column cannot disagree.
+pub const MIN_TARGET_LAG_MINUTES: i32 = 2;
+
+/// The largest target lag a pipeline may be given: 7 days, Snowflake's.
+pub const MAX_TARGET_LAG_MINUTES: i32 = 10_080;
+
+/// Validates an optional `target_lag` value. Minutes must be between
+/// [`MIN_TARGET_LAG_MINUTES`] and [`MAX_TARGET_LAG_MINUTES`] (2 minutes to
+/// 7 days; the top of the range is Snowflake's, the bottom is the measured
+/// floor — plan D11).
 ///
 /// # Errors
 ///
-/// Returns 400 if minutes is outside `1..=10080`.
+/// Returns 400 if minutes is outside
+/// `MIN_TARGET_LAG_MINUTES..=MAX_TARGET_LAG_MINUTES`.
 pub fn validate_target_lag(lag: Option<pipelines::TargetLag>) -> Result<(), ApiError> {
     if let Some(pipelines::TargetLag::Lag { minutes }) = lag
-        && !(1..=10080).contains(&minutes)
+        && !(MIN_TARGET_LAG_MINUTES..=MAX_TARGET_LAG_MINUTES).contains(&minutes)
     {
-        return Err(ApiError::BadRequest(
-            "targetLag minutes must be between 1 and 10080 (1 minute to 7 days)".to_owned(),
-        ));
+        return Err(ApiError::BadRequest(format!(
+            "targetLag minutes must be between {MIN_TARGET_LAG_MINUTES} and {MAX_TARGET_LAG_MINUTES} (2 minutes to 7 days)"
+        )));
     }
     Ok(())
 }
@@ -1192,7 +1209,7 @@ pub async fn apply_set_target_lag(
 /// # Errors
 ///
 /// Returns 404 for an unknown or non-authored id or an id outside the caller's tenant;
-/// 400 for minutes outside `1..=10080` or if the lag would create a cycle;
+/// 400 for minutes outside `2..=10080` or if the lag would create a cycle;
 /// 503 if the store is unavailable.
 pub async fn set_target_lag(
     State(state): State<AppState>,
@@ -4148,21 +4165,29 @@ mod tests {
         }
 
         #[test]
-        fn validate_target_lag_enforces_one_to_10080_minute_bounds() {
-            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 1 })).is_ok());
+        fn validate_target_lag_enforces_the_measured_floor_and_10080_minute_ceiling() {
+            // BLD-2 review round 1 / D11: the floor is the measured one.
+            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 2 })).is_ok());
             assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 10080 })).is_ok());
             assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 60 })).is_ok());
             assert!(validate_target_lag(Some(TargetLag::Downstream)).is_ok());
             assert!(validate_target_lag(None).is_ok());
 
+            let one_minute_err =
+                validate_target_lag(Some(TargetLag::Lag { minutes: 1 })).unwrap_err();
+            assert!(matches!(one_minute_err, ApiError::BadRequest(_)));
+            assert!(
+                one_minute_err.to_string().contains("between 2 and 10080"),
+                "the message names the measured floor: {one_minute_err}"
+            );
             let zero_err = validate_target_lag(Some(TargetLag::Lag { minutes: 0 })).unwrap_err();
             assert!(matches!(zero_err, ApiError::BadRequest(_)));
-            assert!(zero_err.to_string().contains("between 1 and 10080"));
+            assert!(zero_err.to_string().contains("between 2 and 10080"));
 
             let over_err =
                 validate_target_lag(Some(TargetLag::Lag { minutes: 10081 })).unwrap_err();
             assert!(matches!(over_err, ApiError::BadRequest(_)));
-            assert!(over_err.to_string().contains("between 1 and 10080"));
+            assert!(over_err.to_string().contains("between 2 and 10080"));
         }
 
         #[sqlx::test(migrations = "../../migrations")]

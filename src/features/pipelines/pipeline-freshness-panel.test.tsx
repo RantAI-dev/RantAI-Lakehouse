@@ -151,7 +151,7 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
       const configBtn = screen.getByLabelText("Configure target lag")
       fireEvent.click(configBtn)
 
-      const minutesInput = screen.getByLabelText("Minutes (1 - 10080)") as HTMLInputElement
+      const minutesInput = screen.getByLabelText("Minutes (2 - 10080)") as HTMLInputElement
       fireEvent.change(minutesInput, { target: { value: "25" } })
 
       const saveBtn = screen.getByText("Save target lag")

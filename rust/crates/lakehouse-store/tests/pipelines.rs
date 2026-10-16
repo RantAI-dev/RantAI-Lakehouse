@@ -1978,7 +1978,9 @@ async fn target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values(
         .await
         .expect("create_pipeline should succeed");
 
-    for accepted in [60_i32, 604_800] {
+    // BLD-2 review round 1 / D11: 120 s (2 minutes) is the measured floor,
+    // 604800 s the 7-day ceiling.
+    for accepted in [120_i32, 604_800] {
         sqlx::query("UPDATE pipeline_definition SET target_lag_seconds = $2 WHERE id = $1")
             .bind(&created.id)
             .bind(accepted)
@@ -1986,10 +1988,10 @@ async fn target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values(
             .await
             .unwrap_or_else(|e| panic!("{accepted} seconds must be accepted: {e}"));
     }
-    // 59 s is under the 1-minute floor, 604801 over the 7-day ceiling, and
-    // 90 s is inside the range but not a whole number of minutes — the
-    // wire format has no way to ask for it.
-    for refused in [59_i32, 90, 604_801] {
+    // 60 s is under the measured 2-minute floor, 604801 over the 7-day
+    // ceiling, and 90 s is inside the range but not a whole number of
+    // minutes — the wire format has no way to ask for it.
+    for refused in [60_i32, 90, 604_801] {
         let result =
             sqlx::query("UPDATE pipeline_definition SET target_lag_seconds = $2 WHERE id = $1")
                 .bind(&created.id)

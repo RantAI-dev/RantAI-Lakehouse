@@ -60,8 +60,10 @@ true now; SRC-20 runs this gate for real, after G3a, in the
 
 In addition to graph, source, and row materializations, this gate includes
 the BLD-2 D11 target lag verification step (`step_verify_target_lag_bronze_to_silver`):
-measures Bronze-to-Silver lag across 5 append iterations with a 1-minute target
-lag, then verifies 5 checks with unchanged inputs launch no unneeded runs.
+measures Bronze-to-Silver lag across 5 append iterations against the
+measured floor (2 minutes; a 1-minute target was measured at a worst sample
+of 68.94 s and refused -- plan D11), then verifies 5 checks with unchanged
+inputs launch no unneeded runs.
 Because of settling intervals and up to 5 runs, this step can take up to
 ~20 minutes in worst-case conditions inside the job timeout.
 
@@ -637,21 +639,33 @@ def trigger_bronze_ingest() -> str:
     return run_id
 
 
+# The target this gate measures against, in minutes, and the same number in
+# seconds for the assertion. 2 minutes is the MEASURED floor (plan D11):
+# a 1-minute target was measured at a worst sample of 68.94 s on this stack
+# and refused, so the API's minimum, the migration's CHECK and this gate's
+# target all sit at 2. They move together, and only with a measurement.
+TARGET_LAG_MINUTES = 2
+TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
+
+
 def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
-    """BLD-2 D11 gate: measure Bronze-to-Silver lag with a 1-minute target on compose stack.
+    """BLD-2 D11 gate: measure Bronze-to-Silver lag with the measured
+    floor as target on the compose stack.
+
     Appends rows to Bronze 5 times, measuring each time-to-Silver.
-    Then leaves inputs unchanged for 5 checks, asserting no new run and status 'met'."""
-    print(f"[g7] configuring targetLag=1 minute on {pipeline_id}")
+    Then leaves inputs unchanged for 5 checks, asserting no new run and
+    status 'met'."""
+    print(f"[g7] configuring targetLag={TARGET_LAG_MINUTES} minutes on {pipeline_id}")
     resp = API.put(
         f"{API_URL}/api/pipelines/{pipeline_id}/target-lag",
-        json={"targetLag": {"kind": "lag", "minutes": 1}},
+        json={"targetLag": {"kind": "lag", "minutes": TARGET_LAG_MINUTES}},
         timeout=30,
     )
     if not resp.ok:
         raise G7Failure(f"PUT /target-lag failed: {resp.status_code} {resp.text}")
 
     pipe_detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
-    if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": 1}:
+    if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": TARGET_LAG_MINUTES}:
         raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
 
     # BLD-2 review R1 SHOULD-FIX 14: the same derivation as the factory's
@@ -779,12 +793,19 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
 
     avg_sample = sum(samples) / len(samples)
     print(f"[g7] TARGET_LAG_RESULT: 5 samples = {[round(s, 2) for s in samples]}s, avg = {avg_sample:.2f}s")
-    # BLD-2 review R1 BLOCKER 8: sample over 60s must fail (D11)
-    if any(s > 60.0 for s in samples):
+    # BLD-2 review R1 BLOCKER 8: a sample over the target FAILS the gate
+    # (D11: the floor is reported and the minimum raised in the same PR,
+    # never a pass).
+    if any(s > TARGET_LAG_SECONDS for s in samples):
         raise G7Failure(
-            f"NOT ALL SAMPLES MET 1-MINUTE TARGET (<= 60s): samples={[round(s, 2) for s in samples]}s, max={max(samples):.2f}s > 60s"
+            f"NOT ALL SAMPLES MET THE {TARGET_LAG_MINUTES}-MINUTE TARGET "
+            f"(<= {int(TARGET_LAG_SECONDS)}s): samples={[round(s, 2) for s in samples]}s, "
+            f"max={max(samples):.2f}s > {int(TARGET_LAG_SECONDS)}s"
         )
-    print(f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET 1-MINUTE TARGET (<= 60s)")
+    print(
+        f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET THE {TARGET_LAG_MINUTES}-MINUTE TARGET "
+        f"(<= {int(TARGET_LAG_SECONDS)}s)"
+    )
 
 
 def main() -> int:

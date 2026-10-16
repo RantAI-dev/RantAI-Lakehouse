@@ -2032,7 +2032,9 @@ mod tests {
     /// guess, and `not_measured` rather than `met` (plan D4).
     #[sqlx::test(migrations = "../../migrations")]
     async fn an_unreadable_input_is_not_measured_and_requests_nothing(pool: PgPool) {
-        let pipeline = seed_pipeline(&pool, "pl-x", 1).await;
+        // BLD-2 review round 1 / D11: the floor is 2 minutes (measured), so
+        // no fixture may ask for 1 — the column CHECK refuses it.
+        let pipeline = seed_pipeline(&pool, "pl-x", 2).await;
         let now = at(1_000);
         let reader = FakeTokens::new().unreadable("bronze.orders");
         let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("SUCCESS"), &[]).await;
@@ -2044,7 +2046,7 @@ mod tests {
         assert_eq!(outcome.decision, Decision::Wait);
         assert_eq!(outcome.status, LagStatus::NotMeasured);
         assert_eq!(outcome.lag_seconds, None);
-        assert_eq!(outcome.target_seconds, Some(60));
+        assert_eq!(outcome.target_seconds, Some(120));
         assert_eq!(
             outcome.reason.as_deref(),
             Some("an input could not be read")

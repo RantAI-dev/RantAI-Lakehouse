@@ -4601,7 +4601,7 @@
     "type": "function",
     "function": {
       "name": "set_pipeline_target_lag",
-      "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (1 to 10080 minutes), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+      "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (2 to 10080 minutes; 2 is the floor the gate measured on this stack, not an arbitrary minimum), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4626,7 +4626,7 @@
                   },
                   "minutes": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 2,
                     "maximum": 10080
                   }
                 },

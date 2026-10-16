@@ -18,20 +18,28 @@
 -- database should refuse no matter which caller wrote it, including a
 -- future one that forgets the route-level validation.
 --
--- # The range is Snowflake's, and the store-wide floor
+-- # The floor is the MEASURED one, not the spec's
 --
--- 60..604800 seconds is 1 minute to 7 days — the spec's signed range.
--- `% 60 = 0` because the wire format is whole MINUTES (plan D2): storing a
--- 90-second target would be a value no client can ask for and no page can
--- display. The route layer refuses out-of-range bodies with 400 so the
--- client never sees a constraint violation; this CHECK is defense in
--- depth. If the measured floor (plan D11 / `docs/plans/BLD-2-TARGET-LAG-
--- RESULT.md`) turns out to be above 60 seconds, THIS CHECK and the
--- route's own bound move together in the same PR — the minimum is never
--- claimed without a measurement behind it.
+-- The spec's signed range starts at 60 seconds (1 minute); the floor here
+-- is 120 (2 minutes), and the difference is a measurement, not a
+-- preference. Plan D11 says the gate measures the lag on the compose stack
+-- and that a minimum which the measurement does not support is raised in
+-- the same PR rather than claimed. The gate's run on this branch measured
+-- a worst sample of 68.94 s (five samples 40.70, 68.94, 56.85, 56.90,
+-- 52.82 — `docs/plans/BLD-2-TARGET-LAG-RESULT.md`), so a 1-minute target
+-- is not met on this stack and the minimum moves up to the next whole
+-- minute above it. The route's own bound
+-- (`routes::authored_pipelines::validate_target_lag`) carries the same
+-- number, and the two move together.
+--
+-- 120..604800 seconds is 2 minutes to 7 days. `% 60 = 0` because the wire
+-- format is whole MINUTES (plan D2): storing a 90-second target would be a
+-- value no client can ask for and no page can display. The route layer
+-- refuses out-of-range bodies with 400 so the client never sees a
+-- constraint violation; this CHECK is defense in depth.
 ALTER TABLE pipeline_definition
     ADD COLUMN target_lag_seconds INTEGER
-        CHECK (target_lag_seconds BETWEEN 60 AND 604800 AND target_lag_seconds % 60 = 0),
+        CHECK (target_lag_seconds BETWEEN 120 AND 604800 AND target_lag_seconds % 60 = 0),
     ADD COLUMN target_lag_downstream BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE pipeline_definition
@@ -39,8 +47,9 @@ ALTER TABLE pipeline_definition
         CHECK (NOT (target_lag_downstream AND target_lag_seconds IS NOT NULL));
 
 COMMENT ON COLUMN pipeline_definition.target_lag_seconds IS
-    'Target lag in WHOLE MINUTES × 60: 60..604800, NULL when the pipeline '
-    'has no target lag or is "downstream" (see target_lag_downstream).';
+    'Target lag in WHOLE MINUTES × 60: 120..604800 (the floor is the '
+    'measured one, plan D11), NULL when the pipeline has no target lag or '
+    'is "downstream" (see target_lag_downstream).';
 COMMENT ON COLUMN pipeline_definition.target_lag_downstream IS
     'true = Snowflake DOWNSTREAM: this pipeline refreshes only when a '
     'pipeline with a target lag that reads it needs it. Mutually exclusive '
