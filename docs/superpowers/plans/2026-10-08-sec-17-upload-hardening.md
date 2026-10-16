@@ -477,3 +477,131 @@ asserted was dropped. Planner: `bun test src/features/connectors` 242 pass,
 0 fail; `bun run typecheck` exit 0; `bun run lint` 0 errors, 8 warnings.
 `origin/main` merged again (`CHANGELOG.md`: both sides kept). No open
 `BLOCKER`.
+
+### Handoff (2026-10-16, round 4)
+
+#### 1. Commits
+
+- `2a58122c3d29` `merge: bring fix/sec-17-upload-hardening up to origin/main
+  (SEC-17 round 4 M1)` — `origin/main` (5c93fd20, PR #144, SRC-11/12/13) merged
+  into the branch. Two files conflicted; both resolved hunk by hunk, both
+  sides kept (AGENTS.md rule 9): `config.rs` (SEC-17 `upload_max_concurrent*`
+  alongside SRC-11 `connector_auto_disable_after` in the struct, `Debug` impl
+  and `from_map`) and `state.rs` (SEC-17 `upload_limits::ReceiveLimiter` import
+  alongside SRC-12 `secret_crypto`/`secret_manager`; both wirings survive in
+  `AppState::new`). No `--ours`/`--theirs`.
+- `2b408d9bbff9` `refactor(api): extract connector_secrets_keyring to clear
+  the clippy too_many_lines cap (SEC-17 round 4 M2)` — the merge pushed
+  `AppState::new` to 104/100 lines, so `clippy -D warnings` failed. The
+  keyring construction moved into `connector_secrets_keyring(config: &Config)`,
+  behaviour unchanged, same remedy as round 2's ingest split (`c1ce5fe8`), not
+  an `#[allow]`.
+- This commit: `docs(plan): record round 4 handoff (SEC-17)`.
+
+Full log `git log --oneline --abbrev=12 origin/main..HEAD`, captured before
+this commit:
+
+```
+2b408d9bbff9 refactor(api): extract connector_secrets_keyring to clear the clippy too_many_lines cap (SEC-17 round 4 M2)
+2a58122c3d29 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 4 M1)
+0027492f75fd docs: SEC-17 round 3 review (no open finding), decisions signed, backlog Done
+96c992d7167f Merge remote-tracking branch 'origin/main' into fix/sec-17-upload-hardening
+94af79039aa6 docs(plan): record round 3 handoff (SEC-17)
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+```
+
+#### 2. Conflicts resolved (M1)
+
+Only `rust/crates/lakehouse-api/src/config.rs` and
+`rust/crates/lakehouse-api/src/state.rs` conflicted textually; every other
+touched file (`CHANGELOG.md`, `docker-compose.yml`, `.env.example`, `main.rs`,
+`lib.rs`, `BACKLOG.md`, the realm of #144's new modules) auto-merged with both
+sides. `config.rs` had three hunks (struct field, `Debug` impl field,
+`from_map` initialiser) — each kept SEC-17's `upload_max_concurrent_per_user`/
+`upload_max_concurrent` and SRC-11's `connector_auto_disable_after`.
+`state.rs` had one hunk (the `use crate::…` block) — kept SEC-17's
+`upload_limits::ReceiveLimiter` and SRC-12's `secret_crypto`/`secret_manager`
+imports. The receive counter itself (`AppState.upload_receive`,
+`ReceiveLimiter::new(...)`) and #144's keyring/resolver wiring auto-merged and
+both survive.
+
+#### 3. Verification commands, verbatim, with counts
+
+All Rust commands under `flock /home/shiro/rantai/.locks/heavy.lock`, with
+`CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target`, `-j 4`, and a fresh
+`find rust -name '*.rs' -o -name '*.sql' -o -name Cargo.toml | xargs touch`
+before the first one.
+
+- `cargo fmt --check`: no output, exit 0.
+- `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings`:
+  `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 2m 29s`,
+  exit 0. (First run on the merge commit failed 104/100 at
+  `state.rs:597 AppState::new`; the M2 commit is what makes this green.)
+- The task wrote the lib filter as `--lib config:: state::`; `cargo test`
+  takes one `TESTNAME`, so it was run as two invocations. Both:
+  - `cargo test -j 4 -p lakehouse-api --lib config::`:
+    `test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 1849 filtered out; finished in 30.04s`
+  - `cargo test -j 4 -p lakehouse-api --lib state::`:
+    `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 1927 filtered out; finished in 0.00s`
+    (the known environment failure
+    `state::tests::connector_secret_resolver_…_probe_flag` passed here).
+- `cargo test -j 4 -p lakehouse-api --test upload_routes`, default
+  `RUST_TEST_THREADS=4`:
+  `test result: FAILED. 56 passed; 38 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.71s`.
+  Every one of the 38 failures is the same environment error, not a code
+  failure: `connect to the fresh per-test database: Database(PgDatabaseError {
+  severity: Fatal, code: "53100", message: "could not resize shared memory
+  segment \"/PostgreSQL.…\" to 33554432 bytes: No space left on device" })` at
+  `tests/common/mod.rs:150`. Four concurrent Postgres testcontainers exhausted
+  `/dev/shm` (6.8 G tmpfs; 6.5 G free again after the run).
+- Rerun alone with `RUST_TEST_THREADS=2`, same command otherwise:
+  `test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.15s`,
+  exit 0.
+- gitleaks
+  (`docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`):
+  `scanned ~26458328 bytes (26.46 MB) in 4.81s` / `no leaks found`.
+
+#### 4. Skipped, and premises
+
+- TypeScript, Python and docker-compose: out of scope this round; no file of
+  those languages was changed by either commit, so *not verified* here.
+- Whole `bun run test` / `bun test src`: *not run* (dev-rules forbid them).
+- No premise of the plan turned out wrong. §9's conflict list matched: only
+  `config.rs` and `state.rs` conflicted this time (the upload/store/TS files
+  it names had already been merged in round 2 and did not conflict again).
+- The `too_many_lines` cap crossing is a merge artefact (each side alone was
+  under 100); it is fixed at the cause, not suppressed.
+
+#### 5. Repository state
+
+`git status --short` (empty before the handoff commit; the handoff file was
+written after):
+
+```
+```
+
+`git log --oneline --abbrev=12 origin/main..HEAD | head`:
+
+```
+2b408d9bbff9 refactor(api): extract connector_secrets_keyring to clear the clippy too_many_lines cap (SEC-17 round 4 M2)
+2a58122c3d29 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 4 M1)
+0027492f75fd docs: SEC-17 round 3 review (no open finding), decisions signed, backlog Done
+96c992d7167f Merge remote-tracking branch 'origin/main' into fix/sec-17-upload-hardening
+94af79039aa6 docs(plan): record round 3 handoff (SEC-17)
+5792792e5d8c fix(frontend): drive the SEC-17 429 test through main's upload wizard
+7c1bedb026aa docs(plan): SEC-17 round 2 review: 1 BLOCKER
+c1ce5fe8d97c refactor(api): extract `ingest` helpers to clear the clippy `too_many_lines` cap (SEC-17 round 2 M2)
+a752d58237a8 style(rust): cargo fmt after the SEC-17 / main merge (SEC-17 round 2 M2)
+588b8b34eac4 merge: bring fix/sec-17-upload-hardening up to origin/main (SEC-17 round 2 M1)
+```
+
+`git ls-remote --heads origin fix/sec-17-upload-hardening` (12-char prefix of
+the full output):
+
+```
+2b408d9bbff9	refs/heads/fix/sec-17-upload-hardening
+```
