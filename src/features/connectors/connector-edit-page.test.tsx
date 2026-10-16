@@ -65,6 +65,7 @@ const DETAIL = {
   recentErrors: [],
   dependentPipelines: [],
   credentialManaged: false,
+  credentialSource: "env",
   residency: "id-jakarta",
   tenantId: "t-acme",
 }
@@ -101,6 +102,9 @@ function stubFetch(
     if (url.includes("/api/auth/me")) return json(ME)
     if (key === "GET /api/connectors/types") {
       return json([{ name: "PostgreSQL", adapter: "sql", supported: true, docsUrl: null, unsupportedReason: null }])
+    }
+    if (key === "GET /api/connectors/credential-settings") {
+      return json({ secretManager: null, typedCredentials: true })
     }
     if (key === "GET /api/connectors/conn-a") return json(detail)
     if (key === "GET /api/connectors/conn-a/ingest-spec") return json(SPEC)
@@ -370,6 +374,51 @@ describe("ConnectorEditPage", () => {
   })
 
   /**
+   * `SRC-12` part C: an OAuth sign-in connector's edit page asks for the client
+   * secret only. The refresh token is obtained by signing in, so it is never a
+   * field and never part of the request.
+   */
+  it("replaces an OAuth connector's client secret without ever sending a refresh token", async () => {
+    const oauthSpec = {
+      ...SPEC,
+      adapter: "rest",
+      dial: {
+        baseUrl: "https://api.example.com",
+        auth: {
+          type: "oauth2_authorization_code",
+          clientId: "app-1",
+          authorizeUrl: "https://login.example.com/authorize",
+          tokenUrl: "https://login.example.com/token",
+          scopes: ["read"],
+        },
+        pagination: { type: "none" },
+        endpoints: [{ path: "/items", recordsPath: null }],
+      },
+      secretRefs: { primary: "file:/run/secrets/connector_managed_x_secret_key", secondary: "file:/run/secrets/connector_managed_x_token" },
+    }
+    const calls = stubFetch(
+      {
+        "GET /api/connectors/conn-a/ingest-spec": () => json(oauthSpec),
+        "GET /api/connectors/credential-settings": () =>
+          json({ secretManager: null, typedCredentials: true, oauthCallbackUrl: "https://console.test/api/connectors/oauth/callback" }),
+      },
+      { ...DETAIL, type: "REST API", credentialManaged: true, credentialSource: "managed", credentialKind: "secret_key", credentialSecondaryKind: "token" }
+    )
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    expect(page.getByText("https://console.test/api/connectors/oauth/callback")).toBeDefined()
+    expect(page.queryByLabelText("Refresh token")).toBeNull()
+    fireEvent.change(page.getByLabelText("Client secret"), { target: { value: "new-secret" } })
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(writes(calls).some((c) => c.url.endsWith("/credential"))).toBe(true))
+    const put = writes(calls).find((c) => c.url.endsWith("/credential"))
+    expect(put?.body).toEqual({ primary: { kind: "secret_key", value: "new-secret" } })
+  })
+
+  /**
    * A connector pipelines still read from is not offered for deletion at
    * all: the section names the pipelines, the button is off, and no DELETE
    * is ever sent.
@@ -443,7 +492,7 @@ describe("ConnectorEditPage", () => {
         "GET /api/connectors/conn-a/ingest-spec": () => json(restSpec),
         "PUT /api/connectors/conn-a/ingest-spec": () => json(restSpec),
       },
-      { ...DETAIL, type: "REST API", credentialManaged: true, credentialKind: "token", credentialSecondaryKind: null }
+      { ...DETAIL, type: "REST API", credentialManaged: true, credentialSource: "managed", credentialKind: "token", credentialSecondaryKind: null }
     )
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))
@@ -482,5 +531,59 @@ describe("ConnectorEditPage", () => {
     next(page)
     fireEvent.click(page.getByRole("button", { name: "Save changes" }))
     await waitFor(() => expect(page.getByText(/stored without a test/)).toBeDefined())
+  })
+
+  /**
+   * `SRC-12` part B, decision 2: with a secret manager set up the form
+   * offers "Reference a secret"; only the reference is sent, the server
+   * reads it and tests the connection before saving.
+   */
+  it("sends a reference to a secret instead of a value when the secret manager is used", async () => {
+    const calls = stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "vault", typedCredentials: true }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.click(await waitFor(() => page.getByRole("button", { name: "Reference a secret" })))
+    expect(page.getByText(/Secret manager: HashiCorp Vault/)).toBeDefined()
+    // No value box in this mode: the secret stays in the secret manager.
+    expect(page.queryByLabelText("Password")).toBeNull()
+    fireEvent.change(page.getByLabelText("Path in Vault"), { target: { value: "secret/connectors/orders" } })
+    fireEvent.change(page.getByLabelText("Key in the secret"), { target: { value: "password" } })
+    next(page)
+    next(page)
+    expect(page.getByText(/Reference to a secret for the password/)).toBeDefined()
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+    const credentialPut = writes(calls).find((c) => c.url.endsWith("/credential"))
+    expect(credentialPut?.body).toEqual({ primary: { reference: "vault:secret/connectors/orders#password" } })
+  })
+
+  it("holds back a reference that is plainly malformed", async () => {
+    stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "azure", typedCredentials: true }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.click(await waitFor(() => page.getByRole("button", { name: "Reference a secret" })))
+    fireEvent.change(page.getByLabelText("Vault name"), { target: { value: "ab" } })
+    fireEvent.change(page.getByLabelText("Secret name"), { target: { value: "orders-db" } })
+    expect(page.getByText(/Give the vault's name/)).toBeDefined()
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it("offers only the reference when the operator turned typing a value off", async () => {
+    stubFetch({
+      "GET /api/connectors/credential-settings": () => json({ secretManager: "aws", typedCredentials: false }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    await waitFor(() => page.getByLabelText("Secret name or ARN"))
+    expect(page.queryByRole("button", { name: "Type a value" })).toBeNull()
+    expect(page.queryByLabelText("Password")).toBeNull()
+    expect(page.getByText(/Typing a value is turned off/)).toBeDefined()
   })
 })

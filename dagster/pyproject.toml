@@ -21,6 +21,12 @@ dependencies = [
     "psycopg2-binary==2.9.10",
     "sqlalchemy==2.0.36",
     "requests==2.32.3",
+    # `secret_resolver.py` opens the AES-256-GCM-sealed managed connector
+    # credentials (`SRC-12` decision 4) with `AESGCM`. Already installed
+    # transitively in this project's venv (50.0.2, found as its
+    # dist-info on 2026-10-15); named here because the orchestrator now imports it
+    # directly, so a dependency bump elsewhere cannot silently drop it.
+    "cryptography==50.0.2",
     # s3fs is already pulled in transitively by dlt[s3] (verified: s3fs
     # 2026.7.0 is installed in this project's venv), but
     # capacity_snapshot.py imports it directly by name — pinned here so

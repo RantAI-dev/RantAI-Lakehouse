@@ -30,15 +30,15 @@ use axum::middleware::Next;
 use axum::response::Response;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
-use lakehouse_core::secret::SecretValue;
-use lakehouse_dagster::{DgConfiguredRun, iso_from_unix_seconds, map_run_status};
+use lakehouse_core::secret::{SecretError, SecretValue};
+use lakehouse_dagster::{DgConfiguredRun, map_run_status};
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use lakehouse_store::ingest_spec::{Dial, SqlDriver};
+use lakehouse_store::ingest_spec::{Dial, RestAuth, SqlDriver};
 use lakehouse_store::schema_change::{self, SchemaChangePolicy};
 use lakehouse_store::uploads;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,7 @@ use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarg
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::upstream_message;
+use crate::secret_manager::{SecretManagerKind, refs as manager_refs};
 use crate::state::AppState;
 use crate::upstream_error::orchestrator_unreachable;
 
@@ -508,6 +508,37 @@ pub async fn update(
     Ok(ApiJson(updated))
 }
 
+/// What `POST /api/connectors` may carry for a credential, under the
+/// operator's settings (`SRC-12` part B), and the rule that two slots never
+/// name one credential.
+///
+/// # Errors
+///
+/// 400 for the `reference` source — it names a place in the secret manager
+/// that the client chooses, while a new connector's credential names are
+/// derived from its id, so a reference is set after creation, probe-first, by
+/// `PUT …/credential` — for typed values when the operator turned typing off,
+/// and for a primary and a secondary of the same kind.
+fn check_create_credential(
+    state: &AppState,
+    credential: &CredentialSpecBody,
+) -> Result<(), ApiError> {
+    if credential.source == connectors::CredentialSource::Reference {
+        return Err(ApiError::BadRequest(REFERENCE_AFTER_CREATE.to_owned()));
+    }
+    if credential.values.is_some() && !state.config.connector_typed_credentials {
+        return Err(ApiError::BadRequest(TYPED_CREDENTIALS_OFF.to_owned()));
+    }
+    if credential.secondary == Some(credential.primary) {
+        return Err(ApiError::BadRequest(
+            "credential.primary and credential.secondary must be different kinds: both would \
+             name the same credential"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The `POST /api/connectors` body's `credential` field. Mirrors
 /// `CreateConnectorInput["credential"]` in `contracts/connectors.ts`.
 ///
@@ -551,7 +582,7 @@ impl std::fmt::Debug for SecretInput {
 }
 
 impl SecretInput {
-    fn into_secret(self) -> SecretValue {
+    pub(super) fn into_secret(self) -> SecretValue {
         SecretValue::new(self.0)
     }
 }
@@ -743,14 +774,7 @@ pub async fn create(
         .into());
     }
     let source = body.credential.source;
-    if body.credential.secondary == Some(body.credential.primary) {
-        return Err(ApiError::BadRequest(
-            "credential.primary and credential.secondary must be different kinds: both would \
-             name the same credential"
-                .to_owned(),
-        )
-        .into());
-    }
+    check_create_credential(&state, &body.credential)?;
     let values = credential_values(
         source,
         body.credential.secondary.is_some(),
@@ -945,7 +969,10 @@ fn secret_store_error(err: &crate::connector_secret_store::SecretStoreError) -> 
     match err {
         SecretStoreError::InvalidValue(_) => ApiError::BadRequest(err.to_string()),
         SecretStoreError::NotManaged => ApiError::Internal(err.to_string()),
-        SecretStoreError::Io(_) => ApiError::Unavailable(err.to_string()),
+        // SRC-12 decision 12: a fixed text naming the setting, never a key.
+        SecretStoreError::Io(_) | SecretStoreError::Key(_) => {
+            ApiError::Unavailable(err.to_string()) // SEC-11 allowlisted: fixed sentences (SecretStoreError::Io/Key)
+        }
     }
 }
 
@@ -1025,12 +1052,19 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
-    let outcome = crate::connector_probe::probe(
-        &dial_info,
-        state.connector_secret_resolver.as_ref(),
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    let mut outcome = run_probe(&state, &dial_info, state.connector_secret_resolver.as_ref()).await;
+    // `SRC-12` part C: a provider that rotates refresh tokens retired the one
+    // the test just used; keep the new one or the test would sign the
+    // connector out.
+    if let Some(rotated) = outcome.rotated_refresh_token.take() {
+        store_refresh_token(
+            &state,
+            &id,
+            dial_info.secret_ref_secondary.as_deref(),
+            rotated,
+        )
+        .await?;
+    }
     match connectors::record_test_result(
         pool(&state)?,
         &id,
@@ -1231,6 +1265,9 @@ pub async fn rotate_secret(
     body: Bytes,
 ) -> ApiResult<ApiJson<RotateSecretResponse>> {
     let body: RotateSecretBody = parse_body(&body)?;
+    if body.source == connectors::CredentialSource::Reference {
+        return Err(ApiError::BadRequest(REFERENCE_AFTER_CREATE.to_owned()).into());
+    }
     // Derived from THIS connector's own id -- see `RotateSecretBody`'s doc
     // comment for why this can never target a reserved, deployment-owned
     // pattern.
@@ -1269,12 +1306,8 @@ pub async fn rotate_secret(
         }
     }
 
-    let outcome = crate::connector_probe::probe(
-        &candidate,
-        state.connector_secret_resolver.as_ref(),
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    let mut outcome = run_probe(&state, &candidate, state.connector_secret_resolver.as_ref()).await;
+    let rotated = outcome.rotated_refresh_token.take();
 
     if !outcome.supported {
         // 422, not 409: nothing about this connector's STATE conflicts
@@ -1293,11 +1326,16 @@ pub async fn rotate_secret(
         .into());
     }
     if !outcome.ok {
-        // 422: the candidate credential itself does not work — the
-        // probe's own classified message is already safe to surface
-        // (see `connector_probe`'s module doc comment: never raw
-        // upstream `Display` text).
-        return Err(ApiError::Unprocessable(outcome.message).into());
+        return Err(refused_rotation(
+            &state,
+            &id,
+            body.slot,
+            dial_info.secret_ref_secondary.as_deref(),
+            rotated,
+            outcome.message,
+        )
+        .await
+        .into());
     }
 
     match connectors::swap_secret_ref(
@@ -1321,6 +1359,14 @@ pub async fn rotate_secret(
         }
         Err(err) => return Err(ApiError::from(err).into()),
     }
+    // `SRC-12` part C: the probe used the stored refresh token; if the
+    // provider rotated it, the new one is stored now (the slot may have just
+    // been swapped).
+    let secondary_now = match body.slot {
+        connectors::SecretSlot::Secondary => Some(new_secret_ref.as_str()),
+        connectors::SecretSlot::Primary => dial_info.secret_ref_secondary.as_deref(),
+    };
+    keep_rotated(&state, &id, rotated, secondary_now).await?;
     // Rotating away from a credential lakehouse stored (e.g. to an
     // operator's `env:` one) leaves its file unused; a password must not
     // outlive the only reference to it.
@@ -1363,10 +1409,20 @@ pub async fn rotate_secret(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialSlotBody {
-    /// The suffix the managed name ends in.
-    kind: connectors::CredentialKind,
-    /// The credential itself. Write-only; see [`SecretInput`].
-    value: SecretInput,
+    /// The suffix the managed name ends in. Required with `value`; a
+    /// `reference` is not derived from it and ignores it.
+    #[serde(default)]
+    kind: Option<connectors::CredentialKind>,
+    /// The credential itself. Write-only; see [`SecretInput`]. Exactly one of
+    /// `value` and `reference` is sent.
+    #[serde(default)]
+    value: Option<SecretInput>,
+    /// A reference to a secret in the installation's secret manager
+    /// (`vault:…`, `aws-sm:…`, `gcp-sm:…`, `azure-kv:…`; `SRC-12` part B). It
+    /// names a place, never a value: the API reads it once, tests the
+    /// connection with what it read, and stores only the reference.
+    #[serde(default)]
+    reference: Option<String>,
 }
 
 /// The `PUT /api/connectors/{id}/credential` body. Mirrors
@@ -1416,12 +1472,138 @@ pub struct SetCredentialResponse {
     message: String,
 }
 
+/// What a slot's new credential is.
+enum Provided {
+    /// A value the user typed: written, sealed, to the managed store.
+    Typed(SecretValue),
+    /// A reference to a secret in the secret manager: nothing is written. The
+    /// value read from the manager before the probe (`resolved`) is held only
+    /// for that probe and for the request, and is never stored or audited.
+    Reference { resolved: Option<SecretValue> },
+}
+
 /// One slot a [`set_credential`] request changes, validated.
 struct SlotChange {
     slot: connectors::SecretSlot,
+    /// The managed name derived from the connector's id for a typed value,
+    /// or the reference itself.
     new_ref: String,
-    value: SecretValue,
+    provided: Provided,
     old_ref: Option<String>,
+}
+
+impl SlotChange {
+    /// What the probe resolves `new_ref` to: the typed value, or what the
+    /// secret manager returned.
+    fn candidate_value(&self) -> Option<&SecretValue> {
+        match &self.provided {
+            Provided::Typed(value) => Some(value),
+            Provided::Reference { resolved } => resolved.as_ref(),
+        }
+    }
+
+    /// The value to write to the managed store; `None` for a reference.
+    fn value_to_store(&self) -> Option<&SecretValue> {
+        match &self.provided {
+            Provided::Typed(value) => Some(value),
+            Provided::Reference { .. } => None,
+        }
+    }
+
+    fn is_reference(&self) -> bool {
+        matches!(self.provided, Provided::Reference { .. })
+    }
+}
+
+/// What a user may do with a credential on this installation (`SRC-12` part
+/// B, decision 2), from the operator's settings.
+#[derive(Debug, Clone, Copy)]
+struct CredentialPolicy<'a> {
+    /// The installation's secret manager; `None` means a reference is
+    /// refused.
+    manager: Option<SecretManagerKind>,
+    /// Whether typing a value is allowed (`CONNECTOR_TYPED_CREDENTIALS`).
+    typed_allowed: bool,
+    /// `SRC-12 review B1 BLOCKER 1`: the reference prefixes the operator
+    /// allows (`SECRET_MANAGER_ALLOWED_PREFIXES`). None, no reference.
+    prefixes: &'a [String],
+    /// The connector's tenant id, to expand `{tenant}` in a prefix; `None`
+    /// when the connector has no tenant (then such a prefix allows nothing).
+    tenant: Option<&'a str>,
+}
+
+impl<'a> CredentialPolicy<'a> {
+    fn of(state: &'a AppState, tenant: Option<&'a str>) -> Self {
+        Self {
+            manager: state.config.secret_manager.kind,
+            typed_allowed: state.config.connector_typed_credentials,
+            prefixes: &state.config.secret_manager.allowed_prefixes,
+            tenant,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for CredentialPolicy<'_> {
+    /// No secret manager, typing allowed: how every installation was before
+    /// part B, and what the older tests assume.
+    fn default() -> Self {
+        Self {
+            manager: None,
+            typed_allowed: true,
+            prefixes: &[],
+            tenant: None,
+        }
+    }
+}
+
+/// The refusals of the credential policy, one text each so the console and
+/// the assistant show the same words.
+const TYPED_CREDENTIALS_OFF: &str = "Typing a credential is turned off on this installation. \
+     Reference a secret in the secret manager instead.";
+const NO_SECRET_MANAGER: &str = "No secret manager is set up on this installation, so a secret \
+     cannot be referenced. Type the credential, or ask an operator to set one up.";
+const REFERENCE_AFTER_CREATE: &str = "A reference to a secret is set after the connector exists, \
+     with PUT /api/connectors/{id}/credential: it is read and the connection tested before it is \
+     saved.";
+
+/// What `GET /api/connectors/credential-settings` answers (`SRC-12` part B):
+/// what the credential form may offer. Nothing here is an address, a sign-in
+/// or a secret.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSettingsResponse {
+    /// The installation's secret manager (`vault`, `aws`, `gcp`, `azure`), or
+    /// `null` when the operator set none up.
+    secret_manager: Option<&'static str>,
+    /// `false` when the operator turned typing a credential off.
+    typed_credentials: bool,
+    /// This product's OAuth callback address, to enter in the provider's app
+    /// settings (`CONNECTOR_OAUTH_REDIRECT_URI`); `null` when the operator has
+    /// not set it, in which case signing in is refused (`SRC-12` part C).
+    oauth_callback_url: Option<String>,
+}
+
+/// `GET /api/connectors/credential-settings` — what this installation offers
+/// for a connector's credential: its secret manager, if any, and whether a
+/// value may be typed (`SRC-12` decision 2). Read by the credential form and
+/// the connector page.
+///
+/// # Errors
+///
+/// None of its own; the policy table already requires `connector:manage`.
+pub async fn credential_settings(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<CredentialSettingsResponse>> {
+    Ok(ApiJson(CredentialSettingsResponse {
+        secret_manager: state
+            .config
+            .secret_manager
+            .kind
+            .map(SecretManagerKind::as_str),
+        typed_credentials: state.config.connector_typed_credentials,
+        oauth_callback_url: state.config.connector_oauth_redirect_uri.clone(),
+    }))
 }
 
 /// The refusal for a change of where a connector points that does not
@@ -1460,18 +1642,35 @@ fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
     }
 }
 
-/// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent,
-/// each with its managed ref derived from THIS connector's id.
+/// [`slot_changes_with`] under the policy every installation had before part B
+/// (typing allowed, no secret manager); the tests of the typed path use it.
+#[cfg(test)]
+fn slot_changes(
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+    body: SetCredentialBody,
+) -> Result<Vec<SlotChange>, ApiError> {
+    slot_changes_with(id, dial_info, body, CredentialPolicy::default())
+}
+
+/// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent.
+/// A typed value gets its managed ref derived from THIS connector's id; a
+/// reference is checked against the grammar of the installation's secret
+/// manager (`policy`) and is its own ref.
 ///
 /// # Errors
 ///
 /// 400 for a secondary credential on a connector that reads only one, for
 /// a slot that would end up naming the same credential as the other slot
-/// (one would overwrite the other's file), or for an unusable value.
-fn slot_changes(
+/// (one would overwrite the other's file), for an unusable value, for typing
+/// when the operator turned it off, for a reference when no secret manager is
+/// set up or one that does not fit it, and for a slot that sends both a value
+/// and a reference or neither.
+fn slot_changes_with(
     id: &str,
     dial_info: &ConnectorDialInfo,
     body: SetCredentialBody,
+    policy: CredentialPolicy<'_>,
 ) -> Result<Vec<SlotChange>, ApiError> {
     if body.secondary.is_some() && !has_secondary_slot(dial_info) {
         return Err(ApiError::BadRequest(
@@ -1485,21 +1684,74 @@ fn slot_changes(
         (connectors::SecretSlot::Secondary, body.secondary),
     ] {
         let Some(input) = input else { continue };
-        let value = input.value.into_secret();
-        crate::connector_secret_store::validate_secret_value(value.expose_secret())
-            .map_err(|err| ApiError::BadRequest(format!("{}: {err}", slot.as_str())))?;
+        let (new_ref, provided) = match (input.value, input.reference) {
+            (Some(value), None) => {
+                if !policy.typed_allowed {
+                    return Err(ApiError::BadRequest(TYPED_CREDENTIALS_OFF.to_owned()));
+                }
+                let kind = input.kind.ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "{}: kind is required with a value",
+                        slot.as_str()
+                    ))
+                })?;
+                let value = value.into_secret();
+                crate::connector_secret_store::validate_secret_value(value.expose_secret())
+                    .map_err(|err| ApiError::BadRequest(format!("{}: {err}", slot.as_str())))?;
+                (
+                    connectors::derive_secret_ref(id, connectors::CredentialSource::Managed, kind),
+                    Provided::Typed(value),
+                )
+            }
+            (None, Some(reference)) => {
+                let manager = policy
+                    .manager
+                    .ok_or_else(|| ApiError::BadRequest(NO_SECRET_MANAGER.to_owned()))?;
+                // The same grammar the resolver applies when it reads; a
+                // reference that fits no manager shape never reaches it.
+                manager_refs::parse(manager, &reference).map_err(|_| {
+                    ApiError::BadRequest(format!(
+                        "{}: not a valid {} reference",
+                        slot.as_str(),
+                        manager.as_str()
+                    ))
+                })?;
+                // `SRC-12 review B1 BLOCKER 1`: fail closed. A user must not
+                // be able to make the product read any secret its manager
+                // identity can read (the connection test would carry it to a
+                // host the user chose), so only the operator's prefixes pass.
+                if policy.prefixes.is_empty() {
+                    return Err(ApiError::BadRequest(
+                        manager_refs::NO_PREFIXES_TEXT.to_owned(),
+                    ));
+                }
+                let tenant = policy.tenant.map_or(
+                    manager_refs::TenantMatch::NoTenant,
+                    manager_refs::TenantMatch::Exact,
+                );
+                if !manager_refs::reference_allowed(&reference, policy.prefixes, tenant) {
+                    return Err(ApiError::BadRequest(
+                        manager_refs::OUTSIDE_PREFIXES_TEXT.to_owned(),
+                    ));
+                }
+                (reference, Provided::Reference { resolved: None })
+            }
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "{}: send either a value (with its kind) or a reference, not both and not \
+                     neither",
+                    slot.as_str()
+                )));
+            }
+        };
         let old_ref = match slot {
             connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
             connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
         };
         changes.push(SlotChange {
             slot,
-            new_ref: connectors::derive_secret_ref(
-                id,
-                connectors::CredentialSource::Managed,
-                input.kind,
-            ),
-            value,
+            new_ref,
+            provided,
             old_ref,
         });
     }
@@ -1525,6 +1777,95 @@ fn slot_changes(
         ));
     }
     Ok(changes)
+}
+
+/// Read each reference of `changes` from the secret manager, once, so the
+/// probe can test the connection with what it returns and a reference to
+/// nothing, or one the product may not read, is refused before anything is
+/// saved (`SRC-12` decision 2). `not_saved` starts the message ("the
+/// credential was NOT saved").
+///
+/// # Errors
+///
+/// 422 with the fixed text of the failure (the manager cannot be reached, the
+/// product may not sign in or read, the secret does not exist, is not a single
+/// text); never a manager's own words. 400 when the allowlist or the grammar
+/// refuses the reference, which the earlier validation makes unreachable
+/// unless the settings changed under it.
+async fn resolve_references(
+    state: &AppState,
+    changes: &mut [SlotChange],
+    not_saved: &str,
+) -> Result<(), ApiError> {
+    for change in changes.iter_mut() {
+        let Provided::Reference { resolved } = &mut change.provided else {
+            continue;
+        };
+        match state
+            .connector_secret_resolver
+            .resolve_dyn(&change.new_ref)
+            .await
+        {
+            Ok(value) => *resolved = Some(value),
+            Err(SecretError::Failed { failure, .. }) => {
+                return Err(ApiError::Unprocessable(format!("{not_saved}: {failure}")));
+            }
+            Err(_) => {
+                return Err(ApiError::BadRequest(
+                    "that reference is not one this installation can read".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The probe's resolver for `changes`: each slot's new ref answers from
+/// memory (a typed value, or what the manager returned), every other ref goes
+/// to the allowlisted resolver.
+fn candidate_resolver(
+    state: &AppState,
+    changes: &[SlotChange],
+) -> crate::connector_secret_store::CandidateSecretResolver {
+    crate::connector_secret_store::CandidateSecretResolver::new(
+        changes
+            .iter()
+            .filter_map(|c| {
+                c.candidate_value()
+                    .map(|value| (c.new_ref.clone(), value.clone()))
+            })
+            .collect(),
+        state.connector_secret_resolver.clone(),
+    )
+}
+
+/// The audit details of a credential change: the slots, how each is held,
+/// the secret manager for a reference, and whether a probe verified it.
+///
+/// A REFERENCE is audited as it is: it names a place (a path, a secret name, a
+/// version id), never a credential, and who pointed which connector at which
+/// secret is what an auditor asks. A typed value is never audited, and neither
+/// is anything a manager returned (`SRC-12` decision 11). A managed name
+/// derived from the connector's id stays out, as before.
+fn credential_audit_details(
+    manager: Option<SecretManagerKind>,
+    changes: &[SlotChange],
+    verified: bool,
+) -> Value {
+    json!({
+        "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
+        "sources": changes
+            .iter()
+            .map(|c| if c.is_reference() { "reference" } else { "managed" })
+            .collect::<Vec<_>>(),
+        "references": changes
+            .iter()
+            .filter(|c| c.is_reference())
+            .map(|c| c.new_ref.as_str())
+            .collect::<Vec<_>>(),
+        "manager": manager.map(SecretManagerKind::as_str),
+        "verified": verified,
+    })
 }
 
 /// The connector as the probe should see it: each changed slot naming its
@@ -1631,6 +1972,107 @@ async fn replace_credentials(
     .await
 }
 
+/// Seal `token` as this connector's refresh-token credential (`SRC-12` part C):
+/// the managed `…_token` file of the secondary slot, replacing whatever the slot
+/// held. The one place a refresh token is written, for the sign-in callback, the
+/// orchestrator's rotation report and a connection test that was rotated.
+/// `current_secondary_ref` is what the slot names now (the swap's expected old
+/// value); the slot is moved to the managed name when it named something else.
+///
+/// # Errors
+///
+/// As [`replace_credentials`]: a store failure (400/503, fixed texts) or a
+/// 404/409 from the swap; nothing changed.
+pub(super) async fn store_refresh_token(
+    state: &AppState,
+    id: &str,
+    current_secondary_ref: Option<&str>,
+    token: SecretValue,
+) -> Result<(), ApiError> {
+    let change = SlotChange {
+        slot: connectors::SecretSlot::Secondary,
+        new_ref: connectors::derive_secret_ref(
+            id,
+            connectors::CredentialSource::Managed,
+            connectors::CredentialKind::Token,
+        ),
+        provided: Provided::Typed(token),
+        old_ref: current_secondary_ref.map(str::to_owned),
+    };
+    replace_credentials(state, id, std::slice::from_ref(&change)).await
+}
+
+/// Probe `info` with the installation's address and `OAuth2` settings. The one
+/// call the three routes that test a connector share.
+async fn run_probe(
+    state: &AppState,
+    info: &ConnectorDialInfo,
+    resolver: &dyn lakehouse_core::secret::DynSecretResolver,
+) -> crate::connector_probe::Outcome {
+    crate::connector_probe::probe_with(
+        info,
+        resolver,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await
+}
+
+/// Store the refresh token a provider rotated during a probe, if it did
+/// (`SRC-12` part C). The rotated token replaces one the provider has already
+/// retired, so dropping it would sign the connector out; a failure here is an
+/// error, not a log line.
+///
+/// # Errors
+///
+/// As [`store_refresh_token`].
+async fn keep_rotated(
+    state: &AppState,
+    id: &str,
+    rotated: Option<SecretValue>,
+    current_secondary_ref: Option<&str>,
+) -> Result<(), ApiError> {
+    match rotated {
+        Some(token) => store_refresh_token(state, id, current_secondary_ref, token).await,
+        None => Ok(()),
+    }
+}
+
+/// The 422 for a rotation whose candidate credential the source rejected.
+///
+/// `SRC-12` part C: the token request may have succeeded (and rotated the
+/// refresh token) before the source rejected the candidate. The stored token is
+/// retired either way, so the new one is kept, unless it came from the
+/// candidate's own, unsaved, refresh token (a `Secondary` rotation). If keeping
+/// it fails, that failure is returned instead: the connector is signed out and
+/// the person must hear it.
+async fn refused_rotation(
+    state: &AppState,
+    id: &str,
+    slot: connectors::SecretSlot,
+    current_secondary_ref: Option<&str>,
+    rotated: Option<SecretValue>,
+    message: String,
+) -> ApiError {
+    if slot == connectors::SecretSlot::Primary
+        && let Err(err) = keep_rotated(state, id, rotated, current_secondary_ref).await
+    {
+        return err;
+    }
+    // The probe's own classified message is already safe to surface (see
+    // `connector_probe`'s module doc comment: never raw upstream `Display`
+    // text). 422: the candidate credential itself does not work.
+    ApiError::Unprocessable(message)
+}
+
+/// Delete the managed refresh-token file named by `secondary_ref` (sign out).
+/// An operator's or a secret manager's reference is left where it is. Holds the
+/// store's change lock, like every other change to a credential file.
+pub(super) async fn remove_refresh_token(state: &AppState, id: &str, secondary_ref: Option<&str>) {
+    let _serialized = state.connector_secret_store.lock().await;
+    remove_managed_credentials(state, id, secondary_ref, None).await;
+}
+
 /// The part of [`replace_credentials`] every credential change shares
 /// (`SEC-14` extracts it so the ingest-spec re-point reuses it): write the
 /// new values aside, put them in place keeping the files they replace, then
@@ -1653,27 +2095,35 @@ async fn publish_credentials<T>(
 ) -> Result<T, ApiError> {
     let store = &state.connector_secret_store;
     let _serialized = store.lock().await;
-    let staged = store
-        .stage(
-            &changes
-                .iter()
-                .map(|c| (c.new_ref.clone(), c.value.clone()))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(|err| secret_store_error(&err))?;
-    let published = staged
-        .publish()
-        .await
-        .map_err(|err| secret_store_error(&err))?;
-    let written = match write.await {
-        Ok(written) => written,
-        Err(err) => {
-            published.rollback().await;
-            return Err(err);
-        }
+    // A reference writes no file: only typed values are staged.
+    let typed: Vec<(String, SecretValue)> = changes
+        .iter()
+        .filter_map(|c| {
+            c.value_to_store()
+                .map(|value| (c.new_ref.clone(), value.clone()))
+        })
+        .collect();
+    let written = if typed.is_empty() {
+        write.await?
+    } else {
+        let staged = store
+            .stage(&typed)
+            .await
+            .map_err(|err| secret_store_error(&err))?;
+        let published = staged
+            .publish()
+            .await
+            .map_err(|err| secret_store_error(&err))?;
+        let written = match write.await {
+            Ok(written) => written,
+            Err(err) => {
+                published.rollback().await;
+                return Err(err);
+            }
+        };
+        published.commit().await;
+        written
     };
-    published.commit().await;
     // A slot whose kind changed no longer names its old managed file —
     // unless that file is now the OTHER slot's (the two swapped kinds).
     for change in changes {
@@ -1744,22 +2194,38 @@ pub async fn set_credential(
     };
 
     let pending_dial = body.dial.take();
-    let changes = slot_changes(&id, &dial_info, body)?;
+    let tenant = connectors::connector_tenant_id(pool(&state)?, &id)
+        .await?
+        .map(|tenant| tenant.to_string());
+    let mut changes = slot_changes_with(
+        &id,
+        &dial_info,
+        body,
+        CredentialPolicy::of(&state, tenant.as_deref()),
+    )?;
     let candidate = candidate_dial_info(&dial_info, &changes, pending_dial)?;
-    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
-        changes
-            .iter()
-            .map(|c| (c.new_ref.clone(), c.value.clone()))
-            .collect(),
-        state.connector_secret_resolver.clone(),
-    );
-    let outcome = crate::connector_probe::probe(
-        &candidate,
-        &resolver,
-        &state.config.connector_internal_hosts(),
-    )
-    .await;
+    // After the re-point rule, so a refused change makes no call to the
+    // secret manager (SEC-14): "refused before any lookup or connection".
+    resolve_references(&state, &mut changes, "the credential was NOT saved").await?;
+    let resolver = candidate_resolver(&state, &changes);
+    let mut outcome = run_probe(&state, &candidate, &resolver).await;
     if outcome.supported && !outcome.ok {
+        // `SRC-12` part C: as in `rotate_secret`, a refresh token the provider
+        // rotated during a rejected test is kept, unless it came from a
+        // refresh token this request was only proposing.
+        let proposes_a_refresh_token = changes
+            .iter()
+            .any(|c| c.slot == connectors::SecretSlot::Secondary);
+        if !proposes_a_refresh_token {
+            let rotated = outcome.rotated_refresh_token.take();
+            keep_rotated(
+                &state,
+                &id,
+                rotated,
+                dial_info.secret_ref_secondary.as_deref(),
+            )
+            .await?;
+        }
         return Err(ApiError::Unprocessable(format!(
             "the credential was NOT saved: {}",
             outcome.message
@@ -1768,19 +2234,35 @@ pub async fn set_credential(
     }
 
     replace_credentials(&state, &id, &changes).await?;
+    // `SRC-12` part C: the probe used a refresh token; a provider that rotates
+    // them retired it, so the new one replaces it, in the slot as it is now.
+    let secondary_now = changes
+        .iter()
+        .find(|c| c.slot == connectors::SecretSlot::Secondary)
+        .map(|c| c.new_ref.as_str())
+        .or(dial_info.secret_ref_secondary.as_deref());
+    keep_rotated(
+        &state,
+        &id,
+        outcome.rotated_refresh_token.take(),
+        secondary_now,
+    )
+    .await?;
 
     let slots: Vec<connectors::SecretSlot> = changes.iter().map(|c| c.slot).collect();
     // Same audit convention as `rotate_secret`: successful mutations only,
-    // best-effort, the slots and whether they were verified — never a ref
-    // name, never a value.
+    // best-effort; the slots, how each is held and whether they were
+    // verified — never a value, and a reference only as
+    // `credential_audit_details` says.
     let event = connector_audit_event(
         &principal,
         "connector.credential_set",
         &id,
-        json!({
-            "slots": slots.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "verified": outcome.supported,
-        }),
+        credential_audit_details(
+            state.config.secret_manager.kind,
+            &changes,
+            outcome.supported,
+        ),
         "executed",
     );
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
@@ -1795,9 +2277,8 @@ pub async fn set_credential(
     }))
 }
 
-/// `?schema=` query for `POST /api/connectors/{id}/discover`. Required
-/// only for a `sql`/`cdc` adapter connector — see
-/// `crate::connector_discover::discover`'s doc comment.
+/// `?schema=` query of [`discover`]. Required only for a `sql`/`cdc` adapter
+/// connector — see `crate::connector_discover::discover`'s doc comment.
 #[derive(Debug, Deserialize)]
 pub struct DiscoverQuery {
     /// The schema to list tables/columns from. Bound as a query
@@ -1807,9 +2288,17 @@ pub struct DiscoverQuery {
     schema: Option<String>,
 }
 
-/// `POST /api/connectors/{id}/discover` — list a connector's source
-/// tables and columns, for a `sql`/`cdc` adapter connector against the
-/// `?schema=` query parameter. Every other adapter (`files`/`rest`/
+/// List a connector's source tables and columns, for a `sql`/`cdc` adapter
+/// connector against the `?schema=` query parameter.
+///
+/// `SRC-13`: this is NO LONGER A ROUTE (`POST /api/connectors/{id}/discover` and its
+/// policy row were removed when the console moved to `discovery/{kind}`, which lists
+/// every type and previews columns on demand). The handler stays only because the
+/// assistant's `discover_source` tool (`routes::ai::tools::ingest`) calls it in-process
+/// with a schema; moving that tool to the new listing is the AI team's change, since it
+/// alters the tool's answer shape and `tests/fixtures/tool_schemas.json`. Do not mount it again.
+///
+/// Every other adapter (`files`/`rest`/
 /// `sheets`) or a connector with no ingest-spec adapter set yet answers
 /// with an honest `supported: false` — see
 /// `crate::connector_discover`'s module doc comment for exactly what is
@@ -2646,6 +3135,11 @@ pub async fn delete(
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     }
+    // `SRC-12` part C, decision 8: an OAuth connector's refresh token is told
+    // to the provider before the file goes. Best effort: the connector is gone
+    // either way, and the audit event records what happened. The console says
+    // beforehand whether the provider can be told (`GET .../oauth`).
+    let revocation = super::connector_oauth::revoke_stored_token(&state, &dial_info).await;
     // ADR 0002 Addendum 4: a managed credential belongs to this connector
     // alone, so it goes with it. An operator's env/file credential is left
     // exactly where the operator put it.
@@ -2668,7 +3162,18 @@ pub async fn delete(
     // WS5 item D3: best-effort, after the row is already gone — a failed
     // audit write here must never resurrect the 404/409 branches above or
     // undo a delete that already succeeded.
-    let event = connector_audit_event(&principal, "connector.delete", &id, json!({}), "executed");
+    let delete_details = if revocation == super::connector_oauth::Revocation::NotApplicable {
+        json!({})
+    } else {
+        json!({ "oauthRevocation": revocation })
+    };
+    let event = connector_audit_event(
+        &principal,
+        "connector.delete",
+        &id,
+        delete_details,
+        "executed",
+    );
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
         tracing::warn!(%err, connector_id = %id, "failed to record connector.delete audit event");
     }
@@ -2870,6 +3375,62 @@ async fn check_dial_ssrf(
         .map_err(ApiError::BadRequest)
 }
 
+/// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will
+/// never dial. The addresses of an `OAuth2` dial receive the client secret and
+/// the refresh token, so they get the same two checks as `baseUrl`: `https` (or
+/// the gate-only `http` switch) and the private-address refusal; the sign-in
+/// address is only handed to the browser and gets the scheme check alone.
+///
+/// Run BEFORE the `SEC-14` re-point rule: an address that can never be valid
+/// is a 400 with a fixed text whether the connector is new or being changed,
+/// so the person is told the real problem and not that credentials are
+/// missing. The check resolves the host but sends nothing to it, so it does
+/// not weaken what the re-point rule protects (no credential reaches a new
+/// place).
+///
+/// # Errors
+///
+/// 400 with the fixed text of the scheme or address check.
+async fn check_oauth_addresses(
+    dial: &Dial,
+    internal_hosts: &crate::internal_hosts::InternalHosts,
+    oauth: crate::connector_oauth::OAuthSettings,
+) -> Result<(), ApiError> {
+    // `SRC-12` part C: the addresses of an `OAuth2` dial receive the client
+    // secret and the refresh token, so they get the same two checks as
+    // `baseUrl`: `https` (or the gate-only `http` switch) and the private
+    // address refusal. The sign-in address is only handed to the browser, so it
+    // gets the scheme check alone.
+    if let Dial::Rest(rest) = dial {
+        let (sign_in, dialled): (Option<&str>, Vec<&str>) = match &rest.auth {
+            RestAuth::Oauth2ClientCredentials { token_url } => (None, vec![token_url.as_str()]),
+            RestAuth::Oauth2AuthorizationCode {
+                authorize_url,
+                token_url,
+                revocation_url,
+                ..
+            } => (
+                Some(authorize_url.as_str()),
+                std::iter::once(token_url.as_str())
+                    .chain(revocation_url.as_deref())
+                    .collect(),
+            ),
+            RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => (None, Vec::new()),
+        };
+        if sign_in.is_some_and(|url| !crate::connector_oauth::scheme_allowed(url, oauth)) {
+            return Err(ApiError::BadRequest(
+                "auth.authorizeUrl must start with https://".to_owned(),
+            ));
+        }
+        for url in dialled {
+            crate::connector_oauth::check_address(url, internal_hosts, oauth)
+                .await
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a spec whose `sourceObjects` land in a raw table name that uploaded
 /// files have reserved (plan task T8, ADR 0014, decision 5, review finding
 /// B4).
@@ -2978,7 +3539,9 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// name uploads have reserved, or the save re-points the connector without
 /// every credential slot ([`REPOINT_NEEDS_CREDENTIALS`]); 401 if
 /// credentials arrive without a principal; 422 if the probe dialled and the
-/// source rejected the credentials; 503/500 as above.
+/// source rejected the credentials, or if `excludedColumns` is set for a
+/// source type that cannot list its columns or names a key or cursor column
+/// (`SRC-11`; a malformed `excludedColumns` is a 400); 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -3006,6 +3569,28 @@ pub async fn ingest_spec_put(
     // `check_dial_ssrf`, which `set_ingest_spec` never returns.
     let dial = Dial::parse(&body.adapter, &body.dial)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // `SRC-11` decisions D9 to D11: columns left out of a load. A malformed
+    // list is a 400; a source that cannot list its columns, and a key or
+    // cursor column, are well-formed requests the product refuses: 422, with
+    // the fixed text of the error (it names only the object and a column the
+    // request itself named).
+    lakehouse_store::ingest_spec::validate_excluded_columns(&dial, &body.source_objects).map_err(
+        |err| match err {
+            lakehouse_store::ingest_spec::InvalidExcludedColumns::BadList { .. } => {
+                ApiError::BadRequest(err.to_string()) // SEC-11 allowlisted: InvalidExcludedColumns is fixed text
+            }
+            _ => ApiError::Unprocessable(err.to_string()), // SEC-11 allowlisted: InvalidExcludedColumns is fixed text
+        },
+    )?;
+
+    // `SRC-12 review C1 BLOCKER 1`: an OAuth address that can never be dialled
+    // is invalid whatever else the save does, so it is refused first.
+    check_oauth_addresses(
+        &dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
 
     // SEC-14: decide whether this save re-points the connector BEFORE the
     // address check below, which resolves the new host. A re-point without
@@ -3094,7 +3679,10 @@ async fn save_with_credentials(
     let mut after = stored;
     after.adapter = Some(input.adapter.clone());
     after.dial = input.dial.clone();
-    let changes = slot_changes(
+    let tenant = connectors::connector_tenant_id(pool(state)?, id)
+        .await?
+        .map(|tenant| tenant.to_string());
+    let mut changes = slot_changes_with(
         id,
         &after,
         SetCredentialBody {
@@ -3102,17 +3690,15 @@ async fn save_with_credentials(
             secondary: credential.secondary,
             dial: None,
         },
+        CredentialPolicy::of(state, tenant.as_deref()),
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
     check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
-    let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
-        changes
-            .iter()
-            .map(|c| (c.new_ref.clone(), c.value.clone()))
-            .collect(),
-        state.connector_secret_resolver.clone(),
-    );
+    // Only after the address is approved: a refused target makes no call to
+    // the secret manager.
+    resolve_references(state, &mut changes, "the change was NOT saved").await?;
+    let resolver = candidate_resolver(state, &changes);
     let outcome = crate::connector_probe::probe(
         &candidate,
         &resolver,
@@ -3153,8 +3739,8 @@ async fn save_with_credentials(
     })
     .await?;
 
-    // The slots and whether the probe really dialled — never a ref name,
-    // never a value (same convention as `connector.credential_set`).
+    // The same details as `connector.credential_set`: never a value, a
+    // reference only as `credential_audit_details` says.
     let event = connector_audit_event(
         &principal,
         if repoint {
@@ -3163,10 +3749,11 @@ async fn save_with_credentials(
             "connector.credential_set"
         },
         id,
-        json!({
-            "slots": changes.iter().map(|c| c.slot.as_str()).collect::<Vec<_>>(),
-            "verified": outcome.supported,
-        }),
+        credential_audit_details(
+            state.config.secret_manager.kind,
+            &changes,
+            outcome.supported,
+        ),
         "executed",
     );
     if let Err(err) = store_audit::insert(pool(state)?, event).await {
@@ -3243,7 +3830,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// or the body names a table the connector does not load; 400 for a body that
 /// is not `{object, action}` together (see below); 409 if the connector is
 /// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
-/// queued or running (see [`ingest_run_history`]), or if the table named waits
+/// queued or running (see [`connector_runs`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
 /// on a `Dagster` transport failure; 503/500 as above for the database pool.
 ///
@@ -3392,9 +3979,12 @@ async fn launch_ingest(
         op_config["action"] = json!(action.as_str());
     }
     let run_config = json!({"ops": {"run_ingest": {"config": op_config}}});
+    // `SRC-11` review 1 SHOULD-FIX 1: a launch through this route is a
+    // person's ("Run now", refresh, clear); the orchestrator's start report
+    // reads this tag, and a run with no tag is recorded as `other`.
     match state
         .dagster
-        .launch_run_with_config(INGEST_JOB, &run_config)
+        .launch_run_with_config_and_tags(INGEST_JOB, &run_config, &[("lakehouse/trigger", "user")])
         .await
     {
         Ok(outcome) => {
@@ -3526,27 +4116,21 @@ pub(super) const INGEST_JOB: &str = "ingest_job";
 /// are searched for one connector's runs.
 const RECENT_INGEST_RUNS: u32 = 100;
 
-/// How many of one connector's runs [`ingest_run_history`] returns.
+/// How many of one connector's runs [`connector_runs`] keeps.
 const CONNECTOR_RUN_HISTORY: usize = 20;
 
-/// One `ingest_job` run of one connector.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// One `ingest_job` run of one connector, as far as the one-run-at-a-time
+/// guard in [`ingest_run_request`] needs it. The run list the console shows
+/// is the product's own record (`SRC-11`, `routes::connector_runs`); the old
+/// `GET /api/connectors/{id}/ingest/runs` that returned this is gone
+/// (`SRC-11 review 2 SHOULD-FIX 1`, plan D7).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConnectorIngestRun {
     /// `Dagster`'s run id.
     pub run_id: String,
     /// `queued | running | completed | failed | cancelled | unknown`
     /// ([`map_run_status`], the vocabulary the pipelines pages use).
     pub status: &'static str,
-    /// ISO-8601, `None` until the run starts.
-    pub started_at: Option<String>,
-    /// ISO-8601, `None` until the run ends.
-    pub ended_at: Option<String>,
-    /// The one table a run of a single table named (`SRC-10` decision 5), from
-    /// the run's config; `None` for a run of every table.
-    pub object: Option<String>,
-    /// `refresh_keep | refresh_remove | clear` for such a run, else `None`.
-    pub action: Option<String>,
 }
 
 impl ConnectorIngestRun {
@@ -3554,14 +4138,6 @@ impl ConnectorIngestRun {
     fn is_active(&self) -> bool {
         matches!(self.status, "queued" | "running")
     }
-}
-
-/// A text field of a run's `ops.run_ingest.config`, or `None`.
-fn run_config_text(run: &DgConfiguredRun, field: &str) -> Option<String> {
-    run.run_config
-        .pointer(&format!("/ops/run_ingest/config/{field}"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
 }
 
 /// `connector_id`'s runs among `runs`, keeping `Dagster`'s newest-first
@@ -3579,36 +4155,8 @@ fn connector_runs(runs: &[DgConfiguredRun], connector_id: &str) -> Vec<Connector
         .map(|run| ConnectorIngestRun {
             run_id: run.run_id.clone(),
             status: map_run_status(&run.status),
-            started_at: run.start_time.map(iso_from_unix_seconds),
-            ended_at: run.end_time.map(iso_from_unix_seconds),
-            object: run_config_text(run, "object"),
-            action: run_config_text(run, "action"),
         })
         .collect()
-}
-
-/// `GET /api/connectors/{id}/ingest/runs` — this connector's recent
-/// `ingest_job` runs, newest first, with their status.
-///
-/// The per-table results (`GET /api/governance/ingest-runs`) are written
-/// only once a run reaches a table, so a run that fails before that — an
-/// unreachable API, a refused credential — leaves no result at all. This
-/// is the list that still shows it, and the one the console watches to
-/// know a run is still going.
-///
-/// # Errors
-///
-/// 503 when `Dagster` cannot be reached.
-pub async fn ingest_run_history(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<Vec<ConnectorIngestRun>>> {
-    let runs = state
-        .dagster
-        .list_runs_for_job_with_config(INGEST_JOB, RECENT_INGEST_RUNS)
-        .await
-        .map_err(|err| ApiError::Unavailable(upstream_message(err)))?;
-    Ok(ApiJson(connector_runs(&runs, &id)))
 }
 
 #[cfg(test)]
@@ -3641,13 +4189,8 @@ mod tests {
         );
         assert_eq!(mine[0].status, "running");
         assert!(mine[0].is_active());
-        assert_eq!(mine[0].ended_at, None);
         assert_eq!(mine[1].status, "completed");
         assert!(!mine[1].is_active());
-        assert_eq!(
-            mine[1].started_at.as_deref(),
-            Some("2026-09-29T08:21:51.000Z")
-        );
     }
 
     #[test]
@@ -5290,5 +5833,222 @@ mod tests {
             serde_json::to_value(IngestSpecResponse::new(spec("cdc", Some("0 2 * * *")), now))
                 .unwrap();
         assert!(cdc["nextRunAt"].is_null());
+    }
+    // ── SRC-12 part B: a credential can be a reference ───────────────────
+
+    static VAULT_PREFIXES: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec!["vault:secret/".to_owned()]);
+
+    fn vault_policy(typed_allowed: bool) -> CredentialPolicy<'static> {
+        CredentialPolicy {
+            manager: Some(SecretManagerKind::Vault),
+            typed_allowed,
+            prefixes: &VAULT_PREFIXES,
+            tenant: None,
+        }
+    }
+
+    /// `SRC-12 review B1 BLOCKER 1`: no prefixes, no reference; outside them,
+    /// none either; `{tenant}` is the connector's own tenant.
+    #[test]
+    fn a_reference_must_lie_under_an_allowed_prefix() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let body = |reference: &str| set_body(json!({ "primary": { "reference": reference } }));
+        let message_of = |result: Result<Vec<SlotChange>, ApiError>| match result {
+            Err(ApiError::BadRequest(message)) => message,
+            _ => panic!("expected 400"),
+        };
+        let mut policy = vault_policy(true);
+        let none: [String; 0] = [];
+        policy.prefixes = &none;
+        assert_eq!(
+            message_of(slot_changes_with(
+                "c",
+                &info,
+                body("vault:secret/a#k"),
+                policy
+            )),
+            manager_refs::NO_PREFIXES_TEXT
+        );
+        let tenant_prefixes = ["vault:secret/tenants/{tenant}/".to_owned()];
+        policy.prefixes = &tenant_prefixes;
+        policy.tenant = Some("t1");
+        assert!(slot_changes_with("c", &info, body("vault:secret/tenants/t1/a#k"), policy).is_ok());
+        for outside in [
+            "vault:secret/tenants/t2/a#k",
+            "vault:secret/tenants/t1/../t2/a#k",
+            "vault:secret/other/a#k",
+        ] {
+            let result = slot_changes_with("c", &info, body(outside), policy);
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{outside}");
+        }
+        policy.tenant = None;
+        assert_eq!(
+            message_of(slot_changes_with(
+                "c",
+                &info,
+                body("vault:secret/tenants/t1/a#k"),
+                policy
+            )),
+            manager_refs::OUTSIDE_PREFIXES_TEXT
+        );
+    }
+
+    /// A reference is its own ref: nothing is derived, nothing is written, and
+    /// the file the slot used to name is the old ref (removed after the swap).
+    #[test]
+    fn a_reference_is_its_own_ref_and_has_nothing_to_store() {
+        let info = credential_info(
+            Some("sql"),
+            &managed(connectors::CredentialKind::Password),
+            None,
+        );
+        let changes = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "reference": "vault:secret/a#k" } })),
+            vault_policy(true),
+        )
+        .expect("a reference for the configured manager");
+        assert_eq!(changes[0].new_ref, "vault:secret/a#k");
+        assert!(changes[0].is_reference());
+        assert!(changes[0].value_to_store().is_none());
+        assert!(changes[0].candidate_value().is_none(), "not read yet");
+        assert_eq!(
+            changes[0].old_ref.as_deref(),
+            Some(managed(connectors::CredentialKind::Password).as_str())
+        );
+    }
+
+    #[test]
+    fn a_reference_is_refused_without_a_secret_manager_or_of_another_managers_scheme() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let body = || set_body(json!({ "primary": { "reference": "vault:secret/a#k" } }));
+        let none = slot_changes_with("conn-x", &info, body(), CredentialPolicy::default());
+        let Err(ApiError::BadRequest(message)) = none else {
+            panic!("expected 400");
+        };
+        assert_eq!(message, NO_SECRET_MANAGER);
+        for bad in [
+            "aws-sm:prod/orders",
+            "vault:secret/../etc#k",
+            "vault:secret/a",
+            "env:CONNECTOR_X_PASSWORD",
+        ] {
+            let result = slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": { "reference": bad } })),
+                vault_policy(true),
+            );
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_slot_sends_a_value_or_a_reference_never_both_or_neither() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        for slot in [
+            json!({ "kind": "password", "value": "pw", "reference": "vault:secret/a#k" }),
+            json!({ "kind": "password" }),
+            json!({}),
+            json!({ "value": "pw" }),
+        ] {
+            let result = slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": slot })),
+                vault_policy(true),
+            );
+            assert!(matches!(result, Err(ApiError::BadRequest(_))), "{slot}");
+        }
+    }
+
+    #[test]
+    fn typing_a_value_can_be_turned_off_while_a_reference_still_works() {
+        let info = credential_info(Some("sql"), "env:CONNECTOR_X_PASSWORD", None);
+        let typed = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "password", "value": "hunter2" } })),
+            vault_policy(false),
+        );
+        let Err(ApiError::BadRequest(message)) = typed else {
+            panic!("expected 400");
+        };
+        assert_eq!(message, TYPED_CREDENTIALS_OFF);
+        assert!(!message.contains("hunter2"));
+        assert!(
+            slot_changes_with(
+                "conn-x",
+                &info,
+                set_body(json!({ "primary": { "reference": "vault:secret/a#k" } })),
+                vault_policy(false),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Decision 11: the audit details name a reference and the manager, and
+    /// carry neither a typed value nor the derived managed name.
+    #[test]
+    fn the_audit_details_name_a_reference_and_never_a_value() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        let changes = slot_changes_with(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "hunter2-typed" },
+                "secondary": { "reference": "vault:secret/a#k" }
+            })),
+            vault_policy(true),
+        )
+        .expect("a typed primary and a referenced secondary");
+        let details = credential_audit_details(Some(SecretManagerKind::Vault), &changes, true);
+        assert_eq!(details["sources"], json!(["managed", "reference"]));
+        assert_eq!(details["references"], json!(["vault:secret/a#k"]));
+        assert_eq!(details["manager"], "vault");
+        assert_eq!(details["verified"], true);
+        let shown = details.to_string();
+        assert!(!shown.contains("hunter2-typed"), "{shown}");
+        assert!(!shown.contains("connector_managed_"), "{shown}");
+    }
+
+    #[test]
+    fn a_slot_body_prints_a_reference_but_nothing_of_a_value() {
+        let reference: CredentialSlotBody =
+            serde_json::from_value(json!({ "reference": "vault:secret/a#k" })).unwrap();
+        assert!(format!("{reference:?}").contains("vault:secret/a#k"));
+        let value: CredentialSlotBody =
+            serde_json::from_value(json!({ "kind": "password", "value": "hunter2-slot" })).unwrap();
+        assert!(!format!("{value:?}").contains("hunter2-slot"));
+        let unknown: Result<CredentialSlotBody, _> =
+            serde_json::from_value(json!({ "reference": "x", "extra": 1 }));
+        assert!(unknown.is_err());
+    }
+
+    /// `lakehouse-store` names the four schemes itself (it cannot depend on
+    /// this crate); they must be the managers' own.
+    #[test]
+    fn the_store_recognises_exactly_the_managers_schemes() {
+        for kind in SecretManagerKind::ALL {
+            assert!(
+                connectors::MANAGER_REF_SCHEMES.contains(&kind.scheme()),
+                "{}",
+                kind.scheme()
+            );
+            assert_eq!(
+                connectors::credential_source_of_ref(&format!("{}x", kind.scheme())),
+                Some(connectors::CredentialSource::Reference)
+            );
+        }
+        assert_eq!(
+            connectors::MANAGER_REF_SCHEMES.len(),
+            SecretManagerKind::ALL.len()
+        );
     }
 }

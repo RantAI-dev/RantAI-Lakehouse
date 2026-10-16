@@ -39,10 +39,11 @@ the reflected `Table` is neither selected nor given a type hint.
 
 If the API cannot be asked, the table is NOT loaded unchecked.
 `ObservationUnreachable` (no connection, timeout, a 5xx) is transient and
-raised so the op's `DEFAULT_RETRY_POLICY` retries it; `ObservationRefused`
+raised so the op retries it on the ingest schedule (`ingest_errors`, class
+`api_unreachable`); `ObservationRefused`
 (a 4xx, an unset token, an answer that is not a decision) would be answered
-the same way again, so `ingest_factory.ingest_source_object` turns it into
-`Failure(allow_retries=False)`. Neither message holds the token, the URL's
+the same way again, so `ingest_factory.ingest_source_object` ends the step with
+`Failure(allow_retries=False)` (class `setting_rejected`). Neither message holds the token, the URL's
 query or an upstream response body (principle 4).
 """
 

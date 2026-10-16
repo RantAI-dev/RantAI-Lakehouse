@@ -25,7 +25,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{TestApp, session_cookie_for_seeded_user, spin_up, spin_up_with_env};
@@ -137,6 +137,54 @@ async fn ingest_run_launches_the_static_ingest_job_with_this_connectors_id() {
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
     assert_eq!(body["runId"], "run-ingest-1");
+}
+
+/// `SRC-11` review 1 SHOULD-FIX 1: a person's launch carries the run tag
+/// `lakehouse/trigger: user`, which the orchestrator's start report reads (a
+/// run with no tag is recorded as `other`). The mock answers a launch only
+/// when the request body carries the tag, so a launch without it fails the
+/// route.
+#[tokio::test]
+async fn ingest_run_tags_the_launch_as_started_by_a_user() {
+    let server = MockServer::start().await;
+    mount_recent_runs(&server, json!([])).await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .and(body_partial_json(json!({
+            "variables": { "tags": [{ "key": "lakehouse/trigger", "value": "user" }] }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-tagged" } } }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-tag").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/connectors/conn-ingest-tag/ingest/run")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    assert_eq!(body["runId"], "run-tagged");
 }
 
 /// A `cdc`-adapter connector's `ingest/run` reports `supported: false`
@@ -526,51 +574,6 @@ async fn ingest_run_is_not_blocked_by_another_connectors_run() {
         .expect("router never fails a request outright");
 
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// `GET .../ingest/runs` lists only this connector's runs, newest first,
-/// in the pipelines pages' status vocabulary.
-#[tokio::test]
-async fn ingest_run_history_lists_only_this_connectors_runs() {
-    let server = MockServer::start().await;
-    mount_recent_runs(
-        &server,
-        json!([
-            ingest_run_for("conn-ingest-hist", "run-2", "STARTED"),
-            ingest_run_for("conn-someone-else", "run-x", "SUCCESS"),
-            ingest_run_for("conn-ingest-hist", "run-1", "FAILURE"),
-        ]),
-    )
-    .await;
-
-    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
-    seed_sql_connector(&app.pool, "conn-ingest-hist").await;
-    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
-
-    let response = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/connectors/conn-ingest-hist/ingest/runs")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("router never fails a request outright");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-    let runs = body.as_array().expect("an array");
-    assert_eq!(runs.len(), 2);
-    assert_eq!(runs[0]["runId"], "run-2");
-    assert_eq!(runs[0]["status"], "running");
-    assert_eq!(runs[1]["runId"], "run-1");
-    assert_eq!(runs[1]["status"], "failed");
 }
 
 /// A load mode the ingest job cannot run is refused when the spec is
@@ -1027,51 +1030,4 @@ async fn a_run_of_one_table_needs_connector_manage() {
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(launched_configs(&server).await.is_empty());
-}
-
-/// `GET .../ingest/runs` names the table and the action of a run of one table,
-/// and `null` for a run of every table.
-#[tokio::test]
-async fn the_run_list_names_the_table_and_the_action_of_a_run_of_one_table() {
-    let server = MockServer::start().await;
-    mount_recent_runs(
-        &server,
-        json!([
-            {
-                "runId": "run-clear", "status": "SUCCESS", "startTime": 1_790_670_111.0,
-                "endTime": 1_790_670_153.0,
-                "runConfig": { "ops": { "run_ingest": { "config": {
-                    "connector_id": "conn-run-list", "object": "public.orders", "action": "clear"
-                } } } }
-            },
-            ingest_run_for("conn-run-list", "run-all", "SUCCESS"),
-        ]),
-    )
-    .await;
-    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
-    seed_sql_connector(&app.pool, "conn-run-list").await;
-    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
-
-    let response = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/connectors/conn-run-list/ingest/runs")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("router never fails a request outright");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let runs: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(runs[0]["runId"], "run-clear");
-    assert_eq!(runs[0]["object"], "public.orders");
-    assert_eq!(runs[0]["action"], "clear");
-    assert_eq!(runs[1]["runId"], "run-all");
-    assert_eq!(runs[1]["object"], Value::Null);
-    assert_eq!(runs[1]["action"], Value::Null);
 }

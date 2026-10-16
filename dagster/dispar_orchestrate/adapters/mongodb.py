@@ -114,19 +114,21 @@ def _collection_rows(collection, *, checking_resolver=ssrf_guard.checking_resolv
             yield _bson_safe(document)
 
 
-def build_source(
+def connect(
     spec: dict,
     secrets: dict[str, str],
-    source_objects: list[dict],
     *,
     resolve_checked=ssrf_guard.resolve_checked,
-) -> AdapterBuildResult:
-    """Build one dlt-shaped source per `source_objects` entry over a
-    Mongo collection. `validate_mongo_dial` (SRV-shape/directConnection
-    refusal) and `resolve_all_seed_hosts` (every explicit seed host
-    checked) both run BEFORE `MongoClient` is constructed -- a rejected
-    or blocked dial never reaches the driver at all (see this module's
-    two "before connecting" tests).
+) -> tuple[Any, list[ssrf_guard.ResolvedAddress]]:
+    """Check the dial, then build the client: `validate_mongo_dial` (SRV-shape
+    and `directConnection` refusal) and `resolve_all_seed_hosts` (every explicit
+    seed host checked) both run BEFORE `MongoClient` is constructed -- a rejected
+    or blocked dial never reaches the driver at all. Shared by `build_source` and
+    the table discovery (`discover.py`, SRC-13), which reads collection names and a
+    sample through this same guarded client; the caller reads inside
+    `ssrf_guard.checking_resolver` (see `_collection_rows`).
+
+    Returns the client and the checked seed addresses. The caller closes the client.
     """
     validate_mongo_dial(spec)
     resolved = resolve_all_seed_hosts(spec["hosts"], resolve_checked=resolve_checked)
@@ -148,6 +150,21 @@ def build_source(
         authSource=spec["database"],
         directConnection=True,
     )
+    return client, resolved
+
+
+def build_source(
+    spec: dict,
+    secrets: dict[str, str],
+    source_objects: list[dict],
+    *,
+    resolve_checked=ssrf_guard.resolve_checked,
+) -> AdapterBuildResult:
+    """Build one dlt-shaped source per `source_objects` entry over a
+    Mongo collection. The dial is checked and the client built by `connect`
+    (see there for the "before connecting" guarantees, which two tests pin).
+    """
+    client, resolved = connect(spec, secrets, resolve_checked=resolve_checked)
     db = client[spec["database"]]
     sources = {obj["target"]: _collection_rows(db[obj["name"]]) for obj in source_objects}
     return AdapterBuildResult(sources=sources, resolved=resolved)
