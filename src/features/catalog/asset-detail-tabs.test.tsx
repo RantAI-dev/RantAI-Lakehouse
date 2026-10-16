@@ -946,39 +946,62 @@ describe("Sample tab", () => {
       .filter((path) => path.includes("/sample?limit="))
       .map((path) => Number(path.split("limit=")[1]))
 
-  it("asks for 25 rows on opening, and shows the rows the page carries until they arrive", async () => {
+  it("asks for 1,000 rows once on opening, and shows the rows the page carries until they arrive", async () => {
     const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs()
 
-    const sizes = screen.getByRole("group", { name: "Rows to show" })
-    // Labelled, so the numbers read as a choice of how many rows to show.
-    expect(within(sizes).getByText("Rows")).toBeTruthy()
-    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["25", "50", "100"])
-    expect(within(sizes).getByText("25").getAttribute("aria-pressed")).toBe("true")
-    // The detail body's one row is on screen at once (the header row and that row) while 25 load.
+    // `DATA-15` F1: the size choice (25/50/100) is gone; there is one read and a pager.
+    expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+    // The detail body's one row is on screen at once (the header row and that row) while 1,000 load.
     expect(screen.getAllByRole("row")).toHaveLength(2)
-    expect(screen.getByText(/Loading 25 rows… showing the first 1 row,/)).toBeTruthy()
+    expect(screen.getByText(/Loading 1,000 rows… showing the first 1 row,/)).toBeTruthy()
 
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
-    expect(screen.getByText(/The first 25 rows, as you would read them/)).toBeTruthy()
-    expect(sampleLimits(fetchSpy)).toEqual([25])
-    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=25"))).toBe(true)
+    // 1,000 rows come back; the grid shows the first 100 (and its header row).
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
+    expect(screen.getByText(/The first 1,000 rows, as you would read them/)).toBeTruthy()
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    expect(sampleLimits(fetchSpy)).toEqual([1000])
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=1000"))).toBe(true)
   })
 
-  it("asks again for 50 and for 100 rows when they are chosen", async () => {
+  it("pages the 1,000 rows 100 at a time without asking the API again", async () => {
     const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs()
-    const sizes = screen.getByRole("group", { name: "Rows to show" })
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
-
-    fireEvent.click(within(sizes).getByText("50"))
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(51))
-    expect(within(sizes).getByText("50").getAttribute("aria-pressed")).toBe("true")
-    fireEvent.click(within(sizes).getByText("100"))
     await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
-    expect(sampleLimits(fetchSpy)).toEqual([25, 50, 100])
+    const previous = screen.getByRole("button", { name: "Previous" }) as HTMLButtonElement
+    const next = screen.getByRole("button", { name: "Next" }) as HTMLButtonElement
+    expect(previous.disabled).toBe(true)
+
+    fireEvent.click(next)
+    expect(screen.getByRole("status").textContent).toBe("Rows 101–200 of 1,000")
+    // The gutter keeps counting from the first row loaded.
+    expect(document.querySelector("tbody tr th")?.textContent).toBe("101")
+    expect(document.querySelector("tbody tr td")?.textContent).toBe("101")
+    expect(previous.disabled).toBe(false)
+
+    fireEvent.click(previous)
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    for (let i = 0; i < 9; i++) fireEvent.click(next)
+    expect(screen.getByRole("status").textContent).toBe("Rows 901–1,000 of 1,000")
+    expect(next.disabled).toBe(true)
+    expect(sampleLimits(fetchSpy)).toEqual([1000])
+  })
+
+  it("sorts all the rows loaded, not only the page on screen, and says so", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs()
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }))
+    fireEvent.click(screen.getByRole("button", { name: "Sort id ascending" }))
+    fireEvent.click(screen.getByRole("button", { name: "Sort id descending" }))
+    // A new sort starts at the first page, and its first row is the largest of all 1,000.
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    expect(document.querySelector("tbody tr td")?.textContent).toBe("1000")
+    expect(screen.getByText(/among the 1,000 rows loaded, all pages\./)).toBeTruthy()
   })
 
   it("shows the rows the page carries, with no size to choose, where the deployment cannot fetch more", () => {
@@ -989,7 +1012,7 @@ describe("Sample tab", () => {
       url.search = "tab=sample"
       renderTabs()
 
-      expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+      expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
       expect(screen.getAllByRole("row")).toHaveLength(2)
       expect(screen.getByText(/The first 1 row, as you would read them/)).toBeTruthy()
       expect(screen.queryByText(/Loading/)).toBeNull()
@@ -1041,15 +1064,12 @@ describe("Sample tab", () => {
     await waitFor(() => expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/sample?limit=")).length).toBe(2))
   })
 
-  it("puts the row count and Query Studio in the card's body, not the header slot that cannot shrink", () => {
+  it("puts Query Studio in the card's body, not the header slot that cannot shrink", () => {
     stubApi()
     url.search = "tab=sample"
     renderTabs()
 
     const card = screen.getByText("Sample rows").closest("[data-slot=card]") as HTMLElement
-    const controls = within(card).getByRole("group", { name: "Rows to show" })
-    expect(card.querySelector("[data-slot=card-header]")?.contains(controls)).toBe(false)
-    expect(card.querySelector("[data-slot=card-content]")?.contains(controls)).toBe(true)
     const studio = within(card).getByText("Open in Query Studio")
     expect(card.querySelector("[data-slot=card-header]")?.contains(studio)).toBe(false)
   })
@@ -1167,7 +1187,7 @@ describe("Sample tab: the data preview", () => {
     expect(within(bodyRows()[0]).getByText("NULL", { selector: ".italic" })).toBeTruthy()
   })
 
-  it("sorts the rows shown, ascending, descending, then back to the table's order, and says so", async () => {
+  it("sorts the rows loaded, ascending, descending, then back to the table's order, and says so", async () => {
     const fetchSpy = await openPreview()
     // The page's other loads (the signed-in user, the table, the lineage) are
     // still settling when the rows arrive, so the total request count is not
@@ -1182,12 +1202,12 @@ describe("Sample tab: the data preview", () => {
     // Numbers as numbers: 9 before 10 before 250,161, and the id as stored.
     expect(columnOf("id")).toEqual(["9", "10", "0250161"])
     expect(idHeader.getAttribute("aria-sort")).toBe("ascending")
-    expect(screen.getByText(/Sorted by id \(ascending\), among the rows shown\./)).toBeTruthy()
+    expect(screen.getByText(/Sorted by id \(ascending\), among the 3 rows loaded, all pages\./)).toBeTruthy()
 
     fireEvent.click(within(idHeader).getByRole("button", { name: "Sort id descending" }))
     expect(columnOf("id")).toEqual(["0250161", "10", "9"])
     expect(idHeader.getAttribute("aria-sort")).toBe("descending")
-    expect(screen.getByText(/Sorted by id \(descending\), among the rows shown\./)).toBeTruthy()
+    expect(screen.getByText(/Sorted by id \(descending\), among the 3 rows loaded, all pages\./)).toBeTruthy()
 
     fireEvent.click(within(idHeader).getByRole("button", { name: "Stop sorting by id" }))
     expect(columnOf("id")).toEqual(["10", "9", "0250161"])
@@ -1385,16 +1405,20 @@ describe("Sample tab: the data preview", () => {
       expect(document.activeElement).toBe(cellOf(1, "id"))
     })
 
-    it("drops a picked cell when another size is chosen, and keeps a picked column", async () => {
-      await openPreview()
-      const sizes = screen.getByRole("group", { name: "Rows to show" })
+    it("drops a picked cell when another page is shown, and keeps a picked column", async () => {
+      // `DATA-15` F1: the size choice became a pager; a cell is a place on the page that goes away.
+      const many = Array.from({ length: 150 }, (_, i) => ({ ...ROWS[0], id: String(i + 1) }))
+      stubApi({ sample: () => many })
+      url.search = "tab=sample"
+      renderTabs(PREVIEW)
+      await screen.findByText(/^The first 150 rows, as you would read them/)
 
       fireEvent.click(cellOf(0, "id"))
-      fireEvent.click(within(sizes).getByText("50"))
+      fireEvent.click(screen.getByRole("button", { name: "Next" }))
       expect(inspector()).toBeNull()
 
       fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
-      fireEvent.click(within(sizes).getByText("100"))
+      fireEvent.click(screen.getByRole("button", { name: "Previous" }))
       expect(inspector()).not.toBeNull()
     })
   })

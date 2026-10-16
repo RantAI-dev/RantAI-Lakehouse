@@ -1948,8 +1948,14 @@ fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
 /// How many sample rows the detail body itself carries.
 const DETAIL_SAMPLE_ROWS: u32 = 5;
 /// The most `GET /api/catalog/{id}/sample` returns: a look at the data,
-/// not an export — Query Studio is one click away for more.
-const SAMPLE_MAX_ROWS: u32 = 100;
+/// not an export — Query Studio is one click away for more. `DATA-15` F1:
+/// 1,000 rows (`data-15.md` "Data preview"), up from 100; the console
+/// pages them 100 at a time.
+const SAMPLE_MAX_ROWS: u32 = 1000;
+/// Seconds a sample read may run before ClickHouse stops it. `DATA-15` F1:
+/// a 1,000-row read of a wide Iceberg table is the first sample that can
+/// be slow, and it had no time limit at all.
+const SAMPLE_MAX_SECONDS: u32 = 30;
 
 /// Query parameters accepted by `GET /api/catalog/{id}/sample`.
 #[derive(Debug, Deserialize)]
@@ -2027,7 +2033,13 @@ async fn governed_sample(
     if !principal.has(SAMPLE_PERMISSION) {
         return (Vec::new(), masked);
     }
-    let raw_sql = format!("SELECT * FROM {} LIMIT {limit}", source.from);
+    // `DATA-15` F1: the trailing `SETTINGS` survives the rewrite (it is
+    // kept as the pinned-version clause is), so the limit binds the read
+    // ClickHouse actually runs.
+    let raw_sql = format!(
+        "SELECT * FROM {} LIMIT {limit} SETTINGS max_execution_time = {SAMPLE_MAX_SECONDS}",
+        source.from
+    );
     let sql = match crate::routes::query::rewrite_sql_for_principal(
         state,
         &raw_sql,
@@ -5833,17 +5845,25 @@ mod tests {
             .await
             .expect("sample answers");
 
-            assert_eq!(body["limit"], json!(100));
+            // `DATA-15` F1: the cap was 100 and is now 1,000 (the spec's
+            // "up to 1,000 rows"), so the old pin moved with it.
+            assert_eq!(body["limit"], json!(1000));
             assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
             let requests = server.received_requests().await.expect("recorded");
             let reads: Vec<String> = requests
                 .iter()
                 .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-                .filter(|b| b.contains("LIMIT 100"))
+                .filter(|b| b.contains("LIMIT 1000"))
                 .collect();
             assert!(
                 !reads.is_empty(),
                 "the sample must be read at the capped limit"
+            );
+            assert!(
+                reads
+                    .iter()
+                    .all(|b| b.contains("SETTINGS max_execution_time = 30")),
+                "the sample read must carry its time limit through the rewrite"
             );
             assert!(
                 reads.iter().all(|b| b.contains("replaceRegexpOne")),
