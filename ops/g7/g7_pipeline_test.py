@@ -293,6 +293,67 @@ def step_login() -> None:
     print("[g7] logged in as bootstrap admin")
 
 
+def _me_tenant_ids() -> list[str]:
+    """The tenant ids `GET /api/auth/me` reports for the logged-in account."""
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G7Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def step_ensure_connector_tenant() -> None:
+    """Make the logged-in account a member of the tenant that owns
+    `CONNECTOR_ID`, so the per-connector routes this gate drives are not
+    refused by `require_connector_in_tenants`.
+
+    The bootstrap admin of a fresh database is created with `tenants:
+    Vec::new()` (`lakehouse_api::bootstrap_admin`, `main.rs`), so it belongs
+    to NO tenant. Every `/api/connectors/{id}/*` route sits behind
+    `ensure_connector_in_tenants` (`routes/connectors.rs`): the connector's
+    `tenant_id` must be one of the caller's, or the route answers the SAME
+    404 an unknown id gets -- which is exactly what a first run of this
+    gate hit on `GET .../ingest-spec` (the connector is present; the caller
+    simply cannot see it). The seeded `conn-pg-lakehouse` belongs to
+    `meridian-group` (0042), so that is the tenant the account joins, via
+    `PUT /api/identity/users/{id}/tenants/{tenant_id}` (the unrestricted
+    admin may add itself to any tenant), then `/api/auth/me` is re-read to
+    confirm. Membership is read per request, so no new login. An account
+    already in it changes nothing.
+
+    Duplicated, not shared, from `ops/g6/g6_ingest_matrix_test.py`'s
+    `step_ensure_tenant`: these gate scripts share no module (the module
+    doc explains why), and this gate joins only the one tenant it needs.
+    """
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G7Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise G7Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
+    tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if tenant is None:
+        raise G7Failure(
+            f"tenant {GATE_TENANT_SLUG!r} does not exist: it owns the seeded connector "
+            f"{CONNECTOR_ID!r} (0042_tenant_provisioning.sql) this gate runs"
+        )
+    if tenant["id"] not in _me_tenant_ids():
+        added = API.put(
+            f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}",
+            timeout=10,
+        )
+        if not added.ok:
+            raise G7Failure(
+                f"add the account to tenant {GATE_TENANT_SLUG!r} failed: "
+                f"{added.status_code} {added.text[:300]}"
+            )
+        if tenant["id"] not in _me_tenant_ids():
+            raise G7Failure(
+                f"the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it"
+            )
+        print(f"[g7] added the account to tenant {GATE_TENANT_SLUG!r}")
+
+
 def step_create_and_activate_authored_pipeline() -> str:
     """`POST /api/pipelines` (already on this branch, Phase 2 Task 2.5)
     creates a `"draft"` authored pipeline over `BRONZE_TABLE_NAME`;
@@ -526,6 +587,13 @@ UPSTREAM_JOB_NAME = "ingest_job"
 # a second table to every deployment's seeded connector is a product
 # decision, not a gate fixture.
 CONNECTOR_ID = os.environ.get("G7_INGEST_CONNECTOR_ID", "conn-pg-lakehouse")
+# The tenant that owns `CONNECTOR_ID`: `0042_tenant_provisioning.sql`
+# backfills the seeded `conn-pg-lakehouse` to the seed tenant
+# `meridian-group` (`0002_seed_identity.sql`). Every `/api/connectors/{id}/*`
+# route sits behind `require_connector_in_tenants`, so the calling account
+# must be a member of THIS tenant or those routes answer the same 404 an
+# unknown id gets -- see `step_ensure_connector_tenant`.
+GATE_TENANT_SLUG = os.environ.get("G7_INGEST_TENANT_SLUG", "meridian-group")
 SOURCE_OBJECT_A = os.environ.get("G7_INGEST_OBJECT_A", "ingest_demo.orders")
 BRONZE_TABLE_A = os.environ.get("G7_INGEST_BRONZE_TABLE_A", "g7_dep_orders")
 SOURCE_OBJECT_B = os.environ.get("G7_INGEST_OBJECT_B", "ingest_demo.customers")
@@ -657,6 +725,35 @@ def _chain_run_ids(pipeline_id: str) -> list[str]:
     if body.get("unavailable"):
         raise G7Failure(f"GET .../runs reported the orchestrator unavailable: {body['unavailable']}")
     return [run["id"] for run in body.get("runs", [])]
+
+
+def _dependency_sensor_has_ticked(pipeline_id: str) -> bool:
+    """Whether the chain's dependency sensor has evaluated at least once.
+
+    A `run_status_sensor`'s FIRST evaluation sets its cursor to the newest
+    run-status event and SKIPS -- `dagster==1.13.20`'s
+    `RunStatusSensorDefinition._wrapped_fn` (`.../
+    run_status_sensor_definition.py`, the `if context.cursor is None ...`
+    branch) yields `"Initiating <name>. Set cursor to <cursor>"` and
+    returns; events that happened before that tick are never replayed.
+
+    So creating the chain and then loading table A in the same breath
+    races the sensor's first tick: if the load's SUCCESS event lands
+    first, the sensor skips it and the chain never runs -- a false
+    negative the gate would report as a feature failure. Waiting for the
+    first tick before the load removes the race, because the load's event
+    then has a storage id strictly greater than the cursor.
+
+    The tick is read from `GET /api/pipelines/{id}/schedule-ticks`, which
+    merges the `authored__<id>_after` sensor's ticks in tagged
+    `kind:"sensor"` (`routes::authored_pipelines::schedule_ticks`); a
+    `pl-` id's manual schedule has no ticks of its own, so any `sensor`
+    tick is the cursor-initialising one.
+    """
+    resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/schedule-ticks", timeout=30)
+    if not resp.ok:
+        return False
+    return any(t.get("kind") == "sensor" for t in resp.json().get("ticks", []))
 
 
 def _ensure_catalog_database() -> None:
@@ -904,10 +1001,25 @@ def main() -> int:
                 f"{list(SOURCE_PROVENANCE_MODES)}"
             )
         step_login()
+        # The bootstrap admin belongs to no tenant; the seeded connector this
+        # gate drives belongs to `meridian-group`. Join it before any
+        # `/api/connectors/{id}/*` call, or every one answers 404.
+        step_ensure_connector_tenant()
         # BLD-4: the chain's two source objects on the stack's own
         # connector, and the chain itself, BEFORE either ingest run -- a
         # chain created after its anchor already exists would pass the
         # positive assertion for the wrong reason.
+        #
+        # `ingest_job` must be loaded BEFORE the chain is created: the
+        # create route validates `depends_on` against the live Dagster job
+        # list and refuses a Dagster-native upstream it cannot see
+        # (`routes::authored_pipelines::validate_depends_on`), and a fresh
+        # stack's code location may not have registered yet.
+        _wait_for(
+            f"{UPSTREAM_JOB_NAME} loaded",
+            lambda: _dagster_job_is_loaded(UPSTREAM_JOB_NAME),
+            180,
+        )
         seeded_spec = _read_connector_spec()
         _put_connector_spec({**seeded_spec, "sourceObjects": [
             {"name": SOURCE_OBJECT_A, "incrementalKey": "created_at", "target": BRONZE_TABLE_A},
@@ -918,6 +1030,15 @@ def main() -> int:
             f"and {SOURCE_OBJECT_B!r} -> bronze.{BRONZE_TABLE_B} (one object per run)"
         )
         chain_pipeline_id = _create_the_ingest_chained_pipeline()
+        # The chain's sensor must have ticked once (its cursor is set and
+        # skips everything before it) BEFORE the load of table A, or the
+        # load's SUCCESS event races the cursor and the chain never runs --
+        # see `_dependency_sensor_has_ticked`.
+        _wait_for(
+            "the chain's dependency sensor to evaluate once (cursor initialised)",
+            lambda: _dependency_sensor_has_ticked(chain_pipeline_id),
+            300,
+        )
         step_a_load_of_its_own_table_triggers_the_chain(chain_pipeline_id)
         step_a_load_of_another_table_does_not_trigger_the_chain(chain_pipeline_id)
         pipeline_id = step_create_and_activate_authored_pipeline()
