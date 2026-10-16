@@ -1430,16 +1430,22 @@ pub const fn behind_alert_due(behind_streak: i32) -> bool {
 /// plan D7's honest note ("Downstream: no pipeline with a target lag reads
 /// this table"), as a set of ids.
 ///
-/// Two queries whatever the list holds, because a list route that asks
-/// the store once per row turns a page into N round trips: the readers of
-/// all the candidates' targets in one, and the `depends_on` targets of
-/// those readers in one. The error is the caller's, never a silent zero
-/// (a swallowed failure would report every downstream pipeline as having
-/// no reader).
+/// One call to [`pipelines::count_lag_pipelines_reading`] per candidate,
+/// which is the SAME function the lag check itself uses to decide whether a
+/// downstream pipeline is read (review R1 SHOULD-FIX 3). Reusing it is what
+/// makes the two answers agree: the earlier batched version answered the
+/// `dependsOn` edge differently from the check, so a pipeline read only
+/// through `depends_on` was told on the page that nobody reads it while the
+/// check kept scheduling it. The cost is one round trip per downstream
+/// candidate; the list this is called with is a page of pipelines, and the
+/// wrong answer is a false statement about a user's data.
+///
+/// The error is the caller's, never a silent zero (a swallowed failure
+/// would report every downstream pipeline as having no reader).
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] if either query fails.
+/// Returns [`StoreError`] if a reader count query fails.
 // BLD-2 review R1 SHOULD-FIX 3: use count_lag_pipelines_reading for exact parity including dependsOn
 pub async fn downstream_without_readers(
     pool: &PgPool,
