@@ -92,13 +92,13 @@ estimate (S, M, L), which the base has no field for.
 | `BI-1` | Feature | Export a dashboard as a server-made PDF and as Excel | Dashboards | P2 | Planned |  | PRODUCT §2 |
 | `BI-4` | Feature | Result caching for charts and queries; run a dashboard's tiles in parallel | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-5` | Feature | Configurable query timeouts and row limits; Stop cancels the query on the server | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-6` | Feature | A chart builder as capable as Metabase's and Tableau's: several dimensions, filters, sorting, multi-step questions. No drag and drop; the assistant covers that | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-7` | Feature | Joins in the chart builder without writing SQL | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-6` | Feature | A chart builder as capable as Metabase's and Tableau's: several dimensions, filters, sorting, multi-step questions. No drag and drop; the assistant covers that | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-7` | Feature | Joins in the chart builder without writing SQL | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-8` | Feature | Calculated fields and custom expressions: maths, text, dates, conditions, running totals | Dashboards | P2 | In Acceptance | #104 | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-9` | Feature | Group by day, week, month, quarter, year | Dashboards | P2 | In Acceptance | #104 | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-10` | Feature | Bins, groups and hierarchies | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards. **Blocked by `QS-5` (parameters in SQL)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BI-13` | Feature | Combine two sources on one chart | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-10` | Feature | Bins, groups and hierarchies | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-11` | Feature | Parameters, usable in charts, SQL and dashboards. **Blocked by `QS-5` (parameters in SQL)** | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
+| `BI-13` | Feature | Combine two sources on one chart | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-14` | Feature | Lineage from a chart to its sources, reachable from the dashboard. **Blocked by `DATA-13` (column part)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-16` | Feature | Every chart type Tableau and Metabase have that we lack: progress bar, histogram, Gantt, bullet graph, KPI with comparison and sparkline, raw-row table, pivot table with totals, record detail, world maps and uploaded boundaries, image and web-page cards, spatial analysis, custom chart plugins. Part A (tables and KPI) in #104; parts B and C left. **Blocked by `BI-10` (histogram bins)** | Dashboards | P2 | Building | #104 | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-17` | Feature | Chart formatting at both competitors' level: number formats, colours, axes, data labels, conditional formatting, goal and reference lines, trend lines, forecasting, clustering, annotations, custom tooltips, themes and fonts | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
@@ -108,8 +108,8 @@ estimate (S, M, L), which the base has no field for.
 | `AI-3` | Feature | The assistant picks the time grain ("monthly") | AI Copilot | P2 | In Acceptance | #104 | `AGENTS.md` (assistant parity) |
 | `AI-4` | Feature | The assistant writes calculated fields in the product's formula language, not raw SQL | AI Copilot | P2 | In Acceptance | #104 | `AGENTS.md` (assistant parity) |
 | `AI-5` | Feature | The assistant creates every new chart type: raw and pivot tables, KPI with comparison, histogram, Gantt and the rest. The chart types of `BI-16` part A in #104; `AI-5-AC1` not checked yet. **Blocked by `BI-16` (per chart type as it lands)** | AI Copilot | P2 | Building | #104 | `AGENTS.md` (assistant parity) |
-| `AI-6` | Feature | The assistant builds charts with several dimensions and filters, joins tables, uses bins, groups, hierarchies and parameters, and combines two sources. **Blocked by `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
-| `AI-7` | Feature | The assistant uses named metrics before it writes SQL, so the same question gives the same number. **Blocked by `BI-2`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
+| `AI-6` | Feature | The assistant builds charts with several dimensions and filters, joins tables, uses bins, groups, hierarchies and parameters, and combines two sources. **Blocked by `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13`** | AI Copilot | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `AGENTS.md` (assistant parity) |
+| `AI-7` | Feature | The assistant uses named metrics before it writes SQL, so the same question gives the same number. **Blocked by `BI-2`** **Owner QA, 2026-10-15:** the assistant ran SQL before looking for a metric (fails `AI-7-AC1` on `reusable-metrics.md`), and the chart draft card showed `sum(<column>)` instead of the metric's label. Both stay open under this item. | AI Copilot | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | `AGENTS.md` (assistant parity) |
 | `AI-8` | Feature | The assistant changes number formats, colours, axes and labels, and adds trend and forecast lines. **Blocked by `BI-17`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-9` | Feature | The assistant adds tabs and uses templates. **Blocked by `BI-18` (layout part)** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-10` | Feature | The assistant schedules reports ("send this to me every Monday as PDF") and produces a PDF or Excel file on request. **Blocked by `RPT-1`, `BI-1`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
@@ -122,7 +122,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26`. **Blocked by `RPT-1` (digest schedules)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. | Build | P2 | Building | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) (slice 1: a pipeline reads as its author) | PRODUCT §2; [spec](specs/bld-1.md) |
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
-| `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** | Dashboards | P2 | Planned |  | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
+| `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** | Dashboards | P2 | In Acceptance | [#160](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/160) | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
 | `OPS-8` | Feature | Usage and cost view | Operations | P2 | Idea |  | PRODUCT §2 |
 | `SEC-2` | Feature | Login rate limiting | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
@@ -146,9 +146,9 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-8` | Feature | Schema changes at the source: detect, notify, and a per-connector choice to apply, ask or pause | Data | P2 | In Acceptance | #101 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-9` | Task | Gate tests for every advertised connector (Oracle, SFTP, MySQL CDC, SQL Server CDC); the upload gate in CI | Data | P2 | Done | #114 | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-10` | Feature | More load modes: deduplicate on a key, keep history (SCD type 2), refresh or clear one table | Data | P2 | In Acceptance | #115 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice. | Data | P2 | Building | #144 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in. | Data | P2 | Building | #144 | `reference/competitive-comparison.md` (Data matrix) |
-| `SRC-13` | Feature | Table discovery for every source type, not only databases. | Data | P2 | Building | #144 | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-11` | Feature | Connector operations: automatic retries with backoff, a log view per run, column choice. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-12` | Feature | Credentials done properly: external secret managers, encryption at rest, OAuth sign-in. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
+| `SRC-13` | Feature | Table discovery for every source type, not only databases. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-15` | Feature | Load a SQL column whose type changed to one its Bronze column cannot hold (integer to text, text to a number, a changed decimal) into a second column when the change is approved. Today such a change cannot be approved and the table waits (`SRC-8`, decision 10). Starts after the g6 gate has shown the loader's behaviour on a real database. No spec yet | Data | P3 | Idea |  | `features/source-schema-changes.md` |
 | `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07). **Blocked by `SRC-11` (column choice), `SEC-14` (credentials)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter waits for `DATA-12` | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
@@ -190,8 +190,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-26` | Task | About thirty assistant tool results carry raw upstream error text (`err.to_string()`) into the chat response's `toolTrace`. Same rule as `SEC-6` | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 | `SEC-27` | Task | The Security workflow is red on `main`: `cargo audit` reports advisories for `quinn-proto` 0.11.17 (`RUSTSEC-2026-0338`, `-0340`, `-0343`), and both `gitleaks` jobs fail. Update or waive the dependency with a reason; triage the `gitleaks` findings as `docs/CI.md` describes. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Done | #121, #130, #153 | CI on `main` at `c083125` (2026-10-13); named in the `SRC-16` review |
 | `SRC-17` | Task | Load-failure alert delivery: a failed delivery is recorded as if sent (feature-page row 5 cannot pass); a rule-store failure loses the alert because the dedupe row is written first; the Alerts page still says nothing raises `connector_schema_change`; a gate step that receives a webhook, and `SRC-7-RESULT.md` with measured seconds | Data | P2 | Done | #124 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-7`) |
-| `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission. First half closed by `SRC-11` (#144) | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
-| `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | In Progress | #144 | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
+| `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission. First half closed by `SRC-11` (#144) The first half (a paused connector's queued run) is closed by `SRC-11` decision 13 in #144. | Data | P2 | Todo | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) (first half) | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
+| `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) Closed by `SRC-11` decision 2. | Data | P3 | Done | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
 | `SEC-29` | Task | 25 responses in `routes/pipelines.rs` put the orchestrator's error text in the body (`js_error(err)`; `DagsterError::Server` is Dagster's own GraphQL text). Same rule as `SEC-6`: a fixed body, the detail to `tracing`. Closed by `SEC-11`'s change: no `js_error` is left; orchestrator failures answer a fixed message and a reference id | Administration & Security | P2 | Done | #105 | PR #80 review |
 | `GOV-4` | Task | A masking policy on a column does not follow its rows through a pipeline: the pipeline copies unmasked rows into its Silver or Gold table, and the policy on the source column does not apply to the copy. Decide whether policies carry to outputs or outputs must be classified again. **Decided by the product owner, 2026-10-14:** a pipeline reads as its author, through the same masking and row-filter rewrite as the author's own queries; built in `BLD-1`. Closed by `BLD-1` slice 1 | Governance | P2 | Done | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) | `BLD-3` plan, D5 |
 | `SRC-20` | Task | The pipeline gate `ops/g7` is run by no CI job | Data | P3 | Done | #155 | `plans/SRC-9-RESULT.md` |
@@ -233,6 +233,10 @@ estimate (S, M, L), which the base has no field for.
 | `ADM-1` | Feature | Several organisations in one install | Administration & Security | P3 | Idea |  | PRODUCT §2 |
 | `ADM-2` | Feature | Workspace settings that can be changed | Administration & Security | P3 | Idea |  | `README.md` |
 | `OPS-2` | Feature | Install with no internet access | Platform | P3 | Idea |  | Sales playbook (older; re-check) |
+| `SRC-23` | Task | `route_auth.rs` `run_history_log_and_resume_need_connector_manage_...` passes without proving its claim: the `connector:manage` principal is in no tenant, so the tenant gate answers 404 before the permission gate and `assert_ne!(.., FORBIDDEN)` holds either way. Join both principals to the seeded tenant, as the discovery and OAuth tests do (the defect `SRC-13` review 3 BLOCKER 2 fixed there). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
+| `SRC-24` | Task | `SRC-11` plan task 9 asks `docs/plans/SRC-11-RESULT.md` for the time to auto-disable and a run log's size; the RESULT has neither and does not list them under "Not measured". Measure them or list them (principle 2). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
+| `OPS-10` | Task | The shared test Postgres runs out of shared memory under the full workspace run: `53100 could not resize shared memory segment ... No space left on device` and `UnexpectedEof` on connect, in whichever binaries run many per-test databases at once (seen in `embed_tokens`, `ai_tool`, `connector_delete_deprovision`, `upload_routes`). Each passes alone. Give the test-support container a larger `/dev/shm` (`--shm-size`) or cap its connections, so a full run is green without re-runs. Also seen once in CI: the `g6-ops` auto-disable step timed out after 150 s on #160 and passed on re-run | Platform | P2 | Todo |  | review runs 2026-10-16 |
+| `BI-31` | Task | Close out `BI` phase 2 (#160) for acceptance: (1) the owner signs the decision rows still marked "Owner to confirm at QA" on `chart-builder-questions.md`, `joins-without-sql.md`, `bins-groups-hierarchies.md`, `parameters.md`, `combined-charts.md` and `reusable-metrics.md`, with the date; (2) answer the two open questions in the `BI-2` plan (does a seeded role hold `metric:write`; are metric and segment definitions readable by everyone with `dashboard:read`); (3) one check on a running stack with a masked and row-filtered role across a join, a drill-down and an embed. Found in the #160 review | Dashboards | P2 | Todo |  | #160 review |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -253,51 +257,40 @@ parity), built after it.
 | --- | --- | --- | --- |
 | `BI-18` | Building | — | `AI-2`, `AI-9` (layout part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
 | `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
-| `BI-10` | Planned | — | `AI-6`, `BI-16` (histogram bins) |
-| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part), `BI-11` (parameters in SQL) |
 | `RPT-1` | Planned | `BI-1` (PDF and Excel attachments) | `AI-10`, `BI-19` (digest schedules) |
-| `BI-11` | Planned | `QS-5` (parameters in SQL) | `AI-6` |
-| `BI-13` | Planned | — | `AI-6` |
 | `BI-14` | Planned | `DATA-13` (column part) | `AI-13` |
-| `BI-16` | Building | `BI-10` (histogram bins) | `AI-5` (per chart type as it lands) |
+| `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Planned | — | `AI-8` |
 | `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
-| `BI-2` | Planned | `DATA-12` (certified metrics part) | `AI-7` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
-| `BI-6` | Planned | — | `AI-6` |
-| `BI-7` | Planned | — | `AI-6` |
 | `BLD-1` | Building | — | `REL-6` |
 | `BLD-2` | Building | — | `REL-6` |
-| `DATA-12` | Planned | — | `BI-2` (certified metrics part) |
 | `DATA-13` | Planned | — | `BI-14` (column part) |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
 | `DEC-9` | Open (decision) | — | `SRC-3` |
+| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `SEC-14` | Building | — | `SRC-4` (credentials) |
 | `SEC-20` | Todo | — | `QS-3` |
 | `SEC-21` | Todo | — | `QS-2` (full-result download) |
-| `SRC-11` | Planned | — | `SRC-4` (column choice) |
-| `SRC-12` | Planned | — | `SRC-3` (OAuth sign-in) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
 | `AI-13` | Planned | `BI-14` | — |
 | `AI-2` | Planned | `BI-18` | — |
 | `AI-5` | Building | `BI-16` (per chart type as it lands) | — |
-| `AI-6` | Planned | `BI-6`, `BI-7`, `BI-10`, `BI-11`, `BI-13` | — |
-| `AI-7` | Planned | `BI-2` | — |
 | `AI-8` | Planned | `BI-17` | — |
 | `AI-9` | Planned | `BI-18` (layout part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-2` | Planned | `SEC-21` (full-result download) | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1`, `BLD-2` | — |
-| `SRC-3` | Planned | `DEC-9`, `SRC-12` (OAuth sign-in) | — |
-| `SRC-4` | Planned | `SRC-11` (column choice), `SEC-14` (credentials) | — |
+| `SRC-3` | Planned | `DEC-9` | — |
+| `SRC-4` | Planned | `SEC-14` (credentials) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `BLD-4`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-4`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -363,6 +356,18 @@ set by the product owner and are left empty until they are.
 | `BLD-2` | 2026-10-15 | | |
 | `SEC-35` | 2026-10-14 | 2026-10-15 | |
 | `GOV-4` | 2026-10-15 | 2026-10-16 | |
+| `SRC-11` | | 2026-10-16 | |
+| `SRC-12` | | 2026-10-16 | |
+| `SRC-13` | | 2026-10-16 | |
+| `SRC-19` | | 2026-10-16 | |
+| `BI-6` | | 2026-10-16 | |
+| `BI-7` | | 2026-10-16 | |
+| `BI-10` | | 2026-10-16 | |
+| `BI-11` | | 2026-10-16 | |
+| `BI-13` | | 2026-10-16 | |
+| `BI-2` | | 2026-10-16 | |
+| `AI-6` | | 2026-10-16 | |
+| `AI-7` | | 2026-10-16 | |
 
 ## Decide
 
