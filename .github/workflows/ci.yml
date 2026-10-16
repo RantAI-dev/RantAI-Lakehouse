@@ -1664,10 +1664,17 @@ jobs:
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           INGEST_RETRY_DELAYS_SECONDS=5,10,20
           CONNECTOR_AUTO_DISABLE_AFTER=3
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -1783,9 +1790,16 @@ jobs:
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           CONNECTOR_AUTO_DISABLE_AFTER=3
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -1932,8 +1946,8 @@ jobs:
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           CONNECTOR_AUTO_DISABLE_AFTER=3
           SECRET_MANAGER=vault
           SECRET_MANAGER_ALLOWED_PREFIXES=vault:secret/g12/
@@ -1943,6 +1957,13 @@ jobs:
           AWS_ACCESS_KEY_ID=testing
           AWS_SECRET_ACCESS_KEY=testing
           AWS_ENDPOINT_URL_SECRETS_MANAGER=http://moto-g6:5000
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -2058,11 +2079,18 @@ jobs:
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           CONNECTOR_AUTO_DISABLE_AFTER=3
           CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback
           CONNECTOR_OAUTH_ALLOW_HTTP=true
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -2160,8 +2188,15 @@ jobs:
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
-          UPLOAD_S3_ACCESS_KEY=rustfsadmin
-          UPLOAD_S3_SECRET_KEY=rustfsadmin
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
