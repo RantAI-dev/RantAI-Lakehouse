@@ -263,3 +263,32 @@ Compose:
 ## Review
 
 *(planner)*
+
+### Planner's review, 2026-10-16, at `8c8deb68` (merged into the phase branch as `d0b3e9ae`)
+
+No `BLOCKER`. Accepted departures from the plan:
+- The migration's `CHECK` is "an approval or an asset" instead of "an
+  approval or a granter": `granted_by_user_id` is `ON DELETE SET NULL`, so a
+  check on it would make deleting the granting user fail.
+- `ApiError::Gone` (410) is new in `lakehouse-core` for a restore window
+  that has passed.
+- Restore covers a Bronze dataset's table in the `bronze` namespace; Silver
+  and Gold tables answer `supported: false` with the reason (they are
+  ClickHouse tables, which the spec's restore does not reach).
+- The deleted-tables lookup pages Lakekeeper's list (100 per page, at most
+  20 pages) because the product does not hold namespace ids.
+
+The merge conflicted only in two test files (`policy.rs` and
+`tests/route_auth.rs`), where `DATA-13` and `DATA-15` each added tests at
+the same place; both sides' tests are kept whole. `cargo check -p
+lakehouse-api --all-targets` and `cargo fmt --check` passed after the merge.
+
+**Spec rows, as delivered:** preview, usage and access met in code; restore
+partly met (only drops after the soft-delete profile is applied; Bronze
+only); history author partly met (versions written through dlt say
+"unknown").
+
+**Not verified.** No Rust test, no Lakekeeper call and no gate step has run;
+CI on #106 runs them. Five heavy Dagster loader tests did not finish on
+this machine (two of them pass through code this item changed); CI's
+Dagster job runs them.
