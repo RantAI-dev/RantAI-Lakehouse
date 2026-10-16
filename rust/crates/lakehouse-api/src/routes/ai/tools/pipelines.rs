@@ -603,9 +603,11 @@ pub(super) async fn set_pipeline_target_lag(
             None => pipeline_arg.clone(),
         }
     };
+    // BLD-2 review R2 BLOCKER 1: pass tool own headers (&HeaderMap::new())
     let res = crate::routes::authored_pipelines::apply_set_target_lag(
         state,
         principal,
+        &HeaderMap::new(),
         &pipeline_id,
         target_lag,
     )

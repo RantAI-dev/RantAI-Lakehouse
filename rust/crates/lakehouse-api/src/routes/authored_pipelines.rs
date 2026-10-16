@@ -1171,21 +1171,18 @@ pub fn validate_target_lag(lag: Option<pipelines::TargetLag>) -> Result<(), ApiE
 /// # Errors
 ///
 /// Returns 404 if the pipeline does not exist; 400 on cycle or invalid lag; 503 if store is down.
+// BLD-2 review R2 BLOCKER 1: pass caller headers so X-Tenant is preserved
 pub async fn apply_set_target_lag(
     state: &AppState,
     principal: &Principal,
+    headers: &HeaderMap,
     pipeline_id: &str,
     target_lag: Option<pipelines::TargetLag>,
 ) -> ApiResult<pipelines::Pipeline> {
     // BLD-2 review R1 BLOCKER 1: authored_only and in_scope checks inside apply_set_target_lag
+    // BLD-2 review R2 BLOCKER 1: in_scope uses passed caller headers
     authored_only(pipeline_id)?;
-    in_scope(
-        state.pg.as_deref(),
-        principal,
-        &HeaderMap::new(),
-        pipeline_id,
-    )
-    .await?;
+    in_scope(state.pg.as_deref(), principal, headers, pipeline_id).await?;
     validate_target_lag(target_lag)?;
     let pool = crate::routes::pipelines::pool(state)?;
     let updated = pipelines::set_target_lag(pool, pipeline_id, target_lag)
@@ -1221,7 +1218,7 @@ pub async fn set_target_lag(
     authored_only(&id)?;
     in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
     let body: SetTargetLagBody = crate::routes::pipelines::parse_body(&body)?;
-    let updated = apply_set_target_lag(&state, &principal, &id, body.target_lag).await?;
+    let updated = apply_set_target_lag(&state, &principal, &headers, &id, body.target_lag).await?;
     let reloaded = reload_orchestrator(&state).await;
     Ok(ApiJson(with_orchestrator(&updated, reloaded)))
 }
@@ -4390,6 +4387,141 @@ mod tests {
             .await
             .unwrap_err();
 
+            assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+        }
+
+        /// BLD-2 review R2 BLOCKER 1: a user in tenants [A, B] acting through
+        /// X-Tenant: B can set target lag on a tenant-B pipeline (200).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_allows_user_in_multiple_tenants_acting_as_second_tenant(
+            pool: sqlx::PgPool,
+        ) {
+            let (state, _server) = test_state(&pool).await;
+            let tenant_a = provision_tenant(&pool, "multi-tenant-a").await;
+            let tenant_b = provision_tenant(&pool, "multi-tenant-b").await;
+
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-b-multi".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: Some(tenant_b),
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-b-multi".to_owned()),
+                    target_lag: None,
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let caller_ab = Principal {
+                tenant_ids: vec![tenant_a, tenant_b],
+                ..principal(PrincipalId::User(uuid::Uuid::from_u128(99)))
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("x-tenant", tenant_b.to_string().parse().unwrap());
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 10 }
+            }))
+            .expect("body");
+
+            let res = set_target_lag(
+                State(state),
+                Extension(caller_ab),
+                headers,
+                Path(pl.id.clone()),
+                Bytes::from(body),
+            )
+            .await
+            .expect("set_target_lag succeeds when acting as tenant B");
+
+            assert_eq!(res.0["targetLag"], json!({ "kind": "lag", "minutes": 10 }));
+        }
+
+        /// BLD-2 review R2 BLOCKER 1: a Platform Admin acting through X-Tenant: B
+        /// can save lag on a B pipeline (200), and gets 404 when acting as X-Tenant: A.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_allows_platform_admin_acting_through_x_tenant(pool: sqlx::PgPool) {
+            let (state, _server) = test_state(&pool).await;
+            let tenant_a = provision_tenant(&pool, "admin-tenant-a").await;
+            let tenant_b = provision_tenant(&pool, "admin-tenant-b").await;
+
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-b-admin".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: Some(tenant_b),
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-b-admin".to_owned()),
+                    target_lag: None,
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let admin = Principal {
+                tenant_ids: vec![tenant_a, tenant_b],
+                ..unrestricted_principal()
+            };
+            let mut headers_b = HeaderMap::new();
+            headers_b.insert("x-tenant", tenant_b.to_string().parse().unwrap());
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 10 }
+            }))
+            .expect("body");
+
+            let res = set_target_lag(
+                State(state.clone()),
+                Extension(admin.clone()),
+                headers_b,
+                Path(pl.id.clone()),
+                Bytes::from(body.clone()),
+            )
+            .await
+            .expect("admin acting as tenant B succeeds");
+            assert_eq!(res.0["targetLag"], json!({ "kind": "lag", "minutes": 10 }));
+
+            // Acting as tenant A against tenant B's pipeline must 404
+            let mut headers_a = HeaderMap::new();
+            headers_a.insert("x-tenant", tenant_a.to_string().parse().unwrap());
+            let err = set_target_lag(
+                State(state),
+                Extension(admin),
+                headers_a,
+                Path(pl.id),
+                Bytes::from(body),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
         }
     }
