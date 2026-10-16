@@ -163,7 +163,7 @@ point-in-time recovery; off-site replication; Kafka.
   - Restore runtime: `scripts/restore-from-backup.sh --force 20261016T074234Z` completed in 82s (Postgres 41s, Warehouse 10s, ClickHouse 8s, Stack bring-up 23s)
   - Restored app readiness: 12s; Total restore time: 94s
   - AC2 Verifications:
-    - User sign-in (`ops7_drill_user@example.com` / `DrillPass123!`): `HTTP 200 OK`
+    - User sign-in (`ops7_drill_user@example.com` / `<password generated at run time>`): `HTTP 200 OK`
     - Catalog access (`GET /api/catalog`): `HTTP 200 OK`
     - ClickHouse Iceberg count (`SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1`): `2000` (pre=2000)
     - ClickHouse CDC offset (`SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\` WHERE connector_id = 'postgres-cdc-demo'`): `125` (pre=125)
@@ -276,7 +276,7 @@ script and in `backup_job.py`'s subprocess calls (values through `env=`,
 never argv). Add the ClickHouse `RESTORE … FROM S3(...)` statement to E3's
 masking check (query log and server logs), as `BACKUP` was.
 
-**BLOCKER 4. A password is committed.** `DrillPass123!` appears in
+**BLOCKER 4. A password is committed.** A literal password appeared in
 `docs/plans/OPS-7-RESULT.md` (line ~107) and in this plan's handoff. It
 belonged to a throwaway user on a destroyed stack, but no password goes in
 the repository (rule 5, `dev-rules.md`). Replace it with "a password

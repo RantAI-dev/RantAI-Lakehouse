@@ -20,7 +20,7 @@ orders ingestion pipeline and additional operational state, completely destroyed
 and verified against every acceptance criterion (OPS-7-AC1, OPS-7-AC2, OPS-7-AC3).
 
 Every acceptance criterion passed:
-- **AC1:** The backup recorded every component and size (Postgres 4 DBs: 373 KB dumped; Warehouse: 9 objects, 54.4 KB; ClickHouse: 2 DBs, 37 objects, 18.6 KB).
+- **AC1:** The backup recorded every component and size (Postgres 4 DBs: 373 KB dumped; Warehouse: 9 objects, 54.5 KB; ClickHouse: 2 DBs, 37 objects, 18.6 KB).
 - **AC2:** On an emptied stack, restore recovered users, catalog tables, row counts (2,000 rows), permissions, Dagster run history (1 SUCCESS run), and change-capture offset (offset 125).
 - **AC3:** Step-by-step and total timings are recorded below.
 
@@ -59,12 +59,12 @@ Prior to backup, the stack was populated with representative production data:
 | --- | --- | --- |
 | **PostgreSQL** | `lakehouse` (app DB) | 10 MB |
 | **PostgreSQL** | `lakekeeper` (catalog DB) | 11 MB |
-| **PostgreSQL** | `dagster` (runs / event log) | 9.1 MB (9,359 kB) |
+| **PostgreSQL** | `dagster` (runs / event log) | 9.2 MB (9,399 kB) |
 | **PostgreSQL** | `openfga` (tuples) | 7.7 MB (7,911 kB) |
 | **PostgreSQL Total** | 4 databases on disk | **37.8 MB** |
-| **Warehouse S3** | `s3://lakehouse-warehouse/` | **9 objects, 54,389 bytes** |
+| **Warehouse S3** | `s3://lakehouse-warehouse/` | **9 objects, 54,494 bytes** |
 | **ClickHouse** | `lake` database | **5.89 KiB** (active parts) |
-| **ClickHouse** | `system` database | 1.42 MiB (active parts) |
+| **ClickHouse** | `system` database | 725.87 KiB (active parts) |
 
 ---
 
@@ -74,27 +74,27 @@ All steps were executed sequentially under the flock:
 
 | Step | Operation | Duration | Details / Notes |
 | --- | --- | --- | --- |
-| **Step 0** | Unit tests | **10.98s** | 823 passed, 258 deselected in Python 3.11 virtualenv |
-| **Step 1** | Stack bring-up | **50s** | Up `-d` with profiles `dagster`; health checks passed |
-| **Step 2** | Data seeding | **42s** | G3a Dagster job run (SUCCESS), ClickHouse offset insert, user/role/tuple seed |
+| **Step 0** | Unit tests | **13s** | 823 passed, 258 deselected (12.09s in Python 3.11 virtualenv) |
+| **Step 1** | Stack bring-up | **49s** | Up `-d` with profiles `dagster`; health checks passed |
+| **Step 2** | Data seeding | **32s** | G3a Dagster job run (SUCCESS), ClickHouse offset insert, user/role/tuple seed |
 | **Step 3** | Pre-backup measurement | **<1s** | Verification of pre-backup counts and volume sizes |
-| **Step 4** | Full backup execution | **6s** | `backup-job` container execution (see breakdown below) |
+| **Step 4** | Full backup execution | **4s** | `backup-job` container execution (see breakdown below) |
 | **Step 5** | Teardown stack (`down -v`) | **23s** | Volumes and containers destroyed; zero data retained on local stack |
-| **Step 6** | Object store bootstrap | **12s** | Minimal RustFS up to serve preserved backup bucket |
-| **Step 7** | Restore script execution | **82s** | `scripts/restore-from-backup.sh --force 20261016T074234Z` |
-| **Step 7.1** | *Postgres restore* | *41s* | 4 databases restored (373,100 bytes) |
-| **Step 7.2** | *Warehouse restore* | *10s* | 9 objects restored to `lakehouse-warehouse` |
-| **Step 7.3** | *ClickHouse restore* | *8s* | `default` and `lake` restored via native S3 RESTORE |
-| **Step 7.4** | *Stack bring-up* | *23s* | Remaining services up; health checks passed |
-| **Step 7.5** | Restored API settle | **12s** | Lakehouse API and Dagster webserver ready |
-| **Step 8** | Post-restore verification | **4s** | AC2 verification checks (all passed) |
-| **Total** | **End-to-End Restore (Steps 7 + 7.5)** | **94s** | Total time from blank slate to fully operational restored stack |
+| **Step 6** | Object store bootstrap | **16s** | Minimal RustFS up to serve preserved backup bucket |
+| **Step 7** | Restore script execution | **79s** | `scripts/restore-from-backup.sh --force 20261016T082316Z` |
+| **Step 7.1** | *Postgres restore* | *38s* | 4 databases restored (373,154 bytes) |
+| **Step 7.2** | *Warehouse restore* | *9s* | 9 objects restored to `lakehouse-warehouse` (53.2 KiB) |
+| **Step 7.3** | *ClickHouse restore* | *7s* | `default` and `lake` restored via native S3 RESTORE |
+| **Step 7.4** | *Stack bring-up* | *25s* | Remaining services up; health checks passed |
+| **Step 7.5** | Restored API settle | **10s** | Lakehouse API and Dagster webserver ready |
+| **Step 8** | Post-restore verification | **6s** | AC2 verification checks (all passed) |
+| **Total** | **End-to-End Restore (Steps 7 + 7.5)** | **89s** | Total time from blank slate to fully operational restored stack |
 
-### Backup breakdown (Step 4, container runtime 6s)
+### Backup breakdown (Step 4, container runtime 4s)
 
-- **PostgreSQL dump & upload:** 4 databases dumped (`pg_dump -Fc`) and uploaded to `s3://lakehouse-backups/<db>/` in **0.76s** (total 373,198 bytes).
-- **Warehouse bucket mirror:** 9 objects mirrored to `s3://lakehouse-backups/warehouse/` in **0.08s** (54,389 bytes).
-- **ClickHouse backup:** 2 databases (`default`, `lake`) backed up via native `BACKUP DATABASE ... TO S3(...)` in **0.49s** (37 objects, 18,644 bytes).
+- **PostgreSQL dump & upload:** 4 databases dumped (`pg_dump -Fc`) and uploaded to `s3://lakehouse-backups/<db>/` in **0.79s** (total 373,154 bytes).
+- **Warehouse bucket mirror:** 9 objects mirrored to `s3://lakehouse-backups/warehouse/` in **0.07s** (54,494 bytes).
+- **ClickHouse backup:** 2 databases (`default`, `lake`) backed up via native `BACKUP DATABASE ... TO S3(...)` in **0.35s** (37 objects, 18,644 bytes).
 
 ---
 
@@ -104,7 +104,7 @@ After the restore completed, the stack was verified against the acceptance check
 
 | Verification Check | Target / Method | Result | Evidence |
 | --- | --- | --- | --- |
-| **Extra user sign-in** | `POST /api/auth/login` with `ops7_drill_user@example.com` / `DrillPass123!` | **PASS** | HTTP 200 OK, session cookie issued |
+| **Extra user sign-in** | `POST /api/auth/login` with `ops7_drill_user@example.com` / `<password generated at run time>` | **PASS** | HTTP 200 OK, session cookie issued |
 | **Catalog access** | ClickHouse `icecat_g3a` DataLakeCatalog table listing (`SHOW TABLES FROM icecat_g3a LIKE '%bronze%'`) | **PASS** | `bronze.g3a_orders` (matches pre-backup: `bronze.g3a_orders`) |
 | **Iceberg table row count** | `SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1` | **PASS** | **2,000 rows** (matches pre-backup: 2,000) |
 | **Change-capture offset survival** | `SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\` WHERE connector_id = 'postgres-cdc-demo'` | **PASS** | Pre-seeded committed offset **125** survived restore intact (pre=125, post=125) |
