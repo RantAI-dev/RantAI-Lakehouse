@@ -78,7 +78,10 @@ test_authored_factory.py`'s unit tests carry a stub instance, and the
 exactly that shape.
 
 1. a one-table run of the chain's OWN source table starts the chain, and
-   the chain's Silver output carries the rows it should;
+   the chain's Silver output holds exactly `count(DISTINCT id)` rows of the
+   Bronze table it read -- both counted through `ClickHouse`, the same
+   comparison the pre-existing step below it makes (BLD-4 review R1
+   SHOULD-FIX 7 asked for the count this section claimed to be proven);
 2. a one-table run of ANOTHER table does NOT, within two sensor intervals
    (Dagster's default 30 s evaluation interval, verified against the pinned
    1.13.20 and doubled in the gate's own wait).
@@ -242,6 +245,23 @@ class G7Failure(Exception):
     pass
 
 
+class G7Fatal(G7Failure):
+    """A `G7Failure` a `_wait_for` loop must NOT retry (BLD-4 review R1
+    SHOULD-FIX 7).
+
+    `_wait_for` exists to ride out a stack that is still coming up, so it
+    swallows whatever its check raises and reports the last cause when the
+    deadline passes. For a check that only waits for data to appear that
+    is right; for a check that can also hit a SERVICE that is down it is
+    the wrong report -- the sensor-tick wait answers a 401 or a 500 for
+    its full 300 s and then says "timed out waiting for the chain's
+    dependency sensor to evaluate once", which reads like a slow sensor
+    rather than an API that is refusing the gate. A check that raises
+    this instead fails the gate at once, with the status code in the
+    message. It subclasses `G7Failure` so `main()` still reports it as
+    `[g7] FAILED: ...` and returns 1."""
+
+
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None:
     """Duplicated from `ops/g3a/g3a_test.py:71-82`'s `_wait_for` -- same
     shape, same reason (`ops/g4`/`ops/g6` each carry their own copy too,
@@ -254,6 +274,8 @@ def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None
             if check():
                 print(f"[g7] ready: {name}")
                 return
+        except G7Fatal:
+            raise
         except Exception as exc:  # noqa: BLE001 - report the real cause below
             last_err = exc
         time.sleep(interval_s)
@@ -695,8 +717,12 @@ def _dagster_run_status(run_id: str) -> str | None:
         "query($rid:ID!){ pipelineRunOrError(runId:$rid)"
         "{ __typename ... on Run { status } } }"
     )
-    resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
-    resp.raise_for_status()
+    # BLD-4 review R1 SHOULD-FIX 7: turn HTTPError into G7Failure
+    try:
+        resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise G7Failure(f"GraphQL run status query failed: {exc}") from exc
     block = (resp.json().get("data") or {}).get("pipelineRunOrError") or {}
     return block.get("status")
 
@@ -719,8 +745,12 @@ def _chain_run_ids(pipeline_id: str) -> list[str]:
     (`pipelines::runs`, which lists the `authored__<id>` job's runs). An
     `unavailable` payload (Dagster unreachable) is a gate failure, not an
     empty chain: the route says so instead of answering `[]`."""
-    resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=30)
-    resp.raise_for_status()
+    # BLD-4 review R1 SHOULD-FIX 7: turn HTTPError into G7Failure
+    try:
+        resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise G7Failure(f"GET /api/pipelines/{pipeline_id}/runs failed: {exc}") from exc
     body = resp.json()
     if body.get("unavailable"):
         raise G7Failure(f"GET .../runs reported the orchestrator unavailable: {body['unavailable']}")
@@ -751,6 +781,17 @@ def _dependency_sensor_has_ticked(pipeline_id: str) -> bool:
     tick is the cursor-initialising one.
     """
     resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/schedule-ticks", timeout=30)
+    # BLD-4 review R1 SHOULD-FIX 7: an API that refuses or errors fails the
+    # gate now, not after this check's 300 s wait expired and the timeout
+    # blamed a sensor that was never asked. A 404 is the one non-ok answer
+    # that IS a real answer (the chain has no sensor tick yet), so it stays
+    # a `False`.
+    if resp.status_code == 401 or resp.status_code >= 500:
+        raise G7Fatal(
+            f"GET /api/pipelines/{pipeline_id}/schedule-ticks answered "
+            f"{resp.status_code} {resp.text}; the gate cannot tell whether the "
+            "sensor has ticked"
+        )
     if not resp.ok:
         return False
     return any(t.get("kind") == "sensor" for t in resp.json().get("ticks", []))
@@ -773,12 +814,15 @@ def _ensure_catalog_database() -> None:
 
 
 def _bronze_rows(table: str) -> int:
-    """How many rows a Bronze Iceberg table holds, read through this gate's
-    own `DataLakeCatalog` database -- the same read
+    """How many DISTINCT `id`s a Bronze Iceberg table holds, read through
+    this gate's own `DataLakeCatalog` database -- the same read
     `step_verify_the_silver_rows_match_the_bronze_source` does, WITH a
     `WHERE 1` so the aggregate walks the rows rather than the snapshot's
     metadata (R11, `ops/lint/check_bare_iceberg_count.py`; the docstring on
     the step above explains why its prose spells the aggregate out too).
+    Distinct ids, not rows, because both of this gate's row-count
+    assertions compare the Bronze side against a Silver side that runs
+    `dedupe(id)` first: the comparable quantity is one row per id.
 
     The catalog database is ensured here and not by the caller: the BLD-4
     half reads Bronze before any other step of this gate has created it, and
@@ -801,15 +845,22 @@ def _create_the_ingest_chained_pipeline() -> str:
     connector's load.
 
     The transforms name the same fixture columns the existing step's do
-    (`ingest_demo.orders` is that table's source), so the only thing this
-    pipeline proves is the trigger, not a new read path.
+    (`ingest_demo.orders` is that table's source), with `dedupe(id)` first
+    for the same reason that step has it: the row-count assertion below
+    compares the chain's Silver rows against `count(DISTINCT id)` of the
+    Bronze table (R11 forbids an unqualified aggregate there), so the
+    output has to be one row per distinct `id` for the two counts to be
+    comparable at all -- with only `select`, a Bronze table carrying a
+    repeated id would make the assertion fail for a shape the gate never
+    claimed to prove. The only thing this pipeline proves is the trigger,
+    not a new read path.
     """
     create = API.post(
         f"{API_URL}/api/pipelines",
         json={
             "name": "g7_dep_ingest_chain", "kind": "batch",
             "sourceZone": "bronze", "sourceTable": BRONZE_TABLE_A,
-            "transforms": ["select(id,customer)"],
+            "transforms": ["dedupe(id)", "select(id,customer)"],
             "targetZone": "silver", "targetTable": CHAIN_SILVER_TABLE,
             "schedule": "manual",
             "dependsOn": [UPSTREAM_JOB_NAME],
@@ -850,7 +901,7 @@ def step_a_load_of_its_own_table_triggers_the_chain(pipeline_id: str) -> None:
         60,
     )
     loaded = _bronze_rows(BRONZE_TABLE_A)
-    print(f"[g7] bronze.{BRONZE_TABLE_A} holds {loaded} rows, so the anchor this chain needs exists")
+    print(f"[g7] bronze.{BRONZE_TABLE_A} holds {loaded} distinct ids, so the anchor this chain needs exists")
 
     def appeared() -> bool:
         return bool(_chain_run_ids(pipeline_id))
@@ -866,6 +917,18 @@ def step_a_load_of_its_own_table_triggers_the_chain(pipeline_id: str) -> None:
     silver_rows = int(
         ch_query(f"SELECT count() FROM silver.`{CHAIN_SILVER_TABLE}` FORMAT TabSeparated").strip()
     )
+    # BLD-4 review R1 SHOULD-FIX 7: the module doc and the CHANGELOG entry
+    # claim the chain's output CARRIES the rows, so the gate asserts them:
+    # one Silver row per distinct Bronze id, counted on both sides through
+    # ClickHouse rather than read out of the run's own report (the same
+    # discipline `step_verify_the_silver_rows_match_the_bronze_source`
+    # follows, and the reason that step's pipeline carries `dedupe(id)`).
+    if silver_rows != loaded or silver_rows <= 0:
+        raise G7Failure(
+            f"silver.{CHAIN_SILVER_TABLE} holds {silver_rows} rows, expected "
+            f"{loaded} (one per distinct id of bronze.{BRONZE_TABLE_A}); the "
+            "chain ran but its output does not carry the loaded rows"
+        )
     print(
         f"[g7] the chain ran ({chain_runs[0]}) and wrote {silver_rows} rows to "
         f"silver.{CHAIN_SILVER_TABLE}"
@@ -897,7 +960,7 @@ def step_a_load_of_another_table_does_not_trigger_the_chain(pipeline_id: str) ->
         60,
     )
     print(
-        f"[g7] bronze.{BRONZE_TABLE_B} holds {_bronze_rows(BRONZE_TABLE_B)} rows; "
+        f"[g7] bronze.{BRONZE_TABLE_B} holds {_bronze_rows(BRONZE_TABLE_B)} distinct ids; "
         "the chain must not run"
     )
 
