@@ -41,6 +41,7 @@ from dagster import (
     RunsFilter,
     build_op_context,
     job,
+    op,
 )
 
 from dispar_orchestrate import authored_factory, authored_transforms
@@ -662,7 +663,8 @@ class AuthoredScheduleTest(unittest.TestCase):
 class _FakeDagsterRun:
     """Stand-in for `dagster.DagsterRun` carrying only the fields the
     sensor body reads (`job_name`, `start_time`, `end_time`, `run_id`,
-    `status`). The factory module never constructs one of these -- it
+    `status`, and -- for a `file_ingest_job` run -- its resolved
+    `run_config`). The factory module never constructs one of these -- it
     only consumes whatever `context.instance.get_runs` returns -- so a
     minimal stub is enough."""
 
@@ -673,36 +675,61 @@ class _FakeDagsterRun:
         status: DagsterRunStatus,
         start_time: float | None,
         end_time: float | None,
+        run_config: Any = None,
     ) -> None:
         self.job_name = job_name
         self.run_id = run_id
         self.status = status
         self.start_time = start_time
         self.end_time = end_time
+        self.run_config = run_config
+
+
+class _FakeRunRecord:
+    """Drop-in for `dagster._core.storage.dagster_run.RunRecord`.
+
+    In Dagster 1.13.20 the run's `start_time`/`end_time` live HERE and not
+    on the `DagsterRun` (`DATA-19` gate finding, `authored_factory`'s
+    "Why RECORDS and not runs"), so the stub is faithful to that shape
+    rather than to what an older Dagster returned. A stub with the times
+    on the run itself is what let `R3 plan 2a`'s sensor pass its unit
+    tests and fail on every real tick."""
+
+    def __init__(self, run: _FakeDagsterRun) -> None:
+        self.dagster_run = run
+        self.start_time = run.start_time
+        self.end_time = run.end_time
 
 
 class _StubInstance:
     """Drop-in for `context.instance`. Records every `(filter, limit)`
-    pair the sensor asks for and returns the run list the test set up
-    for that pair. Indexed by `RunsFilter.job_name` so the sensor's
-    per-upstream query and per-downstream query can be answered
-    independently."""
+    pair the sensor asks for and returns the record list the test set up
+    for that pair, newest first, honouring the `limit` the sensor chose.
+    Indexed by `RunsFilter.job_name` so the sensor's per-upstream query
+    and per-downstream query can be answered independently.
+
+    Only `get_run_records` exists here on purpose: a sensor that went
+    back to `get_runs` would raise `AttributeError` in every test rather
+    than quietly reading times off an object that no longer has them."""
 
     def __init__(self, runs_by_job: dict[str, list[_FakeDagsterRun]]) -> None:
         self._runs_by_job = runs_by_job
         self.calls: list[tuple[RunsFilter | None, int | None]] = []
 
-    def get_runs(
+    def get_run_records(
         self,
         filters: RunsFilter | None = None,
         cursor: str | None = None,
         limit: int | None = None,
         bucket_by: Any = None,
         ascending: bool = False,
-    ) -> Sequence[_FakeDagsterRun]:
+    ) -> Sequence[_FakeRunRecord]:
         self.calls.append((filters, limit))
         job_name = filters.job_name if filters else None
-        return list(self._runs_by_job.get(job_name, []))
+        runs = list(self._runs_by_job.get(job_name, []))
+        if limit is not None:
+            runs = runs[:limit]
+        return [_FakeRunRecord(run) for run in runs]
 
 
 class _StubContext:
@@ -1213,6 +1240,362 @@ class TestDependencySensor:
         # Same key for both ticks = one daemon-decided downstream run.
         assert out_a[0].run_key == out_b[0].run_key
         assert out_a[0].run_key == "authored-deps:upstream-a-1,upstream-b-1"
+
+
+def _file_ingest_run(
+    run_id: str, table: str | None, end_time: float = 200.0, start_time: float = 180.0
+) -> _FakeDagsterRun:
+    """A `file_ingest_job` SUCCESS run that loaded `table`, carrying the
+    SAME run-config shape `routes::uploads::run_config` launches the job
+    with (`ops.ingest_uploaded_file.config.bronze_table_name`). `table`
+    of `None` is a run launched without that config at all."""
+    config = (
+        {
+            "ops": {
+                "ingest_uploaded_file": {
+                    "config": {
+                        "upload_id": "up-1",
+                        "storage_key": "uploads/tenant/up-1.csv",
+                        "bronze_table_name": table,
+                        "load_mode": "replace",
+                        "encoding": "utf-8",
+                        "delimiter": ",",
+                        "header_row": 0,
+                    }
+                }
+            }
+        }
+        if table is not None
+        else {}
+    )
+    return _FakeDagsterRun(
+        job_name="file_ingest_job",
+        run_id=run_id,
+        status=DagsterRunStatus.SUCCESS,
+        start_time=start_time,
+        end_time=end_time,
+        run_config=config,
+    )
+
+
+def _build_bronze_dep_sensor(pid: str, depends_on: list[str], source_zone: str, source_table: str):
+    """A sensor for a pipeline whose SOURCE is `source_zone.source_table`
+    -- the field DATA-19 / D1 filters a `file_ingest_job` upstream by."""
+    pipeline = _dep_pipeline(pid, depends_on)
+    pipeline["definition"] = {**_ready_pipeline()["definition"], "sourceZone": source_zone, "sourceTable": source_table}
+
+    @job(name=f"authored__{pid.replace('-', '_')}")
+    def _placeholder_job() -> None:
+        return None
+
+    return build_authored_dependency_sensor(pipeline, authored_job=_placeholder_job)
+
+
+def _tick(sensor: Any, instance: _StubInstance, upstream_run: _FakeDagsterRun) -> list[Any]:
+    return list(sensor._run_status_sensor_fn(_StubContext(upstream_run, instance)))
+
+
+class TestFileIngestUpstreamIsFilteredByTable:
+    """DATA-19 / D1: `file_ingest_job` is a per-TABLE job, so a pipeline
+    that names it counts only the SUCCESS runs whose own run config says
+    they loaded THAT pipeline's source table. A load of any other table is
+    a run of a different chain and must not trigger this one -- otherwise
+    every upload anywhere re-runs every Bronze pipeline in the
+    deployment."""
+
+    def _instance(self, table_runs: list[_FakeDagsterRun]) -> _StubInstance:
+        return _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                "file_ingest_job": table_runs,
+            }
+        )
+
+    def test_a_successful_load_of_the_source_table_triggers_the_pipeline(self) -> None:
+        """The whole point of the feature: a re-upload of the pipeline's
+        OWN source table is a fresh SUCCESS run, so the chain fires with
+        a run_key naming that run."""
+        instance = self._instance([_file_ingest_run("up-1", "orders")])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:up-1"
+
+    def test_a_load_of_another_table_does_not_trigger_the_pipeline(self) -> None:
+        """A newer SUCCESS run of `file_ingest_job` that loaded a DIFFERENT
+        table is not a run of this chain. The unfiltered rule (newest run
+        wins) would have fired here, and would have fired again on every
+        upload in the deployment."""
+        instance = self._instance(
+            [
+                _file_ingest_run("other-new", "invoices", end_time=250.0),
+                _file_ingest_run("ours", "orders", end_time=200.0),
+            ]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "other-new"))
+
+        assert len(out) == 1
+        # It did NOT skip: its own table's load IS fresh, so the chain is
+        # allowed to run -- and the run_key names THAT run, never the
+        # other table's.
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_only_a_load_of_another_table_is_not_even_a_success_for_this_chain(self) -> None:
+        """With NO run for the source table at all, the chain waits and
+        says why -- the reason names the table and the rule, because
+        "waiting on file_ingest_job" alone reads as "the upload has not
+        run yet" when the real answer is "a DIFFERENT upload has, twice".
+        """
+        instance = self._instance(
+            [_file_ingest_run("other-1", "invoices"), _file_ingest_run("other-2", "shipments")]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "invoices"))
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "orders" in reason.skip_message
+        assert "file_ingest_job" in reason.skip_message
+
+    def test_a_run_without_the_config_is_not_a_match(self) -> None:
+        """A `file_ingest_job` run launched without the op config (a job
+        launch, a hand-made run, a future config shape) reads as "not
+        about our table", never as a match on an empty name."""
+        instance = self._instance([_file_ingest_run("no-config", None)])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+
+    def test_a_pipeline_whose_source_is_not_bronze_never_fires_on_an_upload(self) -> None:
+        """A stored row can predate the API's refusal
+        (`routes::authored_pipelines::validate_file_ingest_upstream`). A
+        non-Bronze source has no Bronze table to match, so the filter
+        matches nothing and the chain waits: unsupported, honestly, never
+        "works, approximately" by firing on every upload."""
+        instance = self._instance([_file_ingest_run("up-1", "orders")])
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "silver", "orders_clean")
+        out = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "silver" in reason.skip_message or "orders_clean" in reason.skip_message
+
+    def test_the_filtered_upstream_reads_more_than_one_run(self) -> None:
+        """The other upstreams still ask for exactly ONE run; the filtered
+        one asks for a bounded window, because "the newest run that loaded
+        our table" is not in the first one whenever a later upload
+        loaded another table."""
+        instance = self._instance(
+            [_file_ingest_run(f"other-{i}", "invoices") for i in range(3)]
+            + [_file_ingest_run("ours", "orders", end_time=150.0)]
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job"], "bronze", "orders")
+        _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+
+        limits = [limit for filters, limit in instance.calls if filters and filters.job_name == "file_ingest_job"]
+        assert limits == [authored_factory.FILE_INGEST_SCAN_LIMIT]
+
+    def test_the_all_upstreams_rule_holds_with_a_filtered_and_an_authored_upstream(self) -> None:
+        """Section 6, question 2: mixing a per-table `file_ingest_job`
+        with an authored pipeline changes WHICH run of the first one
+        counts, not the ALL rule: every upstream must be fresh, the first
+        stale one ends the tick with its own reason, and one round of
+        successes asks for one downstream run keyed on both."""
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                # Fresh for THIS chain, but the newest run of the job
+                # loaded another table.
+                "file_ingest_job": [
+                    _file_ingest_run("other-new", "invoices", end_time=250.0),
+                    _file_ingest_run("ours", "orders", end_time=200.0),
+                ],
+                "authored__pl_up_a": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_up_a",
+                        run_id="upstream-a-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=180.0,
+                        end_time=210.0,
+                    )
+                ],
+            }
+        )
+        sensor = _build_bronze_dep_sensor("pl-down-1", ["file_ingest_job", "pl-up-a"], "bronze", "orders")
+
+        fired = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+        assert len(fired) == 1
+        assert fired[0].run_key == "authored-deps:ours,upstream-a-1"
+
+        # The same graph with the AUTHORED upstream behind: the tick ends
+        # on that upstream, by name, and asks for nothing.
+        instance._runs_by_job["authored__pl_up_a"] = [
+            _FakeDagsterRun(
+                job_name="authored__pl_up_a",
+                run_id="upstream-a-1",
+                status=DagsterRunStatus.SUCCESS,
+                start_time=40.0,
+                end_time=50.0,
+            )
+        ]
+        behind = _tick(sensor, instance, _file_ingest_run("tick", "orders"))
+        assert len(behind) == 1
+        assert not isinstance(behind[0], RunRequest)
+        assert "pl-up-a" in behind[0].skip_message
+
+
+class TestFileIngestRunConfigReader:
+    """The config path the filter reads, and its refusals."""
+
+    def test_the_path_is_the_one_the_api_launches_with(self) -> None:
+        assert authored_factory.FILE_INGEST_OP_CONFIG == (
+            "ops",
+            "ingest_uploaded_file",
+            "config",
+            "bronze_table_name",
+        )
+
+    def test_a_resolved_config_reads_the_table_it_loaded(self) -> None:
+        run = _file_ingest_run("r", "stock_raw")
+        assert authored_factory._run_config_value(
+            run, authored_factory.FILE_INGEST_OP_CONFIG
+        ) == "stock_raw"
+
+    def test_a_missing_or_reshaped_config_answers_none(self) -> None:
+        path = authored_factory.FILE_INGEST_OP_CONFIG
+        none = _FakeDagsterRun("file_ingest_job", "r", DagsterRunStatus.SUCCESS, 1.0, 2.0)
+        assert authored_factory._run_config_value(none, path) is None
+        assert authored_factory._run_config_value(_file_ingest_run("r", None), path) is None
+        # A config that is a list, one whose `ops` is not a mapping, and
+        # a table name that is not a non-empty string all answer None
+        # rather than raising: a run storage that changed shape must not
+        # take a sensor tick down with it.
+        for config in (
+            [],
+            {"ops": "none"},
+            {"ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": 7}}}},
+            {"ops": {"ingest_uploaded_file": {"config": {"bronze_table_name": ""}}}},
+        ):
+            assert (
+                authored_factory._run_config_value(
+                    _FakeDagsterRun("file_ingest_job", "r", DagsterRunStatus.SUCCESS, 1.0, 2.0, config),
+                    path,
+                )
+                is None
+            ), config
+
+    def test_an_empty_table_name_matches_no_record(self) -> None:
+        records = [_FakeRunRecord(_file_ingest_run("r", "orders"))]
+        assert authored_factory._latest_record_for_table(records, "orders") is records[0]
+        assert authored_factory._latest_record_for_table(records, "") is None
+        assert authored_factory._latest_record_for_table(records, "invoices") is None
+
+    def test_a_real_runs_config_resolves_to_the_table_the_load_wrote(self) -> None:
+        """The assumption D1 rests on, proven on a REAL run instead of a
+        stub: `execute_in_process` against a temp instance writes a
+        `file_ingest_job` run whose stored `run_config` -- the exact
+        attribute `_run_config_value` reads, the exact value
+        `context.instance.get_runs` hands the sensor -- is read back and
+        resolves to the table that was launched.
+
+        This is why no tag was added to the launch (plan D1): the config
+        Dagster already stores carries the table. If a future Dagster
+        resolves the config into a different shape, this test fails here,
+        with the real payload, instead of the filter silently matching
+        nothing in production.
+        """
+        from dagster._core.test_utils import instance_for_test
+
+        from dispar_orchestrate.file_ingest import CONFIG_SCHEMA
+
+        @op(name="ingest_uploaded_file", config_schema=CONFIG_SCHEMA)
+        def _ingest_uploaded_file(context):  # noqa: ANN001, ANN202 - a Dagster op
+            return {"bronze_table_name": context.op_config["bronze_table_name"]}
+
+        @job(name="file_ingest_job")
+        def _file_ingest_job() -> None:
+            _ingest_uploaded_file()
+
+        # `routes::uploads::run_config`'s own shape, verbatim.
+        launch = {
+            "ops": {
+                "ingest_uploaded_file": {
+                    "config": {
+                        "upload_id": "up-1",
+                        "storage_key": "uploads/t/up-1.csv",
+                        "bronze_table_name": "stock_raw",
+                        "load_mode": "replace",
+                        "encoding": "utf-8",
+                        "delimiter": ",",
+                        "header_row": 0,
+                    }
+                }
+            }
+        }
+        with instance_for_test() as instance:
+            result = _file_ingest_job.execute_in_process(
+                run_config=launch, instance=instance, raise_on_error=False
+            )
+            assert result.success
+            runs = instance.get_runs(RunsFilter(job_name="file_ingest_job"), limit=1)
+            assert len(runs) == 1
+            stored = runs[0]
+            assert (
+                authored_factory._run_config_value(
+                    stored, authored_factory.FILE_INGEST_OP_CONFIG
+                )
+                == "stock_raw"
+            ), f"the stored run config resolved to {stored.run_config!r}"
+
+            # And the record the SENSOR reads carries the times and the
+            # run whose config this is: `get_run_records` is what the
+            # sensor asks for, since Dagster 1.13 moved `start_time` /
+            # `end_time` off the run and onto the record.
+            records = instance.get_run_records(
+                RunsFilter(job_name="file_ingest_job"), limit=1
+            )
+            assert len(records) == 1
+            record = records[0]
+            assert record.dagster_run.run_id == stored.run_id
+            # THE finding this gate's step 10 caught, pinned so it cannot
+            # come back: the run carries no times and the record does.
+            assert not hasattr(stored, "start_time")
+            assert not hasattr(stored, "end_time")
+            assert isinstance(record.start_time, float)
+            assert isinstance(record.end_time, float)
+            assert record.start_time < record.end_time
+            assert (
+                authored_factory._latest_record_for_table([record], "stock_raw")
+                is record
+            )
+            assert (
+                authored_factory._latest_record_for_table([record], "invoices_raw")
+                is None
+            )
 
 
 class TestLagSensor:

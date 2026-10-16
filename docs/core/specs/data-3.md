@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `DATA-4`, and a new ADR that replaces ADR 0010's direction |
+| Blocked by | `DATA-4`, and a new ADR that replaces ADR 0010's direction |
 
 ## Why
 

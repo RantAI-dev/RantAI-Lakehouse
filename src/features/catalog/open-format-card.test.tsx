@@ -160,7 +160,7 @@ describe("OpenFormatCard", () => {
     // error message routes through the service action state so the test
     // can assert the server's actual message appears in the DOM.
     let putCalled = false
-    global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+    global.fetch = mock(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString()
       if (url.includes("/publication")) {
         if (putCalled) {
@@ -274,4 +274,88 @@ describe("OpenFormatCard", () => {
     render(<OpenFormatCard assetId="serving.mart_a" />)
     await waitFor(() => expect(screen.getByText("ClickHouse connection refused (111)")).toBeDefined())
   })
+
+  it("shows Copies kept and oldest timestamp when trim succeeded", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "success",
+            copiesKept: 7,
+            oldestKeptExportedAt: "2026-10-14T10:00:00Z",
+            finishedAt: "2026-10-14T10:05:00Z",
+            reason: null,
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Copies kept")).toBeDefined())
+    expect(screen.getByText(/7 \(oldest/)).toBeDefined()
+  })
+
+  it("shows failed trim reason and never trimmed when trim failed", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: {
+            status: "failed",
+            copiesKept: null,
+            oldestKeptExportedAt: null,
+            finishedAt: "2026-10-14T10:05:00Z",
+            reason: "delete_failed",
+          },
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Trim failed: delete_failed")).toBeDefined())
+    expect(screen.queryByText("Copies kept")).toBeNull()
+    expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
+  })
+
+  it("never shows trimmed when trim is null", async () => {
+    global.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.includes("/publication")) {
+        return jsonResponse({
+          ...publicationBody,
+          trim: null,
+        })
+      }
+      if (url.includes("/api/gold/export/mart_a") && !url.includes("/publication") && !url.includes("/exports")) {
+        return mockReadBack()
+      }
+      if (url.includes("/api/gold/exports")) {
+        return jsonResponse(emptyRunsBody)
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }) as unknown as typeof fetch
+
+    render(<OpenFormatCard assetId="serving.mart_a" />)
+    await waitFor(() => expect(screen.getByText("Up to date")).toBeDefined())
+    expect(screen.queryByText("Copies kept")).toBeNull()
+    expect(screen.queryByText(/\btrimmed\b/i)).toBeNull()
+  })
+
 })

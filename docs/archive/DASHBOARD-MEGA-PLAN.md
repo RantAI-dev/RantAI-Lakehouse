@@ -1,5 +1,11 @@
 # Mega Plan — Dashboards ala Tableau/Metabase (1:1 fitur)
 
+> **Archived 2026-10-15 (`DOC-1`).** This document predates the current build and
+> contradicts it in places. It is kept for history only and is not maintained.
+> What the product is and has: [`docs/core/PRODUCT.md`](../core/PRODUCT.md);
+> the work list: [`docs/core/BACKLOG.md`](../core/BACKLOG.md). Where any of
+> them differs from the code, trust the code.
+
 Tujuan: menjadikan **Dashboards** produk BI penuh di dalam konsol lakehouse —
 multi-dashboard (buat/kelola seperti chat), kanvas **drag/drop/resize**, banyak
 tipe tile, filter interaktif, mode edit/lihat, tersimpan di lakehouse.

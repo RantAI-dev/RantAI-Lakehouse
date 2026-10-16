@@ -3025,6 +3025,14 @@ pub async fn create(
     // `create_pipeline` tool lands here too, so it is refused with the
     // same wording its schema enum no longer offers.
     crate::routes::authored_pipelines::validate_target_zone(&body.target_zone)?;
+    // DATA-19 / D2: `file_ingest_job` is only an upstream of a pipeline
+    // that reads a Bronze table, so the create route applies the same
+    // guard `authored_pipelines::update` and `restore_version` run — one
+    // rule, one message, three call sites.
+    crate::routes::authored_pipelines::validate_file_ingest_upstream(
+        &body.source_zone,
+        Some(&body.depends_on),
+    )?;
     for (index, transform) in body.transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))

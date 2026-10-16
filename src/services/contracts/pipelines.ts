@@ -164,6 +164,20 @@ export type PipelineDetail = Omit<Pipeline, "description"> & {
    */
   orchestratorJob?: string | null
   /**
+   * Authored pipelines only: the upstream ids whose successful runs must
+   * precede this one's, exactly as `POST /api/pipelines` and
+   * `PUT /api/pipelines/{id}` take it (migration `0052`). The detail
+   * route returns it as part of the pipeline row
+   * (`routes::pipelines::authored_detail`); a Dagster job has no row and
+   * no such chain, so the key is absent for one — read it only on the
+   * edit page, which is authored by definition.
+   *
+   * `"file_ingest_job"` in this list is what makes a re-upload of the
+   * pipeline's own Bronze table run it again
+   * (`docs/core/features/uploads-feed-pipelines.md`, decision 2).
+   */
+  dependsOn?: string[]
+  /**
    * NOT part of `GET /api/pipelines/{id}`. `routes::pipelines::detail`
    * (WS4 item C1) returns no `runs` field -- runs have their own route,
    * `GET /api/pipelines/{id}/runs`, reached through `listRuns`. Declaring
@@ -210,6 +224,15 @@ export type CreatePipelineInput = {
   /** Optional ingress connector this pipeline reads through (WS4 item F5) — mirrors `Pipeline.connectorId`. */
   connectorId?: string
   description?: string
+  /**
+   * Upstream ids whose successful runs must precede this one's
+   * (migration `0052`). `"file_ingest_job"` is accepted only for a
+   * `bronze` source and means "re-upload of this table runs me again";
+   * the server refuses it otherwise
+   * (`routes::authored_pipelines::validate_file_ingest_upstream`).
+   */
+  dependsOn?: string[]
+  /** BLD-2: the freshness promise this pipeline is created with, if any. */
   targetLag?: TargetLag | null
 }
 
@@ -238,6 +261,13 @@ export type UpdatePipelineInput = {
   schedule: string
   owner?: string
   description?: string
+  /**
+   * Replaces the stored chain; omitting it leaves the stored chain
+   * alone (`routes::authored_pipelines::UpdateBody::depends_on`, PR #57
+   * F1.8 — an absent field used to write `[]` and erase every upstream).
+   * See [`CreatePipelineInput.dependsOn`] for the `file_ingest_job` rule.
+   */
+  dependsOn?: string[]
 }
 
 /** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */

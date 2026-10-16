@@ -22,10 +22,18 @@
 //! (the console's "Export now" button and the Dagster schedule) through
 //! the one HTTP handler both call, rather than recording only
 //! Dagster-triggered runs.
+//!
+//! # Copy retention and trim history (DATA-2)
+//!
+//! `console.gold_trim_run` records each trim operation executed by Dagster's
+//! `trim_gold_mart` op, capturing status, copies kept, oldest kept timestamp,
+//! copies removed, snapshots expired, files removed, and fixed failure reasons.
+//! [`last_trim`] reads the latest trim record per mart for inclusion in
+//! `GET /api/gold/export/{mart}/publication`.
 
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::routes::support::{nullable_i64_col, nullable_u64_col};
@@ -35,6 +43,50 @@ use crate::routes::support::{nullable_i64_col, nullable_u64_col};
 /// cached, so a transient `ClickHouse` outage doesn't permanently wedge
 /// every later call).
 static TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Idempotently create the `console` database (if `lakehouse-bi` has not
+/// Cached flag for `console.gold_trim_run`.
+static TRIM_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Idempotently create `console.gold_trim_run` (DATA-2 D5 + A1).
+///
+/// # Errors
+///
+/// Returns [`ChError`] if any DDL statement fails.
+pub async fn ensure_gold_trim_run_table(ch: &ChClient) -> Result<(), ChError> {
+    TRIM_TABLE_ENSURED
+        .get_or_try_init(|| ensure_gold_trim_run_table_uncached(ch))
+        .await
+        .map(drop)
+}
+
+async fn ensure_gold_trim_run_table_uncached(ch: &ChClient) -> Result<(), ChError> {
+    ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
+        .await?;
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.gold_trim_run (\n\
+           id String,\n\
+           mart String,\n\
+           status String,\n\
+           copies_kept Nullable(UInt32),\n\
+           oldest_kept_exported_at Nullable(DateTime64(3)),\n\
+           copies_removed Nullable(UInt32),\n\
+           snapshots_expired Nullable(UInt32),\n\
+           files_removed Nullable(UInt32),\n\
+           reason Nullable(String),\n\
+           started_at DateTime64(3),\n\
+           finished_at DateTime64(3)\n\
+         ) ENGINE = MergeTree ORDER BY (mart, started_at)",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.gold_trim_run ADD COLUMN IF NOT EXISTS files_removed Nullable(UInt32)",
+        None,
+    )
+    .await?;
+    Ok(())
+}
 
 /// Idempotently create the `console` database (if `lakehouse-bi` has not
 /// already, on this process) and `console.gold_export_run`.
@@ -422,11 +474,151 @@ fn parse_content_fingerprint_row(row: &serde_json::Map<String, Value>) -> Option
     Some(format!("{row_count}:{content_sum}:{schema_hash}"))
 }
 
+/// The latest trim run summary from `console.gold_trim_run` (DATA-2 D6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoldTrimSummary {
+    /// Trim run status (`"success"`, `"failed"`, `"nothing_to_trim"`).
+    pub status: String,
+    /// Number of copies kept after trimming, or `None` if failed or not measured.
+    pub copies_kept: Option<u32>,
+    /// Oldest retained copy's `_exported_at` formatted as RFC 3339, or `None`.
+    pub oldest_kept_exported_at: Option<String>,
+    /// RFC 3339 timestamp when the trim run finished.
+    pub finished_at: String,
+    /// Failure or status reason from a closed set of fixed strings, or `None`.
+    pub reason: Option<String>,
+}
+
+/// Convert unix epoch milliseconds to an RFC 3339 UTC string.
+#[must_use]
+pub fn millis_to_rfc3339(ms: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .ok()
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+}
+
+fn last_trim_sql(mart: &str) -> String {
+    format!(
+        "SELECT status, copies_kept, \
+                toString(toUnixTimestamp64Milli(oldest_kept_exported_at)) AS oldest_kept_ms, \
+                toString(toUnixTimestamp64Milli(finished_at)) AS finished_ms, \
+                reason \
+         FROM console.gold_trim_run \
+         WHERE mart = {mart} \
+         ORDER BY started_at DESC LIMIT 1 FORMAT JSON",
+        mart = SqlLiteral::from(mart),
+    )
+}
+
+fn row_to_trim_summary(row: &serde_json::Map<String, Value>) -> GoldTrimSummary {
+    let status = row
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let copies_kept = nullable_u64_col(row, "copies_kept").and_then(|v| u32::try_from(v).ok());
+    let oldest_kept_exported_at = row
+        .get("oldest_kept_ms")
+        .and_then(Value::as_str)
+        .and_then(|ms| ms.parse::<i64>().ok())
+        .and_then(millis_to_rfc3339);
+    let finished_at = row
+        .get("finished_ms")
+        .and_then(Value::as_str)
+        .and_then(|ms| ms.parse::<i64>().ok())
+        .and_then(millis_to_rfc3339)
+        .unwrap_or_default();
+    let reason = row
+        .get("reason")
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    GoldTrimSummary {
+        status,
+        copies_kept,
+        oldest_kept_exported_at,
+        finished_at,
+        reason,
+    }
+}
+
+/// Read `mart`'s newest trim run summary from `console.gold_trim_run`, or
+/// `None` if it has never been trimmed (DATA-2 D6).
+///
+/// # Errors
+///
+/// Returns [`ChError`] if the table cannot be ensured or the query fails.
+pub async fn last_trim(ch: &ChClient, mart: &str) -> Result<Option<GoldTrimSummary>, ChError> {
+    ensure_gold_trim_run_table(ch).await?;
+    let rows = ch.rows(&last_trim_sql(mart), None).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(row_to_trim_summary(row)))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn last_trim_sql_orders_by_started_at_desc_and_binds_mart() {
+        let sql = last_trim_sql("orders");
+        assert!(sql.contains("ORDER BY started_at DESC LIMIT 1"), "{sql}");
+        assert!(sql.contains("console.gold_trim_run"), "{sql}");
+        assert!(sql.contains("'orders'"), "{sql}");
+    }
+
+    #[test]
+    fn row_to_trim_summary_parses_success_row() {
+        let mut row = serde_json::Map::new();
+        row.insert("status".to_owned(), Value::String("success".to_owned()));
+        row.insert("copies_kept".to_owned(), Value::Number(7.into()));
+        row.insert(
+            "oldest_kept_ms".to_owned(),
+            Value::String("1700000000000".to_owned()),
+        );
+        row.insert(
+            "finished_ms".to_owned(),
+            Value::String("1700000010000".to_owned()),
+        );
+        row.insert("reason".to_owned(), Value::Null);
+
+        let summary = row_to_trim_summary(&row);
+        assert_eq!(summary.status, "success");
+        assert_eq!(summary.copies_kept, Some(7));
+        assert!(summary.oldest_kept_exported_at.is_some());
+        assert!(!summary.finished_at.is_empty());
+        assert_eq!(summary.reason, None);
+    }
+
+    #[test]
+    fn row_to_trim_summary_parses_failed_row() {
+        let mut row = serde_json::Map::new();
+        row.insert("status".to_owned(), Value::String("failed".to_owned()));
+        row.insert("copies_kept".to_owned(), Value::Null);
+        row.insert("oldest_kept_ms".to_owned(), Value::Null);
+        row.insert(
+            "finished_ms".to_owned(),
+            Value::String("1700000010000".to_owned()),
+        );
+        row.insert(
+            "reason".to_owned(),
+            Value::String("delete_failed".to_owned()),
+        );
+
+        let summary = row_to_trim_summary(&row);
+        assert_eq!(summary.status, "failed");
+        assert_eq!(summary.copies_kept, None);
+        assert_eq!(summary.oldest_kept_exported_at, None);
+        assert_eq!(summary.reason, Some("delete_failed".to_owned()));
+    }
 
     #[test]
     fn insert_sql_escapes_every_string_field() {
