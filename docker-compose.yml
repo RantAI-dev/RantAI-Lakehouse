@@ -2365,7 +2365,15 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g7-test-runner
   g7-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    # BLD-2 review R1 BLOCKER 8: the gate's dependencies are pinned in
+    # `ops/g7/Dockerfile` and baked into the image, the same way
+    # `ops/oidc-mock/Dockerfile` pins its own. Build it once with
+    # `docker compose -p <project> --profile dagster build g7-test-runner`
+    # (the `g3a-dagster` CI job does) instead of installing a driver at
+    # run time, so what the gate depends on is fixed by this file.
+    build:
+      context: ./ops/g7
+    image: ${G7_TEST_RUNNER_IMAGE:-rantai-g7-test-runner:local}
     working_dir: /work
     volumes:
       - ./ops/g7:/work:ro
@@ -2422,10 +2430,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
       PYTHONDONTWRITEBYTECODE: "1"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      # BLD-2 review R1 BLOCKER 8: pin psycopg2-binary in runner command
-      - "pip install -q requests psycopg2-binary==2.9.10 && python g7_pipeline_test.py"
+    # BLD-2 review R1 BLOCKER 8: no `pip install` at run time — both
+    # dependencies come from the image (see `ops/g7/Dockerfile`).
+    command: ["python", "g7_pipeline_test.py"]
     restart: "no"
 
   # BLD-1 acceptance — `ops/g7/bld1_pipeline_author_test.py`: an authored

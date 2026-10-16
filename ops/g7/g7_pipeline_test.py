@@ -127,6 +127,7 @@ change what the gate checks.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -157,6 +158,20 @@ SOURCE_PROVENANCE_MODES = ("required", "unavailable")
 # assertion is on the message and the whole body, not on the serializer's
 # key spacing.
 SOURCE_UNAVAILABLE_BODY = {"error": "source provenance is unavailable for this build"}
+
+
+def lag_sensor_name(pipeline_id: str) -> str:
+    """The Dagster sensor name the code location gives pipeline `pipeline_id`.
+
+    BLD-2 review R1 SHOULD-FIX 14: the SAME derivation as
+    `authored_factory._dagster_safe_name` followed by
+    `authored_factory.lag_sensor_name`. It is duplicated rather than
+    imported because this runner image carries no code location (the gate
+    scripts share no module -- see this file's module doc), so a change to
+    either side has to change both; the comment is what keeps them
+    honestly in step.
+    """
+    return f"authored__{re.sub(r'[^A-Za-z0-9_]', '_', pipeline_id)}_lag"
 
 # ClickHouse, for the row assertion: the Silver output and the Bronze
 # source are counted through the same client `ops/g3a/g3a_test.py` uses
@@ -583,7 +598,11 @@ def psql_insert_order(customer: str, amount: float) -> None:
             )
         conn.commit()
         conn.close()
-    except Exception as exc:
+    except psycopg2.Error as exc:
+        # BLD-2 review R1 BLOCKER 8: a driver/connection error is a gate
+        # failure in its own right, not a traceback that reads as an
+        # unrelated crash. The driver's own text is printed because this
+        # is CI output an operator reads, not an API response.
         raise G7Failure(f"Failed to insert order into Postgres: {exc}") from exc
 
 
@@ -635,10 +654,9 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
     if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": 1}:
         raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
 
-    # BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory
-    import re
-    safe_id = re.sub(r"[^A-Za-z0-9_]", "_", pipeline_id)
-    sensor_name = f"authored__{safe_id}_lag"
+    # BLD-2 review R1 SHOULD-FIX 14: the same derivation as the factory's
+    # `_dagster_safe_name`, through `lag_sensor_name()` below.
+    sensor_name = lag_sensor_name(pipeline_id)
     sel = {
         "repositoryName": "__repository__",
         "repositoryLocationName": "dispar_orchestrate.definitions",
@@ -685,6 +703,16 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
         psql_insert_order(cust_name, 100.0 + sample_idx)
 
         trigger_bronze_ingest()
+        # BLD-2 review R1 SHOULD-FIX 15: `trigger_bronze_ingest` polls the
+        # ingest run to SUCCESS at a 2 s interval, so this timestamp is
+        # taken AFTER the row landed in Bronze -- by the ingest run's own
+        # duration plus up to one poll interval. Every sample therefore
+        # reads LOW by that amount. The bias is printed with every sample
+        # (and carried into the result file) rather than corrected: reading
+        # the snapshot's own `last_updated_ms` would need either an Iceberg
+        # metadata surface this runner does not have or a second derivation
+        # of the same instant, and a gate that quietly measures a
+        # different thing is worse than one that says what it measured.
         commit_t = time.time()
 
         bronze_rows = int(
@@ -719,7 +747,13 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
         silver_t = time.time()
         elapsed = silver_t - commit_t
         samples.append(elapsed)
-        print(f"[g7] TARGET_LAG_SAMPLE_{sample_idx}: Bronze commit -> Silver reached {bronze_rows} rows in {elapsed:.2f}s")
+        print(
+            f"[g7] TARGET_LAG_SAMPLE_{sample_idx}: Bronze commit -> Silver reached "
+            f"{bronze_rows} rows in {elapsed:.2f}s "
+            f"(commit_t is taken after the ingest run reached SUCCESS, so the sample "
+            f"EXCLUDES the ingest run and reads low by its duration plus up to 2 s of "
+            f"poll granularity — review R1 SHOULD-FIX 15)"
+        )
 
     runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10)
     if not runs_resp.ok:
