@@ -495,6 +495,17 @@ async fn run_budget_seconds(dagster: &DgClient, job_name: &str) -> Result<i64, D
     Ok(median + CHECK_INTERVAL_SECONDS)
 }
 
+/// BLD-2 review R1 decision R1: how long a request may sit in Dagster
+/// without a run appearing before the check calls it lost.
+///
+/// Four checks at [`CHECK_INTERVAL_SECONDS`] — the sensor's evaluation
+/// period, so "4 checks" and "2 minutes" are the same thing said twice.
+/// It has to be longer than the sensor's own timeout per tick, or a run
+/// that is still being created would be declared lost and requested
+/// twice, and it has to be short enough that a lost request does not pin
+/// the pipeline behind for long.
+const LOST_REQUEST_SECONDS: i64 = 120;
+
 /// What the previous check left behind, plus what this check adds.
 // BLD-2 review R1 decision R1/R2: CheckState holds requested_at and request_attempt
 struct CheckState {
@@ -563,18 +574,22 @@ async fn settle_request(
     };
 
     let Some(run) = run else {
-        if let Some(requested_at) = state.requested_at {
-            if (now - requested_at).whole_seconds() >= 120 {
-                tracing::warn!(
-                    %run_key,
-                    %requested_at,
-                    "target lag: requested run not found in Dagster after 2 minutes; request lost, clearing to decide again"
-                );
-                state.requested_run_key = None;
-                state.requested_tokens = None;
-                state.requested_at = None;
-                return Ok(false);
-            }
+        if let Some(requested_at) = state.requested_at
+            && (now - requested_at).whole_seconds() >= LOST_REQUEST_SECONDS
+        {
+            tracing::warn!(
+                %run_key,
+                %requested_at,
+                lost_after_seconds = LOST_REQUEST_SECONDS,
+                "target lag: requested run not found in Dagster after 2 minutes; request lost, clearing to decide again"
+            );
+            state.requested_run_key = None;
+            state.requested_at = None;
+            // BLD-2 review R1 decision R2: as on a failed run, the tokens
+            // stay — they are what makes the NEXT key (attempt + 1)
+            // distinct, so the retry is a request `Dagster` has not seen.
+            state.request_attempt += 1;
+            return Ok(false);
         }
         tracing::info!(%run_key, "target lag: requested run not created yet; waiting");
         return Ok(true);
@@ -603,6 +618,12 @@ async fn settle_request(
         "FAILURE" | "CANCELED" | "CANCELING" => {
             tracing::info!(%run_key, status = %run.status, "target lag: requested run did not succeed; clearing request and incrementing attempt");
             state.requested_run_key = None;
+            // BLD-2 review R1 decision R2: only the KEY goes — the tokens
+            // stay as the anchor `request_attempt` is reset against when the
+            // inputs change, and the next check asks again under
+            // `run_key_for(.., attempt + 1)`, a key `Dagster` has never seen
+            // (it de-duplicates by key, which is why a retry needs a new
+            // one).
             state.requested_at = None;
             state.request_attempt += 1;
             Ok(false)
@@ -700,7 +721,7 @@ pub async fn run_lag_check(
         ApiError::Internal("the request could not be completed".to_owned())
     })?;
 
-    let stored = pipelines::get_lag_state_for_update(&mut tx, &pipeline.id)
+    let stored = pipelines::get_lag_state_for_update(&mut tx, &pipeline.id, pipeline.tenant_id)
         .await
         .map_err(|err| {
             tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unreadable");
@@ -991,7 +1012,11 @@ async fn evaluate_upstream_chain(
             }));
         }
 
-        let u_inputs = match inputs_of(pool, u_pipe).await.map_err(|err| {
+        // BLD-2 review R1 SHOULD-FIX 1 / SHOULD-FIX 13: an upstream whose
+        // source cannot be parsed is not measurable, so this branch writes
+        // P not_measured instead of returning without a write (the page
+        // would otherwise keep showing the old status).
+        let u_inputs_maybe = inputs_of(pool, u_pipe).await.map_err(|err| {
             tracing::error!(%err, pipeline = %u_pipe.id, "target lag: upstream inputs unreadable");
             crate::upstream_error::report(
                 &crate::upstream_error::STORE,
@@ -999,47 +1024,45 @@ async fn evaluate_upstream_chain(
                 &err.to_string(),
             );
             ApiError::Internal("the request could not be completed".to_owned())
-        })? {
-            Some(inputs) => inputs,
-            None => {
-                // BLD-2 review R1 SHOULD-FIX 1 / SHOULD-FIX 13: unparseable upstream source -> write not_measured
-                let p_update = LagStateUpdate {
-                    pipeline_id: pipeline.id.clone(),
-                    tenant_id: pipeline.tenant_id,
-                    consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                    consumed_at: state.consumed_at,
-                    pending_since: state.pending_since,
-                    requested_run_key: state.requested_run_key.clone(),
-                    requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                    requested_at: state.requested_at,
-                    request_attempt: state.request_attempt,
-                    last_check_at: now,
-                    last_status: LagStatus::NotMeasured.as_str().to_owned(),
-                    behind_streak: 0,
-                };
-                pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                    tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::STORE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Internal("the request could not be completed".to_owned())
-                })?;
-                return Ok(Some(LagCheckOutcome {
-                    decision: Decision::Wait,
-                    run_key: state.requested_run_key.clone(),
-                    job_name: job_name.to_owned(),
-                    status: LagStatus::NotMeasured,
-                    lag_seconds: None,
-                    target_seconds,
-                    behind_streak: 0,
-                    reason: Some(format!(
-                        "upstream pipeline {} has unparseable source",
-                        u_pipe.id
-                    )),
-                }));
-            }
+        })?;
+        let Some(u_inputs) = u_inputs_maybe else {
+            // BLD-2 review R1 SHOULD-FIX 1 / SHOULD-FIX 13: unparseable upstream source -> write not_measured
+            let p_update = LagStateUpdate {
+                pipeline_id: pipeline.id.clone(),
+                tenant_id: pipeline.tenant_id,
+                consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
+                consumed_at: state.consumed_at,
+                pending_since: state.pending_since,
+                requested_run_key: state.requested_run_key.clone(),
+                requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
+                requested_at: state.requested_at,
+                request_attempt: state.request_attempt,
+                last_check_at: now,
+                last_status: LagStatus::NotMeasured.as_str().to_owned(),
+                behind_streak: 0,
+            };
+            pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
+            tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
+            crate::upstream_error::report(
+                &crate::upstream_error::STORE,
+                crate::upstream_error::Class::Unavailable,
+                &err.to_string(),
+            );
+            ApiError::Internal("the request could not be completed".to_owned())
+        })?;
+            return Ok(Some(LagCheckOutcome {
+                decision: Decision::Wait,
+                run_key: state.requested_run_key.clone(),
+                job_name: job_name.to_owned(),
+                status: LagStatus::NotMeasured,
+                lag_seconds: None,
+                target_seconds,
+                behind_streak: 0,
+                reason: Some(format!(
+                    "upstream pipeline {} has unparseable source",
+                    u_pipe.id
+                )),
+            }));
         };
 
         let u_tokens = match reader.tokens(&u_inputs).await {
@@ -1306,7 +1329,7 @@ async fn decide(
     let max_retries = i32::from(pipeline.max_retries);
     if !outstanding {
         // BLD-2 review R1 decision R2 / BLOCKER 4: stop after max_retries + 1 attempts
-        if state.request_attempt >= max_retries + 1 {
+        if state.request_attempt > max_retries {
             decision = Decision::Wait;
         } else {
             let due = if never_consumed || target == i64::MAX {
@@ -1495,7 +1518,8 @@ pub fn lag_json(
 
 #[cfg(test)]
 mod tests {
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1506,6 +1530,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::routes::authored_pipelines::job_name;
 
     /// A reader that answers from a fixed map, so a test states the inputs
     /// it means instead of standing up `ClickHouse`/Lakekeeper. The
@@ -1537,6 +1562,14 @@ mod tests {
         }
 
         fn unreadable(mut self, key: &str) -> Self {
+            self.unreadable.push(key.to_owned());
+            self
+        }
+
+        /// BLD-2 review R1 SHOULD-FIX 1: an input whose token cannot be
+        /// read at all, for the test of the branch that writes
+        /// `not_measured` instead of leaving the old status.
+        fn with_error(mut self, key: &str, _why: &str) -> Self {
             self.unreadable.push(key.to_owned());
             self
         }
@@ -1608,6 +1641,7 @@ mod tests {
     /// an earlier one — which shows up as a check answering with another
     /// test's fixture rather than as an error.
     async fn dagster_with(
+        job: &str,
         run_status: Option<&str>,
         durations: &[(f64, f64)],
     ) -> (DgClient, MockServer) {
@@ -1616,7 +1650,7 @@ mod tests {
             .map(|(start, end)| {
                 json!({
                     "runId": format!("r-{start}"),
-                    "jobName": "authored__pl-x",
+                    "jobName": job,
                     "status": "SUCCESS",
                     "startTime": start,
                     "endTime": end,
@@ -1626,7 +1660,10 @@ mod tests {
         let by_key = run_status.map_or_else(Vec::new, |status| {
             vec![json!({
                 "runId": "requested",
-                "jobName": "authored__pl-x",
+                // BLD-2 review R1 BLOCKER 2: the run-key lookup's answer
+                // has to carry the job that was requested, or
+                // `settle_request` treats it as somebody else's run.
+                "jobName": job,
                 "status": status,
                 "startTime": 1_000.0,
                 "endTime": 1_060.0,
@@ -1694,6 +1731,26 @@ mod tests {
         created
     }
 
+    /// A real `tenant` row: `pipeline_lag_state.tenant_id` references
+    /// `tenant (id)`, so a test that writes lag state (directly or through
+    /// `run_lag_check`) needs a tenant to exist. Inventing a bare UUID
+    /// instead fails the foreign key, and a pipeline with
+    /// `tenant_id IS NULL` links to nothing under R3, so the tenant-scoped
+    /// tests cannot be written that way either.
+    async fn seed_tenant(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO tenant (id, name, slug, plan, residency) \
+             VALUES ($1, 'Fixture tenant', $2, 'Standard', 'US')",
+        )
+        .bind(id)
+        .bind(format!("fixture-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed a tenant row");
+        id
+    }
+
     async fn update_in(
         pool: &PgPool,
         pipeline: &Pipeline,
@@ -1747,7 +1804,7 @@ mod tests {
         )
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:7");
-        let (dagster, _server) = dagster_with(Some("SUCCESS"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("SUCCESS"), &[]).await;
 
         let outcome = run_lag_check(
             &pool,
@@ -1777,7 +1834,7 @@ mod tests {
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
         // No state row yet: nothing has ever been consumed, so the first
         // check runs (plan D5 step 5).
-        let (dagster, _server) = dagster_with(Some("STARTED"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("STARTED"), &[]).await;
         let first = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
             .await
             .expect("the first check succeeds");
@@ -1827,7 +1884,7 @@ mod tests {
         )
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
-        let (dagster, _server) = dagster_with(Some("SUCCESS"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("SUCCESS"), &[]).await;
 
         let outcome = run_lag_check(
             &pool,
@@ -1882,7 +1939,7 @@ mod tests {
         )
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
-        let (dagster, _server) = dagster_with(Some("FAILURE"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("FAILURE"), &[]).await;
 
         let outcome = run_lag_check(
             &pool,
@@ -1939,7 +1996,8 @@ mod tests {
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
         // Two 60-second runs: the median is 60 s, plus the 30 s interval.
-        let (dagster, _server) = dagster_with(None, &[(0.0, 60.0), (1_000.0, 1_060.0)]).await;
+        let (dagster, _server) =
+            dagster_with(&job_name("pl-x"), None, &[(0.0, 60.0), (1_000.0, 1_060.0)]).await;
 
         let early = run_lag_check(
             &pool,
@@ -1977,7 +2035,7 @@ mod tests {
         let pipeline = seed_pipeline(&pool, "pl-x", 1).await;
         let now = at(1_000);
         let reader = FakeTokens::new().unreadable("bronze.orders");
-        let (dagster, _server) = dagster_with(Some("SUCCESS"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-x"), Some("SUCCESS"), &[]).await;
 
         let outcome = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], now)
             .await
@@ -2052,6 +2110,9 @@ mod tests {
     /// which has no stored row, is skipped rather than failing the check.
     #[sqlx::test(migrations = "../../migrations")]
     async fn inputs_of_covers_the_source_and_every_authored_upstream_target(pool: PgPool) {
+        // BLD-2 review R1 decision R3: both ends of the link are inside the
+        // tenant, because a `tenant_id IS NULL` pipeline links to nothing.
+        let tenant_id = seed_tenant(&pool).await;
         let upstream = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
@@ -2068,7 +2129,7 @@ mod tests {
                 owner: None,
                 description: None,
                 max_retries: None,
-                tenant_id: None,
+                tenant_id: Some(tenant_id),
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
@@ -2082,6 +2143,7 @@ mod tests {
         .await
         .expect("create the upstream pipeline");
         let mut downstream = pipeline("pl-x", 10);
+        downstream.tenant_id = Some(tenant_id);
         downstream.depends_on = vec![upstream.id.clone(), "ingest_job".to_owned()];
 
         let inputs = inputs_of(&pool, &downstream)
@@ -2099,16 +2161,21 @@ mod tests {
     /// measure.
     #[tokio::test]
     async fn the_run_budget_is_the_median_plus_one_interval() {
-        let (dagster, _server) = dagster_with(None, &[(0.0, 1.0), (1.0, 11.0), (2.0, 22.0)]).await;
+        let (dagster, _server) = dagster_with(
+            &job_name("pl-x"),
+            None,
+            &[(0.0, 1.0), (1.0, 11.0), (2.0, 22.0)],
+        )
+        .await;
         assert_eq!(
-            run_budget_seconds(&dagster, "authored__pl-x")
+            run_budget_seconds(&dagster, &job_name("pl-x"))
                 .await
                 .expect("the budget is readable"),
             10 + CHECK_INTERVAL_SECONDS
         );
-        let (empty, _server2) = dagster_with(None, &[]).await;
+        let (empty, _server2) = dagster_with(&job_name("pl-x"), None, &[]).await;
         assert_eq!(
-            run_budget_seconds(&empty, "authored__pl-x")
+            run_budget_seconds(&empty, &job_name("pl-x"))
                 .await
                 .expect("the budget is readable"),
             ASSUMED_FIRST_RUN_SECONDS + CHECK_INTERVAL_SECONDS
@@ -2120,14 +2187,34 @@ mod tests {
     /// is not mistaken for the old request's.
     #[test]
     fn the_run_key_is_derived_from_the_pipeline_and_its_tokens() {
-        let first = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:7")]));
-        let same = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:7")]));
-        let other = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:8")]));
-        let elsewhere = run_key_for("pl-y", &tokens_of(&[("bronze.orders", "iceberg:7")]));
+        let first = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:7")]), 0);
+        let same = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:7")]), 0);
+        let other = run_key_for("pl-x", &tokens_of(&[("bronze.orders", "iceberg:8")]), 0);
+        let elsewhere = run_key_for("pl-y", &tokens_of(&[("bronze.orders", "iceberg:7")]), 0);
         assert_eq!(first, same);
         assert_ne!(first, other);
         assert_ne!(first, elsewhere);
-        assert_eq!(first.len(), "lag:pl-x:".len() + 12);
+        assert_eq!(
+            first.len(),
+            "lag:pl-x:".len() + 12 + ":0".len(),
+            "lag:<id>:<12 hex chars>:<attempt>"
+        );
+    }
+
+    /// BLD-2 review R1 decision R2 / BLOCKER 4: the attempt number is part
+    /// of the key, so asking again for the SAME tokens after a failed run
+    /// produces a key `Dagster` has never seen (it de-duplicates by key)
+    /// and a genuinely new change is still not confused with the retry.
+    #[test]
+    fn the_run_key_carries_the_attempt_so_a_retry_is_a_new_key() {
+        let tokens = tokens_of(&[("bronze.orders", "iceberg:7")]);
+        let first = run_key_for("pl-x", &tokens, 0);
+        let retry = run_key_for("pl-x", &tokens, 1);
+        assert_ne!(first, retry);
+        assert!(
+            retry.ends_with(":1"),
+            "the attempt is the last segment: {retry}"
+        );
     }
 
     /// BLD-2 plan D7: when a downstream pipeline's inputs change and the
@@ -2137,8 +2224,8 @@ mod tests {
     async fn downstream_pipeline_changes_request_upstream_first_while_downstream_waits(
         pool: PgPool,
     ) {
-        let (dagster, _server) = dagster_with(Some("STARTED"), &[]).await;
-        let tenant_id = Uuid::new_v4();
+        let (dagster, _server) = dagster_with(&job_name("pl-u"), Some("STARTED"), &[]).await;
+        let tenant_id = seed_tenant(&pool).await;
 
         // Create U: bronze.orders -> silver.u (downstream)
         let u = pipelines::create_pipeline(
@@ -2238,8 +2325,8 @@ mod tests {
     /// BLD-2 plan D7: when U's run lands (succeeds in Dagster), P runs for itself.
     #[sqlx::test(migrations = "../../migrations")]
     async fn upstream_landing_triggers_downstream_pipeline_run(pool: PgPool) {
-        let (dagster, _server) = dagster_with(Some("SUCCESS"), &[]).await;
-        let tenant_id = Uuid::new_v4();
+        let (dagster, _server) = dagster_with(&job_name("pl-u2"), Some("SUCCESS"), &[]).await;
+        let tenant_id = seed_tenant(&pool).await;
 
         let u = pipelines::create_pipeline(
             &pool,
@@ -2315,6 +2402,11 @@ mod tests {
                 pending_since: Some(now),
                 requested_run_key: Some(u_run_key.to_owned()),
                 requested_tokens: Some(json!({"bronze.orders": "iceberg:1"})),
+                // BLD-2 review R1 decisions R1/R2: the seeded row is a
+                // request that Dagster answered, so it carries the time it
+                // was made and its first attempt.
+                requested_at: Some(now),
+                request_attempt: 1,
                 last_check_at: now,
                 last_status: "behind".to_owned(),
                 behind_streak: 1,
@@ -2348,7 +2440,7 @@ mod tests {
     /// the honest note "Downstream: no pipeline with a target lag reads this table".
     #[sqlx::test(migrations = "../../migrations")]
     async fn downstream_pipeline_with_no_lag_readers_shows_honest_note(pool: PgPool) {
-        let (dagster, _server) = dagster_with(None, &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-orphan"), None, &[]).await;
 
         let u = pipelines::create_pipeline(
             &pool,
@@ -2413,6 +2505,8 @@ mod tests {
             pending_since: None,
             requested_run_key: None,
             requested_tokens: None,
+            requested_at: None,
+            request_attempt: 0,
             last_check_at,
             last_status: Some(last_status.to_owned()),
             behind_streak: 0,
@@ -2576,7 +2670,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn downstream_without_readers_names_only_the_table_nobody_reads(pool: PgPool) {
-        let tenant_id = Uuid::new_v4();
+        let tenant_id = seed_tenant(&pool).await;
         let created_orphan = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
@@ -2678,7 +2772,8 @@ mod tests {
         );
     }
 
-    /// BLD-2 review R1 BLOCKER 2: settle_request checks found run's jobName is the one requested.
+    /// BLD-2 review R1 BLOCKER 2: `settle_request` checks the found run's
+    /// `jobName` is the job that was requested.
     /// If Dagster has a run for the key but with a different jobName, ignore it and treat as not created.
     #[sqlx::test(migrations = "../../migrations")]
     async fn settle_request_ignores_run_with_different_job_name(pool: PgPool) {
@@ -2769,7 +2864,7 @@ mod tests {
         )
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
-        let (dagster, _server) = dagster_with(None, &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-lost"), None, &[]).await;
 
         let waiting = run_lag_check(
             &pool,
@@ -2784,13 +2879,17 @@ mod tests {
         assert_eq!(waiting.decision, Decision::Wait);
         assert_eq!(waiting.run_key.as_deref(), Some(key.as_str()));
 
+        // Past the 2-minute lost-request window AND past the target, so
+        // the tick that follows the clear is one that owes a run anyway:
+        // the point of the assertion is that the lost request stops
+        // blocking, not that the batching window is ignored.
         let decided_again = run_lag_check(
             &pool,
             &dagster,
             &reader,
             &pipeline,
             &[source_input()],
-            t0 + time::Duration::seconds(120),
+            t0 + time::Duration::seconds(900),
         )
         .await
         .expect("check succeeds");
@@ -2800,7 +2899,10 @@ mod tests {
             "decides to run again after lost request is cleared"
         );
         let new_key = decided_again.run_key.expect("a new run key");
-        assert!(new_key.starts_with("lag:pl-lost:"));
+        assert!(
+            new_key.ends_with(":1"),
+            "the lost request counted as attempt 0, so the new key is attempt 1: {new_key}"
+        );
     }
 
     /// BLD-2 review R1 decision R2 / BLOCKER 4: retry with real derived key carrying attempt,
@@ -2836,7 +2938,7 @@ mod tests {
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
         let t0 = at(1_000);
 
-        let (dagster_empty, _s1) = dagster_with(None, &[]).await;
+        let (dagster_empty, _s1) = dagster_with(&job_name("pl-retry"), None, &[]).await;
         let c1 = run_lag_check(
             &pool,
             &dagster_empty,
@@ -2854,7 +2956,7 @@ mod tests {
             "first attempt key must end with :0, got {key0}"
         );
 
-        let (dagster_fail, _s2) = dagster_with(Some("FAILURE"), &[]).await;
+        let (dagster_fail, _s2) = dagster_with(&job_name("pl-retry"), Some("FAILURE"), &[]).await;
         let c2 = run_lag_check(
             &pool,
             &dagster_fail,
@@ -2895,12 +2997,12 @@ mod tests {
         assert!(c3.run_key.is_none(), "no run key requested");
     }
 
-    /// BLD-2 review R1 BLOCKER 5: downstream keeps P's outstanding requested_run_key
+    /// BLD-2 review R1 BLOCKER 5: downstream keeps P's outstanding `requested_run_key`
     /// even when upstream U has work to do.
     #[sqlx::test(migrations = "../../migrations")]
     async fn downstream_preserves_outstanding_request_when_upstream_has_work(pool: PgPool) {
-        let tenant_id = Uuid::new_v4();
-        let u = pipelines::create_pipeline(
+        let tenant_id = seed_tenant(&pool).await;
+        let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
                 name: "u_pipe".to_owned(),
@@ -2979,7 +3081,7 @@ mod tests {
             .with("bronze.orders", "iceberg:2")
             .with("silver.u_clean", "fp:1");
 
-        let (dagster, _server) = dagster_with(Some("STARTED"), &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-u-b5"), Some("STARTED"), &[]).await;
 
         let outcome = run_lag_check(
             &pool,
@@ -3007,10 +3109,11 @@ mod tests {
     }
 
     /// BLD-2 review R1 SHOULD-FIX 3: downstream pipeline read only through dependsOn
-    /// is recognized as read by count_lag_pipelines_reading and downstream_without_readers.
+    /// is recognized as read by `count_lag_pipelines_reading` and
+    /// `downstream_without_readers`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn downstream_read_only_through_depends_on_is_recognized_as_read(pool: PgPool) {
-        let tenant_id = Uuid::new_v4();
+        let tenant_id = seed_tenant(&pool).await;
         let u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
@@ -3039,7 +3142,7 @@ mod tests {
         .await
         .expect("create u");
 
-        let reader = pipelines::create_pipeline(
+        let _reader = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
                 name: "reader_dep".to_owned(),
@@ -3067,7 +3170,7 @@ mod tests {
         .await
         .expect("create reader");
 
-        let without = downstream_without_readers(&pool, &[u.clone()])
+        let without = downstream_without_readers(&pool, std::slice::from_ref(&u))
             .await
             .expect("downstream without readers");
         assert!(
@@ -3077,11 +3180,11 @@ mod tests {
     }
 
     /// BLD-2 review R1 SHOULD-FIX 1: When downstream input cannot be read,
-    /// write P's state as not_measured and reset streak to 0.
+    /// write P's state as `not_measured` and reset the streak to 0.
     #[sqlx::test(migrations = "../../migrations")]
     async fn downstream_unreadable_token_persists_not_measured(pool: PgPool) {
-        let tenant_id = Uuid::new_v4();
-        let u = pipelines::create_pipeline(
+        let tenant_id = seed_tenant(&pool).await;
+        let _u = pipelines::create_pipeline(
             &pool,
             &pipelines::CreatePipelineInput {
                 name: "u_pipe".to_owned(),
@@ -3156,7 +3259,7 @@ mod tests {
             .expect("p parseable");
         let reader =
             FakeTokens::new().with_error("bronze.orders", "upstream iceberg metadata corrupted");
-        let (dagster, _server) = dagster_with(None, &[]).await;
+        let (dagster, _server) = dagster_with(&job_name("pl-p-unreadable"), None, &[]).await;
 
         let outcome = run_lag_check(
             &pool,
@@ -3184,12 +3287,14 @@ mod tests {
         assert_eq!(stored_p.behind_streak, 0);
     }
 
-    /// BLD-2 review R1 SHOULD-FIX 12: drive three consecutive behind checks through run_lag_check to the alert
+    /// BLD-2 review R1 SHOULD-FIX 12: drive three consecutive behind checks
+    /// through `run_lag_check` to the alert
     #[sqlx::test(migrations = "../../migrations")]
     async fn three_consecutive_behind_checks_drive_alert_due(pool: PgPool) {
         let pipeline = seed_pipeline(&pool, "pl-streak-alert", 5).await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:1");
-        let (dagster, _server) = dagster_with(Some("STARTED"), &[]).await;
+        let (dagster, _server) =
+            dagster_with(&job_name("pl-streak-alert"), Some("STARTED"), &[]).await;
         let t0 = at(1_000);
 
         let outcome1 = run_lag_check(&pool, &dagster, &reader, &pipeline, &[source_input()], t0)

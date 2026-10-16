@@ -106,8 +106,15 @@ CREATE TABLE pipeline_lag_state (
     -- `connectors.rs`'s REPEATED_FAILURE_STREAK, so no second table is
     -- needed for dedupe.
     behind_streak INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT pipeline_lag_state_request_pair_check
-        CHECK ((requested_run_key IS NULL) = (requested_tokens IS NULL))
+    -- A run key without its tokens would be unreadable (the key is a hash
+    -- of them), so a key REQUIRES tokens. Tokens without a key are the
+    -- other way round and are allowed: they are the tokens of the LAST
+    -- request, which is what `request_attempt` counts attempts for. Without
+    -- them the counter could not be reset when the inputs change
+    -- (BLD-2 review R1 decision R2), because after a failed or lost run
+    -- there is no outstanding key to read them from.
+    CONSTRAINT pipeline_lag_state_request_key_needs_tokens_check
+        CHECK (requested_run_key IS NULL OR requested_tokens IS NOT NULL)
 );
 
 CREATE INDEX pipeline_lag_state_tenant_id_idx ON pipeline_lag_state (tenant_id);
