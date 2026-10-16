@@ -83,12 +83,12 @@ croner = { version = "4" }
 # 0.63 verified latest via docs.rs/sqlparser/latest as of 2026-10-14;
 # `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
 sqlparser = "0.63"
-# SEC-14 part B (E2, D5/D8): the Postgres connection test speaks the wire
-# protocol itself (`lakehouse-api::pg_probe`) so it can refuse every
+# SEC-14 part B (E2, D5/D8, SHOULD-FIX 9): the Postgres connection test speaks
+# the wire protocol itself (`lakehouse-api::pg_probe`) so it can refuse every
 # authentication method but SCRAM-SHA-256, which `sqlx` offers no way to
-# do. This is the crate `sqlx`'s own Postgres driver is built on; MIT OR
-# Apache-2.0.
-postgres-protocol = "0.6"
+# do. Pinned to 0.6.12 because this code relies on the SCRAM iteration cap
+# there to prevent iteration exhaustion attacks. MIT OR Apache-2.0.
+postgres-protocol = "0.6.12"
 # `postgres-protocol`'s `SaslMechanisms` is a
 # `fallible_iterator::FallibleIterator`, and reading its mechanisms needs the
 # trait in scope. Declared directly because `postgres-protocol` already pulls
