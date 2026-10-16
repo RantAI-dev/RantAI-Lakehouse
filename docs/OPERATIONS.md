@@ -1051,14 +1051,25 @@ taken, a scratch database was restored from it, and the restore was
 verified by querying the restored data. See the phase report for the
 actual command transcript.
 
-## Dedicated-bucket backup job (WS5 item G2)
+## Dedicated-bucket backup job (OPS-7 / WS5 item G2)
 
 The script-based procedure above covers only `${POSTGRES_DB:-lakehouse}`
 (the app database) and writes to local disk. `dagster/dispar_orchestrate/
-backup_job.py`, run via the `backups` compose profile, covers all four
-compose-created Postgres databases (the app database, plus Lakekeeper's,
-OpenFGA's, and Dagster's own) and uploads each dump to an **S3-compatible
-bucket that is dedicated to backups**, never the shared warehouse bucket.
+backup_job.py`, run via the `backups` compose profile, covers the entire
+Lakehouse state (OPS-7 D1):
+1. **The four Postgres databases:** the application database (`lakehouse`),
+   Lakekeeper's REST catalog metadata (`lakekeeper`), OpenFGA's authorization
+   tuples (`openfga`), and Dagster's run storage/event logs (`dagster`).
+2. **The warehouse object store bucket:** full incremental mirror of all
+   Apache Iceberg data and metadata files (streaming via `s3fs`) into
+   `<BACKUP_S3_BUCKET>/warehouse/`.
+3. **ClickHouse databases:** all non-catalog, non-system databases (such as
+   `lake`, holding change-capture offsets and ingest facts) backed up via
+   native `BACKUP DATABASE <db> TO S3(...)` into
+   `<BACKUP_S3_BUCKET>/clickhouse/<timestamp>/<db>/`.
+
+All components land in an **S3-compatible bucket dedicated to backups**,
+never inside the shared warehouse bucket.
 
 **Why a dedicated bucket, not the warehouse bucket — security, not
 preference.** One of the four databases is the identity database
@@ -1069,28 +1080,31 @@ turn compromise of ANY ONE of those credentials into compromise of every
 user's password hash — a privilege-escalation path the warehouse bucket's
 access domain was never meant to grant. `backup_job.py` therefore reads
 its own `BACKUP_S3_*` endpoint, bucket, and credentials, entirely
-separate from `RUSTFS_*`/`CONNECTOR_S3_*`.
+separate from `RUSTFS_*`/`CONNECTOR_S3_*`. Furthermore, read access
+to the warehouse bucket uses dedicated read-only credentials
+(`BACKUP_WAREHOUSE_ACCESS_KEY` / `BACKUP_WAREHOUSE_SECRET_KEY`), ensuring
+the backup process cannot mutate live warehouse data.
 
 ### Configure
 
-Set `BACKUP_S3_ENDPOINT`, `BACKUP_S3_BUCKET`, `BACKUP_S3_ACCESS_KEY`,
-`BACKUP_S3_SECRET_KEY` (and leave `BACKUP_S3_ACCESS_KEY_SECRET_REF=env:
-BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY_SECRET_REF=env:
-BACKUP_S3_SECRET_KEY` at their `.env.example` values) in your `.env`.
-`BACKUP_RETENTION_DAYS` (default `30`) is the one optional field — it is
-a retention window, not a credential.
+Set in your `.env`:
+- Target backup bucket: `BACKUP_S3_ENDPOINT`, `BACKUP_S3_BUCKET`,
+  `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY` (and `_SECRET_REF` vars).
+- Source warehouse credentials (read-only): `BACKUP_WAREHOUSE_ACCESS_KEY`,
+  `BACKUP_WAREHOUSE_SECRET_KEY` (and `_SECRET_REF` vars).
+- Source warehouse target: `BACKUP_WAREHOUSE_ENDPOINT` (default: `http://rustfs:9000`),
+  `BACKUP_WAREHOUSE_BUCKET` (default: `lakehouse-warehouse`).
+- ClickHouse connection: `CH_URL` (default: `http://clickhouse:8123`),
+  `CH_USER` (default: `default`), `CH_PASSWORD` (if configured).
+- Retention: `BACKUP_RETENTION_DAYS` (default `30`) controls retention pruning
+  for database dumps and ClickHouse backups. Warehouse mirrored objects are
+  never pruned by age (historical Iceberg snapshots may still reference them).
 
-These four bucket/credential values are **required** (`${VAR:?}`, no
-default) but deliberately do **not** live in the default
-`docker-compose.yml` — they live in
-`ops/backups/docker-compose.backups.override.yml`, added with `-f` only
-when a backup actually runs, same precedent
-`ops/g6/docker-compose.g6.override.yml` already establishes for its own
-gate-only credentials: a `${VAR:?}` in the default file is interpolated
-for every service regardless of profile, so a must-set-only-under-one-
-profile credential placed there would break `docker compose --profile
-'*' config --quiet` (the repo-wide check AGENTS.md prescribes) for every
-checkout, backups configured or not.
+These must-set credential values are **required** (`${VAR:?}`, no default)
+in `ops/backups/docker-compose.backups.override.yml`, added with `-f` only
+when a backup runs. Placing them in the override file ensures `docker compose
+--profile '*' config --quiet` continues to validate cleanly in checkouts that
+do not run backups.
 
 ### Run
 
@@ -1100,13 +1114,12 @@ docker compose -f docker-compose.yml \
   --profile backups run --rm backup-job
 ```
 
-Without the `-f ops/backups/...` override (or with any of its four vars
+Without the `-f ops/backups/...` override (or with any required variable
 unset), this refuses to start — a `backups` profile enabled with no
 bucket configured is a clear startup failure, never a silent write into
 the wrong place, and never a silently-skipped backup reported as
-successful. A failed `pg_dump` for any one database raises immediately
-(`dagster.Failure`) and stops the run before uploading anything for the
-databases after it — a partial run is never reported as a complete one.
+successful. A failure in any component raises immediately (`dagster.Failure`)
+and aborts the run.
 
 **Scheduling:** this is not (yet) wired as an automatic in-process
 Dagster job/schedule — see `backup_job.py`'s module doc for why (in
@@ -1118,20 +1131,49 @@ cron, a systemd timer, or a CI scheduled job) on whatever cadence your
 retention policy assumes (nightly, matching `BACKUP_RETENTION_DAYS`'s
 default 30-day window, is a reasonable starting point).
 
-### Restore
+### Full restore procedure (`scripts/restore-from-backup.sh`)
 
-Download the dump for the database/timestamp you want from
-`<BACKUP_S3_BUCKET>/<db-name>/<timestamp>.dump` (via any S3-compatible
-client pointed at `BACKUP_S3_ENDPOINT` with the same credentials), then:
+A full recovery across all Lakehouse components is automated by
+`scripts/restore-from-backup.sh`.
 
 ```bash
-pg_restore --dbname=<target-db> --clean --if-exists --no-owner <dump-file>
+# Preview usage and options
+scripts/restore-from-backup.sh --help
+
+# Execute restore from a specific timestamp
+scripts/restore-from-backup.sh 20261016T074234Z
+
+# Force restore even if local data volumes are not empty
+scripts/restore-from-backup.sh --force 20261016T074234Z
 ```
 
-Same "restore into a scratch database first" caution as the script-based
-procedure above applies here — `--clean` drops existing objects before
-recreating them, so verify a dump against a throwaway database name
-before trusting it against the live one.
+**Restoration order (OPS-7 E4):**
+1. **Empty-volume safety check:** The script checks all compose data volumes
+   (`postgres_data`, `rustfs_data`, `clickhouse_data`) and refuses to run
+   if existing data is found unless `--force` is passed, preventing partial
+   overwrite corruption.
+2. **Step 1: PostgreSQL restore alone first:** Starts Postgres in isolation
+   while other containers are down, drops and recreates the 4 databases
+   (`lakehouse`, `lakekeeper`, `openfga`, `dagster`), and restores each
+   from `s3://<BACKUP_S3_BUCKET>/<db>/<timestamp>.dump` via `pg_restore`.
+   Restoring alone first guarantees that Lakekeeper and API initialization
+   do not race with or destructively overwrite restored tables.
+3. **Step 2: Warehouse bucket restore:** Starts RustFS (or object store) and
+   syncs `s3://<BACKUP_S3_BUCKET>/warehouse/` back to
+   `s3://<BACKUP_WAREHOUSE_BUCKET>/`.
+4. **Step 3: ClickHouse restore:** Starts ClickHouse, discovers all backed-up
+   databases under `s3://<BACKUP_S3_BUCKET>/clickhouse/<timestamp>/`, drops
+   stale databases, and runs `RESTORE DATABASE <db> FROM S3(...)`.
+5. **Step 4: Stack bring-up:** Starts the remaining services
+   (`lakekeeper`, `openfga`, `lakehouse-api`, `dagster`) and waits for
+   readiness.
+
+**Verified Recovery Performance (OPS-7-AC3):**
+Tested end-to-end in a timed recovery drill (`ops7drill`). Total restore
+duration across all 4 Postgres databases, 9 Iceberg objects, and ClickHouse
+state was **82 seconds** (94 seconds total to full API readiness). See
+[docs/plans/OPS-7-RESULT.md](plans/OPS-7-RESULT.md) for the complete drill
+report and component timing table.
 
 ## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 

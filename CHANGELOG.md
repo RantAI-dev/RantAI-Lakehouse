@@ -1,5 +1,6 @@
 # Changelog
 
+- Complete backups and timed restore drill (backlog `OPS-7`; plan `docs/superpowers/plans/2026-10-15-ops-7-restore-drill.md`, results in `docs/plans/OPS-7-RESULT.md`). Extends the dedicated-bucket `backup-job` service (`backups` profile) from Postgres-only dumps to include full incremental mirroring of the warehouse object store bucket (storing Apache Iceberg data and metadata files via `s3fs`) and ClickHouse's own state databases (change-capture offsets and ingest runs via native `BACKUP DATABASE ... TO S3(...)`). Adds `scripts/restore-from-backup.sh` to execute the full restore sequence across Postgres, the warehouse bucket, ClickHouse, and the application services, with automated empty-volume safety guards (`--force` to override). Verified via an isolated end-to-end drill (`ops7drill`) restoring 2,000 Bronze Iceberg orders, ClickHouse CDC offsets, application identities, OpenFGA permissions, and Dagster run history in 94 seconds total recovery time.
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
