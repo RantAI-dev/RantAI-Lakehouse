@@ -706,16 +706,22 @@ PostgreSQL and SQL Server dials:
   probe only negotiates `SCRAM-SHA-256`; if the server requests clear-text
   (`AuthenticationCleartextPassword`) or MD5 (`AuthenticationMD5Password`)
   authentication, the probe refuses and terminates the connection without
-  transmitting the password.
+  transmitting the password. Plain `SCRAM-SHA-256` without channel binding
+  is used (`channel_binding=disable`); without a CA certificate configured,
+  a relaying server performing a man-in-the-middle attack cannot be detected.
 - **Certificate verification (`CONNECTOR_TLS_CA_FILE`):**
   - Unset or empty: PostgreSQL and SQL Server dials require encryption
     (`Require` / `EncryptionLevel::Required`) without checking the server
     certificate against a custom root CA.
   - Set to a PEM file path: PostgreSQL dials verify the server certificate and
-    hostname (`verify-full` in `pg_probe`, `VerifyCa` in sqlx), and SQL Server
-    dials verify the server certificate against that CA bundle.
+    hostname (`verify-full` in `pg_probe`, `VerifyCa` in sqlx). SQL Server
+    dials verify the server certificate against that CA bundle via Tiberius's
+    `trust_cert_ca`, which adds the CA to the native system roots (so SQL Server
+    accepts either the configured CA or any public root, unlike PostgreSQL which
+    trusts only the configured CA bundle).
   - If `CONNECTOR_TLS_CA_FILE` is set to an unreadable or non-existent path,
-    `lakehouse-api` fails fast at startup with an error naming the variable.
+    or contains no valid PEM certificates, `lakehouse-api` fails fast at startup
+    with an error naming the variable.
 - **Docker Compose:** The default `docker-compose.yml` includes a one-shot
   `postgres-cert-init` service that generates a local CA and server certificate
   (SAN `DNS:postgres`) into the named volume `lakehouse_postgres_tls`. The
@@ -724,12 +730,14 @@ PostgreSQL and SQL Server dials:
   `CONNECTOR_TLS_CA_FILE=/run/certs/postgres/ca.crt`, allowing the seeded
   `conn-pg-lakehouse` connector test to pass over `verify-full`.
 - **Operators with external databases:**
-  - If your database uses a custom or corporate internal CA, mount the PEM CA
-    bundle into the `lakehouse-api` container and set `CONNECTOR_TLS_CA_FILE` to
-    its path.
-  - If your database uses certificates signed by public system roots or does
-    not use a custom CA, leave `CONNECTOR_TLS_CA_FILE` empty or unset. Dials
-    will still require TLS encryption.
+  - Because `docker-compose.yml` defaults `CONNECTOR_TLS_CA_FILE` to
+    `/run/certs/postgres/ca.crt` if unset or empty via `${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}`,
+    it cannot be cleared to empty in `.env`.
+  - To connect to external databases using custom internal CAs or public system
+    roots alongside the bundled PostgreSQL, create a combined CA bundle containing
+    the bundled CA (`/run/certs/postgres/ca.crt`) plus your corporate internal CA
+    or system root certificates. Mount the combined bundle into the `lakehouse-api`
+    container and set `CONNECTOR_TLS_CA_FILE` to its mounted path.
 
 ### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
 

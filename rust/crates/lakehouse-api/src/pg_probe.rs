@@ -329,9 +329,10 @@ where
                 if !offers_scram_sha256(&body)? {
                     return Err(PgProbeError::NoScram);
                 }
-                // `unsupported()` is the `n,,` gs2 header: this is
-                // SCRAM-SHA-256, not SCRAM-SHA-256-PLUS, so channel binding
-                // was never negotiated — what `libpq` sends too.
+                // `unsupported()` is the `n,,` gs2 header: this client does
+                // not implement `tls-server-end-point` channel binding, so it
+                // uses plain SCRAM-SHA-256 without channel binding (equivalent
+                // to libpq with `channel_binding=disable`; SHOULD-FIX 4).
                 let state = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
                 let mut out = BytesMut::new();
                 frontend::sasl_initial_response(SCRAM_SHA_256, state.message(), &mut out)
