@@ -1609,7 +1609,7 @@ class TestFileIngestUpstreamIsFilteredByTable:
 
     def test_a_pipeline_whose_source_is_not_bronze_never_fires_on_an_upload(self) -> None:
         """A stored row can predate the API's refusal
-        (`routes::authored_pipelines::validate_file_ingest_upstream`). A
+        (`routes::authored_pipelines::validate_per_table_upstream`). A
         non-Bronze source has no Bronze table to match, so the filter
         matches nothing and the chain waits: unsupported, honestly, never
         "works, approximately" by firing on every upload."""
@@ -1717,7 +1717,7 @@ def _ingest_run(
 
 def _materialized(run_id: str, table: str, timestamp: float = 250.0) -> _FakeMaterialization:
     """A materialization event logged inside run `run_id` for the Bronze
-    table `table`, shaped as `ingest_factory.py:1263` logs it
+    table `table`, shaped as `ingest_factory.ingest_source_object` logs it
     (`AssetMaterialization(asset_key=f"bronze.{obj['target']}")`). The asset
     key is built through `authored_factory._bronze_asset_key` so the test
     cannot disagree with the filter about the key's shape."""

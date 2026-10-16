@@ -527,9 +527,10 @@ run from create, update and restore): on any other source the chain
 would be wired and could never fire, so it is refused at save time with
 the job's own message, and a row stored before the rule waits with the
 same reason. The window each walk reads is bounded
-(`FILE_INGEST_SCAN_LIMIT`, 20 runs), so a source table that has not
-loaded in the last 20 loads of its job waits rather than anchoring on a
-run older than that.
+(`PER_TABLE_UPSTREAM_SCAN_LIMIT`, 20 materializations/runs), so a source
+table that has not loaded in its last 20 materializations (`ingest_job`)
+or runs (`file_ingest_job`) waits rather than anchoring on a run older than
+that.
 
 **Where the skip reason shows.** `GET /api/pipelines/{id}/schedule-ticks`
 merges the pipeline's schedule ticks with the `authored__<id>_after`

@@ -917,7 +917,7 @@ def _upstream_job_selector(upstream_id: str) -> JobSelector:
 FILE_INGEST_OP_CONFIG = ("ops", "ingest_uploaded_file", "config", "bronze_table_name")
 
 # The other per-table upstream: `ingest_factory.py`'s ONE static job, named
-# `ingest_job` at `ingest_factory.py:1268`, which every connector's load
+# `ingest_job` (`ingest_factory.ingest_job`), which every connector's load
 # runs through (`{"ops": {"run_ingest": {"config": {"connector_id": ...}}}}`
 # from `routes/connectors.rs`, plus an optional `object`/`action` for a run
 # of one table). There is no `JOB_NAME` constant in `ingest_factory` to
@@ -1058,7 +1058,7 @@ def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
     `connector_id` and not the tables (`DATA-19`'s config filter does not
     carry over). What DOES name the table is the materialization each loaded
     object logs inside the run that loaded it --
-    `ingest_factory.py:1263`'s `AssetMaterialization(asset_key=f"bronze.
+    `ingest_factory.ingest_source_object`'s `AssetMaterialization(asset_key=f"bronze.
     {target}")`, where `target` is `obj['target']`.
 
     Two bounded calls, joined on `run_id` -- neither one alone can answer the

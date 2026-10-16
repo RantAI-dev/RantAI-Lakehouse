@@ -77,7 +77,7 @@ describe("turning the switch on and off changes only that one upstream", () => {
   })
 
   it("drops the upload job for a source that is not Bronze, which the server refuses", () => {
-    // `validate_file_ingest_upstream` answers 400 for this chain, and the
+    // `validate_per_table_upstream` answers 400 for this chain, and the
     // user has no switch to fix it with on a `silver` source — so the
     // console must not send it back unchanged.
     expect(withReuploadTrigger([FILE_INGEST_JOB, "pl-upstream"], "silver", true)).toEqual([

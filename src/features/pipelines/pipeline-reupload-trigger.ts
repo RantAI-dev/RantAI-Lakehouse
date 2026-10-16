@@ -13,7 +13,7 @@
  *   file only ever lands in a Bronze table, so a `silver`/`gold` source
  *   has no table to be re-uploaded — and the server refuses that
  *   upstream outright (`routes::authored_pipelines::
- *   validate_file_ingest_upstream`), so sending it would be a 400.
+ *   validate_per_table_upstream`), so sending it would be a 400.
  * - A new pipeline defaults ON: the feature's whole point is that a
  *   re-upload runs the pipeline, and a user building a pipeline over an
  *   uploaded table almost always wants it.
@@ -66,7 +66,7 @@ export function reuploadTriggerOn(
  *
  * For a source that is not Bronze the upload job is always removed: the
  * switch is not shown there, and a stored chain that names it is one the
- * server refuses (`validate_file_ingest_upstream`) — sending it back
+ * server refuses (`validate_per_table_upstream`) — sending it back
  * unchanged would make the whole save fail for a rule the user cannot
  * see a control for.
  */
