@@ -183,6 +183,32 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
+/// `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3), the rewrite
+/// the orchestrator asks for before it runs a pipeline's `SELECT`.
+///
+/// Its own function for the same reason [`pipelines_router`] is: so the
+/// route can be added without pushing that function over
+/// `clippy::too_many_lines`. It merges straight back in, through
+/// [`authored_pipelines_router`], and carries no middleware or state of
+/// its own.
+fn pipeline_enforce_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/enforce",
+        axum::routing::post(authored_pipelines::enforce_pipeline_sql),
+    )
+}
+
+/// The authored-pipeline (orchestrator-only) routes: the definitions the
+/// job factory loads, and the rewrite it asks for before it runs one.
+///
+/// `pipelines_router` merges this rather than growing another four lines:
+/// every route here is orchestrator-only in the handler as well as in
+/// [`crate::policy`], and keeping them together makes that pairing the
+/// thing a reader sees first.
+fn authored_pipelines_router() -> Router<AppState> {
+    pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+}
+
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
 /// purely to keep that function under `clippy::too_many_lines` — it merges
 /// straight back in, with no separate middleware/state of its own.
@@ -197,7 +223,7 @@ fn pipelines_router() -> Router<AppState> {
             axum::routing::post(pipelines::generate),
         )
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
-        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .merge(authored_pipelines_router())
         .route(
             "/api/pipelines/{id}",
             get(pipelines::detail)
@@ -288,6 +314,13 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
+        )
+        // BLD-1 / D2: assign the user a pipeline reads as. A distinct
+        // route for the same reason as `/tenant` — who a row reads as is a
+        // governance decision, not a field on an unrelated update body.
+        .route(
+            "/api/pipelines/{id}/run-as",
+            axum::routing::put(pipelines::assign_pipeline_run_as),
         )
         // Dagster `run_failure_sensor` posts here once per failed run;
         // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler

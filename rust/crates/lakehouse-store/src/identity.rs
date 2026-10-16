@@ -315,6 +315,95 @@ pub async fn add_user_to_tenant(
     Ok(added > 0)
 }
 
+/// Whether an `app_user` row with this id exists.
+///
+/// Mirrors [`tenant_exists`] so BLD-1's `PUT /api/pipelines/{id}/run-as`
+/// can answer an unknown author with the same 404 it gives an unknown
+/// tenant, rather than leaking a foreign-key violation as a 400.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_exists(pool: &PgPool, id: Uuid) -> Result<bool, StoreError> {
+    let present: Option<(bool,)> =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM app_user WHERE id = $1)")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(present.is_some_and(|(present,)| present))
+}
+
+/// The `app_user.status` of `id` — `"active"` or `"inactive"`, the two
+/// values `app_user_status_check` allows — or `None` when there is no such
+/// user.
+///
+/// A **deactivated user is not a dead user**, and `lakehouse_auth::
+/// repository::load_principal_for_user` does not distinguish them: it
+/// reads `app_user.name` and hands back every role the user has, so a
+/// pipeline authored by a deactivated user would otherwise be enforced as
+/// if the user were still working. Callers that need the distinction read
+/// it here.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_status(pool: &PgPool, id: Uuid) -> Result<Option<String>, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(status,)| status))
+}
+
+/// Whether `user_id` is a member of `tenant_id`, read from the same
+/// `app_user_tenant` row every request's tenant list is read from
+/// (`lakehouse_auth::repository::load_principal_for_user`), so a caller's
+/// own scope check and this one can never disagree about membership.
+///
+/// Used by BLD-1's `PUT /api/pipelines/{id}/run-as` to hold the author to
+/// the pipeline's own tenant: a pipeline may only read as a user who is
+/// inside the same scope the pipeline itself lives in.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn user_in_tenant(
+    pool: &PgPool,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<bool, StoreError> {
+    let present: Option<(bool,)> = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM app_user_tenant \
+         WHERE user_id = $1 AND tenant_id = $2)",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(present.is_some_and(|(present,)| present))
+}
+
+/// The display name of `id`, or `None` when there is no such row.
+///
+/// Read from `app_user.name` — the same column
+/// [`lakehouse_auth::repository::load_principal_for_user`] puts in
+/// [`lakehouse_auth::Principal::display_name`], so a pipeline's page and its
+/// own enforcement agree on who the author is. Used by BLD-1's pipeline
+/// detail read: `GET /api/identity/users` needs `identity:read`, which no
+/// ordinary role holds, so the name has to travel with the pipeline or the
+/// people who operate pipelines cannot see whose permissions govern them.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any database failure.
+pub async fn display_name(pool: &PgPool, id: Uuid) -> Result<Option<String>, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT name FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(name,)| name))
+}
+
 /// Delete a user; its membership rows cascade away with it.
 ///
 /// # Errors

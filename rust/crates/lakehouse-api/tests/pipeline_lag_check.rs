@@ -104,6 +104,9 @@ async fn seed_lagged_pipeline(pool: &PgPool, name: &str, minutes: i32) -> String
             connector_id: None,
             id: None,
             target_lag: Some(TargetLag::Lag { minutes }),
+            // BLD-1 / D1: this test is about the lag check, not about who
+            // the pipeline reads as.
+            run_as: None,
         },
         None,
     )
@@ -165,6 +168,9 @@ async fn another_tenants_pipeline_and_an_unknown_id_answer_the_same_404() {
             connector_id: None,
             id: None,
             target_lag: Some(TargetLag::Lag { minutes: 10 }),
+            // BLD-1 / D1: this test is about tenant scoping, not about who
+            // the pipeline reads as.
+            run_as: None,
         },
         None,
     )

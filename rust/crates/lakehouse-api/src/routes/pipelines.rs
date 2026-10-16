@@ -1010,6 +1010,29 @@ async fn authored_detail(
             }
         };
         obj.insert("lag".to_owned(), lag);
+        // BLD-1 / D2: the author this pipeline reads as, by NAME. The
+        // console shows "Reads as: <name>", and it cannot get that from
+        // `GET /api/identity/users` -- that route is `identity:read`, which
+        // no ordinary role holds, and the people who operate pipelines are
+        // Data Engineers, not Platform Admins. Null when no author is
+        // recorded, which is the state in which the pipeline does not run.
+        obj.insert(
+            "runAsName".to_owned(),
+            match pipeline.run_as {
+                Some(run_as) => match lakehouse_store::identity::display_name(pool, run_as).await {
+                    Ok(name) => name.map_or(Value::Null, Value::String),
+                    Err(err) => {
+                        // The name is decoration on a response that is
+                        // otherwise complete: a failure here must not turn
+                        // a readable pipeline into a 500. The id is still
+                        // there, and the page degrades to it.
+                        tracing::warn!(%err, %run_as, "authored_detail: author name lookup failed");
+                        Value::Null
+                    }
+                },
+                None => Value::Null,
+            },
+        );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
 }
@@ -2994,6 +3017,22 @@ pub struct CreatePipelineBody {
     pub target_lag: Option<lakehouse_store::pipelines::TargetLag>,
 }
 
+/// BLD-1 / D1: the `app_user` id a principal may author a pipeline as, or
+/// `None` when the principal is not a person.
+///
+/// `pipeline_definition.run_as` (migration `0076`) references `app_user`,
+/// and a service identity has no row there — `PrincipalId::uuid()` hands
+/// back its `service_identity.id` just the same, so binding the uuid
+/// blindly would fail the foreign key for every service-created pipeline.
+/// Returning `None` instead stores "no author", which D2 refuses to run,
+/// and an admin can assign through `PUT /api/pipelines/{id}/run-as`.
+fn author_id(principal: &Principal) -> Option<uuid::Uuid> {
+    match principal.id {
+        PrincipalId::User(id) => Some(id),
+        PrincipalId::Service(_) => None,
+    }
+}
+
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
 ///
 /// Every entry of `body.transforms` is validated through
@@ -3108,6 +3147,14 @@ pub async fn create(
         connector_id,
         id: Some(id),
         target_lag: body.target_lag,
+        // BLD-1 / D1: the creator is the author, so a pipeline reads as
+        // the person who made it. Only a HUMAN principal gets an author:
+        // `PrincipalId::Service` has no `app_user` row for the foreign
+        // key to point at, and "the service account reads everything" is
+        // exactly what this column exists to stop. Such a row stays
+        // `run_as = NULL` and does not run until an admin assigns an
+        // author (D2).
+        run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -3303,6 +3350,9 @@ pub async fn generate(
         // BLD-2 T4: same as `create` — a pipeline an LLM drafts starts
         // with no target lag until a user or the assistant sets one.
         target_lag: None,
+        // BLD-1 / D1: the LLM proposes the SHAPE, never the identity. The
+        // author is the human who asked, exactly as in `create`.
+        run_as: author_id(&principal),
     };
     let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -4232,6 +4282,91 @@ pub async fn assign_pipeline_tenant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body for `PUT /api/pipelines/{id}/run-as`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignRunAsBody {
+    /// The `app_user` the pipeline will read as.
+    user_id: Uuid,
+}
+
+/// BLD-1 / D2: assign the user an authored pipeline reads as.
+///
+/// Without this route, migration `0076`'s backfill is the only thing that
+/// ever sets `run_as`, so every pipeline created before the migration —
+/// and every pipeline a service identity created — would sit at `NULL`
+/// and, under D2, never run. This is the administrative way out.
+///
+/// # Why the author must be inside the pipeline's own tenant
+///
+/// A pipeline's reads are governed as its author, so an author outside
+/// the pipeline's tenant would let the row read across a scope boundary
+/// the pipeline itself may not cross. The membership is read from
+/// `app_user_tenant` — the same row the author's own session resolves its
+/// tenants from — so the two can never disagree.
+///
+/// A pipeline with no tenant yet has no tenant to check membership
+/// against, so it is refused rather than waved through: assign it a
+/// tenant through `PUT /api/pipelines/{id}/tenant` first.
+///
+/// # Errors
+///
+/// 404 if the pipeline id or the user id does not exist — the same status
+/// for both, matching `assign_pipeline_tenant`'s no-existence-leak rule.
+/// 409 if the pipeline has no tenant yet. 400 for a malformed body. 503 if
+/// no pool is configured; 500 on any other database failure.
+pub async fn assign_pipeline_run_as(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let AssignRunAsBody { user_id } = parse_body(&body)?;
+    let db_pool = pool(&state)?;
+    if !lakehouse_store::identity::user_exists(db_pool, user_id).await? {
+        return Err(ApiError::NotFound("user not found".to_owned()).into());
+    }
+    // The pipeline must be readable as its own tenant's member, so load it
+    // first: a missing pipeline answers 404 before the tenant question is
+    // even asked, and a `Dagster` job id (no such row) takes the same path.
+    let pipeline = pipelines::get_pipeline(db_pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    let Some(tenant_id) = pipeline.tenant_id else {
+        return Err(ApiError::Conflict(
+            "this pipeline has no tenant yet, so there is no way to check who may \
+             read as it; assign it a tenant first"
+                .to_owned(),
+        )
+        .into());
+    };
+    if !lakehouse_store::identity::user_in_tenant(db_pool, user_id, tenant_id).await? {
+        return Err(ApiError::Unprocessable(
+            "that user is not a member of this pipeline's tenant".to_owned(),
+        )
+        .into());
+    }
+    pipelines::assign_run_as(db_pool, &id, user_id)
+        .await
+        .map_err(|err| match err {
+            lakehouse_store::StoreError::NotFound => {
+                ApiError::NotFound(format!("Pipeline {id} not found"))
+            }
+            other => other.into(),
+        })?;
+    // Assigning the author changes who every future run reads as, so it is
+    // audited like any other pipeline write rather than silently applied.
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.run_as.assign",
+        &id,
+        json!({ "userId": user_id }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod dagster_half_tenant_gate {
     //! The `Dagster`-job half of
@@ -4347,9 +4482,11 @@ mod tests {
     /// A logged-in human principal — mirrors `routes::query`/
     /// `routes::agents`/`routes::connectors`'s own test fixture of the
     /// same name.
+    pub(super) const SEED_USER: &str = "33333333-3333-4333-8333-000000000001";
+
     pub(super) fn fixture_user_principal() -> Principal {
         Principal {
-            id: PrincipalId::User(Uuid::from_u128(1)),
+            id: PrincipalId::User(Uuid::parse_str(SEED_USER).unwrap()),
             tenant_ids: Vec::new(),
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("pipeline:write"),
@@ -5869,6 +6006,8 @@ mod tests {
                     id: None,
                     // BLD-2: this fixture is not about a target lag.
                     target_lag: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -8443,6 +8582,8 @@ mod tests {
                     id: Some(id.clone()),
                     // BLD-2: this fixture is not about a target lag.
                     target_lag: None,
+                    // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -9379,6 +9520,8 @@ mod tests {
                 id: None,
                 // BLD-2: this fixture is not about a target lag.
                 target_lag: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -10448,6 +10591,8 @@ mod tests {
                 id: None,
                 // BLD-2: this fixture is not about a target lag.
                 target_lag: None,
+                // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 

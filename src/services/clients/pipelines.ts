@@ -42,7 +42,12 @@ async function sendJson<T>(method: string, url: string, body: unknown, signal?: 
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
-  const json = await res.json();
+  // `PUT .../run-as` and `DELETE /api/pipelines/{id}` answer 204 with no
+  // body, and `res.json()` REJECTS on an empty one -- so parsing
+  // unconditionally would throw on a request that in fact succeeded. The
+  // 204 is checked first, the same way `clients/connectors.ts::sendJson`
+  // already does it for `PUT .../tenant`.
+  const json = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
     throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
@@ -139,6 +144,14 @@ export const dagsterPipelineService: PipelineService = {
   },
   async deletePipeline(id, signal) {
     await sendJson<unknown>("DELETE", `/api/pipelines/${encodeURIComponent(id)}`, undefined, signal);
+  },
+  async assignRunAs(id, userId, signal) {
+    await sendJson<unknown>(
+      "PUT",
+      `/api/pipelines/${encodeURIComponent(id)}/run-as`,
+      { userId },
+      signal
+    );
   },
   async getScheduleTicks(id, signal) {
     const body = await getJson<ScheduleTicks>(

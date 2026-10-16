@@ -58,6 +58,10 @@ fn input() -> CreatePipelineInput {
         // BLD-2: the default fixture has no target lag; the tests below
         // that are about one set it explicitly.
         target_lag: None,
+        // BLD-1 / D1: the fixtures here are not authored by a user, so
+        // they carry no author and, by D2, would not run. Tests that care
+        // about `run_as` set it explicitly.
+        run_as: None,
     }
 }
 
@@ -1883,6 +1887,85 @@ async fn runnable_pipelines_carry_their_target_lag(pool: PgPool) -> sqlx::Result
     Ok(())
 }
 
+/// BLD-1 / D1: create an `app_user` with no roles or tenants — the column
+/// under test is the user row itself, and a membership would only add a
+/// second thing that can fail.
+async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
+    let user = lakehouse_store::identity::create_user(
+        pool,
+        &lakehouse_store::identity::InviteUserInput {
+            name: "Pipeline Author".to_owned(),
+            email: email.to_owned(),
+            roles: Vec::new(),
+            tenants: Vec::new(),
+        },
+    )
+    .await
+    .expect("create user");
+    Uuid::parse_str(&user.id).expect("user id is a uuid")
+}
+
+/// The `run_as` backfill `UPDATE` of migration `0076`, read out of the
+/// migration file itself and returned as executable SQL.
+///
+/// Same reasoning as [`migration_0071_backfill`]: the extraction, not a
+/// copy, is what makes these tests a check on the migration rather than a
+/// restatement of it. Editing the migration's semantics changes what runs
+/// here, and `include_str!` pins the filename at compile time.
+fn migration_0076_backfill() -> &'static str {
+    const MIGRATION: &str = include_str!("../../../migrations/0076_pipeline_run_as.sql");
+    const PREFIX: &str = "UPDATE pipeline_definition p";
+    let mut found = MIGRATION
+        .match_indices(PREFIX)
+        .map(|(start, _)| {
+            let tail = &MIGRATION[start..];
+            let end = tail
+                .find(';')
+                .expect("the migration's backfill UPDATE is `;`-terminated");
+            &tail[..end]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found.len(),
+        1,
+        "migration 0076 must hold exactly one `UPDATE pipeline_definition` \
+         backfill — its other statements are the ALTER, the COMMENT and the \
+         CREATE INDEX"
+    );
+    found.remove(0)
+}
+
+/// BLD-1 / D1: a pipeline's `created` version names the human who made it,
+/// and that is the author the pipeline reads as. `create_pipeline` writes
+/// the version row in the same transaction as the live row, so the
+/// backfill reads the real thing here — no hand-planted fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_takes_the_author_from_the_created_version(pool: PgPool) -> sqlx::Result<()> {
+    let author = seed_user(&pool, "run-as-created@example.com").await;
+    let created = pipelines::create_pipeline(&pool, &input(), Some(author))
+        .await
+        .expect("create pipeline");
+    assert_eq!(
+        created.run_as, None,
+        "create_pipeline must not invent an author; the route layer passes one"
+    );
+
+    sqlx::query(migration_0076_backfill())
+        .execute(&pool)
+        .await?;
+
+    let stored = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("read pipeline")
+        .expect("the pipeline row exists");
+    assert_eq!(
+        stored.run_as,
+        Some(author),
+        "the `created` version's `changed_by` must become `run_as`"
+    );
+    Ok(())
+}
+
 /// The store-wide floor and ceiling, and the whole-minute rule, are
 /// enforced by the column CHECK — the route refuses out-of-range bodies
 /// with a 400 first, but the database is the boundary that no caller can
@@ -1993,6 +2076,47 @@ async fn set_target_lag_clears_both_columns_and_leaves_the_schedule_alone(
             .await
             .expect("an unknown id is a query miss, not an error")
             .is_none()
+    );
+    Ok(())
+}
+
+/// BLD-1 / D1: a pipeline that predates version history has only the
+/// synthetic `baseline` row migration `0071` gave it, and that row carries
+/// `changed_by = NULL` — nobody was recorded, so there is nobody to read
+/// as. Fail closed (D2): the row stays NULL and the pipeline does not run
+/// until an admin assigns an author. Attributing it to any real user here
+/// would fabricate an identity.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_leaves_a_baseline_only_pipeline_with_no_author(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create pipeline");
+    // Model the pre-`0053` versionless state, then the `baseline` row 0071
+    // wrote for it.
+    sqlx::query("DELETE FROM pipeline_definition_version WHERE pipeline_id = $1")
+        .bind(&created.id)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO pipeline_definition_version \
+         (pipeline_id, version, snapshot, event, changed_by, changed_at) \
+         VALUES ($1, 1, '{}'::jsonb, 'baseline', NULL, now())",
+    )
+    .bind(&created.id)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(migration_0076_backfill())
+        .execute(&pool)
+        .await?;
+
+    let stored = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("read pipeline")
+        .expect("the pipeline row exists");
+    assert_eq!(
+        stored.run_as, None,
+        "a baseline-only pipeline has no recorded author and must stay NULL"
     );
     Ok(())
 }
@@ -2357,6 +2481,64 @@ async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::R
     assert_eq!(
         chain[1].id, u1.id,
         "intermediate upstream (u1) must be second"
+    );
+    Ok(())
+}
+
+/// BLD-1 / D1: `changed_by` is a PRINCIPAL id, and `PrincipalId::uuid()`
+/// returns one for a service identity too — which has no `app_user` row.
+/// The foreign key would reject such a pipeline's own author, so the
+/// backfill's `EXISTS (SELECT 1 FROM app_user …)` guard must leave it NULL
+/// rather than fail the migration. `service-…` mirrors the uuid shape a
+/// service identity carries.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_skips_a_created_version_written_by_a_non_user(pool: PgPool) -> sqlx::Result<()> {
+    let not_a_user = Uuid::from_u128(0x5eed_0000_0000_0000_0000_0000_0000_0001);
+    let created = pipelines::create_pipeline(&pool, &input(), Some(not_a_user))
+        .await
+        .expect("create pipeline");
+
+    sqlx::query(migration_0076_backfill())
+        .execute(&pool)
+        .await?;
+
+    let stored = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("read pipeline")
+        .expect("the pipeline row exists");
+    assert_eq!(
+        stored.run_as, None,
+        "a `changed_by` that is not an app_user row must not become `run_as`"
+    );
+    Ok(())
+}
+
+/// BLD-1 / D1: an edit does not change the author. `update_pipeline` never
+/// writes `run_as`, so a pipeline edited by somebody else still reads as
+/// the person who created it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
+    let author = seed_user(&pool, "run-as-update@example.com").await;
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            run_as: Some(author),
+            ..input()
+        },
+        Some(author),
+    )
+    .await
+    .expect("create pipeline");
+    assert_eq!(created.run_as, Some(author));
+
+    let edited = pipelines::update_pipeline(&pool, &created.id, &update_input_for(&created), None)
+        .await
+        .expect("update pipeline")
+        .expect("pipeline exists");
+    assert_eq!(
+        edited.run_as,
+        Some(author),
+        "editing a pipeline must not reassign who it reads as"
     );
     Ok(())
 }

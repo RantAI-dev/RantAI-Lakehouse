@@ -28,17 +28,19 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useAuth } from "@/features/auth/auth-provider"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import type { EntityStatus } from "@/lib/status"
 import { cn } from "@/lib/utils"
-import { pipelineService } from "@/services"
+import { identityService, pipelineService } from "@/services"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import { AuthoredFlow, DagsterDefinition } from "./pipeline-definition"
 import { PipelineMasthead, PipelineVitals } from "./pipeline-detail-header"
 import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
 import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
+import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
 import { ScheduleHistory } from "./schedule-history"
 import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
@@ -173,6 +175,30 @@ export function PipelineDetailPage() {
   const summary = React.useMemo(() => summarizeRuns(runs), [runs])
   const anyLive = runs.some(isLiveRun)
 
+  // BLD-1 / D2: who this pipeline reads as. The NAME rides along with the
+  // detail read, so everyone sees it; the user LIST is only needed by the
+  // assign control below, which is `identity:write` — and that list is
+  // `identity:read`, which no ordinary role holds. So it is fetched only
+  // for a caller who can use it, rather than 403-ing on every pipeline
+  // page an ordinary operator opens.
+  const { hasPermission } = useAuth()
+  const canAssignReadsAs = hasPermission("identity:write")
+  const usersState = useService(
+    (s) => (canAssignReadsAs ? identityService.listUsers(s) : Promise.resolve([])),
+    [canAssignReadsAs]
+  )
+  const users = React.useMemo(
+    () => (usersState.status === "success" ? usersState.data : []),
+    [usersState]
+  )
+  // The user id chosen in the assign control, or `null` for "nothing
+  // chosen". Reset whenever the pipeline changes, so an id chosen on one
+  // pipeline can never be submitted for another.
+  const [readsAsChoice, setReadsAsChoice] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    setReadsAsChoice(null)
+  }, [pipelineId])
+
   const [now, setNow] = React.useState(() => Date.now())
   const fastUntil = React.useRef(0)
   const reloadRuns = runsState.reload
@@ -237,6 +263,20 @@ export function PipelineDetailPage() {
     })
   )
 
+  // BLD-1 / D2: assign the user this pipeline reads as. The page reloads
+  // afterwards because the detail read is what carries `runAsName` — the
+  // row that just changed is the same one the masthead is describing.
+  const assignReadsAs = useServiceAction(
+    withNotify(
+      { success: "Pipeline now reads as the chosen user", error: "The author could not be assigned" },
+      async (signal, id: string) => {
+        if (!readsAsChoice) return true
+        await pipelineService.assignRunAs(id, readsAsChoice, signal)
+        return true
+      }
+    )
+  )
+
   const afterLaunch = React.useCallback(
     (focusNewest: boolean) => {
       fastUntil.current = Date.now() + LAUNCH_WINDOW_MS
@@ -259,6 +299,8 @@ export function PipelineDetailPage() {
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
   const authored = p.engine === "authored"
+  const readsAsState = readsAs(p, users)
+  const authorChoicesState = authorChoices(users, p.tenantId)
   const schedule = parseSchedule(p.schedule)
   // A Dagster job's status is its newest run's, never "paused": whether it
   // is paused lives in its schedule's state. An authored pipeline carries
@@ -361,7 +403,53 @@ export function PipelineDetailPage() {
         schedule={schedule}
         schedulePaused={schedulePaused}
         actions={actions}
+        readsAs={readsAsState}
       />
+
+      {/* BLD-1 / D2: the one control that can change who a pipeline reads
+          as. Platform Admin only (`identity:write`), the same grant the
+          route requires — and the page hides it rather than offering a
+          control the API would refuse. It offers only choices the API will
+          accept: active users inside this pipeline's own tenant. */}
+      {authored && canAssignReadsAs ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card/60 px-3 py-2">
+          <label className="text-xs text-muted-foreground" htmlFor="pipeline-reads-as">
+            Reads as
+          </label>
+          <select
+            id="pipeline-reads-as"
+            className="min-w-52 rounded-md border border-border bg-background px-2 py-1 text-sm"
+            value={readsAsChoice ?? ""}
+            disabled={authorChoicesState.options.length === 0}
+            onChange={(event) => setReadsAsChoice(event.target.value || null)}
+          >
+            <option value="">
+              {readsAsState.kind === "unset" ? "Nobody — this pipeline cannot run" : "Choose a user…"}
+            </option>
+            {authorChoicesState.options.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.name}
+              </option>
+            ))}
+          </select>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!readsAsChoice || assignReadsAs.status === "pending"}
+            onClick={async () => {
+              if (await assignReadsAs.run(pipelineId)) {
+                setReadsAsChoice(null)
+                state.reload()
+              }
+            }}
+          >
+            Assign
+          </Button>
+          {authorChoicesState.blocked ? (
+            <span className="text-xs text-muted-foreground">{authorChoicesState.blocked}</span>
+          ) : null}
+        </div>
+      ) : null}
 
       {authored && !isDraft && !p.orchestratorJob ? (
         <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">

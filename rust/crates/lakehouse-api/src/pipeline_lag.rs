@@ -1392,6 +1392,9 @@ mod tests {
             depends_on: Vec::new(),
             tenant_id: None,
             target_lag: Some(TargetLag::Lag { minutes }),
+            // BLD-1 / D1: this fixture is about the lag decision, not about
+            // who the pipeline reads as.
+            run_as: None,
         }
     }
 
@@ -1485,6 +1488,9 @@ mod tests {
                 connector_id: None,
                 id: Some(id.to_owned()),
                 target_lag: Some(TargetLag::Lag { minutes }),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -1871,6 +1877,9 @@ mod tests {
                 connector_id: None,
                 id: None,
                 target_lag: None,
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -1955,6 +1964,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-u".to_owned()),
                 target_lag: Some(TargetLag::Downstream),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -1983,6 +1995,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-p".to_owned()),
                 target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -2045,6 +2060,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-u2".to_owned()),
                 target_lag: Some(TargetLag::Downstream),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -2072,6 +2090,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-p2".to_owned()),
                 target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -2145,6 +2166,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-lonely".to_owned()),
                 target_lag: Some(TargetLag::Downstream),
+                // BLD-1 / D1: these fixtures are about the lag check, not
+                // about who the pipeline reads as.
+                run_as: None,
             },
             None,
         )
@@ -2366,6 +2390,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-orphan".to_owned()),
                 target_lag: Some(TargetLag::Downstream),
+                // BLD-1 / D1: the fixture is about downstream readers, not
+                // about a pipeline author.
+                run_as: None,
             },
             None,
         )
@@ -2392,6 +2419,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-wanted".to_owned()),
                 target_lag: Some(TargetLag::Downstream),
+                // BLD-1 / D1: the fixture is about downstream readers, not
+                // about a pipeline author.
+                run_as: None,
             },
             None,
         )
@@ -2420,6 +2450,9 @@ mod tests {
                 connector_id: None,
                 id: Some("pl-consumer".to_owned()),
                 target_lag: Some(TargetLag::Lag { minutes: 5 }),
+                // BLD-1 / D1: the fixture is about downstream readers, not
+                // about a pipeline author.
+                run_as: None,
             },
             None,
         )
