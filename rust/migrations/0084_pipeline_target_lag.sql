@@ -6,12 +6,8 @@
 --
 -- # Migration numbering
 --
--- 0077, following 0071 on `main`. `0072`-`0075` are taken by PR #144's
--- unmerged branch and `0076` by BLD-1's `feat/bld-1-run-as-author`; the
--- re-check of every open branch before this PR is opened is recorded in
--- the plan's Handoff. The two BLD branches touch `pipeline_definition`,
--- but different columns and a different table, so the order carries no
--- hazard whichever way they merge.
+-- 0084, following 0080 on `main`. `0078`-`0083` are taken by PR #106's
+-- open branch; 0084 is the next free number per plan D1 and review R4.
 --
 -- # Two columns, never both
 --
@@ -47,8 +43,8 @@ COMMENT ON COLUMN pipeline_definition.target_lag_seconds IS
     'has no target lag or is "downstream" (see target_lag_downstream).';
 COMMENT ON COLUMN pipeline_definition.target_lag_downstream IS
     'true = Snowflake DOWNSTREAM: this pipeline refreshes only when a '
-    'pipeline with a target lag that reads it needs it. Always false with '
-    'target_lag_seconds NULL is NOT allowed to hold both.';
+    'pipeline with a target lag that reads it needs it. Mutually exclusive '
+    'with target_lag_seconds: holding both is NOT allowed.';
 
 -- The per-pipeline lag state, one row per pipeline the lag-check route has
 -- ever looked at. It is NOT written by any user-facing route: the state is
@@ -93,8 +89,11 @@ CREATE TABLE pipeline_lag_state (
     -- outstanding"; the next check asks Dagster for it by `run_key`
     -- before deciding anything new, so two checks can never request two
     -- runs for the same change.
+    -- BLD-2 review R1 decision R4 (R1/R2 columns)
     requested_run_key TEXT,
     requested_tokens JSONB,
+    requested_at TIMESTAMPTZ,
+    request_attempt INTEGER NOT NULL DEFAULT 0,
     last_check_at TIMESTAMPTZ,
     -- 'met' | 'behind' | 'not_measured' — the same three words the API
     -- reports. 'not_measured' is what an unreadable input (plan D4) or a
