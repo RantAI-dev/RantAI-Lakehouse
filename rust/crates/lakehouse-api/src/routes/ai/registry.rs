@@ -155,6 +155,163 @@ fn with_table_properties(mut schema: Value) -> Value {
     schema
 }
 
+/// The `measures` of `create_chart` and `update_chart` (`BI-6`): a column name,
+/// or a column with its own aggregate. A plain name takes the chart's
+/// `aggregate`, as before.
+fn measures_schema() -> Value {
+    json!({ "type": "array", "items": { "oneOf": [
+        { "type": "string" },
+        { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column", "aggregate"],
+            "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" },
+        { "type": "object", "properties": {
+            "column": param_ref_schema(),
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column"],
+            "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}" },
+        { "type": "object", "properties": {
+            "metric": { "type": "string", "description": "the name of a metric from list_metrics" } },
+            "required": ["metric"],
+            "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches" }
+    ] },
+        "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}" })
+}
+
+/// `{ "param": <name> }` (`BI-11`).
+fn param_ref_schema() -> Value {
+    json!({ "type": "object", "properties": { "param": { "type": "string", "description": "the name of a parameter from list_parameters" } },
+        "required": ["param"] })
+}
+
+/// How a number is binned (`BI-10`): the three modes of `lakehouse_bi::bin`.
+fn bin_schema(description: &str) -> Value {
+    json!({ "type": "object", "properties": {
+        "mode": { "type": "string", "enum": ["auto", "count", "width"], "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width" },
+        "count": { "type": ["number", "string"], "description": "mode count: 10, 50 or 100" },
+        "width": { "type": ["number", "string"], "description": "mode width: a positive number; the only mode for a SQL source" } },
+        "required": ["mode"], "description": description })
+}
+
+/// The filters a chart or a question carries (at most 20): the same filters a
+/// dashboard takes, on columns of the data they belong to.
+fn filters_schema(description: &str) -> Value {
+    json!({ "type": "array", "items": { "oneOf": [
+        { "type": "object", "properties": {
+            "segment": { "type": "string", "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters" } },
+            "required": ["segment"] },
+        { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "op": { "type": "string", "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"], "description": "default in" },
+            "values": { "type": "array", "items": { "type": "string" }, "description": "in / not_in" },
+            "min": { "type": "string", "description": "between: a number or a date YYYY-MM-DD" },
+            "max": { "type": "string" },
+            "minExclusive": { "type": "boolean" }, "maxExclusive": { "type": "boolean" },
+            "text": { "type": "string", "description": "contains, starts_with, ends_with, not_contains" },
+            "anchor": { "type": "string", "enum": ["last", "this", "previous", "next"], "description": "relative" },
+            "unit": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
+            "n": { "type": "number" } },
+            "required": ["column"] }
+    ] }, "description": description })
+}
+
+/// The joins of a chart or a question (`BI-7`): up to four more Gold marts.
+fn joins_schema(description: &str) -> Value {
+    json!({ "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)" },
+            "type": { "type": "string", "enum": ["inner", "left", "right", "full"], "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too" },
+            "on": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+                "left": { "type": "string", "description": "a column of the chart's mart, or of an earlier join as <table>__<column>" },
+                "op": { "type": "string", "enum": ["=", "<", "<=", ">", ">="] },
+                "right": { "type": "string", "description": "a column of the table being joined" } },
+                "required": ["left", "op", "right"] },
+                "description": "the pairs to match, all of them; at least one uses =" } },
+            "required": ["mart", "type", "on"] }, "description": description })
+}
+
+/// The `BI-6` fields of `create_chart` and `update_chart` (the chart's own
+/// filters, sort, "Other", groupings), inserted the way
+/// [`with_table_properties`] inserts the table fields. The limits are the ones
+/// `lakehouse_bi::shape` enforces.
+fn with_shape_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "limit": { "oneOf": [ { "type": "number" }, param_ref_schema() ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)" },
+        "dimension": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it" },
+        "breakdown": { "oneOf": [ { "type": "string" }, param_ref_schema() ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it" },
+        "referenceLines": { "type": "array", "maxItems": 5, "items": { "type": "object", "properties": {
+            "value": { "oneOf": [ { "type": "number" }, param_ref_schema() ], "description": "where on the value axis: a number, or {param: <a number parameter>}" },
+            "label": { "type": "string", "description": "at most 60 characters" } },
+            "required": ["value"] },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move" },
+        "filters": filters_schema("the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""),
+        "layers": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "the Gold mart this question reads (give this or sqlSource)" },
+            "sqlSource": { "type": "string", "description": "the id of a saved SQL source (give this or mart)" },
+            "dimension": { "type": "string", "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain" },
+            "measures": measures_schema(),
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"], "description": "for the measures that have none of their own; default sum" },
+            "filters": filters_schema("this question's own filters (at most 20), on its own data"),
+            "joins": joins_schema("up to four more Gold marts joined to this question's mart; not for a SQL source"),
+            "label": { "type": "string", "description": "the legend name, at most 60 characters" },
+            "draw": { "type": "string", "enum": ["bar", "line"], "description": "how this question is drawn" },
+            "axis": { "type": "string", "enum": ["left", "right"], "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors" } },
+            "required": ["dimension", "measures", "draw", "axis"] },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows" },
+        "draw": { "type": "string", "enum": ["bar", "line"], "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)" },
+        "axis": { "type": "string", "enum": ["left", "right"], "description": "with layers: which value axis the chart's own series uses (default left)" },
+        "sort": { "type": "object", "properties": {
+            "by": { "type": "string", "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)" },
+            "dir": { "type": "string", "enum": ["asc", "desc"] } },
+            "required": ["by", "dir"],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode" },
+        "other": { "type": "boolean", "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain" },
+        "steps": { "type": "array", "minItems": 1, "maxItems": 2, "items": { "type": "object", "properties": {
+            "filter": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "type": "object", "properties": {
+                "column": { "type": "string", "description": "a grouping or a measure of the result before this step" },
+                "op": { "type": "string", "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "between"] },
+                "value": { "type": ["string", "number"], "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)" },
+                "min": { "type": ["string", "number"] }, "max": { "type": ["string", "number"] } },
+                "required": ["column", "op"] },
+                "description": "keep the rows that meet every condition" },
+            "summarise": { "type": "object", "properties": {
+                "by": { "type": "array", "items": { "type": "string" }, "description": "the groupings to keep, a subset of the result before (at least one)" },
+                "measures": { "type": "array", "minItems": 1, "maxItems": 6, "items": { "type": "object", "properties": {
+                    "column": { "type": "string", "description": "a measure of the result before this step" },
+                    "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+                    "required": ["column", "aggregate"] },
+                    "description": "each is named <aggregate>_<column> in the result" } },
+                "required": ["by", "measures"],
+                "description": "group the result before this step again" } },
+            "description": "give exactly one of filter and summarise" },
+            "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'" },
+        "joins": joins_schema("up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"),
+        "groupings": { "type": "array", "minItems": 1, "maxItems": 5, "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": "for a date or timestamp column" },
+            "bin": bin_schema("for a number column, instead of a grain") },
+            "required": ["column"] },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension" },
+        "bin": bin_schema("group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"),
+        "breakdownBin": bin_schema("the same for a number `breakdown`"),
+        "grid": { "type": "object", "properties": {
+            "size": { "type": ["string", "number"], "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10" } },
+            "required": ["size"],
+            "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
+}
+
 fn run_sql_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_sql",
         "description": "Run a read-only ClickHouse SELECT and return its rows. Use it for every number you report. Query Gold marts (serving.mart_*) for totals and trends, Silver (silver.<table>) for detail rows. Compute totals, percentages, growth and rankings in the SQL itself. Tables and columns are in the DATA MAP.",
@@ -247,7 +404,7 @@ fn describe_mart_schema() -> Value {
 }
 
 fn create_chart_schema() -> Value {
-    with_table_properties(
+    with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
@@ -256,7 +413,7 @@ fn create_chart_schema() -> Value {
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
             "target": { "type": "number" }, "dimension": { "type": "string" },
-            "measures": { "type": "array", "items": { "type": "string" } },
+            "measures": measures_schema(),
             "breakdown": { "type": "string" },
             "map": { "type": "string", "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta (Jakarta cities), id-provinces (Indonesian provinces), id-regencies (Indonesian kabupaten/kota)" },
             "lat": { "type": "string", "description": "pointmap and geoheat only (required): the latitude column" },
@@ -267,11 +424,11 @@ fn create_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["title", "kind"] } } }),
-    )
+    ))
 }
 
 fn update_chart_schema() -> Value {
-    with_table_properties(
+    with_shape_properties(with_table_properties(
         json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
@@ -279,7 +436,7 @@ fn update_chart_schema() -> Value {
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
             "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "dimension": { "type": "string" },
-            "measures": { "type": "array", "items": { "type": "string" } },
+            "measures": measures_schema(),
             "breakdown": { "type": "string" }, "caption": { "type": "string" },
             "map": { "type": "string", "description": "map kinds only (geomap, pointmap, geoheat): id of a bundled map, one of dki-jakarta, id-provinces, id-regencies" },
             "lat": { "type": "string", "description": "pointmap and geoheat only (required): the latitude column" },
@@ -291,7 +448,7 @@ fn update_chart_schema() -> Value {
             "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
             "required": ["id", "title", "kind"] } } }),
-    )
+    ))
 }
 
 fn create_board_schema() -> Value {
@@ -319,6 +476,15 @@ fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
         "description": "List the chart cards saved on dashboards.",
         "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn suggest_join_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "suggest_join",
+        "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first: both columns in their tables' sorting keys with the same name and kind, then the same name and kind, then the same name. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+        "parameters": { "type": "object", "properties": {
+            "left": { "type": "string", "description": "the chart's mart, e.g. mart_visits" },
+            "right": { "type": "string", "description": "the mart to join to it" } },
+            "required": ["left", "right"] } } })
 }
 
 fn list_sql_sources_schema() -> Value {
@@ -349,6 +515,68 @@ fn list_formula_functions_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_formula_functions",
         "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
         "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_metrics_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_metrics",
+        "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue. Call it BEFORE writing a query or a chart for a number the user names: if one matches, use it and name it in your answer; if none matches, say so before you write SQL.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn describe_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "describe_metric",
+        "description": "One metric in full: its formula, filters, date column and default grain, and the charts and dashboards that use it.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "the metric's name from list_metrics" } },
+            "required": ["name"] } } })
+}
+
+fn query_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "query_metric",
+        "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further. Say which metric you used.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "the metric's name from list_metrics" },
+            "groupBy": { "type": "string", "description": "a column of the metric's table; with grain, a date column" },
+            "grain": { "type": "string", "enum": ["day", "week", "month", "quarter", "year"] },
+            "filters": filters_schema("filters on columns of the metric's table, or a saved segment {segment}") },
+            "required": ["name"] } } })
+}
+
+fn metric_properties() -> Value {
+    let mut properties = calc_source_properties();
+    properties["label"] =
+        json!({ "type": "string", "description": "what people read, for example Total visitors" });
+    properties["description"] = json!({ "type": "string", "description": "what it counts and how, at most 500 characters" });
+    properties["formula"] = json!({ "type": "string", "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)" });
+    properties["filters"] = filters_schema(
+        "the metric's own filters, applied to this metric's number only (or a saved segment {segment})",
+    );
+    properties["timeColumn"] = json!({ "type": "string", "description": "a date or timestamp column its period comparisons run on" });
+    properties["grain"] = json!({ "type": "string", "enum": ["day", "week", "month", "quarter", "year"], "description": "its default period" });
+    properties
+}
+
+fn create_metric_schema() -> Value {
+    let mut properties = metric_properties();
+    properties["name"] = json!({ "type": "string", "description": "letters, digits and _ (for example total_visitors), unique, not a column; charts pick the metric by it and it cannot change later" });
+    json!({ "type": "function", "function": { "name": "create_metric",
+        "description": "Save a reusable metric on a mart or SQL source. Only when the user asks for one; check list_metrics first so there is one definition per number. Needs the metric:write permission.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "label", "formula"] } } })
+}
+
+fn update_metric_schema() -> Value {
+    let mut properties = metric_properties();
+    properties["id"] = json!({ "type": "string", "description": "from list_metrics" });
+    json!({ "type": "function", "function": { "name": "update_metric",
+        "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition.",
+        "parameters": { "type": "object", "properties": properties, "required": ["id", "label", "formula"] } } })
+}
+
+fn delete_metric_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_metric",
+        "description": "Delete one metric (by id). Refused while a chart uses it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
 }
 
 fn list_calculated_fields_schema() -> Value {
@@ -391,6 +619,94 @@ fn delete_calculated_field_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── BI-10 value groups and hierarchies (with AI-6) ───────────────────────
+
+fn create_value_group_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] = json!({ "type": "string", "description": "a name of letters, digits and _ (for example region_group), not a column of the source; charts pick the group by it like a column" });
+    properties["group"] = json!({ "type": "object", "properties": {
+        "column": { "type": "string", "description": "a text column of the source" },
+        "groups": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "object", "properties": {
+            "name": { "type": "string", "description": "what the values are shown as, for example Java" },
+            "values": { "type": "array", "items": { "type": "string" }, "description": "values of the column exactly as spelled; a value belongs to one group only; at most 2000 in all" } },
+            "required": ["name", "values"] } },
+        "rest": { "type": "string", "enum": ["keep", "other"], "description": "keep: values in no group keep their own name; other: they are shown as Other" } },
+        "required": ["column", "groups", "rest"] });
+    json!({ "type": "function", "function": { "name": "create_value_group",
+        "description": "Gather chosen values of a text column under names of your own (for example six provinces as Java) and save it as a field of the source. Then use its name in create_chart as dimension or breakdown, like a column. It is a text column, so not a measure. Take the values from run_sql or describe_mart, never invent them.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "group"] } } })
+}
+
+fn list_hierarchies_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_hierarchies",
+        "description": "The hierarchies of one mart or SQL source: named, ordered lists of columns (for example province, city, place) that a chart can be drilled down through by clicking a value.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn create_hierarchy_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] =
+        json!({ "type": "string", "description": "for example Geography (1 to 64 characters)" });
+    properties["levels"] = json!({ "type": "array", "minItems": 2, "maxItems": 6, "items": { "type": "string" }, "description": "2 to 6 columns of the source, outermost first (province, city, place)" });
+    json!({ "type": "function", "function": { "name": "create_hierarchy",
+        "description": "Save a hierarchy on a mart or SQL source. A viewer can then drill down a chart whose dimension is one of its levels. Charts do not store it, so it never breaks a chart.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "levels"] } } })
+}
+
+fn delete_hierarchy_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_hierarchy",
+        "description": "Delete one hierarchy (by id from list_hierarchies). No chart depends on it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── BI-11 parameters ──────────────────────────────────────────────────────
+
+fn list_parameters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_parameters",
+        "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read. Use before create_chart to reuse one.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn parameter_properties() -> Value {
+    json!({
+        "name": { "type": "string", "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later" },
+        "label": { "type": "string", "description": "what the control shows" },
+        "type": { "type": "string", "enum": ["number", "text", "date", "list"], "description": "cannot be changed later" },
+        "default": { "type": ["number", "string"], "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values" },
+        "min": { "type": ["number", "string"], "description": "number or date" },
+        "max": { "type": ["number", "string"], "description": "number or date" },
+        "maxLength": { "type": "number", "description": "text: at most 200" },
+        "values": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "type": "object", "properties": {
+            "value": { "type": ["number", "string"] }, "label": { "type": "string" } },
+            "required": ["value"] },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)" }
+    })
+}
+
+fn create_parameter_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_parameter",
+        "description": "Define a parameter. Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
+        "parameters": { "type": "object", "properties": parameter_properties(),
+            "required": ["name", "type", "default"] } } })
+}
+
+fn update_parameter_schema() -> Value {
+    let mut properties = parameter_properties();
+    properties["id"] = json!({ "type": "string", "description": "from list_parameters" });
+    json!({ "type": "function", "function": { "name": "update_parameter",
+        "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay.",
+        "parameters": { "type": "object", "properties": properties,
+            "required": ["id", "name", "type", "default"] } } })
+}
+
+fn delete_parameter_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_parameter",
+        "description": "Delete one parameter (by id from list_parameters). Refused while a formula, a chart or a dashboard uses it. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
 // ── T1.1 Alerts ──────────────────────────────────────────────────────────
 
 /// The five comparison operators an alert rule may use, mirroring
@@ -414,12 +730,13 @@ fn list_alert_rules_schema() -> Value {
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read with the fixed viewer role every alert uses, not with the user's access). Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
             "mart": { "type": "string", "description": "Gold mart name, for type=alert" },
             "measure": { "type": "string", "description": "measure column to watch, for type=alert" },
+            "metric": { "type": "string", "description": "the name of a metric to watch, for type=alert, instead of mart/measure/agg" },
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
@@ -439,6 +756,7 @@ fn update_alert_rule_schema() -> Value {
             "type": { "type": "string", "enum": ["alert", "digest"] },
             "mart": { "type": "string" },
             "measure": { "type": "string" },
+            "metric": { "type": "string", "description": "the name of a metric to watch instead of mart/measure/agg" },
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
@@ -1006,6 +1324,13 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only, like `describe_mart`: column metadata of two marts.
+    ToolSpec {
+        name: "suggest_join",
+        schema: suggest_join_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
@@ -1049,6 +1374,98 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "delete_calculated_field",
         schema: delete_calculated_field_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    // BI-2 / AI-7: reusable metrics. Reading, describing and querying need
+    // `dashboard:read` (query_metric runs as the caller); the writes mirror
+    // `/api/dashboard/metrics` and need `metric:write`; deleting asks for
+    // approval like `delete_calculated_field`.
+    ToolSpec {
+        name: "list_metrics",
+        schema: list_metrics_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "describe_metric",
+        schema: describe_metric_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "query_metric",
+        schema: query_metric_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_metric",
+        schema: create_metric_schema,
+        risk: Risk::WriteLow,
+        permission: "metric:write",
+    },
+    ToolSpec {
+        name: "update_metric",
+        schema: update_metric_schema,
+        risk: Risk::WriteLow,
+        permission: "metric:write",
+    },
+    ToolSpec {
+        name: "delete_metric",
+        schema: delete_metric_schema,
+        risk: Risk::WriteHigh,
+        permission: "metric:write",
+    },
+    // BI-10 / AI-6: value groups and hierarchies. The permissions mirror
+    // `/api/dashboard/calc-fields` and `/api/dashboard/hierarchies` in
+    // `POLICY_TABLE`: reading needs `dashboard:read`, saving `dashboard:write`;
+    // deleting a hierarchy asks for approval like `delete_calculated_field`.
+    ToolSpec {
+        name: "create_value_group",
+        schema: create_value_group_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "list_hierarchies",
+        schema: list_hierarchies_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_hierarchy",
+        schema: create_hierarchy_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_hierarchy",
+        schema: delete_hierarchy_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "list_parameters",
+        schema: list_parameters_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_parameter",
+        schema: create_parameter_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_parameter",
+        schema: update_parameter_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_parameter",
+        schema: delete_parameter_schema,
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
@@ -1434,7 +1851,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_seventy_entries() {
+    fn tool_schemas_has_eighty_five_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -1442,8 +1859,126 @@ mod tests {
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
         // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
-        // `propose_sql` (plan 15).
-        assert_eq!(tool_schemas().len(), 71);
+        // `suggest_join` (`BI-7`) + `create_value_group`, `list_hierarchies`,
+        // `create_hierarchy` and `delete_hierarchy` (`BI-10`) + `list_parameters`,
+        // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`)
+        // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
+        // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
+        // (`AI-12`, plan 15; merged from main).
+        assert_eq!(tool_schemas().len(), 86);
+    }
+
+    /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
+    /// changing and deleting one needs `metric:write`, the permission of the
+    /// routes they call, and a delete asks for approval.
+    #[test]
+    fn the_metric_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("list_metrics", Risk::Read, "dashboard:read"),
+            ("describe_metric", Risk::Read, "dashboard:read"),
+            ("query_metric", Risk::Read, "dashboard:read"),
+            ("create_metric", Risk::WriteLow, "metric:write"),
+            ("update_metric", Risk::WriteLow, "metric:write"),
+            ("delete_metric", Risk::WriteHigh, "metric:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, permission, "{name}");
+        }
+        // A measure may be a metric, and a filter a segment, on both chart tools.
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert_eq!(
+                properties["measures"]["items"]["oneOf"][3]["required"],
+                json!(["metric"]),
+                "{tool}"
+            );
+            assert_eq!(
+                properties["filters"]["items"]["oneOf"][0]["required"],
+                json!(["segment"]),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bi_10_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("create_value_group", Risk::WriteLow, "dashboard:write"),
+            ("list_hierarchies", Risk::Read, "dashboard:read"),
+            ("create_hierarchy", Risk::WriteLow, "dashboard:write"),
+            ("delete_hierarchy", Risk::WriteHigh, "dashboard:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!((spec.risk, spec.permission), (risk, permission), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_bi_11_tools_have_the_risk_and_permission_of_the_routes_they_call() {
+        for (name, risk, permission) in [
+            ("list_parameters", Risk::Read, "dashboard:read"),
+            ("create_parameter", Risk::WriteLow, "dashboard:write"),
+            ("update_parameter", Risk::WriteLow, "dashboard:write"),
+            ("delete_parameter", Risk::WriteHigh, "dashboard:write"),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!((spec.risk, spec.permission), (risk, permission), "{name}");
+        }
+    }
+
+    /// `BI-11` (with `AI-6`): the chart tools take a parameter for the limit
+    /// and the column slots, and reference lines.
+    #[test]
+    fn the_chart_tools_take_parameters_and_reference_lines() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert!(properties.get("referenceLines").is_some(), "{tool}");
+            for slot in ["limit", "dimension", "breakdown"] {
+                assert_eq!(
+                    properties[slot]["oneOf"][1]["required"],
+                    json!(["param"]),
+                    "{tool} {slot}"
+                );
+            }
+            assert_eq!(
+                properties["measures"]["items"]["oneOf"][2]["required"],
+                json!(["column"]),
+                "{tool}"
+            );
+        }
+    }
+
+    /// `BI-13` (with `AI-6`): the chart tools take layers, and how the chart's
+    /// own series is drawn.
+    #[test]
+    fn the_chart_tools_take_layers_draw_and_axis() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            assert_eq!(properties["layers"]["maxItems"], 4, "{tool}");
+            assert_eq!(
+                properties["layers"]["items"]["required"],
+                json!(["dimension", "measures", "draw", "axis"]),
+                "{tool}"
+            );
+            assert_eq!(properties["draw"]["enum"], json!(["bar", "line"]), "{tool}");
+            assert_eq!(
+                properties["axis"]["enum"],
+                json!(["left", "right"]),
+                "{tool}"
+            );
+            // A layer takes the same filters and joins a chart takes.
+            for field in ["filters", "joins"] {
+                assert_eq!(
+                    properties["layers"]["items"]["properties"][field]["items"],
+                    properties[field]["items"],
+                    "{tool} {field}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1484,6 +2019,49 @@ mod tests {
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
         );
+    }
+
+    /// `BI-6` (with `AI-6`): the chart tools take the chart builder's fields, and
+    /// `measures` accepts a column with its own aggregate beside a plain name.
+    #[test]
+    fn create_chart_and_update_chart_take_the_chart_builder_fields() {
+        for tool in ["create_chart", "update_chart"] {
+            let schema = (find(tool).expect("registered tool").schema)();
+            let properties = &schema["function"]["parameters"]["properties"];
+            for field in [
+                "filters",
+                "sort",
+                "other",
+                "groupings",
+                "steps",
+                "joins",
+                "bin",
+                "breakdownBin",
+                "grid",
+            ] {
+                assert!(properties.get(field).is_some(), "{tool} lacks {field}");
+            }
+            // BI-10: a bin is {mode, count?, width?}; a grouping may carry one.
+            assert_eq!(properties["bin"]["required"], json!(["mode"]), "{tool}");
+            assert!(
+                properties["groupings"]["items"]["properties"]
+                    .get("bin")
+                    .is_some(),
+                "{tool}"
+            );
+            let item = &properties["measures"]["items"]["oneOf"];
+            assert_eq!(item[0]["type"], "string", "{tool}");
+            assert_eq!(
+                item[1]["required"],
+                json!(["column", "aggregate"]),
+                "{tool}"
+            );
+            assert_eq!(
+                properties["sort"]["required"],
+                json!(["by", "dir"]),
+                "{tool}"
+            );
+        }
     }
 
     /// `SEC-14`: the assistant must never carry a secret, so

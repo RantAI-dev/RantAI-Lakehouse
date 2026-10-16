@@ -9,6 +9,13 @@ describe("toolsFromCaps", () => {
     expect(toolsFromCaps(new Set(["data"]), "build")).toContain("ask_user")
   })
 
+  it("offers the read-only metric tools with Query Data in both modes (AI-7)", () => {
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["list_metrics", "describe_metric", "query_metric"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), mode)).not.toContain("create_metric")
+    }
+  })
+
   it("does not offer ask_user when Query Data is off", () => {
     expect(toolsFromCaps(new Set(["dashboard"]), "build")).not.toContain("ask_user")
   })
@@ -28,6 +35,15 @@ describe("the dashboard capability against the server's tool list", () => {
       /(chart|board|sql_source|calculated_field|formula|describe_mart|suggest_dashboard)/.test(n)
     )
     expect(wanted).toContain("create_calculated_field")
+    const offered = toolsFromCaps(new Set(["dashboard"]), "build")
+    for (const name of wanted) expect(offered).toContain(name)
+  })
+
+  // BI-2 / AI-7: the metric tools were invisible to the model for the same reason until they were named here.
+  it("lists every metric tool the server has", () => {
+    const wanted = serverTools.filter((n) => /^(list|describe|query|create|update|delete)_metrics?$/.test(n))
+    expect(wanted).toContain("query_metric")
+    expect(wanted).toHaveLength(6)
     const offered = toolsFromCaps(new Set(["dashboard"]), "build")
     for (const name of wanted) expect(offered).toContain(name)
   })

@@ -310,6 +310,45 @@ pub(crate) async fn sources_for<'a>(
         .collect())
 }
 
+fn own_columns(
+    chart: &store::StoredChartSpec,
+    mart_cols: &HashMap<String, RelationColumns>,
+    sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+) -> Option<RelationColumns> {
+    match chart.def.sql_source.as_deref() {
+        Some(id) => sources
+            .get(id)
+            .map(lakehouse_bi::sources::SqlSource::column_kinds),
+        None => mart_cols.get(&chart.def.mart).cloned(),
+    }
+}
+
+/// The columns of the marts and the SQL sources a read loaded.
+pub(crate) type SourceColumns<'a> = (
+    &'a HashMap<String, RelationColumns>,
+    &'a HashMap<String, lakehouse_bi::sources::SqlSource>,
+);
+
+/// BI-2 review fix (SHOULD-FIX) R3: the label of each metric the tile shows,
+/// by metric name, as `metricLabels` on the tile's result, so the console
+/// labels a legend, an axis, a tooltip and a table header without a second
+/// request. Left out when no metric of the chart has a label.
+pub(crate) fn annotate_metric_labels(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    fields: &lakehouse_bi::fields::FieldCatalog,
+    columns: Option<SourceColumns<'_>>,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    let own = columns.and_then(|(marts, sources)| own_columns(chart, marts, sources));
+    let labels = fields.metric_labels(&chart.def, own.as_ref());
+    if !labels.is_empty() {
+        tile.insert("metricLabels".to_owned(), json!(labels));
+    }
+}
+
 /// The SQL to run for a stored chart right now: a mart chart through
 /// `sql_with_filters_report`, a SQL-source chart rebuilt from the source's
 /// CURRENT text (`sql_for_sql_source_report`), plus the active filters left
@@ -328,7 +367,23 @@ pub(crate) fn stored_chart_sql(
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
     read: &lakehouse_bi::builder::ReadContext<'_>,
 ) -> Result<FilteredSql, &'static str> {
+    // BI-2: a metric or segment that is gone is the tile's plain error; the
+    // statement saved with the chart would show the old number or a wider set.
+    let own_cols = own_columns(chart, mart_cols, sources);
+    if let Some(cols) = &own_cols
+        && read.fields.broken_reference(&chart.def, cols, read.time)
+    {
+        return Err("this chart uses a metric or segment that is missing or no longer checks out");
+    }
     let Some(id) = chart.def.sql_source.as_deref() else {
+        // BI-7: a join that no longer checks out (a table or column went away)
+        // is the tile's error, never the stored statement run unfiltered.
+        if let Ok(mart) = lakehouse_core::ident::Ident::new(chart.def.mart.clone())
+            && lakehouse_bi::joins::chart_relation(&mart, chart.def.shape.joins_list(), mart_cols)
+                .is_err()
+        {
+            return Err("this chart's joined tables no longer match its definition");
+        }
         return Ok(lakehouse_bi::builder::sql_with_filters_report(
             chart, years, filters, mart_cols, read,
         ));
@@ -345,6 +400,86 @@ pub(crate) fn stored_chart_sql(
         read,
     )
     .ok_or("this chart's definition is invalid")
+}
+
+/// `BI-11`: the chart as this read sees it, with every parameter in its
+/// definition replaced by the read's value ([`lakehouse_bi::params::resolve_chart`]).
+/// A chart that names no parameter slot comes back as it is.
+///
+/// The names a column switch may take are the columns of the chart's relation
+/// (the mart, its joins, or the SQL source's probed columns) and the
+/// calculated fields of that source; the parameter's own list is checked as
+/// well. A SQL source that no longer exists leaves the chart untouched so
+/// [`stored_chart_sql`] reports it with its own sentence.
+///
+/// # Errors
+///
+/// The tile's plain sentence when a parameter is missing, of the wrong kind,
+/// or its value does not fit the slot.
+pub(crate) fn effective_chart<'a>(
+    chart: &'a store::StoredChartSpec,
+    mart_cols: &HashMap<String, RelationColumns>,
+    sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+    read: &lakehouse_bi::builder::ReadContext<'_>,
+) -> Result<std::borrow::Cow<'a, store::StoredChartSpec>, String> {
+    if !lakehouse_bi::params::changes_statement(&chart.def) {
+        return Ok(std::borrow::Cow::Borrowed(chart));
+    }
+    let mut names: std::collections::HashSet<String> = read
+        .fields
+        .for_chart(&chart.def)
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    if let Some(id) = chart.def.sql_source.as_deref() {
+        let Some(source) = sources.get(id) else {
+            return Ok(std::borrow::Cow::Borrowed(chart));
+        };
+        names.extend(source.column_kinds().into_keys());
+    } else {
+        let mart = lakehouse_core::ident::Ident::new(chart.def.mart.clone());
+        match (&mart, chart.def.shape.joins_list().is_empty()) {
+            (Ok(_), true) | (Err(_), _) => {
+                names.extend(
+                    mart_cols
+                        .get(&chart.def.mart)
+                        .map(|c| c.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                );
+            }
+            (Ok(mart), false) => {
+                if let Ok(joined) = lakehouse_bi::joins::chart_relation(
+                    mart,
+                    chart.def.shape.joins_list(),
+                    mart_cols,
+                ) {
+                    names.extend(joined.cols.into_keys());
+                }
+            }
+        }
+    }
+    lakehouse_bi::params::resolve_chart(chart, read.time.params(), &|n| names.contains(n))
+        .map(std::borrow::Cow::Owned)
+}
+
+/// What a tile carries from the chart's parameters (`BI-11`): its reference
+/// lines with the values of this read. A tile that carries an error is left
+/// alone.
+pub(crate) fn annotate_params(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    params: &lakehouse_bi::params::ParamValues,
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if !tile.contains_key("rows") {
+        return;
+    }
+    let lines = lakehouse_bi::params::reference_lines(&chart.def, params);
+    if !lines.is_empty() {
+        tile.insert("referenceLines".to_owned(), json!(lines));
+    }
 }
 
 /// [`annotate_grain`] for a chart that is not on a dashboard (the builder's
@@ -366,8 +501,9 @@ pub(crate) fn annotate_saved_grain(tile: &mut Value, chart: &store::StoredChartS
         grain: Some(grain),
         grain_column: None,
         latest_limit: lakehouse_bi::grain::cuts_to_latest(grain, order)
-            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit)),
+            .then(|| lakehouse_bi::grain::clamp_limit(chart.def.kind, chart.def.limit_value())),
         table: None,
+        bins: Vec::new(),
     };
     annotate_grain(tile, &filtered, chart);
 }
@@ -417,6 +553,101 @@ pub(crate) fn annotate_grain(
     }
 }
 
+/// `BI-10`: what the tile of a binned chart carries so the console can label
+/// its bins: `bins: { <column>: { mode, width, min, max } }`, read by the
+/// statements the builder made over the same filtered relation as the bins,
+/// through the same role rewrite as the tile (the width of a viewer whose role
+/// filters rows comes from the rows that role may see). A read that fails or is
+/// refused leaves its column out: the tile then shows the bin's lower edges
+/// as plain numbers, and the failure is only logged under a reference id.
+pub(crate) async fn annotate_bins(
+    ch: &ChClient,
+    tile: &mut Value,
+    reads: &[lakehouse_bi::builder::BinRead],
+    context: (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    if let Value::Object(tile) = tile {
+        add_bins(ch, tile, reads, context).await;
+    }
+}
+
+async fn add_bins(
+    ch: &ChClient,
+    tile: &mut Map<String, Value>,
+    reads: &[lakehouse_bi::builder::BinRead],
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) {
+    if reads.is_empty() || !tile.contains_key("rows") {
+        return;
+    }
+    let mut out = Map::new();
+    for read in reads {
+        match try_run_spec_sql(ch, &read.sql, roles, placeholders, obligations).await {
+            Ok(result) => {
+                let row = &result["rows"][0];
+                out.insert(
+                    read.column.clone(),
+                    json!({
+                        "mode": read.mode,
+                        "width": row["width"],
+                        "min": row["min"],
+                        "max": row["max"],
+                    }),
+                );
+            }
+            Err(SpecRunFailure::Clickhouse(err)) => {
+                let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+            }
+            Err(SpecRunFailure::Refused(_)) => {}
+        }
+    }
+    if !out.is_empty() {
+        tile.insert("bins".to_owned(), Value::Object(out));
+    }
+}
+
+/// The bin reads of a chart that is not on a dashboard (the builder's
+/// preview): the statements its no-filter dashboard build would make. Empty
+/// for a chart without bins, and when the build cannot be made.
+pub(crate) async fn preview_bin_reads(
+    ch: &ChClient,
+    chart: &store::StoredChartSpec,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Vec<lakehouse_bi::builder::BinRead> {
+    if !chart.def.shape.has_bins() {
+        return Vec::new();
+    }
+    let Ok(cols) = mart_columns(ch).await else {
+        return Vec::new();
+    };
+    let Ok(sources) = sources_for(ch, [chart]).await else {
+        return Vec::new();
+    };
+    let catalog = match lakehouse_bi::fields::list_catalog_fields(ch).await {
+        Ok(found) => lakehouse_bi::fields::FieldCatalog::from_fields(found),
+        Err(_) => return Vec::new(),
+    };
+    let read = lakehouse_bi::builder::ReadContext {
+        time,
+        grain: None,
+        fields: &catalog,
+    };
+    let Ok(chart) = effective_chart(chart, &cols, &sources, &read) else {
+        return Vec::new();
+    };
+    stored_chart_sql(&chart, &[], &[], &cols, &sources, &read)
+        .map(|f| f.bins)
+        .unwrap_or_default()
+}
+
 /// What the tile of a raw table or a pivot carries beyond its rows
 /// (`BI-16` part A).
 ///
@@ -446,6 +677,7 @@ pub(crate) async fn annotate_table(
     if !tile.contains_key("rows") {
         return;
     }
+    add_bins(ch, tile, &filtered.bins, (roles, placeholders, obligations)).await;
     match &filtered.table {
         Some(TableRead::Rows { count_sql }) => {
             match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
@@ -512,6 +744,80 @@ pub(crate) fn annotate_saved_table(tile: &mut Value, chart: &store::StoredChartS
     {
         tile.insert("grain".to_owned(), json!(period));
     }
+}
+
+/// BI-2: the period of a comparing KPI that measures a metric and leaves its
+/// date column and period to the metric's defaults. `annotate_saved_table`
+/// reads the period from the comparison as written, which is absent then; the
+/// preview reads the metric's from the catalog.
+pub(crate) fn annotate_metric_period(
+    tile: &mut Value,
+    chart: &store::StoredChartSpec,
+    entries: &[lakehouse_bi::fields::FieldDef],
+) {
+    let Value::Object(tile) = tile else {
+        return;
+    };
+    if tile.contains_key("grain") || !chart.def.tables.compares_to_previous(chart.spec.kind) {
+        return;
+    }
+    let filled =
+        lakehouse_bi::metrics::fill_compare(&chart.def.tables, &chart.def.measures, entries);
+    if let Some(period) = filled.compare.as_ref().and_then(|c| c.period.as_deref()) {
+        tile.insert("grain".to_owned(), json!(period));
+    }
+}
+
+/// Most rows of a chart's last result the builder's preview table shows
+/// (`BI-6` part 2). Over a SQL source the engine itself returns at most 2,000
+/// rows ([`lakehouse_bi::builder::SQL_SOURCE_SETTINGS`]), so the cap is one
+/// below and a cut is seen instead of hidden by the engine.
+pub(crate) const PREVIEW_RESULT_ROWS: usize = 2000;
+
+/// The rows beside the chart in the builder's preview: up to
+/// [`PREVIEW_RESULT_ROWS`] of the chart's last result, with `truncated` when
+/// more exist. A chart with steps keeps only its limit in the tile, so the
+/// preview reads the same statement with a larger limit (through the same role
+/// rewrite); any other chart's last result is the rows the tile already has.
+/// The saved chart's own limit is not touched. `None` when the tile carries an
+/// error or the longer read fails (the failure is logged under a reference).
+pub(crate) async fn preview_rows(
+    ch: &ChClient,
+    chart: &store::StoredChartSpec,
+    result: &Value,
+    (roles, placeholders, obligations): (
+        &[String],
+        &crate::sql_rewrite::PlaceholderValues,
+        &crate::policy_engine::PolicyEngineObligations<'_>,
+    ),
+) -> Option<Value> {
+    let cap = if chart.def.sql_source.is_some() {
+        PREVIEW_RESULT_ROWS - 1
+    } else {
+        PREVIEW_RESULT_ROWS
+    };
+    let mut shown = result.clone();
+    if chart.def.shape.steps.is_some() {
+        let limit = chart.def.limit_value().unwrap_or(20);
+        let sql = lakehouse_bi::builder::steps::with_limit(
+            &chart.spec.sql,
+            limit,
+            u32::try_from(cap + 1).ok()?,
+        )?;
+        shown = match try_run_spec_sql(ch, &sql, roles, placeholders, obligations).await {
+            Ok(rows) => rows,
+            Err(SpecRunFailure::Refused(_)) => return None,
+            Err(SpecRunFailure::Clickhouse(err)) => {
+                let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                return None;
+            }
+        };
+    }
+    let columns = shown.get("columns")?.clone();
+    let mut rows = shown.get("rows")?.as_array()?.clone();
+    let truncated = rows.len() > cap;
+    rows.truncate(cap);
+    Some(json!({ "columns": columns, "rows": rows, "truncated": truncated, "limit": cap }))
 }
 
 /// `SELECT table, name, type FROM system.columns WHERE database='serving'`,

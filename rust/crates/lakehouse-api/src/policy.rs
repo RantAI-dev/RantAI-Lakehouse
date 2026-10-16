@@ -65,6 +65,17 @@
 //! rows), and Platform Admin's `*:*` satisfies it by the resource-wildcard
 //! rule. Reading the settings stays `RequiresAuth`.
 //!
+//! # `metric:write`
+//!
+//! Introduced for defining, changing and deleting reusable metrics and
+//! segments (`BI-2`, `/api/dashboard/metrics` and `/api/dashboard/segments`) by
+//! the same rules as `settings:write`: the string is listed in the table below,
+//! no seeded role is granted it (so no migration touches the role rows), and
+//! Platform Admin's `*:*` satisfies it by the resource-wildcard rule. A metric
+//! is shared by every dashboard and by the assistant, so changing one is not
+//! the same act as editing a chart (`dashboard:write`, which is not enough).
+//! Listing, validating and the usage of a metric need `dashboard:read` only.
+//!
 //! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
 //!
 //! Four more route groups had the identical problem: any authenticated
@@ -482,7 +493,32 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/dashboard/calc-fields",          Policy::RequiresPermission("dashboard:write")),
     ("POST",   "/api/dashboard/calc-fields/validate", Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/calc-fields/functions", Policy::RequiresPermission("dashboard:read")),
+    // BI-2: metrics and segments. Using one needs only the dashboard; defining
+    // or changing one is its own permission, `metric:write` (see the module doc).
+    ("GET",    "/api/dashboard/metrics",              Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/metrics",              Policy::RequiresPermission("metric:write")),
+    ("PUT",    "/api/dashboard/metrics",              Policy::RequiresPermission("metric:write")),
+    ("DELETE", "/api/dashboard/metrics",              Policy::RequiresPermission("metric:write")),
+    ("POST",   "/api/dashboard/metrics/validate",     Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/metrics/{id}/usage",   Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/segments",             Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/segments",             Policy::RequiresPermission("metric:write")),
+    ("PUT",    "/api/dashboard/segments",             Policy::RequiresPermission("metric:write")),
+    ("DELETE", "/api/dashboard/segments",             Policy::RequiresPermission("metric:write")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
+    // BI-7: join suggestions read column metadata only, like `fields`.
+    ("GET",    "/api/dashboard/join-suggestions", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/hierarchies",      Policy::RequiresPermission("dashboard:write")),
+    // BI-11: parameters are read with the dashboard and defined, changed and
+    // deleted with `dashboard:write`; a viewer's value is a request parameter,
+    // not a write.
+    ("GET",    "/api/dashboard/params",           Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/params",           Policy::RequiresPermission("dashboard:write")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/export",       Policy::RequiresPermission("dashboard:read")),
@@ -1050,6 +1086,61 @@ mod tests {
             policy_for("GET", "/api/settings/reporting"),
             Some(Policy::RequiresAuth)
         );
+    }
+
+    /// `BI-2`: `metric:write` follows the same rules: no seeded role holds it,
+    /// `dashboard:write` is not enough, Platform Admin's `*:*` is, and the read
+    /// routes need only `dashboard:read`.
+    #[test]
+    fn metric_write_needs_no_seed_change_and_no_seeded_role_has_it() {
+        use lakehouse_auth::PermissionSet;
+
+        let non_admin_roles = [
+            ("Analyst", "query:read, catalog:read, lineage:read"),
+            ("Approver", "agent:approve, policy:review"),
+            ("Governance Admin", "policy:*, residency:*, audit:read"),
+            (
+                "Data Engineer",
+                "pipeline:*, catalog:write, connector:manage",
+            ),
+            ("Data Scientist", "query:read, feature:write, notebook:run"),
+            ("Dashboard Viewer", "dashboard:read"),
+        ];
+        for (name, raw) in non_admin_roles {
+            assert!(
+                !PermissionSet::parse(raw).has("metric:write"),
+                "{name} unexpectedly grants metric:write"
+            );
+        }
+        for (method, path) in [
+            ("POST", "/api/dashboard/metrics"),
+            ("PUT", "/api/dashboard/metrics"),
+            ("DELETE", "/api/dashboard/metrics"),
+            ("POST", "/api/dashboard/segments"),
+            ("PUT", "/api/dashboard/segments"),
+            ("DELETE", "/api/dashboard/segments"),
+        ] {
+            assert_denied_then_allowed(
+                method,
+                path,
+                &PermissionSet::parse("dashboard:write, dashboard:read"),
+                "an editor with dashboard:write",
+                &PermissionSet::parse("*:*"),
+                "a Platform Admin (*:*)",
+            );
+        }
+        for (method, path) in [
+            ("GET", "/api/dashboard/metrics"),
+            ("POST", "/api/dashboard/metrics/validate"),
+            ("GET", "/api/dashboard/metrics/{id}/usage"),
+            ("GET", "/api/dashboard/segments"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("dashboard:read")),
+                "{method} {path}"
+            );
+        }
     }
 
     /// Shared shape for the four new-in-this-task route groups: a

@@ -10,12 +10,15 @@
  */
 export function RowsTable({
   columns,
+  labels,
   rows,
   maxRows,
   className,
   onRowClick,
 }: {
   readonly columns: readonly string[]
+  /** Header text by column name, for a column whose name is not what a reader should see; the name otherwise. */
+  readonly labels?: Readonly<Record<string, string>>
   readonly rows: readonly Record<string, unknown>[]
   /** Show at most this many rows; the caller says so if it matters. */
   readonly maxRows?: number
@@ -39,7 +42,7 @@ export function RowsTable({
                 key={c}
                 className="px-2 py-1.5 text-left font-medium text-muted-foreground"
               >
-                {c}
+                {labels?.[c] ?? c}
               </th>
             ))}
           </tr>

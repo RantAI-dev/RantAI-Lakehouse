@@ -24,19 +24,24 @@ mod connectors;
 mod dashboard;
 mod dashboard_folders;
 mod dashboard_sources;
+pub(crate) mod drill;
 mod embed;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
+mod hierarchies;
 mod home;
 mod identity;
 mod knowledge;
 mod lakehouse;
+pub(crate) mod layers;
 mod lineage;
 mod load_alerts;
+pub(crate) mod metrics;
 mod notifications;
 mod ops;
 mod overview;
+pub(crate) mod params;
 mod pipelines;
 mod quality;
 mod query;
@@ -978,7 +983,44 @@ pub fn router(state: AppState) -> Router {
             "/api/dashboard/calc-fields/functions",
             get(calc_fields::functions),
         )
+        .route(
+            "/api/dashboard/metrics",
+            get(metrics::list)
+                .post(metrics::create)
+                .put(metrics::update)
+                .delete(metrics::delete),
+        )
+        .route(
+            "/api/dashboard/metrics/validate",
+            axum::routing::post(metrics::validate),
+        )
+        .route("/api/dashboard/metrics/{id}/usage", get(metrics::usage))
+        .route(
+            "/api/dashboard/segments",
+            get(metrics::list_segments)
+                .post(metrics::create_segment)
+                .put(metrics::update_segment)
+                .delete(metrics::delete_segment),
+        )
+        .route(
+            "/api/dashboard/hierarchies",
+            get(hierarchies::list)
+                .post(hierarchies::create)
+                .put(hierarchies::update)
+                .delete(hierarchies::delete),
+        )
+        .route(
+            "/api/dashboard/params",
+            get(params::list)
+                .post(params::create)
+                .put(params::update)
+                .delete(params::delete),
+        )
         .route("/api/dashboard/fields", get(dashboard::fields))
+        .route(
+            "/api/dashboard/join-suggestions",
+            get(dashboard::join_suggestions),
+        )
         .route("/api/dashboard/records", get(dashboard::records))
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))

@@ -11,6 +11,7 @@
  */
 
 import type { FilterDef } from "@/services/clients/bi-store"
+import { type BinDef, type BinMeta, binLabel, binsOfTile } from "./chart-bins"
 import { filterLabel, isActiveFilter } from "./dashboard-filter-state"
 
 export type TileLike = {
@@ -20,10 +21,15 @@ export type TileLike = {
   source?: string
   mart?: string
   sqlSource?: string
+  /** BI-6: the chart's own filters, which the numbers on the tile already carry. BI-10: its bins. */
+  def?: { filters?: FilterDef[]; dimension?: string; bin?: BinDef; breakdown?: string; breakdownBin?: BinDef; groupings?: { column: string; bin?: BinDef }[] }
 }
 
+/** One more question on a chart (BI-13), as the tile carries its answer. */
+export type LayerLike = { label: string; draw: string; axis: string; source: string; columns: string[]; rows: Record<string, unknown>[]; error?: string }
+
 export type CellLike =
-  | { columns: string[]; rows: Record<string, unknown>[] }
+  | { columns: string[]; rows: Record<string, unknown>[]; bins?: Record<string, BinMeta>; layers?: LayerLike[] }
   | { error: string }
   | undefined
   | null
@@ -79,7 +85,15 @@ export function summarizeTiles(
     else if (!cell) data = "not loaded"
     else if ("error" in cell) data = `error: ${fmt(cell.error)}`
     else data = summarizeRows(cell.columns, cell.rows, maxRows)
-    return `- "${t.title}" (${t.kind}${id}; ${from}): ${data}`
+    // The numbers carry the chart's own filters; the assistant must know they do.
+    const own = (t.def?.filters ?? []).filter(isActiveFilter).map((f) => filterLabel(f))
+    const filtered = own.length ? `; filtered: ${own.join(", ")}` : ""
+    // BI-10: a binned column holds each bin's lower edge; say what the numbers stand for.
+    const bins = cell && "rows" in cell ? Object.entries(binsOfTile(cell.bins, t.def)).map(([column, b]) => `${column} in bins of ${binLabel(0, b.width).split(" – ")[1]} (a value is the bin's lower edge)`) : []
+    const binned = bins.length ? `; binned: ${bins.join(", ")}` : ""
+    // BI-13: the chart's other questions, each from its own source, drawn on the same axis.
+    const layers = cell && "rows" in cell ? (cell.layers ?? []).map((l) => ` | also "${l.label}" (${l.source}; ${l.draw}, ${l.axis} axis): ${l.error ? `error: ${fmt(l.error)}` : summarizeRows(l.columns, l.rows, maxRows)}`) : []
+    return `- "${t.title}" (${t.kind}${id}; ${from}${filtered}${binned}): ${data}${layers.join("")}`
   })
   return clip(lines.join("\n"), opts.maxChars ?? DEFAULT_CHARS)
 }
@@ -91,6 +105,16 @@ export function summarizeTiles(
  */
 export function summarizeFilters(filters: FilterLike[]): string {
   const parts = filters.filter(isActiveFilter).map((f) => filterLabel(f))
+  return parts.length ? parts.join("; ") : "none"
+}
+
+/**
+ * "target = 1000 (number); pick = rooms (list)" — or "none". The parameters the
+ * dashboard shows with the value in force (BI-11), so the assistant reuses them
+ * (`list_parameters` has the rest) instead of defining a second one.
+ */
+export function summarizeParams(controls: { param: { name: string; type: string }; value: string | number }[]): string {
+  const parts = controls.map((c) => `${c.param.name} = ${fmt(c.value)} (${c.param.type})`)
   return parts.length ? parts.join("; ") : "none"
 }
 

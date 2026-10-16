@@ -419,9 +419,17 @@ async fn preview_for_roles(
             };
         crate::routes::support::annotate_saved_grain(&mut rows, &chart);
         crate::routes::support::annotate_saved_table(&mut rows, &chart);
+        let shown = crate::routes::support::preview_rows(
+            ch,
+            &chart,
+            &rows,
+            (roles, placeholders, obligations),
+        )
+        .await;
         out["chart"] = json!({
             "spec": render_stored_spec(&chart.spec, ChartSource::Ui),
             "result": rows,
+            "previewRows": shown,
         });
     }
     Ok(out)

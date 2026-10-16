@@ -202,16 +202,122 @@
             "type": "number"
           },
           "dimension": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it"
           },
           "measures": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "aggregate"
+                  ],
+                  "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ],
+                  "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "metric": {
+                      "type": "string",
+                      "description": "the name of a metric from list_metrics"
+                    }
+                  },
+                  "required": [
+                    "metric"
+                  ],
+                  "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
+                }
+              ]
+            },
+            "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it"
           },
           "map": {
             "type": "string",
@@ -236,7 +342,24 @@
             ]
           },
           "limit": {
-            "type": "number"
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)"
           },
           "span": {
             "type": "number",
@@ -354,6 +477,790 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "referenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
+          },
+          "layers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "the Gold mart this question reads (give this or sqlSource)"
+                },
+                "sqlSource": {
+                  "type": "string",
+                  "description": "the id of a saved SQL source (give this or mart)"
+                },
+                "dimension": {
+                  "type": "string",
+                  "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain"
+                },
+                "measures": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ],
+                        "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "object",
+                            "properties": {
+                              "param": {
+                                "type": "string",
+                                "description": "the name of a parameter from list_parameters"
+                              }
+                            },
+                            "required": [
+                              "param"
+                            ]
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ],
+                        "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "metric": {
+                            "type": "string",
+                            "description": "the name of a metric from list_metrics"
+                          }
+                        },
+                        "required": [
+                          "metric"
+                        ],
+                        "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
+                      }
+                    ]
+                  },
+                  "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
+                },
+                "aggregate": {
+                  "type": "string",
+                  "enum": [
+                    "sum",
+                    "avg",
+                    "max",
+                    "min",
+                    "count"
+                  ],
+                  "description": "for the measures that have none of their own; default sum"
+                },
+                "filters": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "segment": {
+                            "type": "string",
+                            "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                          }
+                        },
+                        "required": [
+                          "segment"
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "op": {
+                            "type": "string",
+                            "enum": [
+                              "in",
+                              "not_in",
+                              "between",
+                              "relative",
+                              "contains",
+                              "starts_with",
+                              "ends_with",
+                              "not_contains"
+                            ],
+                            "description": "default in"
+                          },
+                          "values": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "in / not_in"
+                          },
+                          "min": {
+                            "type": "string",
+                            "description": "between: a number or a date YYYY-MM-DD"
+                          },
+                          "max": {
+                            "type": "string"
+                          },
+                          "minExclusive": {
+                            "type": "boolean"
+                          },
+                          "maxExclusive": {
+                            "type": "boolean"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "contains, starts_with, ends_with, not_contains"
+                          },
+                          "anchor": {
+                            "type": "string",
+                            "enum": [
+                              "last",
+                              "this",
+                              "previous",
+                              "next"
+                            ],
+                            "description": "relative"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": [
+                              "day",
+                              "week",
+                              "month",
+                              "quarter",
+                              "year"
+                            ]
+                          },
+                          "n": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ]
+                      }
+                    ]
+                  },
+                  "description": "this question's own filters (at most 20), on its own data"
+                },
+                "joins": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "mart": {
+                        "type": "string",
+                        "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "inner",
+                          "left",
+                          "right",
+                          "full"
+                        ],
+                        "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                      },
+                      "on": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "left": {
+                              "type": "string",
+                              "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                            },
+                            "op": {
+                              "type": "string",
+                              "enum": [
+                                "=",
+                                "<",
+                                "<=",
+                                ">",
+                                ">="
+                              ]
+                            },
+                            "right": {
+                              "type": "string",
+                              "description": "a column of the table being joined"
+                            }
+                          },
+                          "required": [
+                            "left",
+                            "op",
+                            "right"
+                          ]
+                        },
+                        "description": "the pairs to match, all of them; at least one uses ="
+                      }
+                    },
+                    "required": [
+                      "mart",
+                      "type",
+                      "on"
+                    ]
+                  },
+                  "description": "up to four more Gold marts joined to this question's mart; not for a SQL source"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "the legend name, at most 60 characters"
+                },
+                "draw": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line"
+                  ],
+                  "description": "how this question is drawn"
+                },
+                "axis": {
+                  "type": "string",
+                  "enum": [
+                    "left",
+                    "right"
+                  ],
+                  "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors"
+                }
+              },
+              "required": [
+                "dimension",
+                "measures",
+                "draw",
+                "axis"
+              ]
+            },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows"
+          },
+          "draw": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "line"
+            ],
+            "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)"
+          },
+          "axis": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ],
+            "description": "with layers: which value axis the chart's own series uses (default left)"
+          },
+          "sort": {
+            "type": "object",
+            "properties": {
+              "by": {
+                "type": "string",
+                "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)"
+              },
+              "dir": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            },
+            "required": [
+              "by",
+              "dir"
+            ],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+          },
+          "other": {
+            "type": "boolean",
+            "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain"
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "type": "object",
+              "properties": {
+                "filter": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 10,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string",
+                        "description": "a grouping or a measure of the result before this step"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "eq",
+                          "ne",
+                          "gt",
+                          "gte",
+                          "lt",
+                          "lte",
+                          "between"
+                        ]
+                      },
+                      "value": {
+                        "type": [
+                          "string",
+                          "number"
+                        ],
+                        "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)"
+                      },
+                      "min": {
+                        "type": [
+                          "string",
+                          "number"
+                        ]
+                      },
+                      "max": {
+                        "type": [
+                          "string",
+                          "number"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "column",
+                      "op"
+                    ]
+                  },
+                  "description": "keep the rows that meet every condition"
+                },
+                "summarise": {
+                  "type": "object",
+                  "properties": {
+                    "by": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "the groupings to keep, a subset of the result before (at least one)"
+                    },
+                    "measures": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 6,
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string",
+                            "description": "a measure of the result before this step"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ]
+                      },
+                      "description": "each is named <aggregate>_<column> in the result"
+                    }
+                  },
+                  "required": [
+                    "by",
+                    "measures"
+                  ],
+                  "description": "group the result before this step again"
+                }
+              },
+              "description": "give exactly one of filter and summarise"
+            },
+            "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'"
+          },
+          "joins": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "inner",
+                    "left",
+                    "right",
+                    "full"
+                  ],
+                  "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                },
+                "on": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "left": {
+                        "type": "string",
+                        "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ]
+                      },
+                      "right": {
+                        "type": "string",
+                        "description": "a column of the table being joined"
+                      }
+                    },
+                    "required": [
+                      "left",
+                      "op",
+                      "right"
+                    ]
+                  },
+                  "description": "the pairs to match, all of them; at least one uses ="
+                }
+              },
+              "required": [
+                "mart",
+                "type",
+                "on"
+              ]
+            },
+            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"
+          },
+          "groupings": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "grain": {
+                  "type": "string",
+                  "enum": [
+                    "minute",
+                    "hour",
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year",
+                    "hour_of_day",
+                    "day_of_week",
+                    "day_of_month",
+                    "week_of_year",
+                    "month_of_year",
+                    "quarter_of_year"
+                  ],
+                  "description": "for a date or timestamp column"
+                },
+                "bin": {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "count",
+                        "width"
+                      ],
+                      "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+                    },
+                    "count": {
+                      "type": [
+                        "number",
+                        "string"
+                      ],
+                      "description": "mode count: 10, 50 or 100"
+                    },
+                    "width": {
+                      "type": [
+                        "number",
+                        "string"
+                      ],
+                      "description": "mode width: a positive number; the only mode for a SQL source"
+                    }
+                  },
+                  "required": [
+                    "mode"
+                  ],
+                  "description": "for a number column, instead of a grain"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension"
+          },
+          "bin": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "count",
+                  "width"
+                ],
+                "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+              },
+              "count": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode count: 10, 50 or 100"
+              },
+              "width": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode width: a positive number; the only mode for a SQL source"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "description": "group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"
+          },
+          "breakdownBin": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "count",
+                  "width"
+                ],
+                "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+              },
+              "count": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode count: 10, 50 or 100"
+              },
+              "width": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode width: a positive number; the only mode for a SQL source"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "description": "the same for a number `breakdown`"
+          },
+          "grid": {
+            "type": "object",
+            "properties": {
+              "size": {
+                "type": [
+                  "string",
+                  "number"
+                ],
+                "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10"
+              }
+            },
+            "required": [
+              "size"
+            ],
+            "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count"
           }
         },
         "required": [
@@ -420,16 +1327,122 @@
             "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both"
           },
           "dimension": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the column to group by; or {param: <a list parameter whose values are columns of the data>} to let the viewer switch it"
           },
           "measures": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "aggregate"
+                  ],
+                  "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    },
+                    "aggregate": {
+                      "type": "string",
+                      "enum": [
+                        "sum",
+                        "avg",
+                        "max",
+                        "min",
+                        "count"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ],
+                  "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "metric": {
+                      "type": "string",
+                      "description": "the name of a metric from list_metrics"
+                    }
+                  },
+                  "required": [
+                    "metric"
+                  ],
+                  "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
+                }
+              ]
+            },
+            "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
           },
           "breakdown": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "a second column to split by; or {param: <a list parameter>} to let the viewer switch it"
           },
           "caption": {
             "type": "string"
@@ -460,7 +1473,24 @@
             ]
           },
           "limit": {
-            "type": "number"
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "param": {
+                    "type": "string",
+                    "description": "the name of a parameter from list_parameters"
+                  }
+                },
+                "required": [
+                  "param"
+                ]
+              }
+            ],
+            "description": "the number of groups; or {param: <a number parameter>} to let the viewer choose it (a whole number from 1 to 100 when the chart is read)"
           },
           "span": {
             "type": "number",
@@ -578,6 +1608,790 @@
               "down"
             ],
             "description": "kpi only: which way is good, up (default) or down; colours the change"
+          },
+          "referenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the chart's own filters (at most 20), always applied, whatever the dashboard's filters are; the same filters a dashboard takes, on columns of the chart's data. Use them for \"only one category\" or \"only 2026\""
+          },
+          "layers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "the Gold mart this question reads (give this or sqlSource)"
+                },
+                "sqlSource": {
+                  "type": "string",
+                  "description": "the id of a saved SQL source (give this or mart)"
+                },
+                "dimension": {
+                  "type": "string",
+                  "description": "a column of this question's data to line up with the chart's dimension: both dates, both text or both numbers; dates are lined up by the chart's time grain"
+                },
+                "measures": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ],
+                        "description": "a measure with its own aggregate, e.g. the average of stay beside the sum of visitors; its result column is named <aggregate>_<column> (avg_stay). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "object",
+                            "properties": {
+                              "param": {
+                                "type": "string",
+                                "description": "the name of a parameter from list_parameters"
+                              }
+                            },
+                            "required": [
+                              "param"
+                            ]
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ],
+                        "description": "a measure whose column the viewer switches: {column: {param: <list parameter>}, aggregate?}"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "metric": {
+                            "type": "string",
+                            "description": "the name of a metric from list_metrics"
+                          }
+                        },
+                        "required": [
+                          "metric"
+                        ],
+                        "description": "a saved metric by name (BI-2): the same number everywhere; it has its own aggregate, so no `aggregate` applies. The chart's table must be the metric's table. Prefer it to writing a measure yourself when list_metrics has one that matches"
+                      }
+                    ]
+                  },
+                  "description": "the columns to aggregate (numbers); each is a column name (the chart's `aggregate` applies) or {column, aggregate}"
+                },
+                "aggregate": {
+                  "type": "string",
+                  "enum": [
+                    "sum",
+                    "avg",
+                    "max",
+                    "min",
+                    "count"
+                  ],
+                  "description": "for the measures that have none of their own; default sum"
+                },
+                "filters": {
+                  "type": "array",
+                  "items": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "segment": {
+                            "type": "string",
+                            "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                          }
+                        },
+                        "required": [
+                          "segment"
+                        ]
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string"
+                          },
+                          "op": {
+                            "type": "string",
+                            "enum": [
+                              "in",
+                              "not_in",
+                              "between",
+                              "relative",
+                              "contains",
+                              "starts_with",
+                              "ends_with",
+                              "not_contains"
+                            ],
+                            "description": "default in"
+                          },
+                          "values": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "in / not_in"
+                          },
+                          "min": {
+                            "type": "string",
+                            "description": "between: a number or a date YYYY-MM-DD"
+                          },
+                          "max": {
+                            "type": "string"
+                          },
+                          "minExclusive": {
+                            "type": "boolean"
+                          },
+                          "maxExclusive": {
+                            "type": "boolean"
+                          },
+                          "text": {
+                            "type": "string",
+                            "description": "contains, starts_with, ends_with, not_contains"
+                          },
+                          "anchor": {
+                            "type": "string",
+                            "enum": [
+                              "last",
+                              "this",
+                              "previous",
+                              "next"
+                            ],
+                            "description": "relative"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": [
+                              "day",
+                              "week",
+                              "month",
+                              "quarter",
+                              "year"
+                            ]
+                          },
+                          "n": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "column"
+                        ]
+                      }
+                    ]
+                  },
+                  "description": "this question's own filters (at most 20), on its own data"
+                },
+                "joins": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "mart": {
+                        "type": "string",
+                        "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "inner",
+                          "left",
+                          "right",
+                          "full"
+                        ],
+                        "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                      },
+                      "on": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "left": {
+                              "type": "string",
+                              "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                            },
+                            "op": {
+                              "type": "string",
+                              "enum": [
+                                "=",
+                                "<",
+                                "<=",
+                                ">",
+                                ">="
+                              ]
+                            },
+                            "right": {
+                              "type": "string",
+                              "description": "a column of the table being joined"
+                            }
+                          },
+                          "required": [
+                            "left",
+                            "op",
+                            "right"
+                          ]
+                        },
+                        "description": "the pairs to match, all of them; at least one uses ="
+                      }
+                    },
+                    "required": [
+                      "mart",
+                      "type",
+                      "on"
+                    ]
+                  },
+                  "description": "up to four more Gold marts joined to this question's mart; not for a SQL source"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "the legend name, at most 60 characters"
+                },
+                "draw": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line"
+                  ],
+                  "description": "how this question is drawn"
+                },
+                "axis": {
+                  "type": "string",
+                  "enum": [
+                    "left",
+                    "right"
+                  ],
+                  "description": "which value axis; use right when its numbers are on another scale, like a rate beside visitors"
+                }
+              },
+              "required": [
+                "dimension",
+                "measures",
+                "draw",
+                "axis"
+              ]
+            },
+            "description": "up to 4 more questions drawn on the same chart (bar, line, area or combo only), each from its own table or SQL source, lined up on the dimension's values: a value one lacks is a gap. For \"visitors next to hotel rooms by month\": the chart is visitors by month; one layer reads the rooms table by its month column. No breakdown, 'Other', steps or table calculation on a chart with layers. Unlike a join, layers never multiply rows"
+          },
+          "draw": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "line"
+            ],
+            "description": "with layers: how the chart's own series is drawn (default bar for a bar chart, line otherwise)"
+          },
+          "axis": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ],
+            "description": "with layers: which value axis the chart's own series uses (default left)"
+          },
+          "sort": {
+            "type": "object",
+            "properties": {
+              "by": {
+                "type": "string",
+                "description": "the dimension, a grouping of a table, or a measure's result name (the column name, or <aggregate>_<column> for a measure with its own aggregate)"
+              },
+              "dir": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            },
+            "required": [
+              "by",
+              "dir"
+            ],
+            "description": "the order of the groups, in place of the default; with `limit` it keeps the first N in that order (top N: desc by a measure; bottom N: asc). Not for kpi, gauge, boxplot, maps, pivot or a table in rows mode"
+          },
+          "other": {
+            "type": "boolean",
+            "description": "with `limit` and `sort`: gather every group past the limit into one group called Other, computed from the underlying rows (an average of Other is the average of those rows). bar, hbar, stacked, pie, rose, funnel, treemap and grouped table with one dimension only; not with a grain"
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "type": "object",
+              "properties": {
+                "filter": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 10,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "column": {
+                        "type": "string",
+                        "description": "a grouping or a measure of the result before this step"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "eq",
+                          "ne",
+                          "gt",
+                          "gte",
+                          "lt",
+                          "lte",
+                          "between"
+                        ]
+                      },
+                      "value": {
+                        "type": [
+                          "string",
+                          "number"
+                        ],
+                        "description": "all but between: a number, a date YYYY-MM-DD, or text (eq and ne only)"
+                      },
+                      "min": {
+                        "type": [
+                          "string",
+                          "number"
+                        ]
+                      },
+                      "max": {
+                        "type": [
+                          "string",
+                          "number"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "column",
+                      "op"
+                    ]
+                  },
+                  "description": "keep the rows that meet every condition"
+                },
+                "summarise": {
+                  "type": "object",
+                  "properties": {
+                    "by": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "the groupings to keep, a subset of the result before (at least one)"
+                    },
+                    "measures": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 6,
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "column": {
+                            "type": "string",
+                            "description": "a measure of the result before this step"
+                          },
+                          "aggregate": {
+                            "type": "string",
+                            "enum": [
+                              "sum",
+                              "avg",
+                              "max",
+                              "min",
+                              "count"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "column",
+                          "aggregate"
+                        ]
+                      },
+                      "description": "each is named <aggregate>_<column> in the result"
+                    }
+                  },
+                  "required": [
+                    "by",
+                    "measures"
+                  ],
+                  "description": "group the result before this step again"
+                }
+              },
+              "description": "give exactly one of filter and summarise"
+            },
+            "description": "up to two steps applied, in order, to the grouped result (for example: summarise by province, then keep totals over 1000). The chart's sort and limit then apply to the last step's result and may name only its columns (summarised measures are <aggregate>_<column>). Not for kpi, gauge, pivot, a raw table, maps, a time grain, a breakdown or 'Other'"
+          },
+          "joins": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "properties": {
+                "mart": {
+                  "type": "string",
+                  "description": "a Gold mart to join to the chart's `mart` (call suggest_join first)"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "inner",
+                    "left",
+                    "right",
+                    "full"
+                  ],
+                  "description": "left keeps every row of what comes before; inner only the matches; right and full keep the joined table's unmatched rows too"
+                },
+                "on": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "left": {
+                        "type": "string",
+                        "description": "a column of the chart's mart, or of an earlier join as <table>__<column>"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "=",
+                          "<",
+                          "<=",
+                          ">",
+                          ">="
+                        ]
+                      },
+                      "right": {
+                        "type": "string",
+                        "description": "a column of the table being joined"
+                      }
+                    },
+                    "required": [
+                      "left",
+                      "op",
+                      "right"
+                    ]
+                  },
+                  "description": "the pairs to match, all of them; at least one uses ="
+                }
+              },
+              "required": [
+                "mart",
+                "type",
+                "on"
+              ]
+            },
+            "description": "up to four more Gold marts joined to `mart`, read as one table: the chart's mart columns keep their names and a joined table's columns are <table>__<column> (a table joined twice: <table>2__<column>), usable as dimension, breakdown, measure, filter and in tables and pivots. Not for a SQL source. Joining on columns that are not unique in the joined table multiplies rows and so sums: prefer a max or avg for a joined table's measure. Calculated fields cannot use a joined column"
+          },
+          "groupings": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "grain": {
+                  "type": "string",
+                  "enum": [
+                    "minute",
+                    "hour",
+                    "day",
+                    "week",
+                    "month",
+                    "quarter",
+                    "year",
+                    "hour_of_day",
+                    "day_of_week",
+                    "day_of_month",
+                    "week_of_year",
+                    "month_of_year",
+                    "quarter_of_year"
+                  ],
+                  "description": "for a date or timestamp column"
+                },
+                "bin": {
+                  "type": "object",
+                  "properties": {
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "count",
+                        "width"
+                      ],
+                      "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+                    },
+                    "count": {
+                      "type": [
+                        "number",
+                        "string"
+                      ],
+                      "description": "mode count: 10, 50 or 100"
+                    },
+                    "width": {
+                      "type": [
+                        "number",
+                        "string"
+                      ],
+                      "description": "mode width: a positive number; the only mode for a SQL source"
+                    }
+                  },
+                  "required": [
+                    "mode"
+                  ],
+                  "description": "for a number column, instead of a grain"
+                }
+              },
+              "required": [
+                "column"
+              ]
+            },
+            "description": "table only: the columns a grouped table is grouped by (1 to 5), instead of dimension"
+          },
+          "bin": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "count",
+                  "width"
+                ],
+                "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+              },
+              "count": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode count: 10, 50 or 100"
+              },
+              "width": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode width: a positive number; the only mode for a SQL source"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "description": "group the number `dimension` (or a pivot's first number row or column field) in ranges, for example visitors in bins of 500; the result value is each bin's lower edge. bar, hbar, line, area, stacked, combo, pie, rose, funnel, treemap, radar, waterfall, grouped table, pivot; not with a grain"
+          },
+          "breakdownBin": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "count",
+                  "width"
+                ],
+                "description": "auto: about ten bins with round edges; count: at most that many bins; width: bins of exactly that width"
+              },
+              "count": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode count: 10, 50 or 100"
+              },
+              "width": {
+                "type": [
+                  "number",
+                  "string"
+                ],
+                "description": "mode width: a positive number; the only mode for a SQL source"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "description": "the same for a number `breakdown`"
+          },
+          "grid": {
+            "type": "object",
+            "properties": {
+              "size": {
+                "type": [
+                  "string",
+                  "number"
+                ],
+                "description": "auto, or the cell size in degrees: 0.01, 0.1, 1 or 10"
+              }
+            },
+            "required": [
+              "size"
+            ],
+            "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count"
           }
         },
         "required": [
@@ -651,6 +2465,30 @@
       "parameters": {
         "type": "object",
         "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "suggest_join",
+      "description": "Candidate column pairs for joining two Gold marts in a chart (`joins` of create_chart), best first: both columns in their tables' sorting keys with the same name and kind, then the same name and kind, then the same name. `suggested` marks the pairs to use; `coversRightKey` false means a row of the first mart may match several rows of the second, so sums of the second mart's columns multiply. Reads column metadata only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "type": "string",
+            "description": "the chart's mart, e.g. mart_visits"
+          },
+          "right": {
+            "type": "string",
+            "description": "the mart to join to it"
+          }
+        },
+        "required": [
+          "left",
+          "right"
+        ]
       }
     }
   },
@@ -810,6 +2648,834 @@
   {
     "type": "function",
     "function": {
+      "name": "list_metrics",
+      "description": "The saved metrics (name, label, description, the table or SQL source they are computed from, their date column). A metric is one agreed definition of a number such as revenue. Call it BEFORE writing a query or a chart for a number the user names: if one matches, use it and name it in your answer; if none matches, say so before you write SQL.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_metric",
+      "description": "One metric in full: its formula, filters, date column and default grain, and the charts and dashboards that use it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "the metric's name from list_metrics"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "query_metric",
+      "description": "The value of a metric, read as the person you are helping (their access, masks and row filters apply). With no other argument it is one number. groupBy splits it by one column; grain (day, week, month, quarter, year) splits it by that period of the metric's date column; filters narrow it further. Say which metric you used.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "the metric's name from list_metrics"
+          },
+          "groupBy": {
+            "type": "string",
+            "description": "a column of the metric's table; with grain, a date column"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ]
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "filters on columns of the metric's table, or a saved segment {segment}"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_metric",
+      "description": "Save a reusable metric on a mart or SQL source. Only when the user asks for one; check list_metrics first so there is one definition per number. Needs the metric:write permission.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "label": {
+            "type": "string",
+            "description": "what people read, for example Total visitors"
+          },
+          "description": {
+            "type": "string",
+            "description": "what it counts and how, at most 500 characters"
+          },
+          "formula": {
+            "type": "string",
+            "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the metric's own filters, applied to this metric's number only (or a saved segment {segment})"
+          },
+          "timeColumn": {
+            "type": "string",
+            "description": "a date or timestamp column its period comparisons run on"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "its default period"
+          },
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _ (for example total_visitors), unique, not a column; charts pick the metric by it and it cannot change later"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_metric",
+      "description": "Change a metric (by id). The name and the source stay; every chart that uses it follows the change at once, so say so. Send the whole definition.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "label": {
+            "type": "string",
+            "description": "what people read, for example Total visitors"
+          },
+          "description": {
+            "type": "string",
+            "description": "what it counts and how, at most 500 characters"
+          },
+          "formula": {
+            "type": "string",
+            "description": "an AGGREGATE in the formula language, for example Sum([visitors]); never SQL (see list_formula_functions)"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "segment": {
+                      "type": "string",
+                      "description": "the name of a saved segment of the chart's table (BI-2): stands for its filters"
+                    }
+                  },
+                  "required": [
+                    "segment"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "in",
+                        "not_in",
+                        "between",
+                        "relative",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "not_contains"
+                      ],
+                      "description": "default in"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "in / not_in"
+                    },
+                    "min": {
+                      "type": "string",
+                      "description": "between: a number or a date YYYY-MM-DD"
+                    },
+                    "max": {
+                      "type": "string"
+                    },
+                    "minExclusive": {
+                      "type": "boolean"
+                    },
+                    "maxExclusive": {
+                      "type": "boolean"
+                    },
+                    "text": {
+                      "type": "string",
+                      "description": "contains, starts_with, ends_with, not_contains"
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "last",
+                        "this",
+                        "previous",
+                        "next"
+                      ],
+                      "description": "relative"
+                    },
+                    "unit": {
+                      "type": "string",
+                      "enum": [
+                        "day",
+                        "week",
+                        "month",
+                        "quarter",
+                        "year"
+                      ]
+                    },
+                    "n": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "column"
+                  ]
+                }
+              ]
+            },
+            "description": "the metric's own filters, applied to this metric's number only (or a saved segment {segment})"
+          },
+          "timeColumn": {
+            "type": "string",
+            "description": "a date or timestamp column its period comparisons run on"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "its default period"
+          },
+          "id": {
+            "type": "string",
+            "description": "from list_metrics"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "formula"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_metric",
+      "description": "Delete one metric (by id). Refused while a chart uses it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_value_group",
+      "description": "Gather chosen values of a text column under names of your own (for example six provinces as Java) and save it as a field of the source. Then use its name in create_chart as dimension or breakdown, like a column. It is a text column, so not a measure. Take the values from run_sql or describe_mart, never invent them.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "name": {
+            "type": "string",
+            "description": "a name of letters, digits and _ (for example region_group), not a column of the source; charts pick the group by it like a column"
+          },
+          "group": {
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string",
+                "description": "a text column of the source"
+              },
+              "groups": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "what the values are shown as, for example Java"
+                    },
+                    "values": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "values of the column exactly as spelled; a value belongs to one group only; at most 2000 in all"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "values"
+                  ]
+                }
+              },
+              "rest": {
+                "type": "string",
+                "enum": [
+                  "keep",
+                  "other"
+                ],
+                "description": "keep: values in no group keep their own name; other: they are shown as Other"
+              }
+            },
+            "required": [
+              "column",
+              "groups",
+              "rest"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "group"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_hierarchies",
+      "description": "The hierarchies of one mart or SQL source: named, ordered lists of columns (for example province, city, place) that a chart can be drilled down through by clicking a value.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_hierarchy",
+      "description": "Save a hierarchy on a mart or SQL source. A viewer can then drill down a chart whose dimension is one of its levels. Charts do not store it, so it never breaks a chart.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both"
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart"
+          },
+          "name": {
+            "type": "string",
+            "description": "for example Geography (1 to 64 characters)"
+          },
+          "levels": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 6,
+            "items": {
+              "type": "string"
+            },
+            "description": "2 to 6 columns of the source, outermost first (province, city, place)"
+          }
+        },
+        "required": [
+          "name",
+          "levels"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_hierarchy",
+      "description": "Delete one hierarchy (by id from list_hierarchies). No chart depends on it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_parameters",
+      "description": "The parameters of the deployment: named values (a number, text, a date, or a choice from a list) that a viewer changes on a dashboard and that a formula ({name}), a chart's limit, a reference line or a column switch can read. Use before create_chart to reuse one.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_parameter",
+      "description": "Define a parameter. Then use it in a formula as {name}, as a chart's limit, as a reference line (referenceLines) or, for a list, as the dimension, breakdown or a measure's column.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later"
+          },
+          "label": {
+            "type": "string",
+            "description": "what the control shows"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "number",
+              "text",
+              "date",
+              "list"
+            ],
+            "description": "cannot be changed later"
+          },
+          "default": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values"
+          },
+          "min": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "max": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "maxLength": {
+            "type": "number",
+            "description": "text: at most 200"
+          },
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": [
+                    "number",
+                    "string"
+                  ]
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "default"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_parameter",
+      "description": "Change a parameter (by id): its label, default, bounds or values. Send every field. Its name and type stay.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "letters, digits and _, at most 64; a formula writes it as {name}. Cannot be changed later"
+          },
+          "label": {
+            "type": "string",
+            "description": "what the control shows"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "number",
+              "text",
+              "date",
+              "list"
+            ],
+            "description": "cannot be changed later"
+          },
+          "default": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "the value when nobody chose one; a date is YYYY-MM-DD; a list default is one of the values"
+          },
+          "min": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "max": {
+            "type": [
+              "number",
+              "string"
+            ],
+            "description": "number or date"
+          },
+          "maxLength": {
+            "type": "number",
+            "description": "text: at most 200"
+          },
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": [
+                    "number",
+                    "string"
+                  ]
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            },
+            "description": "list: the choices, all text or all numbers. For a parameter that switches a chart's column, the values are column names of the chart's data (take them from describe_mart)"
+          },
+          "id": {
+            "type": "string",
+            "description": "from list_parameters"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "default"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_parameter",
+      "description": "Delete one parameter (by id from list_parameters). Refused while a formula, a chart or a dashboard uses it. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_alert_rules",
       "description": "List every alert rule (threshold alerts) and digest (scheduled summaries), with whether each is enabled.",
       "parameters": {
@@ -822,7 +3488,7 @@
     "type": "function",
     "function": {
       "name": "create_alert_rule",
-      "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
+      "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Or give metric (a name from list_metrics) with op and threshold, and the alert watches that metric instead (it is read with the fixed viewer role every alert uses, not with the user's access). Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
       "parameters": {
         "type": "object",
         "properties": {
@@ -843,6 +3509,10 @@
           "measure": {
             "type": "string",
             "description": "measure column to watch, for type=alert"
+          },
+          "metric": {
+            "type": "string",
+            "description": "the name of a metric to watch, for type=alert, instead of mart/measure/agg"
           },
           "agg": {
             "type": "string",
@@ -921,6 +3591,10 @@
           },
           "measure": {
             "type": "string"
+          },
+          "metric": {
+            "type": "string",
+            "description": "the name of a metric to watch instead of mart/measure/agg"
           },
           "agg": {
             "type": "string",
