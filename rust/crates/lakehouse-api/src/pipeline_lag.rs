@@ -657,6 +657,41 @@ async fn settle_request(
     }
 }
 
+// BLD-2 review R2 SHOULD-FIX 6: helper for mapping store errors
+fn store_err(pipeline_id: &str, msg: &str, err: impl std::fmt::Display) -> ApiError {
+    tracing::error!(%err, pipeline = %pipeline_id, "target lag: {msg}");
+    crate::upstream_error::report(
+        &crate::upstream_error::STORE,
+        crate::upstream_error::Class::Unavailable,
+        &err.to_string(),
+    );
+    ApiError::Internal("the request could not be completed".to_owned())
+}
+
+// BLD-2 review R2 SHOULD-FIX 6: helper for constructing LagStateUpdate
+fn make_lag_update(
+    pipeline: &Pipeline,
+    state: &CheckState,
+    now: OffsetDateTime,
+    last_status: &str,
+    behind_streak: i32,
+) -> LagStateUpdate {
+    LagStateUpdate {
+        pipeline_id: pipeline.id.clone(),
+        tenant_id: pipeline.tenant_id,
+        consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
+        consumed_at: state.consumed_at,
+        pending_since: state.pending_since,
+        requested_run_key: state.requested_run_key.clone(),
+        requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
+        requested_at: state.requested_at,
+        request_attempt: state.request_attempt,
+        last_check_at: now,
+        last_status: last_status.to_owned(),
+        behind_streak,
+    }
+}
+
 /// One lag check: read the inputs, settle any outstanding run, decide, and
 /// write the whole outcome in one statement (plan D5).
 ///
@@ -736,27 +771,14 @@ pub async fn run_lag_check(
     }
 
     // BLD-2 review R1 decision R5 / SHOULD-FIX 7: concurrency: read with SELECT FOR UPDATE in tx
-    let mut tx = pool.begin().await.map_err(|err| {
-        tracing::error!(%err, pipeline = %pipeline.id, "target lag: transaction begin failed");
-        crate::upstream_error::report(
-            &crate::upstream_error::STORE,
-            crate::upstream_error::Class::Unavailable,
-            &err.to_string(),
-        );
-        ApiError::Internal("the request could not be completed".to_owned())
-    })?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| store_err(&pipeline.id, "transaction begin failed", err))?;
 
     let stored = pipelines::get_lag_state_for_update(&mut tx, &pipeline.id, pipeline.tenant_id)
         .await
-        .map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unreadable");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+        .map_err(|err| store_err(&pipeline.id, "state row unreadable", err))?;
     let mut state = stored.as_ref().map_or_else(
         || CheckState {
             consumed_tokens: None,
@@ -810,15 +832,9 @@ pub async fn run_lag_check(
     )
     .await?
     {
-        tx.commit().await.map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: transaction commit failed");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+        tx.commit()
+            .await
+            .map_err(|err| store_err(&pipeline.id, "transaction commit failed", err))?;
         return Ok(early);
     }
 
@@ -854,45 +870,32 @@ pub async fn run_lag_check(
         LagStatus::Behind => stored.as_ref().map_or(1, |row| row.behind_streak + 1),
         LagStatus::Met | LagStatus::NotMeasured => 0,
     };
-    let update = LagStateUpdate {
-        pipeline_id: pipeline.id.clone(),
-        tenant_id: pipeline.tenant_id,
-        consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-        consumed_at: state.consumed_at,
-        pending_since: state.pending_since,
-        requested_run_key: state.requested_run_key.clone(),
-        requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-        requested_at: state.requested_at,
-        request_attempt: state.request_attempt,
-        last_check_at: now,
-        last_status: outcome.status.as_str().to_owned(),
+    let update = make_lag_update(
+        pipeline,
+        &state,
+        now,
+        outcome.status.as_str(),
         behind_streak,
-    };
+    );
     pipelines::upsert_lag_state_conn(&mut tx, &update)
         .await
-        .map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
-    tx.commit().await.map_err(|err| {
-        tracing::error!(%err, pipeline = %pipeline.id, "target lag: transaction commit failed");
-        crate::upstream_error::report(
-            &crate::upstream_error::STORE,
-            crate::upstream_error::Class::Unavailable,
-            &err.to_string(),
-        );
-        ApiError::Internal("the request could not be completed".to_owned())
-    })?;
+        .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
+    tx.commit()
+        .await
+        .map_err(|err| store_err(&pipeline.id, "transaction commit failed", err))?;
 
     Ok(LagCheckOutcome {
         behind_streak,
         ..outcome
     })
+}
+
+// BLD-2 review R2 BLOCKER 2: helper for resetting attempt on token change and checking max_retries
+fn check_retries_and_reset(state: &mut CheckState, tokens: &TokenMap, max_retries: i32) -> bool {
+    if state.requested_tokens.as_ref() != Some(tokens) {
+        state.request_attempt = 0;
+    }
+    state.request_attempt > max_retries
 }
 
 #[allow(
@@ -914,17 +917,10 @@ async fn evaluate_upstream_chain(
     now: OffsetDateTime,
 ) -> Result<Option<LagCheckOutcome>, ApiError> {
     for u_pipe in chain {
-        let u_stored = pipelines::get_lag_state(pool, &u_pipe.id)
+        // BLD-2 review R2 BLOCKER 3: Lock U row in the same transaction as P
+        let u_stored = pipelines::get_lag_state_for_update(tx, &u_pipe.id, u_pipe.tenant_id)
             .await
-            .map_err(|err| {
-                tracing::error!(%err, pipeline = %u_pipe.id, "target lag: upstream state row unreadable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::STORE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Internal("the request could not be completed".to_owned())
-            })?;
+            .map_err(|err| store_err(&u_pipe.id, "upstream state row unreadable", err))?;
         let mut u_state = u_stored.as_ref().map_or_else(
             || CheckState {
                 consumed_tokens: None,
@@ -951,39 +947,6 @@ async fn evaluate_upstream_chain(
                     ApiError::Unavailable("the orchestrator is unavailable".to_owned())
                 })?;
 
-        // If settle_request changed U's state, persist it.
-        if u_state.requested_run_key != u_stored.as_ref().and_then(|s| s.requested_run_key.clone())
-            || u_state.consumed_at != u_stored.as_ref().and_then(|s| s.consumed_at)
-        {
-            let u_update = LagStateUpdate {
-                pipeline_id: u_pipe.id.clone(),
-                tenant_id: u_pipe.tenant_id,
-                consumed_tokens: u_state.consumed_tokens.as_ref().map(tokens_to_json),
-                consumed_at: u_state.consumed_at,
-                pending_since: u_state.pending_since,
-                requested_run_key: u_state.requested_run_key.clone(),
-                requested_tokens: u_state.requested_tokens.as_ref().map(tokens_to_json),
-                requested_at: u_state.requested_at,
-                request_attempt: u_state.request_attempt,
-                last_check_at: now,
-                // BLD-2 review R1 SHOULD-FIX 2: never-measured U is not_measured, not met
-                last_status: u_stored
-                    .as_ref()
-                    .and_then(|s| s.last_status.clone())
-                    .unwrap_or_else(|| "not_measured".to_owned()),
-                behind_streak: u_stored.as_ref().map_or(0, |s| s.behind_streak),
-            };
-            pipelines::upsert_lag_state(pool, &u_update).await.map_err(|err| {
-                tracing::error!(%err, pipeline = %u_pipe.id, "target lag: upstream state row unwritable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::STORE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Internal("the request could not be completed".to_owned())
-            })?;
-        }
-
         if u_outstanding {
             let pending_since = state.pending_since.unwrap_or(now);
             state.pending_since = Some(pending_since);
@@ -998,30 +961,11 @@ async fn evaluate_upstream_chain(
                 LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
                 LagStatus::Met | LagStatus::NotMeasured => 0,
             };
-            // BLD-2 review R1 BLOCKER 5: keep P's request
-            let p_update = LagStateUpdate {
-                pipeline_id: pipeline.id.clone(),
-                tenant_id: pipeline.tenant_id,
-                consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                consumed_at: state.consumed_at,
-                pending_since: state.pending_since,
-                requested_run_key: state.requested_run_key.clone(),
-                requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                requested_at: state.requested_at,
-                request_attempt: state.request_attempt,
-                last_check_at: now,
-                last_status: status.as_str().to_owned(),
-                behind_streak,
-            };
-            pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::STORE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Internal("the request could not be completed".to_owned())
-            })?;
+            // BLD-2 review R1 BLOCKER 5: keep P request
+            let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
+            pipelines::upsert_lag_state_conn(tx, &p_update)
+                .await
+                .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
             return Ok(Some(LagCheckOutcome {
                 decision: Decision::Wait,
                 run_key: state.requested_run_key.clone(),
@@ -1041,40 +985,15 @@ async fn evaluate_upstream_chain(
         // source cannot be parsed is not measurable, so this branch writes
         // P not_measured instead of returning without a write (the page
         // would otherwise keep showing the old status).
-        let u_inputs_maybe = inputs_of(pool, u_pipe).await.map_err(|err| {
-            tracing::error!(%err, pipeline = %u_pipe.id, "target lag: upstream inputs unreadable");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+        let u_inputs_maybe = inputs_of(pool, u_pipe)
+            .await
+            .map_err(|err| store_err(&u_pipe.id, "upstream inputs unreadable", err))?;
         let Some(u_inputs) = u_inputs_maybe else {
-            // BLD-2 review R1 SHOULD-FIX 1 / SHOULD-FIX 13: unparseable upstream source -> write not_measured
-            let p_update = LagStateUpdate {
-                pipeline_id: pipeline.id.clone(),
-                tenant_id: pipeline.tenant_id,
-                consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                consumed_at: state.consumed_at,
-                pending_since: state.pending_since,
-                requested_run_key: state.requested_run_key.clone(),
-                requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                requested_at: state.requested_at,
-                request_attempt: state.request_attempt,
-                last_check_at: now,
-                last_status: LagStatus::NotMeasured.as_str().to_owned(),
-                behind_streak: 0,
-            };
-            pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::STORE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Internal("the request could not be completed".to_owned())
-            })?;
+            let p_update =
+                make_lag_update(pipeline, state, now, LagStatus::NotMeasured.as_str(), 0);
+            pipelines::upsert_lag_state_conn(tx, &p_update)
+                .await
+                .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
             return Ok(Some(LagCheckOutcome {
                 decision: Decision::Wait,
                 run_key: state.requested_run_key.clone(),
@@ -1093,30 +1012,11 @@ async fn evaluate_upstream_chain(
         let u_tokens = match reader.tokens(&u_inputs).await {
             Ok(tokens) => tokens,
             Err(err) => {
-                // BLD-2 review R1 SHOULD-FIX 1: write P's state as not_measured and reset streak to 0
-                let p_update = LagStateUpdate {
-                    pipeline_id: pipeline.id.clone(),
-                    tenant_id: pipeline.tenant_id,
-                    consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                    consumed_at: state.consumed_at,
-                    pending_since: state.pending_since,
-                    requested_run_key: state.requested_run_key.clone(),
-                    requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                    requested_at: state.requested_at,
-                    request_attempt: state.request_attempt,
-                    last_check_at: now,
-                    last_status: LagStatus::NotMeasured.as_str().to_owned(),
-                    behind_streak: 0,
-                };
-                pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                    tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::STORE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Internal("the request could not be completed".to_owned())
-                })?;
+                let p_update =
+                    make_lag_update(pipeline, state, now, LagStatus::NotMeasured.as_str(), 0);
+                pipelines::upsert_lag_state_conn(tx, &p_update)
+                    .await
+                    .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
                 return Ok(Some(LagCheckOutcome {
                     decision: Decision::Wait,
                     run_key: state.requested_run_key.clone(),
@@ -1130,10 +1030,90 @@ async fn evaluate_upstream_chain(
             }
         };
 
+        // BLD-2 review R2 BLOCKER 2: reset request_attempt when tokens change; stop after max_retries + 1
+        let u_max_retries = i32::from(u_pipe.max_retries);
+        let u_retries_exhausted = check_retries_and_reset(&mut u_state, &u_tokens, u_max_retries);
         let u_changed = u_state.consumed_tokens.as_ref() != Some(&u_tokens);
-        if u_changed {
-            let mut total_budget = run_budget_seconds(dagster, job_name).await.map_err(|err| {
-                tracing::warn!(%err, "target lag: run budget unreadable");
+
+        if !u_changed {
+            u_state.pending_since = None;
+            u_state.request_attempt = 0;
+            // BLD-2 review R2 SHOULD-FIX 1: record check for unchanged U; never copy old status forward on settle
+            let u_status = if u_state.consumed_tokens.is_some() {
+                "met"
+            } else {
+                "not_measured"
+            };
+            let u_update = make_lag_update(u_pipe, &u_state, now, u_status, 0);
+            pipelines::upsert_lag_state_conn(tx, &u_update)
+                .await
+                .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
+            continue;
+        }
+
+        if u_retries_exhausted {
+            // BLD-2 review R2 BLOCKER 2: do not request U when retries exhausted
+            let (u_target, _) = target_of(u_pipe);
+            let (u_status, u_streak) = if u_target.is_some() {
+                (
+                    "behind",
+                    u_stored.as_ref().map_or(1, |s| s.behind_streak + 1),
+                )
+            } else {
+                // BLD-2 review R2 SHOULD-FIX 1: never hard-code behind for pipeline with no target
+                ("not_measured", 0)
+            };
+            let u_update = make_lag_update(u_pipe, &u_state, now, u_status, u_streak);
+            pipelines::upsert_lag_state_conn(tx, &u_update)
+                .await
+                .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
+
+            let pending_since = state.pending_since.unwrap_or(now);
+            state.pending_since = Some(pending_since);
+            let lag_seconds = (now - pending_since).whole_seconds();
+            let target = target_seconds.map_or(i64::MAX, i64::from);
+            let status = if state.consumed_tokens.is_none() || lag_seconds > target {
+                LagStatus::Behind
+            } else {
+                LagStatus::Met
+            };
+            let behind_streak = match status {
+                LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
+                LagStatus::Met | LagStatus::NotMeasured => 0,
+            };
+            let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
+            pipelines::upsert_lag_state_conn(tx, &p_update)
+                .await
+                .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
+
+            return Ok(Some(LagCheckOutcome {
+                decision: Decision::Wait,
+                run_key: state.requested_run_key.clone(),
+                job_name: job_name.to_owned(),
+                status,
+                lag_seconds: Some(lag_seconds),
+                target_seconds,
+                behind_streak,
+                reason: Some(format!(
+                    "waiting for upstream pipeline {} to finish",
+                    u_pipe.id
+                )),
+            }));
+        }
+
+        let mut total_budget = run_budget_seconds(dagster, job_name).await.map_err(|err| {
+            tracing::warn!(%err, "target lag: run budget unreadable");
+            crate::upstream_error::report(
+                &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+                crate::upstream_error::Class::Unavailable,
+                &err.to_string(),
+            );
+            ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+        })?;
+        for up in chain {
+            let up_job = crate::routes::authored_pipelines::job_name(&up.id);
+            total_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
+                tracing::warn!(%err, "target lag: upstream run budget unreadable");
                 crate::upstream_error::report(
                     &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
                     crate::upstream_error::Class::Unavailable,
@@ -1141,107 +1121,49 @@ async fn evaluate_upstream_chain(
                 );
                 ApiError::Unavailable("the orchestrator is unavailable".to_owned())
             })?;
-            for up in chain {
-                let up_job = crate::routes::authored_pipelines::job_name(&up.id);
-                total_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
-                    tracing::warn!(%err, "target lag: upstream run budget unreadable");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Unavailable("the orchestrator is unavailable".to_owned())
-                })?;
-            }
+        }
 
-            let pending_since = state.pending_since.unwrap_or(now);
-            state.pending_since = Some(pending_since);
-            let lag_seconds = (now - pending_since).whole_seconds();
-            let never_consumed = state.consumed_tokens.is_none();
-            let target = target_seconds.map_or(i64::MAX, i64::from);
-            let due = if never_consumed || target == i64::MAX {
-                true
+        let pending_since = state.pending_since.unwrap_or(now);
+        state.pending_since = Some(pending_since);
+        let lag_seconds = (now - pending_since).whole_seconds();
+        let never_consumed = state.consumed_tokens.is_none();
+        let target = target_seconds.map_or(i64::MAX, i64::from);
+        let due = if never_consumed || target == i64::MAX {
+            true
+        } else {
+            lag_seconds >= target.saturating_sub(total_budget)
+        };
+
+        let (u_target, _) = target_of(u_pipe);
+        let (u_status, u_streak) = if u_target.is_some() {
+            let u_pending = u_state.pending_since.unwrap_or(now);
+            let u_lag = (now - u_pending).whole_seconds();
+            let u_tgt = u_target.map_or(i64::MAX, i64::from);
+            if u_state.consumed_tokens.is_none() || u_lag > u_tgt {
+                (
+                    "behind",
+                    u_stored.as_ref().map_or(1, |s| s.behind_streak + 1),
+                )
             } else {
-                lag_seconds >= target.saturating_sub(total_budget)
-            };
-
-            if due {
-                // BLD-2 review R1 decision R2 / BLOCKER 4: run_key carries attempt
-                let u_key = run_key_for(&u_pipe.id, &u_tokens, u_state.request_attempt);
-                u_state.requested_run_key = Some(u_key.clone());
-                u_state.requested_tokens = Some(u_tokens);
-                u_state.requested_at = Some(now);
-
-                let u_update = LagStateUpdate {
-                    pipeline_id: u_pipe.id.clone(),
-                    tenant_id: u_pipe.tenant_id,
-                    consumed_tokens: u_state.consumed_tokens.as_ref().map(tokens_to_json),
-                    consumed_at: u_state.consumed_at,
-                    pending_since: u_state.pending_since.or(Some(now)),
-                    requested_run_key: u_state.requested_run_key.clone(),
-                    requested_tokens: u_state.requested_tokens.as_ref().map(tokens_to_json),
-                    requested_at: u_state.requested_at,
-                    request_attempt: u_state.request_attempt,
-                    last_check_at: now,
-                    last_status: "behind".to_owned(),
-                    // BLD-2 review R1 SHOULD-FIX 2: behind streak should start at 1 or increment
-                    behind_streak: u_stored.as_ref().map_or(1, |s| s.behind_streak + 1),
-                };
-                pipelines::upsert_lag_state(pool, &u_update).await.map_err(|err| {
-                    tracing::error!(%err, pipeline = %u_pipe.id, "target lag: upstream state row unwritable");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::STORE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Internal("the request could not be completed".to_owned())
-                })?;
-
-                let status = if never_consumed || lag_seconds > target {
-                    LagStatus::Behind
-                } else {
-                    LagStatus::Met
-                };
-                let behind_streak = match status {
-                    LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
-                    LagStatus::Met | LagStatus::NotMeasured => 0,
-                };
-                // BLD-2 review R1 BLOCKER 5: keep P's request
-                let p_update = LagStateUpdate {
-                    pipeline_id: pipeline.id.clone(),
-                    tenant_id: pipeline.tenant_id,
-                    consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                    consumed_at: state.consumed_at,
-                    pending_since: state.pending_since,
-                    requested_run_key: state.requested_run_key.clone(),
-                    requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                    requested_at: state.requested_at,
-                    request_attempt: state.request_attempt,
-                    last_check_at: now,
-                    last_status: status.as_str().to_owned(),
-                    behind_streak,
-                };
-                pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                    tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::STORE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Internal("the request could not be completed".to_owned())
-                })?;
-
-                return Ok(Some(LagCheckOutcome {
-                    decision: Decision::Run,
-                    run_key: Some(u_key),
-                    job_name: u_job_name,
-                    status,
-                    lag_seconds: Some(lag_seconds),
-                    target_seconds,
-                    behind_streak,
-                    reason: Some(format!("requesting upstream pipeline {} first", u_pipe.id)),
-                }));
+                ("met", 0)
             }
+        } else {
+            // BLD-2 review R2 SHOULD-FIX 1: never hard-code behind for pipeline with no target
+            ("not_measured", 0)
+        };
+
+        if due {
+            // BLD-2 review R1 decision R2 / BLOCKER 4: run_key carries attempt
+            let u_key = run_key_for(&u_pipe.id, &u_tokens, u_state.request_attempt);
+            u_state.requested_run_key = Some(u_key.clone());
+            u_state.requested_tokens = Some(u_tokens);
+            u_state.requested_at = Some(now);
+
+            // BLD-2 review R2 BLOCKER 3: write U update in tx
+            let u_update = make_lag_update(u_pipe, &u_state, now, u_status, u_streak);
+            pipelines::upsert_lag_state_conn(tx, &u_update)
+                .await
+                .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
 
             let status = if never_consumed || lag_seconds > target {
                 LagStatus::Behind
@@ -1252,42 +1174,54 @@ async fn evaluate_upstream_chain(
                 LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
                 LagStatus::Met | LagStatus::NotMeasured => 0,
             };
-            // BLD-2 review R1 BLOCKER 5: keep P's request
-            let p_update = LagStateUpdate {
-                pipeline_id: pipeline.id.clone(),
-                tenant_id: pipeline.tenant_id,
-                consumed_tokens: state.consumed_tokens.as_ref().map(tokens_to_json),
-                consumed_at: state.consumed_at,
-                pending_since: state.pending_since,
-                requested_run_key: state.requested_run_key.clone(),
-                requested_tokens: state.requested_tokens.as_ref().map(tokens_to_json),
-                requested_at: state.requested_at,
-                request_attempt: state.request_attempt,
-                last_check_at: now,
-                last_status: status.as_str().to_owned(),
-                behind_streak,
-            };
-            pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-                tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::STORE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Internal("the request could not be completed".to_owned())
-            })?;
+            // BLD-2 review R1 BLOCKER 5: keep P request
+            let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
+            pipelines::upsert_lag_state_conn(tx, &p_update)
+                .await
+                .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
 
             return Ok(Some(LagCheckOutcome {
-                decision: Decision::Wait,
-                run_key: state.requested_run_key.clone(),
-                job_name: job_name.to_owned(),
+                decision: Decision::Run,
+                run_key: Some(u_key),
+                job_name: u_job_name,
                 status,
                 lag_seconds: Some(lag_seconds),
                 target_seconds,
                 behind_streak,
-                reason: Some("waiting for target lag budget window".to_owned()),
+                reason: Some(format!("requesting upstream pipeline {} first", u_pipe.id)),
             }));
         }
+
+        let u_update = make_lag_update(u_pipe, &u_state, now, u_status, u_streak);
+        pipelines::upsert_lag_state_conn(tx, &u_update)
+            .await
+            .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
+
+        let status = if never_consumed || lag_seconds > target {
+            LagStatus::Behind
+        } else {
+            LagStatus::Met
+        };
+        let behind_streak = match status {
+            LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
+            LagStatus::Met | LagStatus::NotMeasured => 0,
+        };
+        // BLD-2 review R1 BLOCKER 5: keep P request
+        let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
+        pipelines::upsert_lag_state_conn(tx, &p_update)
+            .await
+            .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
+
+        return Ok(Some(LagCheckOutcome {
+            decision: Decision::Wait,
+            run_key: state.requested_run_key.clone(),
+            job_name: job_name.to_owned(),
+            status,
+            lag_seconds: Some(lag_seconds),
+            target_seconds,
+            behind_streak,
+            reason: Some("waiting for target lag budget window".to_owned()),
+        }));
     }
     Ok(None)
 }
@@ -1324,10 +1258,9 @@ async fn decide(
         }
     };
 
-    // BLD-2 review R1 decision R2 / BLOCKER 4: reset request_attempt when tokens change
-    if state.requested_tokens.as_ref() != Some(&tokens) {
-        state.request_attempt = 0;
-    }
+    // BLD-2 review R2 BLOCKER 2: helper for resetting attempt on token change and checking max_retries
+    let max_retries = i32::from(pipeline.max_retries);
+    let retries_exhausted = check_retries_and_reset(state, &tokens, max_retries);
 
     if state.consumed_tokens.as_ref() == Some(&tokens) {
         state.pending_since = None;
@@ -1351,10 +1284,9 @@ async fn decide(
     let target = target_seconds.map_or(i64::MAX, i64::from);
 
     let mut decision = Decision::Wait;
-    let max_retries = i32::from(pipeline.max_retries);
     if !outstanding {
         // BLD-2 review R1 decision R2 / BLOCKER 4: stop after max_retries + 1 attempts
-        if state.request_attempt > max_retries {
+        if retries_exhausted {
             decision = Decision::Wait;
         } else {
             let due = if never_consumed || target == i64::MAX {
@@ -1386,7 +1318,7 @@ async fn decide(
     }
 
     // BLD-2 review R2 decision R10: retries exhausted reads behind whatever the lag
-    let (status, reason) = if state.request_attempt > max_retries {
+    let (status, reason) = if retries_exhausted {
         let n = max_retries + 1;
         (
             LagStatus::Behind,
@@ -1603,14 +1535,6 @@ mod tests {
         }
 
         fn unreadable(mut self, key: &str) -> Self {
-            self.unreadable.push(key.to_owned());
-            self
-        }
-
-        /// BLD-2 review R1 SHOULD-FIX 1: an input whose token cannot be
-        /// read at all, for the test of the branch that writes
-        /// `not_measured` instead of leaving the old status.
-        fn with_error(mut self, key: &str, _why: &str) -> Self {
             self.unreadable.push(key.to_owned());
             self
         }
@@ -3493,8 +3417,7 @@ mod tests {
             .await
             .expect("p inputs")
             .expect("p parseable");
-        let reader =
-            FakeTokens::new().with_error("bronze.orders", "upstream iceberg metadata corrupted");
+        let reader = FakeTokens::new().unreadable("bronze.orders");
         let (dagster, _server) = dagster_with(&job_name("pl-p-unreadable"), None, &[]).await;
 
         let outcome = run_lag_check(
@@ -3587,5 +3510,158 @@ mod tests {
             !behind_alert_due(outcome4.behind_streak),
             "subsequent behind checks do not re-alert"
         );
+    }
+
+    /// BLD-2 review R2 BLOCKER 2 / BLOCKER 3: downstream upstream U whose run keeps failing:
+    /// increments `request_attempt`, stops requesting after `max_retries` + 1, persists in tx,
+    /// and resets attempt when U tokens change.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn upstream_retries_exhausted_stops_requesting_and_resets_on_token_change(pool: PgPool) {
+        let (dagster, _server) =
+            dagster_with(&job_name("pl-u-retries"), Some("FAILURE"), &[]).await;
+        let tenant_id = seed_tenant(&pool).await;
+
+        let u = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "u_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "u_clean_retries".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-u-retries".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create u");
+
+        let p = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "p_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "u_clean_retries".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "p_mart_retries".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-p-retries".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create p");
+
+        let p_inputs = inputs_of(&pool, &p)
+            .await
+            .expect("p inputs")
+            .expect("p parseable");
+        let reader = FakeTokens::new()
+            .with("bronze.orders", "iceberg:1")
+            .with("silver.u_clean_retries", "fp:1");
+
+        let now = at(1_000);
+
+        // Attempt 0: initial run requested for U
+        let o0 = run_lag_check(&pool, &dagster, &reader, &p, &p_inputs, now)
+            .await
+            .expect("check 0");
+        assert_eq!(o0.decision, Decision::Run);
+        assert_eq!(o0.job_name, "authored__pl_u_retries");
+        let key0 = o0.run_key.expect("key0");
+        assert!(
+            key0.ends_with(":0"),
+            "initial key should have :0 suffix: {key0}"
+        );
+
+        // Attempt 1: Dagster settled FAILURE -> attempt incremented to 1 <= max_retries(1)
+        let o1 = run_lag_check(
+            &pool,
+            &dagster,
+            &reader,
+            &p,
+            &p_inputs,
+            now + time::Duration::seconds(30),
+        )
+        .await
+        .expect("check 1");
+        assert_eq!(o1.decision, Decision::Run);
+        let key1 = o1.run_key.expect("key1");
+        assert!(
+            key1.ends_with(":1"),
+            "first retry should have :1 suffix: {key1}"
+        );
+
+        // Attempt 2: Dagster settled FAILURE -> attempt incremented to 2 > max_retries(1) -> exhausted!
+        let o2 = run_lag_check(
+            &pool,
+            &dagster,
+            &reader,
+            &p,
+            &p_inputs,
+            now + time::Duration::seconds(60),
+        )
+        .await
+        .expect("check 2");
+        assert_eq!(o2.decision, Decision::Wait);
+        assert_eq!(o2.run_key, None);
+        let u_state = pipelines::get_lag_state(&pool, &u.id)
+            .await
+            .expect("get u state")
+            .expect("u state exists");
+        assert_eq!(u_state.request_attempt, 2);
+        assert_eq!(u_state.requested_run_key, None);
+        assert_eq!(u_state.last_status.as_deref(), Some("not_measured")); // SHOULD-FIX 1: no target -> not_measured
+
+        // Tokens change! U tokens become iceberg:2 -> attempt resets to 0!
+        let reader2 = FakeTokens::new()
+            .with("bronze.orders", "iceberg:2")
+            .with("silver.u_clean_retries", "fp:1");
+        let o3 = run_lag_check(
+            &pool,
+            &dagster,
+            &reader2,
+            &p,
+            &p_inputs,
+            now + time::Duration::seconds(90),
+        )
+        .await
+        .expect("check 3");
+        assert_eq!(o3.decision, Decision::Run);
+        let key3 = o3.run_key.expect("key3");
+        assert!(
+            key3.ends_with(":0"),
+            "reset attempt should have :0 suffix: {key3}"
+        );
+        let u_state_after = pipelines::get_lag_state(&pool, &u.id)
+            .await
+            .expect("get u state")
+            .expect("u state exists");
+        assert_eq!(u_state_after.request_attempt, 0);
     }
 }

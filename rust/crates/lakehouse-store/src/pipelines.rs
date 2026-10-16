@@ -2067,30 +2067,6 @@ pub async fn set_target_lag(
 /// A pipeline whose kind is `downstream` is refreshed by the pipeline that
 /// reads it, so this is the list such a pipeline's own check has to walk
 /// to find out whether anybody needs it at all.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if the query fails.
-pub async fn lag_pipelines_reading(
-    pool: &PgPool,
-    targets: &[String],
-) -> Result<Vec<Pipeline>, StoreError> {
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-    let sql = format!(
-        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
-         WHERE (target_lag_seconds IS NOT NULL OR target_lag_downstream) \
-           AND (source = ANY($1) OR EXISTS ( \
-                  SELECT 1 FROM unnest(depends_on) AS up(id) \
-                  JOIN pipeline_definition u ON u.id = up.id \
-                  WHERE u.target = ANY($1))) \
-         ORDER BY id"
-    );
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql).bind(targets).fetch_all(pool).await?;
-    Ok(rows.into_iter().map(Pipeline::from).collect())
-}
-
 /// How many pipelines with a target lag read `target` (other than `pipeline_id`
 /// itself) — plan D7's honest note ("Downstream: no pipeline with a target lag
 /// reads this table") needs this number, and the page must not have to infer it.
