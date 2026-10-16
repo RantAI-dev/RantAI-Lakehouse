@@ -2245,6 +2245,9 @@ async fn list_lag_states_returns_one_entry_per_checked_pipeline(pool: PgPool) ->
             pending_since: None,
             requested_run_key: None,
             requested_tokens: None,
+            // BLD-2 review R1 decisions R1/R2: no request was ever made.
+            requested_at: None,
+            request_attempt: 0,
             last_check_at: now,
             last_status: "met".to_owned(),
             behind_streak: 0,
@@ -2288,6 +2291,9 @@ async fn lag_state_last_status_check_refuses_an_unknown_status(pool: PgPool) -> 
             pending_since: None,
             requested_run_key: None,
             requested_tokens: None,
+            // BLD-2 review R1 decisions R1/R2: no request was ever made.
+            requested_at: None,
+            request_attempt: 0,
             last_check_at: time::OffsetDateTime::now_utc(),
             last_status: "mostly-fine".to_owned(),
             behind_streak: 0,
@@ -2304,6 +2310,17 @@ async fn lag_state_last_status_check_refuses_an_unknown_status(pool: PgPool) -> 
 async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
     pool: PgPool,
 ) -> sqlx::Result<()> {
+    // BLD-2 review R1 decision R3: every link the cycle walk follows stays
+    // inside one tenant, and a `tenant_id IS NULL` pipeline links to
+    // nothing — so these fixtures need a tenant or there is no link to
+    // walk and nothing to refuse.
+    let tenant_id = create_tenant(&pool, &tenant_input("cycle-write-tenant"))
+        .await
+        .expect("tenant")
+        .id
+        .parse()
+        .expect("uuid");
+
     // 1. Direct self-cycle: pipeline reads its own target table.
     let mut self_inp = input();
     self_inp.name = "self_cycle".to_owned();
@@ -2311,6 +2328,7 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
     self_inp.source_table = "orders_clean".to_owned();
     self_inp.target_zone = "silver".to_owned();
     self_inp.target_table = "orders_clean".to_owned();
+    self_inp.tenant_id = Some(tenant_id);
     let p_self = pipelines::create_pipeline(&pool, &self_inp, None)
         .await
         .expect("create pipeline");
@@ -2329,6 +2347,7 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
     // 2. 2-cycle: P1 writes silver.p1 and reads silver.p2; P2 writes silver.p2 and reads silver.p1.
     let mut p1_inp = input();
     p1_inp.name = "p1_node".to_owned();
+    p1_inp.tenant_id = Some(tenant_id);
     p1_inp.source_zone = "silver".to_owned();
     p1_inp.source_table = "p2_out".to_owned();
     p1_inp.target_zone = "silver".to_owned();
@@ -2342,6 +2361,7 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
 
     let mut p2_inp = input();
     p2_inp.name = "p2_node".to_owned();
+    p2_inp.tenant_id = Some(tenant_id);
     p2_inp.source_zone = "silver".to_owned();
     p2_inp.source_table = "p1_out".to_owned();
     p2_inp.target_zone = "silver".to_owned();
@@ -2365,6 +2385,7 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
     // 3. Acyclic chain: P_up (downstream) -> P_down (lag 10) succeeds.
     let mut up_inp = input();
     up_inp.name = "up_node".to_owned();
+    up_inp.tenant_id = Some(tenant_id);
     up_inp.source_zone = "bronze".to_owned();
     up_inp.source_table = "feed".to_owned();
     up_inp.target_zone = "silver".to_owned();
@@ -2378,6 +2399,7 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
 
     let mut down_inp = input();
     down_inp.name = "down_node".to_owned();
+    down_inp.tenant_id = Some(tenant_id);
     down_inp.source_zone = "silver".to_owned();
     down_inp.source_table = "clean_feed".to_owned();
     down_inp.target_zone = "gold".to_owned();
@@ -2622,18 +2644,22 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
         .expect("create p2");
 
     // Updating P1 to read from silver.p2 creates a cycle: P1 -> P2 -> P1!
+    // Only the SOURCE changes (bronze.raw -> silver.p2); every other field
+    // keeps what P1 was created with, read from the input rather than from
+    // the stored `Pipeline`, which carries the flattened `source`/`target`
+    // strings rather than the zone/table parts `UpdatePipelineInput` takes.
     let update_input = pipelines::UpdatePipelineInput {
         kind: p1.kind,
         source_zone: "silver".to_owned(),
         source_table: "p2".to_owned(),
-        target_zone: p1.target_zone,
-        target_table: p1.target_table,
+        target_zone: p1_inp.target_zone.clone(),
+        target_table: p1_inp.target_table.clone(),
         schedule: p1.schedule,
         description: p1.description,
-        incremental_column: p1.incremental_column,
-        fbic_enabled: p1.fbic_enabled,
-        transforms: p1.transforms,
-        owner: p1.owner,
+        incremental_column: p1_inp.incremental_column.clone(),
+        fbic_enabled: p1_inp.fbic_enabled,
+        transforms: p1_inp.transforms.clone(),
+        owner: p1_inp.owner.clone(),
         max_retries: Some(p1.max_retries),
         depends_on: None,
     };
@@ -2641,7 +2667,10 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
         .await
         .expect_err("cycle update must be refused");
     assert!(
-        matches!(err, StoreError::Validation(ref msg) if msg.contains("cycle")),
+        matches!(
+            err,
+            lakehouse_store::StoreError::Validation(ref msg) if msg.contains("cycle")
+        ),
         "expected cycle validation error, got: {err:?}"
     );
     Ok(())

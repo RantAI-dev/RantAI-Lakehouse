@@ -1835,12 +1835,14 @@ pub async fn get_lag_state(
 /// caller skips those rather than failing the check, because the pipeline
 /// still follows such a job through the `_after` sensor.
 ///
+/// BLD-2 review R1 decision R3 / SHOULD-FIX 9 & SHOULD-FIX 10: the lookup is
+/// scoped to `tenant_id`, and a `None` tenant answers an empty map — a
+/// pipeline that belongs to no tenant links to nothing (fail closed, as
+/// migration 0042). One function for both callers (rule 4).
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-/// The stored `target` location (`"<zone>.<table>"`) of each named
-/// pipeline within `tenant_id`, one query.
-/// BLD-2 review R1 decision R3 / SHOULD-FIX 9 & SHOULD-FIX 10.
 pub async fn targets_for(
     pool: &PgPool,
     tenant_id: Option<Uuid>,
@@ -2202,8 +2204,10 @@ pub async fn upstream_downstream_chain(
     Ok(order)
 }
 
-/// Helper DFS for cycle detection starting from `current` and looking for `target`.
-/// BLD-2 review R1 SHOULD-FIX 10.
+/// Helper DFS for cycle detection starting from `current` and looking for
+/// `target`, following `upstream_of` (BLD-2 review R1 SHOULD-FIX 10: the
+/// upstream set is the tenant-scoped one, so a cycle must be made of
+/// pipelines the same tenant owns).
 fn dfs_cycle(
     current: &str,
     target: &str,
