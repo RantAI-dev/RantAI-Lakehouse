@@ -35,6 +35,7 @@
 //! now dropped" from "was never there" so a caller that wants to know can.
 
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use lakehouse_core::secret::SecretValue;
@@ -274,6 +275,7 @@ pub async fn drop_slot_and_publication(
     target: &PgTarget,
     slot_name: &str,
     publication_name: &str,
+    ca: Option<&Path>,
 ) -> Result<Deprovisioned, DeprovisionError> {
     // SEC-15 review fix (SHOULD-FIX 2): the TLS mode is set in one place,
     // `connector_probe`, shared with the connection test and discovery.
@@ -283,6 +285,7 @@ pub async fn drop_slot_and_publication(
         &target.user,
         target.password.expose_secret(),
         &target.database,
+        ca,
     );
 
     let connect_label = format!("slot {slot_name:?} / publication {publication_name:?}");
@@ -466,18 +469,21 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+    use crate::tls_proxy::TlsProxy;
 
-    /// Build a [`PgTarget`] dialing the SAME per-test Postgres database
+    /// Build a [`PgTarget`] for the SAME per-test Postgres database
     /// `#[sqlx::test]` already handed us via `pool` — extracting
-    /// host/port/user/database from the pool's own connect options rather
-    /// than hardcoding them, so this keeps working if
+    /// user/database from the pool's own connect options rather than
+    /// hardcoding them, so this keeps working if
     /// `lakehouse-test-support` ever changes its fixed superuser
-    /// credentials.
-    fn target_for(pool: &PgPool) -> PgTarget {
+    /// credentials — but pointed at `proxy`, because since `SEC-14` part B a
+    /// production dial requires TLS and the shared test Postgres does not
+    /// serve it (see [`TlsProxy`]).
+    fn target_for(pool: &PgPool, proxy: &TlsProxy) -> PgTarget {
         let options = pool.connect_options();
         PgTarget {
-            host: options.get_host().to_owned(),
-            port: options.get_port(),
+            host: "127.0.0.1".to_owned(),
+            port: proxy.port(),
             user: options.get_username().to_owned(),
             // `lakehouse-test-support` always starts the container with
             // the official Postgres image's default superuser password.
@@ -489,13 +495,22 @@ mod tests {
         }
     }
 
+    /// A TLS-terminating proxy in front of the server `pool` is connected
+    /// to.
+    async fn proxy_for(pool: &PgPool) -> TlsProxy {
+        let options = pool.connect_options();
+        TlsProxy::start(options.get_host(), options.get_port()).await
+    }
+
     #[sqlx::test(migrations = false)]
     async fn absent_slot_and_publication_is_success_not_an_error(pool: PgPool) -> sqlx::Result<()> {
-        let target = target_for(&pool);
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
         let result = drop_slot_and_publication(
             &target,
             "nope_never_provisioned_slot",
             "nope_never_provisioned_pub",
+            None,
         )
         .await
         .unwrap();
@@ -512,10 +527,12 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        let target = target_for(&pool);
-        let result = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
-            .await
-            .unwrap();
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
+        let result =
+            drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub", None)
+                .await
+                .unwrap();
         assert_eq!(result.publication, DropOutcome::Dropped);
         assert_eq!(result.slot, DropOutcome::NotPresent);
 
@@ -527,10 +544,11 @@ mod tests {
 
         // Idempotent: calling again on an already-clean connector must
         // still succeed and report NotPresent, not fail.
-        let target = target_for(&pool);
-        let second = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
-            .await
-            .unwrap();
+        let target = target_for(&pool, &proxy);
+        let second =
+            drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub", None)
+                .await
+                .unwrap();
         assert_eq!(second.publication, DropOutcome::NotPresent);
         Ok(())
     }
@@ -545,8 +563,9 @@ mod tests {
     async fn invalid_publication_name_is_rejected_before_any_query(
         pool: PgPool,
     ) -> sqlx::Result<()> {
-        let target = target_for(&pool);
-        let err = drop_slot_and_publication(&target, "safe_slot", "not a valid slug\"; --")
+        let proxy = proxy_for(&pool).await;
+        let target = target_for(&pool, &proxy);
+        let err = drop_slot_and_publication(&target, "safe_slot", "not a valid slug\"; --", None)
             .await
             .expect_err("a non-slug-shaped publication name must be rejected");
         assert!(
@@ -565,10 +584,14 @@ mod tests {
             database: "postgres".to_owned(),
         };
         let started = std::time::Instant::now();
-        let err =
-            drop_slot_and_publication(&target, "unreachable_test_slot", "unreachable_test_pub")
-                .await
-                .expect_err("nothing listens on port 1");
+        let err = drop_slot_and_publication(
+            &target,
+            "unreachable_test_slot",
+            "unreachable_test_pub",
+            None,
+        )
+        .await
+        .expect_err("nothing listens on port 1");
         assert!(started.elapsed() < QUERY_TIMEOUT + Duration::from_secs(2));
         assert!(matches!(
             err,

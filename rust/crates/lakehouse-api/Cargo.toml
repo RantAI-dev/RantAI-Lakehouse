@@ -199,6 +199,20 @@ testcontainers-modules = { version = "0.15", features = ["clickhouse"] }
 # `secret_manager::gcp`'s tests also generate a service-account key with it.
 rsa = "0.9"
 
+# `SEC-14` part B (dev-only): the TLS-terminating proxy in front of the
+# shared test `Postgres` (`src/tls_proxy.rs`) needs a server certificate,
+# and a test can only get one by generating it -- no certificate is
+# committed to this repository (gitleaks reads a committed private key as a
+# leak). `ring` and no `crypto` defaults, matching the workspace's one
+# rustls provider story (the workspace `rustls` entry); MIT OR Apache-2.0.
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# `tls_proxy.rs`, the TLS-terminating proxy the tests that dial a database
+# through the production helper need. Both move to `[dependencies]` with the
+# Postgres connection test's own client (`pg_probe`), which uses them for a
+# client connection rather than a server one.
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+
 tempfile = { workspace = true }
 
 [lints]

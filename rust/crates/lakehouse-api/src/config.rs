@@ -1502,6 +1502,19 @@ impl Config {
         }
     }
 
+    /// The CA a connector dial verifies the database server against
+    /// (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5/D6). `None` is D5's
+    /// `require` posture: TLS is still required, the server certificate is
+    /// trusted as-is.
+    ///
+    /// Every connector dial takes this and never reads the field directly,
+    /// so "which CA does a dial verify against" is one accessor rather than
+    /// a setting read at six call sites.
+    #[must_use]
+    pub fn connector_tls_ca(&self) -> Option<&std::path::Path> {
+        self.connector_tls_ca_file.as_deref()
+    }
+
     /// The internal addresses an alert webhook may call (`SEC-10`): only the
     /// listed networks, never "all" (see
     /// [`Config::webhook_allowed_cidrs`]).

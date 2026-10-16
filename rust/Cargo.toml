@@ -83,6 +83,18 @@ croner = { version = "4" }
 # 0.63 verified latest via docs.rs/sqlparser/latest as of 2026-10-14;
 # `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
 sqlparser = "0.63"
+# SEC-14 part B (D5): the TLS a connector dial makes. First used by the
+# test-only TLS-terminating proxy in front of the shared test Postgres
+# (`lakehouse-api::tls_proxy`), and by the Postgres connection test's own
+# client, which speaks the wire protocol itself so it can refuse every
+# authentication method but SCRAM-SHA-256 (`lakehouse-api::pg_probe`).
+# `default-features = false` with `ring`, not the default `aws_lc_rs`, so the
+# workspace keeps one rustls provider story and matches
+# `sqlx`/`tiberius`/`reqwest`, which all use `ring` on rustls 0.23.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+# `ClientConfig`/`ServerConfig` and the `require`-posture certificate
+# verifier are built against the rustls `tokio-rustls` above re-exports.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 [workspace.lints.rust]
 future-incompatible = "warn"

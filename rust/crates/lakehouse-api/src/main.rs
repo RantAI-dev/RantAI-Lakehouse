@@ -42,6 +42,12 @@ mod state;
 mod tenant;
 mod tenant_scope;
 mod transform_grammar;
+
+// Test-only: the TLS-terminating proxy in front of the shared test
+// Postgres (`SEC-14` part B). Declared in both this crate's module roots
+// because `main.rs` compiles the same sources into the binary.
+#[cfg(test)]
+mod tls_proxy;
 mod upload_parquet;
 mod upload_parse;
 mod upload_store;
