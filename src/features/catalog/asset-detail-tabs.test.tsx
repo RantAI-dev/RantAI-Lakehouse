@@ -341,6 +341,29 @@ describe("Lineage tab", () => {
     )
   })
 
+  it("offers the table's columns for column lineage, and asks for none until one is picked", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=lineage"
+    renderTabs()
+
+    const card = (await screen.findByText("Column lineage")).closest("[data-slot=card]") as HTMLElement
+    expect(within(within(card).getByLabelText("Column")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Pick a column",
+      "amount",
+      "id",
+    ])
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/governance/lineage/columns"))).toBe(false)
+  })
+
+  it("has no column lineage to offer without lineage:read", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read"] })
+    url.search = "tab=lineage"
+    renderTabs()
+
+    expect(await screen.findByText("Lineage needs lineage access")).toBeTruthy()
+    expect(screen.queryByText("Column lineage")).toBeNull()
+  })
+
   it("says nothing is recorded, and why, instead of drawing an empty graph", async () => {
     stubApi({ lineage: NO_LINEAGE })
     url.search = "tab=lineage"

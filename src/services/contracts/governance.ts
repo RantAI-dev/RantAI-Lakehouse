@@ -76,11 +76,61 @@ export type LineageEdge = {
   evidence?: string
 }
 
+/** One end of a column mapping; `null` when the statement did not let us name it. */
+export type ColumnEnd = { table: string | null; column: string | null }
+
+/**
+ * One recorded step from a source column to the column built from it
+ * (`DATA-13`). `partial` is true when the statement could not be fully
+ * traced; `reason` then says why, and `from` may be empty.
+ */
+export type ColumnMapping = {
+  from: ColumnEnd
+  to: { table: string; column: string }
+  /** `copy` (a bare or renamed column), `cast`, `expression` or `unknown`. */
+  transform: "copy" | "cast" | "expression" | "unknown" | string
+  partial: boolean
+  reason: string | null
+  /** What recorded it: an authored pipeline run, a Silver/Gold build from the query log, or a saved dashboard SQL source. */
+  producer: { kind: "pipeline" | "build" | "sql_source" | string; ref: string }
+  recordedAt: string
+  /** Distance from the column asked about; 1 is directly adjacent. */
+  hop: number
+}
+
+/** A saved chart that reads a column downstream of the one asked about. */
+export type ColumnChart = {
+  chartId: string
+  chartTitle: string
+  dashboardId: string
+  dashboardTitle: string
+}
+
+/** `GET /api/governance/lineage/columns`. */
+export type ColumnLineage = {
+  supported: boolean
+  table: string
+  column: string
+  direction: "up" | "down" | string
+  mappings: ColumnMapping[]
+  /** How long column lineage is kept, and how far back this answer's records go. */
+  retention: { days: number; oldestRecordedAt: string | null }
+  /** What this answer leaves out and why (tenant and catalog rules). */
+  coverage?: string[]
+  /** Downstream only, for a caller with `dashboard:read`. */
+  charts?: ColumnChart[]
+  /** Downstream only: the caller may not list dashboards. */
+  chartsHidden?: boolean
+  /** Downstream only: the charts could not be read just now. */
+  chartsUnavailable?: boolean
+}
+
 export type LineageGraph = {
   focus: string
   nodes: { id: string; label: string; kind: string }[]
   edges: LineageEdge[]
-  columnMappings: { source: string; target: string; transform: string }[]
+  /** The recorded column mappings that touch the focus table. */
+  columnMappings: ColumnMapping[]
   /** False when the build has no lineage capture; `reason` says why. */
   supported: boolean
   reason?: string
@@ -194,6 +244,17 @@ export interface GovernanceService {
   listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
+  /**
+   * The columns a column comes from (`up`) or the columns and saved charts
+   * built from it (`down`); needs `lineage:read`, and charts need
+   * `dashboard:read`.
+   */
+  getColumnLineage(
+    table: string,
+    column: string,
+    direction: "up" | "down",
+    signal?: AbortSignal
+  ): Promise<ColumnLineage>
   listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
   /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
   listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>

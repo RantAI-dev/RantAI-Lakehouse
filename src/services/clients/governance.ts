@@ -4,6 +4,7 @@ import type {
   QualityRule,
   QualityRunResult,
   LineageGraph,
+  ColumnLineage,
   AuditEvent,
   ClassificationRule,
   MaintenanceRun,
@@ -96,6 +97,10 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
+  },
+  async getColumnLineage(table, column, direction, signal) {
+    const query = new URLSearchParams({ table, column, direction });
+    return get<ColumnLineage>(`/api/governance/lineage/columns?${query.toString()}`, signal);
   },
   // P6: Bronze maintenance (P4) and CDC replication-slot health (P5),
   // surfaced through the same `bronze_meta.*`-backed governance endpoints
