@@ -14,6 +14,8 @@ mod catalog_search_cache;
 mod config;
 mod connector_deprovision;
 mod connector_discover;
+mod connector_listing;
+mod connector_oauth;
 mod connector_probe;
 mod connector_secret_store;
 mod csv_export;
@@ -32,6 +34,8 @@ mod policy;
 mod policy_engine;
 mod routes;
 mod rustfs_client;
+mod secret_crypto;
+mod secret_manager;
 mod sql_guard;
 mod sql_rewrite;
 mod state;
@@ -61,9 +65,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env().context("failed to resolve configuration from environment")?;
+    // SRC-12 decision 5: `lakehouse-api rotate-secrets-key` re-seals the
+    // managed credentials and exits; it never starts the server.
+    if let Some(command) = std::env::args().nth(1) {
+        return match command.as_str() {
+            "rotate-secrets-key" => rotate_secrets_key(&config).await,
+            other => {
+                anyhow::bail!("unknown command {other:?}; the only command is rotate-secrets-key")
+            }
+        };
+    }
     warn_if_catalog_tenant_unconfigured(&config);
     let port = config.port;
     let state = AppState::new(config);
+
+    // SRC-12 decisions 4 and 9: refuse to serve without the credential key
+    // (compose already refuses to start the container; this covers a run
+    // outside compose), then seal any plain managed file an older build
+    // wrote and remove the leftovers of an interrupted change.
+    seal_connector_secrets_at_startup(&state).await?;
 
     // Bring the OLTP schema up to date before serving. `migrate` is idempotent
     // (`sqlx` records applied versions in `_sqlx_migrations`), so this is safe
@@ -141,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
     // hour). Without a Postgres pool it logs once and spawns nothing —
     // cleanup depends on the database being reachable.
     spawn_auth_cleanup(&state);
+    // SRC-11 D5/D6: the daily removal of run log lines and attempts older
+    // than 30 days.
+    spawn_run_log_cleanup(&state);
 
     let app = routes::router(state);
 
@@ -156,6 +179,92 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// `SRC-12` decisions 4, 9: the start-up pass over the managed credential
+/// files. Fails the start (fail closed) when the key is missing or
+/// malformed. A store directory that does not exist is only a warning: a
+/// development run outside Docker has no `/run/secrets`, and no managed file
+/// can exist there to protect. Logs file names, never contents.
+async fn seal_connector_secrets_at_startup(state: &AppState) -> anyhow::Result<()> {
+    let store = &state.connector_secret_store;
+    store.keyring().context(
+        "CONNECTOR_SECRETS_KEY must be set to 32 random bytes in base64 \
+         (generate one with: openssl rand -base64 32)",
+    )?;
+    match store.startup_pass().await {
+        Ok(report) => {
+            for name in &report.sealed {
+                tracing::info!(file = %name, "sealed a plain managed credential file");
+            }
+            for name in &report.leftovers_removed {
+                tracing::info!(file = %name, "removed a leftover credential temporary or backup file");
+            }
+            for name in &report.unreadable {
+                tracing::error!(
+                    file = %name,
+                    "a managed credential file cannot be opened with the configured key \
+                     and was left as it is"
+                );
+            }
+        }
+        Err(connector_secret_store::SecretStoreError::Io(std::io::ErrorKind::NotFound)) => {
+            tracing::warn!(
+                "the connector credential directory does not exist; no managed credential \
+                 file was checked"
+            );
+        }
+        Err(err) => return Err(anyhow::Error::msg(err.to_string())),
+    }
+    Ok(())
+}
+
+/// `lakehouse-api rotate-secrets-key` (`SRC-12` decision 5): with the NEW key
+/// in `CONNECTOR_SECRETS_KEY` and the OLD one in
+/// `CONNECTOR_SECRETS_KEY_PREVIOUS`, re-seal every managed credential file
+/// with the new key. Prints file names and counts, never a key or a value;
+/// exits non-zero when a file could not be moved, so the old key is not
+/// removed while a file still needs it.
+async fn rotate_secrets_key(config: &Config) -> anyhow::Result<()> {
+    let keyring = secret_crypto::Keyring::from_values(
+        config.connector_secrets_key.as_deref(),
+        config.connector_secrets_key_previous.as_deref(),
+    )
+    .map(std::sync::Arc::new);
+    let store =
+        connector_secret_store::ConnectorSecretStore::new(&config.connector_secrets_dir, keyring);
+    let report = store
+        .reseal_all()
+        .await
+        .map_err(|err| anyhow::Error::msg(err.to_string()))?;
+    for name in &report.resealed {
+        println!("resealed {name}");
+    }
+    for name in &report.sealed {
+        println!("sealed {name} (it was plain)");
+    }
+    for name in &report.leftovers_removed {
+        println!("removed leftover {name}");
+    }
+    for name in &report.unreadable {
+        println!("FAILED {name}: not opened by the current or the previous key");
+    }
+    println!(
+        "{} resealed, {} sealed from plain, {} already under the current key, {} failed",
+        report.resealed.len(),
+        report.sealed.len(),
+        report.unchanged,
+        report.unreadable.len()
+    );
+    if report.unreadable.is_empty() {
+        println!(
+            "done: remove CONNECTOR_SECRETS_KEY_PREVIOUS from the environment of the API and the \
+             orchestrator and restart them"
+        );
+        Ok(())
+    } else {
+        anyhow::bail!("some files were not re-sealed; keep CONNECTOR_SECRETS_KEY_PREVIOUS set")
+    }
 }
 
 /// Idempotently seed exactly one bootstrap admin account from
@@ -748,6 +857,42 @@ fn spawn_auth_cleanup(state: &AppState) {
         loop {
             interval.tick().await;
             run().await;
+        }
+    });
+}
+
+/// Spawn the daily job that removes connector run log lines and attempts older
+/// than [`lakehouse_store::connector_run::LOG_RETENTION_DAYS`] days (`SRC-11`
+/// decisions D5 and D6). It runs once at start (the first tick is immediate)
+/// and then every 24 hours, missed ticks skipped. Only the lines and the
+/// attempts go: the run rows and every per-table result stay. An error is
+/// logged at `warn` and never takes the process down; the next pass removes
+/// what this one missed. Without a Postgres pool, logs once and spawns
+/// nothing.
+fn spawn_run_log_cleanup(state: &AppState) {
+    let Some(pool) = state.pg.clone() else {
+        tracing::warn!("no Postgres pool configured; run-log cleanup background task will not run");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86_400));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cutoff = time::OffsetDateTime::now_utc()
+                - time::Duration::days(lakehouse_store::connector_run::LOG_RETENTION_DAYS);
+            match lakehouse_store::connector_run::purge_older_than(&pool, cutoff).await {
+                Ok(purged) => {
+                    tracing::info!(
+                        log_lines = purged.lines,
+                        attempts = purged.attempts,
+                        "connector run-log cleanup complete",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "connector run-log cleanup failed");
+                }
+            }
         }
     });
 }

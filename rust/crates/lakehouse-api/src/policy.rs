@@ -575,6 +575,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // gated, not the narrower `ingest:read` scope minted only for the
     // Dagster ingest service identity.
     ("GET",  "/api/connectors/types",       Policy::RequiresPermission("connector:manage")),
+    // SRC-12 part B: what the credential form may offer (the installation's
+    // secret manager, and whether typing a value is allowed). Names no
+    // address, sign-in or secret; read by whoever can set a credential.
+    ("GET",  "/api/connectors/credential-settings", Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
     // Was missing entirely while `routes::mod` registered `.delete(...)` on
@@ -594,18 +598,22 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Rewrites which credential reference the connector dials with next
     // (probe-first — see `routes::connectors::rotate_secret`'s doc
     // comment) — a MUTATING action over the same credential-adjacent
-    // surface `/test`/`/discover` already gate on `connector:manage`,
+    // surface `/test` and `/discovery/{kind}` already gate on `connector:manage`,
     // not a new, narrower permission.
     ("PUT",  "/api/connectors/{id}/secret", Policy::RequiresPermission("connector:manage")),
     // ADR 0002 Addendum 4: the user-supplied credential write path — same
     // permission as every other connector mutation (probe-first too, see
     // `routes::connectors::set_credential`'s doc comment).
     ("PUT",  "/api/connectors/{id}/credential", Policy::RequiresPermission("connector:manage")),
-    // Reads a connector's live schema (tables/columns), same sensitivity
-    // class as `/test` (opens a real, credentialed connection to the
-    // connector's own target) — not a new permission, matching every
-    // other read-shaped connector route above (WS3 item 14).
-    ("POST", "/api/connectors/{id}/discover", Policy::RequiresPermission("connector:manage")),
+    // `SRC-13` (D11): list and preview a source's tables, files, endpoints, topics
+    // and collections, the same audience as the connection test. It replaced
+    // `POST /api/connectors/{id}/discover` (WS3 item 14), which read a SQL
+    // source's live schema with the same sensitivity as `/test` (a real,
+    // credentialed connection to the connector's own target) and so gated on the
+    // same permission; the console moved to these routes and that route is gone.
+    // The tenant gate is the route layer.
+    ("POST", "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/discovery/{kind}", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad
@@ -630,7 +638,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // The connector's own ingest runs, read from Dagster: the same
     // audience as the per-table results (`/api/governance/ingest-runs`)
     // and the probe history above.
-    ("GET",  "/api/connectors/{id}/ingest/runs", Policy::RequiresPermission("connector:manage")),
     // `SRC-8`: the orchestrator reports a source table's columns before it
     // loads the table and obeys the answer. `ingest:read` is the one
     // permission its ingest identity holds (`main::bootstrap_ingest_run_service`,
@@ -642,6 +649,44 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // schema the connector loads from (policy `apply_all` only). Same gate and
     // the same handler-side service check as the route above.
     ("POST", "/api/connectors/{id}/schema-observations/tables", Policy::RequiresPermission("ingest:read")),
+    // `SRC-11`: the run history, a run's log (JSON or a text download) and
+    // Resume, for a person (decision D8); the tenant gate is the route layer.
+    // Resume lifts only the pause an auto-disable set.
+    ("GET",  "/api/connectors/{id}/runs", Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/runs/{runId}/log", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/resume", Policy::RequiresPermission("connector:manage")),
+    // `SRC-11`: the orchestrator reports a run's start, each attempt, a line of
+    // the closed log list, and the run's end. `ingest:read`, the one
+    // permission its service identity holds; a user can hold it too (Data
+    // Engineer), so each handler adds `schema_changes::require_orchestrator`
+    // (a service identity or an unrestricted administrator only), as the two
+    // `schema-observations` routes above do.
+    ("POST", "/api/connectors/{id}/run-reports", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/attempts", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/log", Policy::RequiresPermission("ingest:read")),
+    ("POST", "/api/connectors/{id}/run-reports/{runId}/end", Policy::RequiresPermission("ingest:read")),
+    // `SRC-13`: the orchestrator posts the answer to a discovery request it was
+    // launched for. `ingest:read` is the one permission its service identity
+    // holds; a user can hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports above do.
+    ("POST", "/api/connectors/{id}/discovery-results", Policy::RequiresPermission("ingest:read")),
+    // `SRC-12` part C: signing a REST connector in with `OAuth2`. A person
+    // reads the sign-in status, starts a sign-in and signs out; the tenant gate
+    // is the route layer.
+    ("GET",  "/api/connectors/{id}/oauth", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/oauth/start", Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/connectors/{id}/oauth/sign-out", Policy::RequiresPermission("connector:manage")),
+    // The provider's redirect carries the person's session cookie and nothing
+    // else, so it needs a signed-in user and no more here: it names no connector.
+    // The handler consumes the one-time `state`, then requires that user to be
+    // the one who started the sign-in, to belong to the connector's tenant and to
+    // hold `connector:manage` (tests/connector_oauth_flow.rs).
+    ("GET",  "/api/connectors/oauth/callback", Policy::RequiresAuth),
+    // The orchestrator reports a refresh token the provider rotated.
+    // `ingest:read` is the one permission its service identity holds; a user can
+    // hold it too (Data Engineer), so the handler adds
+    // `schema_changes::require_orchestrator`, as the run reports do.
+    ("POST", "/api/connectors/{id}/oauth/refresh-token", Policy::RequiresPermission("ingest:read")),
     // A person reads what changed at the source and approves what waits
     // (`SRC-8` decision D6). The tenant gate is the route layer.
     ("GET",  "/api/connectors/{id}/schema-changes", Policy::RequiresPermission("connector:manage")),

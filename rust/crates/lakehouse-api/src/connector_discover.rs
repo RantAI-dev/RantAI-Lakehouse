@@ -1,6 +1,11 @@
-//! `POST /api/connectors/{id}/discover` — list a connector's source
-//! objects (tables/columns) so a caller can pick what to ingest, without
-//! first hand-typing table names into an ingest spec.
+//! List a connector's source objects (tables/columns) so a caller can pick
+//! what to ingest, without first hand-typing table names into an ingest spec.
+//!
+//! `SRC-13`: the HTTP route `POST /api/connectors/{id}/discover` that served this
+//! was removed when the console moved to `discovery/{kind}`
+//! (`routes::connector_discovery`, `connector_listing`). What remains is used
+//! in-process by the assistant's `discover_source` tool through
+//! `routes::connectors::discover`; see that handler's doc comment.
 //!
 //! # The property this module exists to protect (WS3 item 14)
 //!
@@ -32,15 +37,17 @@
 //! query's row decoding (see [`MYSQL_DISCOVER_QUERY`]). Whether that fix is
 //! enough is decided by the next g6 run.
 //!
-//! # Scope: `sql`/`cdc` only in this task
+//! # Scope: `sql`/`cdc` only (`SRC-13` moved the rest)
 //!
-//! `files`/`rest`/`sheets` adapters answer with an honest
-//! `supported: false` here — same "unsupported, honestly" discipline
-//! `connector_probe::probe_sheets` already uses for the `sheets` adapter
-//! (AGENTS.md rule 14) — rather than a half-built `ListObjectsV2`/JSON
-//! walk added under this task's schema-binding-focused scope. Real
-//! discovery for those adapters is follow-up work, tracked outside this
-//! task; nothing here claims otherwise.
+//! This call lists SQL sources' tables WITH their columns, one schema per
+//! call. Every other type answers `supported: false` with one fixed sentence
+//! ([`DISCOVER_MOVED_REASON`]) that points at the discovery routes
+//! (`connector_listing`, `routes::connector_discovery`), which list schemas and
+//! names first, columns on demand, and cover every connector type (`SRC-13`
+//! decisions D1 to D10). The old text for those types ("not implemented in this
+//! build", `unknown adapter "kafka"`) is gone: it was wrong for the types the
+//! orchestrator can list. This call stays until the console moves to the new
+//! routes.
 
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::DynSecretResolver;
@@ -84,7 +91,7 @@ pub struct DiscoveredObject {
     pub primary_key: Vec<String>,
 }
 
-/// The response body for `POST /api/connectors/{id}/discover`. `reason`
+/// The response body of [`discover`]. `reason`
 /// is populated whenever `supported` is `false` — never left implicit.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,8 +278,15 @@ fn attach_primary_keys(
 }
 
 /// `$1`: `sqlx`'s Postgres positional-parameter placeholder syntax.
-pub(crate) const POSTGRES_DISCOVER_QUERY: &str = "SELECT table_name, column_name, data_type FROM \
-    information_schema.columns WHERE table_schema = $1 ORDER BY table_name, ordinal_position";
+///
+/// `SRC-13` decision D8: base tables only (`t.table_type = 'BASE TABLE'`), as the
+/// loader lists them; a view was listed here before and may not load.
+pub(crate) const POSTGRES_DISCOVER_QUERY: &str = "SELECT c.table_name, c.column_name, c.data_type \
+    FROM information_schema.columns c \
+    JOIN information_schema.tables t \
+      ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+    WHERE c.table_schema = $1 AND t.table_type = 'BASE TABLE' \
+    ORDER BY c.table_name, c.ordinal_position";
 
 /// List every table and column in `schema` on a live Postgres connection.
 /// `schema` is bound as `$1` — see the module doc comment's "The property
@@ -328,12 +342,17 @@ pub(crate) const POSTGRES_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.
 // selected column to `CHAR` with an explicit charset makes the decode
 // independent of the server's column type. Still `const`, with exactly one
 // bind placeholder. Not proven by a live test here; the g6 gate decides.
+//
+// `SRC-13` decision D8: base tables only, by the join on `information_schema.tables`.
 pub(crate) const MYSQL_DISCOVER_QUERY: &str = "SELECT \
-    CAST(table_name AS CHAR CHARACTER SET utf8mb4), \
-    CAST(column_name AS CHAR CHARACTER SET utf8mb4), \
-    CAST(data_type AS CHAR CHARACTER SET utf8mb4) \
-    FROM information_schema.columns WHERE table_schema = ? \
-    ORDER BY table_name, ordinal_position";
+    CAST(c.table_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(c.column_name AS CHAR CHARACTER SET utf8mb4), \
+    CAST(c.data_type AS CHAR CHARACTER SET utf8mb4) \
+    FROM information_schema.columns c \
+    JOIN information_schema.tables t \
+      ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+    WHERE c.table_schema = ? AND t.table_type = 'BASE TABLE' \
+    ORDER BY c.table_name, c.ordinal_position";
 
 /// List every table and column in `schema` on a live `MySQL` connection.
 /// `schema` is bound as `?` — see the module doc comment.
@@ -380,8 +399,14 @@ pub(crate) const MYSQL_PRIMARY_KEY_QUERY: &str = "SELECT CAST(kcu.table_name AS 
 // SQL Server's own `INFORMATION_SCHEMA.COLUMNS` (T-SQL is
 // case-insensitive for identifiers by default) — `tiberius` (not `sqlx`)
 // uses `@P1`-numbered parameters, not `?`/`$1`.
-pub(crate) const MSSQL_DISCOVER_QUERY: &str = "SELECT table_name, column_name, data_type FROM \
-    information_schema.columns WHERE table_schema = @P1 ORDER BY table_name, ordinal_position";
+//
+// `SRC-13` decision D8: base tables only, by the join on `INFORMATION_SCHEMA.TABLES`.
+pub(crate) const MSSQL_DISCOVER_QUERY: &str = "SELECT c.table_name, c.column_name, c.data_type \
+    FROM information_schema.columns c \
+    JOIN information_schema.tables t \
+      ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+    WHERE c.table_schema = @P1 AND t.table_type = 'BASE TABLE' \
+    ORDER BY c.table_name, c.ordinal_position";
 
 /// List every table and column in `schema` on a live SQL Server
 /// connection. `schema` is bound as `@P1` — see the module doc comment.
@@ -441,10 +466,18 @@ pub(crate) const MSSQL_PRIMARY_KEY_QUERY: &str = "SELECT kcu.table_name, kcu.col
     WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = @P1 \
     ORDER BY kcu.table_name, kcu.ordinal_position";
 
-/// The fixed reason for Oracle, which the console cannot discover (`SRC-9`
-/// finding G2, `SRC-13`).
-pub(crate) const ORACLE_DISCOVER_REASON: &str = "Oracle tables are listed by the orchestrator, not \
-    the console; console discovery for Oracle is tracked as SRC-13";
+/// The fixed reason for Oracle on THIS call (`SRC-9` finding G2). `SRC-13`
+/// decision D10: the old text claimed the orchestrator lists Oracle tables
+/// while nothing did; the orchestrator's `discover_job` does now, through the
+/// discovery routes, and this call says so instead of claiming it can.
+pub(crate) const ORACLE_DISCOVER_REASON: &str = "Oracle tables are not listed by this call; list \
+    them with POST /api/connectors/{id}/discovery/list";
+
+/// The fixed reason for every connector type this call does not list (`SRC-13`
+/// decision D10). It replaces "not implemented in this build" and the wrong
+/// `unknown adapter` text; no type name from the request is repeated.
+pub(crate) const DISCOVER_MOVED_REASON: &str = "This call lists SQL sources only; list this \
+    connector's tables with POST /api/connectors/{id}/discovery/list";
 
 /// Open a bounded, SSRF-checked discovery connection for `target` and list
 /// `schema`, dispatching on `target.driver` — the SAME
@@ -610,19 +643,13 @@ pub async fn discover(
             .await?;
             Ok(DiscoverResult::ok(objects))
         }
-        Some("files") => Ok(DiscoverResult::unsupported(
-            "object listing for a files connector is not implemented in this build",
-        )),
-        Some("rest") => Ok(DiscoverResult::unsupported(
-            "endpoint discovery for a rest connector is not implemented in this build",
-        )),
         Some("sheets") => Ok(DiscoverResult::unsupported("no service account configured")),
         None => Ok(DiscoverResult::unsupported(
             "connector has no ingest-spec adapter configured yet",
         )),
-        Some(other) => Ok(DiscoverResult::unsupported(format!(
-            "unknown adapter {other:?}"
-        ))),
+        // `files`, `rest`, `mongodb`, `kafka`, `sftp` and anything else: listed by
+        // the discovery routes (`SRC-13`), said with one fixed sentence.
+        Some(_) => Ok(DiscoverResult::unsupported(DISCOVER_MOVED_REASON)),
     }
 }
 
@@ -630,7 +657,7 @@ pub async fn discover(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test-only module")]
 mod tests {
     use super::{
-        MSSQL_DISCOVER_QUERY, MSSQL_PRIMARY_KEY_QUERY, MYSQL_DISCOVER_QUERY,
+        DISCOVER_MOVED_REASON, MSSQL_DISCOVER_QUERY, MSSQL_PRIMARY_KEY_QUERY, MYSQL_DISCOVER_QUERY,
         MYSQL_PRIMARY_KEY_QUERY, ORACLE_DISCOVER_REASON, POSTGRES_DISCOVER_QUERY,
         POSTGRES_PRIMARY_KEY_QUERY,
     };
@@ -680,6 +707,53 @@ mod tests {
         assert!(!result.supported);
         assert!(result.objects.is_empty());
         assert_eq!(result.reason.as_deref(), Some(ORACLE_DISCOVER_REASON));
+    }
+
+    /// `SRC-13` decision D10: every type this call does not list gets one fixed
+    /// sentence, never `unknown adapter "kafka"` and never the type's name; no
+    /// dial and no credential is touched.
+    #[tokio::test]
+    async fn types_this_call_does_not_list_get_one_fixed_sentence_without_the_type_name() {
+        for adapter in ["files", "rest", "mongodb", "kafka", "sftp", "made-up"] {
+            let info = ConnectorDialInfo {
+                kind: "x".to_owned(),
+                host: "x".to_owned(),
+                secret_ref: "env:UNUSED".to_owned(),
+                secret_ref_secondary: None,
+                adapter: Some(adapter.to_owned()),
+                dial: serde_json::json!({}),
+            };
+            let result = super::discover(
+                &info,
+                Some("APP"),
+                &PanicIfCalledResolver,
+                &InternalHosts::NONE,
+            )
+            .await
+            .expect("an unsupported answer, not an error");
+            assert!(!result.supported, "{adapter}");
+            assert_eq!(result.reason.as_deref(), Some(DISCOVER_MOVED_REASON));
+            assert!(!DISCOVER_MOVED_REASON.contains(adapter));
+        }
+    }
+
+    /// `SRC-13` decision D8: a view is not a table the loader lists, so this call
+    /// no longer lists one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn discover_sql_postgres_does_not_list_views(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE real_table (id INT)")
+            .execute(&pool)
+            .await
+            .expect("create fixture table");
+        sqlx::query("CREATE VIEW a_view AS SELECT id FROM real_table")
+            .execute(&pool)
+            .await
+            .expect("create fixture view");
+        let objects = super::discover_sql_postgres(&pool, "public")
+            .await
+            .expect("discovery query succeeds");
+        assert!(objects.iter().any(|o| o.name == "public.real_table"));
+        assert!(!objects.iter().any(|o| o.name == "public.a_view"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

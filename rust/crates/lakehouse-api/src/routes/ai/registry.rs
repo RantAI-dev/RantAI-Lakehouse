@@ -758,7 +758,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode and primaryKey exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
@@ -772,6 +772,8 @@ fn set_ingest_spec_schema() -> Value {
                     "description": "how each run writes the table; omitted means replace" },
                 "primaryKey": { "type": "array", "items": { "type": "string" },
                     "description": "columns that identify one row; needed by replace_dedup, incremental_dedup and history" },
+                "excludedColumns": { "type": "array", "items": { "type": "string" },
+                    "description": "columns of this table left out of the load, by name; only for PostgreSQL, MySQL, MariaDB and SQL Server sources; never a primaryKey or incrementalKey column; keep the list exactly as get_ingest_spec returned it when you send the object again" },
                 "target": { "type": "string", "description": "Bronze table name it lands in" } },
                 "required": ["name", "target"] } },
             "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
@@ -1510,6 +1512,23 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(description.contains("never carries a credential"));
+    }
+
+    /// `SRC-11 review 2 SHOULD-FIX 2`: a model that re-sends a connector's
+    /// tables must be told to keep `excludedColumns`, or the user's column
+    /// choices are dropped silently (the tool forwards `sourceObjects`
+    /// verbatim, and a save without the key loads every column again).
+    #[test]
+    fn set_ingest_spec_lists_excluded_columns_and_says_to_keep_them() {
+        let schema = (find("set_ingest_spec").expect("registered tool").schema)();
+        let object =
+            &schema["function"]["parameters"]["properties"]["sourceObjects"]["items"]["properties"];
+        assert_eq!(object["excludedColumns"]["type"], "array");
+        assert_eq!(object["excludedColumns"]["items"]["type"], "string");
+        let description = schema["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("excludedColumns exactly as get_ingest_spec returned"));
     }
 
     #[test]

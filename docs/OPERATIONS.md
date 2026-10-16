@@ -694,6 +694,31 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
+
+A credential typed in the console is stored on the `connector_secrets`
+volume encrypted with AES-256-GCM. The key is `CONNECTOR_SECRETS_KEY`: 32
+random bytes, base64. The API and the orchestrator both need it, and
+compose refuses to start either without it.
+
+- **Make one, once:** `openssl rand -base64 32`. Keep it with the
+  installation's other secrets. **Losing it loses every typed credential**:
+  they cannot be decrypted and have to be entered again.
+- **First start with a key on an older install:** the API encrypts every
+  plain credential file at start-up and removes the plain copies. Until the
+  API has done so, the orchestrator refuses a plain file instead of reading
+  it.
+- **Changing the key:**
+  1. Set the new key as `CONNECTOR_SECRETS_KEY` and the current one as
+     `CONNECTOR_SECRETS_KEY_PREVIOUS`.
+  2. Run `docker compose run --rm lakehouse-api rotate-secrets-key` while
+     nobody is saving a credential. It re-encrypts every stored credential
+     with the new key and lists any file it could not.
+  3. Remove `CONNECTOR_SECRETS_KEY_PREVIOUS` and restart the API and the
+     orchestrator. The old key no longer opens anything.
+- Credentials given as an environment variable or an operator's file are
+  not encrypted by the product; they are the operator's to protect.
+
 ### Alert webhooks and internal addresses (`SEC-10`)
 
 An alert or digest sends its message to a webhook URL a user typed, so the
@@ -781,6 +806,40 @@ What the operator needs to know:
   sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
   viewer's browser; it does not replace the token. No other console page sends
   a framing header.
+
+### Connector credentials from a secret manager (`SRC-12`, ADR 0002 addendum 6)
+
+Instead of typing a password, a connector can reference a secret in the
+installation's secret manager. One manager per installation:
+
+- `SECRET_MANAGER` = `vault`, `aws`, `gcp` or `azure`, plus that manager's
+  sign-in for the API and the orchestrator (`.env.example` lists each:
+  Vault address and token or AppRole; AWS region and role or keys; a
+  Google service-account file, mounted into both services, or the
+  platform identity; Azure tenant and client, or a managed identity).
+- **`SECRET_MANAGER_ALLOWED_PREFIXES` is required for references to work.**
+  It lists the paths connectors may reference, for example
+  `vault:secret/lakehouse/{tenant}/`; `{tenant}` is the connector's tenant.
+  With a manager set and no prefixes, every reference is refused. Give the
+  product's manager identity a policy no wider than these prefixes.
+- A reference is read at every test and every run, never cached: changing
+  the secret in the manager takes effect at the next run, and a manager
+  that cannot be reached fails that run with a fixed message.
+- `CONNECTOR_TYPED_CREDENTIALS=false` hides the "type a credential" option
+  when every credential should come from the manager.
+
+### OAuth sign-in for REST connectors (`SRC-12`, ADR 0002 addendum 7)
+
+- Set `CONNECTOR_OAUTH_REDIRECT_URI` to the console's address of the
+  product's callback (the connector form shows the path to append). Register
+  exactly that address in the provider's app settings.
+- The provider's token and revocation addresses must be `https`.
+  `CONNECTOR_OAUTH_ALLOW_HTTP` is for tests only; never set it in a real
+  installation.
+- When a provider refuses a refresh (the user's access was withdrawn, the
+  app's secret changed), the connector's runs fail with "sign in again"
+  until someone with `connector:manage` signs in again from the connector
+  page.
 
 ### What's deliberately NOT in the stack
 
