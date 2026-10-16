@@ -132,15 +132,10 @@ point-in-time recovery; off-site replication; Kafka.
 
 ## 7. Handoff
 
-(developer)
-
-## 8. Review
-
-(planner)
-
 ### Handoff (2026-10-16, round 1)
 
 #### 1. Commits
+- `dc992317` docs(plan): append handoff section for OPS-7
 - `94a32ad0` docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
 - `9d8db395` docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
 - `53c67209` feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
@@ -208,6 +203,7 @@ $ git status --short
 (clean after commit)
 
 $ git log --oneline origin/main..HEAD | head
+dc992317 docs(plan): append handoff section for OPS-7
 94a32ad0 docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
 9d8db395 docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
 53c67209 feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
@@ -217,5 +213,9 @@ ef7bb33c feat(backups): ClickHouse databases into the OPS-7 backup (T2)
 e08d5966 docs(plan): OPS-7 spec and plan, complete backups and a timed restore
 
 $ git ls-remote --heads origin feat/ops-7-restore-drill
-<head-hash>	refs/heads/feat/ops-7-restore-drill
+dc992317d37f	refs/heads/feat/ops-7-restore-drill
 ```
+
+## 8. Review
+
+(planner)
