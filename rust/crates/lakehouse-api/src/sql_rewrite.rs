@@ -226,7 +226,7 @@ fn collect_table_factor_name(
 /// on the other. Splitting can only ever make a name MORE likely to match
 /// a governed key, never less: a governed table whose real columns then
 /// cannot be resolved is refused (`UnprovableSubstitution`), not passed.
-fn canonicalize(parts: &[String]) -> String {
+pub(crate) fn canonicalize(parts: &[String]) -> String {
     let parts: Vec<&str> = parts.iter().flat_map(|p| p.split('.')).collect();
     match parts.len() {
         0 => String::new(),
