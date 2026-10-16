@@ -290,6 +290,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         ".map_err(|err| json!({ \"error\": err.to_string() }))?;",
         "read_catalog_token's ApiError text, written in this repository",
     ),
+    // The tool's own decode of the model's arguments: serde reporting a
+    // shape it cannot parse out of `filters`, which the caller supplied.
+    // Same class as the `invalid JSON: {err}` entries above -- our own
+    // schema describing the caller's input, never an upstream payload.
+    (
+        "ai/tools/boards.rs",
+        "format!(\"filters: {err}\")",
+        "serde error over the caller's own tool arguments",
+    ),
 ];
 
 /// Calls that are the choke point: a line using one is not a leak.
