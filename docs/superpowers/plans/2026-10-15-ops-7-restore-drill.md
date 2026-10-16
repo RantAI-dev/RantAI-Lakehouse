@@ -224,6 +224,88 @@ $ git ls-remote --heads origin feat/ops-7-restore-drill
 dc992317d37f	refs/heads/feat/ops-7-restore-drill
 ```
 
+### Handoff (round 2)
+
+#### 1. Commits
+- `d1a0f351` docs(plans): remove hardcoded password and update drill timings
+- `095ac173` feat(backups): name-only env flags in restore script and RESTORE masking check
+- `741302bc` docs(plans): clarify change-capture offset survival and document unmeasured resumption
+- `1f2b9914` test(drill): verify catalog tables and OpenFGA check API
+- `5d912593` docs(plan): OPS-7 review round 1: 4 BLOCKERs
+- `46cacd43` docs(plan): place handoff under handoff section for OPS-7
+- `dc992317` docs(plan): append handoff section for OPS-7
+- `94a32ad0` docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
+- `9d8db395` docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
+- `53c67209` feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
+- `6ac28e4b` feat(backups): compose service and override for warehouse and ClickHouse (OPS-7 T3)
+- `ef7bb33c` feat(backups): ClickHouse databases into the OPS-7 backup (T2)
+- `68537ab7` feat(backups): warehouse bucket mirror for OPS-7 T1
+- `e08d5966` docs(plan): OPS-7 spec and plan, complete backups and a timed restore
+
+#### 2. Verification Commands and Counts
+- **Python Unit Tests:**
+  `cd dagster && /home/shiro/.cache/rantai-dagster-venv-311/bin/python -m pytest dispar_orchestrate -q -m "not loader"` (under `/home/shiro/rantai/.locks/heavy.lock`)
+  Counts: `823 passed, 258 deselected, 223 warnings in 9.86s`
+- **Shellcheck (`scripts/restore-from-backup.sh`):**
+  `docker run --rm -v "$PWD":/work:ro koalaman/shellcheck:latest /work/scripts/restore-from-backup.sh`
+  Counts: `0 warnings` (100% clean)
+- **Compose Config Validation:**
+  `docker compose --profile '*' config --quiet` (exit code: 0)
+- **Full Timed Restore Drill (OPS-7 T5 round 2, project `ops7drill`):**
+  Detached execution under `/home/shiro/rantai/.locks/heavy.lock` (`ops7-drill2.sh`):
+  - G3a pipeline: 2,000 rows ingested into `bronze.g3a_orders` (format-version=2)
+  - Pre-backup sizes: Postgres 4 DBs (37.8 MB: `lakehouse` 10 MB, `lakekeeper` 11 MB, `dagster` 9,399 kB, `openfga` 7,911 kB), Warehouse (9 objects, 54,494 bytes), ClickHouse `lake` (5.89 KiB), `system` (725.87 KiB)
+  - Backup runtime: 4s (Postgres: 4 DBs 373,154 bytes in 0.79s; Warehouse: 9 objects 54,494 bytes in 0.07s; ClickHouse: 2 DBs 18,644 bytes in 0.35s)
+  - Stack teardown: `docker compose -p ops7drill down -v` emptied stack (23s)
+  - Restore runtime: `scripts/restore-from-backup.sh --force 20261016T082316Z` completed in 79s (Postgres 38s, Warehouse 9s, ClickHouse 7s, Stack bring-up 25s)
+  - Restored app readiness: 10s; Total restore time: 89s
+  - AC2 Verifications:
+    - User sign-in (`ops7_drill_user@example.com` / `<password generated at run time>`): `LOGIN_SUCCESS: 200`
+    - Catalog access (`SHOW TABLES FROM icecat_g3a LIKE '%bronze%'`): `bronze.g3a_orders` (matches pre-backup: `bronze.g3a_orders`)
+    - ClickHouse Iceberg count (`SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1`): `2000` (pre=2000)
+    - ClickHouse CDC offset survival (`SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\` WHERE connector_id = 'postgres-cdc-demo'`): `125` (pre=125)
+    - OpenFGA tuple integrity & Check API:
+      - Tuple count: 35 pre-backup, 35 post-restore (intact)
+      - Check API (`POST /stores/{id}/check`): `{"allowed":true,"resolution":""}`
+    - Dagster run history (`SELECT count(*) FROM runs WHERE status = 'SUCCESS'`): `1` run preserved
+- **Gitleaks Scan:**
+  `docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact` (ignoring untracked `.env`)
+  Counts: `scanned ~26.6 MB, no leaks found`
+- **Password Audit:**
+  `git grep -n 'DrillPass'`
+  Counts: `0 hits` (exit code 1)
+
+#### 3. Review Blockers Addressed
+- **BLOCKER 1:** Catalog access route replaced with direct table listing in `bronze` namespace via ClickHouse `icecat_g3a` (`SHOW TABLES FROM icecat_g3a LIKE '%bronze%'`) matching before/after restore (`bronze.g3a_orders`). OpenFGA table check replaced with OpenFGA Check API evaluating seeded tuple (`user:oidc~ops7_drill_user@example.com`, relation `describe`, object `warehouse:<id>`) returning `{"allowed":true,"resolution":""}` alongside pre/post tuple counts (35).
+- **BLOCKER 2:** Change-capture offset row re-worded to "Change-capture offset survival" confirming the pre-seeded offset (125) survived restore. Resumption of ingestion from offset without snapshot re-read moved to "Not measured" with rationale (G4 ingestion pipeline was not executed).
+- **BLOCKER 3:** Docker CLI secret parameters in `scripts/restore-from-backup.sh` updated to name-only `-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY` with variables exported in the script environment, preventing secrets from appearing in process argv. Added ClickHouse `RESTORE … FROM S3(...)` statement to E3 masking check and verified credentials appear as `[HIDDEN]` in `system.query_log` and are absent from server logs.
+- **BLOCKER 4:** Removed committed password literal across all plan docs and results. The drill script now dynamically generates a random password and Argon2id hash at run time. `git grep -n 'DrillPass'` produces 0 hits.
+
+#### 4. Skipped / Premises
+- In local drill, `--force` is used for restore because local RustFS hosts both warehouse and backup buckets on the same storage instance; in production with off-host cloud S3, target volume is empty prior to restore.
+- CDC live stream resumption from offset was not measured, as the full Debezium/Kafka stack was out of scope for the restore drill.
+
+#### 5. Git Status, Log, and Remote Verification
+```
+$ git status --short
+(clean after commit)
+
+$ git log --oneline origin/main..HEAD | head
+d1a0f351 docs(plans): remove hardcoded password and update drill timings
+095ac173 feat(backups): name-only env flags in restore script and RESTORE masking check
+741302bc docs(plans): clarify change-capture offset survival and document unmeasured resumption
+1f2b9914 test(drill): verify catalog tables and OpenFGA check API
+5d912593 docs(plan): OPS-7 review round 1: 4 BLOCKERs
+46cacd43 docs(plan): place handoff under handoff section for OPS-7
+dc992317 docs(plan): append handoff section for OPS-7
+94a32ad0 docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
+9d8db395 docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
+53c67209 feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
+
+$ git ls-remote --heads origin feat/ops-7-restore-drill
+d1a0f351...	refs/heads/feat/ops-7-restore-drill
+```
+
 ## 8. Review
 
 (planner)
