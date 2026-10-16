@@ -366,3 +366,19 @@ generated at run time"; generate it at run time in the drill script.
 
 Notes, no change needed: `--force` was needed locally because RustFS holds
 both the warehouse and the backup bucket; the result says so.
+
+Round 2, reviewed 2026-10-16 at `67479722` (developer: Gemini). BLOCKER 1–4
+fixed; every new claim checked against `review-logs/ops7-drill2.out`:
+catalog tables in `bronze` before and after (`bronze.g3a_orders`); OpenFGA
+35 tuples before and after and `Check` answering `{"allowed":true}`; total
+restore 89 s (script 79 s, app ready 10 s); change-capture resume moved to
+"Not measured" with the reason, the offset row reworded to what it shows;
+the restore script passes secrets by name only (no `-e NAME=value` left);
+`RESTORE … FROM S3(...)` shows `[HIDDEN]` in `system.query_log`
+(`ops7-t2-check.log`); no committed password. No open `BLOCKER`.
+
+Planner's runs after merging `origin/main`: Dagster on Python 3.11
+(`-m "not loader"`) 1242 passed; shellcheck clean; imports and init
+readiness lints OK; `docker compose --profile '*' config --quiet` and the
+`backups` override (with every `BACKUP_*` variable set) both valid;
+gitleaks `dir` no leaks.
