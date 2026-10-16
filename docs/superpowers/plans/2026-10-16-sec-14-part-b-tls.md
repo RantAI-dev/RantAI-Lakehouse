@@ -547,3 +547,57 @@ machine's load average was 15–30 from other stacks; rerun alone with
 20, 5 and 13 passed, 0 failed. Not a regression.
 
 No open BLOCKER. Ready for the pull request.
+
+Round 3, 2026-10-17, from CI on PR #192 at `a5c46e83` (main is green on
+the same gates, so these are this PR's). Three gates fail: G4 Debezium
+CDC, G6 ingest matrix (SQL sources), SRC-13 discovery of 10,000 tables.
+
+**BLOCKER 10. Every TLS dial that does not name a provider panics the
+API.** The API log in G4, G6 and SRC-13 shows `thread 'tokio-rt-worker'
+panicked at rustls-0.23.46/src/crypto/mod.rs:249: Could not automatically
+determine the process-level CryptoProvider from Rustls crate features`.
+`cargo tree -e features -i rustls` shows both `ring` and `aws-lc-rs`
+enabled in `lakehouse-api` (`aws-lc-rs` arrives through `object_store`,
+`hyper-rustls` and `tokio-rustls`'s default features), and nothing calls
+`CryptoProvider::install_default`. Before this PR `Prefer` fell back to
+plaintext against a server without `ssl`, so sqlx's rustls path never
+ran; with `ssl=on` and `Require`/`VerifyCa` it runs on the first
+discovery and the handler panics (the client sees the connection closed).
+`pg_probe` survives only because it builds with an explicit provider.
+Fix:
+- install one provider (`ring`, matching `pg_probe` and the workspace
+  pin) as the process default at the very start of `main`, before any
+  task that can dial; refuse to start (log and exit non-zero, no
+  `unwrap`) if installation fails for a reason other than "already
+  installed";
+- correct the `rust/Cargo.toml` comment (~104–105) that says everything
+  uses `ring` only: say both features are present and why the default is
+  installed;
+- add a test that dials through the production sqlx connect-options
+  helper (`Require` and `VerifyCa`) against `tls_proxy` and passes, with
+  the test binary calling the same install function `main` calls; give
+  the mutation evidence (remove the install, the test panics with the
+  message above);
+- check every other rustls user in the API that relies on the process
+  default (sqlx, tiberius, `reqwest`, `lettre`) is covered by the same
+  install.
+
+**BLOCKER 11. G6's SQL Server connect fails with `TLS error`.**
+`ops/g6/docker-compose.g6.override.yml` gives `mssql-g6` its own
+self-signed certificate (`mssql-g6-cert-init`, volume `mssql_g6_tls`);
+the API now trusts `CONNECTOR_TLS_CA_FILE`, the bundled Postgres CA, so
+tiberius rejects `mssql-g6`. The refusal is right (fail closed); the gate
+is what has to change, and it should use the route OPERATIONS documents:
+a combined bundle. In the G6 override only (gate-only, commented like the
+other GATE-ONLY entries): an init step writes the Postgres `ca.crt` plus
+`mssql-g6.pem` into a gate volume, and `lakehouse-api` points
+`CONNECTOR_TLS_CA_FILE` at it. Do not set `trust_cert`, do not loosen
+`EncryptionLevel`. Confirm `mssql-g6`'s certificate names the host the
+gate dials, first ruling out BLOCKER 10 as the cause (tiberius also uses
+rustls).
+
+Proof required in the handoff (AGENTS.md rule 8): run G4, G6
+(`g6-sql` half) and SRC-13 locally from a clean project, the same
+commands as `.github/workflows/ci.yml`, and quote each gate's result
+line. One gate at a time, under the heavy lock, `docker compose down -v`
+on your own project between them.
