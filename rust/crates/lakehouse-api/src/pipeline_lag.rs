@@ -72,6 +72,25 @@ const ASSUMED_FIRST_RUN_SECONDS: i64 = 60;
 /// a window but a new one is not held back by a single sample.
 const BUDGET_RUNS: usize = 5;
 
+/// How many check intervals the run budget adds ON TOP of the measured
+/// request-to-land time.
+///
+/// Two, and both are waits the measurement cannot see (review round 1,
+/// decision R6a). The batching rule requests a run once
+/// `lag >= target - budget`, and a change that landed at the top of a check
+/// interval is first measurable up to one interval later — on the tick that
+/// notices it, whose decision is to request the run, not to run it. A budget
+/// that leaves out either interval is short by that much for EVERY batched
+/// run, whatever the target is: the round-1 gate measured exactly that, with
+/// the lag growing as the target grew (60 s target, worst sample 68.94 s;
+/// 120 s target, worst sample 123.77 s), because the time between the
+/// sensor's `RunRequest` and the run's own `startTime` — the daemon queue
+/// and the run-worker launch — was outside the budget as well. That part is
+/// measured, not assumed: the run part below is the median of
+/// `creationTime -> endTime`, and `creationTime` is when the run REQUEST
+/// existed.
+const BUDGET_CHECK_INTERVALS: i64 = 2;
+
 /// One table a pipeline reads: its source, or the target of a pipeline it
 /// depends on (plan D4). Built from the stored `"<zone>.<table>"`
 /// location, the same shape `pipeline_definition.source`/`.target` store.
@@ -445,34 +464,41 @@ fn tokens_from_json(value: Option<&Value>) -> Option<TokenMap> {
     Some(out)
 }
 
-/// The run budget: the median duration of the pipeline's last
-/// [`BUDGET_RUNS`] successful runs, plus the check interval, or
-/// [`ASSUMED_FIRST_RUN_SECONDS`] + the interval when there is nothing to
-/// measure (plan D5 step 4).
+/// The run budget: the median of the pipeline's last [`BUDGET_RUNS`]
+/// successful runs measured from the run REQUEST to its landing, plus
+/// [`BUDGET_CHECK_INTERVALS`] check intervals — or
+/// [`ASSUMED_FIRST_RUN_SECONDS`] plus the same intervals when there is
+/// nothing to measure (plan D5 step 4).
 ///
-/// The check interval is added because a change noticed by the NEXT tick
-/// still costs one interval: without it, a pipeline whose runs take as long
-/// as its target would be asked to run again before the first one could
-/// have landed.
+/// The measurement starts at `creationTime`, not `startTime`: what a target
+/// lag is spent on is the whole time from the change to the rows, and the
+/// daemon's queue and the run-worker launch sit between the request and the
+/// run's first step. Measuring from the start left that gap out of the
+/// budget, so every batched run landed late by roughly the gap — which is
+/// what the round-1 gate measured, with the lag growing as the target grew
+/// (review R1 decision R6a). A run Dagster reports without a `creationTime`
+/// is measured from its `startTime`, which omits the gap again rather than
+/// dropping the run out of the window.
 ///
 /// # Errors
 ///
 /// Returns [`DgError`] if the run list cannot be read. The caller turns
 /// this into a skipped tick rather than a decision on a guessed duration.
 // BLD-2 review R1 SHOULD-FIX 5: fetch up to 25 runs to get 5 successful runs, doc link BUDGET_RUNS
+// BLD-2 review R1 decision R6a: creationTime -> endTime, plus two check intervals
 async fn run_budget_seconds(dagster: &DgClient, job_name: &str) -> Result<i64, DgError> {
     let runs = dagster.list_runs_for_job(job_name, 25).await?;
     let mut durations: Vec<i64> = runs
         .iter()
         .filter(|r| r.status == "SUCCESS")
         .filter_map(|r| {
-            let start = r.start_time?;
+            let created = r.creation_time.or(r.start_time)?;
             let end = r.end_time?;
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "a run's wall-clock duration in whole seconds is far inside i64"
             )]
-            let seconds = (end - start) as i64;
+            let seconds = (end - created) as i64;
             (seconds > 0).then_some(seconds)
         })
         .take(BUDGET_RUNS)
@@ -492,7 +518,7 @@ async fn run_budget_seconds(dagster: &DgClient, job_name: &str) -> Result<i64, D
             durations[middle]
         }
     };
-    Ok(median + CHECK_INTERVAL_SECONDS)
+    Ok(median + BUDGET_CHECK_INTERVALS * CHECK_INTERVAL_SECONDS)
 }
 
 /// BLD-2 review R1 decision R1: how long a request may sit in Dagster
@@ -1632,26 +1658,29 @@ mod tests {
     /// A `Dagster` stub whose answers both queries the check can make: the
     /// run-key lookup and the run list the budget is the median of.
     /// `run_status` is the status the run-key lookup reports (`None` =
-    /// "no run carries that key"), `durations` are the successful runs'
-    /// start/end pairs.
+    /// "no run carries that key"), `runs` are the successful runs' own
+    /// `(creationTime, startTime, endTime)` triples.
     ///
     /// The [`MockServer`] is returned alongside the client and MUST be kept
     /// alive by the caller: dropping it closes the listener, and a later
     /// test's server can then be reached through the pooled connection of
     /// an earlier one — which shows up as a check answering with another
     /// test's fixture rather than as an error.
-    async fn dagster_with(
+    // BLD-2 review R1 decision R6a: creation and start are separate inputs,
+    // because the budget is measured from the run REQUEST, not from the run.
+    async fn dagster_with_runs(
         job: &str,
         run_status: Option<&str>,
-        durations: &[(f64, f64)],
+        runs: &[(f64, f64, f64)],
     ) -> (DgClient, MockServer) {
-        let results: Vec<_> = durations
+        let results: Vec<_> = runs
             .iter()
-            .map(|(start, end)| {
+            .map(|(created, start, end)| {
                 json!({
-                    "runId": format!("r-{start}"),
+                    "runId": format!("r-{created}"),
                     "jobName": job,
                     "status": "SUCCESS",
+                    "creationTime": created,
                     "startTime": start,
                     "endTime": end,
                 })
@@ -1680,6 +1709,18 @@ mod tests {
             .mount(&server)
             .await;
         (DgClient::new(format!("{}/graphql", server.uri())), server)
+    }
+
+    /// [`dagster_with_runs`] for runs that were created and started at the
+    /// same instant, which is what every test that is not about the budget
+    /// means by a duration.
+    async fn dagster_with(
+        job: &str,
+        run_status: Option<&str>,
+        durations: &[(f64, f64)],
+    ) -> (DgClient, MockServer) {
+        let runs: Vec<(f64, f64, f64)> = durations.iter().map(|(s, e)| (*s, *s, *e)).collect();
+        dagster_with_runs(job, run_status, &runs).await
     }
 
     fn at(seconds: i64) -> OffsetDateTime {
@@ -1974,10 +2015,11 @@ mod tests {
         );
     }
 
-    /// Plan D5 step 4's batching: with a 10-minute target and a 90-second
-    /// budget (a 60-second median run plus the 30-second check), a change
-    /// noticed 5 minutes ago waits, and the same change at 8.5 minutes
-    /// runs — so several changes inside one window cost one run.
+    /// Plan D5 step 4's batching: with a 10-minute target and a 120-second
+    /// budget (a 60-second median request-to-land run plus two 30-second
+    /// check intervals, review R1 decision R6a), a change noticed 5 minutes
+    /// ago waits, the same change at 7.9 minutes still waits, and at 8
+    /// minutes it runs — so several changes inside one window cost one run.
     #[sqlx::test(migrations = "../../migrations")]
     async fn changes_inside_one_window_are_batched_into_a_single_run(pool: PgPool) {
         let pipeline = seed_pipeline(&pool, "pl-x", 10).await;
@@ -1995,7 +2037,8 @@ mod tests {
         )
         .await;
         let reader = FakeTokens::new().with("bronze.orders", "iceberg:8");
-        // Two 60-second runs: the median is 60 s, plus the 30 s interval.
+        // Two runs that were created when they started and lasted 60 s: the
+        // median request-to-land is 60 s, plus two 30 s intervals.
         let (dagster, _server) =
             dagster_with(&job_name("pl-x"), None, &[(0.0, 60.0), (1_000.0, 1_060.0)]).await;
 
@@ -2013,17 +2056,33 @@ mod tests {
         assert_eq!(early.decision, Decision::Wait, "5 min into a 10 min target");
         assert_eq!(early.status, LagStatus::Met);
 
+        let just_before = run_lag_check(
+            &pool,
+            &dagster,
+            &reader,
+            &pipeline,
+            &[source_input()],
+            now + time::Duration::seconds(479),
+        )
+        .await
+        .expect("the check succeeds");
+        assert_eq!(
+            just_before.decision,
+            Decision::Wait,
+            "600 s target - 120 s budget: still one second inside the window"
+        );
+
         let due = run_lag_check(
             &pool,
             &dagster,
             &reader,
             &pipeline,
             &[source_input()],
-            now + time::Duration::seconds(510),
+            now + time::Duration::seconds(480),
         )
         .await
         .expect("the check succeeds");
-        assert_eq!(due.lag_seconds, Some(510), "600 s target - 90 s budget");
+        assert_eq!(due.lag_seconds, Some(480), "600 s target - 120 s budget");
         assert_eq!(due.decision, Decision::Run);
         assert!(due.run_key.is_some());
     }
@@ -2158,29 +2217,52 @@ mod tests {
         );
     }
 
-    /// The budget is the MEDIAN of the last five successful runs, plus one
-    /// check interval — and the assumed 60 s when there is nothing to
-    /// measure.
+    /// The budget is the MEDIAN of the last five successful runs measured
+    /// from the run REQUEST to its landing, plus two check intervals — and
+    /// the assumed 60 s plus the same two intervals when there is nothing to
+    /// measure (review R1 decision R6a).
     #[tokio::test]
-    async fn the_run_budget_is_the_median_plus_one_interval() {
-        let (dagster, _server) = dagster_with(
+    async fn the_run_budget_is_the_request_to_land_median_plus_two_intervals() {
+        let (dagster, _server) = dagster_with_runs(
             &job_name("pl-x"),
             None,
-            &[(0.0, 1.0), (1.0, 11.0), (2.0, 22.0)],
+            &[(0.0, 0.0, 1.0), (1.0, 1.0, 11.0), (2.0, 2.0, 22.0)],
         )
         .await;
         assert_eq!(
             run_budget_seconds(&dagster, &job_name("pl-x"))
                 .await
                 .expect("the budget is readable"),
-            10 + CHECK_INTERVAL_SECONDS
+            10 + BUDGET_CHECK_INTERVALS * CHECK_INTERVAL_SECONDS
         );
         let (empty, _server2) = dagster_with(&job_name("pl-x"), None, &[]).await;
         assert_eq!(
             run_budget_seconds(&empty, &job_name("pl-x"))
                 .await
                 .expect("the budget is readable"),
-            ASSUMED_FIRST_RUN_SECONDS + CHECK_INTERVAL_SECONDS
+            ASSUMED_FIRST_RUN_SECONDS + BUDGET_CHECK_INTERVALS * CHECK_INTERVAL_SECONDS
+        );
+    }
+
+    /// R6a: the measured part starts when the run was REQUESTED, not when it
+    /// started. A run that waited 100 s in the queue and ran for 60 s costs
+    /// the pipeline 160 s of target, and a budget built from
+    /// `startTime -> endTime` would promise 60 — which is how every batched
+    /// run landed late by the queue gap, whatever the target was.
+    #[tokio::test]
+    async fn the_run_budget_counts_the_queue_before_the_run_started() {
+        let (dagster, _server) = dagster_with_runs(
+            &job_name("pl-q"),
+            None,
+            &[(0.0, 100.0, 160.0), (200.0, 300.0, 360.0)],
+        )
+        .await;
+        assert_eq!(
+            run_budget_seconds(&dagster, &job_name("pl-q"))
+                .await
+                .expect("the budget is readable"),
+            160 + BUDGET_CHECK_INTERVALS * CHECK_INTERVAL_SECONDS,
+            "both runs waited 100 s in the queue: 160 s from request to land"
         );
     }
 
