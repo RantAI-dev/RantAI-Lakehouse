@@ -179,7 +179,86 @@ test`. Python: the two `ops/lint` lines and the Dagster suite with
 
 ## Handoff
 
-*(developer)*
+### Handoff: DATA-15, tasks 1 to 6 (developer, Claude Sonnet 5.5, 2026-10-16)
+
+Branch `feat/data-15-asset-page`, cut from `ccb6331a` (the plan). Nothing pushed, no PR.
+
+**Commits**
+
+| Task | Hash | Subject |
+| --- | --- | --- |
+| 1 (F1) | `6c939173` | feat(catalog): preview up to 1,000 rows with a time limit and a pager |
+| 2 (F2) | `052f7dc3` | feat(catalog): 30 days of usage with frequent users, queries, joins and columns |
+| 3 (F3) | `bc020d9d` | feat(catalog): grant and revoke access from the asset page |
+| 4 (F4) | `747f9944` | feat(auth): keep dropped tables for 7 days on every Lakekeeper warehouse |
+| 5 (F4) | `0aa85086` | feat(catalog): restore a dropped table from its asset page |
+| 6 (F5) | `96732790` | feat(catalog): show who made each table version |
+| 6 fix | `e4e9d54e` | test(dagster): follow SinkConfig.from_bronze_ingest_config's new author argument |
+
+**Commands run (all on the final code, in the foreground unless noted)**
+
+Rust (from `rust/`, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, `df -h /` before each, 29 GB free at the last):
+- `touch crates/*/src/lib.rs crates/lakehouse-store/src/*.rs`, then `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: finished, no warnings, after the `touch` (3m 39s).
+- **`cargo test` was not run anywhere** (not allowed on this machine). Every Rust test written here, and every Rust test I changed, is **not verified**; the first run is CI's on #106.
+
+TypeScript:
+- `bun install --frozen-lockfile`: no changes.
+- `bun run typecheck`: clean.
+- `bun run lint`: 0 errors, 8 warnings (the same 8 as before the work; none in files I wrote).
+- `bun run test`: 1562 pass, 1 skip, 0 fail (1563 tests, 166 files).
+
+Python:
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK.
+- Dagster suite: see "Dagster suite" below.
+
+Compose:
+- `docker compose --profile '*' config --quiet`: fails only for unset required variables (`POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, ...). With a scratch env file giving every `${X:?}` variable the value `dummy`, the same command passes (exit 0). No `up`, `run` or `build`: the soft-delete init edit is **not proven by a real `up`** (AGENTS rule 8); CI's gates are its proof.
+- `ls rust/migrations | cut -c1-4 | sort | uniq -d`: prints nothing.
+
+**Dagster suite**
+
+`pytest dagster/dispar_orchestrate -q` **did not complete as one run on this machine**: the process stalls (it printed a summary per file but never exited, and in one run stopped making progress at about 17 %), so I ran it **one test file per process** (`~/.cache/rantai-dagster-venv/bin/python -m pytest <file> -q -p no:cacheprovider`, a hard kill after 45 s, the summary line read from the output file). Result for 52 test files, on the final code:
+
+- Passed, every test of the file: 47 of 52 files (45 within the 45 s limit, 2 more in the longer second run), none failed on the final code, including `test_ingest_factory.py` (83), `test_ingest_single_table.py` (19, after the fix commit `e4e9d54e`), `test_sink_history.py` (23), `test_sink_refresh.py` (6), `test_sink_killed_run.py` (13), `test_sink_pending_packages.py` (10), `test_sink_dedup_marker.py` (9), `test_schema_drift_loader.py` (12), `test_history.py` (22), `test_snapshot_author.py` (5, new), `test_file_ingest.py` (161), `test_authored_factory.py` (71). `test_sink_empty_table.py` (25) and `test_sink_history_guard.py` (43) needed longer than 45 s and passed in a second run with a 500 s limit.
+- One failure found and fixed: `test_ingest_single_table.py` (2 tests) failed with `TypeError ... unexpected keyword argument 'author'` because two stubs of `SinkConfig.from_bronze_ingest_config` did not take the new argument. The stubs were updated to the real signature (nothing weakened) in `e4e9d54e`; 19 pass.
+- **Not completed (killed at 45 s, no summary): `test_history_write_measurement.py`, `test_load_modes_dedup_measurement.py`, `test_load_modes_measurement.py`, `test_schema_drift_sql_source.py`, `test_sink_dedup_modes.py`.** They are heavy loader-marked measurement tests that none of this work edits, but `test_history_write_measurement.py` and `test_sink_dedup_modes.py` run through `history.write_versions` / `sink.load_via_sink`, which this work changed (a new defaulted `author` argument), so they are **not verified**. CI's `dagster-loader-tests` job is their proof.
+
+
+**Spec rows**
+
+| Spec row | Met? | Notes |
+| --- | --- | --- |
+| Data preview: up to 1,000 rows, masking applied | Met in code; Rust test **not verified** | `SAMPLE_MAX_ROWS = 1000`, the read carries `SETTINGS max_execution_time = 30` through the rewrite; console pages 100 at a time. The sample route test pins the limit, the `SETTINGS` text and that the read is masked. `DATA-15-AC1` needs the owner on a running console. |
+| Usage: 30 days, queries, frequent users, frequent queries, tables joined, column popularity | Met in code; Rust tests **not verified** | Figures are as the plan's section 3 says. Column popularity counts only single-table statements and says how many were left out. Based on the newest 5,000 history rows, and `truncated` says so. |
+| Access: grant and revoke from the asset | Met in code; Rust tests **not verified** | Three routes, migration `0078`, Grants card. A grant is global (the card says so). |
+| Restore: dropped table within 7 days | Partly met | Soft delete on every warehouse and an undrop route are built. Not proven against a real Lakekeeper here: the gate step in `ops/g3a/g3a_test.py` is written and **not run**. A table dropped before the soft-delete profile is applied cannot come back. Only Bronze (Iceberg) tables are restorable; a ClickHouse table says so. |
+| History: version time, operation and author | Partly met | Author is read and shown. Only commits made by the product's own `pyiceberg` writes (history mode, clearing a table) record it; versions written by `dlt` say "unknown". Recording it in the loader is the backlog item the plan reports. |
+
+`DATA-15-AC4` (a user without the permission is refused, a failure shows an honest message): the refusals are fixed sentences and `route_auth` plus the router tests name them; the owner runs the checklist.
+
+**Not verified**
+
+- All Rust tests (not run, by rule of this machine).
+- The compose soft-delete edit under `docker compose up`, and the `ops/g3a` drop and restore step (needs the gate stack).
+- Lakekeeper behaviour of `delete-profile`, `deleted-tabulars` and `undrop`: request and response shapes were read from Lakekeeper v0.13.3's management OpenAPI (`docs/docs/api/management-open-api.yaml` at the tag), not exercised against a server.
+- The restore status for "the table exists" is covered only by the pure `assess` unit test; the router tests start from a missing table because mocking a full Iceberg `LoadTableResult` would test the mock.
+- The gate step drops the table as `dlt` through the REST catalog and assumes `dlt`, the table's creator, may drop it; if Lakekeeper's `drop` needs more, the step fails at the drop.
+
+**Plan-versus-code mismatches and decisions the plan did not cover**
+
+- Migration `0078`: the plan asked for `CHECK (approval or granter)`. `granted_by_user_id` is `ON DELETE SET NULL`, so that check would make deleting the granting admin fail; I used `CHECK (approval_id IS NOT NULL OR catalog_id IS NOT NULL)` instead (`catalog_id` is never cleared). Needs the planner's eye.
+- `ApiError` had no 410: I added `ApiError::Gone` (410) in `lakehouse-core` for the passed restore window.
+- Lakekeeper 0.13.3 shapes matched the plan (`POST .../delete-profile` with `{"delete-profile": {"type":"soft","expiration-seconds":604800}}`; `GET .../deleted-tabulars`; `POST .../deleted-tabulars/undrop` with `{"targets":[{"id","type":"table"}]}`, 204). The deleted-tabulars list filters by namespace *id*, which the product does not hold, so `find_deleted_table` pages the list (100 per page, at most 20 pages) and matches namespace, name and type.
+- Restore covers only a Bronze dataset's table in the `bronze` namespace; Silver and Gold answer `supported: false`. The admin client's warehouse is found by the configured `LAKEKEEPER_WAREHOUSE` name.
+- `GET .../restore` reads "the table exists" through the reader catalog (`rest::load_table_summary`), the same path as the asset page.
+- Frequent users and joined tables are shown to anyone who can read the asset (the plan did not say who); names of other tables only, no query text, and frequent-query text only without literals.
+- Joined-table asset ids come from one `system.tables` lookup (silver and serving) and one registry lookup (bronze) per detail request, only when joined tables exist.
+- The author label is `connector <id>, run <first 8 characters of the Dagster run id>`; with no run id, `connector <id>`. It is carried on a new defaulted `SinkConfig.author`.
+- `bronze_table_name` was extracted from `catalog_profile::resolve_source` so the registry is asked one way (restore uses it).
+- Grants: `userEmail` is added to each listed grant so two people with one name can be told apart; a request-based grant's `grantedBy` comes from its approval's audit event.
+- Existing Rust tests that mocked the old Lakekeeper call sequence (`ensure_warehouse`, tenant provisioning) now mount the delete-profile call; the sample route test moved from 100 to 1,000.
+- Things I am unsure are right: the exact Display text two Rust tests assert (`literal_free_form`, `IN (?, ?)`), written from sqlparser 0.63's `Display` without running them; whether the `dlt` principal may drop its own table in the g3a step; the `wiremock` ordering in `find_deleted_table`'s paging test.
 
 ## Review
 
