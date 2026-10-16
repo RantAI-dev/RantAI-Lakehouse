@@ -291,6 +291,7 @@ $ git status --short
 (clean after commit)
 
 $ git log --oneline origin/main..HEAD | head
+16773eb1 docs(plan): append handoff round 2 for OPS-7
 d1a0f351 docs(plans): remove hardcoded password and update drill timings
 095ac173 feat(backups): name-only env flags in restore script and RESTORE masking check
 741302bc docs(plans): clarify change-capture offset survival and document unmeasured resumption
@@ -300,10 +301,9 @@ d1a0f351 docs(plans): remove hardcoded password and update drill timings
 dc992317 docs(plan): append handoff section for OPS-7
 94a32ad0 docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
 9d8db395 docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
-53c67209 feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
 
 $ git ls-remote --heads origin feat/ops-7-restore-drill
-d1a0f351...	refs/heads/feat/ops-7-restore-drill
+16773eb1412c	refs/heads/feat/ops-7-restore-drill
 ```
 
 ## 8. Review
