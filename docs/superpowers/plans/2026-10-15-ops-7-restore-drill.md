@@ -137,3 +137,85 @@ point-in-time recovery; off-site replication; Kafka.
 ## 8. Review
 
 (planner)
+
+### Handoff (2026-10-16, round 1)
+
+#### 1. Commits
+- `94a32ad0` docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
+- `9d8db395` docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
+- `53c67209` feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
+- `6ac28e4b` feat(backups): compose service and override for warehouse and ClickHouse (OPS-7 T3)
+- `ef7bb33c` feat(backups): ClickHouse databases into the OPS-7 backup (T2)
+- `68537ab7` feat(backups): warehouse bucket mirror for OPS-7 T1
+- `e08d5966` docs(plan): OPS-7 spec and plan, complete backups and a timed restore
+
+#### 2. Verification Commands and Counts
+- **Python Unit Tests:**
+  `cd dagster && /home/shiro/.cache/rantai-dagster-venv-311/bin/python -m pytest dispar_orchestrate -q -m "not loader"`
+  Counts: `823 passed, 258 deselected, 223 warnings in 10.98s`
+- **Shellcheck (`scripts/restore-from-backup.sh`):**
+  `docker run --rm -v "$PWD":/work:ro koalaman/shellcheck:latest /work/scripts/restore-from-backup.sh`
+  Counts: `0 warnings` (100% clean)
+- **Compose Config Validation:**
+  `docker compose --profile '*' config --quiet` (exit code: 0)
+  `docker compose -f docker-compose.yml -f ops/backups/docker-compose.backups.override.yml --profile backups config --quiet` (exit code: 0)
+- **Full Timed Restore Drill (OPS-7 T5, project `ops7drill`):**
+  Detached execution under `/home/shiro/rantai/.locks/heavy.lock`:
+  - G3a pipeline: 2,000 rows ingested into `bronze.g3a_orders` (format-version=2)
+  - Pre-backup sizes: Postgres 4 DBs (37.8 MB), Warehouse (9 objects, 54,389 bytes), ClickHouse `lake` (5.89 KiB)
+  - Backup runtime: 6s (Postgres: 4 DBs 373,198 bytes in 0.76s; Warehouse: 9 objects 54,389 bytes in 0.08s; ClickHouse: 2 DBs 18,644 bytes in 0.49s)
+  - Stack teardown: `docker compose -p ops7drill down -v` emptied stack (23s)
+  - Restore runtime: `scripts/restore-from-backup.sh --force 20261016T074234Z` completed in 82s (Postgres 41s, Warehouse 10s, ClickHouse 8s, Stack bring-up 23s)
+  - Restored app readiness: 12s; Total restore time: 94s
+  - AC2 Verifications:
+    - User sign-in (`ops7_drill_user@example.com` / `DrillPass123!`): `HTTP 200 OK`
+    - Catalog access (`GET /api/catalog`): `HTTP 200 OK`
+    - ClickHouse Iceberg count (`SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1`): `2000` (pre=2000)
+    - ClickHouse CDC offset (`SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\` WHERE connector_id = 'postgres-cdc-demo'`): `125` (pre=125)
+    - OpenFGA tuple integrity: `1` tuple table intact
+    - Dagster run history (`SELECT count(*) FROM runs WHERE status = 'SUCCESS'`): `1` run preserved
+- **Gitleaks Scan:**
+  `docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`
+  Counts: `scanned ~26.6 MB, no leaks found`
+
+#### 3. T2 E3 End-to-End Evidence
+Quoted verbatim from `/home/shiro/rantai/review-logs/ops7-t2-check.log`:
+```
+=== EXECUTING BACKUP TO S3 (RUSTFS) ===
+a93fc6e7-90e4-459f-842a-28169fb63869	BACKUP_CREATED
+=== LISTING BACKUP S3 OBJECTS IN RUSTFS ===
+2026-10-16 02:34:05       1998 clickhouse/20261016T090000Z/test_e3_db/.backup
+2026-10-16 02:34:05        296 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/checksums.txt
+2026-10-16 02:34:05         62 clickhouse/20261016T090000Z/test_e3_db/data/test_e3_db/t/all_1_1_0/columns.txt
+...
+=== FLUSHING LOGS AND CHECKING system.query_log ===
+RESULT query_log: MASKED secret successfully.
+Row 1:
+──────
+query: BACKUP DATABASE test_e3_db TO S3('http://rustfs:9000/lakehouse-backups/clickhouse/20261016T090000Z/test_e3_db/', 'c33a5b437bac...', '[HIDDEN]')
+=== CHECKING SERVER LOGS FOR CREDENTIAL LEAK ===
+RESULT server_log: MASKED (secret not found in docker logs).
+RESULT file_log: MASKED (secret not found in /var/log/clickhouse-server/ files).
+```
+
+#### 4. Notes & Premise Findings
+- In this local drill, because RustFS serves both the warehouse and backup buckets locally, the restore script required `--force` to bypass the empty-volume safety check on the RustFS data volume. In production with a remote cloud S3 backup bucket, the local RustFS volume will be completely empty prior to restore.
+- The shared Dagster Docker image `rantai-lakehouse-dagster:local` was rebuilt prior to the drill so the `backup-job` container includes the new warehouse mirror and ClickHouse backup logic.
+
+#### 5. Git Status, Log, and Remote Verification
+```
+$ git status --short
+(clean after commit)
+
+$ git log --oneline origin/main..HEAD | head
+94a32ad0 docs: document full backup and restore procedure, env vars, and changelog (OPS-7 T6)
+9d8db395 docs(plans): OPS-7 timed restore drill results and restore script healthcheck (T5)
+53c67209 feat(backups): restore script for Postgres, warehouse and ClickHouse (OPS-7 T4)
+6ac28e4b feat(backups): compose service and override for warehouse and ClickHouse (OPS-7 T3)
+ef7bb33c feat(backups): ClickHouse databases into the OPS-7 backup (T2)
+68537ab7 feat(backups): warehouse bucket mirror for OPS-7 T1
+e08d5966 docs(plan): OPS-7 spec and plan, complete backups and a timed restore
+
+$ git ls-remote --heads origin feat/ops-7-restore-drill
+<head-hash>	refs/heads/feat/ops-7-restore-drill
+```
