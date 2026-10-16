@@ -2119,6 +2119,63 @@ mod tests {
         assert_eq!(stored.behind_streak, 0);
     }
 
+    /// A pipeline with no target lag has nothing to lag: the check must not
+    /// decide `run` or `behind` for it, and must not write a state row that
+    /// claims a measurement nobody asked for (review R1 SHOULD-FIX 6).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_pipeline_without_a_target_lag_is_never_decided(pool: PgPool) {
+        let seeded = seed_pipeline(&pool, "pl-none", 2).await;
+        let now = at(1_000);
+        // A row that says "met, streak 2" before the check: a check that
+        // decided anything for a pipeline with no target would overwrite it.
+        update_in(
+            &pool,
+            &seeded,
+            Some(tokens_of(&[("bronze.orders", "iceberg:7")])),
+            None,
+            None,
+            "met",
+            2,
+            now,
+        )
+        .await;
+        let mut pipeline = pipeline("pl-none", 2);
+        pipeline.target_lag = None;
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:9");
+        let (dagster, _server) = dagster_with(&job_name("pl-none"), None, &[]).await;
+
+        let outcome = run_lag_check(
+            &pool,
+            &dagster,
+            &reader,
+            &pipeline,
+            &[source_input()],
+            at(1_200),
+        )
+        .await
+        .expect("the check itself succeeds");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(outcome.status, LagStatus::NotMeasured);
+        assert_eq!(outcome.run_key, None);
+        assert_eq!(outcome.target_seconds, None);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("pipeline has no target lag configured")
+        );
+        let stored = pipelines::get_lag_state(&pool, "pl-none")
+            .await
+            .expect("read the state row")
+            .expect("a row exists");
+        assert_eq!(
+            stored.last_check_at,
+            Some(now),
+            "a check for a pipeline with no target lag touches nothing"
+        );
+        assert_eq!(stored.last_status.as_deref(), Some("met"));
+        assert_eq!(stored.behind_streak, 2, "no streak is decided either");
+    }
+
     /// A missing input table is not "changed" and not "met" either.
     #[tokio::test]
     async fn a_missing_input_table_is_not_measured() {
