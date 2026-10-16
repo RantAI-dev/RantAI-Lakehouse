@@ -4,14 +4,15 @@ import type { EntityStatus } from "@/lib/status"
 /** The kinds a pipeline can be authored as. */
 export type PipelineKind = "batch" | "incremental"
 
-/** Target lag setting (BLD-2 D2). */
+/** Target lag setting (BLD-2 D2, widened with | string). */
 export type TargetLag =
   | { kind: "lag"; minutes: number }
   | { kind: "downstream" }
+  | { kind: string; minutes?: number }
 
-/** Measured freshness lag status (BLD-2 D8). */
+/** Measured freshness lag status (BLD-2 D8, widened with | string). */
 export type PipelineLag = {
-  status: "met" | "behind" | "not_measured"
+  status: "met" | "behind" | "not_measured" | string
   lagSeconds: number | null
   lastCheckAt: string | null
   reason: string | null

@@ -85,4 +85,11 @@ describe("pipeline-columns lag column", () => {
     render(<>{lagCell(p)}</>)
     expect(screen.getByText("—")).toBeTruthy()
   })
+
+  it("renders Not measured when targetLag is set but lag is null", () => {
+    // BLD-2 review R1 SHOULD-FIX 19
+    const p = makePipeline({ targetLag: { kind: "lag", minutes: 10 }, lag: null })
+    render(<>{lagCell(p)}</>)
+    expect(screen.getByText("Not measured")).toBeTruthy()
+  })
 })

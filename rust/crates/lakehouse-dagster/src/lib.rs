@@ -1112,16 +1112,14 @@ impl DgClient {
         Ok(data.runs_or_error.results.unwrap_or_default())
     }
 
-    /// The most recent run carrying `run_key` as its `dagster/run_key`
-    /// tag, matching
-    /// `pipelineRunsOrError(filter: {runKeys: $keys})`.
+    /// The most recent run carrying `run_key` as its `dagster/run_key` tag.
     ///
     /// BLD-2's lag check stores the run key it asked Dagster to use and
     /// asks this on the next check to learn whether that run has landed
-    /// (plan D5). Filtering on `PipelineRunsFilter.runKeys` — a server-side
-    /// tag filter — rather than paging recent runs and scanning their tags
-    /// client-side: the run being looked for may be older than any page
-    /// limit the route would be willing to fetch, and the answer is
+    /// (plan D5). Filtering on `dagster/run_key` in `PipelineRunsFilter.tags`
+    /// — a server-side tag filter — rather than paging recent runs and
+    /// scanning their tags client-side: the run being looked for may be older
+    /// than any page limit the route would be willing to fetch, and the answer is
     /// "this exact run key", not "the newest run whose tags happen to
     /// match".
     ///
@@ -1155,10 +1153,11 @@ impl DgClient {
             // Most recent first, so a re-used key (which Dagster forbids
             // within one run's history anyway) still answers with the run
             // that matters.
+            // BLD-2 review R1 SHOULD-FIX 11: order by creationTime, not startTime
             runs.sort_by(|a, b| {
-                b.start_time
+                b.creation_time
                     .unwrap_or(0.0)
-                    .total_cmp(&a.start_time.unwrap_or(0.0))
+                    .total_cmp(&a.creation_time.unwrap_or(0.0))
             });
             runs.into_iter().next()
         }))
@@ -3949,9 +3948,7 @@ mod tests {
     }
 
     /// BLD-2: the lag check looks a requested run up by its `runKey`, so
-    /// this proves the `pipelineRunsOrError(filter: {runKeys: })` query
-    /// this crate sends carries the key as a VARIABLE (never interpolated
-    /// into the query text) and that the newest matching run wins.
+    /// BLD-2 review R1 SHOULD-FIX 11: tags filter and ordered by creationTime
     #[tokio::test]
     async fn find_run_by_run_key_sends_the_key_as_a_variable_and_returns_the_newest() {
         use wiremock::matchers::body_partial_json;
@@ -3964,9 +3961,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
                     { "runId": "old", "jobName": "authored__pl-x", "status": "SUCCESS",
-                      "startTime": 100.0, "endTime": 160.0 },
+                      "startTime": 100.0, "endTime": 160.0, "creationTime": 100.0 },
                     { "runId": "new", "jobName": "authored__pl-x", "status": "STARTED",
-                      "startTime": 900.0 }
+                      "startTime": 900.0, "creationTime": 900.0 }
                 ] } }
             })))
             .mount(&server)

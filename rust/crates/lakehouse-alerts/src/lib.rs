@@ -2210,12 +2210,16 @@ async fn run_one(
             "pipeline_failure rules are evaluated by the run-failed event route, not run_rules"
                 .to_owned(),
         ),
-        AlertKind::PipelineSlow
-        | AlertKind::PipelineVolumeDrop
-        | AlertKind::PipelineBehindTarget => skipped(
+        AlertKind::PipelineSlow | AlertKind::PipelineVolumeDrop => skipped(
             rule,
             "pipeline_slow / pipeline_volume_drop rules are evaluated by the run-finished \
              event route, not run_rules"
+                .to_owned(),
+        ),
+        // BLD-2 review R1 SHOULD-FIX 13: pipeline_behind_target rules are evaluated by lag-check
+        AlertKind::PipelineBehindTarget => skipped(
+            rule,
+            "pipeline_behind_target rules are evaluated by the lag-check route, not run_rules"
                 .to_owned(),
         ),
         // Plan 1f: `pipeline_late` is evaluated by the `/api/alerts/run`

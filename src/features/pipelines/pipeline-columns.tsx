@@ -321,8 +321,16 @@ export function getPipelineColumns({
       cell: ({ row }) => {
         const targetLag = row.original.targetLag
         const lag = row.original.lag
-        if (!targetLag || !lag) {
+        if (!targetLag) {
           return <span className="text-xs text-muted-foreground">—</span>
+        }
+        // BLD-2 review R1 SHOULD-FIX 19: render "Not measured" when targetLag is set but lag has not run
+        if (!lag || lag.status === "not_measured") {
+          return (
+            <Pill tone="muted" title={lag?.reason ?? undefined}>
+              Not measured
+            </Pill>
+          )
         }
         if (lag.status === "met") {
           return (

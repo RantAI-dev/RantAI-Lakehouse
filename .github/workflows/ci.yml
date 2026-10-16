@@ -601,11 +601,10 @@ jobs:
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    # SRC-20: raised from 25 for the G7 step added below. The budget is
-    # the measured G7 wall time (30 s on a clean local stack, with the
-    # authored run itself at 5.6 s) plus 5 minutes of slack, which the
-    # plan allows rather than assuming.
-    timeout-minutes: 30
+    # BLD-2 review R1 SHOULD-FIX 16: raised to 45 for the BLD-2 D11 target lag
+    # verification step inside G7, which takes 5 append iterations with settling
+    # intervals plus 5 unchanged checks (~20 minutes worst-case inside G7).
+    timeout-minutes: 45
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci

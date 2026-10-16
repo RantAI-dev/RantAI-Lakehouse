@@ -1038,7 +1038,35 @@ pub async fn lag_check(
     let Some(pipeline) = pipelines::get_pipeline(pool, &id).await? else {
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     };
-    let inputs = crate::pipeline_lag::inputs_of(pool, &pipeline).await?;
+    let Some(inputs) = crate::pipeline_lag::inputs_of(pool, &pipeline).await? else {
+        // BLD-2 review R1 SHOULD-FIX 13: unparseable source yields not_measured
+        let now = time::OffsetDateTime::now_utc();
+        let p_update = lakehouse_store::pipelines::LagStateUpdate {
+            pipeline_id: pipeline.id.clone(),
+            tenant_id: pipeline.tenant_id,
+            consumed_tokens: None,
+            consumed_at: None,
+            pending_since: None,
+            requested_run_key: None,
+            requested_tokens: None,
+            requested_at: None,
+            request_attempt: 0,
+            last_check_at: now,
+            last_status: "not_measured".to_owned(),
+            behind_streak: 0,
+        };
+        let _ = pipelines::upsert_lag_state(pool, &p_update).await;
+        return Ok(ApiJson(serde_json::json!({
+            "decision": "wait",
+            "runKey": serde_json::Value::Null,
+            "jobName": crate::routes::authored_pipelines::job_name(&pipeline.id),
+            "status": "not_measured",
+            "lagSeconds": serde_json::Value::Null,
+            "targetSeconds": serde_json::Value::Null,
+            "behindStreak": 0,
+            "reason": "pipeline source is not a valid <zone>.<table> location",
+        })));
+    };
     let outcome = crate::pipeline_lag::run_lag_check(
         pool,
         &state.dagster,
@@ -1132,15 +1160,25 @@ pub async fn apply_set_target_lag(
     pipeline_id: &str,
     target_lag: Option<pipelines::TargetLag>,
 ) -> ApiResult<pipelines::Pipeline> {
+    // BLD-2 review R1 BLOCKER 1: authored_only and in_scope checks inside apply_set_target_lag
+    authored_only(pipeline_id)?;
+    in_scope(
+        state.pg.as_deref(),
+        principal,
+        &HeaderMap::new(),
+        pipeline_id,
+    )
+    .await?;
     validate_target_lag(target_lag)?;
     let pool = crate::routes::pipelines::pool(state)?;
     let updated = pipelines::set_target_lag(pool, pipeline_id, target_lag)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {pipeline_id} not found")))?;
+    // BLD-2 review R1 SHOULD-FIX 13: audit action name pipeline.target_lag.set
     record_pipeline_audit(
         state,
         principal,
-        "pipeline.target_lag",
+        "pipeline.target_lag.set",
         pipeline_id,
         serde_json::to_value(target_lag).unwrap_or(Value::Null),
     )
@@ -4187,6 +4225,19 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(stored.target_lag, Some(TargetLag::Lag { minutes: 15 }));
+
+            // BLD-2 review R1 SHOULD-FIX 12: assert audit row
+            let audit_rows: Vec<(String, Value)> = sqlx::query_as(
+                "SELECT action, args FROM audit_event WHERE resource_id = $1 ORDER BY created_at ASC",
+            )
+            .bind(&pl.id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch audit");
+            assert!(!audit_rows.is_empty(), "audit event must be recorded");
+            assert_eq!(audit_rows[0].0, "pipeline.target_lag.set");
+            assert_eq!(audit_rows[0].1["kind"], "lag");
+            assert_eq!(audit_rows[0].1["minutes"], 15);
 
             // Clearing target lag with null
             let clear_body = serde_json::to_vec(&json!({ "targetLag": null })).expect("body");

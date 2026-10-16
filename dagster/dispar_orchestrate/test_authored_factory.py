@@ -1857,6 +1857,85 @@ class TestLagSensor:
         assert len(requests_) == 0
 
 
+    @job(name="authored__pl_u")
+    def _upstream_job() -> None:
+        return None
+
+    def test_sensor_yields_run_request_with_different_allowed_job_name(self) -> None:
+        """BLD-2 review R1 BLOCKER 2: sensor can launch upstream job when API directs."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(
+            pipeline,
+            self._order_job,
+            allowed_jobs=[self._order_job, self._upstream_job],
+            cfg=cfg,
+        )
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-upstream",
+            "jobName": "authored__pl_u",
+        }
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            requests_ = list(sensor(build_sensor_context()))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-upstream"
+        assert req.job_name == "authored__pl_u"
+
+    def test_sensor_skips_when_job_name_not_allowed(self) -> None:
+        """BLD-2 review R1 BLOCKER 2: unknown job name is logged and skipped."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__unknown_job",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_when_run_key_missing(self) -> None:
+        """BLD-2 review R1 BLOCKER 2: missing runKey is logged and skipped."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "jobName": "authored__pl_lag_order",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_logs_warning_when_run_token_unset(self) -> None:
+        """BLD-2 review R1 SHOULD-FIX 17: sensor logs warning when run_token is unset."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        ctx = build_sensor_context()
+        with mock.patch.object(ctx.log, "warning") as mock_warn:
+            reqs = list(sensor(ctx))
+        assert len(reqs) == 0
+        mock_warn.assert_called_once()
+        assert "DISPAR_RUN_TOKEN is unset" in mock_warn.call_args[0][0]
+
+
 class PerPipelineRetryPolicyTest(unittest.TestCase):
     """Plan 1c (R2, day-1): `_op_for_pipeline` reads each authored
     pipeline's `definition.maxRetries` (migration `0051_pipeline_max_retries.sql`)

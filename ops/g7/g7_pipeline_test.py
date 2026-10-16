@@ -58,6 +58,13 @@ run). That was true of the commit that first added this file and is not
 true now; SRC-20 runs this gate for real, after G3a, in the
 `g3a-dagster` CI job.
 
+In addition to graph, source, and row materializations, this gate includes
+the BLD-2 D11 target lag verification step (`step_verify_target_lag_bronze_to_silver`):
+measures Bronze-to-Silver lag across 5 append iterations with a 1-minute target
+lag, then verifies 5 checks with unchanged inputs launch no unneeded runs.
+Because of settling intervals and up to 5 runs, this step can take up to
+~20 minutes in worst-case conditions inside the job timeout.
+
 # A failed run must fail the gate (BLD-3 / D7)
 
 `step_trigger_and_wait_for_real_row_materializations` treats FAILURE as
@@ -546,26 +553,38 @@ def _assert_source_refused(op: dict) -> None:
 def psql_insert_order(customer: str, amount: float) -> None:
     """Insert one order into the Postgres demo source table so bronze_ingest_job
     can load it into Bronze."""
+    # BLD-2 review R1 BLOCKER 8: no runtime pip install, use pinned binary from runner image;
+    # read must-set password without fallback; turn connection errors into G7Failure.
     try:
         import psycopg2
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "psycopg2-binary"])
-        import psycopg2
+    except ImportError as e:
+        raise G7Failure(f"psycopg2 is required but not installed: {e}") from e
 
-    conn = psycopg2.connect(
-        host=os.environ.get("PGHOST", "postgres"),
-        port=int(os.environ.get("PGPORT", "5432")),
-        user=os.environ.get("PGUSER", os.environ.get("POSTGRES_USER", "lakehouse")),
-        password=os.environ.get("PGPASSWORD", os.environ.get("POSTGRES_PASSWORD", "lakehouse")),
-        dbname=os.environ.get("PGDATABASE", os.environ.get("POSTGRES_DB", "lakehouse")),
-    )
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO ingest_demo.orders (customer, amount) VALUES (%s, %s);",
-            (customer, amount),
+    pg_host = os.environ.get("PGHOST") or os.environ.get("POSTGRES_HOST", "postgres")
+    pg_port = int(os.environ.get("PGPORT") or os.environ.get("POSTGRES_PORT", "5432"))
+    pg_user = os.environ.get("PGUSER") or os.environ.get("POSTGRES_USER", "lakehouse")
+    pg_password = os.environ.get("PGPASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+    if not pg_password:
+        raise G7Failure("POSTGRES_PASSWORD (or PGPASSWORD) environment variable is required")
+    pg_db = os.environ.get("PGDATABASE") or os.environ.get("POSTGRES_DB", "lakehouse")
+
+    try:
+        conn = psycopg2.connect(
+            host=pg_host,
+            port=pg_port,
+            user=pg_user,
+            password=pg_password,
+            dbname=pg_db,
         )
-    conn.commit()
-    conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ingest_demo.orders (customer, amount) VALUES (%s, %s);",
+                (customer, amount),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        raise G7Failure(f"Failed to insert order into Postgres: {exc}") from exc
 
 
 def trigger_bronze_ingest() -> str:
@@ -616,13 +635,16 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
     if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": 1}:
         raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
 
-    sensor_name = f"authored__{pipeline_id.replace('-', '_')}_lag"
+    # BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory
+    import re
+    safe_id = re.sub(r"[^A-Za-z0-9_]", "_", pipeline_id)
+    sensor_name = f"authored__{safe_id}_lag"
     sel = {
         "repositoryName": "__repository__",
         "repositoryLocationName": "dispar_orchestrate.definitions",
         "sensorName": sensor_name,
     }
-    def sensor_exists() -> bool:
+    def sensor_running() -> bool:
         r = requests.post(
             DAGSTER_URL,
             json={
@@ -631,35 +653,28 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
             },
             timeout=10,
         )
-        return r.json().get("data", {}).get("sensorOrError", {}).get("__typename") == "Sensor"
+        r.raise_for_status()
+        data = r.json().get("data", {}).get("sensorOrError", {})
+        if data.get("__typename") != "Sensor":
+            return False
+        return data.get("sensorState", {}).get("status") == "RUNNING"
 
-    _wait_for(f"sensor {sensor_name} to appear in Dagster", sensor_exists, timeout_s=60, interval_s=2.0)
-
-    # Ensure sensor is started
-    r_start = requests.post(
-        DAGSTER_URL,
-        json={
-            "query": "mutation($sel: SensorSelector!) { startSensor(sensorSelector: $sel) { __typename ... on Sensor { sensorState { status } } } }",
-            "variables": {"sel": sel},
-        },
-        timeout=10,
-    )
-    print(f"[g7] started sensor {sensor_name}: {r_start.json()}")
+    # BLD-2 review R1 SHOULD-FIX 14: assert the lag sensor is RUNNING instead of starting it (D6 default_status)
+    _wait_for(f"sensor {sensor_name} to appear and be RUNNING in Dagster", sensor_running, timeout_s=90, interval_s=2.0)
+    print(f"[g7] confirmed sensor {sensor_name} is RUNNING")
 
     print(f"[g7] waiting for initial baseline lag status to settle to 'met'...")
     def baseline_settled() -> bool:
-        detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+        detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+        detail_resp.raise_for_status()
+        detail = detail_resp.json()
         lag = detail.get("lag") or {}
         st = lag.get("status")
-        ticks = requests.post(
-            DAGSTER_URL,
-            json={
-                "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { ... on Sensor { sensorState { status ticks(limit: 1) { status timestamp skipReason } } } } }",
-                "variables": {"sel": sel},
-            },
-            timeout=5,
-        ).json()
-        runs_list = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5).json().get("runs", []); print(f"[g7] baseline probe: status={st!r}, reason={lag.get('reason')!r}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}")
+        # BLD-2 review R1 SHOULD-FIX 14: remove unused ticks fetch and one-liner
+        runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5)
+        runs_resp.raise_for_status()
+        runs_list = runs_resp.json().get("runs", [])
+        print(f"[g7] baseline probe: status={st!r}, reason={lag.get('reason')!r}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}")
         return st == "met"
 
     _wait_for("initial baseline lag status 'met'", baseline_settled, timeout_s=180, interval_s=5.0)
@@ -730,10 +745,12 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
 
     avg_sample = sum(samples) / len(samples)
     print(f"[g7] TARGET_LAG_RESULT: 5 samples = {[round(s, 2) for s in samples]}s, avg = {avg_sample:.2f}s")
-    if all(s <= 60.0 for s in samples):
-        print(f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET 1-MINUTE TARGET (<= 60s)")
-    else:
-        print(f"[g7] TARGET_LAG_RESULT: NOT ALL SAMPLES MET 1-MINUTE TARGET")
+    # BLD-2 review R1 BLOCKER 8: sample over 60s must fail (D11)
+    if any(s > 60.0 for s in samples):
+        raise G7Failure(
+            f"NOT ALL SAMPLES MET 1-MINUTE TARGET (<= 60s): samples={[round(s, 2) for s in samples]}s, max={max(samples):.2f}s > 60s"
+        )
+    print(f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET 1-MINUTE TARGET (<= 60s)")
 
 
 def main() -> int:

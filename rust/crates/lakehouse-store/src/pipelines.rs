@@ -1218,6 +1218,15 @@ owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
         tx.rollback().await?;
         return Ok(None);
     };
+    // BLD-2 review R1 SHOULD-FIX 8: cycle check on update_pipeline when lag is set
+    if (row.target_lag_seconds.is_some() || row.target_lag_downstream)
+        && let Some(cycle) = find_target_lag_cycle_conn(&mut tx, &row.id).await?
+    {
+        return Err(StoreError::Validation(format!(
+            "target lag would create a cycle: {}",
+            cycle.join(" -> ")
+        )));
+    }
     let snapshot = PipelineDefinitionSnapshot::from(&row);
     insert_definition_version(
         &mut tx,
@@ -1705,6 +1714,10 @@ pub struct PipelineLagState {
     pub requested_run_key: Option<String>,
     /// See [`Self::requested_run_key`].
     pub requested_tokens: Option<serde_json::Value>,
+    /// BLD-2 review R1 decision R1: when the request was recorded
+    pub requested_at: Option<OffsetDateTime>,
+    /// BLD-2 review R1 decision R2: attempt counter for the requested tokens
+    pub request_attempt: i32,
     /// When a lag check last ran for this pipeline.
     pub last_check_at: Option<OffsetDateTime>,
     /// `"met" | "behind" | "not_measured"`; `None` before the first check.
@@ -1742,6 +1755,10 @@ pub struct LagStateUpdate {
     pub requested_run_key: Option<String>,
     /// See [`PipelineLagState::requested_tokens`].
     pub requested_tokens: Option<serde_json::Value>,
+    /// See [`PipelineLagState::requested_at`].
+    pub requested_at: Option<OffsetDateTime>,
+    /// See [`PipelineLagState::request_attempt`].
+    pub request_attempt: i32,
     /// See [`PipelineLagState::last_check_at`].
     pub last_check_at: OffsetDateTime,
     /// See [`PipelineLagState::last_status`].
@@ -1759,14 +1776,16 @@ struct LagStateRow {
     pending_since: Option<OffsetDateTime>,
     requested_run_key: Option<String>,
     requested_tokens: Option<serde_json::Value>,
+    requested_at: Option<OffsetDateTime>,
+    request_attempt: i32,
     last_check_at: Option<OffsetDateTime>,
     last_status: Option<String>,
     behind_streak: i32,
 }
 
 const LAG_STATE_COLUMNS: &str = "pipeline_id, tenant_id, consumed_tokens, consumed_at, \
-     pending_since, requested_run_key, requested_tokens, last_check_at, last_status, \
-     behind_streak";
+     pending_since, requested_run_key, requested_tokens, requested_at, request_attempt, \
+     last_check_at, last_status, behind_streak";
 
 impl From<LagStateRow> for PipelineLagState {
     fn from(row: LagStateRow) -> Self {
@@ -1778,6 +1797,8 @@ impl From<LagStateRow> for PipelineLagState {
             pending_since: row.pending_since,
             requested_run_key: row.requested_run_key,
             requested_tokens: row.requested_tokens,
+            requested_at: row.requested_at,
+            request_attempt: row.request_attempt,
             last_check_at: row.last_check_at,
             last_status: row.last_status,
             behind_streak: row.behind_streak,
@@ -1817,18 +1838,27 @@ pub async fn get_lag_state(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
+/// The stored `target` location (`"<zone>.<table>"`) of each named
+/// pipeline within `tenant_id`, one query.
+/// BLD-2 review R1 decision R3 / SHOULD-FIX 9 & SHOULD-FIX 10.
 pub async fn targets_for(
     pool: &PgPool,
+    tenant_id: Option<Uuid>,
     ids: &[String],
 ) -> Result<std::collections::HashMap<String, String>, StoreError> {
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, target FROM pipeline_definition WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await?;
+    let Some(tenant_id) = tenant_id else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, target FROM pipeline_definition WHERE tenant_id = $1 AND id = ANY($2)",
+    )
+    .bind(tenant_id)
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().collect())
 }
 
@@ -1878,11 +1908,24 @@ pub async fn upsert_lag_state(
     pool: &PgPool,
     update: &LagStateUpdate,
 ) -> Result<PipelineLagState, StoreError> {
+    let mut conn = pool.acquire().await?;
+    upsert_lag_state_conn(&mut conn, update).await
+}
+
+/// In-transaction variant of [`upsert_lag_state`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the database query fails.
+pub async fn upsert_lag_state_conn(
+    conn: &mut sqlx::PgConnection,
+    update: &LagStateUpdate,
+) -> Result<PipelineLagState, StoreError> {
     let sql = format!(
         "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id, consumed_tokens, \
-         consumed_at, pending_since, requested_run_key, requested_tokens, last_check_at, \
-         last_status, behind_streak) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         consumed_at, pending_since, requested_run_key, requested_tokens, requested_at, \
+         request_attempt, last_check_at, last_status, behind_streak) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (pipeline_id) DO UPDATE SET \
             tenant_id = EXCLUDED.tenant_id, \
             consumed_tokens = EXCLUDED.consumed_tokens, \
@@ -1890,6 +1933,8 @@ pub async fn upsert_lag_state(
             pending_since = EXCLUDED.pending_since, \
             requested_run_key = EXCLUDED.requested_run_key, \
             requested_tokens = EXCLUDED.requested_tokens, \
+            requested_at = EXCLUDED.requested_at, \
+            request_attempt = EXCLUDED.request_attempt, \
             last_check_at = EXCLUDED.last_check_at, \
             last_status = EXCLUDED.last_status, \
             behind_streak = EXCLUDED.behind_streak \
@@ -1903,12 +1948,53 @@ pub async fn upsert_lag_state(
         .bind(update.pending_since)
         .bind(&update.requested_run_key)
         .bind(&update.requested_tokens)
+        .bind(update.requested_at)
+        .bind(update.request_attempt)
         .bind(update.last_check_at)
         .bind(&update.last_status)
         .bind(update.behind_streak)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     Ok(PipelineLagState::from(row))
+}
+
+/// BLD-2 review R1 decision R5 / SHOULD-FIX 7: Concurrency.
+///
+/// Reads the pipeline's lag state with `SELECT ... FOR UPDATE` inside `conn`'s
+/// transaction, serializing overlapping checks of the same pipeline.
+/// Inserts an initial empty row if none exists so the lock can be acquired.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the database query fails.
+pub async fn get_lag_state_for_update(
+    conn: &mut sqlx::PgConnection,
+    pipeline_id: &str,
+    tenant_id: Option<Uuid>,
+) -> Result<Option<PipelineLagState>, StoreError> {
+    sqlx::query(
+        "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT (pipeline_id) DO NOTHING",
+    )
+    .bind(pipeline_id)
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+
+    let sql = format!(
+        "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = $1 FOR UPDATE"
+    );
+    let row: Option<LagStateRow> = sqlx::query_as(&sql)
+        .bind(pipeline_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.and_then(|r| {
+        if r.last_check_at.is_none() {
+            None
+        } else {
+            Some(PipelineLagState::from(r))
+        }
+    }))
 }
 
 /// Set (or clear, with `None`) a pipeline's target lag — the store half of
@@ -2007,22 +2093,29 @@ pub async fn lag_pipelines_reading(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
+/// BLD-2 review R1 decision R3 / SHOULD-FIX 9: tenant-scoped
 pub async fn count_lag_pipelines_reading(
     pool: &PgPool,
     pipeline_id: &str,
     target: &str,
+    tenant_id: Option<Uuid>,
 ) -> Result<i64, StoreError> {
+    let Some(tenant_id) = tenant_id else {
+        return Ok(0);
+    };
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*)::bigint FROM pipeline_definition p \
-         WHERE p.id != $1 \
+         WHERE p.tenant_id = $3 \
+           AND p.id != $1 \
            AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
            AND (p.source = $2 OR EXISTS ( \
                   SELECT 1 FROM unnest(p.depends_on) AS up(id) \
                   JOIN pipeline_definition u ON u.id = up.id \
-                  WHERE u.target = $2))",
+                  WHERE u.tenant_id = $3 AND u.target = $2))",
     )
     .bind(pipeline_id)
     .bind(target)
+    .bind(tenant_id)
     .fetch_one(pool)
     .await?;
     Ok(count)
@@ -2030,6 +2123,7 @@ pub async fn count_lag_pipelines_reading(
 
 /// Upstream pipelines whose target lag is `downstream`, and whose target is
 /// read by `pipeline` (directly as its source, or through `depends_on`).
+/// BLD-2 review R1 decision R3 / SHOULD-FIX 9: tenant-scoped.
 ///
 /// # Errors
 ///
@@ -2038,8 +2132,11 @@ pub async fn upstream_downstream_pipelines(
     pool: &PgPool,
     pipeline: &Pipeline,
 ) -> Result<Vec<Pipeline>, StoreError> {
+    let Some(tenant_id) = pipeline.tenant_id else {
+        return Ok(Vec::new());
+    };
     let mut input_tables = vec![pipeline.source.clone()];
-    for target in pipelines_targets(pool, &pipeline.depends_on)
+    for target in targets_for(pool, Some(tenant_id), &pipeline.depends_on)
         .await?
         .into_values()
     {
@@ -2051,6 +2148,7 @@ pub async fn upstream_downstream_pipelines(
     let sql = format!(
         "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
          WHERE target_lag_downstream = true \
+           AND tenant_id = $4 \
            AND id != $1 \
            AND (target = ANY($2) OR id = ANY($3)) \
          ORDER BY id"
@@ -2059,17 +2157,33 @@ pub async fn upstream_downstream_pipelines(
         .bind(&pipeline.id)
         .bind(&input_tables)
         .bind(&pipeline.depends_on)
+        .bind(tenant_id)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(Pipeline::from).collect())
 }
 
+async fn visit_downstream_chain(
+    pool: &PgPool,
+    node: &Pipeline,
+    visited: &mut std::collections::HashSet<String>,
+    order: &mut Vec<Pipeline>,
+) -> Result<(), StoreError> {
+    let upstreams = upstream_downstream_pipelines(pool, node).await?;
+    for u in upstreams {
+        if visited.insert(u.id.clone()) {
+            Box::pin(visit_downstream_chain(pool, &u, visited, order)).await?;
+            order.push(u);
+        }
+    }
+    Ok(())
+}
+
 /// The chain of upstream downstream pipelines, deepest first.
 ///
-/// Walks up the downstream dependencies until reaching inputs that are not
-/// produced by downstream pipelines. Because [`find_target_lag_cycle`] refuses
-/// cycles among lag pipelines at write time, this walk is guaranteed to
-/// terminate.
+/// Walks every downstream input (BLD-2 review R1 BLOCKER 6). Because
+/// [`find_target_lag_cycle`] refuses cycles among lag pipelines at write time,
+/// this walk is guaranteed to terminate.
 ///
 /// # Errors
 ///
@@ -2078,52 +2192,18 @@ pub async fn upstream_downstream_chain(
     pool: &PgPool,
     pipeline: &Pipeline,
 ) -> Result<Vec<Pipeline>, StoreError> {
-    let mut chain = Vec::new();
-    let mut current = pipeline.clone();
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(pipeline.id.clone());
-
-    loop {
-        let upstreams = upstream_downstream_pipelines(pool, &current).await?;
-        let Some(next) = upstreams.into_iter().find(|u| !seen.contains(&u.id)) else {
-            break;
-        };
-        seen.insert(next.id.clone());
-        chain.push(next.clone());
-        current = next;
+    if pipeline.tenant_id.is_none() {
+        return Ok(Vec::new());
     }
-    chain.reverse();
-    Ok(chain)
+    let mut visited = std::collections::HashSet::new();
+    let mut order = Vec::new();
+
+    visit_downstream_chain(pool, pipeline, &mut visited, &mut order).await?;
+    Ok(order)
 }
 
-/// `id → target` for the named pipelines, skipping ids with no row (a
-/// `depends_on` entry may name a `Dagster`-native job).
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if the query fails.
-pub async fn pipelines_targets(
-    pool: &PgPool,
-    ids: &[String],
-) -> Result<std::collections::HashMap<String, String>, StoreError> {
-    if ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, target FROM pipeline_definition WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().collect())
-}
-
-/// BLD-2 plan D7's write-time rule: a pipeline with a target lag may not
-/// (transitively) read the table it writes. A lag pipeline whose input is
-/// another lag pipeline's output would otherwise ask for a run inside the
-/// run it is waiting for — forever, in the worst case.
-///
-/// `Ok(None)` means acyclic, which is every pipeline that is not its own
-/// upstream. `Ok(Some(path))` is the cycle, starting and ending at
+/// Helper DFS for cycle detection starting from `current` and looking for `target`.
+/// BLD-2 review R1 SHOULD-FIX 10.
 fn dfs_cycle(
     current: &str,
     target: &str,
@@ -2177,16 +2257,30 @@ pub async fn find_target_lag_cycle_conn(
     conn: &mut sqlx::PgConnection,
     pipeline_id: &str,
 ) -> Result<Option<Vec<String>>, StoreError> {
-    let targets =
-        sqlx::query_as::<_, (String, String)>("SELECT id, target FROM pipeline_definition")
-            .fetch_all(&mut *conn)
+    // BLD-2 review R1 decision R3 / SHOULD-FIX 9: tenant-scoped
+    let row: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT tenant_id FROM pipeline_definition WHERE id = $1")
+            .bind(pipeline_id)
+            .fetch_optional(&mut *conn)
             .await?;
+
+    let Some((Some(tenant_id),)) = row else {
+        return Ok(None);
+    };
+
+    let targets = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, target FROM pipeline_definition WHERE tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await?;
     let target_of: std::collections::HashMap<String, String> = targets.into_iter().collect();
 
     let lag_rows = sqlx::query_as::<_, (String, String, Vec<String>)>(
         "SELECT id, source, depends_on FROM pipeline_definition \
-         WHERE target_lag_seconds IS NOT NULL OR target_lag_downstream",
+         WHERE tenant_id = $1 AND (target_lag_seconds IS NOT NULL OR target_lag_downstream)",
     )
+    .bind(tenant_id)
     .fetch_all(&mut *conn)
     .await?;
 

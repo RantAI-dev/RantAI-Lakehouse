@@ -2001,3 +2001,39 @@ async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_writ
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (neither)");
     }
 }
+
+/// BLD-2 review R1 BLOCKER 7: lag-check route authorization asserted both ways.
+#[tokio::test]
+async fn lag_check_route_authorization_asserted_both_ways() {
+    let TestApp { router, pool } = spin_up().await;
+    let uri = "/api/pipelines/runnable/pl-test/lag-check";
+
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/pipelines/runnable/{id}/lag-check")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("pipeline:read")),
+    );
+
+    // Platform admin has pipeline:read and passes the service_or_admin handler check
+    let allowed = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let refused_user = common::create_principal_with_permissions(&pool, "query:read").await;
+    let refused = common::session_cookie_for_user(&pool, refused_user).await;
+
+    // A user with wrong permission gets 403
+    let resp = request_with_cookie(&router, "POST", uri, &refused).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // No credentials gets 401
+    let resp = request_with_cookie(&router, "POST", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Allowed principal gets past auth gate (not 401/403)
+    let resp = request_with_cookie(&router, "POST", uri, &allowed).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "allowed principal must get past auth gate, got {}",
+        resp.status()
+    );
+}

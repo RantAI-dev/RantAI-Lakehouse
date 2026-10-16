@@ -1204,12 +1204,16 @@ def build_authored_dependency_sensor(
 # Built at Dagster code-load time, same pattern `agent_run_schedules`
 # (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
 # for every way this degrades to empty lists without raising.
-# Three plain assignments rather than tuple unpacking, so
-# `ops/lint/check_intra_package_imports.py` (which reads module-level
-# names statically) sees all four names `definitions.py` imports.
+def lag_sensor_name(pipeline_id: str) -> str:
+    """BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory."""
+    safe_id = _dagster_safe_name(pipeline_id)
+    return f"authored__{safe_id}_lag"
+
+
 def build_authored_lag_sensor(
     pipeline: dict[str, Any],
     authored_job: Any,
+    allowed_jobs: list[Any] | None = None,
     cfg: AuthoredPipelineConfig | None = None,
 ) -> Any | None:
     """BLD-2 D6: one sensor per authored pipeline with a time-based target lag
@@ -1232,18 +1236,27 @@ def build_authored_lag_sensor(
         return None
 
     pipeline_id = pipeline.get("id", "")
-    safe_id = _dagster_safe_name(pipeline_id)
-    sensor_name = f"authored__{safe_id}_lag"
+    sensor_name = lag_sensor_name(pipeline_id)
+
+    # BLD-2 review R1 BLOCKER 2: give the sensor every job it may name
+    jobs_to_attach = list(allowed_jobs) if allowed_jobs else [authored_job]
+    if authored_job not in jobs_to_attach:
+        jobs_to_attach.insert(0, authored_job)
+    allowed_job_names = {j.name for j in jobs_to_attach}
 
     @sensor(
         name=sensor_name,
-        job=authored_job,
+        jobs=jobs_to_attach,
         minimum_interval_seconds=30,
         default_status=DefaultSensorStatus.RUNNING,
     )
     def _lag_sensor(context: Any) -> Any:
         cfg_ = cfg or AuthoredPipelineConfig.from_env()
         if not cfg_.run_token:
+            # BLD-2 review R1 SHOULD-FIX 17: log once why no checks happen when run token unset
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r}: DISPAR_RUN_TOKEN is unset; no lag checks will run"
+            )
             return None
 
         url = f"{cfg_.api_url}/api/pipelines/runnable/{pipeline_id}/lag-check"
@@ -1284,8 +1297,21 @@ def build_authored_lag_sensor(
 
         decision = body.get("decision")
         if decision == "run":
+            # BLD-2 review R1 BLOCKER 2: use body['jobName'] and validate against allowed jobs
             run_key = body.get("runKey")
-            yield RunRequest(run_key=run_key, job_name=authored_job.name)
+            target_job_name = body.get("jobName")
+            if not run_key:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned decision 'run' without runKey; skipping tick"
+                )
+                return None
+            if not target_job_name or target_job_name not in allowed_job_names:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned unexpected jobName {target_job_name!r} "
+                    f"(allowed: {sorted(allowed_job_names)}); skipping tick"
+                )
+                return None
+            yield RunRequest(run_key=run_key, job_name=target_job_name)
 
     return _lag_sensor
 
@@ -1294,15 +1320,25 @@ def build_authored_lag_sensors(
     pipeline_jobs: list[tuple[dict[str, Any], Any]],
     cfg: AuthoredPipelineConfig | None = None,
 ) -> list[Any]:
-    """One lag sensor per authored pipeline with a time-based target lag."""
+    """One lag sensor per authored pipeline with a time-based target lag.
+    BLD-2 review R1 BLOCKER 2: each sensor gets its own job plus the jobs of downstream pipelines it reads.
+    """
+    downstream_jobs = [
+        job for p, job in pipeline_jobs
+        if isinstance(p.get("targetLag"), dict) and p.get("targetLag", {}).get("kind") == "downstream"
+    ]
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
-        sensor_ = build_authored_lag_sensor(pipeline, authored_job, cfg)
+        allowed = [authored_job] + [j for j in downstream_jobs if j.name != authored_job.name]
+        sensor_ = build_authored_lag_sensor(pipeline, authored_job, allowed_jobs=allowed, cfg=cfg)
         if sensor_ is not None:
             sensors.append(sensor_)
     return sensors
 
 
+# Three plain assignments rather than tuple unpacking, so
+# `ops/lint/check_intra_package_imports.py` (which reads module-level
+# names statically) sees all four names `definitions.py` imports.
 _authored_jobs_and_schedules_and_deps = build_authored_definitions()
 authored_jobs = _authored_jobs_and_schedules_and_deps[0]
 authored_schedules = _authored_jobs_and_schedules_and_deps[1]

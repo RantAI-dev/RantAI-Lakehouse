@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useServiceAction } from "@/hooks/use-service"
 import { formatDateTime } from "@/lib/format"
 import { pipelineService } from "@/services"
 import type { PipelineDetail, TargetLag } from "@/services/contracts/pipelines"
@@ -31,8 +32,15 @@ export function PipelineFreshnessPanel({
     if (pipeline.targetLag?.kind === "lag") return pipeline.targetLag.minutes
     return 10
   })
-  const [saving, setSaving] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
+  const [localError, setLocalError] = React.useState<string | null>(null)
+
+  // BLD-2 review R1 BLOCKER 10: use useServiceAction
+  const saveAction = useServiceAction(async (signal, payload: TargetLag | null) => {
+    return pipelineService.setTargetLag(pipeline.id, payload, signal)
+  })
+
+  const saving = saveAction.status === "pending"
+  const error = localError || saveAction.error?.message || null
 
   // Sync state if pipeline changes externally
   React.useEffect(() => {
@@ -47,7 +55,8 @@ export function PipelineFreshnessPanel({
         setMode("downstream")
         setMinutes(10)
       }
-      setError(null)
+      setLocalError(null)
+      saveAction.reset()
     }
   }, [pipeline.targetLag, isEditing])
 
@@ -84,15 +93,13 @@ export function PipelineFreshnessPanel({
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault()
-    setSaving(true)
-    setError(null)
+    setLocalError(null)
 
     let payload: TargetLag | null = null
     if (mode === "lag") {
       const parsedMinutes = Number(minutes)
       if (isNaN(parsedMinutes) || parsedMinutes < 1 || parsedMinutes > 10080) {
-        setError("Minutes must be between 1 and 10080")
-        setSaving(false)
+        setLocalError("Minutes must be between 1 and 10080")
         return
       }
       payload = { kind: "lag", minutes: parsedMinutes }
@@ -100,21 +107,17 @@ export function PipelineFreshnessPanel({
       payload = { kind: "downstream" }
     }
 
-    try {
-      await pipelineService.setTargetLag(pipeline.id, payload)
+    const res = await saveAction.run(payload)
+    if (res) {
       setIsEditing(false)
       onUpdated?.()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      setError(msg)
-    } finally {
-      setSaving(false)
     }
   }
 
   const handleCancel = () => {
     setIsEditing(false)
-    setError(null)
+    setLocalError(null)
+    saveAction.reset()
     if (!pipeline.targetLag) {
       setMode("none")
       setMinutes(10)

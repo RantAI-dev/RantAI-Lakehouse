@@ -2158,6 +2158,8 @@ async fn lag_state_stamps_the_tenant_and_is_deleted_with_the_pipeline(
         pending_since: Some(now),
         requested_run_key: Some("lag:pl-x:abc".to_owned()),
         requested_tokens: Some(serde_json::json!({"bronze.orders": "iceberg:1"})),
+        requested_at: Some(now),
+        request_attempt: 0,
         last_check_at: now,
         last_status: "behind".to_owned(),
         behind_streak: 2,
@@ -2169,12 +2171,16 @@ async fn lag_state_stamps_the_tenant_and_is_deleted_with_the_pipeline(
     assert_eq!(written.last_status.as_deref(), Some("behind"));
     assert_eq!(written.behind_streak, 2);
     assert_eq!(written.requested_run_key.as_deref(), Some("lag:pl-x:abc"));
+    assert_eq!(written.requested_at, Some(now));
+    assert_eq!(written.request_attempt, 0);
 
     let read = pipelines::get_lag_state(&pool, &created.id)
         .await
         .expect("get_lag_state should succeed")
         .expect("the row exists after a check");
     assert_eq!(read.requested_tokens, update.requested_tokens);
+    assert_eq!(read.requested_at, Some(now));
+    assert_eq!(read.request_attempt, 0);
 
     // A second check overwrites rather than duplicating.
     let again = pipelines::LagStateUpdate {
@@ -2183,6 +2189,8 @@ async fn lag_state_stamps_the_tenant_and_is_deleted_with_the_pipeline(
         pending_since: None,
         requested_run_key: None,
         requested_tokens: None,
+        requested_at: None,
+        request_attempt: 0,
         consumed_tokens: Some(serde_json::json!({"bronze.orders": "iceberg:1"})),
         consumed_at: Some(now),
         ..update
@@ -2391,20 +2399,29 @@ async fn target_lag_cycle_through_source_target_edges_is_refused_at_write(
 /// of other pipelines with a target lag that read the given table.
 #[sqlx::test(migrations = "../../migrations")]
 async fn count_lag_pipelines_reading_counts_other_lag_pipelines(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = create_tenant(&pool, &tenant_input("reading-tenant"))
+        .await
+        .expect("tenant")
+        .id
+        .parse()
+        .expect("uuid");
+
     let mut u_inp = input();
     u_inp.name = "u_table_producer".to_owned();
     u_inp.source_zone = "bronze".to_owned();
     u_inp.source_table = "raw".to_owned();
     u_inp.target_zone = "silver".to_owned();
     u_inp.target_table = "u_target".to_owned();
+    u_inp.tenant_id = Some(tenant_id);
     let u = pipelines::create_pipeline(&pool, &u_inp, None)
         .await
         .expect("create u");
 
     // Nobody reads u_target with a target lag yet.
-    let count0 = pipelines::count_lag_pipelines_reading(&pool, &u.id, "silver.u_target")
-        .await
-        .expect("count_lag_pipelines_reading");
+    let count0 =
+        pipelines::count_lag_pipelines_reading(&pool, &u.id, "silver.u_target", Some(tenant_id))
+            .await
+            .expect("count_lag_pipelines_reading");
     assert_eq!(count0, 0);
 
     // Create a pipeline reading u_target with a target lag.
@@ -2415,21 +2432,33 @@ async fn count_lag_pipelines_reading_counts_other_lag_pipelines(pool: PgPool) ->
     reader_inp.target_zone = "gold".to_owned();
     reader_inp.target_table = "reader_target".to_owned();
     reader_inp.target_lag = Some(pipelines::TargetLag::Lag { minutes: 5 });
+    reader_inp.tenant_id = Some(tenant_id);
     let reader = pipelines::create_pipeline(&pool, &reader_inp, None)
         .await
         .expect("create reader");
 
-    let count1 = pipelines::count_lag_pipelines_reading(&pool, &u.id, "silver.u_target")
-        .await
-        .expect("count_lag_pipelines_reading");
+    let count1 =
+        pipelines::count_lag_pipelines_reading(&pool, &u.id, "silver.u_target", Some(tenant_id))
+            .await
+            .expect("count_lag_pipelines_reading");
     assert_eq!(count1, 1);
 
     // The reader itself does not count itself when checking its own target.
-    let count_self =
-        pipelines::count_lag_pipelines_reading(&pool, &reader.id, "gold.reader_target")
-            .await
-            .expect("count_lag_pipelines_reading");
+    let count_self = pipelines::count_lag_pipelines_reading(
+        &pool,
+        &reader.id,
+        "gold.reader_target",
+        Some(tenant_id),
+    )
+    .await
+    .expect("count_lag_pipelines_reading");
     assert_eq!(count_self, 0);
+
+    // BLD-2 review R1 decision R3: NULL tenant links to nothing.
+    let count_null = pipelines::count_lag_pipelines_reading(&pool, &u.id, "silver.u_target", None)
+        .await
+        .expect("count_lag_pipelines_reading");
+    assert_eq!(count_null, 0);
     Ok(())
 }
 
@@ -2437,6 +2466,13 @@ async fn count_lag_pipelines_reading_counts_other_lag_pipelines(pool: PgPool) ->
 /// pipelines deepest first so that the deepest dependency runs first.
 #[sqlx::test(migrations = "../../migrations")]
 async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = create_tenant(&pool, &tenant_input("chain-tenant"))
+        .await
+        .expect("tenant")
+        .id
+        .parse()
+        .expect("uuid");
+
     // U2: bronze.raw -> silver.u2 (downstream)
     let mut u2_inp = input();
     u2_inp.name = "u2_pipe".to_owned();
@@ -2445,6 +2481,7 @@ async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::R
     u2_inp.target_zone = "silver".to_owned();
     u2_inp.target_table = "u2".to_owned();
     u2_inp.target_lag = Some(pipelines::TargetLag::Downstream);
+    u2_inp.tenant_id = Some(tenant_id);
     let u2 = pipelines::create_pipeline(&pool, &u2_inp, None)
         .await
         .expect("create u2");
@@ -2457,6 +2494,7 @@ async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::R
     u1_inp.target_zone = "silver".to_owned();
     u1_inp.target_table = "u1".to_owned();
     u1_inp.target_lag = Some(pipelines::TargetLag::Downstream);
+    u1_inp.tenant_id = Some(tenant_id);
     let u1 = pipelines::create_pipeline(&pool, &u1_inp, None)
         .await
         .expect("create u1");
@@ -2469,6 +2507,7 @@ async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::R
     p_inp.target_zone = "gold".to_owned();
     p_inp.target_table = "p".to_owned();
     p_inp.target_lag = Some(pipelines::TargetLag::Lag { minutes: 10 });
+    p_inp.tenant_id = Some(tenant_id);
     let p = pipelines::create_pipeline(&pool, &p_inp, None)
         .await
         .expect("create p");
@@ -2481,6 +2520,129 @@ async fn upstream_downstream_chain_orders_deepest_first(pool: PgPool) -> sqlx::R
     assert_eq!(
         chain[1].id, u1.id,
         "intermediate upstream (u1) must be second"
+    );
+    Ok(())
+}
+
+/// BLD-2 review R1 BLOCKER 6: `upstream_downstream_chain` walks EVERY downstream
+/// input, not just the first one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upstream_downstream_chain_walks_every_downstream_input(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = create_tenant(&pool, &tenant_input("multi-downstream-tenant"))
+        .await
+        .expect("tenant")
+        .id
+        .parse()
+        .expect("uuid");
+
+    // U1: bronze.orders -> silver.u1 (downstream)
+    let mut u1_inp = input();
+    u1_inp.name = "u1_downstream".to_owned();
+    u1_inp.source_zone = "bronze".to_owned();
+    u1_inp.source_table = "orders".to_owned();
+    u1_inp.target_zone = "silver".to_owned();
+    u1_inp.target_table = "u1".to_owned();
+    u1_inp.target_lag = Some(pipelines::TargetLag::Downstream);
+    u1_inp.tenant_id = Some(tenant_id);
+    let u1 = pipelines::create_pipeline(&pool, &u1_inp, None)
+        .await
+        .expect("create u1");
+
+    // U2: bronze.customers -> silver.u2 (downstream)
+    let mut u2_inp = input();
+    u2_inp.name = "u2_downstream".to_owned();
+    u2_inp.source_zone = "bronze".to_owned();
+    u2_inp.source_table = "customers".to_owned();
+    u2_inp.target_zone = "silver".to_owned();
+    u2_inp.target_table = "u2".to_owned();
+    u2_inp.target_lag = Some(pipelines::TargetLag::Downstream);
+    u2_inp.tenant_id = Some(tenant_id);
+    let u2 = pipelines::create_pipeline(&pool, &u2_inp, None)
+        .await
+        .expect("create u2");
+
+    // P reads silver.u1 as source AND silver.u2 via depends_on
+    let mut p_inp = input();
+    p_inp.name = "p_multi_reader".to_owned();
+    p_inp.source_zone = "silver".to_owned();
+    p_inp.source_table = "u1".to_owned();
+    p_inp.target_zone = "gold".to_owned();
+    p_inp.target_table = "p_gold".to_owned();
+    p_inp.target_lag = Some(pipelines::TargetLag::Lag { minutes: 15 });
+    p_inp.depends_on = vec![u2.id.clone()];
+    p_inp.tenant_id = Some(tenant_id);
+    let p = pipelines::create_pipeline(&pool, &p_inp, None)
+        .await
+        .expect("create p");
+
+    let chain = pipelines::upstream_downstream_chain(&pool, &p)
+        .await
+        .expect("upstream_downstream_chain");
+    assert_eq!(chain.len(), 2, "both downstream upstreams must be walked");
+    let ids: Vec<&str> = chain.iter().map(|u| u.id.as_str()).collect();
+    assert!(ids.contains(&u1.id.as_str()), "chain must include u1");
+    assert!(ids.contains(&u2.id.as_str()), "chain must include u2");
+    Ok(())
+}
+
+/// BLD-2 review R1 SHOULD-FIX 8: `update_pipeline` must run target-lag cycle check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_id = create_tenant(&pool, &tenant_input("cycle-update-tenant"))
+        .await
+        .expect("tenant")
+        .id
+        .parse()
+        .expect("uuid");
+
+    // P1: bronze.raw -> silver.p1 (lag 10m)
+    let mut p1_inp = input();
+    p1_inp.name = "p1_lag".to_owned();
+    p1_inp.source_zone = "bronze".to_owned();
+    p1_inp.source_table = "raw".to_owned();
+    p1_inp.target_zone = "silver".to_owned();
+    p1_inp.target_table = "p1".to_owned();
+    p1_inp.target_lag = Some(pipelines::TargetLag::Lag { minutes: 10 });
+    p1_inp.tenant_id = Some(tenant_id);
+    let p1 = pipelines::create_pipeline(&pool, &p1_inp, None)
+        .await
+        .expect("create p1");
+
+    // P2: silver.p1 -> silver.p2 (downstream)
+    let mut p2_inp = input();
+    p2_inp.name = "p2_down".to_owned();
+    p2_inp.source_zone = "silver".to_owned();
+    p2_inp.source_table = "p1".to_owned();
+    p2_inp.target_zone = "silver".to_owned();
+    p2_inp.target_table = "p2".to_owned();
+    p2_inp.target_lag = Some(pipelines::TargetLag::Downstream);
+    p2_inp.tenant_id = Some(tenant_id);
+    let _p2 = pipelines::create_pipeline(&pool, &p2_inp, None)
+        .await
+        .expect("create p2");
+
+    // Updating P1 to read from silver.p2 creates a cycle: P1 -> P2 -> P1!
+    let update_input = pipelines::UpdatePipelineInput {
+        kind: p1.kind,
+        source_zone: "silver".to_owned(),
+        source_table: "p2".to_owned(),
+        target_zone: p1.target_zone,
+        target_table: p1.target_table,
+        schedule: p1.schedule,
+        description: p1.description,
+        incremental_column: p1.incremental_column,
+        fbic_enabled: p1.fbic_enabled,
+        transforms: p1.transforms,
+        owner: p1.owner,
+        max_retries: Some(p1.max_retries),
+        depends_on: None,
+    };
+    let err = pipelines::update_pipeline(&pool, &p1.id, &update_input, None)
+        .await
+        .expect_err("cycle update must be refused");
+    assert!(
+        matches!(err, StoreError::Validation(ref msg) if msg.contains("cycle")),
+        "expected cycle validation error, got: {err:?}"
     );
     Ok(())
 }

@@ -538,12 +538,17 @@ pub(super) async fn set_pipeline_target_lag(
     if pipeline_arg.is_empty() {
         return json!({ "error": "pipeline is required" });
     }
-    let target_lag: Option<lakehouse_store::pipelines::TargetLag> = match args.get("targetLag") {
-        Some(val) if !val.is_null() => match serde_json::from_value(val.clone()) {
+    // BLD-2 review R1 SHOULD-FIX 12: require targetLag explicitly
+    let Some(target_lag_val) = args.get("targetLag") else {
+        return json!({ "error": "targetLag is required (use null to clear)" });
+    };
+    let target_lag: Option<lakehouse_store::pipelines::TargetLag> = if target_lag_val.is_null() {
+        None
+    } else {
+        match serde_json::from_value(target_lag_val.clone()) {
             Ok(tl) => Some(tl),
             Err(err) => return json!({ "error": format!("invalid targetLag: {err}") }),
-        },
-        _ => None,
+        }
     };
     let pool = match crate::routes::pipelines::pool(state) {
         Ok(pool) => pool,
@@ -552,19 +557,38 @@ pub(super) async fn set_pipeline_target_lag(
         // own classified body, never this error value's text copied by hand.
         Err(err) => return api_result_to_value::<()>(Err(crate::error::ApiRejection(err))).await,
     };
+    // BLD-2 review R1 BLOCKER 1: name lookup scoped to caller's tenant; db errors propagated
     let pipeline_id = if pipeline_arg.starts_with("pl-") {
         pipeline_arg.clone()
     } else {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1 LIMIT 1",
-        )
-        .bind(&pipeline_arg)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
-        match row {
-            Some((id,)) => id,
-            None => pipeline_arg.clone(),
+        let query_res = match principal.tenant_id {
+            Some(tenant_id) => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT id FROM pipeline_definition WHERE (name = $1 OR target = $1) AND tenant_id = $2 LIMIT 1",
+                )
+                .bind(&pipeline_arg)
+                .bind(tenant_id)
+                .fetch_optional(pool)
+                .await
+            }
+            None => {
+                sqlx::query_as::<_, (String,)>(
+                    "SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1 LIMIT 1",
+                )
+                .bind(&pipeline_arg)
+                .fetch_optional(pool)
+                .await
+            }
+        };
+        match query_res {
+            Ok(Some((id,))) => id,
+            Ok(None) => pipeline_arg.clone(),
+            Err(err) => {
+                return api_result_to_value::<()>(Err(
+                    lakehouse_store::StoreError::from(err).into()
+                ))
+                .await;
+            }
         }
     };
     let res = crate::routes::authored_pipelines::apply_set_target_lag(
@@ -1062,6 +1086,109 @@ mod t1_3_tests {
                 .unwrap()
                 .starts_with("invalid targetLag"),
             "got {res}"
+        );
+    }
+
+    /// BLD-2 review R1 SHOULD-FIX 12: tool refuses omitted targetLag
+    #[tokio::test]
+    async fn set_pipeline_target_lag_refuses_omitted_target_lag() {
+        let state = state();
+        let principal = fixture_user_principal();
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("pl-test"));
+        let res = set_pipeline_target_lag(&state, Some(&principal), &args).await;
+        assert_eq!(
+            res,
+            json!({ "error": "targetLag is required (use null to clear)" })
+        );
+    }
+
+    /// BLD-2 review R1 BLOCKER 1: the assistant tool refuses cross-tenant pipelines
+    /// by id and by name, returning 404 and leaving state untouched.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn set_pipeline_target_lag_refuses_cross_tenant_by_id_and_by_name(pool: PgPool) {
+        let mut cfg = HashMap::new();
+        let state = AppState::new(Config::from_map(&cfg).unwrap()).with_pg(pool.clone());
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+
+        // Seed tenant B's pipeline
+        let created = lakehouse_store::pipelines::create_pipeline(
+            &pool,
+            &lakehouse_store::pipelines::CreatePipelineInput {
+                name: "b-pipeline".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "raw".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "b_target".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_b),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: None,
+                target_lag: None,
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create pipeline for tenant B");
+
+        // Tenant A principal
+        let principal_a = Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            display_name: "User A".to_owned(),
+            email: "user_a@example.com".to_owned(),
+            tenant_id: Some(tenant_a),
+            permissions: PermissionSet::from_iter([
+                "pipeline:read".parse().unwrap(),
+                "pipeline:write".parse().unwrap(),
+            ]),
+        };
+
+        // 1. Try to set by tenant B's id
+        let mut args_by_id = Map::new();
+        args_by_id.insert("pipeline".to_owned(), json!(created.id));
+        args_by_id.insert(
+            "targetLag".to_owned(),
+            json!({ "kind": "lag", "minutes": 10 }),
+        );
+        let res_id = set_pipeline_target_lag(&state, Some(&principal_a), &args_by_id).await;
+        assert_eq!(
+            res_id["error"],
+            json!(format!("Pipeline {} not found", created.id)),
+            "cross-tenant id must return not found"
+        );
+
+        // 2. Try to set by tenant B's name
+        let mut args_by_name = Map::new();
+        args_by_name.insert("pipeline".to_owned(), json!("b-pipeline"));
+        args_by_name.insert(
+            "targetLag".to_owned(),
+            json!({ "kind": "lag", "minutes": 10 }),
+        );
+        let res_name = set_pipeline_target_lag(&state, Some(&principal_a), &args_by_name).await;
+        assert_eq!(
+            res_name["error"],
+            json!("Pipeline b-pipeline not found"),
+            "cross-tenant name must return not found"
+        );
+
+        // Verify tenant B's pipeline lag was not changed
+        let stored = lakehouse_store::pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(
+            stored.target_lag, None,
+            "pipeline target lag must remain untouched"
         );
     }
 }
