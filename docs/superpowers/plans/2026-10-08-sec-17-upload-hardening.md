@@ -468,3 +468,12 @@ full output):
 ```
 5792792e5d8c	refs/heads/fix/sec-17-upload-hardening
 ```
+
+Round 3, reviewed 2026-10-16 at `5792792e` (developer: DeepSeek v4.1 flash,
+opencode free). BLOCKER 1 fixed: the test now asserts what the reworked
+wizard shows after a refusal (the chosen file's name and its "Choose
+another" control) and still that pressing Next sends again; nothing it
+asserted was dropped. Planner: `bun test src/features/connectors` 242 pass,
+0 fail; `bun run typecheck` exit 0; `bun run lint` 0 errors, 8 warnings.
+`origin/main` merged again (`CHANGELOG.md`: both sides kept). No open
+`BLOCKER`.

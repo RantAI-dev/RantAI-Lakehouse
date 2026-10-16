@@ -60,7 +60,7 @@ No. The assistant does not upload files or write CSV files.
 
 ## Decisions
 
-Until signed, the default is used.
+Signed by the product owner on 2026-10-15: the defaults below, as built.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
