@@ -59,7 +59,7 @@ filters in the page address — by default; a separate `save_board_filters`
 saves the board's default when the person asks for it, through Confirm,
 and refuses on the built-in Main board as the console does. The page
 context the assistant reads lists the active filters as compact JSON,
-within the same 5,000-character budget as before, and falls back to the
+within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap, and falls back to the
 chip summary when it does not. Decision 8 is closed; the assistant-parity
 gap this section used to call out is now closed.
 

@@ -275,7 +275,7 @@ once a first release is tagged.
   the on-screen time grain (the override on the dashboard's grain
   control) and the board's saved grain reach the prompt and the
   dashboard page's effect dependency list. The active filters also enter
-  as compact JSON (`FilterDef[]`) within a 5,000-character budget; when
+  as compact JSON (`FilterDef[]`) within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap; when
   over, the JSON is left out and the chip summary stays. **Limits.**
   **Undo is not built** — boards have no version history yet; the row
   waits for `BI-18` (version history part) and a new backlog row is
