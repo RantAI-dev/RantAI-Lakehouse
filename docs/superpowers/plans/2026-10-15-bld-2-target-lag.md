@@ -684,3 +684,137 @@ run therefore lands late by about that gap, whatever the target.
 - **R6c.** The result file states both measurements above (1-minute and
   2-minute targets before R6a) and the final one, each with its commit,
   so the floor is shown as measured, not chosen.
+
+### Round 2 (planner, at `dc1d5e41dd2e`)
+
+Two review passes (Rust; Dagster/TypeScript/gate/docs) checked every
+round-1 finding and R1–R6 against the code and the logs in
+`/home/shiro/rantai/review/`. Most fixes are real and tested; the open items
+are below. The reviewer's full verification runs on the head after this
+round (it includes a merge of `main`).
+
+**Planner correction (principle 5).** R6 quoted the pre-R6a 2-minute run as
+`[103.33, 111.42, 121.44, 123.77, 123.76]` s from
+`bld2-gate-r1.log`. Those numbers were read from that file at ~20:00 UTC,
+but a second gate run on the same commit (`9a59250c77ec`, project
+`bld2r1f`, started 20:01:03) overwrote the file. What survives is that
+second run: `[103.5, 129.77, 115.69, 101.79, 129.69]` s, `FAILED … max=129.77s`
+(`bld2-gate-r1.log:718,736`, exit 1). R6's conclusion stands on the
+surviving run; the first run's numbers have no log and are not to be
+quoted as measured.
+
+#### Decisions for this round (planner)
+
+- **R7. One more merge of `main`** (25 commits: BLD-4 #189 rewrote the
+  `ingest_job` path in `authored_factory.py`, the g7 gate, `docker-compose.yml`
+  and `ci.yml`; the assistant dashboard tools #188/#190 changed
+  `routes/ai/registry.rs`, `tools/mod.rs`, `prompt.rs`, `audit.rs` and
+  `tool_schemas.json`). Hunk by hunk (rule 9): keep both sides' intent,
+  regenerate `tool_schemas.json` with the fixture test rather than merging
+  it by hand, and keep BLD-4's g7 chain steps and BLD-2's lag steps both.
+- **R8. Re-measure 1 minute under R6a.** The 1-minute target was only ever
+  measured before R6a. After the fixes and the merge, run the gate once
+  with a 1-minute target: if all 5 samples are ≤ 60 s and the unchanged
+  checks pass, the floor goes back to **1 minute** (the owner's signed
+  target) in the route, the migration CHECK, the tool schema, the console
+  and the docs; otherwise keep 2 minutes, with both runs in the result
+  file. Either way, finish with a 2-minute (or the final floor's) gate run on
+  the final head and quote it.
+- **R9. A lost request (R1) is not an attempt (R2).** Only a run that
+  Dagster created and that ended FAILURE/CANCELED counts toward
+  `request_attempt`.
+- **R10. Retries exhausted reads `behind`**, with the reason "the last N
+  runs for this change failed; the next input change starts again",
+  whatever the lag: the change will not be consumed, so the table is behind
+  it.
+- **R11. `wip` checkpoint `1bc2e332` stays** (no force-push on a pushed
+  branch); the Handoff names what it holds and which later commits finish
+  each part.
+
+#### BLOCKER
+
+1. **The PUT regressed: a caller acting in a tenant other than their
+   first gets 404.** `apply_set_target_lag` re-checks scope with
+   `&HeaderMap::new()`, so `X-Tenant` is dropped and
+   `tenant_scope::resolve` falls back to `principal.tenant_ids.first()`.
+   Pass the caller's headers in (the tool passes its own, as its other
+   calls do); test a user in tenants [A, B] with `X-Tenant: B` saving a lag
+   on a B pipeline (200), and a Platform Admin acting through `X-Tenant`.
+2. **R2 / round-1 BLOCKER 4 are not done for a downstream upstream U.**
+   `evaluate_upstream_chain` requests U with `request_attempt` but never
+   stops after U's `max_retries + 1` and never resets U's attempt when U's
+   tokens change. Apply the same rule as P (shared helper, rule 4); test a
+   U whose run keeps failing.
+3. **R5 is half done.** U's state row is read without a lock and written
+   outside P's transaction (`get_lag_state` / `upsert_lag_state(pool, …)`
+   in the D7 branch). Lock and write U's row in the same transaction as P's.
+4. **The result file misquotes the gate log** (`BLD-2-TARGET-LAG-RESULT.md`):
+   the pre-R6a 2-minute row gives numbers that are in no log, and says
+   `bld2-gate-r1.log` "holds only its first sample", which is false (it holds
+   five and a FAILED line; see the correction above). The 1-minute row names
+   no commit. "24.87 s of headroom" is computed, not measured — label it.
+   "Every line appears twice … identical" is false. The fingerprint section
+   quotes a 2-column query; the real `mart_content_fingerprint`
+   (`gold_export_history.rs`) has 3 columns, and `bld2-gate-r1.log` holds the
+   real one at 0.011 s: quote that text. Rewrite the file from the logs that
+   exist, plus the R8 runs.
+5. **`CHANGELOG.md` still says 1 minute** ("down to a minute", "with the
+   measured 1-minute target", the round-1 samples 52.65 s … 6.23 s, which no
+   log holds). Describe the floor as R8 leaves it and cite the result file.
+6. **The Handoff misstates the evidence (rule 7):** "one sample in
+   `bld2-gate-r1.log`", and the fingerprint row. Correct both.
+
+#### SHOULD-FIX
+
+1. Status writes for U: never hard-code `behind` for a pipeline with no
+   target; when U is unchanged, record the check (`last_check_at`) so its
+   page does not fall to "no check recorded"; do not copy an old status
+   forward on settle.
+2. The lag-check handler's unparseable-source branch: do not `let _ =`
+   a database error; do not wipe the row (consumed tokens, request,
+   attempt); run it after the no-target-lag guard.
+3. A manual `lag-check` on a `downstream` pipeline answers `wait`.
+4. Stale docs (rule 1): `LagCheckOutcome::run_key` and `run_key_for` (the
+   `:<attempt>` suffix; "the same change always produces the same key" is no
+   longer true); `PipelineLagState::requested_run_key` (the CHECK now allows
+   tokens without a key); the `settle_request` bullets (lost-request case);
+   `authored_factory.py:33` "down to 1 minute"; the floor's justification in
+   the migration header and `MIN_TARGET_LAG_MINUTES` must cite the R6b/R8
+   runs, not the pre-R6a 68.94 s.
+5. Tests that no longer prove what they say (rule 2): the store CHECK test
+   uses 90 s for "not a whole minute" but 90 is now below the floor, so use
+   e.g. 150; `find_run_by_run_key`'s ordering test has creation == start in
+   both fixtures (make them differ) and a spliced doc comment; the
+   `failed_run_retries…` test asserts `Behind` only because nothing was
+   consumed (add a consumed-before case, per R10).
+6. Dead code / duplicates (rule 4): `lag_pipelines_reading` has no caller and
+   no tenant filter (delete it); `FakeTokens::with_error` duplicates
+   `unreadable`; build `LagStateUpdate` and the repeated `map_err` through one
+   helper each instead of six and fifteen copies.
+7. Sensor jobs: attach only the jobs of the downstream pipelines a lag
+   pipeline actually reads (not every downstream pipeline in the location),
+   and test that wiring and that the skip warnings are logged.
+8. Gate: drop the sensor-ticks/runs debug probe from the timed loop;
+   `raise_for_status()` on the remaining calls (`pipe_detail`, the
+   unchanged-check loop); hard-code `PGHOST: postgres` / `PGPORT: "5432"` for
+   the runner like every other service (no `${PGHOST:-…}` from the
+   operator's shell) and drop the duplicate `PG*`/`POSTGRES_*` pair; make the
+   gate's sensor-name derivation match `_dagster_safe_name` exactly or soften
+   the docstring; final newline in `ops/g7/Dockerfile`, and one of its `CMD`
+   or the compose `command`, not both.
+9. `ops/ai_eval/cases.json`: the `minutes` match is key-order sensitive
+   (`str(v) in str(args[k])`); match `targetLag.minutes` itself.
+10. Console: test that a value below the floor is refused with the floor's
+    message, and that an unknown widened `kind` renders honestly.
+11. The tool description says "the floor the gate measured on this stack":
+    say the minimum plainly in model-facing text.
+12. `authored_factory.py`: put the "Built at Dagster code-load time…" comment
+    back with the assignments it describes (round-1 SHOULD-FIX 18, half done);
+    log the unset run token once, not every tick.
+
+#### For the product owner (planner, after merge)
+
+`docs/core/features/pipeline-target-lag.md` still says "from 1 minute to 7
+days"; it is updated with the floor R8 settles on, and decision 2 needs the
+owner's signature if that floor is not 1 minute. 6.4 (`BLD-2-AC4`) still
+stands.
