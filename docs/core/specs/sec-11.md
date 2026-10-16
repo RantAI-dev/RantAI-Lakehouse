@@ -3,11 +3,10 @@
 | | |
 | --- | --- |
 | Backlog | `SEC-11` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Security |
-| Who builds it | Security, shared with the AI team for the agent endpoints |
-| When | Now |
+| Module | Administration & Security |
+| Also involves | AI Copilot |
 | Size | S (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -35,10 +34,9 @@ From the BI and Data audits: routes/support.rs, dashboard.rs, embed.rs, agent.rs
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] A grep test or unit test shows no route builds a response from err.to_string() of an upstream error
-- [ ] A forced ClickHouse error on a public dashboard shows the fixed message
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SEC-11-AC1` A grep test or unit test shows no route builds a response from err.to_string() of an upstream error
+- `SEC-11-AC2` A forced ClickHouse error on a public dashboard shows the fixed message
+- `SEC-11-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

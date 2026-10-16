@@ -3,7 +3,7 @@ import type { ConnectorType, DiscoverResult, IngestRunResult } from "@/services/
 
 describe("ingest-tier1 contracts", () => {
   it("ConnectorType round-trips a planned type with no adapter", () => {
-    const fixture: ConnectorType = { name: "Kafka", adapter: null, supported: false, docsUrl: null }
+    const fixture: ConnectorType = { name: "Kafka", adapter: null, supported: false, docsUrl: null, unsupportedReason: null }
     expect(fixture.supported).toBe(false)
   })
   it("IngestRunResult represents CDC's honest unsupported shape without a runId", () => {

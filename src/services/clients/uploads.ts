@@ -89,6 +89,7 @@ export const uploadService: UploadService = {
     if (chosen.encoding !== undefined) query.set("encoding", chosen.encoding)
     if (chosen.delimiter !== undefined) query.set("delimiter", chosen.delimiter)
     if (chosen.headerRow !== undefined) query.set("headerRow", String(chosen.headerRow))
+    if (chosen.sheet !== undefined) query.set("sheet", chosen.sheet)
     const text = query.toString()
     return readJson<UploadPreview>(
       await apiFetch(uploadUrl(id, `/preview${text === "" ? "" : `?${text}`}`), { signal })

@@ -41,7 +41,7 @@
 //! themselves are still read only through `run_sql`, which goes through
 //! `routes::query::run` and its masking/row-filter enforcement. Sample
 //! values are read unmasked from `ClickHouse` here, so a column that a
-//! masking policy covers is listed without samples
+//! masking policy covers is listed without a range or a sample
 //! ([`masked_columns`]). The stats queries also read every row, so a table
 //! that a row-filter policy covers is listed with no stats at all
 //! ([`row_filtered_tables`]).
@@ -252,10 +252,11 @@ pub(crate) async fn cache_is_empty_for_test() -> bool {
 }
 
 /// `(database.table, column)` pairs a masking policy covers for anyone,
-/// read from the authored policies' structured `conditions`. Samples are
-/// withheld for these columns so the prompt never carries a value the
-/// policy engine would have masked in a query result. Deliberately broader
-/// than "masked for this principal": the map is shared across principals.
+/// read from the authored policies' structured `conditions`. A range or
+/// a sample is withheld for these columns so the prompt never carries a
+/// value the policy engine would have masked in a query result.
+/// Deliberately broader than "masked for this principal": the map is
+/// shared across principals.
 pub(crate) fn masked_columns(conditions: &[String]) -> HashSet<(String, String)> {
     let mut out = HashSet::new();
     for raw in conditions {
@@ -312,7 +313,14 @@ pub(crate) const MAX_SYNONYMS: usize = 6;
 /// Longest single synonym, in characters.
 pub(crate) const SYNONYM_CHARS: usize = 40;
 /// The roles a column may have (the `CHECK` on `semantic_entry.role`).
-pub(crate) const ROLES: [&str; 4] = ["measure", "dimension", "time", "key"];
+pub(crate) const ROLES: [&str; 6] = [
+    "measure",
+    "dimension",
+    "time",
+    "key",
+    "flag",
+    "non_additive",
+];
 
 /// What people and the drafting pass wrote about tables and columns, to be
 /// rendered beside the facts the DATA MAP reads from `ClickHouse`: the
@@ -331,6 +339,9 @@ pub(crate) struct Notes {
 struct Note {
     description: String,
     synonyms: Vec<String>,
+    /// The entry's role, whatever its status: a draft's role counts until a
+    /// person changes it.
+    role: Option<String>,
     confirmed: bool,
 }
 
@@ -363,6 +374,7 @@ impl Notes {
                         Note {
                             description: e.description,
                             synonyms: e.synonyms,
+                            role: e.role,
                             confirmed: e.status == "confirmed",
                         },
                     )
@@ -411,6 +423,14 @@ impl Notes {
             .map(|n| one_line(&n.description, COLUMN_TEXT_CHARS))
             .filter(|t| !t.is_empty());
         confirmed.or(source).or(draft)
+    }
+
+    /// A column's role, whatever the entry's status.
+    fn role(&self, asset: &str, column: &str) -> Option<&str> {
+        self.entries
+            .get(&(asset.to_owned(), column.to_owned()))?
+            .role
+            .as_deref()
     }
 
     /// The synonyms of a table (`column` is `""`) or a column that
@@ -638,6 +658,15 @@ fn stats_plan(table: &Table, withheld: Option<&Withheld>) -> Option<(String, Vec
             continue;
         };
         if is_range_type(&col.ty) {
+            // A masked column's smallest and largest value are as private as
+            // its samples: they reach the chat's prompt and the drafting pass.
+            // PR #81 review.
+            if withheld
+                .masked
+                .contains(&(qualified.clone(), col.name.clone()))
+            {
+                continue;
+            }
             exprs.push(format!(
                 "toString(min(`{ident}`)) AS lo{i}, toString(max(`{ident}`)) AS hi{i}"
             ));
@@ -736,27 +765,91 @@ fn is_key_like(name: &str) -> bool {
         || n == "id"
 }
 
+/// How much a table's grain line says.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grain {
+    /// The line the DATA MAP prints: the grain, the measures to `SUM` and
+    /// the columns never to total.
+    Advice,
+    /// The grain columns alone. The facts for a draft use it, because a
+    /// measures list with "SUM them" makes the drafting model read a count
+    /// that can overlap between rows as something to add up.
+    Only,
+}
+
 /// The table's grain and its measures, for the small-model mistake this
 /// was added for: `qwen3:4b` answered "the peak month's visits" with one
 /// country's row (`ORDER BY jumlah DESC LIMIT 1`) instead of the month's
 /// total, because nothing said a row is one combination of several
-/// columns. `None` when the table has no numeric measure.
-fn grain_line(table: &Table) -> Option<String> {
-    let (measures, keys): (Vec<&Column>, Vec<&Column>) = table
+/// columns.
+///
+/// A column's role in `notes` overrides the name and type guess: a numeric
+/// column with the role `flag`, `non_additive`, `key`, `dimension` or `time`
+/// is not a measure. A `flag` or `non_additive` column that would otherwise
+/// be a measure (a number whose name does not look like a key, such as a
+/// year, a month or an id) is not part of the grain either, because it
+/// describes a row instead of naming it. Any other `flag` or `non_additive`
+/// column, such as a text or boolean one, stays among the grain keys,
+/// because rows still differ by it. The `non_additive` columns are listed
+/// after the measures, with the warning not to total them. `None` when no
+/// column names the grain, or when there is neither a measure nor a
+/// `non_additive` column to say anything about.
+///
+/// With [`Grain::Only`] the line names the grain columns and stops: no list
+/// of measures, no "SUM them", no "not additive". The gate above is the
+/// same, so a table with no number to add up has no line in either style.
+fn grain_line(table: &Table, notes: &Notes, style: Grain) -> Option<String> {
+    let asset = format!("{}.{}", table.db, table.name);
+    let role = |c: &Column| notes.role(&asset, &c.name);
+    let would_be_measure = |c: &Column| is_numeric_type(&c.ty) && !is_key_like(&c.name);
+    let (measures, others): (Vec<&Column>, Vec<&Column>) = table.columns.iter().partition(|c| {
+        would_be_measure(c)
+            && !matches!(
+                role(c),
+                Some("flag" | "non_additive" | "key" | "dimension" | "time")
+            )
+    });
+    let keys: Vec<&str> = others
+        .iter()
+        .filter(|c| !(would_be_measure(c) && matches!(role(c), Some("flag" | "non_additive"))))
+        .map(|c| c.name.as_str())
+        .collect();
+    let non_additive: Vec<&str> = table
         .columns
         .iter()
-        .partition(|c| is_numeric_type(&c.ty) && !is_key_like(&c.name));
-    if measures.is_empty() || keys.is_empty() {
+        .filter(|c| role(c) == Some("non_additive"))
+        .map(|c| c.name.as_str())
+        .collect();
+    if keys.is_empty() || (measures.is_empty() && non_additive.is_empty()) {
         return None;
     }
-    let keys: Vec<&str> = keys.iter().map(|c| c.name.as_str()).collect();
-    let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
-    Some(format!(
-        "    grain: one row per {}; measures: {} (SUM them over rows for any total)\n",
-        keys.join(" x "),
-        measures.join(", ")
-    ))
+    let mut line = format!("    grain: one row per {}", keys.join(" x "));
+    if style == Grain::Only {
+        line.push('\n');
+        return Some(line);
+    }
+    if !measures.is_empty() {
+        let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
+        let _ = write!(
+            line,
+            "; measures: {} (SUM them over rows for any total)",
+            measures.join(", ")
+        );
+    }
+    if !non_additive.is_empty() {
+        let _ = write!(
+            line,
+            "; not additive: {} (never SUM these across rows: compute them from a detail table, or say the total cannot be read from this table)",
+            non_additive.join(", ")
+        );
+    }
+    line.push('\n');
+    Some(line)
 }
+
+/// The marker a `non_additive` column carries in the DATA MAP. A test in
+/// `prompt.rs` fails if the chat's count rules stop quoting this marker.
+pub(super) const NON_ADDITIVE_MARKER: &str = " [never SUM across rows]";
 
 /// `720 rows`, or `row count unknown`.
 fn rows_text(table: &Table) -> String {
@@ -775,6 +868,7 @@ fn render_table(
     descriptions: &HashMap<(String, String), String>,
     stats: &HashMap<String, String>,
     notes: &Notes,
+    grain: Grain,
 ) {
     let rows = rows_text(table);
     let _ = write!(out, "- {}.{} ({rows})", table.db, table.name);
@@ -807,8 +901,8 @@ fn render_table(
         out.push_str(&synonyms);
     }
     out.push('\n');
-    if let Some(grain) = grain_line(table) {
-        out.push_str(&grain);
+    if let Some(line) = grain_line(table, notes, grain) {
+        out.push_str(&line);
     }
     for col in &table.columns {
         let _ = write!(out, "    {} {}", col.name, col.ty);
@@ -820,6 +914,11 @@ fn render_table(
         }
         if let Some(synonyms) = notes.synonyms(&asset, &col.name) {
             out.push_str(&synonyms);
+        }
+        match notes.role(&asset, &col.name) {
+            Some("non_additive") => out.push_str(NON_ADDITIVE_MARKER),
+            Some("flag") => out.push_str(" [0/1 flag]"),
+            _ => {}
         }
         if let Some(fact) = stats.get(&col.name) {
             let _ = write!(out, "; {fact}");
@@ -891,9 +990,9 @@ impl Live {
     /// The text the map prints for one table, without any entry or
     /// annotation: name, row count, source description, every column with
     /// its type and stats. `withheld` is read as [`data_map`] reads it, so a
-    /// masked column carries no sample values and a row-filtered table, or
-    /// any table while `withheld` is `None`, carries no stats at all.
-    /// `None` when `asset` is not a live table.
+    /// masked column and a row-filtered table, or any table while `withheld`
+    /// is `None`, carry no stats at all. `None` when `asset` is not a live
+    /// table.
     pub(crate) async fn facts(
         &self,
         ch: &ChClient,
@@ -905,17 +1004,34 @@ impl Live {
             .iter()
             .find(|t| format!("{}.{}", t.db, t.name) == asset)?;
         let stats = column_stats(ch, table, withheld).await;
-        let mut out = String::new();
-        render_table(
-            &mut out,
+        Some(draft_facts(
             table,
             self.dataset(table),
             &self.descriptions,
             &stats.facts,
-            &Notes::default(),
-        );
-        Some(out)
+        ))
     }
+}
+
+/// The text [`Live::facts`] returns for one table, with no `ClickHouse`
+/// call: the same inputs always give the same text.
+fn draft_facts(
+    table: &Table,
+    dataset: Option<&Dataset>,
+    descriptions: &HashMap<(String, String), String>,
+    stats: &HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    render_table(
+        &mut out,
+        table,
+        dataset,
+        descriptions,
+        stats,
+        &Notes::default(),
+        Grain::Only,
+    );
+    out
 }
 
 /// Read every table's facts from `ClickHouse`: the expensive part of the
@@ -1090,6 +1206,7 @@ fn pieces_from(live: &Live, stats: &[Stats], notes: &Notes, withheld: Option<&Wi
             &live.descriptions,
             &stats.facts,
             notes,
+            Grain::Advice,
         );
         tables.push(TablePiece {
             qualified: format!("{}.{}", table.db, table.name),
@@ -1456,6 +1573,95 @@ mod tests {
         assert!(!sql.contains("negara"), "{sql}");
     }
 
+    /// `mart_visits` with a numeric year, a date and a text column: the three
+    /// kinds of column the stats query summarises.
+    fn visits_with_date_table() -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "mart_visits".to_owned(),
+            rows: Some(720),
+            columns: vec![
+                col("tahun", "UInt16"),
+                col("tanggal", "Date"),
+                col("negara", "String"),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_masked_numeric_column_stays_out_of_the_range_query_and_the_other_columns_stay_in() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tahun"]}"#,
+        ]);
+        let Some((sql, plan)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with a column left to summarise must get a stats query");
+        };
+        assert!(!sql.contains("min(`tahun`)"), "{sql}");
+        assert!(!sql.contains("max(`tahun`)"), "{sql}");
+        assert!(sql.contains("min(`tanggal`)"), "{sql}");
+        assert!(sql.contains("uniq(`negara`)"), "{sql}");
+        assert_eq!(plan, vec![(1, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_masked_date_column_stays_out_of_the_range_query_and_the_other_columns_stay_in() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tanggal"]}"#,
+        ]);
+        let Some((sql, plan)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with a column left to summarise must get a stats query");
+        };
+        assert!(!sql.contains("min(`tanggal`)"), "{sql}");
+        assert!(!sql.contains("max(`tanggal`)"), "{sql}");
+        assert!(sql.contains("min(`tahun`)"), "{sql}");
+        assert!(sql.contains("uniq(`negara`)"), "{sql}");
+        assert_eq!(plan, vec![(0, false), (2, true)]);
+    }
+
+    #[test]
+    fn a_table_with_no_masked_column_gets_the_same_stats_query_as_before() {
+        let withheld = withheld_for(&[]);
+        let Some((sql, _)) = stats_plan(&visits_with_date_table(), Some(&withheld)) else {
+            panic!("a table with no row filter must get a stats query");
+        };
+        assert_eq!(
+            sql,
+            "SELECT toString(min(`tahun`)) AS lo0, toString(max(`tahun`)) AS hi0, toString(min(`tanggal`)) AS lo1, toString(max(`tanggal`)) AS hi1, toString(uniq(`negara`)) AS n2, arrayStringConcat(arraySlice(arraySort(groupUniqArray(200)(toString(`negara`))), 1, 12), '\\u001f') AS v2 FROM `serving`.`mart_visits` SETTINGS max_execution_time = 5"
+        );
+    }
+
+    #[test]
+    fn a_table_whose_only_summarised_column_is_masked_gets_no_stats_query() {
+        let withheld = withheld_for(&[
+            r#"{"roles":["Analyst"],"table":"serving.mart_visits","mask":["tahun"]}"#,
+        ]);
+        let only_year = Table {
+            columns: vec![col("tahun", "UInt16")],
+            ..visits_with_date_table()
+        };
+        assert!(stats_plan(&only_year, Some(&withheld)).is_none());
+    }
+
+    #[test]
+    fn a_column_with_no_stats_fact_is_written_with_its_name_and_type_and_no_range() {
+        let table = Table {
+            columns: vec![col("tahun", "UInt16")],
+            ..visits_with_date_table()
+        };
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &table,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Notes::default(),
+            Grain::Advice,
+        );
+        assert!(out.contains("\n    tahun UInt16\n"), "{out}");
+        assert!(!out.contains("range "), "{out}");
+    }
+
     fn cached_without(without: &[&str], age: Duration) -> CacheEntry {
         let Some(built) = Instant::now().checked_sub(age) else {
             panic!("the clock must be older than the test's cache age");
@@ -1531,7 +1737,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            grain_line(&table).as_deref(),
+            grain_line(&table, &Notes::default(), Grain::Advice).as_deref(),
             Some(
                 "    grain: one row per tahun x bulan_no x negara; measures: jumlah (SUM them over rows for any total)\n"
             )
@@ -1540,7 +1746,10 @@ mod tests {
             columns: vec![col("indikator", "String")],
             ..table
         };
-        assert_eq!(grain_line(&only_labels), None);
+        assert_eq!(
+            grain_line(&only_labels, &Notes::default(), Grain::Advice),
+            None
+        );
     }
 
     fn col(name: &str, ty: &str) -> Column {
@@ -1610,6 +1819,7 @@ mod tests {
             &served_descriptions(),
             &served_stats(),
             notes,
+            Grain::Advice,
         );
         out
     }
@@ -1623,6 +1833,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             notes,
+            Grain::Advice,
         );
         out
     }
@@ -1642,6 +1853,35 @@ mod tests {
     origin String
     count UInt32
 ";
+
+    #[test]
+    fn the_facts_for_a_draft_name_the_grain_and_give_no_advice_on_what_to_sum() {
+        let facts = draft_facts(
+            &served_table(),
+            Some(&served_dataset()),
+            &served_descriptions(),
+            &served_stats(),
+        );
+        assert!(
+            facts.contains("    grain: one row per tahun x negara\n"),
+            "{facts}"
+        );
+        assert!(!facts.contains("SUM them"), "{facts}");
+        assert!(!facts.contains("measures:"), "{facts}");
+        assert!(!facts.contains("not additive"), "{facts}");
+        // The column lines are rendered as before.
+        assert!(facts.contains("    jumlah UInt32\n"), "{facts}");
+    }
+
+    #[test]
+    fn the_facts_for_a_table_with_no_number_to_add_up_have_no_grain_line() {
+        let only_labels = Table {
+            columns: vec![col("indikator", "String"), col("negara", "String")],
+            ..served_table()
+        };
+        let facts = draft_facts(&only_labels, None, &HashMap::new(), &HashMap::new());
+        assert!(!facts.contains("grain:"), "{facts}");
+    }
 
     #[test]
     fn with_no_notes_a_table_with_a_dataset_renders_as_it_did_before() {
@@ -1684,6 +1924,287 @@ mod tests {
 
     fn notes(annotations: Vec<AnnotationRow>, entries: Vec<SemanticEntry>) -> Notes {
         Notes::from_rows(annotations, entries)
+    }
+
+    fn with_role(mut e: SemanticEntry, role: &str) -> SemanticEntry {
+        e.role = Some(role.to_owned());
+        e
+    }
+
+    /// `serving.sales` with the given `(name, type)` columns.
+    fn sales_with(columns: &[(&str, &str)]) -> Table {
+        Table {
+            db: "serving".to_owned(),
+            name: "sales".to_owned(),
+            rows: Some(48),
+            columns: columns.iter().map(|(n, t)| col(n, t)).collect(),
+        }
+    }
+
+    /// A role-only entry for a column of `serving.sales`.
+    fn role_of(column: &str, role: &str, confirmed: bool) -> SemanticEntry {
+        with_role(entry("serving.sales", column, "", confirmed), role)
+    }
+
+    const NOT_ADDITIVE_ADVICE: &str = "(never SUM these across rows: compute them from a detail table, or say the total cannot be read from this table)";
+
+    fn render_sales(table: &Table, notes: &Notes) -> String {
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            table,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            notes,
+            Grain::Advice,
+        );
+        out
+    }
+
+    #[test]
+    fn with_no_roles_every_numeric_non_key_column_is_a_measure_and_no_line_is_tagged() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(vec![], vec![]);
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
+            Some(
+                "    grain: one row per year x region; measures: orders, net_amt, active (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(!rendered.contains('['), "{rendered}");
+    }
+
+    #[test]
+    fn a_non_additive_column_leaves_the_measures_and_is_named_with_the_warning() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", true),
+                role_of("net_amt", "measure", true),
+            ],
+        );
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice),
+            Some(format!(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    orders UInt32 [never SUM across rows]\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("    net_amt Float64\n"), "{rendered}");
+    }
+
+    #[test]
+    fn a_flag_column_leaves_the_measures_and_its_line_says_it_is_a_flag() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
+            Some(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    active UInt8 [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn with_every_numeric_column_non_additive_the_line_does_not_tell_the_model_to_sum() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("visitors", "UInt32"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", true),
+                role_of("visitors", "non_additive", true),
+            ],
+        );
+        let line = grain_line(&table, &notes, Grain::Advice).unwrap_or_default();
+        assert!(!line.contains("SUM them"), "{line}");
+        assert!(!line.contains("measures:"), "{line}");
+        assert_eq!(
+            line,
+            format!(
+                "    grain: one row per year x region; not additive: orders, visitors {NOT_ADDITIVE_ADVICE}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_draft_role_counts_the_same_as_a_confirmed_one() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("orders", "UInt32"),
+            ("net_amt", "Float64"),
+            ("active", "UInt8"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![
+                role_of("orders", "non_additive", false),
+                role_of("active", "flag", true),
+            ],
+        );
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice),
+            Some(format!(
+                "    grain: one row per year x region; measures: net_amt (SUM them over rows for any total); not additive: orders {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    orders UInt32 [never SUM across rows]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("    active UInt8 [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dimension_time_or_key_role_takes_a_numeric_column_out_of_the_measures() {
+        for role in ["dimension", "time", "key"] {
+            let table = sales_with(&[
+                ("region", "String"),
+                ("wave", "UInt8"),
+                ("net_amt", "Float64"),
+            ]);
+            let notes = notes(vec![], vec![role_of("wave", role, true)]);
+            assert_eq!(
+                grain_line(&table, &notes, Grain::Advice).as_deref(),
+                Some(
+                    "    grain: one row per region x wave; measures: net_amt (SUM them over rows for any total)\n"
+                ),
+                "role {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_flag_column_stays_in_the_grain_and_its_line_says_it_is_a_flag() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("active", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice).as_deref(),
+            Some(
+                "    grain: one row per year x region x active; measures: net_amt (SUM them over rows for any total)\n"
+            )
+        );
+        let rendered = render_sales(&table, &notes);
+        assert!(
+            rendered.contains("    active String [0/1 flag]\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_text_non_additive_column_stays_in_the_grain_and_is_not_listed_as_a_measure() {
+        let table = sales_with(&[
+            ("year", "UInt16"),
+            ("region", "String"),
+            ("band", "String"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(vec![], vec![role_of("band", "non_additive", true)]);
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice),
+            Some(format!(
+                "    grain: one row per year x region x band; measures: net_amt (SUM them over rows for any total); not additive: band {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_numeric_non_additive_column_with_a_key_like_name_stays_in_the_grain() {
+        let table = sales_with(&[
+            ("region", "String"),
+            ("monthly_active_users", "UInt64"),
+            ("net_amt", "Float64"),
+        ]);
+        let notes = notes(
+            vec![],
+            vec![role_of("monthly_active_users", "non_additive", true)],
+        );
+        assert_eq!(
+            grain_line(&table, &notes, Grain::Advice),
+            Some(format!(
+                "    grain: one row per region x monthly_active_users; measures: net_amt (SUM them over rows for any total); not additive: monthly_active_users {NOT_ADDITIVE_ADVICE}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_table_left_with_no_measure_and_no_non_additive_column_has_no_grain_line() {
+        let table = sales_with(&[("region", "String"), ("active", "UInt8")]);
+        let notes = notes(vec![], vec![role_of("active", "flag", true)]);
+        assert_eq!(grain_line(&table, &notes, Grain::Advice), None);
+    }
+
+    #[test]
+    fn the_role_tag_follows_the_description_and_synonyms_and_precedes_the_stats() {
+        let table = sales_with(&[("region", "String"), ("orders", "UInt32")]);
+        let notes = notes(
+            vec![],
+            vec![with_role(
+                with_synonyms(
+                    entry("serving.sales", "orders", "Orders placed", true),
+                    &["purchases"],
+                ),
+                "non_additive",
+            )],
+        );
+        let mut out = String::new();
+        render_table(
+            &mut out,
+            &table,
+            None,
+            &HashMap::new(),
+            &HashMap::from([("orders".to_owned(), "range 1..9".to_owned())]),
+            &notes,
+            Grain::Advice,
+        );
+        assert!(
+            out.contains(
+                "    orders UInt32 — Orders placed (also called: purchases) [never SUM across rows]; range 1..9\n"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

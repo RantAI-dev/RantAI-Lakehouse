@@ -19,6 +19,7 @@ use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
 use crate::state::AppState;
+use crate::upstream_error;
 
 fn pool(state: &AppState) -> Result<&PgPool, Value> {
     state.pg.as_deref().ok_or_else(|| {
@@ -59,7 +60,7 @@ pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> V
     // id of its own to record as the author.
     match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None).await {
         Ok(saved) => json!({ "ok": true, "query": saved }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::store(&upstream_error::STORE, &err).to_json(),
     }
 }
 
@@ -70,7 +71,7 @@ pub(super) async fn list_saved_queries(state: &AppState) -> Value {
     };
     match queries::list_saved(pool).await {
         Ok(saved) => json!({ "queries": saved }),
-        Err(err) => json!({ "error": err.to_string() }),
+        Err(err) => upstream_error::store(&upstream_error::STORE, &err).to_json(),
     }
 }
 
@@ -89,7 +90,7 @@ pub(super) async fn run_saved_query(
     };
     let saved = match queries::list_saved(pool).await {
         Ok(all) => all.into_iter().find(|q| q.id == id),
-        Err(err) => return json!({ "error": err.to_string() }),
+        Err(err) => return upstream_error::store(&upstream_error::STORE, &err).to_json(),
     };
     let Some(saved) = saved else {
         return json!({ "error": "saved query tidak ditemukan" });

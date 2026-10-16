@@ -16,7 +16,6 @@ use lakehouse_core::secret::{
     SecretError, SecretResolver, SecretValue,
 };
 use lakehouse_dagster::DgClient;
-use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
@@ -25,6 +24,7 @@ use time::Duration;
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
+use crate::catalog_search_cache::SearchSnapshotCache;
 use crate::config::Config;
 use crate::connector_secret_store::ConnectorSecretStore;
 use crate::gold_lock::MartLocks;
@@ -76,8 +76,6 @@ pub struct AppState {
     pub clickhouse: Arc<ChClient>,
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
-    /// Resolves and caches the signed-embedding (`JWT`) secret.
-    pub embed_secret: Arc<EmbedSecretResolver>,
     /// `OpenAI`-compatible chat-completions client.
     pub llm: Arc<LlmClient>,
     /// Phase 2 OLTP pool (`lakehouse-store`).
@@ -144,6 +142,12 @@ pub struct AppState {
     /// populated (same pattern as [`Self::gold_export_locks`]): it needs
     /// no external dependency, just an in-process map.
     pub bronze_stats_cache: Arc<BronzeStatsCache>,
+    /// The copy of the assembled catalog that `GET /api/catalog?q=` and
+    /// `GET /api/catalog/query?search=` read instead of rebuilding it per
+    /// search (`DATA-11` D2) — see [`crate::catalog_search_cache`]. Always
+    /// populated, like [`Self::bronze_stats_cache`]; holds nothing per
+    /// caller.
+    pub catalog_search_cache: Arc<SearchSnapshotCache>,
     /// `Trino` `/v1/statement` client for `routes::query::run`'s
     /// `engine: "trino"` path (WS2 §4). Always present, like
     /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
@@ -198,9 +202,16 @@ pub struct AppState {
     /// [`Arc`]) across every clone of [`AppState`] so the login
     /// handler reads it without copying.
     pub throttle_policy: Arc<ThrottlePolicy>,
-    /// Counts the files being received by `POST /api/uploads` (`SEC-17`),
+/// Counts the files being received by `POST /api/uploads` (`SEC-17`),
     /// per user and in total. Shared across clones; always populated.
     pub upload_receive: ReceiveLimiter,
+    /// Test seam for the alert webhook sender (merge of `SEC-10` into the
+    /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
+    /// listener on loopback, which the real address policy refuses by
+    /// design and no setting can open. Compiled only for this crate's tests,
+    /// so a service build has no way to swap the policy.
+    #[cfg(test)]
+    pub webhook_sender_override: Option<lakehouse_notify::WebhookSender>,
 }
 
 /// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
@@ -498,8 +509,6 @@ impl AppState {
             config.dagster_location.clone(),
         );
         let clickhouse = Arc::new(clickhouse);
-        let embed_secret =
-            EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
         let llm = LlmClient::new(
             config.llm_url.clone(),
             config.llm_model.clone(),
@@ -587,7 +596,6 @@ impl AppState {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
-            embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
             connector_secret_resolver: connector_secret_resolver(
@@ -599,14 +607,29 @@ impl AppState {
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
+            catalog_search_cache: Arc::new(SearchSnapshotCache::new()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
             lakekeeper_admin,
             throttle_policy: Arc::new(throttle_policy),
-            upload_receive,
+upload_receive,
+            #[cfg(test)]
+            webhook_sender_override: None,
         }
+    }
+
+    /// The webhook sender for alert deliveries that have no request of their
+    /// own to take a policy from: [`crate::webhook_guard::sender`] over this
+    /// state's config (`SEC-10`), or the test override.
+    #[must_use]
+    pub fn webhook_sender(&self) -> lakehouse_notify::WebhookSender {
+        #[cfg(test)]
+        if let Some(sender) = &self.webhook_sender_override {
+            return sender.clone();
+        }
+        crate::webhook_guard::sender(&self.config)
     }
 }
 

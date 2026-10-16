@@ -63,8 +63,14 @@ pub(super) async fn set_ingest_spec(state: &AppState, args: &Map<String, Value>)
         }
     }
     let bytes = Bytes::from(Value::Object(body).to_string());
+    // SEC-14: only the five keys above are forwarded, so the model can never
+    // carry a `credential`, and no principal is passed because no credential
+    // is. A save that changes where the connector points therefore ends in
+    // the route's fixed 409, which `api_result_to_value` hands to the model
+    // as its `error`; the change is made in the console.
     api_result_to_value(
-        crate::routes::connectors::ingest_spec_put(State(state.clone()), Path(id), bytes).await,
+        crate::routes::connectors::ingest_spec_put(State(state.clone()), None, Path(id), bytes)
+            .await,
     )
     .await
 }

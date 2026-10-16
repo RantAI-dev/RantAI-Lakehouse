@@ -3,11 +3,9 @@
 | | |
 | --- | --- |
 | Backlog | `SRC-10` in [BACKLOG.md](../BACKLOG.md) |
-| Area | Data (Sources) |
-| Who builds it | Data |
-| When | Next |
+| Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Status | Spec. Not planned, not built |
+| Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
 
@@ -36,10 +34,9 @@ Airbyte: full refresh overwrite, full refresh append, full refresh overwrite + d
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- [ ] Every Target row above works as written
-- [ ] An update at the source produces one current row in dedup mode and a closed plus a new row in SCD 2 mode
-- [ ] Refreshing one table does not touch the connector's other tables
-- [ ] A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
+- `SRC-10-AC1` An update at the source produces one current row in dedup mode and a closed plus a new row in SCD 2 mode
+- `SRC-10-AC2` Refreshing one table does not touch the connector's other tables
+- `SRC-10-AC3` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 

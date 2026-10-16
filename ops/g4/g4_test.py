@@ -24,6 +24,22 @@ regression (e.g. the connector silently not running) fails the gate
 promptly rather than timing out at some much larger number that would
 mask a slow but real problem.
 
+# SRC-9 (plan task 6): the four steps of the connector gates
+
+This gate is also the connector gate of `PostgreSQL CDC` (`ops/gates/
+coverage.json`, gate `g4`), and records its four steps through
+`ops/gates/gate_summary.py`, whose table it prints at the end and the job
+copies into its summary:
+
+- `connect`, `discover`: the demo CDC source is registered in the connector
+  registry as the console would (type `PostgreSQL CDC`, adapter `cdc`, the
+  slot and publication names this stack really has), then `POST .../test`
+  and `POST .../discover?schema=p5_cdc` must answer for real, as they do for
+  its SQL twin. A failed one is recorded and the gate goes on.
+- `load`: the first copy. Debezium's initial snapshot reaches Bronze and holds
+  the rows `g4-source-init` seeded.
+- `reload`: the insert, update and delete arriving within the latency budget.
+
 # Why `count() WHERE 1`, never a bare `count()`
 
 `docs/plans/P5-RESULT.md`'s (A) finding: ClickHouse 26.3's bare
@@ -44,6 +60,10 @@ import time
 import urllib.parse
 
 import requests
+
+# SRC-9 plan task 6: the coverage registry and the result table, mounted at
+# /opt/gates by `g4-test-runner` in docker-compose.yml (PYTHONPATH).
+import gate_summary
 
 CH_URL = os.environ.get("CH_URL", "http://clickhouse:8123")
 CH_USER = os.environ.get("CH_USER", "default")
@@ -123,7 +143,13 @@ def step_seed_wal_alert_rule() -> None:
             "op": ">",
             "threshold": 0,
             "channel": "webhook",
-            "target": "http://127.0.0.1:1/g4-webhook-sink",
+            # A sink nothing listens on. It was `http://127.0.0.1:1/...`, which
+            # SEC-10 now refuses when the rule is saved (loopback can never be
+            # allow-listed, by design). 192.0.2.0/24 is TEST-NET-1, reserved
+            # for documentation and never routed, so this is still a dead
+            # target, but one the address check admits: the delivery fails
+            # at connect, as it did before.
+            "target": "http://192.0.2.1:9/g4-webhook-sink",
             "severity": "critical",
         },
         timeout=10,
@@ -149,6 +175,36 @@ LATENCY_BUDGET_SECONDS = 20.0
 
 class G4Failure(Exception):
     pass
+
+
+# SRC-9 task 6. The registry type this gate stands for, and the recorder the
+# four steps write into (created by `main`).
+CDC_TYPE = "PostgreSQL CDC"
+RECORDER: gate_summary.Recorder | None = None
+
+# The demo source as the registry holds it: the database and role this stack's
+# Postgres really has (`PG*` is what `psql` below uses), and the slot and
+# publication `g4-source-init` and `debezium-server` really use, so the
+# registry row is the true description of the demo connector (it also lets
+# `replication_metrics` attribute `p5cdc_slot` to a connector).
+GATE_SECRETS_DIR = "/gate-secrets"
+FILE_REF_PREFIX = "file:/run/secrets/connector_"
+GATE_TENANT_SLUG = "meridian-group"
+CDC_SLOT_NAME = "p5cdc_slot"
+CDC_PUBLICATION_NAME = "p5cdc_pub"
+CDC_SCHEMA = "p5_cdc"
+# What `POST .../discover?schema=p5_cdc` must list: `g4-source-init`'s table.
+CDC_DISCOVER_TABLE = "p5_cdc.orders"
+CDC_DISCOVER_COLUMNS = {"id", "customer", "amount", "updated_at"}
+# `g4-source-init` seeds this many rows; the snapshot must deliver all of them.
+SEEDED_ROWS = 5
+
+
+def _record(step: str, outcome: str, detail: str = "") -> None:
+    if RECORDER is None:
+        raise G4Failure("internal error: the gate summary recorder was not created")
+    RECORDER.record(CDC_TYPE, step, outcome, detail)
+    print(f"[g4] {CDC_TYPE} {step}: {outcome}{' (' + detail + ')' if detail else ''}")
 
 
 def ch_query(sql: str) -> str:
@@ -637,23 +693,222 @@ def step_oidc_authorization_code_round_trip() -> None:
     print("[g4] OIDC authorization-code + PKCE round trip: session minted, Analyst role's query:read confirmed")
 
 
-def main() -> int:
+def _write_credential_file(ref_name: str, value: str) -> None:
+    """Duplicated from `ops/g6/g6_ingest_matrix_test.py` (this repository's
+    gates share no code beyond `gate_summary`): refuse any reference that is
+    not the `file:/run/secrets/connector_*` name the server derived (ADR 0002
+    Addendum 3) before writing `value` under its basename into
+    `/gate-secrets`, the writable half of the volume `lakehouse-api` reads at
+    `/run/secrets` (`ops/g4/docker-compose.g4.override.yml`)."""
+    if not ref_name.startswith(FILE_REF_PREFIX):
+        raise G4Failure(f"refusing to write a credential file for an unexpected ref shape: {ref_name!r}")
+    path = os.path.join(GATE_SECRETS_DIR, ref_name.rsplit("/", 1)[-1])
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(value)
+    os.chmod(path, 0o644)
+
+
+def _ensure_gate_tenant() -> str:
+    """Duplicated, shortened, from `ops/g6/g6_ingest_matrix_test.py::
+    step_ensure_tenant` (its docstring has the why): per-connector routes
+    answer only for a connector in one of the caller's tenants, and the
+    bootstrap admin of a fresh database belongs to none, so the account joins
+    the seed tenant first. Returns that tenant's id."""
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G4Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise G4Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
+    tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if tenant is None:
+        raise G4Failure(f"tenant {GATE_TENANT_SLUG!r} does not exist (0042_tenant_provisioning.sql seeds it)")
+    if tenant["id"] not in [t["id"] for t in me.get("tenants", [])]:
+        added = API.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}", timeout=10)
+        if not added.ok:
+            raise G4Failure(f"add the account to tenant {GATE_TENANT_SLUG!r} failed: {added.status_code} {added.text[:300]}")
+    return tenant["id"]
+
+
+def _register_demo_cdc_connector(tenant_id: str) -> str:
+    """Register the demo source the way the console registers a `PostgreSQL
+    CDC` connector: `POST /api/connectors` with a `file:` credential whose
+    value is this stack's Postgres password, then `PUT .../ingest-spec` with
+    the `cdc` adapter and the slot and publication the stack really has.
+    Returns the connector id."""
+    created = API.post(
+        f"{API_URL}/api/connectors",
+        json={
+            "name": "g4-demo-cdc", "type": CDC_TYPE, "direction": "source",
+            "host": "postgres:5432", "credential": {"source": "file", "primary": "password"},
+            "environment": "production", "tenant": "g4", "tenantId": tenant_id, "residency": "", "capabilities": [],
+        },
+        timeout=10,
+    )
+    if not created.ok:
+        raise G4Failure(f"create the CDC connector failed: {created.status_code} {created.text[:300]}")
+    body = created.json()
+    connector_id = body["id"]
+    derived = (body.get("credential") or {}).get("primary")
+    if not derived:
+        raise G4Failure("the create response carries no derived credential name")
+    _write_credential_file(derived, os.environ["PGPASSWORD"])
+    spec = API.put(
+        f"{API_URL}/api/connectors/{connector_id}/ingest-spec",
+        json={
+            "adapter": "cdc", "ingestMode": "cdc", "sourceObjects": [],
+            "dial": {
+                "driver": "postgres", "host": os.environ["PGHOST"], "port": int(os.environ["PGPORT"]),
+                "database": os.environ["PGDATABASE"], "user": os.environ["PGUSER"],
+                "slotName": CDC_SLOT_NAME, "publicationName": CDC_PUBLICATION_NAME,
+            },
+        },
+        timeout=10,
+    )
+    if not spec.ok:
+        raise G4Failure(f"set the CDC connector's ingest-spec failed: {spec.status_code} {spec.text[:300]}")
+    return connector_id
+
+
+def _expects_real(step: str) -> bool:
+    """False after recording a failure when the registry does not say `real`:
+    this gate runs the step for real, so a registry that says otherwise is
+    stale (one list, not two)."""
+    if RECORDER is not None and RECORDER.registry.expectation(CDC_TYPE, step) == "real":
+        return True
+    _record(step, "fail", "ops/gates/coverage.json does not say 'real' for this step but g4 runs it; update the registry")
+    return False
+
+
+def _check_connect(connector_id: str) -> None:
+    """`connect`: `POST .../test` answers `supported: true, ok: true` for the
+    demo source, as it does for its SQL twin (duplicated in miniature from
+    `ops/g6`'s `_check_connect`, whose `real` branch it is)."""
+    if not _expects_real("connect"):
+        return
     try:
+        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/test", timeout=30)
+        if not resp.ok:
+            _record("connect", "fail", f"POST .../test answered {resp.status_code} {resp.text[:200]}")
+            return
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        _record("connect", "fail", f"POST .../test did not answer cleanly ({type(exc).__name__})")
+        return
+    if body.get("supported") is True and body.get("ok") is True:
+        _record("connect", "pass", f"{body.get('latencyMs')} ms")
+    else:
+        _record(
+            "connect", "fail",
+            f"expected supported=true ok=true, got supported={body.get('supported')!r} "
+            f"ok={body.get('ok')!r} message={str(body.get('message'))[:200]!r}",
+        )
+
+
+def _check_discover(connector_id: str) -> None:
+    """`discover`: `POST .../discover?schema=p5_cdc` lists `p5_cdc.orders`
+    with its columns (`real` branch of `ops/g6`'s `_check_discover`)."""
+    if not _expects_real("discover"):
+        return
+    try:
+        resp = API.post(f"{API_URL}/api/connectors/{connector_id}/discover", params={"schema": CDC_SCHEMA}, timeout=30)
+        if not resp.ok:
+            _record("discover", "fail", f"POST .../discover answered {resp.status_code} {resp.text[:200]}")
+            return
+        body = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        _record("discover", "fail", f"POST .../discover did not answer cleanly ({type(exc).__name__})")
+        return
+    table = next((o for o in body.get("objects") or [] if o.get("name") == CDC_DISCOVER_TABLE), None)
+    if body.get("supported") is not True or table is None:
+        listed = [o.get("name") for o in body.get("objects") or []]
+        _record("discover", "fail", f"expected supported=true listing {CDC_DISCOVER_TABLE!r}, got supported={body.get('supported')!r} objects={listed[:20]}")
+        return
+    found = {c.get("name") for c in table.get("columns") or []}
+    if not CDC_DISCOVER_COLUMNS <= found:
+        _record("discover", "fail", f"{CDC_DISCOVER_TABLE!r} is missing columns {sorted(CDC_DISCOVER_COLUMNS - found)}, has {sorted(found)}")
+        return
+    _record("discover", "pass", f"{CDC_DISCOVER_TABLE} with {len(found)} columns")
+
+
+def step_register_demo_connector_and_check_connect_discover() -> None:
+    """SRC-9 task 6, steps `connect` and `discover`. A problem with the
+    registration itself fails both cells, with the reason, and the gate goes
+    on: the Debezium steps below do not depend on the registry."""
+    try:
+        connector_id = _register_demo_cdc_connector(_ensure_gate_tenant())
+    except (G4Failure, requests.RequestException, KeyError, ValueError) as exc:
+        detail = f"could not register the demo CDC connector: {type(exc).__name__}: {exc}"
+        _record("connect", "fail", detail)
+        _record("discover", "fail", detail)
+        return
+    _check_connect(connector_id)
+    _check_discover(connector_id)
+
+
+def step_first_copy_reached_bronze() -> None:
+    """SRC-9 task 6, step `load`: the initial snapshot is the first copy, and
+    it must hold every row `g4-source-init` seeded (the table being
+    registered, `step_wait_for_table_registered`, only says the first commit
+    happened). `WHERE` and `__deleted`, never a bare `count()` (R11)."""
+    def all_seeded_rows():
+        text = ch_query(
+            f"SELECT count() FROM {CATALOG_DB}.{TABLE} WHERE id > 0 AND __deleted = 'false' "
+            "SETTINGS allow_database_iceberg=1 FORMAT TabSeparated"
+        ).strip()
+        return int(text) if text.isdigit() and int(text) == SEEDED_ROWS else None
+
+    try:
+        count = _wait_for(f"initial snapshot holds the {SEEDED_ROWS} seeded rows", all_seeded_rows, 60)
+    except G4Failure as exc:
+        _record("load", "fail", str(exc))
+        raise
+    _record("load", "pass", f"{count} rows in the Bronze table after the initial snapshot")
+
+
+def main() -> int:
+    global RECORDER
+    try:
+        RECORDER = gate_summary.Recorder(gate_summary.Registry.load(), "g4")
+        owner = RECORDER.registry.gate_of(CDC_TYPE)
+        if owner != "g4":
+            raise G4Failure(f"ops/gates/coverage.json gives {CDC_TYPE!r} to gate {owner!r}, but g4 runs it")
         step_wait_for_services()
         step_login()
+        step_register_demo_connector_and_check_connect_discover()
         step_seed_wal_alert_rule()
         step_create_catalog_database()
         step_wait_for_table_registered()
-        order_id, _ = step_insert_visible_within_budget()
-        step_update_visible_within_budget(order_id)
-        step_delete_visible_within_budget(order_id)
+        step_first_copy_reached_bronze()
+        try:
+            order_id, _ = step_insert_visible_within_budget()
+            step_update_visible_within_budget(order_id)
+            step_delete_visible_within_budget(order_id)
+        except G4Failure as exc:
+            _record("reload", "fail", str(exc))
+            raise
+        _record(
+            "reload", "pass",
+            f"an insert, an update and a delete each visible within {LATENCY_BUDGET_SECONDS:.0f}s",
+        )
         step_row_counts_use_a_where_predicate()
         step_wal_breach_produces_a_silenceable_alert_instance()
         step_verify_slot_cleanup_on_connector_delete()
         step_oidc_authorization_code_round_trip()
+        # SRC-9 task 6: connect and discover record a failure and let the gate
+        # run on; the verdict comes here, once, naming each.
+        failed = RECORDER.failures()
+        if failed:
+            raise G4Failure("connector gate steps failed: " + "; ".join(f"{t} {s}: {d}" for t, s, d in failed))
     except G4Failure as exc:
         print(f"[g4] FAILED: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # The table is printed on every path, so a failed run still says which
+        # step broke and which never ran.
+        if RECORDER is not None:
+            RECORDER.emit()
     print("[g4] PASS")
     return 0
 

@@ -154,6 +154,19 @@ export type NlAnswer = {
   steps: NlAnswerStep[]
 }
 
+/**
+ * What the assistant proposed for a failed statement: the whole corrected
+ * statement and one sentence on what was wrong. The person accepts or
+ * rejects it; nothing runs until they run it.
+ */
+export type SqlProposal = { sql: string; reason: string }
+
+/**
+ * The fix request's reply: the proposal when the assistant made one, or its
+ * text alone when it proposed nothing.
+ */
+export type SqlFixOutcome = SqlProposal | { answer: string }
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
@@ -163,5 +176,18 @@ export interface QueryService {
   /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */
   askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string }>
+  /** Plain-words explanation of a statement; the assistant calls no tool and runs nothing. */
+  explainSql(sql: string, engine: QueryEngine, signal?: AbortSignal): Promise<string>
+  /**
+   * Asks the assistant to correct a failed statement. The result is checked
+   * by the server but never run here.
+   * @throws ServiceError `invalid_request` when the statement is over 20,000 characters.
+   */
+  proposeFix(
+    sql: string,
+    engine: QueryEngine,
+    error: string,
+    signal?: AbortSignal
+  ): Promise<SqlFixOutcome>
   getSchedulingCapability(signal?: AbortSignal): Promise<QuerySchedulingCapability>
 }

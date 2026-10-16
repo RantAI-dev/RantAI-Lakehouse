@@ -1,5 +1,5 @@
 import type { EChartsOption } from "echarts";
-import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
@@ -19,9 +19,21 @@ const PALETTE = [
 
 // English number format, matching the English UI (data values stay as-is).
 const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
-const fmtCompact = formatCompactNumber;
 
 type Row = Record<string, unknown>;
+
+/**
+ * BI-9 review fix (SHOULD-FIX) R5: a line with more points than this draws no
+ * point markers (1000 hourly points read as a solid block). The hover marker
+ * and tooltip still work: ECharts shows the symbol under the axis pointer even
+ * with `showSymbol: false`.
+ */
+export const MARKER_LIMIT = 60;
+
+/** Whether a chart of `kind` with `points` category points draws a marker on each. */
+export function showsPointMarkers(kind: string, points: number): boolean {
+  return kind === "line" && points <= MARKER_LIMIT;
+}
 const num = (v: unknown) => Number(v ?? 0);
 const str = (v: unknown) => String(v ?? "");
 
@@ -29,7 +41,15 @@ export function buildOption(
   spec: Renderable,
   rows: Row[],
   dark: boolean,
+  /** `firstDay`: the calendar's first weekday (0 Sunday, 1 Monday), from the Settings (BI-9). */
+  opts: { firstDay?: 0 | 1 } = {},
 ): EChartsOption {
+  // BI-8 review fix (SHOULD-FIX) R4: axis, tooltip and label numbers carry the
+  // decimals the drawn values need (none for whole numbers, as before).
+  const yColumns = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const decimals = decimalsFor(rows.flatMap((r) => yColumns.map((c) => num(r[c]))));
+  const fmtInt = (v: number) => formatNumber(v, decimals);
+  const fmtCompact = (v: number) => formatCompactNumber(v, decimals);
   const axis = dark ? "#a1a1aa" : "#71717a";
   const split = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
   const tooltipBg = dark ? "#18181b" : "#ffffff";
@@ -255,7 +275,9 @@ export function buildOption(
   if (spec.kind === "sunburst" && spec.series) {
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { treePathInfo: { name: string }[]; value: number }; return `${o.treePathInfo.map((t) => t.name).filter(Boolean).join(" › ")}<br/><b>${fmtInt(o.value)}</b>`; } },
-      series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined,
+      // `nodeClick: false`: by default a click zooms the ring in, and a click now
+      // opens the drill menu (BI-18·B); the two cannot share the gesture.
+      series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined, nodeClick: false,
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1.5 },
         label: { color: "#fff", fontSize: 10, minAngle: 10, rotate: "radial" },
         levels: [{}, { r0: "12%", r: "45%" }, { r0: "45%", r: "90%", label: { fontSize: 9 } }],
@@ -303,7 +325,7 @@ export function buildOption(
       calendar: range ? { range, top: 24, left: 36, right: 12, bottom: 44, cellSize: ["auto", "auto"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, color: dark ? "#18181b" : "#fafafa" },
         splitLine: { show: false }, yearLabel: { show: false },
-        dayLabel: { color: axis, fontSize: 9, firstDay: 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
+        dayLabel: { color: axis, fontSize: 9, firstDay: opts.firstDay ?? 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
       series: range ? [{ type: "heatmap", coordinateSystem: "calendar", data }] : [],
       title: range ? undefined : { text: "No dated rows to show", left: "center", top: "middle", textStyle: { color: axis, fontSize: 12, fontWeight: "normal" } },
     } as EChartsOption;
@@ -353,7 +375,7 @@ export function buildOption(
       type: isLine ? "line" : "bar",
       stack: stack ? "total" : undefined,
       smooth: isLine,
-      showSymbol: spec.kind === "line",
+      showSymbol: showsPointMarkers(spec.kind, orderedCats.length),
       symbolSize: 5,
       areaStyle: spec.kind === "area" ? { opacity: 0.15 } : undefined,
       emphasis: { focus: "series" },
@@ -407,7 +429,7 @@ export function buildOption(
         data: values,
         barMaxWidth: 34,
         smooth: isLine,
-        showSymbol: spec.kind === "line",
+        showSymbol: showsPointMarkers(spec.kind, values.length),
         symbolSize: 6,
         lineStyle: isLine ? { width: 2 } : undefined,
         areaStyle:

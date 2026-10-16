@@ -49,6 +49,8 @@ async fn iceberg_config_for(
     let token =
         crate::routes::gold::read_catalog_token(&state.config.lakekeeper_gold_export_token_file)
             .await
+            // `read_catalog_token` returns an `ApiError` whose text this crate wrote
+            // (it names the token setting), not an upstream error.
             .map_err(|err| json!({ "error": err.to_string() }))?;
     let iceberg_config = crate::gold_export::iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),

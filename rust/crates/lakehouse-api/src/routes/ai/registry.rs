@@ -73,6 +73,22 @@ pub struct ToolSpec {
     pub permission: &'static str,
 }
 
+/// The thirteen values of a chart's `grain` (`BI-9`), shared by
+/// [`create_chart_schema`] and [`update_chart_schema`]. Read from
+/// [`lakehouse_bi::grain::ALL_GRAINS`] so the schema cannot drift from what
+/// the server accepts.
+fn grain_enum() -> Value {
+    json!(
+        lakehouse_bi::grain::ALL_GRAINS
+            .iter()
+            .map(|g| g.as_str())
+            .collect::<Vec<_>>()
+    )
+}
+
+/// The description of the `grain` property, the same on both chart tools.
+const GRAIN_DESCRIPTION: &str = "how to group a date or timestamp `dimension` (the column's kind is in describe_mart / list_sql_sources `columns`): minute, hour, day, week, month, quarter, year; or a part of the date: hour_of_day, day_of_week, day_of_month, week_of_year, month_of_year, quarter_of_year. Not for number or text columns; minute, hour and hour_of_day need a datetime column; a calendar chart takes day only; only bar, hbar, line, area, stacked, combo, waterfall, heatmap, pie, rose, funnel, treemap, radar and calendar charts take one. Omit for no grouping.";
+
 /// The `chart_kind_enum` JSON array shared by [`create_chart_schema`] and
 /// [`update_chart_schema`] — factored out only because the two schemas
 /// are otherwise identical lists; not shared with any other tool.
@@ -103,8 +119,40 @@ fn chart_kind_enum() -> Value {
         "kpi",
         "gauge",
         "table",
+        "pivot",
         "text"
     ])
+}
+
+/// The properties `BI-16` part A adds to both chart tools (raw tables, pivots,
+/// KPI comparisons, column settings), inserted into the schema built by
+/// [`create_chart_schema`] and [`update_chart_schema`] so the two cannot drift.
+/// The limits are the ones `lakehouse_bi::tables` enforces.
+fn with_table_properties(mut schema: Value) -> Value {
+    let extra = json!({
+        "tableMode": { "type": "string", "enum": ["grouped", "rows"], "description": "table only: grouped (default) summarises by `dimension`; rows lists the rows themselves, 50 a page, in the `columns` you pick (no dimension or measures)" },
+        "columns": { "type": "array", "items": { "type": "string" }, "description": "table in rows mode: the columns to list, in order (1 to 30). pivot: the column fields (0 to 2)" },
+        "rows": { "type": "array", "items": { "type": "string" }, "description": "pivot only (required): the row fields, outermost first (1 to 3)" },
+        "values": { "type": "array", "items": { "type": "object", "properties": {
+            "column": { "type": "string" },
+            "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] } },
+            "required": ["column", "aggregate"] },
+            "description": "pivot only (required): what each cell shows (1 to 5). A pivot takes no dimension, measures or breakdown" },
+        "totals": { "type": "string", "enum": ["none", "grand", "all"], "description": "pivot only: none (default); grand adds the row, column and grand totals; all adds a subtotal for every outer group as well. Computed by the database, not by adding cells" },
+        "sortColumn": { "type": "string", "description": "table in rows mode: the column the rows are sorted by" },
+        "sortDir": { "type": "string", "enum": ["asc", "desc"] },
+        "columnSettings": { "type": "object", "description": "table and pivot: per column name, {label, format (auto, number, percent, currency, date, link, image), decimals 0 to 6, width 60 to 800, wrap, hidden}. A link or image column must hold http(s) URLs" },
+        "compare": { "type": "object", "description": "kpi only: {\"kind\":\"previous\",\"dateColumn\":<a date or timestamp column>,\"period\":day|week|month|quarter|year} compares the latest period that has data with the one before it and draws a trend line; or {\"kind\":\"goal\",\"value\":<number>} compares with a goal" },
+        "goodDirection": { "type": "string", "enum": ["up", "down"], "description": "kpi only: which way is good, up (default) or down; colours the change" }
+    });
+    if let Some(props) = schema
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+        && let Value::Object(extra) = extra
+    {
+        props.extend(extra);
+    }
+    schema
 }
 
 fn run_sql_schema() -> Value {
@@ -128,6 +176,21 @@ fn ask_user_schema() -> Value {
             "question": { "type": "string", "description": "one sentence asking which they mean (at most 200 characters)" },
             "options": { "type": "array", "minItems": 2, "maxItems": 4, "items": { "type": "string" }, "description": "the readings to choose from: names from the DATA MAP, each 1 to 80 characters" } },
             "required": ["term", "question", "options"] } } })
+}
+
+/// The tool that proposes a corrected statement for a Query Studio query that
+/// failed. Named once so the chat's switch and its offered list cannot
+/// misspell it; a test pins it to a registered tool.
+pub const PROPOSE_SQL: &str = "propose_sql";
+
+fn propose_sql_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "propose_sql",
+        "description": "Propose the whole corrected statement once, with one sentence saying what was wrong. The server checks that it would run for this user, and the person sees it as a diff and accepts or rejects it. It is never run by you or by the server. Use it only for a query the person asked you to fix.",
+        "parameters": { "type": "object", "properties": {
+            "sql": { "type": "string", "description": "the whole corrected statement, not a fragment (1 to 20000 characters)" },
+            "reason": { "type": "string", "description": "one sentence saying what was wrong (1 to 300 characters)" },
+            "engine": { "type": "string", "enum": ["clickhouse", "trino"], "description": "the engine the statement is for" } },
+            "required": ["sql", "reason", "engine"] } } })
 }
 
 fn list_datasets_schema() -> Value {
@@ -178,13 +241,14 @@ fn get_build_status_schema() -> Value {
 
 fn describe_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "describe_mart",
-        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Call this before create_chart.",
+        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Each column also has a kind (number, date, datetime, text); a date or datetime dimension can take a grain. Call this before create_chart.",
         "parameters": { "type": "object", "properties": {
             "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
 
 fn create_chart_schema() -> Value {
-    json!({ "type": "function", "function": { "name": "create_chart",
+    with_table_properties(
+        json!({ "type": "function", "function": { "name": "create_chart",
         "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -199,12 +263,16 @@ fn create_chart_schema() -> Value {
             "lon": { "type": "string", "description": "pointmap and geoheat only (required): the longitude column" },
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
+            "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
-            "required": ["title", "kind"] } } })
+            "required": ["title", "kind"] } } }),
+    )
 }
 
 fn update_chart_schema() -> Value {
-    json!({ "type": "function", "function": { "name": "update_chart",
+    with_table_properties(
+        json!({ "type": "function", "function": { "name": "update_chart",
         "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
@@ -219,8 +287,11 @@ fn update_chart_schema() -> Value {
             "target": { "type": "number" },
             "aggregate": { "type": "string", "enum": ["sum", "avg", "max", "min", "count"] },
             "limit": { "type": "number" }, "span": { "type": "number", "enum": [1, 2] },
+            "click": { "type": "object", "description": "what a click on the chart does instead of the drill menu (not for text): {\"kind\":\"dashboard\",\"board\":<dashboard id>,\"column\":<column of that dashboard the clicked value filters>}, {\"kind\":\"query\",\"id\":<saved query id>}, or {\"kind\":\"url\",\"url\":<https://… or a /path; {value} is replaced by the clicked value>}" },
+            "grain": { "type": "string", "enum": grain_enum(), "description": GRAIN_DESCRIPTION },
             "board": { "type": "string" } },
-            "required": ["id", "title", "kind"] } } })
+            "required": ["id", "title", "kind"] } } }),
+    )
 }
 
 fn create_board_schema() -> Value {
@@ -259,6 +330,63 @@ fn list_sql_sources_schema() -> Value {
 fn delete_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_chart",
         "description": "Delete one saved chart card (by id). Built-in charts cannot be deleted. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── BI-8 calculated fields (with AI-4) ───────────────────────────────────
+
+/// The properties that name the source of a calculated field, the same on
+/// every tool that takes one.
+fn calc_source_properties() -> Value {
+    json!({
+        "mart": { "type": "string", "description": "Gold mart name (from describe_mart); set mart OR sqlSource, not both" },
+        "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart" }
+    })
+}
+
+fn list_formula_functions_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_formula_functions",
+        "description": "The formula language of calculated fields and every function it has (name, signature, one line of help, an example). Call it before writing a formula. You write formulas, never SQL.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_calculated_fields_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_calculated_fields",
+        "description": "The calculated fields of one mart or SQL source (name, formula, whether it is one value per row or an aggregate, and its type). A chart uses one by naming it in dimension, breakdown or measures like a column.",
+        "parameters": { "type": "object", "properties": calc_source_properties() } } })
+}
+
+fn validate_formula_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["formula"] = json!({ "type": "string", "description": "the formula to check, in the formula language (see list_formula_functions)" });
+    properties["name"] = json!({ "type": "string", "description": "the field's name, if it already has one (so a field that uses itself is caught)" });
+    json!({ "type": "function", "function": { "name": "validate_formula",
+        "description": "Check a formula against a mart or SQL source without saving anything: returns ok with its level and type, or the message and the character position of the first mistake. Use it to fix a formula before create_calculated_field.",
+        "parameters": { "type": "object", "properties": properties, "required": ["formula"] } } })
+}
+
+fn create_calculated_field_schema() -> Value {
+    let mut properties = calc_source_properties();
+    properties["name"] = json!({ "type": "string", "description": "a name of letters, digits and _ (for example profit), not a column of the source; charts pick the field by it" });
+    properties["formula"] = json!({ "type": "string", "description": "for example [revenue] - [cost], or Sum([revenue]) / CountDistinct([customer]); never SQL" });
+    json!({ "type": "function", "function": { "name": "create_calculated_field",
+        "description": "Save a calculated field on a mart or SQL source from a formula in the formula language (see list_formula_functions); the server checks and compiles it. Then use its name in create_chart like a column: a per-row field can be a dimension, breakdown or measure; an aggregate field only a measure.",
+        "parameters": { "type": "object", "properties": properties, "required": ["name", "formula"] } } })
+}
+
+fn update_calculated_field_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "update_calculated_field",
+        "description": "Change the formula of a calculated field (by id from list_calculated_fields). The name stays; every chart using the field follows the new formula.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "formula": { "type": "string", "description": "the new formula" } },
+            "required": ["id", "formula"] } } })
+}
+
+fn delete_calculated_field_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_calculated_field",
+        "description": "Delete one calculated field (by id). Refused while a chart or another field uses it. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -630,7 +758,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses.",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode and primaryKey exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
@@ -639,6 +767,11 @@ fn set_ingest_spec_schema() -> Value {
             "sourceObjects": { "type": "array", "items": { "type": "object", "properties": {
                 "name": { "type": "string", "description": "source table (schema.table), endpoint or file" },
                 "incrementalKey": { "type": "string", "description": "optional column for incremental reads" },
+                "loadMode": { "type": "string",
+                    "enum": ["replace", "append", "incremental", "replace_dedup", "incremental_dedup", "history"],
+                    "description": "how each run writes the table; omitted means replace" },
+                "primaryKey": { "type": "array", "items": { "type": "string" },
+                    "description": "columns that identify one row; needed by replace_dedup, incremental_dedup and history" },
                 "target": { "type": "string", "description": "Bronze table name it lands in" } },
                 "required": ["name", "target"] } },
             "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
@@ -683,13 +816,13 @@ fn rotate_connector_credential_schema() -> Value {
 
 fn create_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_pipeline",
-        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Zones: bronze, silver, gold. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Source zones: bronze, silver, gold. Target zones: silver, gold -- a pipeline never writes bronze, which is written by ingestion. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "description": { "type": "string" },
             "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "sourceTable": { "type": "string" },
-            "targetZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "targetZone": { "type": "string", "enum": ["silver", "gold"] },
             "targetTable": { "type": "string" },
             "transforms": { "type": "array", "items": { "type": "string" } },
             "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
@@ -874,6 +1007,46 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    // BI-8 / AI-4: calculated fields. The permissions mirror
+    // `/api/dashboard/calc-fields` in `POLICY_TABLE`: reading, checking and
+    // the function list need `dashboard:read`; saving and changing need
+    // `dashboard:write`; deleting is high-risk like `delete_chart`.
+    ToolSpec {
+        name: "list_formula_functions",
+        schema: list_formula_functions_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "list_calculated_fields",
+        schema: list_calculated_fields_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "validate_formula",
+        schema: validate_formula_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "create_calculated_field",
+        schema: create_calculated_field_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "update_calculated_field",
+        schema: update_calculated_field_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_calculated_field",
+        schema: delete_calculated_field_schema,
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
@@ -1085,8 +1258,10 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     // ── T2.5 Governance draft tools ─────────────────────────────────
     // `POST /api/governance/policies` requires `policy:write`
-    // (policy.rs:163); `POST /api/governance/{kind}` (quality,
-    // classification) is `RequiresAuth` only (policy.rs:165, C1).
+    // (policy.rs:163). SEC-23 (F3): `POST /api/governance/{kind}` (quality,
+    // classification) now requires `governance:write` too, so the two rule
+    // tools carry it — [`super::gate::decide`] refuses them without it. Before,
+    // the tools were an unguarded path around the route policy.
     ToolSpec {
         name: "draft_policy",
         schema: draft_policy_schema,
@@ -1097,13 +1272,13 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "draft_classification_rule",
         schema: draft_classification_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "draft_quality_rule",
         schema: draft_quality_rule_schema,
         risk: Risk::WriteLow,
-        permission: "",
+        permission: "governance:write",
     },
     ToolSpec {
         name: "get_ingest_spec",
@@ -1198,6 +1373,15 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "",
     },
+    // Checks a proposed statement as the caller, with the caller's own
+    // permission, and runs nothing. The Query Studio's own permission is
+    // `query:read`, so the same person may propose what they may run.
+    ToolSpec {
+        name: PROPOSE_SQL,
+        schema: propose_sql_schema,
+        risk: Risk::Read,
+        permission: "query:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -1248,15 +1432,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_sixty_four_entries() {
+    fn tool_schemas_has_seventy_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
         // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
-        // sources) + `ask_user`.
-        assert_eq!(tool_schemas().len(), 64);
+        // sources) + `ask_user` + 6 calculated-field tools (`BI-8`) +
+        // `propose_sql` (plan 15).
+        assert_eq!(tool_schemas().len(), 71);
     }
 
     #[test]
@@ -1297,6 +1482,34 @@ mod tests {
              regenerate the fixture ONLY for an intentional, reviewed \
              schema change, never to make this test pass during a refactor"
         );
+    }
+
+    /// `SEC-14`: the assistant must never carry a secret, so
+    /// `set_ingest_spec` has no credential property, and the handler it
+    /// calls only ever receives the five spec keys the tool forwards.
+    #[test]
+    fn set_ingest_spec_has_no_credential_property() {
+        let schema = (find("set_ingest_spec").expect("registered tool").schema)();
+        let properties = schema["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("an object of properties");
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "adapter",
+                "dial",
+                "id",
+                "ingestMode",
+                "scheduleCron",
+                "sourceObjects"
+            ]
+        );
+        let description = schema["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("never carries a credential"));
     }
 
     #[test]
@@ -1391,9 +1604,10 @@ mod tests {
         // Tier 2 tools that carry no narrower permission than
         // `RequiresAuth` (C1) — every T2.1 governance read,
         // `run_bronze_maintenance`, `list_workloads`, both gold export
-        // tools, the two rule-level draft tools (`draft_policy` needs
-        // `policy:write`, so it is NOT in this list), and `ask_user`, which
-        // stores and reads nothing.
+        // tools, and `ask_user`, which stores and reads nothing. The three
+        // draft tools are NOT in this list: `draft_policy` needs
+        // `policy:write`, and since SEC-23 the two rule drafts need
+        // `governance:write`.
         assert_eq!(
             offered_names,
             vec![
@@ -1408,8 +1622,6 @@ mod tests {
                 "list_workloads".to_owned(),
                 "export_gold_mart".to_owned(),
                 "get_gold_export".to_owned(),
-                "draft_classification_rule".to_owned(),
-                "draft_quality_rule".to_owned(),
                 "ask_user".to_owned(),
             ]
         );
@@ -1466,8 +1678,12 @@ mod tests {
             ("export_gold_mart", Risk::WriteLow, ""),
             ("get_gold_export", Risk::Read, ""),
             ("draft_policy", Risk::WriteLow, "policy:write"),
-            ("draft_classification_rule", Risk::WriteLow, ""),
-            ("draft_quality_rule", Risk::WriteLow, ""),
+            (
+                "draft_classification_rule",
+                Risk::WriteLow,
+                "governance:write",
+            ),
+            ("draft_quality_rule", Risk::WriteLow, "governance:write"),
         ];
         for (name, risk, permission) in expected {
             let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));

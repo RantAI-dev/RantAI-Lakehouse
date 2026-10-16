@@ -89,14 +89,15 @@ fn internal_message_never_leaks_source_error_text() { ... }
 ```
 — `rust/crates/lakehouse-store/src/error.rs` is the regression guard.
 
-Known deviation (audit, 2026-09-08): `ApiError::Internal` renders its
-payload verbatim (`#[error("{0}")]`), and fourteen Phase-1 handlers wrap a
-`ClickHouse` error with `ApiError::Internal(err.to_string())`, so an upstream
-message can reach a 500 body. The store layer already does this right
-(`StoreError::Database` → fixed `"database error"`); the `ChError` path has
-not been brought up to it because the TypeScript parity corpus pins those
-bodies. It is tracked as a deliberate, bounded gap — do not add a fifteenth
-site.
+Closed deviation (audit 2026-09-08, SEC-11): `ApiError::Internal` still
+renders its payload verbatim (`#[error("{0}")]`), and fourteen Phase-1
+handlers used to wrap a `ClickHouse` error with
+`ApiError::Internal(err.to_string())`. No route does now: an upstream error
+goes through `lakehouse_api::upstream_error` (log the raw text under a
+reference id, return a fixed message and the id), `lakehouse-clickhouse` has
+no `From<ChError> for ApiError` so a `?` on a `ChError` does not compile, and
+`tests/sec11_guard.rs` fails when a route line builds a response from an
+error's text (its allowlist names the file, the line and the reason).
 
 ### 1.5 Measured, not assumed
 
@@ -193,10 +194,12 @@ denied, `missing_docs` warned (`rust/Cargo.toml` `[workspace.lints]`).
 - `tests/route_auth.rs` sweeps `POLICY_TABLE` itself; a new entry is covered
   automatically, but a permission-gated route must be asserted in *both*
   directions: wrong principal → 403, right principal → never 401/403.
-- Caller-controlled network targets go through `connector_dial::resolve_checked`
-  (DNS-resolved, internal ranges blocked unless
-  `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`) and a bounded
-  `tokio::time::timeout`.
+- Caller-controlled network targets go through
+  `connector_probe::resolve_checked` (DNS-resolved, internal ranges blocked
+  unless `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` or the address is in
+  `CONNECTOR_PROBE_ALLOWED_CIDRS`), the dial uses the `Approved` address it
+  returns instead of resolving the name again, redirects are not followed, and
+  the dial has a bounded `tokio::time::timeout` (`SEC-15`).
 
 ### 3.5 Store layer (sqlx) and migrations
 
@@ -478,7 +481,7 @@ python3 ops/lint/check_intra_package_imports.py
 python3 ops/lint/check_bare_iceberg_count.py
 (cd dagster && python -m pytest dispar_orchestrate -q)
 # Compose (config is necessary, not sufficient — see §8.8)
-docker compose --profile '*' config --quiet
+docker compose --profile '*' config --quiet   # needs the must-set secrets: sh ops/init-env.sh (SEC-18)
 # Hygiene
 git status                                   # nothing generated staged
 gitleaks git --log-opts="<base>..HEAD" --config .gitleaks.toml --redact

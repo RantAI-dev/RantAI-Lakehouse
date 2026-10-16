@@ -33,6 +33,7 @@ import {
   type Severity,
 } from "@/lib/status"
 import type { AlertItem } from "@/services/contracts/overview"
+import { AlertDelivery } from "./alert-delivery"
 
 type AlertColumnOptions = {
   readonly onOpenDetail: (alert: AlertItem) => void
@@ -184,6 +185,14 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
           })
         ),
       },
+    },
+    {
+      // SRC-17: an alert whose webhook or e-mail failed is still listed, and
+      // says so here instead of reading as sent.
+      id: "delivery",
+      header: () => <span>Delivery</span>,
+      cell: ({ row }) => <AlertDelivery alert={row.original} />,
+      enableSorting: false,
     },
     {
       id: "assignee",

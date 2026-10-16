@@ -12,7 +12,7 @@
 //!
 //! The list never reaches loopback, link-local (`169.254/16`, where cloud
 //! instance metadata lives, and `fe80::/10`), multicast or the unspecified
-//! address: listing `0.0.0.0/0` opens private ranges, not those. Only
+//! address (all of `0/8`): listing `0.0.0.0/0` opens private ranges, not those. Only
 //! `allow_all` does.
 //!
 //! Mirrors `dagster/dispar_orchestrate/ssrf_guard.py`'s
@@ -79,7 +79,13 @@ fn canonical(ip: &IpAddr) -> IpAddr {
 fn never_listed(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_multicast()
+            // SEC-15: all of 0/8, not only 0.0.0.0 — Linux routes every
+            // 0.x.x.x destination to the local host.
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
         }
         IpAddr::V6(v6) => {
             let is_link_local = v6.segments()[0] & 0xffc0 == 0xfe80; // fe80::/10
@@ -167,9 +173,22 @@ mod tests {
             "::1",
             "fe80::1",
             "::",
+            // SEC-15: the rest of 0/8 and multicast stay refused too.
+            "0.1.2.3",
+            "224.0.0.1",
+            "ff02::1",
         ] {
             assert!(!hosts.permits(&ip(blocked)), "{blocked} must stay refused");
         }
+    }
+
+    /// SEC-15: carrier-grade NAT is blocked by default but, unlike loopback
+    /// and link-local, an operator can list it (an overlay network such as
+    /// Tailscale lives there).
+    #[test]
+    fn carrier_grade_nat_can_be_listed() {
+        assert!(listing("100.64.0.0/10").permits(&ip("100.100.1.1")));
+        assert!(!InternalHosts::NONE.permits(&ip("100.100.1.1")));
     }
 
     #[test]

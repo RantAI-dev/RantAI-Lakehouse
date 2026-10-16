@@ -58,9 +58,10 @@ use crate::json::ApiJson;
 use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::routes::catalog_governance;
 use crate::routes::catalog_query;
+use crate::routes::catalog_search;
 use crate::routes::catalog_source::{self, ReadSource, SourceKind};
 use crate::routes::schema_versions;
-use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
+use crate::routes::support::{js_string, num_or_zero, prettify, str_col, upstream_message};
 use crate::state::AppState;
 
 use crate::tenant::{
@@ -189,10 +190,16 @@ pub(crate) async fn catalog_tenant_refusal(
     Ok((active != Some(catalog_tenant_id)).then_some(CATALOG_TENANT_REFUSAL_NOT_OWNER))
 }
 
-/// `GET /api/catalog` — the full asset registry, grouped into namespaces,
-/// optionally narrowed by `?q=` to assets whose `name`/`description`/`id`
-/// (or, when Postgres is configured, whose annotation `description`/`tags`)
-/// contain the term.
+/// `GET /api/catalog` — the full asset registry, grouped into namespaces.
+///
+/// With a non-empty `?q=` it is a search instead (`DATA-11`): the assets
+/// that match every word of the term, ranked by [`super::catalog_search`]
+/// — over name, id, namespace, owner, tags, description and the columns'
+/// names and descriptions — each with `matchedOn`, read from the 30-second
+/// search copy ([`search_snapshot`]) rather than rebuilt per request. When
+/// a column query was cut at its row limit the body also says
+/// `"columnSearch": "partial"`. Without a term nothing changes: the
+/// registry is assembled live.
 ///
 /// # Tenant scoping
 ///
@@ -223,28 +230,53 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
-    match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
-        Ok((mut body, bronze_pairs)) => {
-            apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-            enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-            let annotations = apply_annotations(&state, &mut body).await;
-            apply_badges(&state, &mut body, &bronze_pairs).await;
-            if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty())
-                && let Some(assets) = body.get("assets").and_then(Value::as_array)
-            {
-                let filtered = filter_assets_by_query(assets, q, &annotations);
-                body["assets"] = Value::Array(filtered);
+    if let Some(term) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        return match search_snapshot(&state).await {
+            Ok(snapshot) => {
+                let assets = catalog_search::search(
+                    &snapshot.assets,
+                    &snapshot.columns,
+                    &snapshot.usage,
+                    term,
+                );
+                let mut body = json!({ "assets": assets, "namespaces": snapshot.namespaces });
+                if snapshot.column_search_partial {
+                    body["columnSearch"] = json!("partial");
+                }
+                (StatusCode::OK, ApiJson(body)).into_response()
             }
-            (StatusCode::OK, ApiJson(body)).into_response()
-        }
-        // `catch (e) { return NextResponse.json({ error: String(e), assets:
-        // [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
-        )
-            .into_response(),
+            Err(err) => list_unavailable(err),
+        };
     }
+    match assemble_catalog(&state).await {
+        Ok((body, _bronze_pairs)) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(err) => list_unavailable(err),
+    }
+}
+
+/// The catalog as `list` serves it: [`list_body`] and the four enrichment
+/// steps, none of which takes a `Principal`. The one assembly behind the
+/// live list, the live `query`, and the search copy
+/// ([`build_search_snapshot`]); also hands back the Bronze `(slug,
+/// table_name)` pairs the use ranking needs.
+async fn assemble_catalog(state: &AppState) -> Result<(Value, Vec<(String, String)>), ChError> {
+    let (mut body, bronze_pairs) =
+        list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await?;
+    apply_sla_targets(state, &mut body, &bronze_pairs).await;
+    enrich_bronze_assets(state, &mut body, bronze_pairs.clone()).await;
+    apply_annotations(state, &mut body).await;
+    apply_badges(state, &mut body, &bronze_pairs).await;
+    Ok((body, bronze_pairs))
+}
+
+/// `catch (e) { return NextResponse.json({ error: String(e), assets:
+/// [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
+fn list_unavailable(err: ChError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ApiJson(json!({ "error": upstream_message(err), "assets": [], "namespaces": [] })),
+    )
+        .into_response()
 }
 
 /// Query string for [`query`]. Mirrors the params the Advanced Data Table
@@ -337,40 +369,52 @@ pub async fn query(
     let group_by = catalog_query::parse_group_by(params.group_by.as_deref())?;
     let join = catalog_query::JoinOperator::parse(params.join_operator.as_deref());
 
-    let listed = list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await;
-    let (mut body, bronze_pairs) = match listed {
-        Ok(v) => v,
-        // Matches `list`'s contract: the catalog being unreachable is a
-        // 503 with an empty result, not a 500.
-        Err(err) => {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({
-                    "error": js_error(err),
-                    "items": [],
-                    "totalItems": 0,
-                    "totalPages": 0,
-                    "page": page,
-                    "pageSize": page_size,
-                })),
-            )
-                .into_response());
-        }
+    // A non-empty `search` reads the 30-second copy and comes back ranked
+    // (DATA-11); without one the catalog is assembled live, as before.
+    let term = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // Matches `list`'s contract: the catalog being unreachable is a 503
+    // with an empty result, not a 500.
+    let unavailable = |err: ChError| {
+        Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({
+                "error": upstream_message(err),
+                "items": [],
+                "totalItems": 0,
+                "totalPages": 0,
+                "page": page,
+                "pageSize": page_size,
+            })),
+        )
+            .into_response())
     };
-    apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-    enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
-    apply_annotations(&state, &mut body).await;
-    apply_badges(&state, &mut body, &bronze_pairs).await;
+    let (searched, column_search_partial) = if let Some(term) = term {
+        match search_snapshot(&state).await {
+            Ok(snapshot) => (
+                catalog_search::search(&snapshot.assets, &snapshot.columns, &snapshot.usage, term),
+                snapshot.column_search_partial,
+            ),
+            Err(err) => return unavailable(err),
+        }
+    } else {
+        let body = match assemble_catalog(&state).await {
+            Ok((body, _bronze_pairs)) => body,
+            Err(err) => return unavailable(err),
+        };
+        let assets = body
+            .get("assets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        (assets, false)
+    };
 
-    let assets = body
-        .get("assets")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let searched = catalog_query::apply_search(&assets, params.search.as_deref().unwrap_or(""));
     let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
-    catalog_query::apply_sort(&mut filtered, &sort);
+    order_results(&mut filtered, term.is_some(), &sort);
 
     let (ordered, summaries) = match group_by.as_deref() {
         Some(field) => catalog_query::apply_grouping(&filtered, field),
@@ -398,64 +442,32 @@ pub async fn query(
         summaries
     };
 
-    Ok((
-        StatusCode::OK,
-        ApiJson(catalog_query::build_response(
-            page_items,
-            total_items,
-            page,
-            page_size,
-            group_by.as_deref(),
-            &summaries,
-            keys,
-        )),
-    )
-        .into_response())
+    let mut response = catalog_query::build_response(
+        page_items,
+        total_items,
+        page,
+        page_size,
+        group_by.as_deref(),
+        &summaries,
+        keys,
+    );
+    if column_search_partial {
+        // Principle 2: a caller can see column search was cut short.
+        response["columnSearch"] = json!("partial");
+    }
+    Ok((StatusCode::OK, ApiJson(response)).into_response())
 }
 
-/// Case-insensitive substring match over each asset's `name`, `description`,
-/// and `id` — the SAME fields and case rule
-/// `src/services/clients/assets.ts`'s `clickhouseAssetService.listAssets`
-/// used to apply in the browser, moved here so there is one implementation
-/// (WS2 §13). Case folding uses `to_lowercase()`, not `to_ascii_lowercase()`,
-/// because the browser's JavaScript `toLowerCase()` is Unicode-aware and a
-/// faithful port must match it for non-ASCII text in descriptions and
-/// annotations. Widened by `annotations`: an asset also matches when its own
-/// annotation row's `description` or any `tags` entry contains the term. An
-/// empty `q` matches everything.
-fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRow]) -> Vec<Value> {
-    let needle = q.trim().to_lowercase();
-    if needle.is_empty() {
-        return assets.to_vec();
+/// Orders the rows of [`query`] before grouping and paging.
+///
+/// DATA-11 F4: `apply_sort` falls back to ordering by `id` even for an
+/// empty sort, which would throw away a search's ranking. A search with no
+/// requested sort therefore keeps its rank order; a search with a sort
+/// obeys the sort; without a search, behaviour is as before.
+fn order_results(rows: &mut [Value], searched: bool, sort: &[catalog_query::SortSpec]) {
+    if !searched || !sort.is_empty() {
+        catalog_query::apply_sort(rows, sort);
     }
-    let by_id: HashMap<&str, &AnnotationRow> = annotations
-        .iter()
-        .map(|row| (row.asset_id.as_str(), row))
-        .collect();
-    assets
-        .iter()
-        .filter(|asset| {
-            let id = asset["id"].as_str().unwrap_or_default();
-            let name = asset["name"].as_str().unwrap_or_default().to_lowercase();
-            let description = asset["description"]
-                .as_str()
-                .unwrap_or_default()
-                .to_lowercase();
-            if name.contains(&needle)
-                || description.contains(&needle)
-                || id.to_lowercase().contains(&needle)
-            {
-                return true;
-            }
-            by_id.get(id).is_some_and(|row| {
-                row.description
-                    .as_deref()
-                    .is_some_and(|d| d.to_lowercase().contains(&needle))
-                    || row.tags.iter().any(|t| t.to_lowercase().contains(&needle))
-            })
-        })
-        .cloned()
-        .collect()
 }
 
 #[allow(
@@ -640,6 +652,149 @@ async fn list_body(
         json!({ "assets": assets, "namespaces": namespaces }),
         bronze_pairs,
     ))
+}
+
+/// How long the search copy is trusted before one request rebuilds it
+/// (`DATA-11` D2). Thirty seconds is the age a new table or a fresh row
+/// count may lag in a search result; the list a person opens without a
+/// term is still live. A console annotation edit does not wait for it
+/// (`put_annotation` drops the copy).
+const SEARCH_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+/// The search copy: what `list` assembles for a request, plus the columns
+/// and the use counts, rebuilt at most once per [`SEARCH_SNAPSHOT_TTL`] by
+/// one request at a time (`DATA-11` D2).
+///
+/// Nothing in it depends on the caller: the four enrichment steps take the
+/// shared [`AppState`] and no `Principal`, and the tenant check runs per
+/// request before this is called.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of the catalog read, like [`list_body`]; the
+/// routes answer it as they do today (`503`, the fixed shape).
+async fn search_snapshot(
+    state: &AppState,
+) -> Result<Arc<crate::catalog_search_cache::CatalogSearchSnapshot>, ChError> {
+    state
+        .catalog_search_cache
+        .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || {
+            build_search_snapshot(state)
+        })
+        .await
+}
+
+/// The rebuild behind [`search_snapshot`]: [`assemble_catalog`], exactly
+/// what `list` serves, then the columns and the use counts.
+async fn build_search_snapshot(
+    state: &AppState,
+) -> Result<crate::catalog_search_cache::CatalogSearchSnapshot, ChError> {
+    let (body, bronze_pairs) = assemble_catalog(state).await?;
+    let (columns, column_search_partial) = search_column_index(&state.clickhouse).await?;
+    let assets = body
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ids: Vec<String> = assets
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let usage = catalog_governance::use_by_asset(state, &ids, &bronze_pairs).await;
+    Ok(crate::catalog_search_cache::CatalogSearchSnapshot {
+        assets,
+        namespaces: body.get("namespaces").cloned().unwrap_or(Value::Null),
+        columns,
+        usage,
+        column_search_partial,
+    })
+}
+
+/// Most rows each of the two column queries of [`search_column_index`]
+/// reads. A catalog of 10,000 tables at 20 columns is 200,000 rows; this
+/// leaves room for 2.5 times that, and bounds the memory the search copy
+/// can take whatever the registry holds. A query that returns exactly this
+/// many was cut, and search says so (`DATA-11` F2, principle 2).
+const SEARCH_COLUMN_ROWS_MAX: usize = 500_000;
+
+/// Column names and descriptions per asset id for the search copy
+/// (`DATA-11` F2): Bronze `slug, key_asli, deskripsi` from both
+/// `dataset_column` registries, and `silver` / `serving` from
+/// `system.columns`. Run only when the copy is rebuilt, never per search.
+///
+/// The `bool` is true when either query hit [`SEARCH_COLUMN_ROWS_MAX`]:
+/// column search is then partial, and a warning is logged.
+///
+/// # Errors
+///
+/// Returns the [`ChError`] of whichever query failed; the caller treats it
+/// as the catalog being unreachable.
+async fn search_column_index(
+    ch: &ChClient,
+) -> Result<(crate::routes::catalog_search::ColumnIndex, bool), ChError> {
+    // `SEARCH_COLUMN_ROWS_MAX` is a constant integer, not caller input.
+    let bronze_sql = format!(
+        "SELECT slug, key_asli, deskripsi FROM (
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta.dataset_column`
+           UNION ALL
+           SELECT slug, key_asli, deskripsi FROM lake.`bronze_meta_sec.dataset_column`
+         ) LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let system_sql = format!(
+        "SELECT database db, table, name, comment FROM system.columns
+         WHERE database IN ('silver','serving') LIMIT {SEARCH_COLUMN_ROWS_MAX}"
+    );
+    let (bronze, system) =
+        tokio::try_join!(ch.rows(&bronze_sql, None), ch.rows(&system_sql, None))?;
+    let partial = bronze.len() >= SEARCH_COLUMN_ROWS_MAX || system.len() >= SEARCH_COLUMN_ROWS_MAX;
+    if partial {
+        tracing::warn!(
+            limit = SEARCH_COLUMN_ROWS_MAX,
+            "catalog search: a column query reached its row limit; column search is partial"
+        );
+    }
+    Ok((collect_columns(&bronze, &system), partial))
+}
+
+/// The asset id the row builders give a `system.columns` table: Silver
+/// `silver.<name>` ([`silver_catalog_row`]), Gold `serving.<name>`
+/// ([`gold_catalog_row`]). `None` for any other database.
+fn system_column_key(db: &str, table: &str) -> Option<String> {
+    matches!(db, "silver" | "serving").then(|| format!("{db}.{table}"))
+}
+
+/// [`search_column_index`]'s rows as `asset id -> [(name, description)]`.
+/// A Bronze row is keyed by its slug, which is the asset id
+/// ([`bronze_catalog_row`]); a row with no name is skipped.
+fn collect_columns(
+    bronze: &[Map<String, Value>],
+    system: &[Map<String, Value>],
+) -> crate::routes::catalog_search::ColumnIndex {
+    let mut index = crate::routes::catalog_search::ColumnIndex::new();
+    for row in bronze {
+        let (slug, name) = (str_col(row, "slug"), str_col(row, "key_asli"));
+        if slug.is_empty() || name.is_empty() {
+            continue;
+        }
+        index
+            .entry(slug.to_owned())
+            .or_default()
+            .push((name.to_owned(), str_col(row, "deskripsi").to_owned()));
+    }
+    for row in system {
+        let (name, table) = (str_col(row, "name"), str_col(row, "table"));
+        let Some(key) = system_column_key(str_col(row, "db"), table) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        index
+            .entry(key)
+            .or_default()
+            .push((name.to_owned(), str_col(row, "comment").to_owned()));
+    }
+    index
 }
 
 // WS2 — filling Bronze `sizeBytes`/`freshnessLagSeconds` from Iceberg.
@@ -1323,22 +1478,23 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
     }
 }
 
-/// [`apply_annotation`] over every row of a list body, and the annotations
-/// themselves for the caller's search. They decorate the list; they never
-/// gate it — a store failure is logged and leaves the registry's values.
-async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<AnnotationRow> {
+/// [`apply_annotation`] over every row of a list body. They decorate the
+/// list; they never gate it — a store failure is logged and leaves the
+/// registry's values. (`DATA-11` F1: the annotations are no longer handed
+/// back for a second matcher; the tags and the description are on the rows.)
+async fn apply_annotations(state: &AppState, body: &mut Value) {
     let Some(pool) = state.pg.as_deref() else {
-        return Vec::new();
+        return;
     };
     let annotations = match lakehouse_store::annotation::list_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(%err, "asset_annotation lookup failed; the catalog list shows registry values");
-            return Vec::new();
+            return;
         }
     };
     if annotations.is_empty() {
-        return annotations;
+        return;
     }
     let by_id: HashMap<&str, &AnnotationRow> = annotations
         .iter()
@@ -1352,7 +1508,6 @@ async fn apply_annotations(state: &AppState, body: &mut Value) -> Vec<Annotation
             }
         }
     }
-    annotations
 }
 
 /// The detail page's share of the same: the overlay, plus the raw
@@ -1838,7 +1993,7 @@ async fn bronze_asset_detail(
         // status: 503 }); }` in `catalog/[id]/route.ts`.
         Err(err) => Ok((
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": upstream_message(err) })),
         )
             .into_response()),
     }
@@ -1880,9 +2035,15 @@ async fn bronze_asset_detail_body(
     };
 
     let cols_sql = format!(
-        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={escaped_id}
-       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={escaped_id}"
+        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` FINAL WHERE slug={escaped_id}
+       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` FINAL WHERE slug={escaped_id}"
     );
+    // `PR #101 CI run 2` (G6, SRC-8 step 4): `FINAL`, because the registry is a
+    // `ReplacingMergeTree ORDER BY (slug, key_asli)` that every run of a
+    // connector writes again (`register_bronze_table`), and ClickHouse merges
+    // the copies only in the background. Without it a table loaded by three
+    // runs listed each column three times, `col_count` said 3x the columns,
+    // and a mark set on one copy left the others unmarked.
     let mut cols = ch.rows(&cols_sql, None).await?;
 
     let table = str_col(sync, "table_name");
@@ -1954,9 +2115,14 @@ async fn bronze_asset_detail_body(
             if !deskripsi.is_empty() {
                 o.insert("description".to_owned(), json!(deskripsi));
             }
+            // Filled by `mark_inactive_columns` below; `null` for a column
+            // the source still has (`SRC-8` task 11).
+            o.insert("inactiveSince".to_owned(), Value::Null);
             Value::Object(o)
         })
         .collect();
+    let mut schema = schema;
+    mark_inactive_columns(state, table, &mut schema).await;
 
     let rows = num_or_zero(Some(sync), "total");
     let sekunder = str_col(sync, "tier") == "sekunder";
@@ -2023,6 +2189,54 @@ async fn bronze_asset_detail_body(
     mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
+}
+
+/// Sets `inactiveSince` on the columns of a Bronze table that the connector
+/// loading it no longer finds at its source (`SRC-8` task 11, decision D8).
+///
+/// ONE extra query for the whole table
+/// ([`lakehouse_store::schema_change::inactive_columns_of_table`]), matched on
+/// the column's name in the Bronze table (the loader's normalised name, which
+/// the orchestrator sent as `loadedName`); a row that has none marks nothing.
+///
+/// Tenant: this runs inside [`detail`], after `catalog_tenant_refusal`, so
+/// the caller may already read this table's whole column list; the query is
+/// keyed by that table's name and returns only which of those columns are
+/// inactive and since when. It takes no connector id, name or tenant from
+/// the caller and returns nothing about any connector.
+///
+/// The marks are decoration: with no pool configured, or when the query
+/// fails, the detail still answers, without marks, and a warning is logged
+/// (the Schema tab must not break because of this; the text of the failure
+/// stays in the log).
+async fn mark_inactive_columns(state: &AppState, table: &str, schema: &mut [Value]) {
+    if table.is_empty() {
+        return;
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let marks = match lakehouse_store::schema_change::inactive_columns_of_table(pool, table).await {
+        Ok(marks) => marks,
+        Err(err) => {
+            tracing::warn!(%err, table, "inactive-column lookup failed; the detail shows no marks");
+            return;
+        }
+    };
+    for (loaded_name, since) in marks {
+        // Every entry of that name, not the first: the registry can still hold
+        // a column twice (a merge not yet run on a replica); a reader keyed
+        // by name must see the mark whichever copy it reads (`PR #101 CI run 2`).
+        for column in schema
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .filter(|column| {
+                column.get("name").and_then(Value::as_str) == Some(loaded_name.as_str())
+            })
+        {
+            column.insert("inactiveSince".to_owned(), json!(since.as_str()));
+        }
+    }
 }
 
 /// Whether the catalog list shows a Silver table as a row of its own. One
@@ -2362,19 +2576,69 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Whether `id` names an asset of the catalog, by the rule `detail` and
+/// `sample` apply (`SEC-16`): a `silver.`/`serving.` id is an asset when a
+/// `ClickHouse` table of that name exists; any other id is one when a
+/// registry (`bronze_meta`, `bronze_meta_sec`) holds it as a slug. Both are
+/// answered by [`super::catalog_profile::resolve_source`], the one lookup
+/// of this module that tells "no such asset" from "an asset with nothing
+/// readable behind it" (`Ok(None)` for a Bronze slug that is registered).
+///
+/// An annotation is stored under whatever id the caller sends, so without
+/// this a person could write one for a table that is not there, and read
+/// back what another wrote for a name they had only guessed. Costs one or
+/// two `ClickHouse` reads per call; no catalog listing.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] (`Asset not found.`) when no asset has that id;
+/// [`ApiError::Unavailable`] with a fixed sentence when the catalog cannot be
+/// asked, so the answer fails closed and never carries upstream text.
+async fn ensure_asset_exists(state: &AppState, id: &str) -> Result<(), ApiError> {
+    let by_table = id.starts_with("silver.") || id.starts_with("serving.");
+    match super::catalog_profile::resolve_source(state, id).await {
+        Ok(source) if !by_table || source.is_some() => Ok(()),
+        Ok(_) | Err(ApiError::NotFound(_)) => {
+            Err(ApiError::NotFound("Asset not found.".to_owned()))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "the catalog could not be asked whether an asset exists");
+            Err(ApiError::Unavailable(
+                "The catalog could not be checked. Try again.".to_owned(),
+            ))
+        }
+    }
+}
+
 /// `GET /api/catalog/{id}/annotation` — one asset's console-only metadata.
 /// An asset with no annotation row returns the empty shape rather than
 /// `404`, matching how the rest of this module nulls out unmeasured
 /// fields instead of failing.
 ///
 /// # Errors
+/// `SEC-16`: the tenant gate runs first, as for the write. It answers
+/// [`ApiError::PermissionDenied`] (`403`) with the gate's fixed reason, and
+/// passes through the [`ApiError::NotFound`] (`404`) of a malformed or
+/// foreign `X-Tenant`. Then `400` for an `id` over the bound; `404`
+/// (`Asset not found.`) when the catalog holds no asset of that id, `503`
+/// when it cannot be asked ([`ensure_asset_exists`]); then
 /// [`ApiError::Unavailable`] if no Postgres pool is configured; a
 /// classified [`lakehouse_store::StoreError`] on any other database
 /// failure.
 pub async fn get_annotation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
+    // SEC-16: the read skipped the gate the write already passes. The
+    // description of an annotation is as readable to a caller outside the
+    // catalog's tenant as the catalog itself, so it gets the catalog's rule.
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    validate_annotation_id(&id)?;
+    ensure_asset_exists(&state, &id).await?;
     let pool = annotation_pool(&state)?;
     let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
     Ok(ApiJson(row.map_or_else(
@@ -2413,7 +2677,10 @@ pub async fn get_annotation(
 /// `CATALOG_TENANT_ID`, the gate also passes through the
 /// [`ApiError::NotFound`] (`404`) that `tenant_scope::resolve` returns for an
 /// `X-Tenant` header that is malformed or names a tenant the caller does not
-/// belong to, again before the body is read. A caller the gate admits then gets `400` if the body is not JSON,
+/// belong to, again before the body is read. A caller the gate admits then gets
+/// `404` (`Asset not found.`) when the catalog holds no asset of that id and
+/// `503` when it cannot be asked ([`ensure_asset_exists`]), before the body is
+/// read and with nothing written; then `400` if the body is not JSON,
 /// or if `id`/`owner`/`steward`/`description`/any `tags` entry exceeds its
 /// bound (see the module doc above), or a classified
 /// [`lakehouse_store::StoreError`] on any database failure (including a
@@ -2434,6 +2701,9 @@ pub async fn put_annotation(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // SEC-16: an annotation for a table that is not in the catalog is
+    // refused before anything is stored.
+    ensure_asset_exists(&state, &id).await?;
     let parsed: AnnotationBody = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
     validate_annotation_body(&parsed)?;
@@ -2451,6 +2721,9 @@ pub async fn put_annotation(
         },
     )
     .await?;
+    // DATA-11 D2: a search must show the edit at once, not after the copy's
+    // age. Dropped only after the write succeeded.
+    state.catalog_search_cache.invalidate().await;
     // The asset's Change history reads this. Best-effort, like every other
     // audit write here: it never fails the edit it records. A save that
     // changed nothing records nothing.
@@ -2754,63 +3027,106 @@ mod tests {
         assert_eq!(table, "martDROPTABLEx");
     }
 
-    #[test]
-    fn filter_assets_by_query_matches_name_description_or_id_case_insensitively() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        let filtered = filter_assets_by_query(&assets, "ORDER", &[]);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], json!("bronze.orders"));
+    fn row(pairs: &[(&str, &str)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), json!(v)))
+            .collect()
+    }
 
-        let by_id = filter_assets_by_query(&assets, "bronze.users", &[]);
-        assert_eq!(by_id.len(), 1);
-        assert_eq!(by_id[0]["id"], json!("bronze.users"));
+    // DATA-11 R2: the three id shapes the row builders give.
+    #[test]
+    fn collect_columns_keys_bronze_by_slug_and_silver_and_gold_by_database() {
+        let bronze = vec![
+            row(&[
+                ("slug", "orders"),
+                ("key_asli", "total"),
+                ("deskripsi", "Order total"),
+            ]),
+            row(&[("slug", "orders"), ("key_asli", "buyer"), ("deskripsi", "")]),
+            row(&[("slug", ""), ("key_asli", "orphan"), ("deskripsi", "")]),
+        ];
+        let system = vec![
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", "amount"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "serving"),
+                ("table", "mart_x"),
+                ("name", "visitors"),
+                ("comment", "Visitors"),
+            ]),
+            row(&[
+                ("db", "lake"),
+                ("table", "other"),
+                ("name", "ignored"),
+                ("comment", ""),
+            ]),
+            row(&[
+                ("db", "silver"),
+                ("table", "clean"),
+                ("name", ""),
+                ("comment", ""),
+            ]),
+        ];
+        let index = collect_columns(&bronze, &system);
+        assert_eq!(
+            index.get("orders"),
+            Some(&vec![
+                ("total".to_owned(), "Order total".to_owned()),
+                ("buyer".to_owned(), String::new()),
+            ])
+        );
+        assert_eq!(
+            index.get("silver.clean"),
+            Some(&vec![("amount".to_owned(), String::new())])
+        );
+        assert_eq!(
+            index.get("serving.mart_x"),
+            Some(&vec![("visitors".to_owned(), "Visitors".to_owned())])
+        );
+        // The empty slug, the other database and the unnamed column add nothing.
+        assert_eq!(index.len(), 3);
+    }
+
+    fn rows_in(order: &[&str]) -> Vec<Value> {
+        order
+            .iter()
+            .map(|id| json!({ "id": id, "name": id }))
+            .collect()
+    }
+
+    fn row_ids(rows: &[Value]) -> Vec<&str> {
+        rows.iter().filter_map(|r| r["id"].as_str()).collect()
+    }
+
+    // DATA-11 R4 / F4.
+    #[test]
+    fn a_search_with_no_sort_keeps_its_rank_order() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        order_results(&mut rows, true, &[]);
+        assert_eq!(row_ids(&rows), vec!["b", "c", "a"]);
     }
 
     #[test]
-    fn filter_assets_by_query_matches_via_an_annotation_tag() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        let annotations = vec![AnnotationRow {
-            asset_id: "bronze.users".to_owned(),
-            owner: None,
-            steward: None,
-            tags: vec!["pii".to_owned()],
-            description: None,
+    fn a_search_with_a_sort_obeys_the_sort() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        let sort = [catalog_query::SortSpec {
+            id: "name".to_owned(),
+            desc: true,
         }];
-        let filtered = filter_assets_by_query(&assets, "pii", &annotations);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0]["id"], json!("bronze.users"));
+        order_results(&mut rows, true, &sort);
+        assert_eq!(row_ids(&rows), vec!["c", "b", "a"]);
     }
 
     #[test]
-    fn filter_assets_by_query_empty_q_returns_everything() {
-        let assets = vec![
-            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
-            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
-        ];
-        assert_eq!(filter_assets_by_query(&assets, "", &[]).len(), 2);
-        assert_eq!(filter_assets_by_query(&assets, "   ", &[]).len(), 2);
-    }
-
-    #[test]
-    fn filter_assets_by_query_matches_non_ascii_case_unicode_aware() {
-        // `Ö`/`ö` are distinct bytes under `to_ascii_lowercase` (ASCII
-        // lowercasing only touches `A`-`Z`, so a non-ASCII byte never
-        // changes and the two never compare equal) but fold to the same
-        // code point under `to_lowercase`, matching the browser's
-        // Unicode-aware JavaScript `toLowerCase()`.
-        let assets = vec![json!({
-            "id": "bronze.orders",
-            "name": "Orders",
-            "description": "Umsatz nach Übersee"
-        })];
-        let filtered = filter_assets_by_query(&assets, "übersee", &[]);
-        assert_eq!(filtered.len(), 1);
+    fn without_a_search_the_rows_still_order_by_id() {
+        let mut rows = rows_in(&["b", "c", "a"]);
+        order_results(&mut rows, false, &[]);
+        assert_eq!(row_ids(&rows), vec!["a", "b", "c"]);
     }
 
     #[test]
@@ -3584,6 +3900,24 @@ mod tests {
             server
         }
 
+        /// A mock `ClickHouse` that answers every query with one column, so
+        /// any `silver.`/`serving.` table exists for `ensure_asset_exists`.
+        async fn mock_clickhouse_with_table() -> wiremock::MockServer {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        { "name": "name", "type": "String" },
+                        { "name": "type", "type": "String" },
+                    ],
+                    "data": [{ "name": "id", "type": "UInt64" }],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
         fn principal(tenant_ids: &[Uuid], permissions: &str) -> Principal {
             Principal {
                 id: PrincipalId::User(Uuid::new_v4()),
@@ -3651,6 +3985,58 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("CATALOG_TENANT_ID")
+            );
+        }
+
+        /// DATA-11 R4: a refused caller who sends a search term gets the same
+        /// `supported: false` answer, and the search copy is never read: the
+        /// mock `ClickHouse` receives no request at all.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_refused_caller_searching_gets_supported_false_and_the_copy_is_not_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:read");
+
+            let resp = list(
+                State(state.clone()),
+                Extension(outsider.clone()),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    q: Some("revenue".to_owned()),
+                }),
+            )
+            .await;
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["supported"], json!(false));
+
+            let resp = query(
+                State(state),
+                Extension(outsider),
+                HeaderMap::new(),
+                axum::extract::Query(CatalogQuery {
+                    page: None,
+                    page_size: None,
+                    search: Some("revenue".to_owned()),
+                    sort: None,
+                    filters: None,
+                    join_operator: None,
+                    group_by: None,
+                    skip_list_meta: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let (status, body) = response_json(resp).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["supported"], json!(false));
+            assert_eq!(body["totalItems"], json!(0));
+
+            assert!(
+                ch.received_requests().await.unwrap().is_empty(),
+                "a refused caller must not cause a catalog read"
             );
         }
 
@@ -3812,7 +4198,11 @@ mod tests {
         async fn put_annotation_still_writes_when_the_caller_is_a_member_of_the_catalog_tenant(
             pool: lakehouse_store::PgPool,
         ) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: the write now needs the asset to exist, so the mock
+            // catalog has a `serving.mart_x`; the dead address this test used
+            // before answers 503.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
 
             let result = put_annotation(
@@ -3828,6 +4218,239 @@ mod tests {
             };
             assert_eq!(body, json!({ "ok": true }));
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
+        }
+
+        /// SEC-16 regression: the read passed no tenant gate, so a caller
+        /// outside the catalog's tenant read an annotation. It fails before
+        /// the fix (200), and the refusal is the write's fixed 403.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_refuses_with_403_when_the_caller_is_not_a_member(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:read");
+
+            let result = get_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(outsider),
+                HeaderMap::new(),
+            )
+            .await;
+            let Err(rejection) = result else {
+                panic!("a refused read must be an error, never a 200");
+            };
+            let (status, body) = response_json(rejection.into_response()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("CATALOG_TENANT_ID"), "{message}");
+            assert!(
+                !message.contains(TENANT_A) && !message.contains(TENANT_B),
+                "the refusal must not name a tenant id: {message}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_answers_the_empty_shape_for_an_existing_asset_without_one(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            let result = get_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+            )
+            .await;
+            let Ok(ApiJson(body)) = result else {
+                panic!("a member must read the annotation of an existing asset");
+            };
+            assert_eq!(body["owner"], Value::Null);
+            assert_eq!(body["tags"], json!([]));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn get_annotation_answers_404_for_an_id_that_is_not_in_the_catalog(
+            pool: lakehouse_store::PgPool,
+        ) {
+            // Every query returns no rows: no such table, no such slug.
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read");
+
+            for id in ["serving.not_there", "not-a-registered-slug"] {
+                let result = get_annotation(
+                    State(state.clone()),
+                    Path(id.to_owned()),
+                    Extension(member.clone()),
+                    HeaderMap::new(),
+                )
+                .await;
+                let Err(rejection) = result else {
+                    panic!("{id}: an unknown asset must be an error");
+                };
+                let (status, body) = response_json(rejection.into_response()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body["error"], json!("Asset not found."), "{id}");
+            }
+        }
+
+        /// SEC-16 regression: an annotation could be written for an id that
+        /// is not an asset. Nothing is written.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_annotation_answers_404_and_writes_nothing_for_an_id_that_is_not_in_the_catalog(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+
+            for id in ["serving.not_there", "not-a-registered-slug"] {
+                let result = put_annotation(
+                    State(state.clone()),
+                    Path(id.to_owned()),
+                    Extension(member.clone()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"description":"visits per month"}"#),
+                )
+                .await;
+                let Err(rejection) = result else {
+                    panic!("{id}: a write for an unknown asset must be an error");
+                };
+                let (status, body) = response_json(rejection.into_response()).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body["error"], json!("Asset not found."), "{id}");
+                assert_eq!(annotation_rows(&pool, id).await, 0, "{id}: no row");
+            }
+        }
+
+        /// Fail closed: when the catalog cannot be asked, the answer is a
+        /// fixed 503 sentence, not a pass and not the upstream's text.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn annotation_routes_answer_503_when_the_catalog_cannot_be_asked(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:read,catalog:write");
+
+            let Err(read) = get_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(member.clone()),
+                HeaderMap::new(),
+            )
+            .await
+            else {
+                panic!("a read must not pass when the catalog cannot be asked");
+            };
+            let (status, body) = response_json(read.into_response()).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                body["error"],
+                json!("The catalog could not be checked. Try again.")
+            );
+
+            let Err(write) = put_annotation(
+                State(state),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"description":"visits per month"}"#),
+            )
+            .await
+            else {
+                panic!("a write must not pass when the catalog cannot be asked");
+            };
+            let (status, _) = response_json(write.into_response()).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        fn empty_copy() -> crate::catalog_search_cache::CatalogSearchSnapshot {
+            crate::catalog_search_cache::CatalogSearchSnapshot {
+                assets: Vec::new(),
+                namespaces: Value::Null,
+                columns: std::collections::HashMap::new(),
+                usage: std::collections::HashMap::new(),
+                column_search_partial: false,
+            }
+        }
+
+        /// `DATA-11` review `SHOULD-FIX 3`: put a copy in the cache, so a
+        /// test can tell whether the next read rebuilds it.
+        async fn prime_search_copy(state: &AppState) {
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Whether the next read of the copy runs its build.
+        async fn next_read_rebuilds(state: &AppState) -> bool {
+            let rebuilt = std::sync::atomic::AtomicBool::new(false);
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    rebuilt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, String>(empty_copy())
+                })
+                .await
+                .unwrap();
+            rebuilt.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_annotation_drops_the_search_copy_so_the_next_search_rebuilds(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_ok(), "a member's write must succeed");
+            assert!(
+                next_read_rebuilds(&state).await,
+                "an edit must drop the copy so a search shows it at once"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_refused_put_annotation_leaves_the_search_copy_in_place(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let outsider = principal(&[TENANT_B.parse().unwrap()], "catalog:write");
+            prime_search_copy(&state).await;
+
+            let result = put_annotation(
+                State(state.clone()),
+                Path("serving.mart_x".to_owned()),
+                Extension(outsider),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"tags":["finance"]}"#),
+            )
+            .await;
+            assert!(result.is_err(), "a refused write must be an error");
+            assert!(
+                !next_read_rebuilds(&state).await,
+                "a write that stored nothing must not drop the copy"
+            );
         }
     }
 
@@ -4342,6 +4965,157 @@ mod tests {
                 assert_eq!(body["schemaVersions"], json!([]));
                 Ok(())
             }
+        }
+    }
+
+    /// `SRC-8` task 11: the Schema tab's inactive-column marks.
+    mod inactive_marks {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn schema() -> Vec<Value> {
+            ["id", "order_date", "legacy"]
+                .iter()
+                .map(|n| json!({"name": n, "dataType": "String", "inactiveSince": Value::Null}))
+                .collect()
+        }
+
+        /// A connector that loads `orders_raw` from its source object `public.orders`,
+        /// whose column `OrderDate` (loaded as `order_date`) was approved as removed.
+        async fn seed(pool: &lakehouse_store::PgPool) {
+            use lakehouse_store::connectors::{
+                CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
+            };
+            let created = lakehouse_store::connectors::create_connector(
+                pool,
+                &CreateConnectorInput {
+                    name: "marks".to_owned(),
+                    kind: "PostgreSQL".to_owned(),
+                    direction: "source".to_owned(),
+                    host: "db.example".to_owned(),
+                    credential: CredentialSpec {
+                        source: CredentialSource::Env,
+                        primary: CredentialKind::Password,
+                        secondary: None,
+                    },
+                    environment: "staging".to_owned(),
+                    tenant: "Meridian Group".to_owned(),
+                    residency: "in-region".to_owned(),
+                    capabilities: vec![],
+                    owner: None,
+                },
+            )
+            .await
+            .unwrap()
+            .0
+            .id;
+            sqlx::query("UPDATE connector SET source_objects = $2 WHERE id = $1")
+                .bind(&created)
+                .bind(json!([{"name": "public.orders", "target": "orders_raw", "loadMode": "replace"}]))
+                .execute(pool)
+                .await
+                .unwrap();
+            for (column, loaded) in [("OrderDate", Some("order_date")), ("legacy", None)] {
+                sqlx::query(
+                    "INSERT INTO connector_inactive_column \
+                     (connector_id, object_name, column_name, inactive_since, loaded_name) \
+                     VALUES ($3, 'public.orders', $1, '2026-10-01T08:00:00Z', $2)",
+                )
+                .bind(column)
+                .bind(loaded)
+                .bind(&created)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        /// The marked column carries its date and the others stay `null`; a
+        /// row with no loaded name marks nothing, and another table is not
+        /// touched.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_removed_column_is_marked_by_its_name_in_the_bronze_table(
+            pool: lakehouse_store::PgPool,
+        ) {
+            seed(&pool).await;
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+            assert_eq!(schema[0]["inactiveSince"], Value::Null);
+            assert_eq!(
+                schema[1]["inactiveSince"],
+                json!("2026-10-01T08:00:00.000Z")
+            );
+            assert_eq!(
+                schema[2]["inactiveSince"],
+                Value::Null,
+                "no loaded name, no mark"
+            );
+
+            let mut other = self::schema();
+            mark_inactive_columns(&state, "customers_raw", &mut other).await;
+            assert!(other.iter().all(|c| c["inactiveSince"].is_null()));
+        }
+
+        /// `PR #101 CI run 2` (G6 SRC-8 step 4): a column the registry lists
+        /// more than once is marked in every copy, so a reader keyed by name
+        /// sees the mark whichever copy it reads.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_column_listed_twice_is_marked_in_every_copy(pool: lakehouse_store::PgPool) {
+            seed(&pool).await;
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            schema.push(
+                json!({"name": "order_date", "dataType": "String", "inactiveSince": Value::Null}),
+            );
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+
+            let marked: Vec<&Value> = schema
+                .iter()
+                .filter(|c| c["name"] == "order_date")
+                .map(|c| &c["inactiveSince"])
+                .collect();
+            assert_eq!(marked.len(), 2);
+            assert!(marked.iter().all(|m| !m.is_null()), "{marked:?}");
+        }
+
+        /// A failed lookup leaves the columns as they were: the detail still
+        /// answers, only without marks.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_failed_lookup_leaves_the_columns_unmarked(pool: lakehouse_store::PgPool) {
+            seed(&pool).await;
+            sqlx::query("DROP TABLE connector_inactive_column")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let state = state_for(&pool);
+
+            let mut schema = schema();
+            mark_inactive_columns(&state, "orders_raw", &mut schema).await;
+
+            assert!(schema.iter().all(|c| c["inactiveSince"].is_null()));
         }
     }
 }

@@ -39,6 +39,12 @@
 //!   [`TableClaim::Ours`] or [`TableClaim::Theirs`].
 //! - [`table_claimed`] asks whether anyone holds it, for the one caller with
 //!   no tenant to ask on behalf of (a connector's ingest spec, plan task T8).
+//! - [`list_claims`] lists a tenant's claims with the upload each one came
+//!   from and that upload's file name while it exists. It is the record the
+//!   lineage graph draws an `upload -> bronze.<table>` edge from (`DATA-19`),
+//!   which is why a claim outliving its upload matters outside the ownership
+//!   rules above: the origin of a table stays drawable after the file is
+//!   gone.
 //!
 //! A claim is NEVER RELEASED. Not when the upload that made it is deleted
 //! ([`delete`] removes the upload's row and nothing else), not when the load
@@ -305,6 +311,25 @@ pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64) -> Result<Vec<Uplo
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<Upload>, StoreError> {
     let sql = format!("SELECT {COLS} FROM file_upload WHERE id = $1");
     Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
+}
+
+/// The upload whose load is run `run_id`, or `None` (`SRC-7` F6): the
+/// orchestrator's failure report names a run, not an upload. NOT
+/// tenant-scoped, like [`get`]: the caller is the run-event route, which
+/// is admitted by service identity, not a tenant. A relaunch replaces the
+/// row's `run_id` ([`attach_run`]), so the newest claim is the one named.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn get_by_run_id(pool: &PgPool, run_id: &str) -> Result<Option<Upload>, StoreError> {
+    let sql = format!(
+        "SELECT {COLS} FROM file_upload WHERE run_id = $1 ORDER BY updated_at DESC LIMIT 1"
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// Whether upload `id` belongs to one of `tenant_ids`: the access rule every
@@ -714,6 +739,69 @@ pub async fn claim_table(
     .fetch_one(pool)
     .await?;
     Ok(holder == Some(tenant_id))
+}
+
+/// One claimed raw table and the upload that asked for the name, as the
+/// lineage graph reads it (`routes::lineage`, `DATA-19` / D5).
+///
+/// `original_filename` is `None` when the `file_upload` row is gone: a
+/// claim outlives the upload that made it (the module doc), and deleting
+/// an upload deletes its row for real. A caller that shows this node says
+/// "deleted upload" for `None` rather than guessing a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedTable {
+    /// The claimed raw table name (`upload_table_claim.bronze_table`).
+    pub bronze_table: String,
+    /// The upload that first asked for the name (`upload_id`). Kept even
+    /// when that upload is gone — the claim must outlive it.
+    pub upload_id: String,
+    /// The upload's original file name, when the row still exists.
+    pub original_filename: Option<String>,
+}
+
+/// Every claim `tenant_id` holds, with the file name of the upload that
+/// asked for the name when that row still exists.
+///
+/// The tenant rule is [`ConnectorFilter`]'s, the one every tenant-scoped
+/// read in this crate follows: `Some(t)` shows only the rows whose own
+/// `tenant_id` is `t`, so a claim whose tenant was deleted
+/// (`ON DELETE SET NULL`) belongs to nobody and is invisible to every
+/// tenant-scoped caller (fail closed); `None` is the unscoped read and
+/// shows every claim, `tenant_id IS NULL` included. It exists for the
+/// lineage route, which resolves its tenant first exactly as
+/// `routes::connectors::list` does.
+///
+/// One `LEFT JOIN`, not one query per claim: the lineage graph reads every
+/// claim of the caller's tenant on every focus, and a claim per table
+/// makes a second round trip per table.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn list_claims(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+) -> Result<Vec<ClaimedTable>, StoreError> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT c.bronze_table, c.upload_id, f.original_filename \
+           FROM upload_table_claim c \
+           LEFT JOIN file_upload f ON f.id = c.upload_id \
+          WHERE ($1::uuid IS NULL OR c.tenant_id = $1) \
+          ORDER BY c.bronze_table",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(bronze_table, upload_id, original_filename)| ClaimedTable {
+                bronze_table,
+                upload_id,
+                original_filename,
+            },
+        )
+        .collect())
 }
 
 /// Whether ANY tenant holds `table`, a claim whose tenant is gone included.

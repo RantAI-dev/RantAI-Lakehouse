@@ -82,6 +82,50 @@ UNCLEAR WORDS
 - Ask only once. If your previous message was a question, take the most likely reading, say which one you took, and answer.
 - If the question is not about data, answer it as it is. Do not ask.";
 
+/// The two sentences the console sends with the SQL help. `prepare_chat`
+/// matches the Explain one to take the tool out of its turn (plan 17); the
+/// test below holds the rules to the same words.
+pub(super) const EXPLAIN_REQUEST: &str = "Explain what this query does.";
+/// The Fix sentence is named only for the test that holds the rules to it:
+/// no product code matches it, so it is not compiled outside tests.
+#[cfg(test)]
+pub(super) const FIX_REQUEST: &str = "Why does this query fail? Fix it.";
+
+/// Appended after the mode text when `AI_SQL_HELP` is on and `propose_sql` is
+/// in the chat's tool list. It is a separate block, so a chat without the
+/// tool keeps the prompt it had, byte for byte.
+///
+/// The rules name no table, column or value: the statement, the engine and
+/// the error come in the message, and the rules say only what to do with
+/// them.
+pub(super) const SQL_HELP_RULES: &str = "
+
+SQL HELP
+- A message that starts with \"Why does this query fail? Fix it.\" holds an engine, a statement and the error it raised. Find the cause, then call propose_sql once with the whole corrected statement for that engine and one sentence on what was wrong. Change only what the error requires.
+- If propose_sql returns an error, correct the statement and call it again.
+- If the statement cannot be fixed from what is known, say what is missing and call nothing.
+- A message that starts with \"Explain what this query does.\" holds a statement. Say in plain words what it returns, step by step, and call no tool.
+- Never call run_sql for either.";
+
+/// Appended after the mode text (and after [`ASK_BACK_RULES`]) when
+/// `AI_SEMANTIC_LAYER` is on, in both modes. It is a separate block and not
+/// part of [`SYSTEM_BASE`], so a deployment with the switch off keeps the
+/// prompt it was measured with, byte for byte.
+///
+/// Rule 2 of [`SYSTEM_BASE`] says to `SUM` the measure. A count of distinct
+/// things in a table grouped by several columns is no measure: the same
+/// thing can sit in more than one row, so a sum counts it more than once.
+/// The rules name no table, column or value, because they apply to any
+/// dataset; the marker they quote is the one `data_map` writes for a
+/// `non_additive` column.
+pub(super) const DISTINCT_COUNT_RULES: &str = "
+
+COUNTS IN A GROUPED TABLE
+- A count column in a table whose grain has several columns may count the same thing in more than one row, so adding it up counts that thing more than once. Amounts and quantities are added up as before.
+- Never add up a column the DATA MAP marks [never SUM across rows], or a count you judge to overlap in this way. If a detail table in the DATA MAP has one row per thing or per line of it, count the distinct things there, with the same filters.
+- If there is no such detail table, give the figure per row of the grain and say that a total cannot be read from this table.
+- Say in one clause which table the count came from.";
+
 /// Most remembered words carried in one prompt: the newest ones. A person
 /// may keep more (`lakehouse_store::chat_term::MAX_TERMS_PER_OWNER`), but a
 /// small model's context is better spent on the question.
@@ -322,20 +366,33 @@ pub(super) const SYSTEM_ASK_SUFFIX: &str = "
 
 MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. If the user asks for a change, tell them to switch to Build mode.";
 
+/// The line added to the newest user message, naming the mode for that
+/// message. The history still holds the model's own earlier statements about
+/// the mode (for example "I am in ASK mode" after a switch to Build), and the
+/// model follows those, so the newest message says which mode applies now.
+pub(super) fn mode_note(is_build: bool) -> &'static str {
+    if is_build {
+        "[Mode for this message: BUILD. Earlier messages about the mode are out of date.]"
+    } else {
+        "[Mode for this message: ASK. Earlier messages about the mode are out of date.]"
+    }
+}
+
 /// Appended in build mode.
 pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
-- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart.
+- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart. A chart can read only a Gold mart (describe_mart lists its columns) or a saved SQL source (list_sql_sources); a Silver or Bronze table cannot be charted, so say so and offer a mart or a SQL source instead.
+- Calculated fields (a value the table does not store, such as profit = revenue - cost): list_formula_functions gives the formula language and every function; write a FORMULA, never SQL; validate_formula checks it and returns the position of a mistake; create_calculated_field saves it on a mart or SQL source (then use its name in create_chart like a column); update_calculated_field changes it; list_calculated_fields shows what exists and explains a formula in plain words. Running totals, ranks, percent of total, moving averages, previous period, same period last year and Fixed are formula functions too: a table calculation or period comparison is only a measure of a bar, line, area, stacked, combo, waterfall or grouped table chart (period comparisons need Group by on a date); the server says why when it refuses.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
-- Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets, run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
+- Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets (it cannot change where a connector points: that needs its credentials again and is done in the console), run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
 - Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity.
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, delete_calculated_field, run_bronze_maintenance, kill_query. Call the tool; the server then creates the approval. Only when a tool result says needs_approval, tell the user the request is waiting in Approvals (/agents/approvals). Never say a request is waiting if you did not call the tool, or if its result did not say needs_approval.
 - needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
 
@@ -409,6 +466,16 @@ const DOMAINS: &[Domain] = &[
             "tile",
             "sql source",
             "sumber sql",
+            "formula",
+            "rumus",
+            "calculated",
+            "kolom hitung",
+            "calculate",
+            "profit",
+            "margin",
+            "minus",
+            "ratio",
+            "selisih",
         ],
         tools: &[
             "list_charts",
@@ -418,6 +485,12 @@ const DOMAINS: &[Domain] = &[
             "update_chart",
             "create_board",
             "delete_chart",
+            "list_formula_functions",
+            "list_calculated_fields",
+            "validate_formula",
+            "create_calculated_field",
+            "update_calculated_field",
+            "delete_calculated_field",
         ],
     },
     Domain {
@@ -600,6 +673,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_count_rules_are_five_lines_and_name_no_dataset() {
+        let lines = DISTINCT_COUNT_RULES
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines <= 5, "{lines} lines: {DISTINCT_COUNT_RULES}");
+        // A word of one dataset would tie these rules to one deployment.
+        let lower = DISTINCT_COUNT_RULES.to_lowercase();
+        for word in ["wisman", "pariwisata", "mart_", "outlet", "distributor"] {
+            assert!(!lower.contains(word), "`{word}` in {DISTINCT_COUNT_RULES}");
+        }
+        assert!(
+            DISTINCT_COUNT_RULES.contains(crate::routes::ai::data_map::NON_ADDITIVE_MARKER.trim()),
+            "the marker the DATA MAP writes is not quoted"
+        );
+    }
+
+    #[test]
+    fn the_sql_help_rules_are_six_lines_and_hold_both_sentences_verbatim() {
+        let lines = SQL_HELP_RULES
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines <= 6, "{lines} lines: {SQL_HELP_RULES}");
+        // The console sends these two sentences; the rules must name them
+        // exactly, or the model does not know which branch a message is in.
+        assert!(SQL_HELP_RULES.contains(FIX_REQUEST), "{SQL_HELP_RULES}");
+        assert!(SQL_HELP_RULES.contains(EXPLAIN_REQUEST), "{SQL_HELP_RULES}");
+    }
+
+    #[test]
+    fn the_sql_help_rules_name_no_dataset() {
+        let lower = SQL_HELP_RULES.to_lowercase();
+        for word in [
+            "wisman",
+            "pariwisata",
+            "mart_",
+            "kunjungan",
+            "serving.",
+            "silver.",
+        ] {
+            assert!(!lower.contains(word), "`{word}` in {SQL_HELP_RULES}");
+        }
+    }
+
+    #[test]
+    fn propose_sql_is_offered_only_by_an_allowlist_never_by_default() {
+        // The chat's own list and the eval's plain chat keep today's tools:
+        // the tool is in no domain and not in `ALWAYS`.
+        assert!(!ALWAYS.contains(&super::super::registry::PROPOSE_SQL));
+        for domain in DOMAINS {
+            assert!(!domain.tools.contains(&super::super::registry::PROPOSE_SQL));
+        }
+        for recent in [
+            vec!["Why does this query fail? Fix it."],
+            vec!["Explain what this query does."],
+        ] {
+            assert!(!select_tools(&recent).contains(super::super::registry::PROPOSE_SQL));
+        }
+    }
+
+    #[test]
     fn a_data_question_gets_only_the_data_tools_and_listings() {
         let tools = select_tools(&["How many foreign tourists came in 2024?"]);
         assert_eq!(tools.len(), ALWAYS.len());
@@ -648,6 +783,12 @@ mod tests {
     #[test]
     fn every_registered_tool_is_reachable_from_some_domain() {
         for spec in super::super::registry::TOOLS {
+            // `propose_sql` is offered only when the console's allowlist names
+            // it (plan 15 decision: the eval's plain chat keeps today's tools),
+            // so it is reachable by that path and by no domain.
+            if spec.name == super::super::registry::PROPOSE_SQL {
+                continue;
+            }
             let reachable =
                 ALWAYS.contains(&spec.name) || DOMAINS.iter().any(|d| d.tools.contains(&spec.name));
             assert!(reachable, "{} can never be offered to the model", spec.name);

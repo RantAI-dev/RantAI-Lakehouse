@@ -8,10 +8,11 @@ import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder
 import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import { apiFetch } from "@/services/http";
+import type { TileFailure } from "@/services/contracts/dashboards";
 
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
-  result: { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
+  result: { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 };
 
 function str(v: unknown): string | undefined {
@@ -127,7 +128,6 @@ export function ChartDraftCard({
             cell={preview.result}
             dark={resolvedTheme === "dark"}
             loading={loading}
-            year="all"
           />
         ) : (
           <div className="h-full animate-pulse rounded-lg bg-muted/60" />

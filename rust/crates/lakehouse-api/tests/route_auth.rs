@@ -336,14 +336,30 @@ async fn a_seeded_analyst_is_not_denied_catalog_annotation_read() {
     .await;
     assert_ne!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "a seeded Analyst holding catalog:read must not be denied"
-    );
-    assert_ne!(
-        resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+    // SEC-16: the read now runs the catalog tenant gate too, and the seeded
+    // app has several tenants and no `CATALOG_TENANT_ID`, so it answers 403
+    // with the gate's fixed reason. Only that 403 is allowed here: the
+    // permission middleware's body names the missing permission instead, so
+    // the assertion still fails if the middleware denies the Analyst.
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "a seeded Analyst holding catalog:read must not be denied by the permission \
+             middleware; the only 403 allowed here is the tenant gate's, got {error:?}"
+        );
+    }
 }
 
 /// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied
@@ -730,6 +746,12 @@ async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
             "endpoints": [],
         },
         "sourceObjects": [],
+        // SEC-14: this body moves `conn-pg-lakehouse` from `sql` to `rest`,
+        // which is a re-point and so needs its credential in the same
+        // request; without it the answer would be the 409 of that rule
+        // (tests/connector_repoint.rs), not the address check's 400 this
+        // test is about. The credential is a throwaway bearer token.
+        "credential": { "primary": { "kind": "token", "value": "throwaway-token" } },
     });
 
     let response = router
@@ -819,6 +841,82 @@ async fn governance_write_only_principal_may_put_but_not_get_sla() {
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+}
+
+/// SEC-23 (F1/F2): a principal holding other write permissions but NOT
+/// `governance:write` is refused (403) when it adds a quality,
+/// classification or residency rule, and nothing is stored. The bodies are
+/// valid, so a 403 can only come from the permission gate, and the row
+/// counts prove the handler never ran.
+#[tokio::test]
+async fn adding_a_governance_rule_without_governance_write_is_refused_and_stores_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(
+        &pool,
+        "catalog:read,catalog:write,policy:read,policy:write,query:read,pipeline:write",
+    )
+    .await;
+
+    let cases = [
+        (
+            "quality",
+            "quality_rule",
+            serde_json::json!({
+                "name": "sec23-no-write", "asset": "gold.orders", "dimension": "completeness",
+                "threshold": "99%", "severity": "high",
+            }),
+        ),
+        (
+            "classification",
+            "classification_rule",
+            serde_json::json!({
+                "asset": "gold.orders", "column": "email", "classification": "PII",
+                "maskingRule": "hash",
+            }),
+        ),
+        (
+            "residency",
+            "residency_rule",
+            serde_json::json!({
+                "tenant": "sec23", "classification": "PII", "approvedSites": ["site-a"],
+                "crossSiteAllowed": false, "allowedOutput": "none",
+            }),
+        ),
+    ];
+    for (kind, table, body) in cases {
+        // `table` is a constant from the array above, never user input.
+        let count_sql = format!("SELECT count(*) FROM {table}");
+        let before: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules before");
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/governance/{kind}"))
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("serialize body"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "adding a {kind} rule without governance:write must be refused"
+        );
+        let after: i64 = sqlx::query_scalar(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count rules after");
+        assert_eq!(before, after, "a refused {kind} rule must store nothing");
+    }
 }
 
 /// # Input validation: `expectedIntervalMinutes: 0` is refused at the
@@ -998,6 +1096,33 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
         "POLICY_TABLE looks suspiciously small ({}) for a ~30-route-module service",
         POLICY_TABLE.len()
     );
+}
+
+/// SEC-9: the natural-language box in Query Studio has no endpoint of its
+/// own. The old `/api/agent*` ask and text-to-SQL routes ran model-written SQL
+/// straight against the engine; #78 removed them, and the assistant now runs
+/// SQL only through the tool gate (`/api/ai/chat`, `/api/ai/tool`). A route
+/// of that shape coming back would be a path around the gate, so it fails
+/// here by name.
+#[test]
+fn no_route_runs_model_written_sql_outside_the_assistant_tool_gate() {
+    for (method, path, _) in POLICY_TABLE {
+        let lower = path.to_ascii_lowercase();
+        assert!(
+            lower != "/api/agent" && !lower.starts_with("/api/agent/"),
+            "{method} {path}: a standalone agent endpoint (SEC-9)"
+        );
+        assert!(
+            !lower.contains("text-to-sql")
+                && !lower.contains("text_to_sql")
+                && !lower.contains("nl2sql"),
+            "{method} {path}: a text-to-SQL endpoint (SEC-9)"
+        );
+        assert!(
+            !(lower.starts_with("/api/ai/") && lower.contains("sql")),
+            "{method} {path}: an AI route that names SQL outside the tool gate (SEC-9)"
+        );
+    }
 }
 
 /// Every route the router actually registers must have a `POLICY_TABLE`
@@ -1269,4 +1394,68 @@ async fn delete_session_writes_an_audit_event() {
          revoked (the request path's {{id}}, never the caller's bearer \
          token)"
     );
+}
+
+/// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
+/// policies the plan names, so the table-driven loops above walk them both
+/// ways (a `dashboard:read`-only principal is refused on the withdrawal; the
+/// frame answer is reachable with no credentials at all).
+#[test]
+fn the_sec12_embed_routes_are_registered_with_the_policies_the_plan_names() {
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    assert_eq!(
+        policy_of("POST", "/api/embed/frame"),
+        Some(Policy::Public),
+        "the frame answer is read by the console's proxy with only the embed token"
+    );
+    assert_eq!(
+        policy_of("POST", "/api/dashboard/embed-revoke"),
+        Some(Policy::RequiresPermission("dashboard:write")),
+        "withdrawing a token is a write"
+    );
+}
+
+/// BI-16 part A (T8): the whole-result table export needs `dashboard:read` and
+/// nothing more, and not the Query Studio permission. Asserted both ways: a
+/// principal holding only `dashboard:read` gets past the gate, one holding only
+/// `query:read` is refused.
+#[tokio::test]
+async fn the_table_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/table-export")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/dashboard/table-export?chart=x",
+        &cookie,
+    )
+    .await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/dashboard/table-export?chart=x",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

@@ -106,6 +106,14 @@ def step_wait_for_services() -> None:
         == 200,
         90,
     )
+    # SRC-9 F-c: the webserver answering is not the code location having
+    # loaded; same wait as `ops/g3/g3_test.py::step_wait_for_services`.
+    # `_post_trigger` still guards a race that lands after it.
+    _wait_for(
+        f"Dagster code location ({JOB_NAME} loaded)",
+        lambda: _dagster_job_is_loaded(JOB_NAME),
+        120,
+    )
 
 
 def step_login() -> None:
@@ -162,8 +170,51 @@ def step_job_is_listed_via_lakehouse_api() -> None:
     print(f"[g3a] {JOB_NAME!r} is visible via GET /api/pipelines")
 
 
+def _dagster_job_is_loaded(job_name: str) -> bool:
+    """True once a loaded Dagster repository lists `job_name`. Twin of
+    `ops/g6/g6_ingest_matrix_test.py::_ingest_job_is_loaded` and of
+    `ops/g3/g3_test.py::_dagster_job_is_loaded` (the gate scripts share no
+    module)."""
+    query = (
+        "{ repositoriesOrError { ... on RepositoryConnection "
+        "{ nodes { jobs { name } } } } }"
+    )
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == job_name for node in nodes for job in node.get("jobs", []))
+
+
+def _job_not_loaded(resp: requests.Response) -> bool:
+    """Whether the API answered "the orchestrator has not loaded this job
+    yet": 503 and the stable `code`, never the message text. SEC-11 removed
+    Dagster's `PipelineNotFoundError` text from responses, which this gate
+    used to match (PR #105 CI fix)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return resp.status_code == 503 and isinstance(body, dict) and body.get("code") == "orchestrator_job_not_loaded"
+
+
+def _post_trigger(url: str, job_name: str) -> requests.Response:
+    """POST a trigger with a one-shot retry for the code-location start-up
+    race. SRC-9 F-c: `ops/g3/g3_test.py::_post_trigger` (its twin, and
+    `ops/g6/g6_ingest_matrix_test.py::_post_ingest_run`) hit
+    `422 {"error":"PipelineNotFoundError"}` when the first trigger came
+    before the code location had loaded. On that 503 `orchestrator_job_not_loaded`, wait up to 120 s for
+    Dagster to list `job_name` and POST once more. Any other failure is
+    returned unchanged for the caller's own assertion."""
+    resp = API.post(url, timeout=10)
+    if resp.ok or not _job_not_loaded(resp):
+        return resp
+    print(f"[g3a] trigger hit the code-location start-up window; waiting for {job_name} to load")
+    _wait_for(f"Dagster code location ({job_name} loaded)", lambda: _dagster_job_is_loaded(job_name), 120)
+    return API.post(url, timeout=10)
+
+
 def step_trigger_run_via_lakehouse_api() -> str:
-    resp = API.post(f"{API_URL}/api/pipelines/{JOB_NAME}/trigger", timeout=10)
+    resp = _post_trigger(f"{API_URL}/api/pipelines/{JOB_NAME}/trigger", JOB_NAME)
     if not resp.ok:
         raise G3aFailure(f"POST trigger failed: {resp.status_code} {resp.text}")
     body = resp.json()

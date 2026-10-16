@@ -24,10 +24,12 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
+    IngestSpecInput, REPEATED_FAILURE_STREAK, SecretRefSwap, SecretSlot, UpdateConnectorInput,
+    any_connector_of_tenant_targets, any_connector_targets, connector_ids_in_tenants,
     connector_in_tenants, create_connector, delete_connector, get_connector,
     get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
+    list_ingestible_connectors_for_tenant, record_run_once, record_run_result, record_test_result,
+    set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -812,6 +814,65 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     assert_eq!(row.schedule_cron.as_deref(), Some("0 * * * *"));
     assert_eq!(row.secret_ref, credential_names.primary);
     assert_eq!(row.secret_ref_secondary, None);
+    Ok(())
+}
+
+/// `SEC-16`: `list_ingestible_connectors_for_tenant` returns the asked
+/// tenant's rows and nothing else; a connector with no tenant is in no
+/// tenant's list, only in the unscoped one. Written to fail against a query
+/// that ignores the tenant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_ingestible_connectors_for_tenant_returns_only_that_tenants_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-ingestible"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-ingestible"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "mysql",
+            "host": "source.example.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects: serde_json::json!([{"name": "orders", "target": "orders"}]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    let mut ids = Vec::new();
+    for name in ["ingestible of a", "ingestible of b", "ingestible of nobody"] {
+        let (created, _credential_names) =
+            create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    let of_a = list_ingestible_connectors_for_tenant(&pool, tenant_a_id)
+        .await
+        .unwrap();
+    assert!(of_a.iter().any(|r| r.id == ids[0]), "A's own row is listed");
+    assert!(!of_a.iter().any(|r| r.id == ids[1]), "B's row is absent");
+    assert!(
+        !of_a.iter().any(|r| r.id == ids[2]),
+        "a connector with no tenant is in no tenant's list"
+    );
+
+    let all = list_ingestible_connectors(&pool).await.unwrap();
+    for id in &ids {
+        assert!(
+            all.iter().any(|r| &r.id == id),
+            "the unscoped list has {id}"
+        );
+    }
     Ok(())
 }
 
@@ -1600,6 +1661,58 @@ fn sql_spec_with_objects(source_objects: serde_json::Value) -> IngestSpecInput {
     }
 }
 
+/// `SEC-16`: `any_connector_of_tenant_targets` answers for the asked
+/// tenant's connectors only. Another tenant's connector, and one with no
+/// tenant, never count, however exactly the target matches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_of_tenant_targets_counts_only_that_tenants_connectors(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-targets"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-targets"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+    let spec = |target: &str| {
+        sql_spec_with_objects(serde_json::json!([{ "name": "public.t", "target": target }]))
+    };
+    let mut ids = Vec::new();
+    for (name, target) in [
+        ("targets of a", "a_target"),
+        ("targets of b", "b_target"),
+        ("targets of nobody", "nobody_target"),
+    ] {
+        let (created, _) = create_connector(&pool, &minimal_input(name)).await.unwrap();
+        set_ingest_spec(&pool, &created.id, &spec(target))
+            .await
+            .unwrap();
+        ids.push(created.id);
+    }
+    set_connector_tenant(&pool, &ids[0], tenant_a_id).await;
+    set_connector_tenant(&pool, &ids[1], tenant_b_id).await;
+
+    assert!(
+        any_connector_of_tenant_targets(&pool, tenant_a_id, "a_target")
+            .await
+            .unwrap()
+    );
+    for other in ["b_target", "nobody_target", "a_targe"] {
+        assert!(
+            !any_connector_of_tenant_targets(&pool, tenant_a_id, other)
+                .await
+                .unwrap(),
+            "{other} is not a target of tenant A's connectors"
+        );
+    }
+    // The unscoped question still sees all of them.
+    assert!(any_connector_targets(&pool, "b_target").await.unwrap());
+    assert!(any_connector_targets(&pool, "nobody_target").await.unwrap());
+    Ok(())
+}
+
 /// An upload may never load into a table a connector loads (ADR 0014,
 /// decision 5). `any_connector_targets` answers for every connector, by the
 /// `target` of each source object and by nothing else: not a prefix, not a
@@ -1681,5 +1794,176 @@ async fn any_connector_targets_ignores_a_source_objects_value_that_is_not_a_list
         .execute(&pool)
         .await?;
     assert!(any_connector_targets(&pool, "sales_orders").await.unwrap());
+    Ok(())
+}
+
+/// `SRC-7` F4: three failed runs in a row walk the badge degraded, degraded,
+/// unhealthy; a success resets the streak and the badge, and keeps the last
+/// failure time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_result_counts_failures_and_a_success_resets_them(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    assert_eq!(REPEATED_FAILURE_STREAK, 3);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let h = record_run_result(&pool, id, false, at).await.unwrap();
+        seen.push((h.health, h.failure_streak));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("degraded".to_owned(), 1),
+            ("degraded".to_owned(), 2),
+            ("unhealthy".to_owned(), 3),
+        ]
+    );
+    let after_fail = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(after_fail.failure_streak, 3);
+    assert!(after_fail.last_run_failure_at.is_some());
+    assert!(after_fail.last_run_success_at.is_none());
+
+    let fourth = record_run_result(&pool, id, false, at).await.unwrap();
+    assert_eq!(fourth.failure_streak, 4);
+    assert_eq!(fourth.health, "unhealthy");
+
+    let ok = record_run_result(&pool, id, true, at).await.unwrap();
+    assert_eq!((ok.health.as_str(), ok.failure_streak), ("healthy", 0));
+    let after_ok = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert!(after_ok.last_run_success_at.is_some());
+    assert_eq!(
+        after_ok.last_run_failure_at, after_fail.last_run_failure_at,
+        "a success must not erase when the last failure happened"
+    );
+    Ok(())
+}
+
+/// An unknown connector id is `NotFound`, and `record_test_result` still
+/// leaves the run facts alone (`SRC-7` task 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_result_refuses_an_unknown_id_and_a_manual_test_leaves_run_facts(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let err = record_run_result(&pool, "conn-nope", false, time::OffsetDateTime::now_utc())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+
+    record_run_result(
+        &pool,
+        "conn-pg-lakehouse",
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    record_test_result(&pool, "conn-pg-lakehouse", true, true, Some(3), "ok")
+        .await
+        .unwrap();
+    let c = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap()
+        .connector;
+    assert_eq!(c.health, "healthy", "a manual Test still sets health");
+    assert_eq!(
+        c.failure_streak, 1,
+        "a manual Test does not touch the streak"
+    );
+    Ok(())
+}
+
+/// `SRC-17` F2: a run is counted once. The first report counts it and keeps
+/// the streak it produced; a retry changes nothing and gets the same streak
+/// back, even after a later run moved the connector's own streak on.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_once_counts_a_run_once_and_hands_a_retry_the_runs_own_streak(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let id = "conn-pg-lakehouse";
+    let at = time::OffsetDateTime::now_utc();
+    for (run, expected) in [("run-1", 1), ("run-2", 2), ("run-3", 3)] {
+        let r = record_run_once(&pool, run, id, "failure", false, at)
+            .await
+            .unwrap();
+        assert!(r.first_seen, "{run}");
+        assert_eq!(r.failure_streak, Some(expected), "{run}");
+    }
+    // A fourth run moves the connector on; run 3's retry still reads 3.
+    record_run_once(&pool, "run-4", id, "failure", false, at)
+        .await
+        .unwrap();
+    let retry = record_run_once(&pool, "run-3", id, "failure", false, at)
+        .await
+        .unwrap();
+    assert!(!retry.first_seen);
+    assert_eq!(retry.failure_streak, Some(3));
+    let c = get_connector(&pool, id).await.unwrap().unwrap().connector;
+    assert_eq!(c.failure_streak, 4, "the retry counted nothing");
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pipeline_run_event WHERE pipeline_id = $1 AND kind = 'failure'",
+    )
+    .bind(format!("connector:{id}"))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows, 4);
+
+    let ok = record_run_once(&pool, "run-5", id, "success", true, at)
+        .await
+        .unwrap();
+    assert_eq!((ok.first_seen, ok.failure_streak), (true, Some(0)));
+    Ok(())
+}
+
+/// `SRC-17` F2: an unknown connector leaves no dedupe row behind (the count
+/// and the row are one transaction), so a retry is not told "already done".
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_once_leaves_no_dedupe_row_for_an_unknown_connector(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let err = record_run_once(
+        &pool,
+        "run-ghost",
+        "conn-nope",
+        "failure",
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM pipeline_run_event WHERE run_id = 'run-ghost'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(rows, 0);
+    Ok(())
+}
+
+/// `SRC-7` review BLOCKER 1: the many-ids form answers as the one-id form
+/// does, in one query.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connector_ids_in_tenants_keeps_only_the_ids_of_the_callers_tenants(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("seeded tenant id");
+    let ids = vec![
+        "conn-pg-lakehouse".to_owned(),
+        "conn-s3-warehouse".to_owned(),
+        "conn-does-not-exist".to_owned(),
+    ];
+    let own = connector_ids_in_tenants(&pool, &ids, &[group])
+        .await
+        .expect("query");
+    assert!(own.contains(&"conn-pg-lakehouse".to_owned()));
+    assert!(!own.contains(&"conn-does-not-exist".to_owned()));
+    assert!(
+        connector_ids_in_tenants(&pool, &ids, &[])
+            .await
+            .expect("query")
+            .is_empty()
+    );
     Ok(())
 }

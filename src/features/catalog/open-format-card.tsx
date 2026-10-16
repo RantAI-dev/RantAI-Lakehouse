@@ -159,14 +159,35 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             Publishing is off; this copy is no longer updated.
           </p>
         )}
-        {showHistory && (
+        {(showHistory || p.trim) && (
           <dl className="grid grid-cols-3 gap-1 text-sm">
-            <dt className="text-muted-foreground">Last published</dt>
-            <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
-            <dt className="text-muted-foreground">Snapshot</dt>
-            <dd className="col-span-2 font-mono text-xs">
-              {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
-            </dd>
+            {showHistory && (
+              <>
+                <dt className="text-muted-foreground">Last published</dt>
+                <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+                <dt className="text-muted-foreground">Snapshot</dt>
+                <dd className="col-span-2 font-mono text-xs">
+                  {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+                </dd>
+              </>
+            )}
+            {p.trim && (p.trim.status === "success" || p.trim.status === "nothing_to_trim") && p.trim.copiesKept !== null && (
+              <>
+                <dt className="text-muted-foreground">Copies kept</dt>
+                <dd className="col-span-2">
+                  {p.trim.copiesKept}
+                  {p.trim.oldestKeptExportedAt ? ` (oldest ${formatDateTime(p.trim.oldestKeptExportedAt)})` : ""}
+                </dd>
+              </>
+            )}
+            {p.trim && p.trim.status === "failed" && (
+              <>
+                <dt className="text-muted-foreground">Trim</dt>
+                <dd className="col-span-2 text-destructive">
+                  Trim failed{p.trim.reason ? `: ${p.trim.reason}` : ""}
+                </dd>
+              </>
+            )}
           </dl>
         )}
         {enabled && (

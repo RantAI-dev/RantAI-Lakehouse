@@ -1,0 +1,102 @@
+# ops/trino/docker-compose.ops1-measure.override.yml -- MEASUREMENT-ONLY
+# OVERRIDE FOR THE `trino` SERVICE. IT MUST NEVER BE USED BY A DEPLOYMENT.
+#
+# What it does: it redefines `trino`'s `command:` with the SAME catalog and
+# access-control rendering `docker-compose.yml`'s `trino` service already
+# performs, plus ONE added line in the generated
+# `/etc/trino/catalog/iceberg.properties`:
+#
+#     iceberg.expire-snapshots.min-retention=0s
+#
+# Why that line exists. Trino's Iceberg connector refuses a
+# `expire_snapshots(retention_threshold => ...)` shorter than this
+# property (catalog property `iceberg.expire-snapshots.min-retention`,
+# renamed from `iceberg.expire_snapshots.min-retention` in Trino 464;
+# default `7d`), failing with "Retention specified (1.00d) is shorter
+# than the minimum retention configured in the system (7.00d)".
+# `docs/plans/OPS-1-RESULT.md` (OPS-1, the default snapshot-retention
+# measurement) needs to prove that snapshot expiry actually RECLAIMS
+# snapshots, not merely that it is applied -- and with the 7-day floor in
+# place, a table written in the last few minutes has nothing old enough
+# to expire, so the reclaim can never be observed on a local stack.
+# Setting the floor to `0s` for the measurement only is what makes the
+# before/after snapshot counts real. The refusal at the default floor is
+# measured TOO, in the same document, so nothing here hides the
+# production posture: `0s` is a lab setting, not a product setting.
+#
+# Provenance: OPS-1 review round 1, BLOCKER 1 (the 0s floor), satisfied by
+# this file rather than by an edit to `docker-compose.yml`.
+#
+# Usage (OPS-1 measurement only, project `ops1check`):
+#
+#   docker compose -f docker-compose.yml \
+#     -f ops/trino/docker-compose.ops1-measure.override.yml \
+#     -p ops1check --profile trino up -d trino
+#
+# Nothing in this file is reachable from a default start: the override
+# only takes effect when a caller passes this path with `-f`, exactly the
+# precedent `ops/g6/docker-compose.g6.override.yml` and
+# `ops/backups/docker-compose.backups.override.yml` already set. It adds
+# no credential, no volume, no port and no profile, so
+# `docker compose --profile '*' config --quiet` without `-f` is unchanged
+# by this file's existence.
+#
+# Why the whole `command:` is repeated instead of patched: Compose merges
+# a service's `command:` by REPLACEMENT, not by concatenation, so an
+# override that carried only the added line would silently drop the
+# catalog properties file, the access-control rules and the `exec
+# run-trino` step -- i.e. it would start a Trino with no catalog at all.
+# The block below is therefore a verbatim copy of
+# `docker-compose.yml`'s `trino` `command:` with the single added line
+# marked by the comment above it. If that block ever changes, this copy
+# must change with it; the two must not drift.
+services:
+  trino:
+    command:
+      - |
+        set -eu
+        TRINO_TOKEN="$$(cat /tokens/trino.jwt 2>/dev/null || true)"
+        mkdir -p /etc/trino/catalog && cat > /etc/trino/catalog/iceberg.properties <<EOF
+        connector.name=iceberg
+        iceberg.catalog.type=rest
+        iceberg.rest-catalog.uri=$${LAKEKEEPER_CATALOG_URI}
+        iceberg.rest-catalog.warehouse=$${LAKEKEEPER_WAREHOUSE}
+        iceberg.rest-catalog.vended-credentials-enabled=true
+        iceberg.rest-catalog.security=OAUTH2
+        iceberg.rest-catalog.oauth2.token=$${TRINO_TOKEN}
+        fs.s3.enabled=true
+        s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
+        s3.region=us-east-1
+        s3.path-style-access=true
+        s3.aws-access-key=$${RUSTFS_ACCESS_KEY}
+        s3.aws-secret-key=$${RUSTFS_SECRET_KEY}
+        # OPS-1 MEASUREMENT ONLY -- the one added line. Trino's Iceberg
+        # connector refuses an `expire_snapshots` threshold below this
+        # floor, and the default (`7d`) would make it impossible to
+        # observe any snapshot actually being reclaimed on a stack whose
+        # table was written minutes ago. `0s` is a lab setting: a
+        # deployment that ships this file would let a maintenance policy
+        # expire snapshots younger than the product's own 7-day default
+        # (OPS-1 Decision D1), which is exactly the data loss the floor
+        # exists to prevent. Never pass this override in a deployment.
+        iceberg.expire-snapshots.min-retention=0s
+        EOF
+        mkdir -p /etc/trino && cat > /etc/trino/access-control.properties <<EOF
+        access-control.name=file
+        security.config-file=/etc/trino/rules.json
+        EOF
+        cat > /etc/trino/rules.json <<EOF
+        {
+          "catalogs": [
+            {"user": "trino-maintenance", "catalog": "iceberg", "allow": "all"},
+            {"catalog": "iceberg", "allow": "read-only"},
+            {"catalog": "system", "allow": "read-only"}
+          ],
+          "tables": [
+            {"user": "trino-maintenance", "catalog": "iceberg", "schema": ".*", "table": ".*", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]},
+            {"catalog": "iceberg", "schema": ".*", "table": ".*", "privileges": ["SELECT"]},
+            {"catalog": "system", "schema": ".*", "table": ".*", "privileges": ["SELECT"]}
+          ]
+        }
+        EOF
+        exec /usr/lib/trino/bin/run-trino
