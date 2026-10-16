@@ -638,9 +638,9 @@ async fn a_seeded_data_engineer_is_denied_all_three_catalog_grant_routes() {
 /// `DATA-15` F4: undropping a table needs `governance:write`. A seeded Data
 /// Engineer holds `catalog:write` but not `governance:write`, so the
 /// permission middleware refuses `POST /api/catalog/{id}/restore` with the
-/// permission named; the status read (`catalog:read`) is not refused by it.
+/// permission named.
 #[tokio::test]
-async fn a_seeded_data_engineer_is_denied_the_undrop_but_not_the_restore_status() {
+async fn a_seeded_data_engineer_is_denied_the_undrop() {
     let TestApp { router, pool } = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
     let resp = request_with_cookie(
@@ -659,8 +659,17 @@ async fn a_seeded_data_engineer_is_denied_the_undrop_but_not_the_restore_status(
         body.get("error").and_then(serde_json::Value::as_str),
         Some("permission_denied: governance:write"),
     );
+}
 
-    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+/// `DATA-15` F4: the restore status read is `catalog:read`, which a seeded
+/// Analyst holds (and `governance:write` it does not), so the permission
+/// middleware must not refuse it. The first version of this check used the
+/// Data Engineer, who holds `catalog:write` only; CI failed with
+/// `permission_denied: catalog:read` (`DATA-15` CI run).
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_the_restore_status_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
     let resp = request_with_cookie(
         &router,
         "GET",
