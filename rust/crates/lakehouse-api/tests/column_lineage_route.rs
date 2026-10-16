@@ -98,16 +98,26 @@ async fn app(charts: Vec<Value>) -> (axum::Router, PgPool, MockServer) {
 }
 
 async fn get(router: &axum::Router, cookie: &str, uri: &str) -> (StatusCode, Value) {
+    get_as_tenant(router, cookie, uri, None).await
+}
+
+/// `get` acting as `tenant` through `X-Tenant` (`tenant_scope::resolve`).
+async fn get_as_tenant(
+    router: &axum::Router,
+    cookie: &str,
+    uri: &str,
+    tenant: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("cookie", cookie);
+    if let Some(tenant) = tenant {
+        req = req.header("x-tenant", tenant);
+    }
     let resp = router
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(uri)
-                .header("cookie", cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(req.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -242,7 +252,12 @@ async fn a_caller_without_dashboard_access_gets_no_charts_and_no_sql_source_rows
         .collect();
     assert_eq!(tables, vec!["silver.a", "serving.m"], "{body}");
 
-    let (_, body) = get(&router, &admin, down).await;
+    // DATA-13 CI fix: the seeded admin belongs to three tenants and, with no
+    // `X-Tenant`, acts as the first of them (`tenant_scope::resolve`), which
+    // is not `meridian-retail`; like the table route, a tenant-member admin
+    // reads that one tenant's rows, so the pipeline row is hidden. Naming the
+    // pipeline's tenant is what this half of the test meant to do.
+    let (_, body) = get_as_tenant(&router, &admin, down, Some(RETAIL)).await;
     let tables: Vec<&str> = body["mappings"]
         .as_array()
         .unwrap()
@@ -255,6 +270,23 @@ async fn a_caller_without_dashboard_access_gets_no_charts_and_no_sql_source_rows
         "{body}"
     );
     assert!(body.get("chartsHidden").is_none(), "{body}");
+
+    // An unrestricted caller who belongs to no tenant reads every tenant's
+    // rows (`all_tenants`), as the table route does for the same principal.
+    let root = create_principal_with_permissions(&pool, "*:*").await;
+    let root_cookie = session_cookie_for_user(&pool, root).await;
+    let (_, body) = get(&router, &root_cookie, down).await;
+    let tables: Vec<&str> = body["mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["to"]["table"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tables,
+        vec!["silver.a", "serving.m", "sql_source:s1"],
+        "{body}"
+    );
 }
 
 #[tokio::test]
