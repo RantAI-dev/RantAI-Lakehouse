@@ -2945,6 +2945,57 @@ mod tests {
         );
     }
 
+    /// BLD-4 / D2 on `POST /api/pipelines`, the refusal half for the other
+    /// per-table upstream: a non-Bronze source that lists `ingest_job` is
+    /// refused with [`INGEST_UPSTREAM_REFUSED`]. Same route, same
+    /// `state_without_pool()` and same reason for it as the `file_ingest_job`
+    /// pair above -- the guard reads the parsed body, so it must answer
+    /// before any store, orchestrator or tenant lookup decides anything.
+    /// BLD-4 review R1 SHOULD-FIX 6: create was the one call site of the
+    /// three (update, restore) with no `ingest_job` test.
+    #[tokio::test]
+    async fn create_with_an_ingest_upstream_on_a_silver_source_is_refused() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-connector-ingest","kind":"batch","sourceZone":"silver","sourceTable":"s","targetZone":"gold","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["ingest_job"]}"#,
+        );
+        let err = crate::routes::pipelines::create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("ingest_job on a silver source must be refused");
+        assert_eq!(err.0.status(), 400);
+        assert_eq!(err.0.to_string(), INGEST_UPSTREAM_REFUSED);
+    }
+
+    /// The accepted half, in this job's words: the same body with a `bronze`
+    /// source passes the guard, so the create reaches the store and answers
+    /// 503 for the missing pool instead of 400. The refusal above and this
+    /// one differ in exactly one field of the body, so a guard that
+    /// refused every `ingest_job` chain on create would fail here.
+    #[tokio::test]
+    async fn create_with_an_ingest_upstream_on_a_bronze_source_passes_the_guard() {
+        let body = Bytes::from_static(
+            br#"{"name":"pl-connector-ingest-ok","kind":"batch","sourceZone":"bronze","sourceTable":"t","targetZone":"silver","targetTable":"t","schedule":"manual","transforms":[],"dependsOn":["ingest_job"]}"#,
+        );
+        let err = crate::routes::pipelines::create(
+            State(state_without_pool()),
+            Extension(fixture_user_principal()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect_err("the store is not configured in this state");
+        assert_eq!(
+            err.0.status(),
+            503,
+            "the guard must pass and the request must reach the store, got: {}",
+            err.0
+        );
+    }
+
     /// BLD-3 / D4: the same refusal on `PUT /api/pipelines/{id}` and on
     /// `POST /api/pipelines/{id}/versions/{version}/restore`.
     ///
