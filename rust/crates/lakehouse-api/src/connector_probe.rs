@@ -1190,7 +1190,7 @@ pub(crate) fn pg_options_for_address(
 /// * With a CA: [`tiberius::Config::trust_cert_ca`] verifies the chain
 ///   against it. Tiberius adds the configured CA to native system roots, so
 ///   SQL Server accepts either the configured CA or any public root, unlike
-///   PostgreSQL which trusts only the configured CA (SEC-14B review round 1,
+///   `PostgreSQL` which trusts only the configured CA (SEC-14B review round 1,
 ///   SHOULD-FIX 7). tiberius checks the certificate's names against `config.host`,
 ///   which is the CONFIGURED name (see the `SEC-15` socket note at each call site),
 ///   so this is verify-full for SQL Server, not verify-ca.
