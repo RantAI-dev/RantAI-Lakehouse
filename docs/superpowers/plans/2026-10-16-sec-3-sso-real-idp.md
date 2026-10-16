@@ -99,7 +99,122 @@ SAML, SCIM, OIDC sign-in throttling, any Rust change (E6), changing
 
 ## 6. Handoff
 
-(developer)
+### Handoff (2026-10-16, round 1)
+
+Base `origin/main` = `53d05f0024a6`; branch `feat/sec-3-sso-real-idp`, worktree
+`/home/shiro/rantai/wt/sec-3`, pushed to `origin` as
+`36ce01c548a66570e00c739df49f058d35dab8f8`. One commit per task:
+
+```
+36ce01c548a6 docs(sso): add the per-provider single sign-on runbook and SEC-3 results
+b54f0edeaf91 ci(sso): run the G10 Keycloak sign-in gate on pull requests
+4f62a3ab4e1a test(sso): add the G10 Keycloak sign-in gate
+40fcf408ab6d feat(sso): add the SEC-3 Keycloak gate override and realm render
+fa15bb53b446 docs(plan): SEC-3 spec and plan, single sign-on against real identity providers
+```
+
+**Commands run, verbatim, with their results.**
+
+T1 (E1, E2) — config resolves: `docker compose -f docker-compose.yml -f
+ops/sso/docker-compose.keycloak.override.yml --profile '*' config --quiet`
+→ exit 0. Resolved config inspected: three services (`keycloak`,
+`keycloak-realm-init`, `sso-test-runner`, all `profiles=['sso']`, no host
+ports), `lakehouse-api`'s `OIDC_*` override correct, volume
+`keycloak_realm_import` present. Keycloak image
+`quay.io/keycloak/keycloak:26.8.1` pinned by tag **and** digest
+`sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244`,
+the digest cross-checked two ways: `docker buildx imagetools inspect` and the
+Quay API `https://quay.io/api/v1/repository/keycloak/keycloak/tag/?specificTag=26.8.1`
+(`manifest_digest`), both matching; 26.8.1 is the newest stable 26.x at the
+time. `render_realm.py` unit-checked by importing the module (happy path
+renders the client secret and both user passwords; an empty/blank secret or
+user-B password exits non-zero).
+
+T2 (E3) — the gate, real run (rule 8), under the heavy lock, project
+`sec3sso`, `down -v` via `trap`, ports remapped. `sso-test-runner` output
+(`review-logs/sec3-t2b.log`, `GATE_EXIT=0`):
+
+```
+[g10] lakehouse-api /health: visible after 0.0s
+[g10] keycloak discovery document: visible after 0.2s
+[g10] discovery reachable; issuer and endpoints match the API's configuration
+[g10] alice signed in through Keycloak; permissions=['catalog:read', 'lineage:read', 'query:read']
+[g10] bob (no group) signed in with no mapped role; permissions=[]
+[g10] a token minted for audience lakehouse-wrongaud was refused with 401
+[g10] a token past its 5s expiry was refused with 401
+[g10] PASS
+```
+
+A defect in the first run was fixed in this commit: `finished.headers.get_list("Set-Cookie")`
+raised `AttributeError` (`requests`' `CaseInsensitiveDict` has no `get_list`);
+replaced with `session.cookies.get("lh_session")`.
+
+T3 (E4) — `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`
+→ 27 jobs, `g10-sso` present, every job in `ci-required.needs`, no extra.
+`bash scripts/ci/tests/test_required_gate.sh` → **46 passed, 0 failed**
+(includes the structural self-test that a job absent from `ci-required` fails
+it). The job's CI-only `.env` validated in isolation:
+`docker compose -p sec3ci --env-file <ci .env> -f docker-compose.yml -f
+ops/sso/docker-compose.keycloak.override.yml --profile sso config --quiet`
+→ exit 0.
+
+T4 (E5) — `python3 ops/lint/check_intra_package_imports.py &&
+python3 ops/lint/check_bare_iceberg_count.py &&
+python3 ops/lint/check_compose_init_readiness.py` → `LINTS_OK`. T4 check
+("every setting named exists in `config.rs`"): every `OIDC_*` token in the
+changed docs is one of the 12 in `rust/crates/lakehouse-api/src/config.rs`
+(the only doc token not in `config.rs` is the pre-existing
+`OIDC_MOCK_HOST_PORT`).
+
+Before each push: `docker run --rm -v "$PWD":/repo -w /repo
+zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml
+--no-banner --redact` → `no leaks found`. Run with the gitignored `.env`
+moved aside, because `dir` does not honour `.gitignore` (it otherwise flags
+`.env`).
+
+**Not verified, with the reason.** No Rust command (`cargo fmt/clippy/test`):
+no Rust file changed (E6). No `bun` command: no console file changed. No
+Dagster pytest: no Dagster file changed. The base `docker-compose.yml` alone
+was not re-checked: it is unchanged. The CI job itself is not run here; T3's
+check is that the planner's PR runs it. The full workspace block is the
+reviewer's and CI's, not this handoff's.
+
+**Premises and decisions.** (1) E3 writes "a new `ops/g*` directory" with no
+number; used `ops/g10/` (no `ops/g5`, `ops/g10` free). (2) E4's paths fall
+onto the coarse `rust`/`stack` change scopes, so the job also runs on
+unrelated rust/ops changes — noted in the job's comment. (3)
+`scripts/ci/tests/test_required_gate.sh` fails any `ci.yml` job that is
+absent from `ci-required.needs` or lacks a result variable in
+`required_gate.sh`, so "the same pattern as the other gate jobs" (E4)
+requires the `ci-required` wiring that T3 adds; it is not improvised scope.
+(4) `docs/plans/` matches a machine-local `plans/` entry in
+`.git/info/exclude`, so `docs/plans/SEC-3-RESULT.md` was staged with
+`git add -f`, exactly as the other tracked `docs/plans/*.md`.
+
+**Finding (E5's verify step, reported, not fixed — E6).** The API builds the
+JWKS URL as `{OIDC_ISSUER}/.well-known/jwks.json` when `OIDC_JWKS_URL` is
+unset (`rust/crates/lakehouse-api/src/state.rs`), and never reads `jwks_uri`
+from the provider's discovery document. Entra ID and Google publish keys
+elsewhere, so both require `OIDC_JWKS_URL`; reading `jwks_uri` from discovery
+would remove that step for every provider. Written up in
+`docs/OPERATIONS.md` and `docs/plans/SEC-3-RESULT.md`.
+
+Final state:
+
+```
+$ git status --short
+(empty)
+
+$ git log --oneline origin/main..HEAD | head
+36ce01c5 docs(sso): add the per-provider single sign-on runbook and SEC-3 results
+b54f0ede ci(sso): run the G10 Keycloak sign-in gate on pull requests
+4f62a3ab test(sso): add the G10 Keycloak sign-in gate
+40fcf408 feat(sso): add the SEC-3 Keycloak gate override and realm render
+fa15bb53 docs(plan): SEC-3 spec and plan, single sign-on against real identity providers
+
+$ git ls-remote --heads origin feat/sec-3-sso-real-idp
+36ce01c548a66570e00c739df49f058d35dab8f8	refs/heads/feat/sec-3-sso-real-idp
+```
 
 ## 7. Review
 
