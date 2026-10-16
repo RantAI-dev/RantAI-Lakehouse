@@ -69,6 +69,11 @@ fn arg_obj<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String
 /// `IdQuery`); the route takes the body as `Bytes` so we go through
 /// `serde_json::to_vec` rather than re-parsing arg keys.
 fn encode_body(value: &Value) -> Bytes {
+    // `serde_json::to_vec` cannot fail on a `Value`: the value is already
+    // JSON, so there is nothing left that can fail to represent it. The
+    // fallback is unreachable rather than a live path, and `expect` is
+    // denied outside `#[cfg(test)]`, so an empty body is what stands in for
+    // "cannot happen" here.
     Bytes::from(serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()))
 }
 
@@ -569,21 +574,25 @@ mod tests {
         let out = set_board_view_filters(&args);
         let err = out["error"].as_str().expect("error message");
         assert!(
-            err.contains("fuzzy_match") || err.contains("filters:"),
+            // Every parse error is prefixed `filters: `, so asserting on that
+            // cannot fail; what matters is that the refusal names the op the
+            // model actually sent, which is the user-facing part.
+            err.contains("fuzzy_match"),
             "expected the unknown op to be named in the refusal, got: {err}"
         );
     }
 
-    // `save_board_filters` does NOT get a 21-filters test here, and
-    // deliberately so. The limit lives in the route
-    // (`routes/dashboard.rs:942`, `validate_filters`), the tool does not
-    // duplicate it, and this test would have to call `save_board_filters`
-    // — which needs an `&AppState`, so a live `ClickHouse` that this
-    // harness does not have. A test that calls
-    // `lakehouse_bi::filters::validate_filters` instead would only
-    // re-assert the library against itself and stay green if the route's
-    // call were deleted, so it is not worth having. The limit is covered
-    // where it lives, by `lakehouse_bi::filters`' own tests; the refusal
-    // *message* is covered through a real call path by
-    // `set_board_view_filters_refuses_more_than_max_filters` above.
+    // `save_board_filters`' own 21-filter and invalid-op refusals are NOT
+    // tested in this module, because they cannot be: the tool takes an
+    // `&AppState`, and this unit-test module has none to give it. They are not
+    // untested, though — both run before any `ClickHouse` call (the invalid op
+    // in the tool's own parse, the count in the route's `validate_filters`
+    // ahead of its first store call), so they are asserted through the HTTP
+    // harness in `tests/ai_tool.rs` as
+    // `save_board_filters_refuses_more_than_twenty_filters` and
+    // `save_board_filters_refuses_an_invalid_op`.
+    //
+    // What is genuinely untested here is the half no harness can reach:
+    // `save_board_filters` writing a valid filter list to `bi_board.filters_json`
+    // needs a real `ClickHouse`. That gap is recorded in `tests/ai_tool.rs`.
 }

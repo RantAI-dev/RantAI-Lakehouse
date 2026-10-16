@@ -391,12 +391,16 @@ async fn unauthenticated_request_is_refused_by_the_policy_layer() {
 //     named board). The CPU-only bounds / off-grid /
 //     `w`-or-`h`-below-1 checks are covered by `parse_arrange_tiles`'s
 //     unit tests in `tools/boards.rs`.
-//   * `save_board_filters` (plan 133): "valid filters are saved"
-//     needs a real `bi_board` row whose `filters_json` the call would
-//     write through `store::update_board_filters`. The "Main refuses"
-//     half IS testable here (the route's `board_edit_allowed` returns
-//     400 before any ClickHouse call) — see
-//     `save_board_filters_on_main_fails_with_the_console_message`.
+//   * `save_board_filters` (plan 133): of its four lines, three are covered
+//     here — "21 filters are refused" and "an invalid op is refused" both run
+//     before any `ClickHouse` call (see
+//     `save_board_filters_refuses_more_than_twenty_filters` and
+//     `save_board_filters_refuses_an_invalid_op`), and "Main refuses" runs
+//     inside `board_edit_allowed` (see
+//     `save_board_filters_on_main_fails_with_the_console_message`). Only
+//     "valid filters are saved" is a gap: it needs a real `bi_board` row
+//     whose `filters_json` the call would write through
+//     `store::update_board_filters`.
 //   * `set_board_view_filters` / `AI-2-AC2` (plan 134): "the board's
 //     saved filters are unchanged after the call" needs to read
 //     `bi_board.filters_json` before and after to establish a
@@ -612,6 +616,77 @@ async fn save_board_filters_on_main_fails_with_the_console_message() {
         body["result"]["error"],
         json!("invalid dashboard"),
         "route's own message must surface through the tool"
+    );
+}
+
+/// `save_board_filters` refuses more than the 20 filters the route allows
+/// (`routes/dashboard.rs:942`, `validate_filters`). The refusal runs before
+/// the route's first `ClickHouse` call, so the dead upstream never gets
+/// asked — this is the plan's "21 filters are refused" line, asserted
+/// through the tool rather than against the library.
+#[tokio::test]
+async fn save_board_filters_refuses_more_than_twenty_filters() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let too_many: Vec<_> = (0..21)
+        .map(|i| json!({ "column": format!("c{i}"), "values": ["A"] }))
+        .collect();
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": { "board": "b-some", "filters": too_many, "confirmed": true },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    let err = body["result"]["error"].as_str().expect("error message");
+    assert!(
+        err.contains("at most 20"),
+        "the route's own limit must surface through the tool, got: {err}"
+    );
+}
+
+/// `save_board_filters` refuses an invalid filter op. The tool parses the
+/// args into `Vec<FilterDef>` itself (`tools/boards.rs:419`), so this one
+/// never reaches the route at all — it is the plan's "an invalid op is
+/// refused" line for Save filters, which the view-filter tool's own invalid
+/// op test does not cover.
+#[tokio::test]
+async fn save_board_filters_refuses_an_invalid_op() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post_tool(
+        &router,
+        Some(&cookie),
+        json!({
+            "tool": "save_board_filters",
+            "args": {
+                "board": "b-some",
+                "filters": [{ "column": "kabupaten", "values": ["A"], "op": "fuzzy_match" }],
+                "confirmed": true
+            },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_ne!(body["outcome"], json!("needs_confirmation"));
+    assert_ne!(body["outcome"], json!("refused"));
+    let err = body["result"]["error"].as_str().expect("error message");
+    // The parse error is always prefixed `filters: `, so that proves
+    // nothing; naming the op the model actually sent is the part that matters.
+    assert!(
+        err.contains("fuzzy_match"),
+        "the refusal must name the unknown op, got: {err}"
     );
 }
 

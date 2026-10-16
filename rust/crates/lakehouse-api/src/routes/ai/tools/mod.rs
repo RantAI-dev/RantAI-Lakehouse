@@ -100,17 +100,15 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
 ///
-/// The match is the registry-to-domain table and nothing else: every arm is a
-/// one-line delegation into the per-domain module that already owns the tool
-/// (`data::`, `ask::`, `propose::`, `pipelines::`, `dashboards::`,
-/// `calc_fields::`). The domain split this lint pushes for is already done, so
-/// splitting the table itself would only scatter one lookup across helpers
-/// with no independent reuse.
+/// The match is the registry-to-domain lookup and nothing more: 66 arms
+/// naming a tool, plus a catch-all, over 15 per-domain modules. All but
+/// `create_chart | update_chart` are a one-line delegation; that one reads
+/// the report time zone first, because a chart's SQL is built in it (`BI-9`).
 #[allow(
     clippy::too_many_lines,
-    reason = "the match is a pure registry-to-domain table whose arms already \
-              delegate to per-domain modules; splitting it would scatter one \
-              lookup across helpers with no independent reuse"
+    reason = "one lookup table over 15 domain modules, 65 of its 66 arms a \
+              one-line delegation; the split by domain already happened, so \
+              splitting the table itself would only scatter that lookup"
 )]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
