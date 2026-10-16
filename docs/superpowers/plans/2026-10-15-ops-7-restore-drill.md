@@ -219,3 +219,60 @@ dc992317d37f	refs/heads/feat/ops-7-restore-drill
 ## 8. Review
 
 (planner)
+
+## 8. Review
+
+Round 1, reviewed 2026-10-16 at `46cacd43` (developers: Gemini, Stepfun,
+MiniMax, Gemini). The planner checked every number in
+`docs/plans/OPS-7-RESULT.md` against the drill's raw output
+(`review-logs/ops7-drill.out`, `ops7-drill-timings.txt`): backup 6 s,
+restore script 82 s (Postgres 41 s, warehouse 10 s, ClickHouse 8 s),
+app ready 12 s, total 94 s; 2,000 rows and offset 125 before and after;
+sign-in HTTP 200; one Dagster run kept. Those match. E3's evidence is
+real (`ops7-t2-check.log`: the secret is `[HIDDEN]` in `system.query_log`,
+absent from the container and server logs).
+
+**BLOCKER 1. Two results are marked PASS without having been checked.**
+- "Catalog access … PASS, catalog operational": the response body in the
+  raw output is `{"assets":[],"namespaces":[],"supported":false,…}`. The
+  route answers "not supported" in this configuration; it proves nothing
+  about the restore. Replace it with a real check that the catalog came
+  back: list the tables of the `bronze` namespace through Lakekeeper's REST
+  API (or the ClickHouse `icecat` database) and compare with the list
+  before the backup.
+- "OpenFGA permissions … PASS, tuples intact": the raw output is
+  `FGA tables present: 1`, i.e. a table exists. Replace it with a real
+  check: OpenFGA's `Check` API for the seeded tuple (user, relation,
+  object) answering `allowed: true` after the restore, and the tuple count
+  before and after.
+If either cannot be done, the row says *not measured* and why; never PASS.
+
+**BLOCKER 2. Change capture resuming from its offset was not measured.**
+The offset row was seeded by hand (`Seeding change-capture offset…`), so
+the drill shows the row survives, not that ingestion resumes from it. The
+plan (T5 step 4) asked for a change-capture run that resumes without
+re-reading the snapshot. Either run the G4 change-capture path before the
+backup (a real offset) and one run after the restore (quote its log line
+showing it starts from the stored offset), or move this to "Not measured"
+with the reason, and re-word the "Change-capture offset" row to say what it
+shows (the seeded row survives).
+
+**BLOCKER 3. Secrets on the docker command line (E5).**
+`scripts/restore-from-backup.sh` passes values as
+`-e AWS_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_KEY}"` (lines ~184, 231,
+245, 257, 268, 299), which puts the secret in `docker`'s argv, visible in
+`ps`. Use the name-only form (`-e AWS_SECRET_ACCESS_KEY`) with the variable
+exported in the script's own environment, or an `--env-file` written with
+mode 0600 and removed on exit. Check every `-e …KEY=…`/`…PASSWORD=…` in the
+script and in `backup_job.py`'s subprocess calls (values through `env=`,
+never argv). Add the ClickHouse `RESTORE … FROM S3(...)` statement to E3's
+masking check (query log and server logs), as `BACKUP` was.
+
+**BLOCKER 4. A password is committed.** `DrillPass123!` appears in
+`docs/plans/OPS-7-RESULT.md` (line ~107) and in this plan's handoff. It
+belonged to a throwaway user on a destroyed stack, but no password goes in
+the repository (rule 5, `dev-rules.md`). Replace it with "a password
+generated at run time"; generate it at run time in the drill script.
+
+Notes, no change needed: `--force` was needed locally because RustFS holds
+both the warehouse and the backup bucket; the result says so.
