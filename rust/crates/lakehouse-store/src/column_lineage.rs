@@ -97,6 +97,11 @@ pub struct Scope {
     pub all_tenants: bool,
     /// Read the shared rows (`tenant_id` NULL).
     pub shared: bool,
+    /// Read the rows of dashboard SQL sources (`producer_kind` `sql_source`).
+    /// A source is a dashboard object, listed to `dashboard:read` holders
+    /// only, so its mappings are hidden from everyone else; a walk neither
+    /// returns nor follows a hidden row.
+    pub dashboards: bool,
 }
 
 /// Direction of a [`walk`].
@@ -223,8 +228,9 @@ pub async fn walk(
     let sql = format!(
         "WITH RECURSIVE visible AS ( \
              SELECT * FROM column_lineage \
-             WHERE (tenant_id IS NULL AND $3) \
-                OR (tenant_id IS NOT NULL AND ($4 OR tenant_id = $5)) \
+             WHERE ((tenant_id IS NULL AND $3) \
+                OR (tenant_id IS NOT NULL AND ($4 OR tenant_id = $5))) \
+               AND (producer_kind <> 'sql_source' OR $6) \
          ), walk AS ( \
              SELECT v.id, 1 AS hop, v.{next_table} AS nt, v.{next_column} AS nc \
              FROM visible v WHERE v.{match_table} = $1 AND v.{match_column} = $2 \
@@ -246,6 +252,7 @@ pub async fn walk(
         .bind(scope.shared)
         .bind(scope.all_tenants)
         .bind(scope.tenant)
+        .bind(scope.dashboards)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -268,12 +275,14 @@ pub async fn touching_table(
          FROM column_lineage \
          WHERE (from_table = $1 OR to_table = $1) \
            AND ((tenant_id IS NULL AND $2) OR (tenant_id IS NOT NULL AND ($3 OR tenant_id = $4))) \
+           AND (producer_kind <> 'sql_source' OR $5) \
          ORDER BY to_table, to_column, id LIMIT {MAX_WALK_ROWS}"
     ))
     .bind(table)
     .bind(scope.shared)
     .bind(scope.all_tenants)
     .bind(scope.tenant)
+    .bind(scope.dashboards)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -291,11 +300,13 @@ pub async fn oldest_recorded_at(
 ) -> Result<Option<OffsetDateTime>, StoreError> {
     let oldest: Option<OffsetDateTime> = sqlx::query_scalar(
         "SELECT MIN(recorded_at) FROM column_lineage \
-         WHERE (tenant_id IS NULL AND $1) OR (tenant_id IS NOT NULL AND ($2 OR tenant_id = $3))",
+         WHERE ((tenant_id IS NULL AND $1) OR (tenant_id IS NOT NULL AND ($2 OR tenant_id = $3))) \
+           AND (producer_kind <> 'sql_source' OR $4)",
     )
     .bind(scope.shared)
     .bind(scope.all_tenants)
     .bind(scope.tenant)
+    .bind(scope.dashboards)
     .fetch_one(pool)
     .await?;
     Ok(oldest)

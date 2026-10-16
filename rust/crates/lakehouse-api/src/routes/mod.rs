@@ -397,6 +397,12 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // DATA-13: column-level lineage. A static path ahead of the
+        // `{kind}` capture like `lineage` above (and four segments deep).
+        .route(
+            "/api/governance/lineage/columns",
+            get(governance::column_lineage),
+        )
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(

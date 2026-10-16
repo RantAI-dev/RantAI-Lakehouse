@@ -47,6 +47,7 @@ fn everything() -> Scope {
         tenant: None,
         all_tenants: true,
         shared: true,
+        dashboards: true,
     }
 }
 
@@ -55,6 +56,7 @@ fn tenant_only(t: Uuid) -> Scope {
         tenant: Some(t),
         all_tenants: false,
         shared: false,
+        dashboards: true,
     }
 }
 
@@ -405,5 +407,56 @@ async fn the_build_cursor_starts_empty_and_moves(pool: PgPool) -> sqlx::Result<(
         .fetch_one(&pool)
         .await?;
     assert_eq!(n, 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn sql_source_rows_are_hidden_from_a_caller_without_dashboard_access(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    replace_producer(
+        &pool,
+        "build",
+        "serving.m",
+        None,
+        &[map(("silver.a", "x"), ("serving.m", "x"), "copy")],
+    )
+    .await
+    .unwrap();
+    replace_producer(
+        &pool,
+        "sql_source",
+        "s1",
+        None,
+        &[map(("serving.m", "x"), ("sql_source:s1", "y"), "copy")],
+    )
+    .await
+    .unwrap();
+    let hidden = Scope {
+        dashboards: false,
+        ..everything()
+    };
+    let down = walk(&pool, "silver.a", "x", Direction::Down, everything())
+        .await
+        .unwrap();
+    assert_eq!(
+        down.len(),
+        2,
+        "with dashboard access the walk reaches the source"
+    );
+    let down = walk(&pool, "silver.a", "x", Direction::Down, hidden)
+        .await
+        .unwrap();
+    assert_eq!(
+        down.len(),
+        1,
+        "without it the source's row is neither shown nor followed"
+    );
+    assert!(
+        touching_table(&pool, "sql_source:s1", hidden)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     Ok(())
 }

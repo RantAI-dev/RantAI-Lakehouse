@@ -21,10 +21,16 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 
+use axum::http::HeaderMap;
+use lakehouse_auth::Principal;
+use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::column_lineage::{self, NewMapping};
+use lakehouse_store::column_lineage::{self, Direction, MappingRow, NewMapping, Scope};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlparser::dialect::ClickHouseDialect;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::sql_lineage::{self, Lineage};
 use crate::state::AppState;
@@ -218,6 +224,287 @@ pub(crate) async fn forget_sql_source(state: &AppState, id: &str) {
     if let Err(err) = column_lineage::delete_producer(pool, "sql_source", id).await {
         tracing::warn!(%err, source = id, "column lineage: a SQL source's mappings could not be removed");
     }
+}
+
+// ── Reading ────────────────────────────────────────────────────────────
+
+/// Longest table key or column name accepted in a query.
+const MAX_NAME_CHARS: usize = 300;
+
+/// `GET /api/governance/lineage/columns` query. Every field is checked by
+/// [`read`] (a missing one is a 400 with a sentence, not axum's own text).
+#[derive(Debug, Deserialize)]
+pub(crate) struct ColumnQuery {
+    #[serde(default)]
+    table: String,
+    #[serde(default)]
+    column: String,
+    #[serde(default)]
+    direction: String,
+}
+
+/// The table key a caller's `table` stands for: lowercased and with the Gold
+/// zone spelled `serving`, as the rows are keyed; a `sql_source:<id>` key is
+/// kept as written.
+fn normalize_table(raw: &str) -> Result<String, ApiError> {
+    let table = raw.trim();
+    if table.is_empty() || table.chars().count() > MAX_NAME_CHARS {
+        return Err(ApiError::BadRequest(
+            "table is required, for example serving.mart_x".to_owned(),
+        ));
+    }
+    if table.starts_with("sql_source:") {
+        return Ok(table.to_owned());
+    }
+    Ok(graph_key(&table.to_ascii_lowercase()))
+}
+
+fn parse_direction(raw: &str) -> Result<Direction, ApiError> {
+    match raw.trim() {
+        "" | "up" => Ok(Direction::Up),
+        "down" => Ok(Direction::Down),
+        _ => Err(ApiError::BadRequest(
+            "direction must be up or down".to_owned(),
+        )),
+    }
+}
+
+fn iso(at: OffsetDateTime) -> Value {
+    at.format(&Rfc3339).map_or(Value::Null, Value::String)
+}
+
+fn mapping_json(row: &MappingRow) -> Value {
+    json!({
+        "from": { "table": row.from_table, "column": row.from_column },
+        "to": { "table": row.to_table, "column": row.to_column },
+        "transform": row.transform,
+        "partial": row.partial,
+        "reason": row.reason,
+        "producer": { "kind": row.producer_kind, "ref": row.producer_ref },
+        "recordedAt": iso(row.recorded_at),
+        "hop": row.hop,
+    })
+}
+
+/// Every column a chart definition names: the dimension, the measures, the
+/// breakdown, a map's latitude and longitude, and the fields of raw tables
+/// and pivots (`columns`, `rows`, pivot `values`, the saved sort) and a KPI's
+/// comparison date. Columns that are calculated fields are named here too and
+/// simply match nothing, because no mapping starts from them.
+fn named_columns(input: &lakehouse_bi::store::ChartInput) -> Vec<&str> {
+    let tables = &input.tables;
+    let mut names: Vec<&str> = vec![input.dimension.as_str()];
+    names.extend(input.measures.iter().map(String::as_str));
+    names.extend(input.breakdown.as_deref());
+    names.extend(input.lat.as_deref());
+    names.extend(input.lon.as_deref());
+    names.extend(tables.columns.iter().flatten().map(String::as_str));
+    names.extend(tables.rows.iter().flatten().map(String::as_str));
+    names.extend(tables.values.iter().flatten().map(|v| v.column.as_str()));
+    names.extend(tables.sort_column.as_deref());
+    names.extend(
+        tables
+            .compare
+            .as_ref()
+            .and_then(|c| c.date_column.as_deref()),
+    );
+    names.retain(|n| !n.is_empty());
+    names
+}
+
+/// The table key a chart reads: a mart is `serving.<mart>`, a SQL source is
+/// `sql_source:<id>`; a chart with neither (text) reads nothing.
+fn chart_relation(input: &lakehouse_bi::store::ChartInput) -> Option<String> {
+    match input.sql_source.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => Some(sql_source_key(id)),
+        None if input.mart.is_empty() => None,
+        None => Some(format!("serving.{}", input.mart.to_ascii_lowercase())),
+    }
+}
+
+/// The saved charts that read a column in `reached` (`(table, column)`
+/// pairs, the starting column included), each as the JSON the answer carries.
+/// A chart is listed once, however many of its columns are reached.
+fn charts_reaching(
+    charts: &[lakehouse_bi::store::StoredChartSpec],
+    reached: &HashSet<(String, String)>,
+    board_titles: &HashMap<String, String>,
+) -> Vec<Value> {
+    charts
+        .iter()
+        .filter(|chart| {
+            chart_relation(&chart.def).is_some_and(|relation| {
+                named_columns(&chart.def)
+                    .iter()
+                    .any(|name| reached.contains(&(relation.clone(), (*name).to_owned())))
+            })
+        })
+        .map(|chart| {
+            json!({
+                "chartId": chart.spec.id,
+                "chartTitle": chart.spec.title,
+                "dashboardId": chart.board,
+                "dashboardTitle": board_titles
+                    .get(&chart.board)
+                    .cloned()
+                    .unwrap_or_else(|| chart.board.clone()),
+            })
+        })
+        .collect()
+}
+
+/// The charts and dashboards that depend on the column, for a `down` answer.
+/// `Err(())` when they could not be read; the caller says so rather than
+/// answering an empty list.
+async fn dependent_charts(
+    state: &AppState,
+    reached: &HashSet<(String, String)>,
+) -> Result<Vec<Value>, ()> {
+    let ch = &state.clickhouse;
+    let charts = lakehouse_bi::store::list_stored_charts(ch)
+        .await
+        .map_err(|err| tracing::warn!(?err, "column lineage: dashboard charts unavailable"))?;
+    let titles: HashMap<String, String> = lakehouse_bi::store::list_boards(ch)
+        .await
+        .map_err(|err| tracing::warn!(?err, "column lineage: dashboard names unavailable"))?
+        .into_iter()
+        .map(|b| (b.id, b.name))
+        .collect();
+    Ok(charts_reaching(&charts, reached, &titles))
+}
+
+/// The table key a graph node id stands for: `table:silver.x` and
+/// `table:serving.x` are warehouse tables, `bronze:x` is `bronze.x`; every
+/// other node (a dataset, a connector, an Iceberg copy) has no columns here.
+fn node_table_key(node_id: &str) -> Option<String> {
+    if let Some(table) = node_id.strip_prefix("table:") {
+        return Some(graph_key(&table.to_ascii_lowercase()));
+    }
+    node_id
+        .strip_prefix("bronze:")
+        .map(|t| format!("bronze.{}", t.to_ascii_lowercase()))
+}
+
+/// The recorded mappings that touch any of the focus nodes, as the table
+/// graph's `columnMappings`. A store failure is logged and answers an empty
+/// list: the graph itself is still an honest answer, and the dedicated
+/// columns route reports the failure properly.
+pub(crate) async fn mappings_touching(
+    state: &AppState,
+    principal: &Principal,
+    tenant: Option<uuid::Uuid>,
+    shared: bool,
+    focus_nodes: &[String],
+) -> Value {
+    let Some(pool) = state.pg.as_deref() else {
+        return json!([]);
+    };
+    let scope = Scope {
+        tenant,
+        all_tenants: tenant.is_none() && crate::routes::catalog::is_unrestricted(principal),
+        shared,
+        dashboards: principal.has("dashboard:read"),
+    };
+    let keys: BTreeSet<String> = focus_nodes
+        .iter()
+        .filter_map(|n| node_table_key(n))
+        .collect();
+    let mut out: Vec<Value> = Vec::new();
+    for key in &keys {
+        match column_lineage::touching_table(pool, key, scope).await {
+            Ok(rows) => out.extend(rows.iter().map(mapping_json)),
+            Err(err) => {
+                tracing::warn!(%err, "column lineage: the focus table's mappings could not be read");
+            }
+        }
+    }
+    Value::Array(out)
+}
+
+/// What the answer to a column query carries. See the module doc and the
+/// plan: the rows reached by following mappings up to ten hops, the
+/// retention line, and (for `down`) the dependent charts when the caller may
+/// list dashboards.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] for a missing or malformed parameter,
+/// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does not
+/// belong to, [`ApiError::Unavailable`] without a Postgres pool or when the
+/// shared-catalog rule cannot be evaluated, and the classified store error
+/// otherwise.
+pub(crate) async fn read(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    query: &ColumnQuery,
+) -> Result<Value, ApiError> {
+    let table = normalize_table(&query.table)?;
+    let column = query.column.trim();
+    if column.is_empty() || column.chars().count() > MAX_NAME_CHARS {
+        return Err(ApiError::BadRequest("column is required".to_owned()));
+    }
+    let direction = parse_direction(&query.direction)?;
+    let pool = state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "column lineage store unavailable: no Postgres pool is configured".to_owned(),
+        )
+    })?;
+
+    // The same tenant rules as the table-level route (`build`): shared
+    // records (builds, the catalog) only where the shared catalog may be
+    // read; a tenant's own records for that tenant; every tenant's only for
+    // an unrestricted caller who belongs to none.
+    let tenant = crate::tenant_scope::resolve(principal, headers)?;
+    let refusal = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await?;
+    let unrestricted = crate::routes::catalog::is_unrestricted(principal);
+    let scope = Scope {
+        tenant,
+        all_tenants: tenant.is_none() && unrestricted,
+        shared: refusal.is_none(),
+        dashboards: principal.has("dashboard:read"),
+    };
+    let mut coverage: Vec<String> = Vec::new();
+    if let Some(reason) = refusal {
+        coverage.push(format!(
+            "lineage of the shared catalog's tables is not shown: {reason}"
+        ));
+    }
+    if tenant.is_none() && !unrestricted {
+        coverage.push("lineage of pipelines is not shown: you belong to no tenant".to_owned());
+    }
+
+    let rows = column_lineage::walk(pool, &table, column, direction, scope).await?;
+    let oldest = column_lineage::oldest_recorded_at(pool, scope).await?;
+    let mut body = json!({
+        "supported": true,
+        "table": table,
+        "column": column,
+        "direction": if direction == Direction::Up { "up" } else { "down" },
+        "mappings": rows.iter().map(mapping_json).collect::<Vec<_>>(),
+        "retention": {
+            "days": column_lineage::RETENTION_DAYS,
+            "oldestRecordedAt": oldest.map_or(Value::Null, iso),
+        },
+        "coverage": coverage,
+    });
+    if direction == Direction::Down {
+        if principal.has("dashboard:read") {
+            let mut reached: HashSet<(String, String)> = rows
+                .iter()
+                .map(|r| (r.to_table.clone(), r.to_column.clone()))
+                .collect();
+            // A chart may read the starting column itself.
+            reached.insert((table, column.to_owned()));
+            match dependent_charts(state, &reached).await {
+                Ok(charts) => body["charts"] = Value::Array(charts),
+                Err(()) => body["chartsUnavailable"] = Value::Bool(true),
+            }
+        } else {
+            body["chartsHidden"] = Value::Bool(true);
+        }
+    }
+    Ok(body)
 }
 
 /// Remember the SQL the API approved for `pipeline_id`'s run, to be mapped
@@ -439,6 +726,13 @@ pub(crate) fn spawn_builds_pass(state: &AppState) -> bool {
         };
         let written = run_builds_pass(&state, pool).await;
         tracing::info!(written, "column lineage: build pass finished");
+        // DATA-13 retention (F8): rows older than a year go on the same
+        // tick, so the answer's "kept since" line is true.
+        match column_lineage::purge_expired(pool).await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "column lineage: expired rows removed"),
+            Err(err) => tracing::warn!(%err, "column lineage: expired rows could not be removed"),
+        }
     });
     true
 }
@@ -568,6 +862,7 @@ mod tests {
                 tenant: None,
                 all_tenants: true,
                 shared: true,
+                dashboards: true,
             }
         }
 

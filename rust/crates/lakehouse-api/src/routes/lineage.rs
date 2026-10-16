@@ -494,12 +494,19 @@ pub(crate) async fn build(
 ) -> Result<Value, ApiError> {
     let tenant = crate::tenant_scope::resolve(principal, headers)?;
     let mut g = Graph::default();
-    match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
-        None => add_shared(state, &mut g).await,
-        Some(reason) => g.coverage.push(format!(
-            "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
-        )),
-    }
+    let shared =
+        match crate::routes::catalog::catalog_tenant_refusal(state, principal, headers).await? {
+            None => {
+                add_shared(state, &mut g).await;
+                true
+            }
+            Some(reason) => {
+                g.coverage.push(format!(
+                    "shared catalog, ClickHouse tables and Gold exports are not shown: {reason}"
+                ));
+                false
+            }
+        };
     add_tenant_owned(state, principal, tenant, &mut g).await;
     builds::drop_repeats(&mut g);
     g.coverage.push(
@@ -545,6 +552,11 @@ pub(crate) async fn build(
         })
         .collect();
     let mut body = base;
+    // DATA-13 (F1): the recorded column mappings that touch the focus, in the
+    // row shape `GET /api/governance/lineage/columns` answers, under the same
+    // tenant rules as the graph above.
+    body["columnMappings"] =
+        columns::mappings_touching(state, principal, tenant, shared, &start).await;
     body["nodes"] = json!(nodes);
     body["edges"] = json!(edges);
     body["coverage"] = json!(g.coverage);

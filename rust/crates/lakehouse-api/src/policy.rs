@@ -264,6 +264,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // DATA-13: column-level lineage reads the same records' lineage, so the
+    // same permission; charts and dashboards in the answer are listed only
+    // to `dashboard:read` inside the handler.
+    ("GET",  "/api/governance/lineage/columns", Policy::RequiresPermission("lineage:read")),
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
@@ -835,6 +839,16 @@ mod tests {
         assert_eq!(
             policy_for("PUT", "/api/catalog/{id}/certification"),
             Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-13`: column-level lineage needs `lineage:read`, like the table
+    /// graph, and the route is classified (an unclassified route is a 500).
+    #[test]
+    fn column_lineage_needs_lineage_read() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/lineage/columns"),
+            Some(Policy::RequiresPermission("lineage:read"))
         );
     }
 

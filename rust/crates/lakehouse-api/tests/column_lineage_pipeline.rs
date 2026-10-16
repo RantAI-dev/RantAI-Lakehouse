@@ -187,6 +187,7 @@ fn everything() -> Scope {
         tenant: None,
         all_tenants: true,
         shared: true,
+        dashboards: true,
     }
 }
 
