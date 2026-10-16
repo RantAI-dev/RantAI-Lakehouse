@@ -639,6 +639,21 @@ pub struct IdQuery {
     id: Option<String>,
 }
 
+impl IdQuery {
+    /// Build a query for `id`, so a copilot tool that already parsed
+    /// `id` from the call's args can call the same handler the console
+    /// route does, without copying the `?id=` query shape (plan 20:
+    /// the tool calls the route, not the store, so the route's 400
+    /// for an empty/`"default"` id runs there too). Visible only
+    /// inside `crate::routes`, per plan 20 Decisions line 72-73
+    /// ("make it `pub(in crate::routes)`").
+    pub(in crate::routes) fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: Some(id.into()),
+        }
+    }
+}
+
 /// `DELETE /api/dashboard/specs?id=` — soft-delete a stored chart.
 ///
 /// # Errors

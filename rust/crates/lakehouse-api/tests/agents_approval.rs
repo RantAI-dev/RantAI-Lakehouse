@@ -524,3 +524,196 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     .expect("load principal after grant");
     assert!(after.has("catalog:write"));
 }
+
+// ── AI-1 / AI-20 (plan 20): `delete_board` is a WriteHigh tool ──────────
+//
+// `delete_board` deletes a board AND its charts. It is `WriteHigh`, so
+// it always goes through the human-approval flow: `POST /api/ai/tool`
+// creates a pending approval, `POST /api/agents/approvals/{id}/decide`
+// is the only path that ever runs the tool. This block pins both
+// branches. The harness's `ClickHouse` is a dead upstream, so a
+// successful approval lands the run at `failed` (the route's `DELETE
+// /api/dashboard/boards?id=…` reached `store::delete_board`, which
+// failed in ClickHouse) — exactly the same pattern the `delete_chart`
+// approval test uses. The "board and charts are gone afterwards" half
+// is left to a future harness with a real `ClickHouse`.
+
+/// `delete_board` (WriteHigh): calling `POST /api/ai/tool` with or
+/// without `confirmed: true` creates a pending approval, never
+/// executes the route directly. The approval carries the board id as
+/// the resource and the `reason` names the board and says the charts
+/// are deleted with it.
+#[tokio::test]
+async fn delete_board_creates_a_pending_approval_and_does_not_execute() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let resp = post(
+        &router,
+        "/api/ai/tool",
+        Some(&cookie),
+        json!({
+            "tool": "delete_board",
+            "args": { "id": "b-del" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["outcome"], json!("needs_approval"));
+    assert_eq!(body["result"]["needs_approval"], json!(true));
+    let approval_id = body["result"]["approval_id"]
+        .as_str()
+        .expect("approval_id present")
+        .to_owned();
+    let run_id = body["result"]["run_id"]
+        .as_str()
+        .expect("run_id present")
+        .to_owned();
+
+    // The reason the human sees names the board and says its charts
+    // are deleted with it (plan 20 `gate.rs::reason_for_write_high`
+    // arm for `delete_board`).
+    let summary = body["result"]["summary"].as_str().expect("summary present");
+    assert!(
+        summary.contains("b-del"),
+        "summary must name the board, got: {summary}"
+    );
+    assert!(
+        summary.contains("chart") || summary.contains("board"),
+        "summary must mention the chart cascade, got: {summary}"
+    );
+
+    let approvals = lakehouse_store::agents::list_approvals(&pool, None)
+        .await
+        .expect("list approvals");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].id, approval_id);
+    assert_eq!(approvals[0].status, "pending");
+    assert_eq!(approvals[0].action, "delete_board");
+    assert_eq!(approvals[0].resource.as_deref(), Some("b-del"));
+
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+
+    // The gate audit row carries the board as the resource, the
+    // `needs_approval` outcome, and is linked to the run/approval.
+    let events = list(&pool, AuditFilter::default())
+        .await
+        .expect("list audit events");
+    let ours: Vec<_> = events
+        .iter()
+        .filter(|e| e.action == "delete_board")
+        .collect();
+    assert_eq!(ours.len(), 1);
+    assert_eq!(ours[0].outcome, "needs_approval");
+    assert_eq!(ours[0].resource_kind.as_deref(), Some("board"));
+    assert_eq!(ours[0].resource_id.as_deref(), Some("b-del"));
+    assert_eq!(ours[0].run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(ours[0].approval_id.as_deref(), Some(approval_id.as_str()));
+}
+
+/// Approving a pending `delete_board` approval by a principal who
+/// holds the tool's own permission routes the run through the real
+/// dispatch. The dead `ClickHouse` upstream forces the run to `failed`,
+/// the same shape `delete_chart` produces — the point is that the
+/// approval-decision path executed, not that the board was deleted.
+#[tokio::test]
+async fn approve_delete_board_executes_the_dispatch_and_audits_it() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_board_approval(&router, &pool).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(true));
+    assert_eq!(body["approval"]["status"], json!("approved"));
+    assert!(body.get("result").is_some());
+
+    let run_id = body["approval"]["runId"]
+        .as_str()
+        .expect("runId present")
+        .to_owned();
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert!(
+        run.status == "failed" || run.status == "succeeded",
+        "the run must have reached the dispatch and ended terminally, got: {}",
+        run.status
+    );
+    assert_eq!(
+        run.steps.len(),
+        2,
+        "the pending step plus the execution step"
+    );
+}
+
+/// Rejecting a pending `delete_board` approval executes nothing.
+#[tokio::test]
+async fn reject_delete_board_executes_nothing() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_delete_board_approval(&router, &pool).await;
+
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let resp = post(
+        &router,
+        &format!("/api/agents/approvals/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "rejected" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["executed"], json!(false));
+    assert_eq!(body["approval"]["status"], json!("rejected"));
+
+    let run_id = body["approval"]["runId"]
+        .as_str()
+        .expect("runId present")
+        .to_owned();
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "rejected");
+}
+
+/// Same shape as `create_pending_delete_chart_approval`: create a
+/// pending `delete_board` approval as the Platform Admin and return
+/// the `approval_id` so the approve/reject tests can decide it.
+async fn create_pending_delete_board_approval(
+    router: &axum::Router,
+    pool: &sqlx::PgPool,
+) -> String {
+    let cookie = session_cookie_for_seeded_user(pool, "fajar@meridian.example").await;
+    let resp = post(
+        router,
+        "/api/ai/tool",
+        Some(&cookie),
+        json!({
+            "tool": "delete_board",
+            "args": { "id": "b-del" },
+            "mode": "build"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    body["result"]["approval_id"]
+        .as_str()
+        .expect("approval_id present")
+        .to_owned()
+}

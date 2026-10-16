@@ -24,6 +24,7 @@
 
 mod alerts;
 mod ask;
+mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
@@ -98,6 +99,15 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+///
+/// The exhaustive match is intentionally kept in one place: each new
+/// `ToolSpec` is a one-line arm here, and any future refactor that would
+/// split it (e.g. a per-subsystem map) gets to carry the migration
+/// cost — splitting today would be premature.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single exhaustive match on the tool registry; plan 20 keeps it here on purpose"
+)]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,
@@ -157,6 +167,12 @@ pub(in crate::routes) async fn run_tool(
         | "create_calculated_field"
         | "update_calculated_field"
         | "delete_calculated_field" => calc_fields::run(state, principal, name, args).await,
+        "rename_board"
+        | "delete_board"
+        | "arrange_board"
+        | "move_chart"
+        | "set_board_view_filters"
+        | "save_board_filters" => boards::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
         "update_alert_rule" => alerts::update_alert_rule(state, principal, args).await,

@@ -18,12 +18,12 @@
 //!
 //! | Role | Loses copilot access to | Keeps |
 //! | --- | --- | --- |
-//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
+//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart`/`rename_board`/`delete_board`/`arrange_board`/`move_chart`/`save_board_filters` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
 //! | Data Scientist (`query:read, feature:write, notebook:run`) | same dashboard tools as Analyst | `run_sql`, `list_datasets`, `describe_dataset` |
 //! | Approver (`agent:approve, policy:review`) | all dashboard tools; also `run_sql`/`list_datasets`/etc (no `query:read`/`catalog:read`) | — |
 //! | Governance Admin (`policy:*, residency:*, audit:read`) | all dashboard tools; data tools too (no `query:read`/`catalog:read`/`lineage:read`) | — |
 //! | Data Engineer (`pipeline:*, catalog:write, connector:manage`) | all dashboard tools | `trigger_lakehouse_build`, `get_build_status` (`pipeline:*`) |
-//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` |
+//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only (incl. the five new write tools) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` |
 //! | Platform Admin (`*:*`) | nothing | everything |
 //!
 //! This is **correct** — it matches exactly what each role can already do
@@ -132,6 +132,10 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        "delete_board" => format!(
+            "Menghapus board {} berikut seluruh chart di dalamnya secara permanen.",
+            s("id")
+        ),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -287,6 +291,32 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("kind")
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "rename_board" => format!(
+            "Mengganti nama board {} menjadi \"{}\".",
+            s("id"),
+            s("name")
+        ),
+        "arrange_board" => {
+            let n = args
+                .get("tiles")
+                .and_then(Value::as_object)
+                .map_or(0, Map::len);
+            format!(
+                "Menata ulang {n} tile pada board {} (grid 12 kolom, hanya tile yang disebut berubah).",
+                s("board")
+            )
+        }
+        "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        "save_board_filters" => {
+            let n = args
+                .get("filters")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!(
+                "Menyimpan {n} filter sebagai default board {} untuk semua pengguna.",
+                s("board")
+            )
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
