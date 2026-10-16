@@ -694,6 +694,43 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector TLS and certificate verification (`SEC-14` part B)
+
+Connector connection tests (`POST /api/connectors/{id}/test`), table discovery
+(`POST /api/connectors/{id}/discover`), and CDC clean-up require TLS for
+PostgreSQL and SQL Server dials:
+
+- **PostgreSQL connection test (`pg_probe`):** Connection tests send an
+  `SSLRequest` before the PostgreSQL startup packet. If the server declines TLS
+  (responds `N`), the probe fails immediately without sending credentials. The
+  probe only negotiates `SCRAM-SHA-256`; if the server requests clear-text
+  (`AuthenticationCleartextPassword`) or MD5 (`AuthenticationMD5Password`)
+  authentication, the probe refuses and terminates the connection without
+  transmitting the password.
+- **Certificate verification (`CONNECTOR_TLS_CA_FILE`):**
+  - Unset or empty: PostgreSQL and SQL Server dials require encryption
+    (`Require` / `EncryptionLevel::Required`) without checking the server
+    certificate against a custom root CA.
+  - Set to a PEM file path: PostgreSQL dials verify the server certificate and
+    hostname (`verify-full` in `pg_probe`, `VerifyCa` in sqlx), and SQL Server
+    dials verify the server certificate against that CA bundle.
+  - If `CONNECTOR_TLS_CA_FILE` is set to an unreadable or non-existent path,
+    `lakehouse-api` fails fast at startup with an error naming the variable.
+- **Docker Compose:** The default `docker-compose.yml` includes a one-shot
+  `postgres-cert-init` service that generates a local CA and server certificate
+  (SAN `DNS:postgres`) into the named volume `lakehouse_postgres_tls`. The
+  bundled `postgres` container runs with `ssl=on`. `lakehouse-api` mounts this
+  CA at `/run/certs/postgres/ca.crt` and defaults
+  `CONNECTOR_TLS_CA_FILE=/run/certs/postgres/ca.crt`, allowing the seeded
+  `conn-pg-lakehouse` connector test to pass over `verify-full`.
+- **Operators with external databases:**
+  - If your database uses a custom or corporate internal CA, mount the PEM CA
+    bundle into the `lakehouse-api` container and set `CONNECTOR_TLS_CA_FILE` to
+    its path.
+  - If your database uses certificates signed by public system roots or does
+    not use a custom CA, leave `CONNECTOR_TLS_CA_FILE` empty or unset. Dials
+    will still require TLS encryption.
+
 ### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
 
 A credential typed in the console is stored on the `connector_secrets`
