@@ -32,7 +32,7 @@ const ZONES: [&str; 3] = ["bronze", "silver", "serving"];
 
 /// `zone.table` for a zone a rule can check, with a plain table name; the
 /// lower-cased key a schedule is stored under.
-fn table_key(asset: &str) -> Option<String> {
+pub(super) fn table_key(asset: &str) -> Option<String> {
     let (zone, table) = asset.trim().split_once('.')?;
     let zone = zone.to_lowercase();
     (ZONES.contains(&zone.as_str()) && Ident::new(table).is_ok())

@@ -10,8 +10,9 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::quality::{
-    IncidentKind, Resolution, ScheduleMode, StatusFilter, list, list_schedules, put_schedule,
-    record_failure, resolve, resolve_for_rule,
+    IncidentKind, Resolution, ScheduleMode, StatusFilter, freshness_resolved_since, list,
+    list_schedules, load_summaries, load_summary, purge_loads, put_schedule, recent_loads,
+    record_failure, record_load, resolve, resolve_for_rule,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -342,5 +343,140 @@ async fn a_schedule_interval_is_between_one_hour_and_one_day(pool: PgPool) -> sq
         put_schedule(&pool, "  ", ScheduleMode::Interval, 60, USER).await,
         Err(StoreError::Validation(_))
     ));
+    Ok(())
+}
+
+async fn backdated_load(pool: &PgPool, asset: &str, days_ago: i32, rows: i64) {
+    sqlx::query(
+        "INSERT INTO table_load (asset, loaded_at, rows_after) \
+         VALUES ($1, now() - make_interval(days => $2), $3)",
+    )
+    .bind(asset)
+    .bind(days_ago)
+    .bind(rows)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn loads_are_recorded_per_table_and_read_back_oldest_first(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        load_summary(&pool, "silver.orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (days_ago, rows) in [(5, 100), (3, 200), (1, 300)] {
+        backdated_load(&pool, "silver.orders", days_ago, rows).await;
+    }
+    backdated_load(&pool, "silver.other", 2, 9).await;
+    record_load(&pool, " Silver.Orders ", 400).await.unwrap();
+
+    let all = recent_loads(&pool, "silver.orders", 50).await.unwrap();
+    assert_eq!(
+        all.iter().map(|l| l.rows_after).collect::<Vec<_>>(),
+        vec![100, 200, 300, 400]
+    );
+    // The newest two, still oldest first.
+    let newest = recent_loads(&pool, "silver.orders", 2).await.unwrap();
+    assert_eq!(
+        newest.iter().map(|l| l.rows_after).collect::<Vec<_>>(),
+        vec![300, 400]
+    );
+
+    let summary = load_summary(&pool, "SILVER.ORDERS").await.unwrap().unwrap();
+    assert_eq!(summary.loads, 4);
+    assert!(summary.first_at < summary.last_at);
+    let every = load_summaries(&pool).await.unwrap();
+    assert_eq!(
+        every
+            .iter()
+            .map(|s| (s.asset.as_str(), s.loads))
+            .collect::<Vec<_>>(),
+        vec![("silver.orders", 4), ("silver.other", 1)]
+    );
+
+    // A count below zero is refused by the table, not stored.
+    assert!(record_load(&pool, "silver.orders", -1).await.is_err());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn loads_older_than_ninety_days_are_purged(pool: PgPool) -> sqlx::Result<()> {
+    backdated_load(&pool, "silver.orders", 91, 1).await;
+    backdated_load(&pool, "silver.orders", 90, 2).await;
+    backdated_load(&pool, "silver.orders", 89, 3).await;
+    assert_eq!(purge_loads(&pool).await.unwrap(), 2);
+    let kept = recent_loads(&pool, "silver.orders", 10).await.unwrap();
+    assert_eq!(
+        kept.iter().map(|l| l.rows_after).collect::<Vec<_>>(),
+        vec![3]
+    );
+    Ok(())
+}
+
+/// Only a RESOLVED freshness incident opened after the table's last load
+/// suppresses a new one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_resolved_freshness_incident_after_the_last_load_is_remembered(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let last_load = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    assert!(
+        !freshness_resolved_since(&pool, "silver.orders", last_load)
+            .await
+            .unwrap()
+    );
+
+    let opened = record_failure(
+        &pool,
+        "silver.orders",
+        None,
+        IncidentKind::FreshnessAnomaly,
+        "late",
+    )
+    .await
+    .unwrap();
+    // Open is not resolved.
+    assert!(
+        !freshness_resolved_since(&pool, "silver.orders", last_load)
+            .await
+            .unwrap()
+    );
+    resolve(&pool, &opened.id, USER, "known").await.unwrap();
+    assert!(
+        freshness_resolved_since(&pool, "silver.orders", last_load)
+            .await
+            .unwrap()
+    );
+    // A load after the incident opened ends that silence.
+    let later = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    assert!(
+        !freshness_resolved_since(&pool, "silver.orders", later)
+            .await
+            .unwrap()
+    );
+    // Another table, and another kind, do not count.
+    assert!(
+        !freshness_resolved_since(&pool, "silver.other", last_load)
+            .await
+            .unwrap()
+    );
+    let volume = record_failure(
+        &pool,
+        "silver.vol",
+        None,
+        IncidentKind::VolumeAnomaly,
+        "small",
+    )
+    .await
+    .unwrap();
+    resolve(&pool, &volume.id, USER, "known").await.unwrap();
+    assert!(
+        !freshness_resolved_since(&pool, "silver.vol", last_load)
+            .await
+            .unwrap()
+    );
     Ok(())
 }

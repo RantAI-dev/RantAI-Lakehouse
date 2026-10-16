@@ -1734,6 +1734,30 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
     assert_eq!(stored, 0, "no empty-bodied request may store a schedule");
 }
 
+/// `DATA-14` (F5): any login may read a table's learning state; an anonymous
+/// caller is refused.
+#[tokio::test]
+async fn the_learning_state_is_readable_by_any_login_and_not_anonymously() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let path = "/api/governance/quality/learning/silver.orders";
+    let read = request_with_cookie(&router, "GET", path, &cookie).await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
 /// policies the plan names, so the table-driven loops above walk them both
 /// ways (a `dashboard:read`-only principal is refused on the withdrawal; the

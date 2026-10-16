@@ -73,8 +73,16 @@ async fn follow_up(state: &AppState, pool: &PgPool, run_id: &str, loaded: Loaded
     }
 }
 
-/// Everything a finished load of `tables` sets going.
+/// Everything a finished load of `tables` sets going: its row count goes
+/// into the table's load history whatever its schedule (`DATA-14`, F5; a
+/// table that cannot be counted is not recorded, never recorded as empty),
+/// and the rules of those on `on_load` run.
 async fn after_load(state: &AppState, tables: &[String]) {
+    for table in tables {
+        if let Some(rows_after) = crate::routes::quality::count_rows(state, table).await {
+            crate::routes::quality_anomaly::note_load(state, table, rows_after).await;
+        }
+    }
     crate::routes::quality::run_on_load(state, tables).await;
 }
 

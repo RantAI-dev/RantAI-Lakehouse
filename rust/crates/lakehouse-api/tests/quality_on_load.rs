@@ -212,7 +212,11 @@ impl App {
             .await
             .unwrap()
             .iter()
-            .filter(|r| String::from_utf8_lossy(&r.body).contains("toString(count()) AS n FROM"))
+            .filter(|r| {
+                // A rule's check has no `WHERE`; the load's own row count does.
+                let sql = String::from_utf8_lossy(&r.body);
+                sql.contains("toString(count()) AS n FROM") && !sql.contains("WHERE 1")
+            })
             .count()
     }
 }

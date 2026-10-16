@@ -17,6 +17,7 @@
 
 use serde::Serialize;
 use sqlx::FromRow;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
@@ -427,6 +428,152 @@ pub async fn put_schedule(
         .bind(&asset)
         .fetch_one(pool)
         .await?)
+}
+
+// ── Load history ───────────────────────────────────────────────────────
+
+/// How long a load is kept, in days (the spec's history for learning).
+pub const LOAD_RETENTION_DAYS: i32 = 90;
+
+/// One recorded load of a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
+pub struct TableLoad {
+    /// When the load finished.
+    pub loaded_at: OffsetDateTime,
+    /// The table's row count after it.
+    pub rows_after: i64,
+}
+
+/// What a table's history holds, for the learned-or-learning decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
+pub struct LoadSummary {
+    /// How many loads are recorded.
+    pub loads: i64,
+    /// The oldest one.
+    pub first_at: OffsetDateTime,
+    /// The newest one.
+    pub last_at: OffsetDateTime,
+}
+
+/// A table's summary together with its name, for the tick's pass over every
+/// table.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct AssetLoadSummary {
+    /// The table, lower-cased.
+    pub asset: String,
+    /// How many loads are recorded.
+    pub loads: i64,
+    /// The oldest one.
+    pub first_at: OffsetDateTime,
+    /// The newest one.
+    pub last_at: OffsetDateTime,
+}
+
+/// Records that `asset` just finished a load and now holds `rows_after`
+/// rows. Written for every loaded table whatever its schedule.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the insert fails (including a negative count
+/// or an empty or over-long table name, which the table's `CHECK`s refuse).
+pub async fn record_load(pool: &PgPool, asset: &str, rows_after: i64) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO table_load (asset, loaded_at, rows_after) VALUES ($1, now(), $2) \
+         ON CONFLICT (asset, loaded_at) DO NOTHING",
+    )
+    .bind(asset.trim().to_lowercase())
+    .bind(rows_after)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The newest `limit` loads of `asset`, oldest first.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn recent_loads(
+    pool: &PgPool,
+    asset: &str,
+    limit: i64,
+) -> Result<Vec<TableLoad>, StoreError> {
+    Ok(sqlx::query_as::<_, TableLoad>(
+        "SELECT loaded_at, rows_after FROM ( \
+             SELECT loaded_at, rows_after FROM table_load WHERE asset = $1 \
+             ORDER BY loaded_at DESC LIMIT $2 \
+         ) newest ORDER BY loaded_at",
+    )
+    .bind(asset.trim().to_lowercase())
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// What `asset`'s history holds, or `None` for a table never recorded.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn load_summary(pool: &PgPool, asset: &str) -> Result<Option<LoadSummary>, StoreError> {
+    Ok(sqlx::query_as::<_, LoadSummary>(
+        "SELECT count(*) AS loads, min(loaded_at) AS first_at, max(loaded_at) AS last_at \
+         FROM table_load WHERE asset = $1 HAVING count(*) > 0",
+    )
+    .bind(asset.trim().to_lowercase())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Every recorded table's summary, for the tick's freshness pass.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn load_summaries(pool: &PgPool) -> Result<Vec<AssetLoadSummary>, StoreError> {
+    Ok(sqlx::query_as::<_, AssetLoadSummary>(
+        "SELECT asset, count(*) AS loads, min(loaded_at) AS first_at, max(loaded_at) AS last_at \
+         FROM table_load GROUP BY asset ORDER BY asset",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Deletes loads older than [`LOAD_RETENTION_DAYS`], returning how many.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the delete fails.
+pub async fn purge_loads(pool: &PgPool) -> Result<u64, StoreError> {
+    let done =
+        sqlx::query("DELETE FROM table_load WHERE loaded_at < now() - make_interval(days => $1)")
+            .bind(LOAD_RETENTION_DAYS)
+            .execute(pool)
+            .await?;
+    Ok(done.rows_affected())
+}
+
+/// Whether a person already resolved a freshness incident of `asset` that
+/// opened after `since` (its last load). A table that stays silent after
+/// someone resolved the incident has not become a new problem, so the tick
+/// does not open a second incident for the same silence.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn freshness_resolved_since(
+    pool: &PgPool,
+    asset: &str,
+    since: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM quality_incident WHERE asset = $1 \
+         AND kind = 'freshness_anomaly' AND status = 'resolved' AND opened_at >= $2)",
+    )
+    .bind(asset.trim().to_lowercase())
+    .bind(since)
+    .fetch_one(pool)
+    .await?)
 }
 
 #[cfg(test)]

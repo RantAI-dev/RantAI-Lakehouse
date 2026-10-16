@@ -59,6 +59,26 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     }
 }
 
+/// Opens the incident of an anomaly (`DATA-14`, F5) for `asset`, or moves the
+/// `last_seen_at` of the one already open. Returns the incident's id when
+/// this call opened it, `None` when it was already open or could not be
+/// saved (logged). Bookkeeping after a load or a tick, so it never fails.
+pub(crate) async fn open_anomaly(
+    state: &AppState,
+    asset: &str,
+    kind: IncidentKind,
+    detail: &str,
+) -> Option<String> {
+    let pg = state.pg.as_deref()?;
+    match quality::record_failure(pg, asset, None, kind, detail).await {
+        Ok(recorded) => recorded.opened.then_some(recorded.id),
+        Err(err) => {
+            tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: the anomaly could not be recorded");
+            None
+        }
+    }
+}
+
 /// Resolves the open incidents of a rule that was just deleted.
 pub(crate) async fn resolve_for_deleted_rule(
     state: &AppState,

@@ -496,8 +496,12 @@ fn check_sql(check: &Check, from: &str, per_load: bool) -> String {
             "SELECT toString(count()) AS n, toString(uniqExact(`{column}`)) AS k \
              FROM {from} WHERE isNotNull(`{column}`)"
         ),
+        // `WHERE 1`: an unqualified count on an Iceberg table can take the
+        // metadata-only path that ignores equality deletes (R11,
+        // `docs/plans/P5-RESULT.md`); any `WHERE` forces the row scan.
         Check::Nulls { column, .. } => format!(
-            "SELECT toString(count()) AS n, toString(countIf(isNull(`{column}`))) AS k FROM {from}"
+            "SELECT toString(count()) AS n, toString(countIf(isNull(`{column}`))) AS k \
+             FROM {from} WHERE 1"
         ),
         Check::Fresh { column, .. } => format!(
             "SELECT toString(count()) AS n, \
@@ -1245,6 +1249,9 @@ async fn scheduled_pass(state: &AppState) {
     let Some(pg) = state.pg.as_deref() else {
         return;
     };
+    // DATA-14 (F5): load-history upkeep and the freshness anomalies ride the
+    // same tick; they read Postgres only and never stop the rules below.
+    crate::routes::quality_anomaly::tick(state).await;
     let rules = match lakehouse_store::governance::list_quality_rules(pg).await {
         Ok(rules) => rules,
         Err(err) => {
@@ -1304,6 +1311,30 @@ async fn scheduled_pass(state: &AppState) {
         ran,
         "quality schedule: pass finished"
     );
+}
+
+/// The table `asset` names as it holds now: its row count, for the load
+/// history (`DATA-14`, F5). `None` when the table cannot be read or counted;
+/// the reason is logged, and a load whose size is not known is not recorded
+/// (no invented count).
+pub(crate) async fn count_rows(state: &AppState, asset: &str) -> Option<i64> {
+    let source = resolve(state, asset).await?;
+    // `WHERE 1`: see `check_sql` on counting an Iceberg table (R11).
+    let sql = format!(
+        "SELECT toString(count()) AS n FROM {} WHERE 1 SETTINGS max_execution_time = {MAX_EXECUTION_SECONDS}",
+        source.from
+    );
+    match state.clickhouse.rows(&sql, None).await {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(Value::as_str)
+            .and_then(|n| n.parse::<i64>().ok()),
+        Err(err) => {
+            tracing::warn!(?err, %asset, "quality: the table's rows could not be counted");
+            None
+        }
+    }
 }
 
 /// Who the runs started by a load are recorded as.
@@ -2022,7 +2053,7 @@ mod tests {
         assert_eq!(
             sql("email nulls <= 5%"),
             "SELECT toString(count()) AS n, toString(countIf(isNull(`email`))) AS k \
-             FROM silver.`orders` SETTINGS max_execution_time = 30"
+             FROM silver.`orders` WHERE 1 SETTINGS max_execution_time = 30"
         );
         assert!(sql("id duplicates <= 2").contains("uniqExact(`id`)"));
         assert!(sql("id duplicates <= 2").contains("WHERE isNotNull(`id`)"));

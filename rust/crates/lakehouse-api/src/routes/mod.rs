@@ -36,6 +36,7 @@ mod ops;
 mod overview;
 mod pipelines;
 mod quality;
+mod quality_anomaly;
 mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
@@ -425,6 +426,11 @@ fn governance_static_router() -> Router<AppState> {
         .route(
             "/api/governance/quality/schedules/{asset}",
             put(quality_schedules::put_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
         )
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
