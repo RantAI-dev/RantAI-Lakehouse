@@ -18,8 +18,10 @@
  *   re-upload runs the pipeline, and a user building a pipeline over an
  *   uploaded table almost always wants it.
  * - Toggling changes ONLY this upstream. An `authored__`-free chain of
- *   other upstreams (another pipeline, `ingest_job`) is carried through
- *   untouched, and never duplicated.
+ *   other upstreams (another pipeline, `ingest_job` on bronze) is carried through
+ *   untouched, and never duplicated. On a non-Bronze source, per-table upstreams
+ *   (`file_ingest_job` and `ingest_job`) are dropped on save (BLD-4 review R1)
+ *   because the server refuses them and the form offers no control for them.
  *
  * The one upstream the switch owns is named by the DAGSTER side's own
  * constant (`file_ingest.JOB_NAME`); this literal and the API's
@@ -31,6 +33,9 @@
 
 /** The Dagster job one uploaded file's load runs. */
 export const FILE_INGEST_JOB = "file_ingest_job"
+
+/** The Dagster job one connector's load runs (BLD-4 review R1). */
+export const INGEST_JOB = "ingest_job"
 
 /** The only zone an uploaded file can be re-uploaded into. */
 export const BRONZE_ZONE = "bronze"
@@ -76,6 +81,10 @@ export function withReuploadTrigger(
   on: boolean
 ): string[] {
   const kept = (dependsOn ?? []).filter((entry) => entry !== FILE_INGEST_JOB)
-  if (!on || !showsReuploadSwitch(sourceZone)) return kept
+  if (!showsReuploadSwitch(sourceZone)) {
+    // BLD-4 review R1 / Decision R1: drop ingest_job on non-Bronze sources
+    return kept.filter((entry) => entry !== INGEST_JOB)
+  }
+  if (!on) return kept
   return [FILE_INGEST_JOB, ...kept]
 }
