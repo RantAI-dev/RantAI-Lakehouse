@@ -917,8 +917,18 @@ class _StubInstance:
         ascending: bool = False,
     ) -> Sequence[_FakeRunRecord]:
         self.calls.append((filters, limit))
-        job_name = filters.job_name if filters else None
-        runs = list(self._runs_by_job.get(job_name, []))
+        if filters and filters.job_name:
+            runs = list(self._runs_by_job.get(filters.job_name, []))
+        else:
+            runs = [r for job_runs in self._runs_by_job.values() for r in job_runs]
+        if filters and filters.run_ids:
+            # BLD-4 review R1 BLOCKER 1 / SHOULD-FIX 5
+            run_ids_set = set(filters.run_ids)
+            runs = [r for r in runs if r.run_id in run_ids_set]
+        if filters and filters.statuses:
+            # BLD-4 review R1 SHOULD-FIX 5
+            statuses_set = set(filters.statuses)
+            runs = [r for r in runs if r.status in statuses_set]
         if limit is not None:
             runs = runs[:limit]
         return [_FakeRunRecord(run) for run in runs]
@@ -1809,13 +1819,14 @@ class TestIngestUpstreamIsFilteredByTable:
         `TestIngestMaterializationKeyTest`). Such a run is not a load this
         chain may follow, so the tick looks past it to the SUCCESS run."""
         ours = _ingest_run("ours", end_time=200.0)
+        # BLD-4 review R1 SHOULD-FIX 5: feed the failed run to the stub
         broken = _ingest_run("broken", end_time=250.0, status=DagsterRunStatus.FAILURE)
         instance = self._instance(
             [
                 _materialized("broken", "orders", timestamp=260.0),
                 _materialized("ours", "orders", timestamp=200.0),
             ],
-            runs=[ours],
+            runs=[broken, ours],
         )
         out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
 
@@ -1827,10 +1838,11 @@ class TestIngestUpstreamIsFilteredByTable:
         """When every materialization in the window belongs to a run that
         FAILED, the chain waits and says why: the table's last load did not
         succeed, which is a different fact from "never loaded"."""
+        # BLD-4 review R1 SHOULD-FIX 5: feed the failed run to the stub
         broken = _ingest_run("broken", end_time=250.0, status=DagsterRunStatus.FAILURE)
         instance = self._instance(
             [_materialized("broken", "orders", timestamp=260.0)],
-            runs=[],
+            runs=[broken],
         )
         out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
 
@@ -1838,6 +1850,56 @@ class TestIngestUpstreamIsFilteredByTable:
         assert not isinstance(out[0], RunRequest)
         assert "orders" in out[0].skip_message
         assert "ingest_job" in out[0].skip_message
+
+    def test_more_than_twenty_success_runs_of_other_tables_after_own_run_still_triggers(self) -> None:
+        """BLD-4 review R1 BLOCKER 1: The SUCCESS-run window is keyed on the
+        table's materializations, not the deployment's newest runs. More than 20
+        SUCCESS runs of other tables after this table's own SUCCESS run must
+        still find this table's run and trigger the pipeline. Under the old
+        deployment-wide window, 20 newer runs of other tables pushed ours out
+        of the window, falsely skipping."""
+        ours = _ingest_run("ours", end_time=200.0)
+        other_runs = [
+            _ingest_run(f"other-{i}", end_time=210.0 + i)
+            for i in range(25)
+        ]
+        other_materializations = [
+            _materialized(f"other-{i}", "invoices", timestamp=210.0 + i)
+            for i in range(25)
+        ]
+        all_runs = list(reversed(other_runs)) + [ours]
+        instance = self._instance(
+            [_materialized("ours", "orders", timestamp=200.0)] + other_materializations,
+            runs=all_runs,
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_stale_anchor_skip_names_the_table_when_per_table_upstream_is_behind(self) -> None:
+        """BLD-4 review R1 SHOULD-FIX 1: When a per-table upstream's latest
+        SUCCESS run for this table is behind the downstream's start, the skip
+        reason must name the table (D4) rather than falsely claiming the job
+        itself has no SUCCESS run after the downstream start when other tables
+        have loaded."""
+        ours = _ingest_run("ours", end_time=50.0)
+        other = _ingest_run("other-new", end_time=200.0)
+        instance = self._instance(
+            [
+                _materialized("ours", "orders", timestamp=50.0),
+                _materialized("other-new", "invoices", timestamp=200.0),
+            ],
+            runs=[other, ours],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, other)
+
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+        assert "orders" in out[0].skip_message
+        assert "ingest_job" in out[0].skip_message
+        assert "stale" in out[0].skip_message
 
     def test_nothing_inside_the_window_skips_with_the_table_named(self) -> None:
         """D4: the reason names the table, the job and the window size,
@@ -1896,15 +1958,16 @@ class TestIngestUpstreamIsFilteredByTable:
         # `TestIngestMaterializationKeyTest`).
         assert tuple(records_filter.path) == ("bronze", "orders")
         assert limit == authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT
+        # BLD-4 review R1 BLOCKER 1: run lookup is keyed on materializations' run_ids
         run_calls = [
             (filters, limit)
             for filters, limit in instance.calls
-            if filters and filters.job_name == "ingest_job"
+            if filters and filters.run_ids == ["ours"]
         ]
         assert run_calls == [
             (
                 RunsFilter(
-                    job_name="ingest_job",
+                    run_ids=["ours"],
                     statuses=[DagsterRunStatus.SUCCESS],
                 ),
                 authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT,
@@ -1919,10 +1982,11 @@ class TestIngestUpstreamIsFilteredByTable:
         _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
 
         assert len(instance.materialization_calls) == 1
+        # BLD-4 review R1 BLOCKER 1
         ingest_run_calls = [
             (filters, limit)
             for filters, limit in instance.calls
-            if filters and filters.job_name == "ingest_job"
+            if filters and (filters.job_name == "ingest_job" or filters.run_ids is not None)
         ]
         assert ingest_run_calls == []
 

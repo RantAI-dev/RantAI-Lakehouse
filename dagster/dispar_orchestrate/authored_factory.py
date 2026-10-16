@@ -1069,7 +1069,8 @@ def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
        and no status, and the per-event `get_event_records` twin is
        deprecated in `dagster==1.13.20` ("Use fetch_materializations
        instead").
-    2. `instance.get_run_records` for `ingest_job`'s newest SUCCESS runs,
+    2. `instance.get_run_records` keyed on the materializations' `run_ids`
+       with `statuses=[DagsterRunStatus.SUCCESS]` (BLD-4 review R1 BLOCKER 1),
        which is where the RUN's status and `end_time` live. A materialization
        logged by a step whose run later FAILED is still in the event log --
        the log is append-only per step -- so the event alone is NOT evidence
@@ -1087,8 +1088,13 @@ def _latest_record_for_ingest_table(instance: Any, table: str) -> Any | None:
     )
     if not materializations.records:
         return None
+    # BLD-4 review R1 BLOCKER 1: key the run lookup on the materializations
+    # so loads of other tables do not push this table's run out of the window.
     success_records = instance.get_run_records(
-        filters=RunsFilter(job_name=INGEST_JOB, statuses=[DagsterRunStatus.SUCCESS]),
+        filters=RunsFilter(
+            run_ids=[m.run_id for m in materializations.records],
+            statuses=[DagsterRunStatus.SUCCESS],
+        ),
         limit=PER_TABLE_UPSTREAM_SCAN_LIMIT,
     )
     # The run records are the run-side of the join: one dict lookup per
@@ -1313,6 +1319,15 @@ unfiltered rule above, byte for byte.
                 )
                 return
             if latest.end_time <= (downstream_start or 0.0):
+                if upstream_id in _PER_TABLE_UPSTREAMS and bronze_table:
+                    # BLD-4 review R1 SHOULD-FIX 1: name the table in the stale anchor reason
+                    yield SkipReason(
+                        f"upstream {upstream_id!r} has no SUCCESS run that loaded "
+                        f"{bronze_table!r} after the downstream's most-recent "
+                        f"start ({downstream_start}); this upstream run "
+                        f"({upstream_run.run_id}) is stale"
+                    )
+                    return
                 yield SkipReason(
                     f"upstream {upstream_id!r} has no SUCCESS run after the "
                     f"downstream's most-recent start ({downstream_start}); "
