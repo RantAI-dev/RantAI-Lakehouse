@@ -252,3 +252,27 @@ have a way through that the plan allows:
 
 Then do T2 steps 1-4 as written (step 4 measures with that override;
 steps 2 and 3 with the plain file) and write `docs/plans/OPS-1-RESULT.md`.
+
+Round 2, reviewed 2026-10-16 at `9fca593f` (developer: Stepfun), then
+`origin/main` merged in (`CHANGELOG.md`: both sides kept). BLOCKER 1 is
+fixed: `ops/trino/docker-compose.ops1-measure.override.yml` (used only with
+`-f`; its header says it must never reach a deployment) and
+`docs/plans/OPS-1-RESULT.md`. Every number in the result was checked
+against the raw log `review-logs/ops1-measure.log` (before 10 snapshots,
+41 objects; AC2 unchanged 11 / 56 / 237,422 B; 0s floor after 2 snapshots,
+39 objects, 191,622 B). No open finding.
+
+Re-run by the planner on the merged head: `check_intra_package_imports.py`
+OK, `check_bare_iceberg_count.py` OK, `check_compose_init_readiness.py`
+exit 0; `docker compose --profile '*' config --quiet` and the same with
+`-f ops/trino/docker-compose.ops1-measure.override.yml --profile trino`
+both exit 0; Dagster tests on Python 3.11 as CI runs them
+(`pytest dispar_orchestrate -m "not loader"`): 805 passed, 258 deselected,
+0 failed. (The local 3.14 venv fails 223 tests with a `SQLAlchemy` typing
+error on `main` too; it is not a usable gate.) gitleaks `dir`: 9 findings,
+all in the gitignored, uncommitted `.env` the drill generated.
+
+The result found a bug outside this item: the per-table maintenance route
+filters on the bare table name while the job records the qualified one, so
+`lastRun`/`lastVerbRuns` are always empty for Bronze tables. Filed as
+`OPS-9`.
