@@ -155,6 +155,22 @@ pub fn stats_from_summary(summary: &Summary) -> TableStats {
     }
 }
 
+/// The snapshot summary key the product's own `pyiceberg` commits write the
+/// author under (`dagster/dispar_orchestrate/adapters/history.py`
+/// `AUTHOR_PROPERTY`): the run that made the commit, e.g.
+/// `connector conn-x, run 1a2b`.
+pub const AUTHOR_SUMMARY_KEY: &str = "rantai.author";
+
+/// The recorded author of a snapshot, if it has one. An empty value is no
+/// author.
+fn author_of(summary: &Summary) -> Option<String> {
+    summary
+        .additional_properties
+        .get(AUTHOR_SUMMARY_KEY)
+        .filter(|a| !a.trim().is_empty())
+        .cloned()
+}
+
 fn parse_u64(summary: &Summary, key: &str) -> Option<u64> {
     summary.additional_properties.get(key)?.parse().ok()
 }
@@ -285,6 +301,10 @@ pub struct SnapshotDetail {
     /// snapshot, kept here per-snapshot since `total_bytes` has no
     /// dedicated field above.
     pub stats: TableStats,
+    /// Who made the commit, from the summary key [`AUTHOR_SUMMARY_KEY`]
+    /// where the product recorded it (`DATA-15` F5); `None` where it did not
+    /// (a load written through `dlt` records none), never a guess.
+    pub author: Option<String>,
 }
 
 /// Full detail for one table: schema, partition spec, properties, snapshot
@@ -375,6 +395,7 @@ pub async fn load_table_detail(
                     total_records: parse_u64(s.summary(), "total-records"),
                     total_data_files: parse_u64(s.summary(), "total-data-files"),
                     stats: stats_from_summary(s.summary()),
+                    author: author_of(s.summary()),
                 })
                 .collect();
             // `TableMetadata::snapshots()` iterates a map keyed by snapshot
@@ -435,6 +456,19 @@ mod tests {
         assert_eq!(stats.file_count, None);
         assert_eq!(stats.record_count, None);
         assert_eq!(stats.total_bytes, None);
+    }
+
+    /// `DATA-15` F5: the author is the summary key `rantai.author`; a summary
+    /// without it, or with an empty value, has none.
+    #[test]
+    fn a_snapshot_author_is_read_from_the_summary_key_or_is_none() {
+        let with = summary_with(&[("rantai.author", "connector conn-x, run 1a2b")]);
+        assert_eq!(
+            author_of(&with).as_deref(),
+            Some("connector conn-x, run 1a2b")
+        );
+        assert_eq!(author_of(&summary_with(&[])), None);
+        assert_eq!(author_of(&summary_with(&[("rantai.author", "  ")])), None);
     }
 
     #[test]

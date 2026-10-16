@@ -197,6 +197,13 @@ pub enum AlertKind {
     /// connector scope `"*"`: an upload belongs to no connector (`SRC-7`).
     #[serde(rename = "upload_failure")]
     UploadFailure,
+    /// Fires when a quality incident OPENS (`DATA-14`): a failed check, or a
+    /// learned volume or freshness anomaly. Scoped to one table
+    /// (`silver.orders`) or `"*"` by the `asset` column. Evaluated by
+    /// [`deliver_quality_incident_to`] from the route that opens the incident,
+    /// never by `run_rules`; an incident seen again does not deliver again.
+    #[serde(rename = "quality_incident")]
+    QualityIncident,
 }
 
 impl AlertKind {
@@ -213,6 +220,20 @@ impl AlertKind {
                 | Self::ConnectorSuccess
                 | Self::UploadFailure
         )
+    }
+
+    /// Whether the kind is scoped by the `asset` column (`DATA-14`): only
+    /// `quality_incident`.
+    #[must_use]
+    pub const fn is_asset_scoped(self) -> bool {
+        matches!(self, Self::QualityIncident)
+    }
+
+    /// Parse a literal kind string for the `DATA-14` kind only; `None` for
+    /// any other string.
+    #[must_use]
+    pub fn parse_asset_kind(s: &str) -> Option<Self> {
+        (s == "quality_incident").then_some(Self::QualityIncident)
     }
 
     /// Parse a literal kind string (the inverse of [`AlertKind::as_str`])
@@ -247,6 +268,7 @@ impl AlertKind {
             Self::ConnectorSchemaChange => "connector_schema_change",
             Self::ConnectorSuccess => "connector_success",
             Self::UploadFailure => "upload_failure",
+            Self::QualityIncident => "quality_incident",
         }
     }
 }
@@ -349,6 +371,11 @@ pub struct AlertRule {
     /// stores the empty string then, like `pipeline`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub connector: Option<String>,
+    /// Table (`silver.orders`) or `"*"` for `quality_incident` rules
+    /// (`DATA-14`). `None` for every other kind; the column stores the empty
+    /// string then, like `pipeline` and `connector`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub asset: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -421,6 +448,9 @@ pub struct AlertRuleInput {
     /// Required for them, ignored for `upload_failure` (always stored as
     /// `"*"`) and for every other kind.
     pub connector: Option<String>,
+    /// Table (`zone.table` in `bronze`, `silver` or `serving`) or `"*"` for
+    /// a `quality_incident` rule (`DATA-14`); not read for any other kind.
+    pub asset: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -448,6 +478,8 @@ struct NormalizedRule {
     /// Connector id or `"*"` for the `SRC-7` kinds; empty for every other
     /// kind.
     connector: String,
+    /// Table or `"*"` for `quality_incident`; empty for every other kind.
+    asset: String,
 }
 
 /// Validate and normalize `input`, exactly reproducing `saveRule`'s
@@ -470,7 +502,9 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         Some("pipeline_slow") => AlertKind::PipelineSlow,
         Some("pipeline_late") => AlertKind::PipelineLate,
         Some("pipeline_volume_drop") => AlertKind::PipelineVolumeDrop,
-        Some(other) => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
+        Some(other) => AlertKind::parse_connector_kind(other)
+            .or_else(|| AlertKind::parse_asset_kind(other))
+            .unwrap_or(AlertKind::Alert),
         None => AlertKind::Alert,
     };
     let channel = if input.channel.as_deref() == Some("email") {
@@ -528,6 +562,8 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_pipeline_scoped(input, common, "pipeline_volume_drop")
     } else if kind.is_connector_scoped() {
         normalize_connector_scoped(input, common)
+    } else if kind.is_asset_scoped() {
+        normalize_asset_scoped(input, common)
     } else {
         normalize_digest(input, common)
     }
@@ -579,6 +615,7 @@ fn normalize_alert(
             metric: metric.to_owned(),
             pipeline: String::new(),
             connector: String::new(),
+            asset: String::new(),
         });
     }
     let raw_mart = input.mart.as_deref().unwrap_or("");
@@ -618,6 +655,7 @@ fn normalize_alert(
         metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
+        asset: String::new(),
     })
 }
 
@@ -667,6 +705,7 @@ fn normalize_freshness(
         metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
+        asset: String::new(),
     })
 }
 
@@ -697,6 +736,7 @@ fn normalize_pipeline_failure(
         metric: String::new(),
         pipeline: raw,
         connector: String::new(),
+        asset: String::new(),
     })
 }
 
@@ -725,6 +765,7 @@ fn normalize_pipeline_scoped(
         metric: String::new(),
         pipeline: raw,
         connector: String::new(),
+        asset: String::new(),
     })
 }
 
@@ -818,6 +859,64 @@ fn normalize_connector_scoped(
         metric: String::new(),
         pipeline: String::new(),
         connector,
+        asset: String::new(),
+    })
+}
+
+/// The zones a `quality_incident` rule may name a table in (the zones a
+/// quality rule can check).
+const QUALITY_ZONES: [&str; 3] = ["bronze", "silver", "serving"];
+
+/// Validate the scope of a `quality_incident` rule (`DATA-14`): `"*"` for
+/// every table, or `zone.table` with a real zone and a plain table name,
+/// stored lower-cased because incidents are keyed that way. Messages are
+/// fixed text, never an echo of the input.
+fn validate_asset_scoped(input: &AlertRuleInput) -> Result<String, AlertError> {
+    let raw = input.asset.as_deref().unwrap_or("").trim().to_lowercase();
+    if raw.is_empty() {
+        return Err(AlertError::Validation(
+            "quality_incident requires a table or \"*\".".to_owned(),
+        ));
+    }
+    if raw == "*" {
+        return Ok(raw);
+    }
+    let valid = raw.split_once('.').is_some_and(|(zone, table)| {
+        QUALITY_ZONES.contains(&zone) && lakehouse_core::ident::Ident::new(table).is_ok()
+    });
+    if valid {
+        Ok(raw)
+    } else {
+        Err(AlertError::Validation(
+            "quality_incident table must be bronze.<table>, silver.<table> or serving.<table>, or \"*\"."
+                .to_owned(),
+        ))
+    }
+}
+
+/// `DATA-14`: `quality_incident`. No mart, measure, board, pipeline or
+/// connector: only the table scope.
+fn normalize_asset_scoped(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let asset = validate_asset_scoped(input)?;
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board: String::new(),
+        severity: common.severity,
+        metric: String::new(),
+        pipeline: String::new(),
+        connector: String::new(),
+        asset,
     })
 }
 
@@ -847,6 +946,7 @@ fn normalize_digest(
         metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
+        asset: String::new(),
     })
 }
 
@@ -930,10 +1030,18 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // `DATA-14`: the `asset` column carries a table or "*" for
+    // `quality_incident` rules. Additive, like `connector` above; existing
+    // rows read back as `None`.
+    ch.exec(
+        "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS asset String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector,asset";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -977,7 +1085,9 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         "pipeline_slow" => AlertKind::PipelineSlow,
         "pipeline_late" => AlertKind::PipelineLate,
         "pipeline_volume_drop" => AlertKind::PipelineVolumeDrop,
-        other => AlertKind::parse_connector_kind(other).unwrap_or(AlertKind::Alert),
+        other => AlertKind::parse_connector_kind(other)
+            .or_else(|| AlertKind::parse_asset_kind(other))
+            .unwrap_or(AlertKind::Alert),
     };
     let channel = if row_str(row, "channel") == "email" {
         AlertChannel::Email
@@ -1004,6 +1114,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         pipeline: non_empty(row_str(row, "pipeline")),
         metric: non_empty(row_str(row, "metric")),
         connector: non_empty(row_str(row, "connector")),
+        asset: non_empty(row_str(row, "asset")),
     }
 }
 
@@ -1089,7 +1200,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector,asset) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -1104,6 +1215,7 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.pipeline.as_str()),
         SqlLiteral::from(normalized.metric.as_str()),
         SqlLiteral::from(normalized.connector.as_str()),
+        SqlLiteral::from(normalized.asset.as_str()),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -1858,6 +1970,8 @@ pub struct RuleDelivery {
 enum RuleScope<'a> {
     Pipeline(&'a str),
     Connector(&'a str),
+    /// The `asset` column (`DATA-14`): a table, lower-cased, or `"*"`.
+    Asset(&'a str),
 }
 
 impl RuleScope<'_> {
@@ -1865,6 +1979,7 @@ impl RuleScope<'_> {
         let (wanted, stored) = match self {
             Self::Pipeline(id) => (id, rule.pipeline.as_deref()),
             Self::Connector(id) => (id, rule.connector.as_deref()),
+            Self::Asset(asset) => (asset, rule.asset.as_deref()),
         };
         stored.is_some_and(|s| s == wanted || s == "*")
     }
@@ -1971,6 +2086,36 @@ pub async fn deliver_connector_event_to(
         silence,
         kind,
         RuleScope::Connector(connector_id),
+        title_prefix,
+        text,
+    )
+    .await
+}
+
+/// Deliver an opened quality incident (`DATA-14`) to every enabled
+/// `quality_incident` rule whose table is `asset` (compared lower-cased) or
+/// `"*"`, over rules already read with [`load_rules`] — it cannot fail on the
+/// rule store. Returns each rule a delivery was attempted for with its
+/// outcome. `text` holds only the table, the rule's name and what was
+/// measured, built by the caller from the incident, never upstream error
+/// text.
+pub async fn deliver_quality_incident_to(
+    rules: &[AlertRule],
+    http: &WebhookSender,
+    email: &EmailSender,
+    asset: &str,
+    title_prefix: &str,
+    text: &str,
+    silence: Option<&dyn SilenceSource>,
+) -> Vec<RuleDelivery> {
+    let asset = asset.trim().to_lowercase();
+    deliver_to_matching(
+        rules,
+        http,
+        email,
+        silence,
+        AlertKind::QualityIncident,
+        RuleScope::Asset(&asset),
         title_prefix,
         text,
     )
@@ -2191,6 +2336,11 @@ async fn run_one(
         | AlertKind::UploadFailure => skipped(
             rule,
             "connector and upload rules are evaluated by their event, not run_rules".to_owned(),
+        ),
+        // `DATA-14`: a quality incident rule fires when an incident opens.
+        AlertKind::QualityIncident => skipped(
+            rule,
+            "quality incident rules are evaluated when an incident opens, not run_rules".to_owned(),
         ),
     }
 }
@@ -3725,6 +3875,7 @@ mod tests {
             pipeline: None,
             metric: None,
             connector: None,
+            asset: None,
         }
     }
 
@@ -4040,6 +4191,7 @@ mod tests {
             pipeline: None,
             metric: Some(metric.to_owned()),
             connector: None,
+            asset: None,
         }
     }
 
@@ -4669,5 +4821,234 @@ mod tests {
         .await
         .unwrap();
         assert!(delivered.is_empty());
+    }
+
+    // ── DATA-14: the quality_incident kind ──────────────────────────────
+
+    fn quality_input(asset: Option<&str>) -> AlertRuleInput {
+        AlertRuleInput {
+            name: Some("Quality incident".to_owned()),
+            kind: Some("quality_incident".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            asset: asset.map(str::to_owned),
+            ..AlertRuleInput::default()
+        }
+    }
+
+    #[test]
+    fn the_quality_incident_kind_is_asset_scoped_and_nothing_else_is() {
+        assert_eq!(AlertKind::QualityIncident.as_str(), "quality_incident");
+        assert_eq!(
+            AlertKind::parse_asset_kind("quality_incident"),
+            Some(AlertKind::QualityIncident)
+        );
+        assert_eq!(AlertKind::parse_asset_kind("connector_failure"), None);
+        assert!(AlertKind::QualityIncident.is_asset_scoped());
+        assert!(!AlertKind::QualityIncident.is_connector_scoped());
+        assert!(!AlertKind::ConnectorFailure.is_asset_scoped());
+        assert_eq!(
+            serde_json::to_string(&AlertKind::QualityIncident).unwrap(),
+            "\"quality_incident\""
+        );
+    }
+
+    #[test]
+    fn normalize_input_accepts_a_table_or_star_for_a_quality_incident_rule() {
+        let all = normalize_input(&quality_input(Some("*"))).unwrap();
+        assert_eq!(all.kind, AlertKind::QualityIncident);
+        assert_eq!(all.asset, "*");
+        assert_eq!(all.connector, "");
+        assert_eq!(all.pipeline, "");
+        for (given, stored) in [
+            ("silver.orders", "silver.orders"),
+            ("  Serving.Mart_Sales ", "serving.mart_sales"),
+            ("bronze.raw", "bronze.raw"),
+        ] {
+            assert_eq!(
+                normalize_input(&quality_input(Some(given))).unwrap().asset,
+                stored
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_input_refuses_a_quality_incident_rule_without_a_valid_table() {
+        for asset in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("orders"),
+            Some("gold.orders"),
+            Some("silver."),
+            Some("silver.a b"),
+            Some("silver.x'; DROP TABLE y"),
+            Some("silver.`x`"),
+        ] {
+            let err = normalize_input(&quality_input(asset)).unwrap_err();
+            assert!(matches!(err, AlertError::Validation(_)), "{asset:?}");
+            // Fixed text: the input is never echoed.
+            assert!(!err.to_string().contains("DROP"), "{err}");
+        }
+    }
+
+    #[test]
+    fn row_to_rule_reads_the_asset_and_an_empty_one_is_none() {
+        let mut row = serde_json::Map::new();
+        row.insert("id".to_owned(), Value::String("al_q".to_owned()));
+        row.insert(
+            "type".to_owned(),
+            Value::String("quality_incident".to_owned()),
+        );
+        row.insert(
+            "asset".to_owned(),
+            Value::String("silver.orders".to_owned()),
+        );
+        let rule = row_to_rule(&row);
+        assert_eq!(rule.kind, AlertKind::QualityIncident);
+        assert_eq!(rule.asset.as_deref(), Some("silver.orders"));
+        row.insert("asset".to_owned(), Value::String(String::new()));
+        assert_eq!(row_to_rule(&row).asset, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_sends_an_additive_asset_column_statement() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ADD COLUMN IF NOT EXISTS asset"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        ensure(&ch).await.unwrap();
+    }
+
+    /// `(id, asset, target, enabled)` quality incident rules, plus one rule of
+    /// another kind, every field `row_to_rule` reads populated.
+    fn quality_rules_json(rows: &[(&str, &str, &str, bool)]) -> serde_json::Value {
+        let mut data: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, asset, target, enabled)| {
+                serde_json::json!({
+                    "id": id, "name": format!("Rule {id}"), "type": "quality_incident",
+                    "mart": "", "measure": "", "agg": "", "op": "", "threshold": "0",
+                    "board": "", "channel": "webhook", "target": target,
+                    "enabled": if *enabled { "1" } else { "0" },
+                    "created_at": "", "severity": "", "pipeline": "",
+                    "connector": "", "asset": asset,
+                })
+            })
+            .collect();
+        data.push(serde_json::json!({
+            "id": "other-kind", "name": "Rule other", "type": "connector_failure",
+            "mart": "", "measure": "", "agg": "", "op": "", "threshold": "0",
+            "board": "", "channel": "webhook", "target": "http://127.0.0.1:1/x",
+            "enabled": "1", "created_at": "", "severity": "", "pipeline": "",
+            "connector": "*", "asset": "*",
+        }));
+        serde_json::json!({ "meta": [], "data": data, "rows": data.len() })
+    }
+
+    /// A rule for one table delivers for that table (whatever the case the
+    /// caller names it in); `*` delivers for every table; another table, a
+    /// disabled rule and another kind never deliver.
+    #[tokio::test]
+    async fn deliver_quality_incident_matches_its_table_star_and_kind_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (id, times) in [("one", 1_u64), ("other", 0), ("all", 1), ("off", 0)] {
+            Mock::given(method("POST"))
+                .and(path(format!("/hooks/{id}")))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(times)
+                .mount(&server)
+                .await;
+        }
+        let rows = [
+            ("one", "silver.orders", true),
+            ("other", "silver.customers", true),
+            ("all", "*", true),
+            ("off", "silver.orders", false),
+        ]
+        .map(|(id, asset, enabled)| (id, asset, format!("{}/hooks/{id}", server.uri()), enabled));
+        let refs: Vec<(&str, &str, &str, bool)> = rows
+            .iter()
+            .map(|(id, asset, target, enabled)| (*id, *asset, target.as_str(), *enabled))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(quality_rules_json(&refs)))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let rules = load_rules(&ch).await.unwrap();
+
+        let delivered = deliver_quality_incident_to(
+            &rules,
+            &test_webhook_sender(),
+            &no_smtp_email_sender(),
+            "Silver.Orders",
+            "Quality incident",
+            "silver.orders: email_filled — 75.0% not null (threshold: email not null >= 90%)",
+            None,
+        )
+        .await;
+        let mut ids: Vec<&str> = delivered.iter().map(|d| d.rule.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["all", "one"]);
+        assert!(delivered.iter().all(|d| d.result.ok));
+    }
+
+    /// The scope reaches `ClickHouse` as an escaped literal.
+    #[tokio::test]
+    async fn save_rule_sends_the_asset_scope_as_a_quoted_literal() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("INSERT INTO console.alert_rule"))
+            .and(body_string_contains("'quality_incident'"))
+            .and(body_string_contains("'silver.orders'"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(quality_rules_json(&[(
+                    "al_q1",
+                    "silver.orders",
+                    "https://hooks.example.com/x",
+                    true,
+                )])),
+            )
+            .mount(&server)
+            .await;
+        // `DATA-14` (CI failure): the target is a name, so the sender needs a
+        // resolver that approves it without dialling; the bare sender resolved
+        // the real host in CI.
+        let webhooks = lakehouse_notify::MappedResolver::new()
+            .with("hooks.example.com", "127.0.0.1:9".parse().unwrap())
+            .into_sender();
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let saved = save_rule(
+            &ch,
+            &webhooks,
+            &quality_input(Some("silver.orders")),
+            Some("al_q1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.kind, AlertKind::QualityIncident);
     }
 }

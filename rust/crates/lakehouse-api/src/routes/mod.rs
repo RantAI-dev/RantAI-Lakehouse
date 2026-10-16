@@ -13,8 +13,10 @@ mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
+mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_restore;
 mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
@@ -44,6 +46,10 @@ mod overview;
 pub(crate) mod params;
 mod pipelines;
 mod quality;
+mod quality_anomaly;
+mod quality_incidents;
+mod quality_load;
+mod quality_schedules;
 mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -59,7 +65,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -422,6 +428,40 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // DATA-13: column-level lineage. A static path ahead of the
+        // `{kind}` capture like `lineage` above (and four segments deep).
+        .route(
+            "/api/governance/lineage/columns",
+            get(governance::column_lineage),
+        )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
+        )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(
@@ -470,6 +510,16 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/classification/{id}",
             axum::routing::delete(governance::delete_classification_rule),
         )
+        // DATA-12 part 2: governed tag keys. Static segments, so they match
+        // ahead of the `{kind}` capture, as `policies` and `sla` do.
+        .route(
+            "/api/governance/tag-keys",
+            get(governance::list_tag_keys).post(governance::create_tag_key),
+        )
+        .route(
+            "/api/governance/tag-keys/{key}",
+            axum::routing::put(governance::update_tag_key).delete(governance::delete_tag_key),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +
@@ -488,6 +538,20 @@ fn catalog_access_router() -> Router<AppState> {
         .route(
             "/api/catalog/access-requests/{id}/decide",
             axum::routing::post(catalog::decide_access_request),
+        )
+        // `DATA-15` F3: grant and revoke from the asset's page.
+        .route(
+            "/api/catalog/{id}/grants",
+            get(catalog_grants::list).post(catalog_grants::create),
+        )
+        .route(
+            "/api/catalog/{id}/grants/{grant_id}",
+            axum::routing::delete(catalog_grants::revoke),
+        )
+        // `DATA-15` F4: undrop a dropped Iceberg table within its window.
+        .route(
+            "/api/catalog/{id}/restore",
+            get(catalog_restore::status).post(catalog_restore::restore),
         )
 }
 
@@ -869,6 +933,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
+        )
+        .route(
+            "/api/catalog/{id}/certification",
+            put(catalog::put_certification),
         )
         // The semantic layer: a table's and a column's plain-words
         // description. `{asset}` is `serving.<table>` or `silver.<table>`;

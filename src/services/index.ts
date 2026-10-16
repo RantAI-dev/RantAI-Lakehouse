@@ -26,6 +26,7 @@ import { homeService as homeClientService } from "./clients/home"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { semanticService as semanticClientService } from "./clients/semantic"
+import { tagKeysService as tagKeysClientService } from "./clients/tag-keys"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -112,6 +113,9 @@ export const chatTermService = chatTermClientService
 // the drafted meaning and role, and the person's confirmed corrections. No
 // mock ever existed.
 export const semanticService = semanticClientService
+// The governed tag keys and their allowed values (`/api/governance/tag-keys`,
+// `DATA-12` part 2). Free tags are not part of this.
+export const tagKeysService = tagKeysClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and

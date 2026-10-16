@@ -8,6 +8,7 @@ import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import {
+  CertificationBadge,
   ClassificationBadge,
   HealthBadge,
   TierBadge,
@@ -40,6 +41,7 @@ import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
 import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
+import { CertificationAction, DeprecationNotice } from "./asset-certification"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 import { useMeanings } from "./asset-column-data"
 import { MeaningBadge } from "./asset-meaning-view"
@@ -120,12 +122,16 @@ export function AssetDetailPage() {
         title={a.name}
         titleAccessory={
           <>
+            <CertificationBadge certification={a.certification} />
             <TierBadge tier={a.tier} title={tierTitle(a)} />
             <ClassificationBadge
               classification={a.classification}
               title={classificationTitle(a)}
             />
             <HealthBadge health={a.health} title={healthTitle(a)} />
+            {hasPermission("governance:write") ? (
+              <CertificationAction asset={a} onChanged={state.reload} />
+            ) : null}
             <MeaningBadge state={meanings} columns={a.schema.map((c) => c.name)} />
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
@@ -136,6 +142,7 @@ export function AssetDetailPage() {
         }
         description={a.description}
       />
+      <DeprecationNotice asset={a} />
       <MetadataList
         density="compact"
         columns={3}

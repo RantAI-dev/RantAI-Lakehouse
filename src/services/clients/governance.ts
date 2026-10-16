@@ -3,7 +3,13 @@ import type {
   Policy,
   QualityRule,
   QualityRunResult,
+  QualityRunRecord,
+  QualityIncident,
+  QualitySchedule,
+  QualitySchedules,
+  QualityLearning,
   LineageGraph,
+  ColumnLineage,
   AuditEvent,
   ClassificationRule,
   MaintenanceRun,
@@ -97,6 +103,10 @@ export const clickhouseGovernanceService: GovernanceService = {
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
   },
+  async getColumnLineage(table, column, direction, signal) {
+    const query = new URLSearchParams({ table, column, direction });
+    return get<ColumnLineage>(`/api/governance/lineage/columns?${query.toString()}`, signal);
+  },
   // P6: Bronze maintenance (P4) and CDC replication-slot health (P5),
   // surfaced through the same `bronze_meta.*`-backed governance endpoints
   // the Rust side already exposes — no new backend route added here.
@@ -145,6 +155,49 @@ export const clickhouseGovernanceService: GovernanceService = {
       undefined,
       signal
     );
+  },
+  async listQualityRuns(id, signal) {
+    return (
+      await get<{ runs: QualityRunRecord[] }>(
+        `/api/governance/quality/${encodeURIComponent(id)}/runs`,
+        signal
+      )
+    ).runs
+  },
+  async listQualityIncidents(filter, signal) {
+    const query = new URLSearchParams()
+    if (filter?.status) query.set("status", filter.status)
+    if (filter?.asset) query.set("asset", filter.asset)
+    const qs = query.toString()
+    return (
+      await get<{ incidents: QualityIncident[] }>(
+        `/api/governance/quality/incidents${qs ? `?${qs}` : ""}`,
+        signal
+      )
+    ).incidents
+  },
+  resolveQualityIncident(id, resolution, signal) {
+    return post<QualityIncident>(
+      `/api/governance/quality/incidents/${encodeURIComponent(id)}/resolve`,
+      { resolution },
+      signal
+    )
+  },
+  listQualitySchedules(signal) {
+    return get<QualitySchedules>("/api/governance/quality/schedules", signal)
+  },
+  setQualitySchedule(asset, input, signal) {
+    return put<QualitySchedule>(
+      `/api/governance/quality/schedules/${encodeURIComponent(asset)}`,
+      input,
+      signal
+    )
+  },
+  getQualityLearning(asset, signal) {
+    return get<QualityLearning>(
+      `/api/governance/quality/learning/${encodeURIComponent(asset)}`,
+      signal
+    )
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);

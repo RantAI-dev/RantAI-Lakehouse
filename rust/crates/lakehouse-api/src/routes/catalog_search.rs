@@ -132,6 +132,20 @@ struct Hit {
     approximate: bool,
 }
 
+/// The `(key, value)` pairs of an asset's `governedTags` object
+/// (`DATA-12` part 2); empty for an asset without it.
+pub fn governed_pairs(asset: &Value) -> Vec<(&str, &str)> {
+    asset
+        .get("governedTags")
+        .and_then(Value::as_object)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn text_of<'a>(asset: &'a Value, key: &str) -> &'a str {
     asset.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -160,6 +174,18 @@ fn candidates(asset: &Value, columns: &ColumnIndex) -> Vec<Candidate> {
                 shown: tag.to_owned(),
             });
         }
+    }
+    // `DATA-12` part 2: a governed pair is indexed as the text `key: value`,
+    // so a word finds it by the key, the value or the pair, and the reason
+    // line reads `data_domain: finance`. It is a tag for ranking and for
+    // `matchedOn.field`, which stays `"tag"`.
+    for (key, value) in governed_pairs(asset) {
+        let pair = format!("{key}: {value}");
+        out.push(Candidate {
+            field: Field::Tag,
+            lower: pair.to_lowercase(),
+            shown: pair,
+        });
     }
     if let Some(cols) = columns.get(text_of(asset, "id")) {
         for (name, description) in cols {
@@ -392,6 +418,24 @@ mod tests {
                 "description": "Agregat restoran",
             }),
         ]
+    }
+
+    /// `DATA-12` part 2: a governed tag is found by its value alone, its key
+    /// alone and the whole pair, and the reason line shows the pair.
+    #[test]
+    fn a_governed_tag_finds_its_table_by_value_key_or_pair() {
+        let mut assets = orders_and_users();
+        assets[1]["governedTags"] = json!({ "data_domain": "finance" });
+        for term in ["finance", "data_domain", "data_domain: finance"] {
+            let hits = find(&assets, term);
+            assert_eq!(ids(&hits), vec!["bronze.users"], "{term}");
+            assert_eq!(
+                hits[0]["matchedOn"],
+                json!({ "field": "tag", "value": "data_domain: finance", "approximate": false }),
+                "{term}"
+            );
+        }
+        assert!(find(&assets, "revenue").is_empty());
     }
 
     // Carried over from `filter_assets_by_query_*` in `catalog.rs`

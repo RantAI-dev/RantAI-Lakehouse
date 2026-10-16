@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use super::{api_result_to_value, arg_str};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::catalog::apply_serving_certification;
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 use crate::state::AppState;
 
@@ -615,7 +616,11 @@ pub(super) async fn get_quality(ch: &ChClient) -> Value {
     }
 }
 
-pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> Value {
+/// `DATA-12` task 10: the assistant's mart description carries each
+/// mart's certification fields, so it can tell a user that a mart it is
+/// about to build a chart on is deprecated, and name the replacement.
+pub(super) async fn describe_mart(state: &AppState, args: &Map<String, Value>) -> Value {
+    let ch = &state.clickhouse;
     let mart = strip_non_ident(&arg_str(args, "mart"));
     if mart.is_empty() {
         let Ok(rows) = ch
@@ -628,7 +633,7 @@ pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> V
         else {
             return json!({ "error": "the Gold mart list could not be read from ClickHouse" });
         };
-        let marts: Vec<Value> = rows
+        let mut marts: Vec<Value> = rows
             .iter()
             .map(|r| {
                 // A view has no stored row count: report it as unknown,
@@ -640,6 +645,7 @@ pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> V
                 json!({ "mart": r.get("name"), "rows": rows_n })
             })
             .collect();
+        apply_serving_certification(state, &mut marts, "mart").await;
         return json!({ "marts": marts });
     }
     let Ok(cols) = ch
@@ -677,7 +683,13 @@ pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> V
             }))
         })
         .collect();
-    json!({ "mart": mart, "dimensions": dimensions, "measures": measures, "columns": columns })
+    // One entry through the list-shaped helper, so the mark merge has a
+    // single owner; a single mart is that list of one.
+    let mut described = vec![
+        json!({ "mart": mart, "dimensions": dimensions, "measures": measures, "columns": columns }),
+    ];
+    apply_serving_certification(state, &mut described, "mart").await;
+    described.remove(0)
 }
 
 #[cfg(test)]
@@ -804,7 +816,9 @@ mod run_sql_delegation {
     use super::*;
     use crate::config::Config;
 
-    fn database_url_for(pool: &PgPool) -> String {
+    /// `DATA-12` task 10's tests reuse it: the two tool tests that need a
+    /// real Postgres behind an `AppState` share one helper rather than two.
+    pub(super) fn database_url_for(pool: &PgPool) -> String {
         let options = pool.connect_options();
         format!(
             "postgres://{}:postgres@{}:{}/{}",
@@ -1146,6 +1160,149 @@ mod run_sql_delegation {
             }),
             "expected the honest no-principal refusal, got {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod describe_mart_marks {
+    //! `DATA-12` task 10: the assistant's mart description carries the same
+    //! certification fields the picker shows, so it can warn about a
+    //! deprecated mart and name the replacement. Real Postgres for the
+    //! annotations, a wiremock `ClickHouse` for `system.tables` and
+    //! `system.columns` — the same two harnesses `run_sql_delegation`
+    //! uses; `ChClient` speaks plain HTTP and has no query-recording
+    //! double of its own.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_store::PgPool;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::run_sql_delegation::database_url_for;
+    use super::*;
+    use crate::config::Config;
+
+    async fn mount_mart_responses(server: &MockServer, marts: Value) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "total_rows", "type": "String"},
+                ],
+                "data": marts,
+                "rows": marts.as_array().map_or(0, Vec::len),
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "type", "type": "String"},
+                ],
+                "data": [
+                    {"name": "customer_id", "type": "String"},
+                    {"name": "amount", "type": "UInt64"},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn state_for(pool: &PgPool, server: &MockServer) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        AppState::new(Config::from_map(&env).expect("valid config from a map"))
+    }
+
+    async fn mark_old_deprecated(pool: &PgPool) {
+        lakehouse_store::annotation::set_certification(
+            pool,
+            &lakehouse_store::annotation::CertificationInput {
+                asset_id: "serving.mart_old".to_owned(),
+                status: "deprecated".to_owned(),
+                note: Some("Superseded by mart_new".to_owned()),
+                replacement_asset_id: Some("serving.mart_new".to_owned()),
+                certified_by: "Rina".to_owned(),
+            },
+        )
+        .await
+        .expect("seeding the mark must succeed");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn describe_mart_lists_a_marked_mart_with_its_replacement(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        mark_old_deprecated(&pool).await;
+        let server = MockServer::start().await;
+        mount_mart_responses(
+            &server,
+            json!([
+                {"name": "mart_old", "total_rows": "1000"},
+                {"name": "mart_plain", "total_rows": "7"},
+            ]),
+        )
+        .await;
+        let state = state_for(&pool, &server);
+        let result = describe_mart(&state, &Map::new()).await;
+        let marts = result["marts"].as_array().expect("marts array");
+        let old = marts
+            .iter()
+            .find(|m| m["mart"] == json!("mart_old"))
+            .expect("mart_old is listed");
+        assert_eq!(
+            old["certification"],
+            json!("deprecated"),
+            "expected the mart's mark on the list entry, got {old}"
+        );
+        assert_eq!(old["certificationNote"], json!("Superseded by mart_new"));
+        assert_eq!(old["replacementAssetId"], json!("serving.mart_new"));
+        assert_eq!(old["certifiedBy"], json!("Rina"));
+        // mart_new is not in this list, so it stays unnamed — never "".
+        assert!(
+            old.get("replacementName").is_none(),
+            "expected no replacementName for a replacement outside the list, got {old}"
+        );
+        let plain = marts
+            .iter()
+            .find(|m| m["mart"] == json!("mart_plain"))
+            .expect("mart_plain is listed");
+        assert!(
+            plain.get("certification").is_none(),
+            "an unmarked mart gains no key, got {plain}"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn describe_mart_of_one_mart_carries_the_mark_and_its_columns(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        mark_old_deprecated(&pool).await;
+        let server = MockServer::start().await;
+        mount_mart_responses(&server, json!([])).await;
+        let state = state_for(&pool, &server);
+        let mut args = Map::new();
+        args.insert("mart".to_owned(), json!("mart_old"));
+        let result = describe_mart(&state, &args).await;
+        assert_eq!(result["mart"], json!("mart_old"));
+        assert_eq!(result["dimensions"], json!(["customer_id"]));
+        assert_eq!(result["measures"], json!(["amount"]));
+        assert_eq!(
+            result["certification"],
+            json!("deprecated"),
+            "expected the mark beside the columns, got {result}"
+        );
+        assert_eq!(result["replacementAssetId"], json!("serving.mart_new"));
+        Ok(())
     }
 }
 

@@ -132,7 +132,7 @@ pub(in crate::routes) async fn run_tool(
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
-        "describe_mart" => data::describe_mart(ch, args).await,
+        "describe_mart" => data::describe_mart(state, args).await,
         "create_chart" | "update_chart" => {
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {

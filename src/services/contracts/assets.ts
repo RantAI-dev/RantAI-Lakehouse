@@ -79,6 +79,25 @@ export type Asset = {
   steward?: string | null
   tags?: string[]
   /**
+   * `DATA-12` part 2: governed tags, `key -> value`, each value one the key
+   * allows (`/api/governance/tag-keys`). Beside `tags`, not instead of them.
+   * Absent when the asset has none.
+   */
+  governedTags?: Record<string, string>
+  /**
+   * `DATA-12`: the mark a person with `governance:write` set. Absent when
+   * the asset has none. `certificationNote` and `replacementAssetId` come
+   * only with `"deprecated"`; `certifiedBy` is the display name of whoever
+   * set it and `certifiedAt` an RFC 3339 time.
+   */
+  certification?: "certified" | "deprecated" | string
+  certificationNote?: string
+  replacementAssetId?: string
+  /** The replacement's name; absent when it is no longer in the catalog. */
+  replacementName?: string
+  certifiedBy?: string
+  certifiedAt?: string
+  /**
    * Why a search returned this asset (`DATA-11`): present only on a result
    * of a search with a term, and absent when every word matched the name.
    * With several words it explains the first word, in typed order, that the
@@ -91,12 +110,30 @@ export type Asset = {
   matchedOn?: { field: string; value: string; approximate: boolean }
 }
 
+/**
+ * What `PUT /api/catalog/{id}/certification` takes (`DATA-12`): `status:
+ * null` clears the mark; a note and a replacement are allowed only with
+ * `"deprecated"`.
+ */
+export type AssetCertificationInput = {
+  status: "certified" | "deprecated" | null
+  note?: string
+  replacementAssetId?: string
+}
+
 /** What `PUT /api/catalog/{id}/annotation` stores; `null` clears a field. */
 export type AssetAnnotation = {
   owner: string | null
   steward: string | null
   tags: string[]
   description: string | null
+  /**
+   * `DATA-12` part 2. Left out of a save, it leaves the asset's governed tags
+   * alone; sent, it replaces the whole set (`{}` clears it). The API checks
+   * each value against its key and refuses with a sentence naming the key and
+   * the allowed values. The detail's `annotation` carries the stored set.
+   */
+  governedTags?: Record<string, string>
 }
 
 export type AssetColumn = {
@@ -112,6 +149,32 @@ export type AssetColumn = {
    * connector loads (Silver, Serving), which carry no such fact.
    */
   inactiveSince?: string | null
+}
+
+/**
+ * What the query history says about an asset over `days` days (`DATA-15`).
+ * Query text appears only without its literals (`frequentQueries`), because
+ * SQL can carry a customer id or a name.
+ */
+export type AssetUsage = {
+  days: number
+  queries: number
+  users: number
+  avgLatencyMs: number
+  /** How many history rows the figures were read from. */
+  basedOn: number
+  /** True when that read was full, so the oldest queries of the window are not in the figures. */
+  truncated: boolean
+  frequentUsers: { name: string; queries: number }[]
+  /** `sql` has every literal replaced by `?`; queries are grouped by that form. */
+  frequentQueries: { sql: string; runs: number; lastAt: string }[]
+  /** Queries left out of `frequentQueries` because they do not parse. */
+  unparsed: number
+  /** Other tables read in the same statement; `assetId` when the table is a catalog asset. */
+  joinedTables: { table: string; assetId: string | null; queries: number }[]
+  /** Counted only from statements that read this table alone. */
+  columns: { name: string; queries: number }[]
+  columnsNote: string
 }
 
 export type AssetDetail = Asset & {
@@ -167,12 +230,13 @@ export type AssetDetail = Asset & {
     rowFilter?: string | null
   }[]
   /**
-   * Queries that read this asset in the last seven days, by anyone:
+   * Queries that read this asset in the last `days` (30) days, by anyone:
    * how many, by how many people, and the average latency of the completed
-   * ones. `null` only when the query history could not be read — a table
-   * nobody queried is a measured zero.
+   * ones, and who runs them, what they run, what they join and which
+   * columns they use. `null` only when the query history could not be
+   * read — a table nobody queried is a measured zero.
    */
-  usage: { queries7d: number; users7d: number; avgLatencyMs: number } | null
+  usage: AssetUsage | null
   /**
    * The caller's own recent queries on this asset. Other people's query
    * text is never sent: SQL can carry literals.
@@ -393,6 +457,47 @@ export type DecideAccessRequestResult = {
   grant?: AccessGrant
 }
 
+/**
+ * One grant in force that was made from an asset's page
+ * (`GET /api/catalog/{id}/grants`, `DATA-15`): a direct one, or that of an
+ * approved access request for this asset. The permission is global — the
+ * grant says only where it was made.
+ */
+export type AssetGrant = {
+  id: string
+  user: string
+  userEmail: string
+  permission: string
+  grantedAt: string
+  expiresAt: string
+  via: "request" | "direct" | string
+  /** Who granted it; `null` when that person was deleted or is not recorded. */
+  grantedBy: string | null
+}
+
+/** `POST /api/catalog/{id}/grants`'s body (`DATA-15`). */
+export type GrantAccessInput = {
+  email: string
+  permission: string
+}
+
+/**
+ * `GET /api/catalog/{id}/restore` (`DATA-15`): whether a dropped Iceberg
+ * table can be brought back. `supported: false` where restore does not
+ * apply (a `ClickHouse` table) or is not configured on the install;
+ * otherwise `restorable`, with the drop and expiry dates when a dropped copy
+ * is kept, and the `reason` when there is nothing to restore.
+ */
+export type AssetRestoreStatus =
+  | { supported: false; reason: string }
+  | {
+      supported?: undefined
+      restorable: boolean
+      reason?: string
+      droppedAt?: string
+      expiresAt?: string
+    }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
   /**
@@ -431,6 +536,17 @@ export interface AssetService {
    * (needs `catalog:write`). Optional for the same dead-fixture reason.
    */
   updateAnnotation?(id: string, input: AssetAnnotation, signal?: AbortSignal): Promise<void>
+  /**
+   * `PUT /api/catalog/{id}/certification` — set, change or clear the
+   * certified / deprecated mark (needs `governance:write`, not the
+   * `catalog:write` of the details). Optional for the same dead-fixture
+   * reason; no mock implements it.
+   */
+  setCertification?(
+    id: string,
+    input: AssetCertificationInput,
+    signal?: AbortSignal
+  ): Promise<void>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
   /**
    * `POST /api/catalog/{id}/access-request` — ask for a permission not
@@ -470,4 +586,31 @@ export interface AssetService {
     comment: string | undefined,
     signal?: AbortSignal
   ): Promise<DecideAccessRequestResult>
+  /**
+   * `GET /api/catalog/{id}/grants` — the grants in force made from this
+   * asset. Needs `access:approve`. Optional for the same dead-fixture
+   * reason as `requestAccess`; no mock implements it.
+   */
+  listGrants?(id: string, signal?: AbortSignal): Promise<AssetGrant[]>
+  /**
+   * `POST /api/catalog/{id}/grants` — give a user a permission for 30 days.
+   * Refused (as a `ServiceError` carrying the server's sentence) for an
+   * unknown e-mail, for oneself, and for a permission the user already holds.
+   */
+  grantAccess?(id: string, input: GrantAccessInput, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/catalog/{id}/restore` — whether the asset's dropped table can
+   * be restored. Optional for the same dead-fixture reason as
+   * `requestAccess`; no mock implements it.
+   */
+  getRestoreStatus?(id: string, signal?: AbortSignal): Promise<AssetRestoreStatus>
+  /**
+   * `POST /api/catalog/{id}/restore` — undrop the table (needs
+   * `governance:write`). Refused with the server's sentence when a table of
+   * that name exists again (409), nothing is kept (404) or the window has
+   * passed (410).
+   */
+  restoreTable?(id: string, signal?: AbortSignal): Promise<void>
+  /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
+  revokeGrant?(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

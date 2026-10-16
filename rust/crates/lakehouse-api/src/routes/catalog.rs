@@ -28,7 +28,7 @@
 //! (`silver_catalog_row`), `"serving.<name>"` for Gold (`gold_catalog_row`)
 //! — never a re-derived table name.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1460,7 +1460,12 @@ fn set(value: Option<&String>) -> Option<&str> {
 /// registry row says: a set `owner` or `description` replaces the
 /// registry's (an ingest job's name is not an owner), and `steward` and
 /// `tags` are added. A blank annotation field changes nothing.
-fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
+///
+/// `replacement_name` is the `name` of the annotation's replacement asset
+/// as the caller found it in the assembled list; `None` when the
+/// replacement is no longer in the catalog (or could not be looked up), and
+/// then no `replacementName` is written.
+fn apply_annotation(row: &mut Value, annotation: &AnnotationRow, replacement_name: Option<&str>) {
     let Some(o) = row.as_object_mut() else {
         return;
     };
@@ -1476,6 +1481,132 @@ fn apply_annotation(row: &mut Value, annotation: &AnnotationRow) {
     if !annotation.tags.is_empty() {
         o.insert("tags".to_owned(), json!(annotation.tags));
     }
+    // DATA-12 F4: the mark rides the same overlay, so it reaches the live
+    // list, `/api/catalog/query`, the search copy and the detail body. Absent
+    // when there is no mark, as `tags` is.
+    insert_certification_fields(o, annotation, replacement_name);
+}
+
+/// Writes the part-1 mark fields (`certification`, `certificationNote`,
+/// `replacementAssetId`, `replacementName`, `certifiedBy`, `certifiedAt`) of
+/// `annotation` into `o`; nothing when the annotation has no mark. The one
+/// place their names and shapes are decided: the catalog rows, the chart
+/// builder's mart list and Query Studio's sources (`DATA-12` part 3) all
+/// call it.
+pub(crate) fn insert_certification_fields(
+    o: &mut serde_json::Map<String, Value>,
+    annotation: &AnnotationRow,
+    replacement_name: Option<&str>,
+) {
+    let Some(certification) = set(annotation.certification.as_ref()) else {
+        return;
+    };
+    o.insert("certification".to_owned(), json!(certification));
+    if let Some(note) = set(annotation.certification_note.as_ref()) {
+        o.insert("certificationNote".to_owned(), json!(note));
+    }
+    if let Some(replacement) = set(annotation.replacement_asset_id.as_ref()) {
+        o.insert("replacementAssetId".to_owned(), json!(replacement));
+        // DATA-12 review SHOULD-FIX 1: the notice names the replacement
+        // by its name; absent (never "") when it left the catalog.
+        if let Some(name) = replacement_name.map(str::trim).filter(|n| !n.is_empty()) {
+            o.insert("replacementName".to_owned(), json!(name));
+        }
+    }
+    if let Some(by) = set(annotation.certified_by.as_ref()) {
+        o.insert("certifiedBy".to_owned(), json!(by));
+    }
+    if let Some(at) = annotation.certified_at.and_then(|at| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    }) {
+        o.insert("certifiedAt".to_owned(), json!(at));
+    }
+}
+
+/// The marks of the assets in `ids`, by id, from one read of the annotations
+/// (`DATA-12` part 3: no query per mart or per source). An id with no mark is
+/// not in the map. `names` maps an asset id to its display name, so a
+/// replacement that is itself in the list is named; one that is not stays
+/// unnamed. A failed read is logged and answers no marks: a mark decorates a
+/// picker, it never gates it.
+pub(crate) async fn certification_marks(
+    state: &AppState,
+    ids: &[String],
+    names: &HashMap<String, String>,
+) -> HashMap<String, serde_json::Map<String, Value>> {
+    let Some(pool) = state.pg.as_deref() else {
+        return HashMap::new();
+    };
+    let annotations = match lakehouse_store::annotation::list_all(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "asset_annotation lookup failed; the marks are left off");
+            return HashMap::new();
+        }
+    };
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    annotations
+        .iter()
+        .filter(|row| wanted.contains(row.asset_id.as_str()))
+        .filter_map(|row| {
+            let mut fields = serde_json::Map::new();
+            let replacement_name = row
+                .replacement_asset_id
+                .as_deref()
+                .and_then(|r| names.get(r.trim()))
+                .map(String::as_str);
+            insert_certification_fields(&mut fields, row, replacement_name);
+            (!fields.is_empty()).then(|| (row.asset_id.clone(), fields))
+        })
+        .collect()
+}
+
+/// `DATA-12` task 10: the same certification fields on entries read from
+/// `ClickHouse` `serving` — the mart list the chart builder's picker and
+/// the assistant's `describe_mart` both show. A mart's catalog id is
+/// `serving.<name>`; `name_key` is the entry's own mart-name field (`name`
+/// in the picker's list, `mart` in `describe_mart`'s output). One batch
+/// read for the whole list; an unmarked entry gains no key.
+pub(crate) async fn apply_serving_certification(
+    state: &AppState,
+    entries: &mut [Value],
+    name_key: &str,
+) {
+    let id_of = |e: &Value| {
+        e.get(name_key)
+            .and_then(Value::as_str)
+            .map(|n| format!("serving.{n}"))
+    };
+    let ids: Vec<String> = entries.iter().filter_map(id_of).collect();
+    if ids.is_empty() {
+        return;
+    }
+    // The marts are the names a replacement can have in this list.
+    let names: HashMap<String, String> = ids
+        .iter()
+        .filter_map(|id| Some((id.clone(), id.strip_prefix("serving.")?.to_owned())))
+        .collect();
+    let by_id = certification_marks(state, &ids, &names).await;
+    if by_id.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        let Some(fields) = id_of(entry).and_then(|id| by_id.get(&id)) else {
+            continue;
+        };
+        if let Some(o) = entry.as_object_mut() {
+            o.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+}
+
+/// The `name` of the asset `id` in an assembled list, if it is there.
+fn asset_name_in<'a>(assets: &'a [Value], id: &str) -> Option<&'a str> {
+    assets
+        .iter()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|a| a.get("name").and_then(Value::as_str))
 }
 
 /// [`apply_annotation`] over every row of a list body. They decorate the
@@ -1486,6 +1617,47 @@ async fn apply_annotations(state: &AppState, body: &mut Value) {
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
+    apply_annotation_rows(pool, body).await;
+    apply_governed_tag_rows(pool, body).await;
+}
+
+/// The governed-tag half of [`apply_annotations`] (`DATA-12` part 2): one
+/// batch read for every row of the list, never a query per table. It does
+/// not depend on the annotation overlay finding a row, and a failed read is
+/// logged and leaves the rows without tags: they decorate the list, they
+/// never gate it.
+async fn apply_governed_tag_rows(pool: &lakehouse_store::PgPool, body: &mut Value) {
+    let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let ids: Vec<String> = assets
+        .iter()
+        .filter_map(|a| a.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let rows = match lakehouse_store::governed_tag::list_for_assets(pool, &ids).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(%err, "governed tag lookup failed; the catalog list shows no governed tags");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let mut by_asset: HashMap<&str, Vec<&lakehouse_store::governed_tag::AssetTagRow>> =
+        HashMap::new();
+    for row in &rows {
+        by_asset.entry(row.asset_id.as_str()).or_default().push(row);
+    }
+    for asset in assets {
+        let id = asset.get("id").and_then(Value::as_str).unwrap_or_default();
+        if let Some(tags) = by_asset.get(id) {
+            apply_governed_tags(asset, tags);
+        }
+    }
+}
+
+async fn apply_annotation_rows(pool: &lakehouse_store::PgPool, body: &mut Value) {
     let annotations = match lakehouse_store::annotation::list_all(pool).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -1501,10 +1673,26 @@ async fn apply_annotations(state: &AppState, body: &mut Value) {
         .map(|row| (row.asset_id.as_str(), row))
         .collect();
     if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+        // Names first, from the list as assembled (DATA-12 review
+        // SHOULD-FIX 1): the loop below needs `assets` mutably.
+        let names: HashMap<String, String> = assets
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    a.get("id")?.as_str()?.to_owned(),
+                    a.get("name")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect();
         for asset in assets {
             let id = asset.get("id").and_then(Value::as_str).unwrap_or_default();
             if let Some(annotation) = by_id.get(id).copied() {
-                apply_annotation(asset, annotation);
+                let replacement_name = annotation
+                    .replacement_asset_id
+                    .as_deref()
+                    .and_then(|r| names.get(r.trim()))
+                    .map(String::as_str);
+                apply_annotation(asset, annotation, replacement_name);
             }
         }
     }
@@ -1534,23 +1722,62 @@ async fn mark_annotation_and_history(
         None => None,
     };
     if let Some(annotation) = &annotation {
-        apply_annotation(body, annotation);
+        // DATA-12 review SHOULD-FIX 1: the replacement's name comes from the
+        // search copy, not a second catalog assembly. A failed read leaves
+        // the name absent; it never fails the page.
+        let replacement_name = match annotation.replacement_asset_id.as_deref().map(str::trim) {
+            Some(replacement) if !replacement.is_empty() => match search_snapshot(state).await {
+                Ok(snapshot) => asset_name_in(&snapshot.assets, replacement).map(str::to_owned),
+                Err(err) => {
+                    tracing::warn!(%err, "catalog read failed; the deprecation notice shows the replacement id");
+                    None
+                }
+            },
+            _ => None,
+        };
+        apply_annotation(body, annotation, replacement_name.as_deref());
     }
     let mut keys = vec![id.to_owned()];
     keys.extend(tables.iter().cloned());
     let history = catalog_governance::change_history(state, &keys).await;
+    // DATA-12 part 2: the detail carries `governedTags` on the body (the
+    // overlay) and in `annotation` (what the edit form holds). A failed read
+    // is logged and shows none, as the annotation read above does.
+    let governed_rows = match state.pg.as_deref() {
+        Some(pool) => lakehouse_store::governed_tag::list_for_asset(pool, id)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "governed tag lookup failed; the detail shows no governed tags");
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    apply_governed_tags(body, &governed_rows.iter().collect::<Vec<_>>());
+    let governed = governed_tags_object(&governed_rows);
     if let Some(o) = body.as_object_mut() {
         o.insert("registry".to_owned(), registry);
         o.insert(
             "annotation".to_owned(),
-            annotation.map_or(Value::Null, |a| {
-                json!({
-                    "owner": a.owner,
-                    "steward": a.steward,
-                    "tags": a.tags,
-                    "description": a.description,
-                })
-            }),
+            annotation.map_or_else(
+                // A table with governed tags and no details row still has an
+                // annotation for the form to hold.
+                || {
+                    if governed_rows.is_empty() {
+                        Value::Null
+                    } else {
+                        json!({ "governedTags": governed })
+                    }
+                },
+                |a| {
+                    json!({
+                        "owner": a.owner,
+                        "steward": a.steward,
+                        "tags": a.tags,
+                        "description": a.description,
+                        "governedTags": governed,
+                    })
+                },
+            ),
         );
         o.insert("changeHistory".to_owned(), Value::Array(history));
     }
@@ -1677,20 +1904,23 @@ async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(Strin
 /// `policySummary` (policies bound to `tables`, qualified as policies name
 /// them), `qualityChecks` (checks naming the asset by any of `names`),
 /// `dependents` (saved queries and dashboards reading `tables`), and
-/// `usage`/`recentQueries` (the last week's queries on them).
+/// `usage`/`recentQueries` (the last 30 days' queries on them; `columns`
+/// are the table's columns, for the column-popularity list, `DATA-15` F2).
 async fn mark_governance(
     state: &AppState,
     principal: &Principal,
     body: &mut Value,
     tables: &[String],
     names: &[String],
+    columns: &[String],
 ) {
     let policies = catalog_governance::policy_summary(state, principal, tables).await;
     let checks = catalog_governance::QualityIndex::load(state, Some(names))
         .await
         .checks_for(names);
     let dependents = catalog_governance::dependents(state, principal, tables).await;
-    let (usage, recent_queries) = catalog_governance::usage(state, principal, tables).await;
+    let (usage, recent_queries) =
+        catalog_governance::usage(state, principal, tables, columns).await;
     if let Some(o) = body.as_object_mut() {
         o.insert("policySummary".to_owned(), Value::Array(policies));
         o.insert("qualityChecks".to_owned(), Value::Array(checks));
@@ -1698,6 +1928,17 @@ async fn mark_governance(
         o.insert("usage".to_owned(), usage);
         o.insert("recentQueries".to_owned(), Value::Array(recent_queries));
     }
+}
+
+/// The names of the columns `source` reads, without the loader's
+/// underscore-prefixed bookkeeping ones (hidden from the page as well).
+fn source_column_names(source: Option<&ReadSource>) -> Vec<String> {
+    source
+        .into_iter()
+        .flat_map(|s| s.columns.iter())
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.starts_with('_'))
+        .collect()
 }
 
 /// Tells the console what to put after `FROM` to query this asset in
@@ -1721,8 +1962,14 @@ fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
 /// How many sample rows the detail body itself carries.
 const DETAIL_SAMPLE_ROWS: u32 = 5;
 /// The most `GET /api/catalog/{id}/sample` returns: a look at the data,
-/// not an export — Query Studio is one click away for more.
-const SAMPLE_MAX_ROWS: u32 = 100;
+/// not an export — Query Studio is one click away for more. `DATA-15` F1:
+/// 1,000 rows (`data-15.md` "Data preview"), up from 100; the console
+/// pages them 100 at a time.
+const SAMPLE_MAX_ROWS: u32 = 1000;
+/// Seconds a sample read may run before `ClickHouse` stops it. `DATA-15` F1:
+/// a 1,000-row read of a wide Iceberg table is the first sample that can
+/// be slow, and it had no time limit at all.
+const SAMPLE_MAX_SECONDS: u32 = 30;
 
 /// Query parameters accepted by `GET /api/catalog/{id}/sample`.
 #[derive(Debug, Deserialize)]
@@ -1800,7 +2047,13 @@ async fn governed_sample(
     if !principal.has(SAMPLE_PERMISSION) {
         return (Vec::new(), masked);
     }
-    let raw_sql = format!("SELECT * FROM {} LIMIT {limit}", source.from);
+    // `DATA-15` F1: the trailing `SETTINGS` survives the rewrite (it is
+    // kept as the pinned-version clause is), so the limit binds the read
+    // ClickHouse actually runs.
+    let raw_sql = format!(
+        "SELECT * FROM {} LIMIT {limit} SETTINGS max_execution_time = {SAMPLE_MAX_SECONDS}",
+        source.from
+    );
     let sql = match crate::routes::query::rewrite_sql_for_principal(
         state,
         &raw_sql,
@@ -1968,6 +2221,7 @@ async fn clickhouse_asset_detail(
         &mut body,
         std::slice::from_ref(&key),
         &[key.clone(), table.clone()],
+        &source_column_names(Some(&source)),
     )
     .await;
     mark_badges(
@@ -2185,7 +2439,15 @@ async fn bronze_asset_detail_body(
     if !table.is_empty() {
         names.push(table.to_owned());
     }
-    mark_governance(state, principal, &mut body, &tables, &names).await;
+    mark_governance(
+        state,
+        principal,
+        &mut body,
+        &tables,
+        &names,
+        &source_column_names(source.as_ref()),
+    )
+    .await;
     mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug, &tables).await;
     Ok(Some(body))
@@ -2486,6 +2748,14 @@ struct AnnotationBody {
     tags: Vec<String>,
     #[serde(default)]
     description: Option<String>,
+    /// `DATA-12` part 2: `{"data_domain": "finance"}`. `None` (absent) leaves
+    /// the table's governed tags alone; `Some` replaces the whole set, as
+    /// `tags` does, and `Some({})` clears it. The one place this differs from
+    /// `tags`: an absent `tags` is an empty list, because the form always
+    /// sends it, whereas a caller that never heard of governed tags must not
+    /// wipe them by saving a description.
+    #[serde(default, rename = "governedTags")]
+    governed_tags: Option<BTreeMap<String, String>>,
 }
 
 const ANNOTATION_ID_MAX_LEN: usize = 200;
@@ -2495,7 +2765,7 @@ const ANNOTATION_DESCRIPTION_MAX_LEN: usize = 4000;
 const ANNOTATION_TAGS_MAX_COUNT: usize = 20;
 const ANNOTATION_TAG_MAX_LEN: usize = 64;
 
-fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
+pub(crate) fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "annotation store unavailable: no Postgres pool is configured".to_owned(),
@@ -2525,7 +2795,7 @@ fn tag_is_valid(tag: &str) -> bool {
 /// # Errors
 /// [`ApiError::BadRequest`] if `id` exceeds [`ANNOTATION_ID_MAX_LEN`]
 /// characters.
-fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
     if id.chars().count() > ANNOTATION_ID_MAX_LEN {
         return Err(ApiError::BadRequest(format!(
             "id must be at most {ANNOTATION_ID_MAX_LEN} characters"
@@ -2571,6 +2841,26 @@ fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
             return Err(ApiError::BadRequest(format!(
                 "tags: \"{tag}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
             )));
+        }
+    }
+    // The shape and the cap are checked here so the refusal names the field
+    // without a database round trip; whether a value is one its key allows is
+    // the store's, inside the write (it needs the key's row lock).
+    if let Some(governed) = &body.governed_tags {
+        let max = lakehouse_store::governed_tag::MAX_TAGS_PER_ASSET;
+        if governed.len() > max {
+            return Err(ApiError::BadRequest(format!(
+                "governedTags must have at most {max} entries"
+            )));
+        }
+        for (key, value) in governed {
+            for (what, word) in [("key", key), ("value", value)] {
+                if !lakehouse_store::governed_tag::is_valid_word(word) {
+                    return Err(ApiError::BadRequest(format!(
+                        "governedTags: {what} \"{word}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -2641,6 +2931,8 @@ pub async fn get_annotation(
     ensure_asset_exists(&state, &id).await?;
     let pool = annotation_pool(&state)?;
     let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
+    let governed =
+        governed_tags_object(&lakehouse_store::governed_tag::list_for_asset(pool, &id).await?);
     Ok(ApiJson(row.map_or_else(
         || {
             json!({
@@ -2648,6 +2940,7 @@ pub async fn get_annotation(
                 "steward": Value::Null,
                 "tags": Value::Array(vec![]),
                 "description": Value::Null,
+                "governedTags": governed,
             })
         },
         |r| {
@@ -2656,6 +2949,7 @@ pub async fn get_annotation(
                 "steward": r.steward,
                 "tags": r.tags,
                 "description": r.description,
+                "governedTags": governed,
             })
         },
     )))
@@ -2709,18 +3003,40 @@ pub async fn put_annotation(
     validate_annotation_body(&parsed)?;
     let pool = annotation_pool(&state)?;
     let before = lakehouse_store::annotation::get_annotation(pool, &id).await?;
-    let changed = changed_annotation_fields(before.as_ref(), &parsed);
-    lakehouse_store::annotation::upsert_annotation(
-        pool,
-        &lakehouse_store::annotation::AnnotationInput {
-            asset_id: id.clone(),
-            owner: parsed.owner,
-            steward: parsed.steward,
-            tags: parsed.tags,
-            description: parsed.description,
-        },
-    )
-    .await?;
+    let mut changed = changed_annotation_fields(before.as_ref(), &parsed);
+    let input = lakehouse_store::annotation::AnnotationInput {
+        asset_id: id.clone(),
+        owner: parsed.owner,
+        steward: parsed.steward,
+        tags: parsed.tags,
+        description: parsed.description,
+    };
+    if let Some(governed) = &parsed.governed_tags {
+        let stored = lakehouse_store::governed_tag::list_for_asset(pool, &id).await?;
+        if governed_tags_differ(&stored, governed) {
+            changed.push("governedTags");
+        }
+        // Details and governed tags in one transaction: a refused value
+        // (not allowed for its key, or a key nobody defined) saves neither.
+        // The store's sentence names the key and the allowed values.
+        let pairs: Vec<(String, String)> = governed
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let set_by: String = principal
+            .display_name
+            .chars()
+            .take(CERTIFIED_BY_MAX_LEN)
+            .collect();
+        lakehouse_store::annotation::upsert_annotation_with_governed_tags(
+            pool, &input, &pairs, &set_by,
+        )
+        .await?;
+    } else {
+        // No `governedTags` in the body: the plain upsert, which names no
+        // governed column or table, so the set is untouched.
+        lakehouse_store::annotation::upsert_annotation(pool, &input).await?;
+    }
     // DATA-11 D2: a search must show the edit at once, not after the copy's
     // age. Dropped only after the write succeeded.
     state.catalog_search_cache.invalidate().await;
@@ -2747,6 +3063,49 @@ pub async fn put_annotation(
     Ok(ApiJson(json!({ "ok": true })))
 }
 
+/// `true` if `after` is not the set `stored` already holds. Compared as
+/// pairs, so a re-save of the same values is not a change and records no
+/// audit entry.
+fn governed_tags_differ(
+    stored: &[lakehouse_store::governed_tag::AssetTagRow],
+    after: &BTreeMap<String, String>,
+) -> bool {
+    stored.len() != after.len()
+        || stored
+            .iter()
+            .any(|row| after.get(&row.tag_key) != Some(&row.value))
+}
+
+/// A table's governed tags as the JSON object the rows, the detail and the
+/// annotation routes carry: `{ "data_domain": "finance" }`, built from rows
+/// the store returns ordered by key, `{}` when there are none.
+fn governed_tags_object(rows: &[lakehouse_store::governed_tag::AssetTagRow]) -> Value {
+    Value::Object(
+        rows.iter()
+            .map(|r| (r.tag_key.clone(), json!(r.value)))
+            .collect(),
+    )
+}
+
+/// Puts a table's governed tags on its row or detail body as `governedTags`;
+/// absent, not `{}`, when it has none, as `tags` is.
+fn apply_governed_tags(row: &mut Value, tags: &[&lakehouse_store::governed_tag::AssetTagRow]) {
+    if tags.is_empty() {
+        return;
+    }
+    let Some(o) = row.as_object_mut() else {
+        return;
+    };
+    o.insert(
+        "governedTags".to_owned(),
+        Value::Object(
+            tags.iter()
+                .map(|r| (r.tag_key.clone(), json!(r.value)))
+                .collect(),
+        ),
+    );
+}
+
 /// Which annotation fields a `PUT` body changes from the stored row —
 /// names only: the audit trail says what was edited, not what it said.
 fn changed_annotation_fields(
@@ -2768,6 +3127,210 @@ fn changed_annotation_fields(
         changed.push("tags");
     }
     changed
+}
+
+// ── PUT /api/catalog/{id}/certification (DATA-12 part 1) ───────────────
+
+/// Body of `PUT /api/catalog/{id}/certification`. `status` has no default
+/// on purpose: a body without it must not read as "clear the mark", so the
+/// field is required and `null` is the explicit way to clear.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificationBody {
+    status: Value,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    replacement_asset_id: Option<String>,
+}
+
+const CERTIFICATION_NOTE_MAX_LEN: usize = 1000;
+const CERTIFIED_BY_MAX_LEN: usize = 128;
+
+/// A trimmed text field, with blank read as absent.
+fn trimmed_or_none(value: Option<&String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// The body of [`put_certification`] after the checks that need no store:
+/// `status` is `None` to clear the mark.
+#[derive(Debug, PartialEq, Eq)]
+struct CertificationChange {
+    status: Option<&'static str>,
+    note: Option<String>,
+    replacement_asset_id: Option<String>,
+}
+
+/// Validates the shape of a certification body against the asset it is
+/// for. The checks that need the catalog or the store (does the replacement
+/// exist, is it deprecated) run after this, in the handler.
+///
+/// # Errors
+/// [`ApiError::BadRequest`] with a fixed sentence for an unknown status, a
+/// note or replacement without `deprecated`, a note over 1000 characters,
+/// a replacement over 200 characters, or a replacement equal to `id`.
+fn validate_certification(
+    id: &str,
+    body: &CertificationBody,
+) -> Result<CertificationChange, ApiError> {
+    let status = match &body.status {
+        Value::Null => None,
+        Value::String(s) if s == "certified" => Some("certified"),
+        Value::String(s) if s == "deprecated" => Some("deprecated"),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "status must be \"certified\", \"deprecated\" or null".to_owned(),
+            ));
+        }
+    };
+    let note = trimmed_or_none(body.note.as_ref());
+    let replacement = trimmed_or_none(body.replacement_asset_id.as_ref());
+    if status != Some("deprecated") && (note.is_some() || replacement.is_some()) {
+        return Err(ApiError::BadRequest(
+            "a note or a replacement is allowed only with the deprecated mark".to_owned(),
+        ));
+    }
+    if note
+        .as_ref()
+        .is_some_and(|n| n.chars().count() > CERTIFICATION_NOTE_MAX_LEN)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "note must be at most {CERTIFICATION_NOTE_MAX_LEN} characters"
+        )));
+    }
+    if replacement
+        .as_ref()
+        .is_some_and(|r| r.chars().count() > ANNOTATION_ID_MAX_LEN)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "replacementAssetId must be at most {ANNOTATION_ID_MAX_LEN} characters"
+        )));
+    }
+    if replacement.as_deref() == Some(id) {
+        return Err(ApiError::BadRequest(
+            "a table cannot be its own replacement".to_owned(),
+        ));
+    }
+    Ok(CertificationChange {
+        status,
+        note,
+        replacement_asset_id: replacement,
+    })
+}
+
+/// `PUT /api/catalog/{id}/certification` — mark an asset certified or
+/// deprecated, or clear the mark with `"status": null` (`DATA-12` D1).
+/// Needs `governance:write` (`POLICY_TABLE`), not the `catalog:write` that
+/// edits the details: who may vouch for a table is a governance decision.
+///
+/// # Errors
+/// The tenant gate runs first and answers [`ApiError::PermissionDenied`]
+/// (`403`) with a fixed reason, exactly as [`put_annotation`] does, before
+/// the body is read and with nothing written. Then `400` with a fixed
+/// sentence for each refusal of [`validate_certification`], for a
+/// replacement that is not an asset in the catalog, and for a replacement
+/// that is itself deprecated. [`ApiError::Unavailable`] without a Postgres
+/// pool, or when the catalog cannot be read to check a replacement (fail
+/// closed: an unchecked replacement is not stored). A classified
+/// [`lakehouse_store::StoreError`] on any database failure.
+pub async fn put_certification(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    if let Some(reason) = catalog_tenant_refusal(&state, &principal, &headers).await? {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
+    validate_annotation_id(&id)?;
+    let parsed: CertificationBody = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::BadRequest("body must be JSON with a \"status\" field".to_owned())
+    })?;
+    let change = validate_certification(&id, &parsed)?;
+    let pool = annotation_pool(&state)?;
+    if let Some(replacement) = change.replacement_asset_id.as_deref() {
+        // The search copy is the catalog's asset list without a rebuild per
+        // write; a failed read refuses rather than storing an unchecked id.
+        let snapshot = search_snapshot(&state).await.map_err(|err| {
+            tracing::warn!(%err, "catalog read failed while checking a replacement");
+            ApiError::Unavailable(
+                "the catalog could not be read to check the replacement".to_owned(),
+            )
+        })?;
+        let exists = snapshot
+            .assets
+            .iter()
+            .any(|a| a.get("id").and_then(Value::as_str) == Some(replacement));
+        if !exists {
+            return Err(ApiError::BadRequest(
+                "the replacement is not an asset in the catalog".to_owned(),
+            )
+            .into());
+        }
+        let replacement_row =
+            lakehouse_store::annotation::get_annotation(pool, replacement).await?;
+        if replacement_row.is_some_and(|r| r.certification.as_deref() == Some("deprecated")) {
+            return Err(
+                ApiError::BadRequest("the replacement is itself deprecated".to_owned()).into(),
+            );
+        }
+    }
+    let before = lakehouse_store::annotation::get_annotation(pool, &id)
+        .await?
+        .and_then(|r| r.certification);
+    let (action, args) = if let Some(status) = change.status {
+        lakehouse_store::annotation::set_certification(
+            pool,
+            &lakehouse_store::annotation::CertificationInput {
+                asset_id: id.clone(),
+                status: status.to_owned(),
+                note: change.note.clone(),
+                replacement_asset_id: change.replacement_asset_id.clone(),
+                certified_by: principal
+                    .display_name
+                    .chars()
+                    .take(CERTIFIED_BY_MAX_LEN)
+                    .collect(),
+            },
+        )
+        .await?;
+        if status == "deprecated" {
+            (
+                Some("catalog.deprecate"),
+                json!({ "note": change.note, "replacementAssetId": change.replacement_asset_id }),
+            )
+        } else {
+            (Some("catalog.certify"), json!({}))
+        }
+    } else {
+        lakehouse_store::annotation::clear_certification(pool, &id).await?;
+        // Clearing an asset that had no mark changed nothing and records
+        // nothing, as a details save that changes nothing does.
+        (
+            before.as_ref().map(|_| "catalog.uncertify"),
+            json!({ "was": before }),
+        )
+    };
+    state.catalog_search_cache.invalidate().await;
+    if let Some(action) = action {
+        let _ = lakehouse_store::audit::insert(
+            pool,
+            lakehouse_store::audit::NewAuditEvent {
+                principal_id: Some(principal.id.uuid().to_string()),
+                principal_kind: Some("user".to_owned()),
+                actor_label: Some(principal.display_name.clone()),
+                action: action.to_owned(),
+                resource_kind: Some("catalog".to_owned()),
+                resource_id: Some(id),
+                args: Some(args),
+                outcome: "executed".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    Ok(ApiJson(json!({ "ok": true })))
 }
 
 // ── POST /api/catalog/{id}/access-request (WS7 item E2) ────────────────
@@ -2876,7 +3439,7 @@ pub async fn access_request(
 /// a value, so this uses the same 30-day window its own store-layer test
 /// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
 /// exercises.
-const GRANT_DAYS: i64 = 30;
+pub(crate) const GRANT_DAYS: i64 = 30;
 
 /// See [`DecideAccessRequestBody`]'s doc comment — reuses
 /// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
@@ -3283,6 +3846,11 @@ mod tests {
             steward: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             description: description.map(str::to_owned),
+            certification: None,
+            certification_note: None,
+            replacement_asset_id: None,
+            certified_by: None,
+            certified_at: None,
         }
     }
 
@@ -3295,11 +3863,138 @@ mod tests {
         apply_annotation(
             &mut row,
             &annotation(Some("Data Platform"), Some("  "), &["pii"]),
+            None,
         );
         assert_eq!(row["owner"], json!("Data Platform"));
         assert_eq!(row["description"], registry_description);
         assert_eq!(row["tags"], json!(["pii"]));
         assert!(row.get("steward").is_none());
+    }
+
+    /// `DATA-12` F4: a marked row carries the five fields, an unmarked row
+    /// none of them.
+    #[test]
+    fn a_mark_is_overlaid_on_the_row_and_an_unmarked_row_has_none() {
+        let mut unmarked = silver_catalog_row("orders", "MergeTree", 0, None);
+        apply_annotation(
+            &mut unmarked,
+            &annotation(Some("Data Platform"), None, &[]),
+            None,
+        );
+        for key in [
+            "certification",
+            "certificationNote",
+            "replacementAssetId",
+            "certifiedBy",
+            "certifiedAt",
+        ] {
+            assert!(unmarked.get(key).is_none(), "{key}");
+        }
+
+        let mut marked = silver_catalog_row("orders", "MergeTree", 0, None);
+        let mut row = annotation(None, None, &[]);
+        row.certification = Some("deprecated".to_owned());
+        row.certification_note = Some("Superseded".to_owned());
+        row.replacement_asset_id = Some("silver.orders_v2".to_owned());
+        row.certified_by = Some("Rina".to_owned());
+        row.certified_at = time::OffsetDateTime::from_unix_timestamp(1_790_000_000).ok();
+        apply_annotation(&mut marked, &row, Some("Orders v2"));
+        assert_eq!(marked["replacementName"], json!("Orders v2"));
+        assert_eq!(marked["certification"], json!("deprecated"));
+        assert_eq!(marked["certificationNote"], json!("Superseded"));
+        assert_eq!(marked["replacementAssetId"], json!("silver.orders_v2"));
+        assert_eq!(marked["certifiedBy"], json!("Rina"));
+        assert_eq!(marked["certifiedAt"], json!("2026-09-21T14:13:20Z"));
+    }
+
+    /// DATA-12 review SHOULD-FIX 1: a replacement that left the catalog has
+    /// no name, and the key is absent rather than an empty string.
+    #[test]
+    fn a_replacement_that_left_the_catalog_has_no_name_and_a_list_finds_one_that_is_there() {
+        let mut row = silver_catalog_row("orders", "MergeTree", 0, None);
+        let mut marked = annotation(None, None, &[]);
+        marked.certification = Some("deprecated".to_owned());
+        marked.replacement_asset_id = Some("silver.orders_v2".to_owned());
+        apply_annotation(&mut row, &marked, None);
+        assert_eq!(row["replacementAssetId"], json!("silver.orders_v2"));
+        assert!(row.get("replacementName").is_none());
+
+        let assets = vec![json!({"id": "silver.orders_v2", "name": "Orders v2"})];
+        assert_eq!(
+            asset_name_in(&assets, "silver.orders_v2"),
+            Some("Orders v2")
+        );
+        assert_eq!(asset_name_in(&assets, "silver.gone"), None);
+    }
+
+    fn tag_row(asset: &str, key: &str, value: &str) -> lakehouse_store::governed_tag::AssetTagRow {
+        lakehouse_store::governed_tag::AssetTagRow {
+            asset_id: asset.to_owned(),
+            tag_key: key.to_owned(),
+            value: value.to_owned(),
+            set_by: "Rina".to_owned(),
+            set_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// `DATA-12` part 2: governed tags sit beside `tags` as an object, and a
+    /// row with none has no `governedTags` at all.
+    #[test]
+    fn governed_tags_are_overlaid_as_an_object_and_an_untagged_row_has_none() {
+        let mut untagged = silver_catalog_row("orders", "MergeTree", 0, None);
+        apply_governed_tags(&mut untagged, &[]);
+        assert!(untagged.get("governedTags").is_none());
+
+        let mut tagged = silver_catalog_row("orders", "MergeTree", 0, None);
+        let a = tag_row("silver.orders", "data_domain", "finance");
+        let b = tag_row("silver.orders", "tier", "gold");
+        apply_governed_tags(&mut tagged, &[&a, &b]);
+        assert_eq!(
+            tagged["governedTags"],
+            json!({ "data_domain": "finance", "tier": "gold" })
+        );
+        assert_eq!(governed_tags_object(&[]), json!({}));
+    }
+
+    #[test]
+    fn governed_tags_differ_only_when_a_pair_or_the_count_changes() {
+        let stored = [tag_row("a", "data_domain", "finance")];
+        let same = BTreeMap::from([("data_domain".to_owned(), "finance".to_owned())]);
+        let other_value = BTreeMap::from([("data_domain".to_owned(), "ops".to_owned())]);
+        let extra = BTreeMap::from([
+            ("data_domain".to_owned(), "finance".to_owned()),
+            ("tier".to_owned(), "gold".to_owned()),
+        ]);
+        assert!(!governed_tags_differ(&stored, &same));
+        assert!(governed_tags_differ(&stored, &other_value));
+        assert!(governed_tags_differ(&stored, &extra));
+        assert!(governed_tags_differ(&stored, &BTreeMap::new()));
+        assert!(!governed_tags_differ(&[], &BTreeMap::new()));
+    }
+
+    #[test]
+    fn validate_annotation_body_bounds_governed_tags() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut body = valid_body();
+            body.governed_tags = Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            );
+            body
+        };
+        assert!(validate_annotation_body(&with(&[("data_domain", "finance")])).is_ok());
+        assert!(validate_annotation_body(&with(&[])).is_ok());
+        let err = validate_annotation_body(&with(&[("Data Domain", "finance")])).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: key")));
+        let err = validate_annotation_body(&with(&[("data_domain", "")])).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("governedTags: value")));
+        let many: Vec<(String, String)> =
+            (0..21).map(|i| (format!("k{i}"), "v".to_owned())).collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let err = validate_annotation_body(&with(&pairs)).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(m) if m.contains("at most 20")));
     }
 
     /// The audit trail names the fields an edit changed, and a save that
@@ -3312,6 +4007,7 @@ mod tests {
             steward: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             description: Some(description.to_owned()),
+            governed_tags: None,
         };
         assert!(
             changed_annotation_fields(Some(&before), &body("Data Platform", " Orders ", &["pii"]))
@@ -3718,6 +4414,7 @@ mod tests {
             steward: Some("bayu".to_owned()),
             tags: vec!["pii".to_owned()],
             description: Some("Order events".to_owned()),
+            governed_tags: None,
         }
     }
 
@@ -3746,6 +4443,7 @@ mod tests {
             steward: None,
             tags: vec![],
             description: None,
+            governed_tags: None,
         };
         assert!(validate_annotation_body(&body).is_ok());
     }
@@ -4220,6 +4918,249 @@ mod tests {
             assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 1);
         }
 
+        // ── DATA-12 part 1: PUT /api/catalog/{id}/certification ──────
+
+        async fn put_mark(
+            state: &AppState,
+            principal: Principal,
+            id: &str,
+            body: &str,
+        ) -> Result<(), (StatusCode, String)> {
+            let result = put_certification(
+                State(state.clone()),
+                Path(id.to_owned()),
+                Extension(principal),
+                HeaderMap::new(),
+                Bytes::copy_from_slice(body.as_bytes()),
+            )
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(rejection) => {
+                    let (status, body) = response_json(rejection.into_response()).await;
+                    Err((
+                        status,
+                        body["error"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                }
+            }
+        }
+
+        fn governor(tenant: &str) -> Principal {
+            principal(&[tenant.parse().unwrap()], "governance:write")
+        }
+
+        /// Puts a search copy in the cache that lists `ids` as assets, so a
+        /// replacement can be checked without a catalog behind the mock.
+        async fn prime_search_copy_with(state: &AppState, ids: &[&str]) {
+            let mut copy = empty_copy();
+            copy.assets = ids.iter().map(|id| json!({ "id": id })).collect();
+            state
+                .catalog_search_cache
+                .get_or_build(Instant::now(), SEARCH_SNAPSHOT_TTL, || async {
+                    Ok::<_, String>(copy)
+                })
+                .await
+                .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn each_certification_refusal_has_its_sentence_and_writes_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // A deprecated asset, to be refused as a replacement.
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.old",
+                r#"{"status":"deprecated"}"#,
+            )
+            .await
+            .unwrap();
+            // CI's first run (DATA-12): a successful write drops the search
+            // copy, and with no ClickHouse behind the mock the rebuild fails
+            // (503). Seed it after that write; refusals below keep it.
+            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y", "serving.old"])
+                .await;
+            let long_note = format!(r#"{{"status":"deprecated","note":"{}"}}"#, "a".repeat(1001));
+            let cases: [(&str, &str); 7] = [
+                (r#"{"status":"trusted"}"#, "status must be"),
+                (
+                    r#"{"status":"certified","note":"x"}"#,
+                    "only with the deprecated mark",
+                ),
+                (
+                    r#"{"status":null,"replacementAssetId":"serving.mart_y"}"#,
+                    "only with the deprecated mark",
+                ),
+                (long_note.as_str(), "note must be at most 1000 characters"),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.mart_x"}"#,
+                    "its own replacement",
+                ),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.nope"}"#,
+                    "not an asset in the catalog",
+                ),
+                (
+                    r#"{"status":"deprecated","replacementAssetId":"serving.old"}"#,
+                    "itself deprecated",
+                ),
+            ];
+            for (body, sentence) in cases {
+                let err = put_mark(&state, governor(TENANT_A), "serving.mart_x", body)
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.0, StatusCode::BAD_REQUEST, "{body}");
+                assert!(err.1.contains(sentence), "{body}: {}", err.1);
+            }
+            assert_eq!(
+                annotation_rows(&pool, "serving.mart_x").await,
+                0,
+                "a refused write must leave no row"
+            );
+            // A body without `status` is not a clear.
+            let err = put_mark(&state, governor(TENANT_A), "serving.mart_x", r"{}")
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_replacement_is_refused_with_503_when_the_catalog_cannot_be_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            // No search copy seeded and no ClickHouse behind the mock: the
+            // replacement cannot be checked, so nothing is stored.
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let err = put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"deprecated","replacementAssetId":"serving.mart_y"}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                err.1
+                    .contains("the catalog could not be read to check the replacement"),
+                "{}",
+                err.1
+            );
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_member_certifies_with_their_display_name_and_clears_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification.as_deref(), Some("certified"));
+            assert_eq!(row.certified_by.as_deref(), Some("Test Principal"));
+            assert!(row.certified_at.is_some());
+
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":null}"#,
+            )
+            .await
+            .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification, None);
+            assert_eq!(row.certified_by, None);
+            assert_eq!(row.certified_at, None);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecation_stores_its_note_and_replacement(pool: lakehouse_store::PgPool) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y"]).await;
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"deprecated","note":" Superseded ","replacementAssetId":"serving.mart_y"}"#,
+            )
+            .await
+            .unwrap();
+            let row = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.certification.as_deref(), Some("deprecated"));
+            assert_eq!(row.certification_note.as_deref(), Some("Superseded"));
+            assert_eq!(row.replacement_asset_id.as_deref(), Some("serving.mart_y"));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_certification_tenant_refusal_is_403_and_writes_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let err = put_mark(
+                &state,
+                governor(TENANT_B),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert!(err.1.contains("CATALOG_TENANT_ID"), "{}", err.1);
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_certification_write_drops_the_search_copy_and_a_refusal_keeps_it(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            prime_search_copy(&state).await;
+            put_mark(
+                &state,
+                governor(TENANT_B),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                !next_read_rebuilds(&state).await,
+                "a refused write must not drop the copy"
+            );
+            put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.mart_x",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap();
+            assert!(
+                next_read_rebuilds(&state).await,
+                "a mark must drop the copy so a search shows it at once"
+            );
+        }
+
         /// SEC-16 regression: the read passed no tenant gate, so a caller
         /// outside the catalog's tenant read an annotation. It fails before
         /// the fix (200), and the refusal is the write's fixed 403.
@@ -4452,6 +5393,311 @@ mod tests {
                 "a write that stored nothing must not drop the copy"
             );
         }
+
+        // ── DATA-12 part 3: marks for pickers ───────────────────────────
+
+        async fn mark(
+            pool: &lakehouse_store::PgPool,
+            id: &str,
+            status: &str,
+            note: Option<&str>,
+            replacement: Option<&str>,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: status.to_owned(),
+                    note: note.map(str::to_owned),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn certification_marks_returns_only_the_requested_marked_assets_with_the_replacement_named(
+            pool: lakehouse_store::PgPool,
+        ) {
+            mark(
+                &pool,
+                "serving.old",
+                "deprecated",
+                Some("Superseded"),
+                Some("serving.new"),
+            )
+            .await;
+            mark(&pool, "serving.trusted", "certified", None, None).await;
+            mark(&pool, "serving.elsewhere", "certified", None, None).await;
+            // Details only: an annotation without a mark is not a mark.
+            lakehouse_store::annotation::upsert_annotation(
+                &pool,
+                &lakehouse_store::annotation::AnnotationInput {
+                    asset_id: "serving.plain".to_owned(),
+                    owner: Some("x".to_owned()),
+                    steward: None,
+                    tags: vec![],
+                    description: None,
+                },
+            )
+            .await
+            .unwrap();
+            let state = state_for(&pool, "http://127.0.0.1:0", None);
+            let ids: Vec<String> = [
+                "serving.old",
+                "serving.trusted",
+                "serving.plain",
+                "serving.unannotated",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            let names = HashMap::from([("serving.new".to_owned(), "new".to_owned())]);
+
+            let marks = certification_marks(&state, &ids, &names).await;
+
+            assert_eq!(marks.len(), 2, "{marks:?}");
+            let old = &marks["serving.old"];
+            assert_eq!(old["certification"], json!("deprecated"));
+            assert_eq!(old["certificationNote"], json!("Superseded"));
+            assert_eq!(old["replacementAssetId"], json!("serving.new"));
+            assert_eq!(old["replacementName"], json!("new"));
+            assert_eq!(
+                marks["serving.trusted"]["certification"],
+                json!("certified")
+            );
+            assert!(
+                !marks.contains_key("serving.elsewhere"),
+                "only requested ids"
+            );
+        }
+
+        // ── DATA-12 part 2: governed tags on the annotation route ──────
+
+        async fn define_key(pool: &lakehouse_store::PgPool) {
+            lakehouse_store::governed_tag::create_key(
+                pool,
+                "data_domain",
+                &["finance".to_owned(), "ops".to_owned()],
+                "Rina",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn put_body(
+            state: &AppState,
+            id: &str,
+            body: &'static str,
+        ) -> Result<(), (StatusCode, String)> {
+            let member = principal(&[TENANT_A.parse().unwrap()], "catalog:write");
+            let result = put_annotation(
+                State(state.clone()),
+                Path(id.to_owned()),
+                Extension(member),
+                HeaderMap::new(),
+                Bytes::from_static(body.as_bytes()),
+            )
+            .await;
+            match result {
+                Ok(_) => Ok(()),
+                Err(rejection) => {
+                    let (status, body) = response_json(rejection.into_response()).await;
+                    Err((
+                        status,
+                        body["error"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                }
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn governed_tags_are_saved_with_the_details_and_cleared_by_an_empty_object(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"description":"visits","governedTags":{"data_domain":"finance"}}"#,
+            )
+            .await
+            .unwrap();
+            let rows = lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].value, "finance");
+            assert_eq!(rows[0].set_by, "Test Principal");
+
+            put_body(&state, "serving.mart_x", r#"{"governedTags":{}}"#)
+                .await
+                .unwrap();
+            assert!(
+                lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let audited: Vec<Value> = sqlx::query_scalar(
+                "SELECT args FROM audit_event WHERE action = 'catalog.annotate' \
+                 AND resource_id = 'serving.mart_x' ORDER BY at",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(audited.len(), 2);
+            assert!(
+                audited[0]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("governedTags"))
+            );
+            assert!(
+                audited[1]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("governedTags"))
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_governed_value_outside_the_list_is_refused_naming_the_key_and_saves_nothing(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"description":"visits","governedTags":{"data_domain":"revenue"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("\"data_domain\""), "{message}");
+            assert!(message.contains("\"revenue\""), "{message}");
+            assert!(message.contains("finance, ops"), "{message}");
+            assert_eq!(
+                annotation_rows(&pool, "serving.mart_x").await,
+                0,
+                "a refused governed tag must not save the details either"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_undefined_governed_key_and_a_malformed_pair_are_refused(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"governedTags":{"no_such_key":"x"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("\"no_such_key\""), "{message}");
+
+            let (status, message) = put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"governedTags":{"data_domain":"Finance"}}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                message.contains("governedTags: value \"Finance\""),
+                "{message}"
+            );
+            assert_eq!(annotation_rows(&pool, "serving.mart_x").await, 0);
+        }
+
+        /// The regression guard beside part 1's "saving details never changes
+        /// a mark": a body with no `governedTags` leaves the set alone, however
+        /// the free tags and the description change.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn saving_details_without_governed_tags_never_changes_them(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"tags":["pii"],"governedTags":{"data_domain":"ops"}}"#,
+            )
+            .await
+            .unwrap();
+            put_body(
+                &state,
+                "serving.mart_x",
+                r#"{"tags":["finance"],"description":"edited"}"#,
+            )
+            .await
+            .unwrap();
+            let rows = lakehouse_store::governed_tag::list_for_asset(&pool, "serving.mart_x")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].value, "ops");
+            let details = lakehouse_store::annotation::get_annotation(&pool, "serving.mart_x")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(details.tags, vec!["finance".to_owned()]);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_list_overlay_carries_governed_tags_from_one_batch_read(
+            pool: lakehouse_store::PgPool,
+        ) {
+            define_key(&pool).await;
+            // A governed tag with no annotation row: the overlay must not
+            // depend on the details overlay finding one.
+            lakehouse_store::governed_tag::set_asset_tags(
+                &pool,
+                "silver.orders",
+                &[("data_domain".to_owned(), "finance".to_owned())],
+                "Rina",
+            )
+            .await
+            .unwrap();
+            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let mut body = json!({ "assets": [
+                { "id": "silver.orders", "name": "orders" },
+                { "id": "silver.other", "name": "other" },
+            ]});
+            apply_annotations(&state, &mut body).await;
+            assert_eq!(
+                body["assets"][0]["governedTags"],
+                json!({ "data_domain": "finance" })
+            );
+            assert!(body["assets"][1].get("governedTags").is_none());
+        }
     }
 
     /// The detail route's sample rows are data, so they must go through
@@ -4638,17 +5884,25 @@ mod tests {
             .await
             .expect("sample answers");
 
-            assert_eq!(body["limit"], json!(100));
+            // `DATA-15` F1: the cap was 100 and is now 1,000 (the spec's
+            // "up to 1,000 rows"), so the old pin moved with it.
+            assert_eq!(body["limit"], json!(1000));
             assert_eq!(body["rows"], json!([{"id": "1", "email": "***"}]));
             let requests = server.received_requests().await.expect("recorded");
             let reads: Vec<String> = requests
                 .iter()
                 .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-                .filter(|b| b.contains("LIMIT 100"))
+                .filter(|b| b.contains("LIMIT 1000"))
                 .collect();
             assert!(
                 !reads.is_empty(),
                 "the sample must be read at the capped limit"
+            );
+            assert!(
+                reads
+                    .iter()
+                    .all(|b| b.contains("SETTINGS max_execution_time = 30")),
+                "the sample read must carry its time limit through the rewrite"
             );
             assert!(
                 reads.iter().all(|b| b.contains("replaceRegexpOne")),
