@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { AnimatePresence, motion } from "motion/react";
 import {
   BarChart3,
@@ -22,6 +23,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { encodeFilters } from "@/lib/dashboard-filter-state";
 import { ErrorWithReference } from "@/components/error-reference";
 
 export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
@@ -58,7 +60,29 @@ export const TOOL_LABEL: Record<string, string> = {
   create_board: "Create board",
   list_boards: "List boards",
   suggest_dashboard: "Design dashboard",
+  // AI-1 / AI-2 / AI-20 (plan 20). The fallback rule would also produce
+  // "Set board view filters" / "Save board filters" etc., but the explicit
+  // labels keep the wording stable and tell `set_board_view_filters` apart
+  // from `save_board_filters` (the first only changes what this viewer sees,
+  // the second saves the board's default).
+  rename_board: "Rename board",
+  delete_board: "Delete board",
+  arrange_board: "Arrange board",
+  move_chart: "Move chart",
+  set_board_view_filters: "Set view filters",
+  save_board_filters: "Save default filters",
 };
+
+/**
+ * The board the dashboard page is showing, extracted from `/dashboards/<id>`.
+ * Returns `null` for any other path (e.g. the assistant panel's edge cases).
+ * Exported for the test, not for callers.
+ */
+export function boardFromPath(pathname: string | null): string | null {
+  if (!pathname) return null
+  const m = /^\/dashboards\/([^/?#]+)/.exec(pathname)
+  return m ? decodeURIComponent(m[1] ?? "") : null
+}
 
 export function asObj(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
@@ -142,6 +166,10 @@ function QualityChips({ summary }: { summary: { verdict: string; n: string }[] }
 
 function StepBody({ step }: { step: ToolStep }) {
   const res = asObj(step.result);
+  // AI-2 (plan 20): read `set_board_view_filters` needs the page's own URL,
+  // read at the top of `StepBody` so a conditional return above does not
+  // make the rule of hooks complain.
+  const here = usePathname();
 
   // Confirm/Cancel live on the message's confirmation card (`chat-messages`),
   // which also recovers a title the model left empty; a second pair of
@@ -267,6 +295,35 @@ function StepBody({ step }: { step: ToolStep }) {
           <p><span className="text-muted-foreground">Dimensions:</span> {(dims ?? []).join(", ") || "—"}</p>
           <p><span className="text-muted-foreground">Measures:</span> {(meas ?? []).join(", ") || "—"}</p>
         </div>
+      );
+    }
+  }
+
+  // AI-2 (plan 20): when the assistant applied filters to a board the page
+  // already shows, say so on the step card itself; when it applied them to
+  // another board, link to it with the filters already in the address (built
+  // with the same `?f=` helper the chip editor uses).
+  if (step.tool === "set_board_view_filters") {
+    const argBoard = typeof asObj(step.args).board === "string" ? (asObj(step.args).board as string) : "";
+    const resultFilters = Array.isArray(res.filters) ? (res.filters as unknown[]) : [];
+    const onScreen = argBoard && here && boardFromPath(here) === argBoard;
+    if (onScreen) {
+      return (
+        <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+          ✓ Filters applied
+        </p>
+      );
+    }
+    if (argBoard) {
+      const enc = encodeFilters(resultFilters as Parameters<typeof encodeFilters>[0]);
+      const href = enc ? `/dashboards/${encodeURIComponent(argBoard)}?f=${enc}` : `/dashboards/${encodeURIComponent(argBoard)}`;
+      return (
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          <Link href={href} className="font-medium text-foreground underline underline-offset-2">
+            Open {argBoard}
+          </Link>{" "}
+          with these filters applied.
+        </p>
       );
     }
   }

@@ -33,7 +33,11 @@ export const CAPABILITIES: Capability[] = [
     write: true,
     tools: ["describe_mart", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
       // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.
-      "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field"],
+      "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field",
+      // AI-1 / AI-2 / AI-20 (plan 20): rename and delete the board, move tiles,
+      // move a chart to another board, set the view's filters (read-only, so
+      // Ask mode can offer it too) and save the board's default filters.
+      "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters"],
   },
   {
     key: "pipeline",

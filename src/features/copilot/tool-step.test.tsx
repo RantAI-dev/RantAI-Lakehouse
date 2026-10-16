@@ -1,0 +1,59 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { afterEach, describe, expect, it, mock } from "bun:test"
+import { ToolStepCard, toolLabel } from "./tool-step"
+import type { ToolStep } from "./tool-step"
+
+afterEach(cleanup)
+
+// `usePathname` lives in `next/navigation`; the component reads it to tell a
+// `set_board_view_filters` step which board is on screen. The happy-dom test
+// environment does not provide it, so we stub the module before importing
+// the component.
+let mockPathname = "/dashboards/main-board"
+mock.module("next/navigation", () => ({
+  usePathname: () => mockPathname,
+}))
+
+describe("toolLabel covers the six dashboard tools", () => {
+  it("names each new dashboard tool so the Copilot does not fall back to its capitalized rule", () => {
+    expect(toolLabel("rename_board")).toBe("Rename board")
+    expect(toolLabel("delete_board")).toBe("Delete board")
+    expect(toolLabel("arrange_board")).toBe("Arrange board")
+    expect(toolLabel("move_chart")).toBe("Move chart")
+    expect(toolLabel("set_board_view_filters")).toBe("Set view filters")
+    expect(toolLabel("save_board_filters")).toBe("Save default filters")
+  })
+})
+
+describe("ToolStepCard set_board_view_filters rendering", () => {
+  const baseStep: ToolStep = {
+    tool: "set_board_view_filters",
+    args: { board: "main-board", filters: [{ column: "province", values: ["Bali"] }] },
+    ok: true,
+    result: { applyViewFilters: true, board: "main-board", filters: [{ column: "province", values: ["Bali"] }] },
+  }
+
+  it("shows 'Filters applied' and no link when the step's board is the one on screen", () => {
+    mockPathname = "/dashboards/main-board"
+    render(<ToolStepCard step={baseStep} />)
+    fireEvent.click(screen.getByRole("button"))
+    // The exact text appears; no link to another board is rendered.
+    expect(screen.queryByText("✓ Filters applied")).not.toBeNull()
+    expect(screen.queryByRole("link")).toBeNull()
+  })
+
+  it("links to the other board with the filters in the address when the step targets a different board", () => {
+    mockPathname = "/dashboards/main-board"
+    const otherStep: ToolStep = {
+      ...baseStep,
+      args: { board: "sales-board", filters: baseStep.result && typeof baseStep.result === "object" ? (baseStep.result as { filters?: unknown[] }).filters ?? [] : [] },
+    }
+    render(<ToolStepCard step={otherStep} />)
+    fireEvent.click(screen.getByRole("button"))
+    // The 'Filters applied' confirmation would be wrong here.
+    expect(screen.queryByText("✓ Filters applied")).toBeNull()
+    const link = screen.getByRole("link") as HTMLAnchorElement
+    expect(link.getAttribute("href")?.startsWith("/dashboards/sales-board")).toBe(true)
+    expect(link.getAttribute("href")).toContain("f=")
+  })
+})
