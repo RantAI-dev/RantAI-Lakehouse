@@ -262,3 +262,18 @@ then).
 **Not verified.** No Rust test has run; CI on #106 runs them. The
 developer's whole-suite `bun run test` was killed by the machine (memory);
 per-directory runs passed 1,594 tests with 0 failures.
+
+### First CI run of DATA-14, 2026-10-16
+
+- **BLOCKER 1, fixed (`5d1f6dfb`).** CI's delivery tests showed that an
+  incident opened by a failed check sent no alert: only the anomaly path
+  called the delivery. The spec's Alerts row and this plan's section 3 ask
+  for delivery whenever an incident opens. `open_for_failed_run` now
+  delivers when the incident is new; a repeat failure of an open incident
+  still sends nothing.
+- `918958d2`: the Data Quality page test that resolves an incident used a
+  `waitFor` that, started while the request was in flight, made Bun use
+  4.5 GB and crash the whole console suite in CI; it polls instead (217 MB).
+  The page itself makes one request and one reload; no loop.
+- `c28b3959`: the asset-scoped alert rule test resolves its webhook host
+  through a mapped resolver, as its neighbour does.
