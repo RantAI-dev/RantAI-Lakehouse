@@ -105,10 +105,10 @@ After the restore completed, the stack was verified against the acceptance check
 | Verification Check | Target / Method | Result | Evidence |
 | --- | --- | --- | --- |
 | **Extra user sign-in** | `POST /api/auth/login` with `ops7_drill_user@example.com` / `DrillPass123!` | **PASS** | HTTP 200 OK, session cookie issued |
-| **Catalog access** | `GET /api/catalog` with restored user session | **PASS** | HTTP 200 OK, catalog operational |
+| **Catalog access** | ClickHouse `icecat_g3a` DataLakeCatalog table listing (`SHOW TABLES FROM icecat_g3a LIKE '%bronze%'`) | **PASS** | `bronze.g3a_orders` (matches pre-backup: `bronze.g3a_orders`) |
 | **Iceberg table row count** | `SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1` | **PASS** | **2,000 rows** (matches pre-backup: 2,000) |
 | **Change-capture offset** | `SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\`` | **PASS** | **125** for `postgres-cdc-demo` (matches pre-backup: 125) |
-| **OpenFGA permissions** | Verification of OpenFGA tuple table in `openfga` DB | **PASS** | Tuples intact; `openfga` store preserved |
+| **OpenFGA permissions** | OpenFGA Check API (`POST /stores/{id}/check`) for seeded tuple and tuple count | **PASS** | Tuple count preserved: 35 (pre=35, post=35); OpenFGA Check API answered `{"allowed":true,"resolution":""}` |
 | **Dagster run history** | `SELECT count(*) FROM runs WHERE status = 'SUCCESS'` in `dagster` DB | **PASS** | **1 run** (the pre-teardown G3a run is preserved) |
 
 ---
