@@ -316,3 +316,8 @@ test("a required placeholder with no value is dropped and does not make its colu
   assert.ok(!isRequiredColumn("region", dropInertFilters(saved)))
   assert.deepEqual(enforceRequired([], dropInertFilters(saved)), [])
 })
+
+test("a filter chip names a joined column as table.column (BI-7)", () => {
+  assert.equal(filterLabel({ column: "capacity__provinsi", values: ["Bali"] }), "capacity.provinsi is Bali")
+  assert.equal(filterLabel({ column: "provinsi", values: ["Bali"] }), "provinsi is Bali")
+})

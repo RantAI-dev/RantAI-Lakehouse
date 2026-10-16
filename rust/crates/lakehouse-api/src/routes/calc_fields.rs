@@ -29,6 +29,7 @@ use lakehouse_bi::fields::{self, FieldDef, SourceKind};
 use lakehouse_bi::formula::FormulaError;
 use lakehouse_bi::formula::catalog::CATALOG;
 use lakehouse_bi::formula::compile::Level;
+use lakehouse_bi::groups::{self, GroupDef};
 use lakehouse_bi::store;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
@@ -47,7 +48,7 @@ const CALC_FIELD: upstream_error::Context = upstream_error::Context::new(
     "ClickHouse is unavailable.",
 );
 
-fn classify_ch(failure: &ChError) -> ApiError {
+pub(crate) fn classify_ch(failure: &ChError) -> ApiError {
     upstream_error::ch_error(&CALC_FIELD, failure)
 }
 
@@ -85,6 +86,9 @@ pub struct FieldBody {
     name: String,
     #[serde(default)]
     formula: String,
+    /// `BI-10`: a value group in place of a formula.
+    #[serde(default)]
+    group: Option<GroupDef>,
 }
 
 fn parse_body(body: &Bytes) -> Result<FieldBody, ApiError> {
@@ -93,13 +97,13 @@ fn parse_body(body: &Bytes) -> Result<FieldBody, ApiError> {
 }
 
 /// The source a field belongs to, with its current columns.
-struct Resolved {
-    kind: SourceKind,
-    id: String,
-    cols: RelationColumns,
+pub(crate) struct Resolved {
+    pub(crate) kind: SourceKind,
+    pub(crate) id: String,
+    pub(crate) cols: RelationColumns,
 }
 
-async fn resolve(
+pub(crate) async fn resolve(
     ch: &ChClient,
     mart: Option<&str>,
     source: Option<&str>,
@@ -149,7 +153,7 @@ fn problem_json(problem: &FormulaError) -> Value {
     })
 }
 
-fn author_name(principal: Option<&Extension<Principal>>) -> String {
+pub(crate) fn author_name(principal: Option<&Extension<Principal>>) -> String {
     principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
 }
 
@@ -213,7 +217,18 @@ pub async fn validate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
     let parsed = parse_body(&body)?;
     let ch = &state.clickhouse;
     let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
+    if let Some(group) = &parsed.group {
+        return Ok(ApiJson(match group.validate(&source.cols) {
+            Ok(()) => json!({ "ok": true, "level": groups::LEVEL, "type": "text" }),
+            // A group has no position in a text; the sentence is ours.
+            Err(message) => json!({
+                "ok": false,
+                "error": { "message": message, "position": 0, "length": 1 },
+            }),
+        }));
+    }
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     if let Err(too_long) = fields::validate_formula_size(&parsed.formula) {
         return Ok(ApiJson(json!({
             "ok": false,
@@ -259,9 +274,12 @@ pub async fn create(
     let ch = &state.clickhouse;
     let source = resolve(ch, parsed.mart.as_deref(), parsed.source.as_deref()).await?;
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     let name = parsed.name.trim().to_owned();
     fields::validate_name(&name, &source.cols).map_err(ApiError::BadRequest)?;
-    fields::validate_formula_size(&parsed.formula).map_err(ApiError::BadRequest)?;
+    if parsed.group.is_none() {
+        fields::validate_formula_size(&parsed.formula).map_err(ApiError::BadRequest)?;
+    }
     let siblings = fields::list_fields_for(ch, source.kind, &source.id)
         .await
         .map_err(|failure| classify_ch(&failure))?;
@@ -278,16 +296,34 @@ pub async fn create(
         ))
         .into());
     }
-    let (level, ty) = fields::check(&parsed.formula, &name, &siblings, &source.cols, &time)
-        .map_err(|problem| unprocessable(&problem))?;
+    // BI-10: a value group is checked against the source's columns and stored
+    // as its canonical definition; a formula goes through the checker.
+    let (formula, level, ty) = if let Some(group) = &parsed.group {
+        group
+            .validate(&source.cols)
+            .map_err(ApiError::Unprocessable)?;
+        (
+            group.to_stored(),
+            groups::LEVEL.to_owned(),
+            "text".to_owned(),
+        )
+    } else {
+        let (level, ty) = fields::check(&parsed.formula, &name, &siblings, &source.cols, &time)
+            .map_err(|problem| unprocessable(&problem))?;
+        (
+            parsed.formula,
+            level.as_str().to_owned(),
+            ty.as_str().to_owned(),
+        )
+    };
     let field = FieldDef {
         id: fields::new_field_id(),
         source_kind: source.kind,
         source_id: source.id,
         name,
-        formula: parsed.formula,
-        level: level.as_str().to_owned(),
-        ty: ty.as_str().to_owned(),
+        formula,
+        level,
+        ty,
         created_by: author_name(principal.as_ref()),
         updated_at: None,
     };
@@ -353,6 +389,31 @@ pub async fn update(
         SourceKind::SqlSource => resolve(ch, None, Some(&current.source_id)).await?,
     };
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
+    // BI-10: a value group is replaced by a value group, a formula by a
+    // formula; one never turns into the other (a chart may use it as a text
+    // column, and its level is the group's, not a formula's).
+    if current.is_group() != parsed.group.is_some() {
+        return Err(ApiError::BadRequest(
+            "a value group stays a value group, and a formula a formula.".to_owned(),
+        )
+        .into());
+    }
+    if let Some(group) = &parsed.group {
+        group
+            .validate(&source.cols)
+            .map_err(ApiError::Unprocessable)?;
+        let field = FieldDef {
+            formula: group.to_stored(),
+            created_by: author_name(principal.as_ref()),
+            updated_at: None,
+            ..current
+        };
+        fields::save_field(ch, &field)
+            .await
+            .map_err(|failure| classify_ch(&failure))?;
+        return Ok(ApiJson(json!({ "ok": true, "field": field })));
+    }
     fields::validate_formula_size(&parsed.formula).map_err(ApiError::BadRequest)?;
     let siblings = fields::list_fields_for(ch, source.kind, &source.id)
         .await
@@ -426,6 +487,7 @@ pub async fn delete(
         cols: RelationColumns::default(),
     });
     let time = crate::routes::settings::time_context(&state).await?;
+    let time = crate::routes::params::with_defaults(&state.clickhouse, time).await;
     let siblings = fields::list_fields_for(ch, source.kind, &source.id)
         .await
         .map_err(|failure| classify_ch(&failure))?;
@@ -571,7 +633,8 @@ mod tests {
             .and_then(lakehouse_bi::grain::Grain::parse)
         {
             let chart =
-                lakehouse_bi::builder::GrainedChart::from_def(&def, def.kind, grain).unwrap();
+                lakehouse_bi::builder::GrainedChart::from_def(&def, def.kind, grain, &p.from)
+                    .unwrap();
             return lakehouse_bi::builder::grained_sql(
                 &p.from,
                 Vec::new(),

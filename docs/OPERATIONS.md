@@ -272,9 +272,11 @@ partition synthetic load vs. a 1-file/partition control). This is a real
 operational requirement, not a nicety, for any deployment taking CDC-rate
 or dlt-batch writes into Bronze at meaningful volume — see ADR 0009. It
 does not affect `lakehouse-api`'s own boot or any of its existing routes;
-`dagster/dispar_orchestrate/maintenance.py`'s `expire_snapshots` chain is
-independent of Trino and keeps running either way (it does not compact
-data files, only aged snapshot/manifest metadata).
+`dagster/dispar_orchestrate/maintenance.py`'s snapshot expiry chain
+(default 7-day retention floor, OPS-1) requires Trino because ClickHouse 26.8
+refuses `expire_snapshots` on catalog-backed tables. If the `trino` profile is
+down or unconfigured, snapshot expiry logs a warning and skips cleanly, leaving
+snapshots unexpired without failing the maintenance job.
 
 ### Debezium Server (opt-in, `dagster` profile — P5, CDC)
 
@@ -719,6 +721,31 @@ API refuses to dial an internal address unless the operator allows it:
 The CI gates that save ingest specs aimed at compose-network fixtures set the
 variable themselves, in their own override (`ops/g6/`), marked gate-only.
 
+### Connector credentials at rest (`SRC-12`, ADR 0002 addendum 5)
+
+A credential typed in the console is stored on the `connector_secrets`
+volume encrypted with AES-256-GCM. The key is `CONNECTOR_SECRETS_KEY`: 32
+random bytes, base64. The API and the orchestrator both need it, and
+compose refuses to start either without it.
+
+- **Make one, once:** `openssl rand -base64 32`. Keep it with the
+  installation's other secrets. **Losing it loses every typed credential**:
+  they cannot be decrypted and have to be entered again.
+- **First start with a key on an older install:** the API encrypts every
+  plain credential file at start-up and removes the plain copies. Until the
+  API has done so, the orchestrator refuses a plain file instead of reading
+  it.
+- **Changing the key:**
+  1. Set the new key as `CONNECTOR_SECRETS_KEY` and the current one as
+     `CONNECTOR_SECRETS_KEY_PREVIOUS`.
+  2. Run `docker compose run --rm lakehouse-api rotate-secrets-key` while
+     nobody is saving a credential. It re-encrypts every stored credential
+     with the new key and lists any file it could not.
+  3. Remove `CONNECTOR_SECRETS_KEY_PREVIOUS` and restart the API and the
+     orchestrator. The old key no longer opens anything.
+- Credentials given as an environment variable or an operator's file are
+  not encrypted by the product; they are the operator's to protect.
+
 ### Alert webhooks and internal addresses (`SEC-10`)
 
 An alert or digest sends its message to a webhook URL a user typed, so the
@@ -806,6 +833,40 @@ What the operator needs to know:
   sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
   viewer's browser; it does not replace the token. No other console page sends
   a framing header.
+
+### Connector credentials from a secret manager (`SRC-12`, ADR 0002 addendum 6)
+
+Instead of typing a password, a connector can reference a secret in the
+installation's secret manager. One manager per installation:
+
+- `SECRET_MANAGER` = `vault`, `aws`, `gcp` or `azure`, plus that manager's
+  sign-in for the API and the orchestrator (`.env.example` lists each:
+  Vault address and token or AppRole; AWS region and role or keys; a
+  Google service-account file, mounted into both services, or the
+  platform identity; Azure tenant and client, or a managed identity).
+- **`SECRET_MANAGER_ALLOWED_PREFIXES` is required for references to work.**
+  It lists the paths connectors may reference, for example
+  `vault:secret/lakehouse/{tenant}/`; `{tenant}` is the connector's tenant.
+  With a manager set and no prefixes, every reference is refused. Give the
+  product's manager identity a policy no wider than these prefixes.
+- A reference is read at every test and every run, never cached: changing
+  the secret in the manager takes effect at the next run, and a manager
+  that cannot be reached fails that run with a fixed message.
+- `CONNECTOR_TYPED_CREDENTIALS=false` hides the "type a credential" option
+  when every credential should come from the manager.
+
+### OAuth sign-in for REST connectors (`SRC-12`, ADR 0002 addendum 7)
+
+- Set `CONNECTOR_OAUTH_REDIRECT_URI` to the console's address of the
+  product's callback (the connector form shows the path to append). Register
+  exactly that address in the provider's app settings.
+- The provider's token and revocation addresses must be `https`.
+  `CONNECTOR_OAUTH_ALLOW_HTTP` is for tests only; never set it in a real
+  installation.
+- When a provider refuses a refresh (the user's access was withdrawn, the
+  app's secret changed), the connector's runs fail with "sign in again"
+  until someone with `connector:manage` signs in again from the connector
+  page.
 
 ### What's deliberately NOT in the stack
 
@@ -916,7 +977,7 @@ check.
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
-| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (see `rust/crates/lakehouse-auth/README.md`) |
+| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs and `OIDC_JWKS_URL`); see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
 ## Login throttling and session cleanup
 
@@ -1032,6 +1093,143 @@ live response.
 `routes/mod.rs` router wiring, which is out of scope here — left as a
 proposal for whoever owns the auth surface next.
 
+## Single sign-on (OIDC)
+
+Browser sign-in is an authorization-code flow with PKCE, served by the API
+(`GET /api/auth/oidc/start` → the provider → `GET /api/auth/oidc/callback`),
+which sets the ordinary `lh_session` cookie the password login also sets.
+`rust/crates/lakehouse-auth/README.md` is the reference for how a token is
+verified and how groups map to roles; this section is the operator's side:
+which settings go with which provider, and what each provider cannot do.
+
+OIDC turns on only when **both** `OIDC_ISSUER` and `OIDC_CLIENT_ID` are set.
+With either unset, `AuthState::oidc` stays `None` and the `oidc/*` routes
+answer `503` rather than misbehaving — the same posture as every other
+opt-in feature here. The browser flow reads three more settings the
+resource-server path does not: `OIDC_AUTHORIZE_URL`, `OIDC_TOKEN_URL` and
+`OIDC_REDIRECT_URI` (all read from the API's own config, never from the
+request — that is what closes the open-redirect on `next`). A confidential
+client also sets `OIDC_CLIENT_SECRET`.
+
+| Setting | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `OIDC_ISSUER` | to enable OIDC | unset | Compared byte-for-byte with the token's `iss`. |
+| `OIDC_CLIENT_ID` | to enable OIDC | unset | Must appear in the token's `aud`. |
+| `OIDC_AUTHORIZE_URL` | for the browser flow | unset | The provider's authorization endpoint; unset makes `oidc/start` `503`. |
+| `OIDC_TOKEN_URL` | for the browser flow | unset | The provider's token endpoint. |
+| `OIDC_REDIRECT_URI` | for the browser flow | unset | This deployment's callback: `<api-origin>/api/auth/oidc/callback`. Register the same value on the provider. |
+| `OIDC_CLIENT_SECRET` | for a confidential client | unset | Sent only in the code exchange; never logged, redacted in `Config`'s `Debug`. |
+| `OIDC_JWKS_URL` | for providers not serving `{issuer}/.well-known/jwks.json` | `{OIDC_ISSUER}/.well-known/jwks.json` | See the limitation below: Entra ID and Google both need this set. |
+| `OIDC_PROVIDER_NAME` | no | `default` | Label behind `oidc:<name>` in `auth_identity.provider`. |
+| `OIDC_GROUPS_CLAIM` | no | `groups` | Which token claim carries the caller's groups. |
+| `OIDC_ROLE_MAP` | no | empty | `group=Role Name,...`; a group not named here is ignored. |
+| `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
+| `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
+
+**A limitation worth stating plainly: the API does not read `jwks_uri` from
+the provider's discovery document.** It builds the JWKS URL as
+`{OIDC_ISSUER}/.well-known/jwks.json` unless `OIDC_JWKS_URL` overrides it
+(`state.rs`). Neither vendor below serves keys at that path, so both require
+`OIDC_JWKS_URL`; the setting's whole purpose is this case. A future
+change could fetch the discovery document and read `jwks_uri` from it —
+reported, not built (SEC-3).
+
+### Keycloak
+
+Keycloak is the automated gate's provider: a real OIDC server, not the mock.
+Its override (`ops/sso/docker-compose.keycloak.override.yml`, profile `sso`)
+and the gate (`ops/g10/g10_sso_test.py`) run Keycloak **in the compose
+network only** — no host port is published. `docs/plans/SEC-3-RESULT.md`
+records the gate's measured result.
+
+| Setting | Local gate value | Real Keycloak |
+| --- | --- | --- |
+| `OIDC_ISSUER` | `http://keycloak:8080/realms/lakehouse` | `https://<host>/realms/<realm>` |
+| `OIDC_AUTHORIZE_URL` | `.../protocol/openid-connect/auth` | same path on the host |
+| `OIDC_TOKEN_URL` | `.../protocol/openid-connect/token` | same path on the host |
+| `OIDC_JWKS_URL` | `.../protocol/openid-connect/certs` | same path on the host |
+| `OIDC_REDIRECT_URI` | `http://lakehouse-api:8080/api/auth/oidc/callback` | `<api-origin>/api/auth/oidc/callback` |
+| `OIDC_GROUPS_CLAIM` | `groups` | `groups` |
+
+Discovery lives at `/realms/<realm>/.well-known/openid-configuration`; the
+four endpoints above are its `authorization_endpoint`, `token_endpoint` and
+`jwks_uri`. Keycloak publishes groups through an `oidc-group-membership-mapper`
+whose `full.path` is `true` by default (it then emits `/top/level1`, not
+`top/level1`) — set it `false` for the plain name `OIDC_ROLE_MAP` expects, as
+the gate's realm template does. (Keycloak docs: `securing-apps/oidc-layers`,
+`admin-api/protocol-mappers`.)
+
+To run the gate by hand, put throwaway values in `.env` for
+`KEYCLOAK_ADMIN_PASSWORD`, `OIDC_CLIENT_SECRET`, `SSO_USER_A_PASSWORD` and
+`SSO_USER_B_PASSWORD` (`ops/init-env.sh` writes a `.env` if you have none;
+fill the empty `OIDC_CLIENT_SECRET=` line rather than adding a second), then:
+
+```bash
+docker compose -p sso -f docker-compose.yml \
+  -f ops/sso/docker-compose.keycloak.override.yml --profile sso \
+  up -d --build lakehouse-api keycloak
+docker compose -p sso -f docker-compose.yml \
+  -f ops/sso/docker-compose.keycloak.override.yml --profile sso \
+  run --rm sso-test-runner
+docker compose -p sso -f docker-compose.yml \
+  -f ops/sso/docker-compose.keycloak.override.yml --profile sso down -v
+```
+
+### Microsoft Entra ID
+
+Register an application in the Entra admin center (App registrations → New
+registration); note the **Application (client) ID** and **Directory (tenant)
+ID**, and add a **Web** redirect URI equal to `OIDC_REDIRECT_URI`. Create a
+client secret under Certificates & secrets. To carry groups, add the
+**groups** optional claim (Token configuration → Add groups claim) to the ID
+token. Entra's issuer and endpoints are per tenant:
+
+| Setting | Value |
+| --- | --- |
+| `OIDC_ISSUER` | `https://login.microsoftonline.com/<tenant-id>/v2.0` |
+| `OIDC_CLIENT_ID` | the application (client) id |
+| `OIDC_CLIENT_SECRET` | the client secret value |
+| `OIDC_AUTHORIZE_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/authorize` |
+| `OIDC_TOKEN_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` |
+| `OIDC_JWKS_URL` | `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys` |
+| `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
+| `OIDC_GROUPS_CLAIM` | `groups` |
+
+**Limits.** Entra's `groups` claim carries group **object ids** (GUIDs), not
+names, so `OIDC_ROLE_MAP` keys are those GUIDs. When a user is in more groups
+than the claim can hold, Entra replaces the claim with an overage marker
+(`_claim_names`/`_claim_sources`, or `hasgroups`) and the group list must be
+fetched from Microsoft Graph instead — the console does not follow that, so a
+role mapping for such a user silently does not apply. (Microsoft docs:
+<https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>,
+the `groups` and overage claims.) Backlog `SEC-39` makes this case visible.
+
+### Google
+
+Create an OAuth client (Google Cloud console → APIs & Services →
+Credentials → OAuth client ID, type **Web application**) and add the
+authorized redirect URI equal to `OIDC_REDIRECT_URI`. Google publishes its
+keys at a fixed URL, so `OIDC_JWKS_URL` must be set:
+
+| Setting | Value |
+| --- | --- |
+| `OIDC_ISSUER` | `https://accounts.google.com` |
+| `OIDC_CLIENT_ID` | the OAuth client id, ending `.apps.googleusercontent.com` |
+| `OIDC_CLIENT_SECRET` | the client secret |
+| `OIDC_AUTHORIZE_URL` | `https://accounts.google.com/o/oauth2/v2/auth` |
+| `OIDC_TOKEN_URL` | `https://oauth2.googleapis.com/token` |
+| `OIDC_JWKS_URL` | `https://www.googleapis.com/oauth2/v3/certs` |
+| `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
+| `OIDC_GROUPS_CLAIM` | not usable — see below |
+
+**Limit, stated honestly (D3):** Google's `id_token` carries no groups
+claim, and there is no supported way to add one. So `OIDC_ROLE_MAP` cannot
+map anything for Google: a Google sign-in gets whatever its local
+`app_user_role` rows grant, and a JIT-provisioned account starts with none
+until an administrator assigns a role. Group-based authorization on Google
+is therefore not supported. (Google docs:
+<https://developers.google.com/identity/openid-connect/reference>.)
+
 ## Postgres backup / restore
 
 Scripts: `scripts/backup-postgres.sh`, `scripts/restore-postgres.sh`. Both
@@ -1078,14 +1276,25 @@ taken, a scratch database was restored from it, and the restore was
 verified by querying the restored data. See the phase report for the
 actual command transcript.
 
-## Dedicated-bucket backup job (WS5 item G2)
+## Dedicated-bucket backup job (OPS-7 / WS5 item G2)
 
 The script-based procedure above covers only `${POSTGRES_DB:-lakehouse}`
 (the app database) and writes to local disk. `dagster/dispar_orchestrate/
-backup_job.py`, run via the `backups` compose profile, covers all four
-compose-created Postgres databases (the app database, plus Lakekeeper's,
-OpenFGA's, and Dagster's own) and uploads each dump to an **S3-compatible
-bucket that is dedicated to backups**, never the shared warehouse bucket.
+backup_job.py`, run via the `backups` compose profile, covers the entire
+Lakehouse state (OPS-7 D1):
+1. **The four Postgres databases:** the application database (`lakehouse`),
+   Lakekeeper's REST catalog metadata (`lakekeeper`), OpenFGA's authorization
+   tuples (`openfga`), and Dagster's run storage/event logs (`dagster`).
+2. **The warehouse object store bucket:** full incremental mirror of all
+   Apache Iceberg data and metadata files (streaming via `s3fs`) into
+   `<BACKUP_S3_BUCKET>/warehouse/`.
+3. **ClickHouse databases:** all non-catalog, non-system databases (such as
+   `lake`, holding change-capture offsets and ingest facts) backed up via
+   native `BACKUP DATABASE <db> TO S3(...)` into
+   `<BACKUP_S3_BUCKET>/clickhouse/<timestamp>/<db>/`.
+
+All components land in an **S3-compatible bucket dedicated to backups**,
+never inside the shared warehouse bucket.
 
 **Why a dedicated bucket, not the warehouse bucket — security, not
 preference.** One of the four databases is the identity database
@@ -1096,28 +1305,31 @@ turn compromise of ANY ONE of those credentials into compromise of every
 user's password hash — a privilege-escalation path the warehouse bucket's
 access domain was never meant to grant. `backup_job.py` therefore reads
 its own `BACKUP_S3_*` endpoint, bucket, and credentials, entirely
-separate from `RUSTFS_*`/`CONNECTOR_S3_*`.
+separate from `RUSTFS_*`/`CONNECTOR_S3_*`. Furthermore, read access
+to the warehouse bucket uses dedicated read-only credentials
+(`BACKUP_WAREHOUSE_ACCESS_KEY` / `BACKUP_WAREHOUSE_SECRET_KEY`), ensuring
+the backup process cannot mutate live warehouse data.
 
 ### Configure
 
-Set `BACKUP_S3_ENDPOINT`, `BACKUP_S3_BUCKET`, `BACKUP_S3_ACCESS_KEY`,
-`BACKUP_S3_SECRET_KEY` (and leave `BACKUP_S3_ACCESS_KEY_SECRET_REF=env:
-BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY_SECRET_REF=env:
-BACKUP_S3_SECRET_KEY` at their `.env.example` values) in your `.env`.
-`BACKUP_RETENTION_DAYS` (default `30`) is the one optional field — it is
-a retention window, not a credential.
+Set in your `.env`:
+- Target backup bucket: `BACKUP_S3_ENDPOINT`, `BACKUP_S3_BUCKET`,
+  `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY` (and `_SECRET_REF` vars).
+- Source warehouse credentials (read-only): `BACKUP_WAREHOUSE_ACCESS_KEY`,
+  `BACKUP_WAREHOUSE_SECRET_KEY` (and `_SECRET_REF` vars).
+- Source warehouse target: `BACKUP_WAREHOUSE_ENDPOINT` (default: `http://rustfs:9000`),
+  `BACKUP_WAREHOUSE_BUCKET` (default: `lakehouse-warehouse`).
+- ClickHouse connection: `CH_URL` (default: `http://clickhouse:8123`),
+  `CH_USER` (default: `default`), `CH_PASSWORD` (if configured).
+- Retention: `BACKUP_RETENTION_DAYS` (default `30`) controls retention pruning
+  for database dumps and ClickHouse backups. Warehouse mirrored objects are
+  never pruned by age (historical Iceberg snapshots may still reference them).
 
-These four bucket/credential values are **required** (`${VAR:?}`, no
-default) but deliberately do **not** live in the default
-`docker-compose.yml` — they live in
-`ops/backups/docker-compose.backups.override.yml`, added with `-f` only
-when a backup actually runs, same precedent
-`ops/g6/docker-compose.g6.override.yml` already establishes for its own
-gate-only credentials: a `${VAR:?}` in the default file is interpolated
-for every service regardless of profile, so a must-set-only-under-one-
-profile credential placed there would break `docker compose --profile
-'*' config --quiet` (the repo-wide check AGENTS.md prescribes) for every
-checkout, backups configured or not.
+These must-set credential values are **required** (`${VAR:?}`, no default)
+in `ops/backups/docker-compose.backups.override.yml`, added with `-f` only
+when a backup runs. Placing them in the override file ensures `docker compose
+--profile '*' config --quiet` continues to validate cleanly in checkouts that
+do not run backups.
 
 ### Run
 
@@ -1127,13 +1339,12 @@ docker compose -f docker-compose.yml \
   --profile backups run --rm backup-job
 ```
 
-Without the `-f ops/backups/...` override (or with any of its four vars
+Without the `-f ops/backups/...` override (or with any required variable
 unset), this refuses to start — a `backups` profile enabled with no
 bucket configured is a clear startup failure, never a silent write into
 the wrong place, and never a silently-skipped backup reported as
-successful. A failed `pg_dump` for any one database raises immediately
-(`dagster.Failure`) and stops the run before uploading anything for the
-databases after it — a partial run is never reported as a complete one.
+successful. A failure in any component raises immediately (`dagster.Failure`)
+and aborts the run.
 
 **Scheduling:** this is not (yet) wired as an automatic in-process
 Dagster job/schedule — see `backup_job.py`'s module doc for why (in
@@ -1145,20 +1356,49 @@ cron, a systemd timer, or a CI scheduled job) on whatever cadence your
 retention policy assumes (nightly, matching `BACKUP_RETENTION_DAYS`'s
 default 30-day window, is a reasonable starting point).
 
-### Restore
+### Full restore procedure (`scripts/restore-from-backup.sh`)
 
-Download the dump for the database/timestamp you want from
-`<BACKUP_S3_BUCKET>/<db-name>/<timestamp>.dump` (via any S3-compatible
-client pointed at `BACKUP_S3_ENDPOINT` with the same credentials), then:
+A full recovery across all Lakehouse components is automated by
+`scripts/restore-from-backup.sh`.
 
 ```bash
-pg_restore --dbname=<target-db> --clean --if-exists --no-owner <dump-file>
+# Preview usage and options
+scripts/restore-from-backup.sh --help
+
+# Execute restore from a specific timestamp
+scripts/restore-from-backup.sh 20261016T074234Z
+
+# Force restore even if local data volumes are not empty
+scripts/restore-from-backup.sh --force 20261016T074234Z
 ```
 
-Same "restore into a scratch database first" caution as the script-based
-procedure above applies here — `--clean` drops existing objects before
-recreating them, so verify a dump against a throwaway database name
-before trusting it against the live one.
+**Restoration order (OPS-7 E4):**
+1. **Empty-volume safety check:** The script checks all compose data volumes
+   (`postgres_data`, `rustfs_data`, `clickhouse_data`) and refuses to run
+   if existing data is found unless `--force` is passed, preventing partial
+   overwrite corruption.
+2. **Step 1: PostgreSQL restore alone first:** Starts Postgres in isolation
+   while other containers are down, drops and recreates the 4 databases
+   (`lakehouse`, `lakekeeper`, `openfga`, `dagster`), and restores each
+   from `s3://<BACKUP_S3_BUCKET>/<db>/<timestamp>.dump` via `pg_restore`.
+   Restoring alone first guarantees that Lakekeeper and API initialization
+   do not race with or destructively overwrite restored tables.
+3. **Step 2: Warehouse bucket restore:** Starts RustFS (or object store) and
+   syncs `s3://<BACKUP_S3_BUCKET>/warehouse/` back to
+   `s3://<BACKUP_WAREHOUSE_BUCKET>/`.
+4. **Step 3: ClickHouse restore:** Starts ClickHouse, discovers all backed-up
+   databases under `s3://<BACKUP_S3_BUCKET>/clickhouse/<timestamp>/`, drops
+   stale databases, and runs `RESTORE DATABASE <db> FROM S3(...)`.
+5. **Step 4: Stack bring-up:** Starts the remaining services
+   (`lakekeeper`, `openfga`, `lakehouse-api`, `dagster`) and waits for
+   readiness.
+
+**Verified Recovery Performance (OPS-7-AC3):**
+Tested end-to-end in a timed recovery drill (`ops7drill`). Total restore
+duration across all 4 Postgres databases, 9 Iceberg objects, and ClickHouse
+state was **82 seconds** (94 seconds total to full API readiness). See
+[docs/plans/OPS-7-RESULT.md](plans/OPS-7-RESULT.md) for the complete drill
+report and component timing table.
 
 ## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 

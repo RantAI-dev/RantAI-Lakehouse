@@ -15,11 +15,13 @@ Only what is Oracle's own lives here: the fixture and the dial.
 
 - `connect`: refused, honestly. The API has no Oracle client; `POST .../test`
   answers `supported: false` (SRC-5, `connector_probe.rs`).
-- `discover`: refused, honestly. `POST .../discover` answers
-  `supported: false` for Oracle (SRC-13; SRC-9 finding G2 changed it from an
-  HTTP 422). `?schema=` is sent: without it every sql connector gets a
-  `supported: false` for a different reason ("the schema parameter is
-  required") and the check would pass for the wrong cause.
+- `discover`: real (SRC-13 D5, D12). The orchestrator lists Oracle: the
+  schemas the login can read hold `G6_INGEST`, that schema's tables hold
+  `G6_INGEST.ORDERS`, and the preview shows its declared columns `ID` and
+  `AMOUNT` (types not inferred). The source object of the load below is that
+  listed name, `G6_INGEST.ORDERS`, so the gate also proves that what the
+  listing offers loads (SRC-13 review 1 SHOULD-FIX 1: the schema part and the
+  upper-case spelling).
 - `load`: real. The run succeeds and Bronze holds every seeded row.
 - `reload`: real. The connector has no `loadMode`, so the default `replace`
   applies and a second run leaves the same rows.
@@ -69,6 +71,9 @@ ORACLE_USER = "g6_ingest"
 ORACLE_SCHEMA = "G6_INGEST"
 CONNECTOR_ORACLE_PASSWORD = os.environ.get("CONNECTOR_ORACLE_PASSWORD", "")
 
+# The name the listing offers for the fixture table, and what the load's source object is called
+# (SRC-13: a listed name must load).
+SOURCE_OBJECT = f"{ORACLE_SCHEMA}.ORDERS"
 FIXTURE_ROWS = [(1, 10.5), (2, 20.25), (3, 30.0)]
 SIGN_IN_TIMEOUT_S = 300
 
@@ -119,11 +124,17 @@ def _install_oracle_into_matrix() -> None:
     level dicts by connector name, and `_step_reload` walks all of `TYPE_OF`
     (it would record a `skipped` for every other connector type). Rebinding
     the names, rather than adding to the dicts, leaves the matrix with only
-    Oracle in it for the whole run. `DISCOVER_FIXTURES` carries the schema the
-    discover check sends; its table and columns are unused for a refusal."""
+    Oracle in it for the whole run. `DISCOVER_FIXTURES` carries what the
+    discover check must find: Oracle's own upper-case spelling, and declared
+    (not inferred) column types."""
     matrix.TYPE_OF = {NAME: TYPE_NAME}
     matrix.BRONZE_OF = {NAME: BRONZE_TABLE}
-    matrix.DISCOVER_FIXTURES = {TYPE_NAME: (ORACLE_SCHEMA, f"{ORACLE_SCHEMA}.ORDERS", set())}
+    matrix.DISCOVER_FIXTURES = {
+        TYPE_NAME: {
+            "schema": ORACLE_SCHEMA, "object": SOURCE_OBJECT, "kind": "table",
+            "columns": {"ID", "AMOUNT"}, "inferred": False,
+        }
+    }
 
 
 def _check_load(run_id: str) -> int | None:
@@ -174,18 +185,20 @@ def run() -> None:
         credential_values={"primary": CONNECTOR_ORACLE_PASSWORD},
         adapter="sql",
         dial={"driver": "oracle", "host": ORACLE_HOST, "port": ORACLE_PORT, "database": ORACLE_SERVICE, "user": ORACLE_USER},
-        source_objects=[{"name": "orders", "target": BRONZE_TABLE}],
+        source_objects=[{"name": SOURCE_OBJECT, "target": BRONZE_TABLE}],
         connector_ids=connector_ids,
     )
     connector_id = connector_ids[NAME]
-    # While the first run is in flight: both are quick, read-only calls.
+    # While the first run is in flight: `connect` is a quick, read-only call. `discover` is Dagster runs of its
+    # own (the orchestrator lists Oracle), so it waits for the load below to end and not for a run slot.
     matrix._check_connect(NAME, connector_id)
-    matrix._check_discover(NAME, connector_id)
 
     if run_id is None:
         matrix._record_fail(TYPE_NAME, "load", "ingest/run answered supported=false for an Oracle sql connector")
+        matrix._check_discover(NAME, connector_id)
         return
     count = _check_load(run_id)
+    matrix._check_discover(NAME, connector_id)
     if count is None:
         matrix._record(TYPE_NAME, "reload", "skipped", "the first load did not complete, so there is nothing to load again")
         return

@@ -1,5 +1,6 @@
 "use client";
 
+import { normalizeDef } from "@/lib/params";
 import * as React from "react";
 import { useTheme } from "next-themes";
 import { ChartColumn, PencilRuler } from "lucide-react";
@@ -7,6 +8,11 @@ import { Button } from "@/components/ui/button";
 import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
 import { TileBody } from "@/features/dashboards/tile-body";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
+import type { BinDef, GridDef } from "@/lib/chart-bins";
+import type { JoinDef } from "@/lib/chart-joins";
+import type { LayerDef } from "@/lib/chart-layers";
+import type { Grouping, MeasureEntry, SortSpec, StepDef } from "@/lib/chart-shape";
+import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
@@ -25,8 +31,13 @@ function str(v: unknown): string | undefined {
  * The model sometimes leaves `title` empty and puts the name in `caption`.
  */
 export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
+  // BI-6: a measure is a column name, or a column with its own aggregate.
   const measures = Array.isArray(args.measures)
-    ? args.measures.filter((m): m is string => typeof m === "string")
+    ? args.measures.filter((m): m is MeasureEntry =>
+        typeof m === "string" ||
+        // BI-2: a measure may be a saved metric by name.
+        (typeof m === "object" && m !== null && typeof (m as { metric?: unknown }).metric === "string") ||
+        (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
   return {
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? "",
@@ -49,6 +60,22 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     caption: str(args.caption),
     target: typeof args.target === "number" ? args.target : undefined,
     limit: typeof args.limit === "number" ? args.limit : undefined,
+    // BI-6: the chart's own filters, sort, "Other" and groupings travel to the builder as the model sent them.
+    filters: Array.isArray(args.filters) ? (args.filters as FilterDef[]) : undefined,
+    sort: typeof args.sort === "object" && args.sort !== null ? (args.sort as SortSpec) : undefined,
+    other: args.other === true ? true : undefined,
+    groupings: Array.isArray(args.groupings) ? (args.groupings as Grouping[]) : undefined,
+    steps: Array.isArray(args.steps) ? (args.steps as StepDef[]) : undefined,
+    // BI-7: the joins travel to the builder as the model sent them.
+    joins: Array.isArray(args.joins) ? (args.joins as JoinDef[]) : undefined,
+    // BI-10: bins and the map grid travel to the builder as the model sent them.
+    bin: args.bin && typeof args.bin === "object" ? (args.bin as BinDef) : undefined,
+    breakdownBin: args.breakdownBin && typeof args.breakdownBin === "object" ? (args.breakdownBin as BinDef) : undefined,
+    grid: args.grid && typeof args.grid === "object" ? (args.grid as GridDef) : undefined,
+    // BI-13: the chart's other questions, and how its own series is drawn, travel to the builder as the model sent them.
+    layers: Array.isArray(args.layers) ? (args.layers as LayerDef[]) : undefined,
+    draw: args.draw === "bar" || args.draw === "line" ? args.draw : undefined,
+    axis: args.axis === "left" || args.axis === "right" ? args.axis : undefined,
   };
 }
 
@@ -72,7 +99,8 @@ export function ChartDraftCard({
   // `args` is rebuilt on every render; key the draft on its content so the
   // preview is fetched once per draft, not once per render.
   const argsKey = JSON.stringify(args);
-  const def = React.useMemo(() => chartDefFromArgs(JSON.parse(argsKey)), [argsKey]);
+  // BI-11: a parameter in a column slot arrives as { param } and is held as {name} text, as on the dashboard.
+  const def = React.useMemo(() => normalizeDef(chartDefFromArgs(JSON.parse(argsKey))) ?? {}, [argsKey]);
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -143,7 +171,7 @@ export function ChartDraftCard({
         ) : null}
         {def.dimension ? <span>by {def.dimension}</span> : null}
         {def.measures?.length ? (
-          <span>· {def.aggregate ?? "sum"}({def.measures.join(", ")})</span>
+          <span>· {def.aggregate ?? "sum"}({def.measures.map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : m.column)).join(", ")})</span>
         ) : null}
       </div>
 

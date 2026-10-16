@@ -105,6 +105,58 @@ pub enum SecretError {
         /// Which resolver rejected it.
         resolver: &'static str,
     },
+    /// The reference was understood and allowed, but its value could not be
+    /// read, for a reason a person can act on (`SRC-12` decision 12): the
+    /// stored file does not open with this installation's key, or a secret
+    /// manager refused or could not be reached.
+    ///
+    /// The text is [`SecretFailure`]'s fixed one and nothing else: never a
+    /// key, a value, a library's message or a secret manager's own words
+    /// (principle 4).
+    #[error("{failure}")]
+    Failed {
+        /// The reference, safe to log (a name, not a value). Deliberately
+        /// not part of the message: the text above is shown to users.
+        secret_ref: String,
+        /// What went wrong, as a fixed text.
+        failure: SecretFailure,
+    },
+}
+
+/// Why a [`SecretError::Failed`] read failed. Each variant is one fixed
+/// text (`SRC-12` decision 12); the same texts are listed in
+/// `lakehouse-api/tests/fixtures/secret_manager_refs.json`, which the
+/// orchestrator's tests also read, so the two sides cannot word them
+/// differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SecretFailure {
+    /// A stored (managed) credential file does not open with the key.
+    #[error("the stored credential cannot be decrypted with this installation's key")]
+    WrongKey,
+    /// The installation's key is missing or malformed.
+    #[error(
+        "this installation's connector secrets key is missing or invalid, so stored credentials cannot be read"
+    )]
+    KeyUnavailable,
+    /// The stored file is not in a format this build reads.
+    #[error("the stored credential file is not in a format this build reads")]
+    UnreadableFile,
+    /// The secret manager did not answer.
+    #[error("the secret manager cannot be reached")]
+    ManagerUnreachable,
+    /// The manager refused the product's own sign-in.
+    #[error("the product may not sign in to the secret manager")]
+    ManagerSignIn,
+    /// Nothing exists at the reference.
+    #[error("the referenced secret does not exist in the secret manager")]
+    ManagerNotFound,
+    /// The product signed in but may not read this secret.
+    #[error("the product may not read the referenced secret")]
+    ManagerForbidden,
+    /// The secret is binary, or has several parts, or the named key is not
+    /// a text.
+    #[error("the referenced secret is not a single text value")]
+    NotSingleText,
 }
 
 /// Resolves a `secretRef` string to a [`SecretValue`].
@@ -420,8 +472,21 @@ impl FileSecretResolver {
     }
 }
 
-impl SecretResolver for FileSecretResolver {
-    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+impl FileSecretResolver {
+    /// The raw bytes of the file `secret_ref` names, after the same
+    /// confinement checks [`SecretResolver::resolve`] applies (scheme,
+    /// canonical path under the base directory).
+    ///
+    /// Exists for `SRC-12` decision 4: a managed credential is stored
+    /// sealed (not text), so its resolver needs the bytes to open, and must
+    /// not grow a second copy of the confinement rule (AGENTS.md rule 4).
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError::UnsupportedRef`] for a wrong scheme or a path outside
+    /// the base directory; [`SecretError::NotFound`] if the file cannot be
+    /// read.
+    pub fn read_confined(&self, secret_ref: &str) -> Result<Vec<u8>, SecretError> {
         let Some(path) = secret_ref.strip_prefix(FILE_SECRET_REF_PREFIX) else {
             return Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -444,11 +509,21 @@ impl SecretResolver for FileSecretResolver {
                 resolver: "file",
             });
         }
-        let contents =
-            std::fs::read_to_string(&canonical_path).map_err(|_| SecretError::NotFound {
-                secret_ref: secret_ref.to_owned(),
-                resolver: "file",
-            })?;
+        std::fs::read(&canonical_path).map_err(|_| SecretError::NotFound {
+            secret_ref: secret_ref.to_owned(),
+            resolver: "file",
+        })
+    }
+}
+
+impl SecretResolver for FileSecretResolver {
+    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+        let bytes = self.read_confined(secret_ref)?;
+        // Not UTF-8 is "nothing usable here", as `read_to_string` reported.
+        let contents = String::from_utf8(bytes).map_err(|_| SecretError::NotFound {
+            secret_ref: secret_ref.to_owned(),
+            resolver: "file",
+        })?;
         Ok(SecretValue::new(contents.trim().to_owned()))
     }
 }

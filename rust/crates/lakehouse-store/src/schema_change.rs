@@ -383,7 +383,17 @@ pub struct InactiveColumn {
     /// when the orchestrator did not send it, and then the Schema tab marks
     /// nothing for this row.
     pub loaded_name: Option<String>,
+    /// Why it is inactive: `removed_at_source` (`SRC-8`, an approved removal)
+    /// or `excluded` (`SRC-11` decision D10: the user left it out of a table
+    /// that keeps its rows).
+    pub reason: String,
 }
+
+/// The inactive-column `reason` of an approved removal at the source.
+pub const REASON_REMOVED_AT_SOURCE: &str = "removed_at_source";
+
+/// The inactive-column `reason` of a column the user left out (`SRC-11`).
+pub const REASON_EXCLUDED: &str = "excluded";
 
 /// One change as [`ObservationTx::record`] left it, and whether this call
 /// created it.
@@ -604,7 +614,10 @@ impl<'p> ObservationTx<'p> {
             .bind(write.now)
             .execute(&mut *self.tx)
             .await?;
-            // A column accepted again is no longer inactive.
+            // A column accepted again is no longer inactive. Only a removal
+            // mark: the observation sees the whole source table, including a
+            // column the user left out, and that mark is the ingest-spec
+            // save's to clear (`SRC-11` D10, migration 0073).
             let names: Vec<&str> = write
                 .observed_columns
                 .iter()
@@ -612,7 +625,8 @@ impl<'p> ObservationTx<'p> {
                 .collect();
             sqlx::query(
                 "DELETE FROM connector_inactive_column \
-                 WHERE connector_id = $1 AND object_name = $2 AND column_name = ANY($3)",
+                 WHERE connector_id = $1 AND object_name = $2 AND column_name = ANY($3) \
+                   AND reason = 'removed_at_source'",
             )
             .bind(&self.connector_id)
             .bind(&self.object_name)
@@ -995,8 +1009,8 @@ pub async fn list_inactive_columns(
     pool: &PgPool,
     connector_id: &str,
 ) -> Result<Vec<InactiveColumn>, StoreError> {
-    let rows: Vec<(String, String, OffsetDateTime, Option<String>)> = sqlx::query_as(
-        "SELECT object_name, column_name, inactive_since, loaded_name \
+    let rows: Vec<(String, String, OffsetDateTime, Option<String>, String)> = sqlx::query_as(
+        "SELECT object_name, column_name, inactive_since, loaded_name, reason \
          FROM connector_inactive_column \
          WHERE connector_id = $1 ORDER BY object_name, column_name",
     )
@@ -1006,11 +1020,12 @@ pub async fn list_inactive_columns(
     Ok(rows
         .into_iter()
         .map(
-            |(object_name, column_name, at, loaded_name)| InactiveColumn {
+            |(object_name, column_name, at, loaded_name, reason)| InactiveColumn {
                 object_name,
                 column_name,
                 inactive_since: at.into(),
                 loaded_name,
+                reason,
             },
         )
         .collect())
@@ -1159,7 +1174,8 @@ async fn accept_waiting_shape(
     .execute(&mut *tx)
     .await?;
 
-    // An approved addition accepts the column again: not inactive.
+    // An approved addition accepts the column again: not inactive. Only a
+    // removal mark; a column the user left out stays out (`SRC-11` D10/D12).
     let added: Vec<&str> = approved
         .iter()
         .filter(|c| c.kind == "column_added")
@@ -1167,11 +1183,68 @@ async fn accept_waiting_shape(
         .collect();
     sqlx::query(
         "DELETE FROM connector_inactive_column \
-         WHERE connector_id = $1 AND object_name = $2 AND column_name = ANY($3)",
+         WHERE connector_id = $1 AND object_name = $2 AND column_name = ANY($3) \
+           AND reason = 'removed_at_source'",
     )
     .bind(connector_id)
     .bind(object_name)
     .bind(&added)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Make the `excluded` inactive marks match the ingest spec being saved
+/// (`SRC-11` decisions D10 and D12): every `(table, column)` in `wanted`
+/// (`ingest_spec::inactive_exclusions`) is marked, every `excluded` mark of
+/// the connector that is no longer wanted is cleared (the user ticked the
+/// column again, or the table now replaces its rows). A mark of another
+/// reason (an approved removal at the source) is never touched, and a column
+/// that already has one keeps it.
+///
+/// `loaded_name` is taken from the table's accepted shape when the
+/// orchestrator sent one, so the catalog's Schema tab can mark the Bronze
+/// column; a column never observed marks nothing there, as for a removal.
+/// Runs inside the ingest-spec save's transaction, so the spec and its marks
+/// are one decision.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if a statement fails.
+pub(crate) async fn sync_excluded_columns_in(
+    tx: &mut sqlx::PgConnection,
+    connector_id: &str,
+    wanted: &[(String, String)],
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let objects: Vec<&str> = wanted.iter().map(|(o, _)| o.as_str()).collect();
+    let columns: Vec<&str> = wanted.iter().map(|(_, c)| c.as_str()).collect();
+    sqlx::query(
+        "DELETE FROM connector_inactive_column ic \
+         WHERE ic.connector_id = $1 AND ic.reason = 'excluded' \
+           AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS d(o, c) \
+                           WHERE d.o = ic.object_name AND d.c = ic.column_name)",
+    )
+    .bind(connector_id)
+    .bind(&objects)
+    .bind(&columns)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO connector_inactive_column \
+           (connector_id, object_name, column_name, inactive_since, loaded_name, reason) \
+         SELECT $1, d.o, d.c, $4::timestamptz, ( \
+           SELECT e.value ->> 'loadedName' \
+           FROM connector_source_schema s, jsonb_array_elements(s.columns) e \
+           WHERE s.connector_id = $1 AND s.object_name = d.o AND e.value ->> 'name' = d.c \
+           LIMIT 1), 'excluded' \
+         FROM unnest($2::text[], $3::text[]) AS d(o, c) \
+         ON CONFLICT (connector_id, object_name, column_name) DO NOTHING",
+    )
+    .bind(connector_id)
+    .bind(&objects)
+    .bind(&columns)
+    .bind(now)
     .execute(&mut *tx)
     .await?;
     Ok(())

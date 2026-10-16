@@ -419,6 +419,8 @@ async fn approval_moves_the_baseline_marks_inactive_and_lifts_the_pause(
     let inactive = list_inactive_columns(&pool, &id).await.unwrap();
     assert_eq!(inactive.len(), 1);
     assert_eq!(inactive[0].column_name, "note");
+    // `SRC-11` (migration 0073): an approved removal keeps SRC-8's reason.
+    assert_eq!(inactive[0].reason, "removed_at_source");
     let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
     let accepted = tx.accepted().await.unwrap().unwrap();
     assert_eq!(accepted.columns, vec![col("id", "integer")]);
@@ -1477,6 +1479,114 @@ async fn a_column_removed_after_an_added_column_keeps_its_loaded_name_through_ap
     let marks = inactive_columns_of_table(&pool, "t_orders").await.unwrap();
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0].0, "qty");
+}
+
+/// Save `objects` as the connector's selection (the same `PostgreSQL` dial as
+/// `select_tables`).
+async fn save_objects(pool: &PgPool, id: &str, objects: serde_json::Value) {
+    set_ingest_spec(
+        pool,
+        id,
+        &IngestSpecInput {
+            adapter: "sql".to_owned(),
+            ingest_mode: "batch".to_owned(),
+            dial: serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "shop", "user": "reader",
+            }),
+            source_objects: objects,
+            schedule_cron: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// `SRC-11` D10: a column left out of a table that keeps its rows is marked
+/// inactive with its own reason when the spec is saved, carries the Bronze
+/// name the baseline knows, survives a before-load observation that sees the
+/// column at the source, and is cleared when the column is ticked again, when
+/// the table replaces its rows, or when the table leaves the selection.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_column_left_out_is_marked_inactive_and_cleared_when_ticked_again(pool: PgPool) {
+    use lakehouse_store::schema_change::inactive_columns_of_table;
+    let id = connector(&pool).await;
+    let append = |excluded: &[&str]| {
+        serde_json::json!([{
+            "name": "orders", "target": "t_orders", "loadMode": "append",
+            "excludedColumns": excluded
+        }])
+    };
+    let mut named = col("OrderDate", "date");
+    named.loaded_name = Some("order_date".to_owned());
+    let observed = [col("id", "integer"), named, col("note", "text")];
+    let observe = |accept: bool| {
+        let pool = pool.clone();
+        let id = id.clone();
+        let observed = observed.clone();
+        async move {
+            let mut tx = ObservationTx::begin(&pool, &id, "orders").await.unwrap();
+            tx.record(&ObservationWrite {
+                observed_columns: &observed,
+                observed_primary_key: &["id".to_owned()],
+                changes: &[],
+                accept_observed: accept,
+                pause_connector: false,
+                run_id: None,
+                now: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+    };
+    observe(true).await;
+
+    save_objects(&pool, &id, append(&["OrderDate", "note"])).await;
+    let listed = list_inactive_columns(&pool, &id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|c| c.reason == "excluded"));
+    let date = listed
+        .iter()
+        .find(|c| c.column_name == "OrderDate")
+        .unwrap();
+    assert_eq!(date.loaded_name.as_deref(), Some("order_date"));
+    let marks = inactive_columns_of_table(&pool, "t_orders").await.unwrap();
+    assert_eq!(
+        marks.len(),
+        1,
+        "the column with no Bronze name marks nothing"
+    );
+    assert_eq!(marks[0].0, "order_date");
+
+    // Ticking OrderDate again clears its mark only.
+    save_objects(&pool, &id, append(&["note"])).await;
+    let listed = list_inactive_columns(&pool, &id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].column_name, "note");
+
+    // The before-load observation sees `note` at the source and accepts the
+    // shape: that is not "the column came back", the mark stays.
+    observe(true).await;
+    assert_eq!(list_inactive_columns(&pool, &id).await.unwrap().len(), 1);
+
+    // A table that replaces its rows has no column left to mark.
+    save_objects(
+        &pool,
+        &id,
+        serde_json::json!([{
+            "name": "orders", "target": "t_orders", "loadMode": "replace",
+            "excludedColumns": ["note"]
+        }]),
+    )
+    .await;
+    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+
+    // A table taken out of the selection takes its marks with it.
+    save_objects(&pool, &id, append(&["note"])).await;
+    assert_eq!(list_inactive_columns(&pool, &id).await.unwrap().len(), 1);
+    save_objects(&pool, &id, serde_json::json!([])).await;
+    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
 }
 
 // --- SRC-21: the pause and a key column's pending removal (SRC-10 x SRC-16) ---

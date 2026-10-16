@@ -17,6 +17,7 @@ import { notifySuccess } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { ConnectorDependent } from "@/services/contracts/connectors"
 import { ServiceError } from "@/services/errors"
+import { signOutWarning } from "./connector-oauth-panel"
 
 /**
  * Deleting a connector, with the two refusals the API can answer spelled
@@ -35,12 +36,19 @@ export function ConnectorDeleteDialog({
   open,
   onOpenChange,
   onDeleted,
+  oauth = null,
 }: {
   connector: { id: string; name: string }
   dependents: ConnectorDependent[]
   open: boolean
   onOpenChange: (open: boolean) => void
   onDeleted: () => void
+  /**
+   * Set for a connector that signs in with OAuth (`SRC-12` part C, decision 8):
+   * whether its dial names a revocation address decides what the dialog says
+   * about the provider's copy of the token.
+   */
+  oauth?: { revocationConfigured: boolean } | null
 }) {
   // Set once the user moves on to a forced delete, so the refusal that
   // prompted it stays on screen while the forced attempt runs.
@@ -128,7 +136,11 @@ export function ConnectorDeleteDialog({
       onOpenChange={close}
       title={`Delete ${connector.name}?`}
       description="The connector and the credential stored for it are removed. This cannot be undone."
-      impact="A CDC connector's replication slot and publication are dropped on the source database first."
+      impact={
+        oauth
+          ? `${signOutWarning(oauth.revocationConfigured)} A CDC connector's replication slot and publication are dropped on the source database first.`
+          : "A CDC connector's replication slot and publication are dropped on the source database first."
+      }
       confirmLabel="Delete"
       destructive
       confirming={remove.status === "pending"}

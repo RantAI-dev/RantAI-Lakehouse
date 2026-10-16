@@ -1,0 +1,307 @@
+[
+ {
+  "id": "inventory",
+  "completeness": 0.25,
+  "accuracy": 1.0,
+  "experience": 0.6,
+  "overall": 0.62,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": [
+   "layer=bronze",
+   "layer=silver",
+   "layer=gold"
+  ]
+ },
+ {
+  "id": "total_foreign_2024",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 1.0,
+  "overall": 1.0,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "top3_countries",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.6,
+  "overall": 0.92,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "yoy_growth",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 1.0,
+  "overall": 1.0,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "peak_month_2024",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.6,
+  "overall": 0.92,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "top_attraction",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 1.0,
+  "overall": 1.0,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "foreign_share",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.6,
+  "overall": 0.92,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "events_trend",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 1.0,
+  "overall": 1.0,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "gci_missing",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "culinary_top_id",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "did not answer in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "schema_foreign",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "poi_atlas",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.96,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "neg_hotel_revenue",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "neg_year_out_of_range",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.96,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "lineage_foreign",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.48,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": [
+   "layer=bronze",
+   "layer=silver",
+   "layer=gold"
+  ]
+ },
+ {
+  "id": "quality_status",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.96,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "failing_pipelines",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.48,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": [
+   "failed pipeline=Main"
+  ]
+ },
+ {
+  "id": "connectors_empty",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.96,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "alert_rules_empty",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "dashboards_list",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.56,
+  "problems": [],
+  "missing": [
+   "board=Main"
+  ]
+ },
+ {
+  "id": "followup_compare",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "cdc_health",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.96,
+  "problems": [],
+  "missing": []
+ },
+ {
+  "id": "build_chart",
+  "completeness": 1.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.88,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": []
+ },
+ {
+  "id": "iceberg_tables",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.56,
+  "problems": [],
+  "missing": [
+   "namespace=Main",
+   "gold iceberg table=Main"
+  ]
+ },
+ {
+  "id": "storage_capacity",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.48,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": [
+   "bucket=Main"
+  ]
+ },
+ {
+  "id": "lineage_gold_mart",
+  "completeness": 0.5,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.76,
+  "problems": [],
+  "missing": [
+   "export=iceberg"
+  ]
+ },
+ {
+  "id": "build_rebuild",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.4,
+  "overall": 0.48,
+  "problems": [
+   "answered an English question in Indonesian"
+  ],
+  "missing": [
+   "tool=trigger_lakehouse_build{}"
+  ]
+ },
+ {
+  "id": "build_pipeline_draft",
+  "completeness": 0.0,
+  "accuracy": 1.0,
+  "experience": 0.8,
+  "overall": 0.56,
+  "problems": [],
+  "missing": [
+   "tool=create_pipeline{'sourceTable': 'event_tahunan'}"
+  ]
+ }
+]

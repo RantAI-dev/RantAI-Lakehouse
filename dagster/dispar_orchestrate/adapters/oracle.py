@@ -77,6 +77,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from dlt.sources.sql_database import sql_database
+from sqlalchemy.dialects.oracle.oracledb import OracleDialect_oracledb
 
 from dispar_orchestrate import ssrf_guard
 
@@ -93,21 +94,26 @@ class AdapterBuildResult:
     resolved: ssrf_guard.ResolvedAddress
 
 
-def build_source(
+def connection_parts(
     spec: dict,
     secrets: dict[str, str],
-    source_objects: list[dict],
     *,
     resolve_checked=ssrf_guard.resolve_checked,
-    table_adapter_callback=None,
-) -> AdapterBuildResult:
-    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
-    calls it with each reflected table while the source is built, which is
-    below, inside `checking_resolver()` and over the checked IP literal -- the
-    observation reads the columns from that reflection and opens no
-    connection of its own."""
+) -> tuple[dict[str, Any], dict[str, Any], ssrf_guard.ResolvedAddress]:
+    """The SQLAlchemy `credentials` and `engine_kwargs` for this dial, and the
+    address `resolve_checked` approved: everything about the connection that the
+    module docstring's SSRF and TLS paragraphs describe, in one place. Shared by
+    `build_source` and the table discovery (`discover.py`, SRC-13), so a listing
+    dials exactly as a load does: the checked IP literal, the service name, the
+    operator's certificate DN. The caller opens the connection inside
+    `ssrf_guard.checking_resolver()`.
+
+    # Errors
+
+    `OracleTlsConfigError` when `sslMode` requires TLS and `sslServerCertDn` is
+    unset; whatever `resolve_checked` raises for a blocked host.
+    """
     resolved = resolve_checked(spec["host"], spec["port"])
-    table_names = [obj["name"].split(".")[-1] for obj in source_objects]
 
     tls_required = bool(spec.get("sslMode")) and spec["sslMode"] != "disable"
     engine_kwargs: dict[str, Any] = {}
@@ -140,8 +146,44 @@ def build_source(
         # `database` stays unset because the dialect refuses both together.
         "query": {"service_name": spec["database"]},
     }
+    return credentials, engine_kwargs, resolved
+
+
+def build_source(
+    spec: dict,
+    secrets: dict[str, str],
+    source_objects: list[dict],
+    *,
+    resolve_checked=ssrf_guard.resolve_checked,
+    table_adapter_callback=None,
+) -> AdapterBuildResult:
+    """`table_adapter_callback` (SRC-8, `schema_observer.py`): `sql_database`
+    calls it with each reflected table while the source is built, which is
+    below, inside `checking_resolver()` and over the checked IP literal -- the
+    observation reads the columns from that reflection and opens no
+    connection of its own."""
+    credentials, engine_kwargs, resolved = connection_parts(spec, secrets, resolve_checked=resolve_checked)
+    # SRC-13: the listing (`discover.py`) returns Oracle's own spelling, `EMPLOYEES`. SQLAlchemy's Oracle
+    # dialect reports an all-upper-case name in lower case ("lower case is the case-insensitive spelling") and
+    # `MetaData.reflect(only=[...])` refuses a name that is not in that list, so `EMPLOYEES` would not load
+    # while `employees` does. The dialect's own `normalize_name` maps one to the other, so what is listed loads.
+    normalize = OracleDialect_oracledb().normalize_name
+    table_names = [normalize(obj["name"].split(".")[-1]) for obj in source_objects]
+    # SRC-13 review 1 SHOULD-FIX 1 (D5: the listing offers every schema the user
+    # can read): the object's `SCHEMA.TABLE` names the OWNER to read from. Before,
+    # only the table part was kept and `sql_database` read the login's own schema,
+    # so a table listed from another schema did not load (or loaded a same-named
+    # table of the login's own). `sql_database` takes one `schema` per source, and
+    # a load builds one source per object, so objects of two schemas in one call
+    # are refused rather than half-loaded. A bare `TABLE` keeps the login's schema.
+    schemas = {obj["name"].rpartition(".")[0] for obj in source_objects} - {""}
+    if len(schemas) > 1:
+        raise ValueError("oracle build_source reads one schema per call; got " + ", ".join(sorted(schemas)))
+    schema_kwargs: dict[str, Any] = {"schema": next(iter(schemas))} if schemas else {}
+
     with ssrf_guard.checking_resolver():
         extra = {} if table_adapter_callback is None else {"table_adapter_callback": table_adapter_callback}
+        extra.update(schema_kwargs)
         source = sql_database(
             credentials=credentials, table_names=table_names, engine_kwargs=engine_kwargs, **extra
         )

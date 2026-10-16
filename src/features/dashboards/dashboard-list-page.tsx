@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { ChevronDown, Folder, FolderCog, LayoutGrid, PlusIcon, Rows3 } from "lucide-react"
+import { ChevronDown, Folder, FolderCog, LayoutGrid, PlusIcon, Rows3, Sigma } from "lucide-react"
 
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
@@ -489,6 +489,10 @@ export function DashboardListPage() {
             trailing={
               <div className="flex items-center gap-2">
                 {viewToggle}
+                <Button variant="outline" size="sm" render={<Link href="/dashboards/metrics" />}>
+                  <Sigma data-icon="inline-start" />
+                  Metrics
+                </Button>
                 {canFile ? (
                   <Button variant="outline" size="sm" onClick={() => setFoldersOpen(true)}>
                     <FolderCog data-icon="inline-start" />

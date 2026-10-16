@@ -21,7 +21,7 @@ const TONE: Record<KpiReading["tone"], string> = {
  * Colour is never the only cue: the arrow and the sign say the same.
  */
 export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; readonly cell: Rows; readonly caption?: string }) {
-  const r = readKpi(cell.rows, def.compare, def.goodDirection);
+  const r = readKpi(cell.rows, def.compare, def.goodDirection, typeof cell.grain === "string" ? cell.grain : undefined);
   // R4: one convention for the value and its change, the charts' (`decimalsFor`).
   const dec = decimalsFor([r.value ?? 0, r.reference ?? 0, r.delta ?? 0, ...r.series]);
   const grain = isGrain(cell.grain) ? cell.grain : null;
@@ -30,7 +30,7 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; 
   return (
     <div className="grid h-full place-content-center px-2 text-center">
       <p className="text-4xl font-semibold tabular-nums text-foreground">{r.value === null ? "—" : formatNumber(r.value, dec)}</p>
-      {r.mode === "previous" && r.value !== null ? (
+      {(r.mode === "previous" || r.mode === "last_year") && r.value !== null ? (
         <p className="mt-0.5 text-xs text-muted-foreground">{label(r.valueBucket)}</p>
       ) : null}
       {r.delta !== null ? (
@@ -48,8 +48,14 @@ export function KpiCard({ def, cell, caption }: { readonly def: TableDefFields; 
             </span>
           )}
         </p>
-      ) : r.mode === "previous" && r.value !== null ? (
-        <p className="mt-1 text-xs text-muted-foreground">No earlier period to compare with.</p>
+      ) : (r.mode === "previous" || r.mode === "last_year") && r.value !== null ? (
+        <p className="mt-1 text-xs text-muted-foreground">{r.mode === "last_year" ? "No data a year earlier." : "No earlier period to compare with."}</p>
+      ) : null}
+      {r.mode === "last_year" && r.previous ? (
+        <p className={cn("mt-0.5 inline-flex items-center justify-center gap-1 text-xs font-medium tabular-nums", TONE[r.previous.tone])} aria-label="Change against the previous period">
+          {signedAmount(r.previous.delta, dec)}{r.previous.percent !== null ? ` (${signedPercent(r.previous.percent)})` : ""}
+          <span className="font-normal text-muted-foreground"> vs {label(r.previous.bucket)}</span>
+        </p>
       ) : null}
       {r.series.length > 1 ? (
         <svg viewBox="0 0 120 28" role="img" aria-label="Trend over the last periods" className={cn("mx-auto mt-2 h-7 w-32", TONE[r.tone])}>

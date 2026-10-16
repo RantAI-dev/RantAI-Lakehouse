@@ -159,3 +159,25 @@ test("a chart with no grain keeps reading the clicked name as the stored value",
   const spec: ClickSpec = { kind: "bar", source: "ui", dimension: "kab", y: "v" }
   assert.deepEqual(drillTarget(spec, { name: "Bandung" }), { column: "kab", value: "Bandung" })
 })
+
+// BI-6: the computed "Other" group is not one stored value.
+test("a click on the computed Other group names no value, while the same label elsewhere still does", () => {
+  const bar = spec("bar", { dimension: "kab" })
+  const hit = { name: "Other (rest)", dataIndex: 3 }
+  assert.equal(drillTarget(bar, hit, { otherLabels: new Set(["Other (rest)"]) }), null)
+  assert.deepEqual(drillTarget(bar, { name: "Other" }, { otherLabels: new Set(["Other (rest)"]) }), { column: "kab", value: "Other" })
+  assert.deepEqual(drillTarget(bar, hit, {}), { column: "kab", value: "Other (rest)" })
+})
+
+test("a click on a bin names the bin's lower edge, the width and the label the person read", () => {
+  const rows = [{ region: 0, n: 1 }, { region: 500, n: 2 }]
+  const labelled = [{ region: "0 – 500", n: 1 }, { region: "500 – 1,000", n: 2 }]
+  const bin = { width: 500, max: 970 }
+  assert.deepEqual(
+    drillTarget(spec("bar"), { name: "500 – 1,000" }, { rows, labelledRows: labelled, bin }),
+    { column: "region", value: "500", label: "500 – 1,000", bin },
+  )
+  // A label no row has, and an empty bin, name nothing.
+  assert.equal(drillTarget(spec("bar"), { name: "9 – 10" }, { rows, labelledRows: labelled, bin }), null)
+  assert.equal(drillTarget(spec("bar"), { name: "x" }, { rows: [{ region: null }], labelledRows: [{ region: "x" }], bin }), null)
+})

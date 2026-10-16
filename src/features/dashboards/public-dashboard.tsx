@@ -6,6 +6,7 @@ import Image from "next/image";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
+import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
 import type { TileFailure } from "@/services/contracts/dashboards";
@@ -76,6 +77,8 @@ export function PublicDashboard({ token }: { token: string }) {
     id: spec.id,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
+    // BI-6: the chart's own filters, listed (the viewer cannot change them).
+    hint: ownFilters(spec) ? <OwnFiltersMarker filters={ownFilters(spec) ?? []} /> : null,
     body: <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} />,
   }));
 
