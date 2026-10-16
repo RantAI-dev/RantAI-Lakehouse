@@ -348,6 +348,14 @@ Each one is proven before the task that relies on it, and quoted in the handoff.
 A "no" stops the task and is reported to the planner.
 
 1. RustFS accepts S3 multipart create, part, complete, abort and list through `object_store` 0.14, with 8 MiB parts, and a part number sent twice keeps the last copy.
+   **Answered for RustFS by the planner, 2026-10-16, with `botocore` (not yet through `object_store`).** The probe ran against a throwaway `rustfs/rustfs:1.0.0-rc.4` container (the compose image) with run-time credentials; the container was removed afterwards. Results:
+   - Parts sent out of order (2, then 1, then 1 again) completed. The object held the **last** copy of part 1 (SHA-256 compared), and `list_parts` showed `(1, 8388608), (2, 3145745)`.
+   - A ranged read of the first 64 KiB of the completed object matched.
+   - A non-last part of 1 MiB was refused at completion with `EntityTooSmall`, so pieces must be at least 5 MiB, and 8 MiB is right.
+   - After `abort`, `list_parts` answered `NoSuchUpload`, the object was absent, and the upload no longer appeared in `list_multipart_uploads`.
+   - Completing with a part number never sent was refused with `InvalidPart`.
+
+   What is left for T1.2 is the same sequence through `object_store`'s `MultipartStore`.
 2. The Next.js rewrite passes an 8 MiB `PUT` with an `application/octet-stream` body unchanged (`next dev` against the API).
 3. Peak memory of the console's proxy while 4 pieces are in flight. The proxy keeps a copy of each body, by reading: expect about 4 × 8 MiB per user, and measure it.
 4. dlt 1.30: a generator that raises during extract leaves the table untouched, and the next run starts clean (`_abort_pending`, `adapters/sink.py`).
