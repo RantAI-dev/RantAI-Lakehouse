@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Data (Sources) |
 | Backlog | `DATA-9` |
-| Status | In Acceptance for CSV and text (#71, #73); checklist not run. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 and Parquet files 2026-10-08 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions not yet signed) |
+| Status | In Acceptance for CSV and text (#71, #73); checklist not run. Decisions signed 2026-10-02; Excel workbooks added 2026-10-07 and Parquet files 2026-10-08 (plan `docs/superpowers/plans/2026-10-07-upload-excel.md`, decisions 10 and 11 signed 2026-10-16) |
 | Plan | `docs/superpowers/plans/2026-10-02-upload-file.md` |
 
 ## Problem
@@ -77,8 +77,8 @@ table once it is loaded.
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Which files are accepted | Delimited text: UTF-8 or UTF-16; comma, semicolon, tab or pipe | Product owner, 2026-10-02 |
-| 10 | Excel workbooks | `.xls` and `.xlsx`, one sheet per load, converted to text in the API as described under "How a workbook is read" | Asked for by the product owner, 2026-10-07; the conversion rules are the planner's defaults, to be signed |
-| 11 | Parquet files | `.parquet`, the file's one table, converted to text in the API as described under "How a Parquet file is read"; every column text; binary and nested columns refused | Asked for by the product owner, 2026-10-08; the conversion rules are the planner's defaults, to be signed |
+| 10 | Excel workbooks | `.xls` and `.xlsx`, one sheet per load, converted to text in the API as described under "How a workbook is read" | Asked for by the product owner, 2026-10-07; the conversion rules signed 2026-10-16 by the product owner, as `DATA-17` decision 15 |
+| 11 | Parquet files | `.parquet`, the file's one table, converted to text in the API as described under "How a Parquet file is read"; every column text; binary and nested columns refused | Asked for by the product owner, 2026-10-08; the conversion rules signed 2026-10-16 by the product owner, as `DATA-17` decision 15 |
 | 2 | Size limits | 50 MB and 2,000,000 rows per file. Over either, the file is refused, not cut short | Product owner, 2026-10-02 |
 | 3 | Where it sits | A button and an "Uploaded files" tab on Sources; a link from "New Connector" | Product owner, 2026-10-02 |
 | 4 | Who may upload | Holders of the existing `connector:manage` permission (Data Engineer, Platform Admin). No new permission | Product owner, 2026-10-02 |
