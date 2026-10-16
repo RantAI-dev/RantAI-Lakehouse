@@ -141,3 +141,44 @@ exactly one `Day` transform on `_ingested_at`, and that the namespace
 resolves to the flat `bronze` string. The G1 test additionally proves the
 naming/partitioning convention holds against a real Lakekeeper-registered
 table on both the Rust-write and `ClickHouse`-write paths.
+
+## Addendum (2026-10-15, OPS-1)
+
+### Context
+
+Bronze snapshot retention remained open following P1b and P4. ClickHouse 26.8
+refuses `expire_snapshots` on catalog-backed Iceberg tables
+(`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`). Without a default retention
+policy, tables without explicit governance policies accumulated snapshots
+indefinitely.
+
+### Decision
+
+1. `bronze_maintenance_job` (`dagster/dispar_orchestrate/maintenance.py`)
+   applies a default snapshot retention floor of 7 days
+   (`DEFAULT_SNAPSHOT_RETENTION = "7d"`) to any Bronze table that has no
+   governance policy or whose policy leaves `snapshotsToKeep` unset (`None`).
+2. Snapshot expiration is dispatched to Trino using
+   `ALTER TABLE iceberg.{namespace}."{name}" EXECUTE expire_snapshots(retention_threshold => '7d')`.
+3. Tables with an explicit `snapshotsToKeep: N` continue to compute a
+   retention threshold from the timestamp of the Nth newest snapshot.
+4. If Trino is unreachable or down (or the `trino` profile is not enabled),
+   snapshot expiry is skipped cleanly with a warning logged; it does not fail
+   the maintenance job.
+
+### Consequences
+
+- Deployments with the `trino` profile active bound snapshot growth at 7 days
+  without requiring manual table-by-table policy configuration.
+- Deployments without the `trino` profile accumulate snapshots until Trino is
+  started or Lakekeeper gains native retention support.
+- Custom policies configuring `snapshotsToKeep` retain precedence.
+
+### Verification
+
+- Unit and integration tests in `dagster/dispar_orchestrate/test_maintenance.py`:
+  - `test_table_without_policy_expires_snapshots_older_than_seven_days`
+  - `test_table_without_policy_records_trino_unreachable_as_skipped`
+  - `test_table_without_policy_records_a_trino_refusal_as_refused`
+  - `test_policy_with_no_snapshots_to_keep_uses_default_retention`
+  - `test_policy_with_snapshots_to_keep_still_uses_its_own_threshold`

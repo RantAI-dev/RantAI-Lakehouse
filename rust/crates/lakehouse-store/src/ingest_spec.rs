@@ -177,7 +177,43 @@ pub enum RestAuth {
     #[serde(rename = "oauth2_client_credentials")]
     Oauth2ClientCredentials {
         /// The token endpoint URL to exchange credentials at.
+        ///
+        /// `SRC-12` part C: the wire name is `tokenUrl`, the one the console
+        /// and `adapters/rest.py` use. The enum-level `rename_all` renames
+        /// variants, not the fields of a variant, so without this rename the
+        /// field only parsed as `token_url` and a dial written by the console
+        /// was refused. `token_url` stays accepted for a row written that way.
+        #[serde(rename = "tokenUrl", alias = "token_url")]
         token_url: String,
+    },
+    /// `OAuth2` authorization-code grant with PKCE (`S256`; `SRC-12` part C,
+    /// decision 6). A person signs in at the provider once; the refresh token
+    /// the provider returns is the connector's secondary credential (sealed,
+    /// part A) and the client secret its primary one (`secret_field_names`).
+    ///
+    /// Every address here is configuration, not a secret. `token_url` and
+    /// `revocation_url` are dialled by the product and receive the client
+    /// secret and the refresh token, so they are part of the target identity
+    /// ([`Dial::target_identity`]); `authorize_url` is only handed to the
+    /// person's browser.
+    #[serde(rename = "oauth2_authorization_code")]
+    Oauth2AuthorizationCode {
+        /// The app's client id (public by the protocol's definition).
+        #[serde(rename = "clientId")]
+        client_id: String,
+        /// The provider's sign-in page. Opened by the browser, never dialled
+        /// by the product.
+        #[serde(rename = "authorizeUrl")]
+        authorize_url: String,
+        /// The provider's token endpoint.
+        #[serde(rename = "tokenUrl")]
+        token_url: String,
+        /// The provider's revocation endpoint (RFC 7009), when it has one.
+        #[serde(rename = "revocationUrl", default)]
+        revocation_url: Option<String>,
+        /// The scopes asked for, each one a single token.
+        #[serde(default)]
+        scopes: Vec<String>,
     },
     /// HTTP Basic authentication.
     Basic,
@@ -193,6 +229,7 @@ impl RestAuth {
             RestAuth::ApiKey { .. } => "api_key",
             RestAuth::Bearer => "bearer",
             RestAuth::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
+            RestAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
             RestAuth::Basic => "basic",
         }
     }
@@ -507,7 +544,11 @@ impl Dial {
                 Ok(Dial::Sftp(dial))
             }
             "files" => Ok(Dial::Files(parse_dial(adapter, raw)?)),
-            "rest" => Ok(Dial::Rest(parse_dial(adapter, raw)?)),
+            "rest" => {
+                let dial: RestDial = parse_dial(adapter, raw)?;
+                validate_rest_dial_post_parse(adapter, &dial)?;
+                Ok(Dial::Rest(dial))
+            }
             "sheets" => Ok(Dial::Sheets(parse_dial(adapter, raw)?)),
             other => Err(IngestSpecError::UnknownAdapter {
                 adapter: other.to_owned(),
@@ -657,7 +698,33 @@ impl Dial {
                 ],
             ),
             Dial::Rest(rest) => {
-                TargetIdentity::new("rest", vec![("baseUrl", origin_key(&rest.base_url))])
+                let mut parts = vec![("baseUrl", origin_key(&rest.base_url))];
+                // `SRC-12` part C: the token and revocation addresses receive
+                // the client secret and the refresh token, so moving either to
+                // another host is a re-point exactly as moving `baseUrl` is
+                // (`SEC-14`). A client-credentials connector's `tokenUrl` was
+                // not compared before; it is now, for the same reason.
+                match &rest.auth {
+                    RestAuth::Oauth2ClientCredentials { token_url } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                    }
+                    RestAuth::Oauth2AuthorizationCode {
+                        token_url,
+                        revocation_url,
+                        ..
+                    } => {
+                        parts.push(("tokenUrl", origin_key(token_url)));
+                        parts.push((
+                            "revocationUrl",
+                            revocation_url
+                                .as_deref()
+                                .map(origin_key)
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+                }
+                TargetIdentity::new("rest", parts)
             }
             Dial::Mongo(mongo) => TargetIdentity::new(
                 "mongodb",
@@ -885,6 +952,95 @@ fn split_host_port<'a>(
     }
 }
 
+/// The longest `OAuth2` address, client id or scope accepted.
+const MAX_OAUTH_FIELD_LEN: usize = 2048;
+/// The most scopes a dial may ask for.
+const MAX_OAUTH_SCOPES: usize = 50;
+
+/// Whether `value` is an `http(s)://` address with a host, no user name or
+/// password and no whitespace or control character. The scheme is not
+/// narrowed to `https` here: the store does not know the installation's
+/// settings. The API refuses `http` unless the operator's gate-only switch
+/// allows it (`routes::connectors::check_dial_ssrf`), and the orchestrator
+/// applies the same rule when it dials.
+fn is_plain_http_address(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+        && value.len() <= MAX_OAUTH_FIELD_LEN
+}
+
+/// Post-deserialize validation for a [`RestDial`]: the `OAuth2` addresses and
+/// names serde cannot check (`SRC-12` part C).
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] for an `OAuth2` address that is
+/// not a plain `http(s)` address, an empty or oversized client id, or a scope
+/// that is not a single token.
+fn validate_rest_dial_post_parse(adapter: &str, dial: &RestDial) -> Result<(), IngestSpecError> {
+    let refuse = |message: &str| IngestSpecError::InvalidDial {
+        adapter: adapter.to_owned(),
+        source: serde::de::Error::custom(message.to_owned()),
+    };
+    match &dial.auth {
+        RestAuth::Oauth2ClientCredentials { token_url } => {
+            if !is_plain_http_address(token_url) {
+                return Err(refuse(
+                    "auth.tokenUrl must be an http(s):// address with a host and no user name or password",
+                ));
+            }
+        }
+        RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            authorize_url,
+            token_url,
+            revocation_url,
+            scopes,
+        } => {
+            if client_id.trim().is_empty()
+                || client_id.len() > MAX_OAUTH_FIELD_LEN
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(refuse("auth.clientId must be a non-empty name"));
+            }
+            for (field, value) in [
+                ("auth.authorizeUrl", Some(authorize_url)),
+                ("auth.tokenUrl", Some(token_url)),
+                ("auth.revocationUrl", revocation_url.as_ref()),
+            ] {
+                if value.is_some_and(|v| !is_plain_http_address(v)) {
+                    return Err(refuse(&format!(
+                        "{field} must be an http(s):// address with a host and no user name or password"
+                    )));
+                }
+            }
+            if scopes.len() > MAX_OAUTH_SCOPES
+                || scopes.iter().any(|scope| {
+                    scope.is_empty()
+                        || scope.len() > MAX_OAUTH_FIELD_LEN
+                        || scope
+                            .chars()
+                            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+                })
+            {
+                return Err(refuse(
+                    "auth.scopes must be a short list of single-word scopes",
+                ));
+            }
+        }
+        RestAuth::ApiKey { .. } | RestAuth::Bearer | RestAuth::Basic => {}
+    }
+    Ok(())
+}
+
 /// Post-deserialize application-level validation for an [`SqlDial`]:
 /// the rules serde cannot express declaratively.
 ///
@@ -1036,6 +1192,13 @@ pub struct SourceObject {
     /// can hold on to a detected key while the user switches modes.
     #[serde(default)]
     pub primary_key: Option<Vec<String>>,
+    /// The columns of the source table the load leaves out (`SRC-11`
+    /// decisions D9 to D12). Stored as what is left OUT, not what is kept, so
+    /// a column that appears at the source later follows the connector's
+    /// schema-change policy instead of being left out silently. Absent or
+    /// empty: nothing is left out. See [`validate_excluded_columns`].
+    #[serde(default)]
+    pub excluded_columns: Option<Vec<String>>,
     /// The Bronze target this object lands at.
     pub target: String,
 }
@@ -1239,6 +1402,198 @@ pub fn validate_load_modes(
         }
     }
     Ok(())
+}
+
+/// The most columns an object may leave out (`SRC-11`); generous for any
+/// table.
+const MAX_EXCLUDED_COLUMNS: usize = 2000;
+
+/// Why a source object's `excludedColumns` cannot be saved (`SRC-11`
+/// decisions D9 and D11). The route answers [`Self::BadList`] with 400 and the
+/// others with 422; every text is fixed, and names only the object and a
+/// column the request itself named.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidExcludedColumns {
+    /// Not a list of at most 2,000 distinct, non-blank column names of at
+    /// most 128 characters without control characters.
+    #[error(
+        "source object {name:?} has an excludedColumns that is not a list of distinct, \
+         non-blank column names of at most 128 characters without control characters"
+    )]
+    BadList {
+        /// The source object's name.
+        name: String,
+    },
+    /// The source cannot list its columns before loading (`SRC-11` decision
+    /// D9): only `PostgreSQL`, `MySQL`, `MariaDB` and SQL Server can.
+    #[error(
+        "source object {name:?} leaves columns out, which is not available for this source type"
+    )]
+    NotForSource {
+        /// The source object's name.
+        name: String,
+    },
+    /// A key column of a deduplicating or history table (`SRC-11` decision
+    /// D11): the table cannot identify its rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is part of the table's key")]
+    NamesKeyColumn {
+        /// The source object's name.
+        name: String,
+        /// The key column that was named.
+        column: String,
+    },
+    /// The cursor column of an incremental table (`SRC-11` decision D11): the
+    /// load cannot find new rows without it.
+    #[error("source object {name:?} cannot leave out {column:?}: it is the cursor column")]
+    NamesCursorColumn {
+        /// The source object's name.
+        name: String,
+        /// The cursor column that was named.
+        column: String,
+    },
+}
+
+/// Whether the dial's source can list its columns before loading, so that
+/// column choice is offered for it (`SRC-11` decision D9): the `sql` adapter
+/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver. Oracle
+/// follows with `SRC-13`; change-capture and every other adapter are out.
+#[must_use]
+pub const fn supports_column_choice(dial: &Dial) -> bool {
+    matches!(
+        dial,
+        Dial::Sql(SqlDial {
+            driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
+            ..
+        })
+    )
+}
+
+/// `object`'s `excludedColumns` as names, `Ok(None)` when absent, null or
+/// empty (nothing left out).
+fn excluded_names(
+    object: &serde_json::Value,
+    name: &str,
+) -> Result<Option<Vec<String>>, InvalidExcludedColumns> {
+    let bad = || InvalidExcludedColumns::BadList {
+        name: name.to_owned(),
+    };
+    let list = match object.get("excludedColumns") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(list)) => list,
+        Some(_) => return Err(bad()),
+    };
+    if list.len() > MAX_EXCLUDED_COLUMNS {
+        return Err(bad());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::with_capacity(list.len());
+    for column in list {
+        let Some(column) = column.as_str() else {
+            return Err(bad());
+        };
+        if column.trim().is_empty()
+            || column.len() > MAX_PRIMARY_KEY_COLUMN_LEN
+            || column.chars().any(char::is_control)
+            || !seen.insert(column)
+        {
+            return Err(bad());
+        }
+        names.push(column.to_owned());
+    }
+    Ok((!names.is_empty()).then_some(names))
+}
+
+/// Check each source object's `excludedColumns` at save time (`SRC-11`
+/// decisions D9 to D11): well-formed, only for a source that can list its
+/// columns ([`supports_column_choice`]), and never naming a key column of a
+/// deduplicating or history table or the cursor column of an incremental one.
+///
+/// What this cannot check is that a named column exists: the columns are
+/// read from the source at load time, and a name the source does not have
+/// simply leaves nothing out.
+///
+/// # Errors
+///
+/// Returns [`InvalidExcludedColumns`] for the first object that breaks a rule.
+pub fn validate_excluded_columns(
+    dial: &Dial,
+    source_objects: &serde_json::Value,
+) -> Result<(), InvalidExcludedColumns> {
+    for object in source_objects.as_array().into_iter().flatten() {
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(excluded) = excluded_names(object, name)? else {
+            continue;
+        };
+        if !supports_column_choice(dial) {
+            return Err(InvalidExcludedColumns::NotForSource {
+                name: name.to_owned(),
+            });
+        }
+        let mode = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok());
+        if mode.is_some_and(LoadMode::needs_key) {
+            let key = object
+                .get("primaryKey")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str);
+            for column in key {
+                if excluded.iter().any(|e| e == column) {
+                    return Err(InvalidExcludedColumns::NamesKeyColumn {
+                        name: name.to_owned(),
+                        column: column.to_owned(),
+                    });
+                }
+            }
+        }
+        if mode.is_some_and(LoadMode::is_incremental) {
+            let cursor = object
+                .get("incrementalKey")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if excluded.iter().any(|e| e == cursor) {
+                return Err(InvalidExcludedColumns::NamesCursorColumn {
+                    name: name.to_owned(),
+                    column: cursor.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `(object, column)` pairs that are to be marked inactive: the columns
+/// left out of a table that KEEPS its rows (`append`, `incremental`,
+/// `incremental_dedup`, `history`), where a left-out column stays in the
+/// Bronze table with no new values (`SRC-11` decision D10). In a table the
+/// next load replaces (`replace`, `replace_dedup`, or no mode) the column is
+/// gone after the load and nothing is marked. Lenient like [`dedup_keys`]:
+/// a stored spec has passed [`validate_excluded_columns`].
+#[must_use]
+pub fn inactive_exclusions(source_objects: &serde_json::Value) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for object in source_objects.as_array().into_iter().flatten() {
+        let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let keeps_rows = object
+            .get("loadMode")
+            .and_then(|value| LoadMode::deserialize(value).ok())
+            .is_some_and(|mode| !matches!(mode, LoadMode::Replace | LoadMode::ReplaceDedup));
+        if !keeps_rows {
+            continue;
+        }
+        let Ok(Some(excluded)) = excluded_names(object, name) else {
+            continue;
+        };
+        pairs.extend(excluded.into_iter().map(|column| (name.to_owned(), column)));
+    }
+    pairs
 }
 
 /// The key columns of every object whose stored load mode has a key (the
@@ -1455,6 +1810,10 @@ pub fn secret_field_names(
         ("rest", Some("bearer")) => Some(&["token"]),
         ("rest", Some("basic")) => Some(&["username", "password"]),
         ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
+        // `SRC-12` part C: the client id is configuration in the dial, so the
+        // two secrets are the client secret (primary, typed or referenced)
+        // and the refresh token (secondary, written by the sign-in callback).
+        ("rest", Some("oauth2_authorization_code")) => Some(&["clientSecret", "refreshToken"]),
         ("kafka", Some("none")) => Some(&[]),
         ("sftp", Some("public_key")) => Some(&["privateKey"]),
         ("sheets", _) => Some(&["serviceAccountJson"]),
@@ -1747,6 +2106,7 @@ mod tests {
             incremental_key: None,
             load_mode: None,
             primary_key: None,
+            excluded_columns: None,
             target: String::new(),
         };
         let err = object.validate().unwrap_err();
@@ -1760,6 +2120,7 @@ mod tests {
             incremental_key: Some("updated_at".to_owned()),
             load_mode: Some(LoadMode::Incremental),
             primary_key: None,
+            excluded_columns: None,
             target: "bronze.orders".to_owned(),
         };
         assert!(object.validate().is_ok());
@@ -2456,7 +2817,10 @@ mod target_identity_tests {
 
     use serde_json::{Value, json};
 
-    use super::{Dial, is_repoint};
+    use super::{
+        Dial, InvalidExcludedColumns, SourceObject, inactive_exclusions, is_repoint,
+        supports_column_choice, validate_excluded_columns,
+    };
 
     fn parse(adapter: &str, dial: &Value) -> Dial {
         Dial::parse(adapter, dial).expect("a valid dial")
@@ -2886,5 +3250,357 @@ mod target_identity_tests {
             &with("sql", &stored, "host", json!("other.internal"))
         ));
         assert!(is_repoint(Some("sql"), &stored, &parse("rest", &rest())));
+    }
+
+    fn sql_dial_of(driver: &str) -> Dial {
+        Dial::parse(
+            "sql",
+            &serde_json::json!({
+                "driver": driver, "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            }),
+        )
+        .expect("valid sql dial")
+    }
+
+    /// `SRC-11` D9: column choice for the four sources that list columns
+    /// before loading; a refusal for Oracle, change capture and the rest.
+    #[test]
+    fn excluded_columns_are_accepted_only_for_sources_that_list_their_columns() {
+        let objects = serde_json::json!([
+            { "name": "public.orders", "target": "orders", "excludedColumns": ["note"] }
+        ]);
+        for driver in ["postgres", "mysql", "mssql"] {
+            assert_eq!(
+                validate_excluded_columns(&sql_dial_of(driver), &objects),
+                Ok(()),
+                "{driver}"
+            );
+        }
+        let refused = Err(InvalidExcludedColumns::NotForSource {
+            name: "public.orders".to_owned(),
+        });
+        assert_eq!(
+            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
+            refused
+        );
+        let cdc = Dial::parse(
+            "cdc",
+            &serde_json::json!({
+                "driver": "postgres", "host": "db.internal", "port": 5432,
+                "database": "orders", "user": "app_reader",
+                "slotName": "orders_slot", "publicationName": "orders_pub"
+            }),
+        )
+        .expect("valid cdc dial");
+        assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
+        assert!(supports_column_choice(&sql_dial_of("postgres")));
+        assert!(!supports_column_choice(&cdc));
+    }
+
+    /// An object that leaves nothing out is fine for every source: the field
+    /// absent, null and an empty list all mean "nothing".
+    #[test]
+    fn leaving_nothing_out_is_accepted_for_every_source() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a" },
+            { "name": "b", "target": "b", "excludedColumns": null },
+            { "name": "c", "target": "c", "excludedColumns": [] },
+        ]);
+        assert_eq!(
+            validate_excluded_columns(&sql_dial_of("oracle"), &objects),
+            Ok(())
+        );
+        assert!(inactive_exclusions(&objects).is_empty());
+    }
+
+    /// `SRC-11` D11: a key column of a deduplicating or history table and the
+    /// cursor column cannot be left out; other columns can.
+    #[test]
+    fn excluded_columns_refuse_the_key_and_the_cursor() {
+        let dial = sql_dial_of("postgres");
+        let refuse = |object: serde_json::Value| {
+            validate_excluded_columns(&dial, &serde_json::json!([object]))
+        };
+        for mode in ["replace_dedup", "incremental_dedup", "history"] {
+            let mut object = serde_json::json!({
+                "name": "t", "target": "t", "loadMode": mode,
+                "primaryKey": ["id"], "excludedColumns": ["note", "id"]
+            });
+            if mode == "incremental_dedup" {
+                object["incrementalKey"] = serde_json::json!("updated_at");
+            }
+            assert_eq!(
+                refuse(object),
+                Err(InvalidExcludedColumns::NamesKeyColumn {
+                    name: "t".to_owned(),
+                    column: "id".to_owned()
+                }),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+            })),
+            Err(InvalidExcludedColumns::NamesCursorColumn {
+                name: "t".to_owned(),
+                column: "updated_at".to_owned()
+            })
+        );
+        // A key is only a key in a mode that reads it: a plain replace may
+        // leave out the column the console remembered as a detected key.
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "replace",
+                "primaryKey": ["id"], "excludedColumns": ["id"]
+            })),
+            Ok(())
+        );
+        assert_eq!(
+            refuse(serde_json::json!({
+                "name": "t", "target": "t", "loadMode": "incremental",
+                "incrementalKey": "updated_at", "excludedColumns": ["note"]
+            })),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn excluded_columns_must_be_a_short_list_of_plain_distinct_names() {
+        let dial = sql_dial_of("mysql");
+        let long = "x".repeat(129);
+        let many: Vec<String> = (0..2001).map(|n| format!("c{n}")).collect();
+        for bad in [
+            serde_json::json!("note"),
+            serde_json::json!([1]),
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!(["a", "a"]),
+            serde_json::json!(["a\nb"]),
+            serde_json::json!([long]),
+            serde_json::json!(many),
+        ] {
+            assert!(
+                matches!(
+                    validate_excluded_columns(
+                        &dial,
+                        &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": bad }])
+                    ),
+                    Err(InvalidExcludedColumns::BadList { .. })
+                ),
+                "{bad}"
+            );
+        }
+        // Names are compared as written: a case difference is two columns.
+        assert_eq!(
+            validate_excluded_columns(
+                &dial,
+                &serde_json::json!([{ "name": "t", "target": "t", "excludedColumns": ["a", "A"] }])
+            ),
+            Ok(())
+        );
+    }
+
+    /// `SRC-11` D10: only a table that keeps its rows gets the inactive mark.
+    #[test]
+    fn only_a_table_that_keeps_its_rows_marks_a_left_out_column_inactive() {
+        let objects = serde_json::json!([
+            { "name": "a", "target": "a", "loadMode": "append", "excludedColumns": ["x"] },
+            { "name": "b", "target": "b", "loadMode": "replace", "excludedColumns": ["x"] },
+            { "name": "c", "target": "c", "excludedColumns": ["x"] },
+            { "name": "d", "target": "d", "loadMode": "replace_dedup",
+              "primaryKey": ["id"], "excludedColumns": ["x"] },
+            { "name": "e", "target": "e", "loadMode": "history",
+              "primaryKey": ["id"], "excludedColumns": ["x", "y"] },
+            { "name": "f", "target": "f", "loadMode": "incremental_dedup",
+              "primaryKey": ["id"], "incrementalKey": "u", "excludedColumns": ["z"] },
+        ]);
+        assert_eq!(
+            inactive_exclusions(&objects),
+            vec![
+                ("a".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "x".to_owned()),
+                ("e".to_owned(), "y".to_owned()),
+                ("f".to_owned(), "z".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_object_reads_excluded_columns_and_defaults_to_none() {
+        let with: SourceObject = serde_json::from_value(serde_json::json!({
+            "name": "public.orders", "target": "orders", "excludedColumns": ["note"]
+        }))
+        .expect("valid");
+        assert_eq!(with.excluded_columns, Some(vec!["note".to_owned()]));
+        let without: SourceObject = serde_json::from_value(
+            serde_json::json!({ "name": "public.orders", "target": "orders" }),
+        )
+        .expect("valid");
+        assert_eq!(without.excluded_columns, None);
+    }
+}
+
+/// `SRC-12` part C: the `OAuth2` dial shapes, their addresses, and what moves
+/// the target identity.
+#[cfg(test)]
+mod oauth_dial_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{Dial, RestAuth, secret_field_names};
+    use serde_json::{Value, json};
+
+    fn rest(auth: &Value) -> Value {
+        json!({
+            "baseUrl": "https://api.example.com",
+            "auth": auth,
+            "pagination": { "type": "none" },
+            "endpoints": [{ "path": "/items" }],
+        })
+    }
+
+    fn code_auth() -> Value {
+        json!({
+            "type": "oauth2_authorization_code",
+            "clientId": "app-1",
+            "authorizeUrl": "https://login.example.com/authorize",
+            "tokenUrl": "https://login.example.com/token",
+            "revocationUrl": "https://login.example.com/revoke",
+            "scopes": ["read", "offline_access"],
+        })
+    }
+
+    #[test]
+    fn an_authorization_code_dial_parses_with_its_camel_case_names() {
+        let Dial::Rest(dial) = Dial::parse("rest", &rest(&code_auth())).expect("valid") else {
+            panic!("a rest dial");
+        };
+        let RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            revocation_url,
+            scopes,
+            ..
+        } = dial.auth
+        else {
+            panic!("an authorization-code auth");
+        };
+        assert_eq!(client_id, "app-1");
+        assert_eq!(
+            revocation_url.as_deref(),
+            Some("https://login.example.com/revoke")
+        );
+        assert_eq!(scopes, vec!["read", "offline_access"]);
+    }
+
+    #[test]
+    fn the_revocation_address_and_scopes_are_optional() {
+        let mut auth = code_auth();
+        auth.as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        auth.as_object_mut().expect("object").remove("scopes");
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+    }
+
+    #[test]
+    fn an_authorization_code_dial_needs_the_client_secret_and_the_refresh_token() {
+        assert_eq!(
+            secret_field_names("rest", Some("oauth2_authorization_code")),
+            Some(["clientSecret", "refreshToken"].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_client_credentials_token_address_parses_under_the_name_the_console_sends() {
+        let auth = json!({ "type": "oauth2_client_credentials", "tokenUrl": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&auth)).is_ok());
+        // The name an earlier build accepted still parses.
+        let old = json!({ "type": "oauth2_client_credentials", "token_url": "https://login.example.com/token" });
+        assert!(Dial::parse("rest", &rest(&old)).is_ok());
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_plain_http_address_is_refused() {
+        for bad in [
+            "javascript:alert(1)",
+            "ftp://login.example.com/token",
+            "https://user:pw@login.example.com/token",
+            "https://",
+            "https://login.example.com/to ken",
+            "login.example.com/token",
+        ] {
+            for field in ["authorizeUrl", "tokenUrl", "revocationUrl"] {
+                let mut auth = code_auth();
+                auth[field] = json!(bad);
+                assert!(
+                    Dial::parse("rest", &rest(&auth)).is_err(),
+                    "{field} = {bad:?} must be refused"
+                );
+            }
+        }
+        let cc = json!({ "type": "oauth2_client_credentials", "tokenUrl": "file:///etc/passwd" });
+        assert!(Dial::parse("rest", &rest(&cc)).is_err());
+    }
+
+    #[test]
+    fn an_empty_client_id_and_a_bad_scope_are_refused() {
+        let mut auth = code_auth();
+        auth["clientId"] = json!("  ");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+        for scope in ["", "two words", "quo\"te", "new\nline"] {
+            let mut auth = code_auth();
+            auth["scopes"] = json!([scope]);
+            assert!(
+                Dial::parse("rest", &rest(&auth)).is_err(),
+                "scope {scope:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_of_the_authorization_code_auth_is_refused() {
+        let mut auth = code_auth();
+        auth["clientSecret"] = json!("must-never-be-in-a-dial");
+        assert!(Dial::parse("rest", &rest(&auth)).is_err());
+    }
+
+    #[test]
+    fn moving_the_token_or_revocation_host_is_a_re_point_but_a_new_path_is_not() {
+        let identity = |auth: &Value| {
+            Dial::parse("rest", &rest(auth))
+                .expect("valid")
+                .target_identity()
+        };
+        let base = identity(&code_auth());
+
+        let mut other_token_host = code_auth();
+        other_token_host["tokenUrl"] = json!("https://evil.example.net/token");
+        assert_ne!(base, identity(&other_token_host));
+
+        let mut other_revocation_host = code_auth();
+        other_revocation_host["revocationUrl"] = json!("https://evil.example.net/revoke");
+        assert_ne!(base, identity(&other_revocation_host));
+
+        let mut no_revocation = code_auth();
+        no_revocation
+            .as_object_mut()
+            .expect("object")
+            .remove("revocationUrl");
+        assert_ne!(base, identity(&no_revocation));
+
+        let mut new_path = code_auth();
+        new_path["tokenUrl"] = json!("https://login.example.com/v2/token");
+        new_path["scopes"] = json!(["read"]);
+        new_path["authorizeUrl"] = json!("https://other.example.org/authorize");
+        assert_eq!(base, identity(&new_path));
+
+        let cc =
+            |url: &str| identity(&json!({ "type": "oauth2_client_credentials", "tokenUrl": url }));
+        assert_ne!(
+            cc("https://login.example.com/token"),
+            cc("https://evil.example.net/token")
+        );
     }
 }

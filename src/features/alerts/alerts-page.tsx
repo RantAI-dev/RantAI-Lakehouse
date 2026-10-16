@@ -100,15 +100,16 @@ const EMPTY_FORM: AlertRule = {
 
 /**
  * D5, corrected by `SRC-17` D-c: the line under the two kinds with something
- * special to say. `connector_disabled` is still raised by nothing (`SRC-11`
- * has not landed). `connector_schema_change` is raised: schema change
+ * special to say. `connector_disabled` is raised since `SRC-11`: once, when a
+ * connector fails runs in a row and is paused (30 by default, a setting of the
+ * API). `connector_schema_change` is raised: schema change
  * detection (`SRC-8`) sends it when a source table's columns change or a new
  * table appears, so the page no longer tells the user a working rule does not
  * work.
  */
 const KIND_NOTES: Record<string, string> = {
   connector_disabled:
-    "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed.",
+    "Raised once when a connector fails runs in a row (30 by default) and is paused. Resume it from its page.",
   connector_schema_change:
     "Raised when a source table's columns change or a new table appears at the source.",
 }

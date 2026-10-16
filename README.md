@@ -106,7 +106,10 @@ bun install
 #    default credentials. docker-compose.yml refuses to start while
 #    POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY or
 #    LAKEKEEPER_ENCRYPTION_KEY is empty, and `cp .env.example .env` alone
-#    does not start the stack. This writes a `.env` with generated values
+#    does not start the stack. SRC-12: CONNECTOR_SECRETS_KEY, the key
+#    stored connector credentials are encrypted with, is generated too.
+#    Keep it: without it, every stored credential has to be entered
+#    again (docs/OPERATIONS.md). This writes a `.env` with generated values
 #    (and refuses to overwrite an existing one):
 sh ops/init-env.sh
 $EDITOR .env    # set AUTH_BOOTSTRAP_EMAIL; see .env.example and the
@@ -154,10 +157,13 @@ This project runs on **Bun**, not Node.js. You need Bun `>= 1.3.0`
 curl -fsSL https://bun.sh/install | bash
 ```
 
-All scripts (`dev`, `build`, `start`, `lint`, `typecheck`) use the `--bun`
-flag so Next.js executes under the Bun runtime, not Node. The lockfile is
-`bun.lock` — don't use `npm install`, it will create an out-of-sync
-`package-lock.json`.
+Most scripts (`dev`, `start`, `lint`, `typecheck`) use the `--bun`
+flag so Next.js executes under the Bun runtime, not Node. `bun run build`
+runs `next build` under Node (Node 20.9 or newer must be installed).
+It runs under Node because Bun's Turbopack runtime fails with "Expected
+CommonJS module to have a function wrapper" (`REL-8`, PR #170 review round 1,
+SHOULD-FIX 2). The lockfile is `bun.lock` — don't use `npm install`, it will
+create an out-of-sync `package-lock.json`.
 
 > Note: in `ps`, the server process shows up as `node` because Bun
 > intentionally masquerades as Node for tooling compatibility. To confirm
@@ -459,15 +465,15 @@ issue about any of the following — they're known, not bugs:
   therefore still runs out-of-band via a Trino-as-cron container (`trino`
   compose profile, ADR 0009); a deployment that never enables that profile
   accumulates small Bronze files unbounded.
-- **Bronze snapshot history is currently unbounded.** This follows from the
-  line above and is an operational gap now, not a future one: nothing
-  expires snapshots. ClickHouse 26.8 refuses `expire_snapshots` for
-  catalog-backed tables, the maintenance job probes it each run and logs
-  the live refusal rather than skipping silently, and Lakekeeper-side
-  expiry does not exist yet. ADR 0004 deferred retention to P4; with P5
-  CDC volume landing continuously, metadata grows without a bound until
-  that is built. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` and
-  `docs/plans/G3-RESULT.md`.
+- **Bronze snapshot history has a default 7-day retention floor (OPS-1), but requires the `trino` profile to actually run expiry.**
+  Tables without an explicit governance policy or with `snapshotsToKeep: None`
+  expire snapshots older than 7 days when `bronze_maintenance_job` runs.
+  Because ClickHouse 26.8 refuses `expire_snapshots` for catalog-backed
+  tables, expiry is dispatched via Trino (`ALTER TABLE iceberg.<ns>."<name>" EXECUTE expire_snapshots(retention_threshold => '7d')`).
+  Deployments that do not enable the `trino` compose profile skip expiry
+  with a logged warning, leaving snapshot growth unbounded until Trino is
+  started or Lakekeeper gains native retention support. See
+  `docs/adr/0004-bronze-naming-partitioning-retention.md`.
 - **A bare `count()` overcounts on CDC-fed Bronze tables — measured on
   26.3, not re-verified on the pinned 26.8.** Reproducing it needs a
   CDC-fed table carrying merge-on-read equality deletes, i.e. the full

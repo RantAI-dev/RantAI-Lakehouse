@@ -119,13 +119,18 @@ proving a `gold.*` table is excluded.
 # Per-table policy + Trino verbs
 
 The verbs above are the job's fixed, unconditional behavior. Operators
-who want to actually reclaim expired snapshots or bin-pack small files
-need `table_maintenance_policy` (`rust/migrations/0030`), read once per
-run from `GET /api/lakehouse/maintenance-policies` and routed through
-Trino's Iceberg connector — which does not carry ClickHouse's
-"transactional catalog" restriction on `expire_snapshots`, and whose
-`optimize` genuinely bin-packs (ClickHouse's does not — see the table
-above).
+who want to bin-pack small files need `table_maintenance_policy`
+(`rust/migrations/0030`), read once per run from
+`GET /api/lakehouse/maintenance-policies` and routed through Trino's
+Iceberg connector — which does not carry ClickHouse's "transactional catalog"
+restriction on `expire_snapshots`, and whose `optimize` genuinely
+bin-packs (ClickHouse's does not — see the table above).
+
+Snapshot expiry (`expire_snapshots`) runs by default for every Bronze
+table with a 7-day retention threshold (Trino's own floor, OPS-1 Decision
+D1). Operators who want to retain fewer or more snapshots configure
+`snapshotsToKeep` in `table_maintenance_policy`, which overrides the
+default (D2).
 
 * **`snapshotsToKeep`.** Trino 483's `expire_snapshots` procedure takes
   only a `retention_threshold` age, not a keep-count, so keeping the N
@@ -585,9 +590,13 @@ def _run_maintenance_for_table(
             )
         last_run_at = _parse_run_at(latest_maintenance_run_at(cfg.ch, table_name))
 
-    expire_skip, expire_verb_run = _expire_snapshots_result(
-        cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
-    )
+    if policy_fetch_error is not None:
+        expire_skip = f"expire_snapshots (policy fetch failed: {policy_fetch_error})"
+        expire_verb_run = None
+    else:
+        expire_skip, expire_verb_run = _expire_snapshots_result(
+            cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
+        )
     if expire_skip is not None and expire_skip not in skipped_verbs:
         skipped_verbs.append(expire_skip)
     if expire_verb_run is not None:
@@ -838,6 +847,12 @@ def _compute_retention_threshold(
 
 _TRINO_UNREACHABLE_SKIP = "expire_snapshots/optimize skipped: trino unreachable"
 
+# OPS-1 (Decision D1): Tables without a policy, or a policy with no
+# `snapshotsToKeep`, keep 7 days of snapshots. Trino 483's Iceberg
+# connector enforces `iceberg.expire-snapshots.min-retention` (7 days by
+# default), so 7d is both the product floor and Trino's system floor.
+DEFAULT_SNAPSHOT_RETENTION = "7d"
+
 
 def _expire_snapshots_result(
     cfg: MaintenanceConfig,
@@ -848,20 +863,54 @@ def _expire_snapshots_result(
     now: datetime,
     last_run_at: datetime | None,
 ) -> tuple[str | None, dict[str, str] | None]:
-    """Decides and (if requested) executes this table's `expire_snapshots`
-    verb via Trino. Returns `(skipped_verbs_entry, verb_run_record)`:
+    """Decides and executes this table's `expire_snapshots` verb via
+    Trino. Returns `(skipped_verbs_entry, verb_run_record)`:
     `skipped_verbs_entry` is `None` exactly when the verb genuinely ran
     (it must not also be recorded as skipped); `verb_run_record` is
-    `None` only when no policy requested this verb at all (nothing to
-    record in `bronze_meta.maintenance_verb_run` either).
+    `None` only when no verb ran or was skipped with a recorded run.
 
-    With no policy, or a policy that does not set `snapshotsToKeep`,
-    this keeps today's exact behavior: the real, freshly-observed
-    ClickHouse probe failure (`expire_skip_reason`) is the recorded skip
-    reason, and no Trino call is made."""
+    When `snapshotsToKeep` is specified in `policy`, computes the retention
+    threshold to preserve that many snapshots. When no policy is set or
+    `snapshotsToKeep` is None, applies `DEFAULT_SNAPSHOT_RETENTION` ('7d')
+    unconditionally on the daily schedule (OPS-1 Decision D1)."""
     keep = None if policy is None else policy.get("snapshotsToKeep")
     if keep is None:
-        return f"expire_snapshots ({expire_skip_reason})", None
+        sql = (
+            f'ALTER TABLE iceberg.{namespace}."{name}" '
+            f"EXECUTE expire_snapshots(retention_threshold => '{DEFAULT_SNAPSHOT_RETENTION}')"
+        )
+        try:
+            _trino_execute(cfg, sql)
+        except TrinoUnavailableError:
+            return (
+                _TRINO_UNREACHABLE_SKIP,
+                {
+                    "verb": "expire_snapshots",
+                    "engine": "trino",
+                    "outcome": "skipped",
+                    "detail": "trino unreachable",
+                },
+            )
+        except TrinoQueryError as exc:
+            detail = str(exc)
+            return (
+                f"expire_snapshots refused: {detail}",
+                {
+                    "verb": "expire_snapshots",
+                    "engine": "trino",
+                    "outcome": "refused",
+                    "detail": detail,
+                },
+            )
+        return (
+            None,
+            {
+                "verb": "expire_snapshots",
+                "engine": "trino",
+                "outcome": "applied",
+                "detail": f"default retention {DEFAULT_SNAPSHOT_RETENTION} (no snapshotsToKeep policy)",
+            },
+        )
 
     cadence_ok, cadence_reason = _cadence_allows(policy.get("schedule"), now, last_run_at)
     if not cadence_ok:

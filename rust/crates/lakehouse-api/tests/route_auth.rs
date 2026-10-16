@@ -103,6 +103,30 @@ async fn request_with_cookie(
         .expect("router never fails a request outright")
 }
 
+/// [`request_with_cookie`] with a JSON body, for routes whose handler needs
+/// one to get past the auth gate. The auth gate runs first, so the body is
+/// only ever read by a handler that has already been let in.
+async fn request_with_cookie_and_body(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: Vec<u8>,
+) -> axum::http::Response<Body> {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright")
+}
+
 /// # Authz: authenticated-but-missing-permission -> 403
 ///
 /// Every `Policy::RequiresPermission` entry, hit by a principal
@@ -236,6 +260,56 @@ async fn a_seeded_analyst_is_denied_adding_a_user_to_a_tenant() {
     );
 }
 
+/// BLD-1 / D2: `PUT /api/pipelines/{id}/run-as` decides whose permissions
+/// every future run of that pipeline is governed by, so it is
+/// `identity:write` — a governance decision, exactly like
+/// `PUT /api/pipelines/{id}/tenant` above it in [`POLICY_TABLE`].
+///
+/// Both directions are named here with a real principal: a seeded Data
+/// Engineer, who holds `pipeline:*` (so they can edit and run the
+/// pipeline) but not `identity:write`, is refused; a Platform Admin is
+/// not. Naming the Data Engineer rather than the Analyst is the stronger
+/// half — `pipeline:write` alone must never be enough to reassign who a
+/// pipeline reads as.
+#[tokio::test]
+async fn assigning_a_pipelines_author_is_denied_without_identity_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let data_engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let admin = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let body = br#"{"userId":"00000000-0000-0000-0000-000000000001"}"#.to_vec();
+
+    let denied = request_with_cookie_and_body(
+        &router,
+        "PUT",
+        "/api/pipelines/pl-x/run-as",
+        &data_engineer,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer's pipeline:write must not be enough to \
+         reassign who the pipeline reads as"
+    );
+
+    // The other half: the correctly-permissioned caller must never be
+    // refused by the auth gate. This asserts only "not 401/403" — the id
+    // does not exist, so a 404 from the handler is the right answer and
+    // the body is deliberately not checked here (see this file's header).
+    let allowed =
+        request_with_cookie_and_body(&router, "PUT", "/api/pipelines/pl-x/run-as", &admin, body)
+            .await;
+    assert!(
+        !matches!(
+            allowed.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "a Platform Admin must pass the auth gate on this route, got {}",
+        allowed.status()
+    );
+}
+
 /// A seeded Analyst (no `governance:write`) is denied
 /// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4),
 /// a fifth `Policy::RequiresPermission` route added after the four-family
@@ -336,14 +410,30 @@ async fn a_seeded_analyst_is_not_denied_catalog_annotation_read() {
     .await;
     assert_ne!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "a seeded Analyst holding catalog:read must not be denied"
-    );
-    assert_ne!(
-        resp.status(),
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+    // SEC-16: the read now runs the catalog tenant gate too, and the seeded
+    // app has several tenants and no `CATALOG_TENANT_ID`, so it answers 403
+    // with the gate's fixed reason. Only that 403 is allowed here: the
+    // permission middleware's body names the missing permission instead, so
+    // the assertion still fails if the middleware denies the Analyst.
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "a seeded Analyst holding catalog:read must not be denied by the permission \
+             middleware; the only 403 allowed here is the tenant gate's, got {error:?}"
+        );
+    }
 }
 
 /// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied
@@ -647,6 +737,305 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
         "a seeded Data Engineer holding connector:manage must not be denied PUT"
     );
     assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `SRC-11` decisions D9 and D11 at the route: leaving columns out is refused
+/// with a 422 for a source type that cannot list its columns (Oracle) and for a
+/// key column of a deduplicating table, and a malformed list is a 400. All
+/// three are refused before the address check or any write, so no connection
+/// is made and nothing is stored.
+#[tokio::test]
+async fn ingest_spec_put_refuses_excluded_columns_the_source_cannot_honour() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) \
+         VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("join the connector's tenant");
+
+    let body = |driver: &str, objects: serde_json::Value| {
+        serde_json::json!({
+            "adapter": "sql",
+            "ingestMode": "batch",
+            "dial": {
+                "driver": driver, "host": "db.example", "port": 5432,
+                "database": "orders", "user": "app_reader"
+            },
+            "sourceObjects": objects,
+        })
+    };
+    let cases = [
+        (
+            "oracle",
+            serde_json::json!([{
+                "name": "APP.ORDERS", "target": "orders", "excludedColumns": ["NOTE"]
+            }]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "postgres",
+            serde_json::json!([{
+                "name": "public.orders", "target": "orders", "loadMode": "replace_dedup",
+                "primaryKey": ["id"], "excludedColumns": ["id"]
+            }]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "postgres",
+            serde_json::json!([{
+                "name": "public.orders", "target": "orders", "excludedColumns": "note"
+            }]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (driver, objects, expected) in cases {
+        let cookie = session_cookie_for_user(&pool, user_id).await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/connectors/conn-pg-lakehouse/ingest-spec")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&body(driver, objects.clone())).expect("serialize body"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(response.status(), expected, "{driver} {objects}");
+    }
+}
+
+/// `SRC-11`: the run history, a run's log and Resume are a person's routes
+/// (`connector:manage`); the four run reports are the orchestrator's
+/// (`ingest:read`, then the handler's service-identity check). Each direction
+/// is asserted: a `connector:manage`-only principal passes the gate of the
+/// person's routes and is refused by the gate on the reports; an
+/// `ingest:read`-only principal is refused by the gate on the person's routes
+/// and, on the reports, passes the gate and is refused by the handler (it is a
+/// user, not the service identity). The table-driven loops above cover the
+/// zero-permission and Platform-Admin directions for all seven entries.
+#[tokio::test]
+async fn run_history_log_and_resume_need_connector_manage_and_run_reports_need_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let person_routes = [
+        ("GET", format!("{base}/runs")),
+        ("GET", format!("{base}/runs/run-1/log")),
+        ("POST", format!("{base}/resume")),
+    ];
+    let report_routes = [
+        ("POST", format!("{base}/run-reports")),
+        ("POST", format!("{base}/run-reports/run-1/attempts")),
+        ("POST", format!("{base}/run-reports/run-1/log")),
+        ("POST", format!("{base}/run-reports/run-1/end")),
+    ];
+    for (method, path) in &person_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    for (method, path) in &report_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .into_owned();
+        assert!(
+            text.contains("ingest:read"),
+            "the gate names the permission: {text}"
+        );
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .into_owned();
+        assert!(
+            text.contains("service identity"),
+            "passed the gate, refused by the handler: {text}"
+        );
+    }
+}
+
+/// `SRC-13` (decision D11): the discovery routes are a person's
+/// (`connector:manage`), both ways, and the orchestrator's answer route is the
+/// service identity's (`ingest:read`, then the handler's check). A
+/// `connector:manage`-only principal passes the gate of the person's routes (the
+/// handler answers 400 for the body it was sent, or 404 for an answer nobody
+/// asked for) and is refused by the gate on the result route; an
+/// `ingest:read`-only principal is refused by the gate on the person's routes
+/// and, on the result route, passes the gate and is refused by the handler (it
+/// is a user, not the service identity). The table-driven loops above cover the
+/// zero-permission and Platform-Admin directions for all three entries.
+#[tokio::test]
+async fn discovery_routes_need_connector_manage_and_the_result_route_needs_ingest_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    // SRC-13 review 3 BLOCKER 2: both principals join Meridian Group, the tenant of
+    // `conn-pg-lakehouse`. The per-connector routes answer 404 for a connector outside
+    // the caller's tenants (the route layer, before the handler), so without this the
+    // person's routes answered 404 instead of reaching the handler's 400, and the
+    // test's point (403 from the permission gate, not from the tenant gate) was lost.
+    for user_id in [manage, ingest] {
+        sqlx::query(
+            "INSERT INTO app_user_tenant (user_id, tenant_id) \
+             VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("join the connector's tenant");
+    }
+    let base = "/api/connectors/conn-pg-lakehouse";
+    // A preview with no object is a 400 before any dial; a poll with nothing
+    // requested is a 404. Neither touches a source.
+    let person_routes = [
+        (
+            "POST",
+            format!("{base}/discovery/preview"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "GET",
+            format!("{base}/discovery/list"),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (method, path, reached) in &person_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), *reached, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    let result_route = format!("{base}/discovery-results");
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, "POST", &result_route, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, "POST", &result_route, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
+}
+
+/// `SRC-12` part C: the OAuth sign-in routes of a connector are a person's
+/// (`connector:manage`), the rotated-token report is the orchestrator's
+/// (`ingest:read`, then the handler's service-identity check), and the
+/// provider's callback needs a signed-in user and nothing more at the gate.
+/// Each direction: a `connector:manage`-only principal passes the gate of the
+/// person's routes (the handler answers 409, the seeded Postgres connector is
+/// not an OAuth one) and is refused by the gate on the report; an
+/// `ingest:read`-only principal is refused by the gate on the person's routes
+/// and passes the gate on the report to be refused by the handler (a user, not
+/// the service identity). The callback refuses nobody at the gate who is signed
+/// in (a principal with no permission at all gets the fixed "not valid" page)
+/// and answers 401 to nobody signed in.
+#[tokio::test]
+async fn oauth_routes_need_connector_manage_the_report_needs_ingest_read_and_the_callback_a_user() {
+    let TestApp { router, pool } = spin_up().await;
+    let manage = create_principal_with_permissions(&pool, "connector:manage").await;
+    let ingest = create_principal_with_permissions(&pool, "ingest:read").await;
+    let nobody = create_zero_permission_principal(&pool).await;
+    // Both join the connector's tenant, as in the discovery test above, so the
+    // person's routes reach the handler and the 403 is the permission gate's.
+    for user_id in [manage, ingest] {
+        sqlx::query(
+            "INSERT INTO app_user_tenant (user_id, tenant_id) \
+             VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("join the connector's tenant");
+    }
+    let base = "/api/connectors/conn-pg-lakehouse";
+    let person_routes = [
+        ("GET", format!("{base}/oauth")),
+        ("POST", format!("{base}/oauth/start")),
+        ("POST", format!("{base}/oauth/sign-out")),
+    ];
+    for (method, path) in &person_routes {
+        let cookie = session_cookie_for_user(&pool, manage).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {path}");
+
+        let cookie = session_cookie_for_user(&pool, ingest).await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    let report = format!("{base}/oauth/refresh-token");
+    let cookie = session_cookie_for_user(&pool, manage).await;
+    let resp = request_with_cookie(&router, "POST", &report, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("ingest:read"),
+        "the gate names the permission: {text}"
+    );
+    let cookie = session_cookie_for_user(&pool, ingest).await;
+    let resp = request_with_cookie(&router, "POST", &report, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(
+        text.contains("service identity"),
+        "passed the gate, refused by the handler: {text}"
+    );
+
+    // The callback: signed in, with no permission at all, passes the gate and
+    // gets the fixed page (no `state`); not signed in, 401.
+    let callback = "/api/connectors/oauth/callback";
+    let cookie = session_cookie_for_user(&pool, nobody).await;
+    let resp = request_with_cookie(&router, "GET", callback, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(text.contains("Sign-in not completed"), "{text}");
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(callback)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// The six upload routes (ADR 0014, decision 6) are gated by the existing
