@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
-import { LOAD_ALERT_KINDS, type AlertRule } from "@/services/contracts/alerts"
+import { LOAD_ALERT_KINDS, QUALITY_ALERT_KIND, type AlertRule } from "@/services/contracts/alerts"
 
 /**
  * `getRuleColumns` used to declare its own looser `Rule` type (every field
@@ -44,6 +44,7 @@ export const RULE_KIND_LABEL: Record<string, string> = {
   connector_schema_change: "Connector schema changed",
   connector_success: "Connector run succeeded",
   upload_failure: "Upload failed",
+  quality_incident: "Quality incident opened",
 }
 
 export function ruleKindLabel(type: string): string {
@@ -55,6 +56,11 @@ export function isLoadAlertKind(type: string): boolean {
   return (LOAD_ALERT_KINDS as readonly string[]).includes(type)
 }
 
+/** Whether `type` is the quality incident kind (`DATA-14`). */
+export function isQualityAlertKind(type: string): boolean {
+  return type === QUALITY_ALERT_KIND
+}
+
 /**
  * What a rule of the `SRC-7` kinds is scoped to, for the rules table: "Uploads"
  * for an upload rule, "All connectors" for `*`, the connector's name when the
@@ -62,9 +68,11 @@ export function isLoadAlertKind(type: string): boolean {
  * cannot list is not given a made-up name). `null` for every other kind.
  */
 export function ruleScope(
-  rule: Pick<AlertRule, "type" | "connector">,
+  rule: Pick<AlertRule, "type" | "connector"> & { asset?: string },
   connectors: readonly { id: string; name: string }[]
 ): string | null {
+  // A quality incident rule is scoped to a table, or to every table.
+  if (isQualityAlertKind(rule.type)) return rule.asset === "*" ? "All tables" : (rule.asset ?? null)
   if (!isLoadAlertKind(rule.type)) return null
   if (rule.type === "upload_failure") return "Uploads"
   if (!rule.connector) return null
@@ -137,7 +145,7 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       cell: ({ row }) => {
         const r = row.original
         // A load rule has no mart, measure or board: its scope is the next column.
-        if (isLoadAlertKind(r.type)) {
+        if (isLoadAlertKind(r.type) || isQualityAlertKind(r.type)) {
           return <span className="text-sm text-muted-foreground">—</span>
         }
         if (r.type === "alert") {

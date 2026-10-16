@@ -178,6 +178,54 @@ describe("the rules table's labels and scope", () => {
   })
 })
 
+describe("the quality incident kind (DATA-14)", () => {
+  const base: AlertRule = {
+    id: "",
+    name: "  Quality  ",
+    type: "quality_incident",
+    agg: "sum",
+    op: ">",
+    threshold: 0,
+    channel: "webhook",
+    target: " https://hooks.example.com/x ",
+    enabled: true,
+  }
+
+  it("has no mart, measure, board, connector or table-name field of the other kinds", () => {
+    for (const admin of [false, true]) {
+      expect(alertRuleFormFields("quality_incident", admin)).toEqual({
+        martMeasure: false,
+        board: false,
+        freshnessTarget: false,
+        ...NO_LOAD_FIELDS,
+      })
+    }
+  })
+
+  it("saves only the fields that apply: name, kind, delivery, severity and the table", () => {
+    expect(alertRuleSaveInput({ ...base, asset: " Silver.Orders ", severity: "high" })).toEqual({
+      name: "Quality",
+      type: "quality_incident",
+      channel: "webhook",
+      target: "https://hooks.example.com/x",
+      enabled: true,
+      severity: "high",
+      asset: "Silver.Orders",
+    })
+    // No mart, aggregate, threshold or connector rides along, and no severity
+    // when there is none.
+    const sent = alertRuleSaveInput({ ...base, asset: "*", mart: "x", connector: "conn-a" })
+    expect(Object.keys(sent).sort()).toEqual(["asset", "channel", "enabled", "name", "target", "type"])
+  })
+
+  it("is named in words and scoped to its table, or to every table", () => {
+    expect(ruleKindLabel("quality_incident")).toBe("Quality incident opened")
+    expect(ruleScope({ type: "quality_incident", asset: "silver.orders" }, [])).toBe("silver.orders")
+    expect(ruleScope({ type: "quality_incident", asset: "*" }, [])).toBe("All tables")
+    expect(ruleScope({ type: "quality_incident" }, [])).toBeNull()
+  })
+})
+
 describe("RunAlertsNotice", () => {
   it("says run alerts are not reported when the API says the token is not set", () => {
     render(<RunAlertsNotice runEventsConfigured={false} />)

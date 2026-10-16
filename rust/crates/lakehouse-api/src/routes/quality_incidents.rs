@@ -59,6 +59,22 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     }
 }
 
+/// Hands an incident that just OPENED to the `quality_incident` alert rules
+/// (`DATA-14`, F6), in the background so a webhook that is slow to answer
+/// never holds up the run, load or tick that found it. Only an opening
+/// delivers: an incident seen again is the same incident. The message is the
+/// table, what was found and a relative link; the rules' webhook and email
+/// channels and silences are SRC-7's.
+fn notify_opened(state: &AppState, asset: &str, detail: &str) {
+    let (state, asset) = (state.clone(), asset.to_owned());
+    let text = format!("{asset}: {detail}. View: /governance/data-quality");
+    tokio::spawn(async move {
+        if let Some(pg) = state.pg.as_deref() {
+            crate::routes::load_alerts::deliver_quality_incident(&state, pg, &asset, &text).await;
+        }
+    });
+}
+
 /// Opens the incident of an anomaly (`DATA-14`, F5) for `asset`, or moves the
 /// `last_seen_at` of the one already open. Returns the incident's id when
 /// this call opened it, `None` when it was already open or could not be
@@ -71,7 +87,12 @@ pub(crate) async fn open_anomaly(
 ) -> Option<String> {
     let pg = state.pg.as_deref()?;
     match quality::record_failure(pg, asset, None, kind, detail).await {
-        Ok(recorded) => recorded.opened.then_some(recorded.id),
+        Ok(recorded) => {
+            if recorded.opened {
+                notify_opened(state, asset, detail);
+            }
+            recorded.opened.then_some(recorded.id)
+        }
         Err(err) => {
             tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: the anomaly could not be recorded");
             None
@@ -177,4 +198,237 @@ pub async fn resolve_incident(
     )
     .await;
     Ok(ApiJson(json!(incident)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::Config;
+
+    struct Harness {
+        state: AppState,
+        webhook: MockServer,
+        _clickhouse: MockServer,
+    }
+
+    /// Postgres plus mocked `ClickHouse` (the rule store) and webhook servers.
+    /// `rules` are `(id, asset, enabled)` quality incident rules; each rule's
+    /// webhook is `/<id>` on the webhook mock.
+    async fn harness(pool: &sqlx::PgPool, rules: &[(&str, &str, bool)]) -> Harness {
+        let ch = MockServer::start().await;
+        let webhook = MockServer::start().await;
+        let options = pool.connect_options();
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch.uri());
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        // The webhook mock listens on loopback, which the real address policy
+        // refuses (`SEC-10`); the policy has its own tests.
+        state.webhook_sender_override = Some(lakehouse_notify::MappedResolver::new().into_sender());
+        let data: Vec<Value> = rules
+            .iter()
+            .map(|(id, asset, enabled)| {
+                json!({
+                    "id": id, "name": format!("Rule {id}"), "type": "quality_incident",
+                    "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "0",
+                    "board": "", "channel": "webhook",
+                    "target": format!("{}/{id}", webhook.uri()),
+                    "enabled": if *enabled { "1" } else { "0" },
+                    "created_at": "", "severity": "high", "pipeline": "", "connector": "",
+                    "asset": asset,
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "rows": data.len(), "data": data })),
+            )
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&webhook)
+            .await;
+        Harness {
+            state,
+            webhook,
+            _clickhouse: ch,
+        }
+    }
+
+    impl Harness {
+        async fn posts_to(&self, rule_id: &str) -> Vec<String> {
+            self.webhook
+                .received_requests()
+                .await
+                .expect("request log")
+                .iter()
+                .filter(|r| r.url.path() == format!("/{rule_id}"))
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect()
+        }
+
+        /// The delivery runs in the background: wait for `count` posts.
+        async fn wait_for_posts(&self, rule_id: &str, count: usize) {
+            for _ in 0..100 {
+                if self.posts_to(rule_id).await.len() >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{rule_id} never reached {count} posts");
+        }
+
+        /// Gives a background delivery that must NOT happen time to have happened.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn rule(asset: &str) -> QualityRule {
+        QualityRule {
+            id: "r1".to_owned(),
+            name: "email_filled".to_owned(),
+            asset: asset.to_owned(),
+            dimension: "completeness".to_owned(),
+            threshold: "email not null >= 90%".to_owned(),
+            severity: "high".to_owned(),
+            last_status: None,
+            last_run_at: None,
+        }
+    }
+
+    /// `DATA-14` F6: an incident that opens is delivered to the rules of its
+    /// table and to `*` rules, once; the same incident seen again delivers
+    /// nothing; another table's rule and a disabled rule never deliver.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_opened_incident_is_delivered_once_to_the_rules_of_its_table(pool: sqlx::PgPool) {
+        let h = harness(
+            &pool,
+            &[
+                ("one", "silver.orders", true),
+                ("all", "*", true),
+                ("other", "silver.customers", true),
+                ("off", "silver.orders", false),
+            ],
+        )
+        .await;
+        let failing = rule("silver.orders");
+
+        open_for_failed_run(&h.state, &failing, "75.0% not null").await;
+        h.wait_for_posts("one", 1).await;
+        h.wait_for_posts("all", 1).await;
+        Harness::settle().await;
+        assert_eq!(h.posts_to("other").await.len(), 0);
+        assert_eq!(h.posts_to("off").await.len(), 0);
+
+        // Failing again moves `last_seen_at`; nobody is told twice.
+        open_for_failed_run(&h.state, &failing, "74.0% not null").await;
+        Harness::settle().await;
+        assert_eq!(h.posts_to("one").await.len(), 1);
+        assert_eq!(h.posts_to("all").await.len(), 1);
+
+        // The message names the table, the rule, what was measured and the
+        // threshold, and links to the console — nothing else.
+        let body = &h.posts_to("one").await[0];
+        for needle in [
+            "silver.orders",
+            "email_filled",
+            "75.0% not null",
+            "email not null >= 90%",
+            "/governance/data-quality",
+        ] {
+            assert!(body.contains(needle), "{needle} missing from {body}");
+        }
+    }
+
+    /// Each delivery is also listed on the Alerts page, under its own source.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_delivered_quality_alert_is_listed_as_an_instance(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("one", "silver.orders", true)]).await;
+        open_for_failed_run(&h.state, &rule("silver.orders"), "75.0% not null").await;
+        h.wait_for_posts("one", 1).await;
+
+        let mut listed: i64 = 0;
+        for _ in 0..100 {
+            listed = sqlx::query_scalar(
+                "SELECT count(*) FROM alert_instance WHERE source = 'Data quality'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if listed > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(listed, 1);
+    }
+
+    /// An anomaly opens an incident and is delivered the same way, once.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_opened_anomaly_is_delivered_once(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("all", "*", true)]).await;
+        let detail = "The latest load added 100 rows, 10% of the usual";
+
+        let opened = open_anomaly(
+            &h.state,
+            "silver.orders",
+            IncidentKind::VolumeAnomaly,
+            detail,
+        )
+        .await;
+        assert!(opened.is_some());
+        h.wait_for_posts("all", 1).await;
+        assert!(h.posts_to("all").await[0].contains(detail));
+
+        let again = open_anomaly(
+            &h.state,
+            "silver.orders",
+            IncidentKind::VolumeAnomaly,
+            detail,
+        )
+        .await;
+        assert_eq!(again, None);
+        Harness::settle().await;
+        assert_eq!(h.posts_to("all").await.len(), 1);
+    }
+
+    /// With no rule for the table, opening an incident delivers nothing and
+    /// still succeeds.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_incident_with_no_matching_rule_is_still_opened(pool: sqlx::PgPool) {
+        let h = harness(&pool, &[("other", "silver.customers", true)]).await;
+        open_for_failed_run(&h.state, &rule("silver.orders"), "75.0% not null").await;
+        Harness::settle().await;
+        assert_eq!(h.posts_to("other").await.len(), 0);
+        let open = quality::list(&pool, StatusFilter::Open, None)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+    }
 }
