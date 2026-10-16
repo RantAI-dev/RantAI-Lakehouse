@@ -288,3 +288,81 @@ lines).
 ## 9. Review
 
 (planner)
+
+## 9. Review
+
+Round 1, reviewed 2026-10-16 at `10e2b8fe` (developers: DeepSeek, MiniMax
+M3.1, Gemini; read with a separate security reviewer). E1, E2's refusal
+paths, E3, E5, E6 are implemented as planned; T3(b)'s mutation evidence
+and T5's compose run (TLSv1.3, the seeded connector's test over
+verify-full) are real (`review-logs/sec14b-t5.log`). `tls_proxy.rs` is
+`#[cfg(test)]` only: fine.
+
+**BLOCKER 1. The CA's private key reaches the API container.** The
+`postgres-cert-init` step writes `ca.key` (and `ca.srl`, `server.key`) into
+`lakehouse_postgres_tls` (`docker-compose.yml` ~35–48; the cleanup removes
+only `server.csr`, `server.ext`), and `lakehouse-api` mounts the whole
+volume (~657). The API image runs as root (`rust/Dockerfile` has no
+`USER`), so it can read the CA signing key, and that CA is the only trust
+root for every connector dial: anyone in the API container could mint a
+certificate for any database name and pass verify-full. E4 says the API
+mounts *the CA certificate*. Fix: delete `ca.key` and `ca.srl` after
+signing (nothing needs them afterwards; the idempotence check uses
+`ca.crt`, `server.crt`, `server.key`), and give the API only `ca.crt` (a
+second volume, or a copy written into a separate volume holding the
+certificate alone). Prove in T5's re-run that the API container has no
+file other than `ca.crt` under its mount.
+
+**BLOCKER 2. A server can make the probe reserve about 4 GiB.**
+`pg_probe.rs` `read_message` (~424–440) calls `Message::parse` with no
+length limit; `postgres-protocol` reads the 4-byte length from the header
+and reserves that much. Fix: read the 5-byte header yourself, refuse a
+length above a small cap (64 KiB is plenty for every message the probe
+expects) as `Protocol` before parsing, and add a fake-server test that
+sends `R` with a length of `0xFFFFFFFF` and is refused without growing the
+buffer.
+
+**BLOCKER 3. The server's SCRAM signature check can be skipped.**
+`pg_probe.rs` ~315 accepts `AuthenticationOk` in any state: a server that
+answers `SaslContinue` and then `AuthenticationOk` without `SaslFinal`
+never has `finish` run, and the test reports success. Once SCRAM has
+started, `AuthenticationOk` before a successful `finish` is a refusal. And
+`AuthenticationOk` with no authentication at all (a `trust` server) must
+not report the credential as verified: refuse it with a fixed message
+("the server did not ask for a password") unless the plan's owner says
+otherwise. Tests for both.
+
+**SHOULD-FIX 4.** The comment at ~320–322 says sending `n,,` (no channel
+binding) is what libpq sends; libpq's default `channel_binding=prefer`
+uses `SCRAM-SHA-256-PLUS` when offered over TLS. Correct the comment.
+Implementing `tls-server-end-point` binding is optional; if not done, say
+in `docs/OPERATIONS.md` that without a CA a relaying server is not
+detected.
+
+**SHOULD-FIX 5.** `docker-compose.yml` ~388
+`${CONNECTOR_TLS_CA_FILE:-/run/certs/postgres/ca.crt}` cannot be cleared
+from `.env`, while `docs/OPERATIONS.md` ~730 tells operators with publicly
+signed databases to "leave it empty". Document what an operator does
+instead (a bundle that includes the bundled CA and their own roots), in
+OPERATIONS and `.env.example`.
+
+**SHOULD-FIX 6.** `config.rs` ~1163 only checks the CA file is readable;
+also parse at least one PEM certificate at startup (a file with none stops
+the API with a message naming the variable), as `pg_probe.rs` ~192 says.
+
+**SHOULD-FIX 7.** tiberius' `trust_cert_ca` adds the CA to the native
+roots, so SQL Server accepts the configured CA or any public root, unlike
+Postgres. State that difference at `connector_probe.rs` ~1190 and in
+OPERATIONS ~714.
+
+**SHOULD-FIX 8.** `CHANGELOG.md` ~244–245 names
+`connector_probe::drop_cdc_publication_and_slot` (it is
+`connector_deprovision::drop_slot_and_publication`) and calls the third
+SQL Server dial a "CDC drop helper" (it is `connector_listing`).
+
+**SHOULD-FIX 9.** Pin `postgres-protocol = "0.6.12"` in `rust/Cargo.toml`
+with the reason (the SCRAM iteration cap this code relies on is there).
+
+The planner's own run of fmt, workspace clippy, `cargo deny` and the
+`lakehouse-api`/`lakehouse-store` tests is in progress; its counts go here
+before merge.
