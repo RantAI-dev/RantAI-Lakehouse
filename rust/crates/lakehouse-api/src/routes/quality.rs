@@ -1118,15 +1118,19 @@ pub async fn delete_rule(
 
 // ── The scheduled pass ─────────────────────────────────────────────────
 
-/// How often a rule is run on the schedule: at most once in this many
-/// minutes. A check is a full aggregate over its table, so it does not
-/// run on every 15-minute tick; an hour keeps a verdict current for
-/// tables that refresh daily without rescanning them all day.
+/// How often a table's rules run when it has no schedule: at most once in
+/// this many minutes. A check is a full aggregate over its table, so it does
+/// not run on every 15-minute tick; an hour keeps a verdict current for
+/// tables that refresh daily without rescanning them all day. A table can
+/// choose another interval, one hour to one day (`routes::quality_schedules`,
+/// `DATA-14`).
 const SCHEDULED_EVERY_MINUTES: i64 = 60;
 
-/// The most rules one tick runs. The rest wait for the next tick, oldest
-/// verdict first.
-const SCHEDULED_BATCH: usize = 25;
+/// The most rules one tick runs; the rest wait for the next tick, oldest
+/// verdict first. `DATA-14` (F3): 100, up from 25, which capped hourly rules
+/// at about 100 per day-tick-cycle (25 every 15 minutes); the pass says in
+/// its log how many it left over.
+const SCHEDULED_BATCH: usize = 100;
 
 /// Who the schedule's runs are recorded as.
 const SCHEDULE_ACTOR: &str = "schedule";
@@ -1168,18 +1172,40 @@ fn remember_skipped(rule_id: &str, at: &str) {
     }
 }
 
-/// Which rules are due: runnable as written, and never tried or last
-/// tried at least [`SCHEDULED_EVERY_MINUTES`] ago — longest-waiting first,
-/// at most [`SCHEDULED_BATCH`]. A rule was last tried when it last ran
-/// (`runs`) or when the schedule last found it could not be run
-/// (`skipped`), whichever is later. Every time is
-/// `YYYY-MM-DDTHH:MM:SSZ`, so they compare as text.
+/// The rules a tick will run and how many more were due.
+#[derive(Debug)]
+struct Due<'a> {
+    /// At most [`SCHEDULED_BATCH`], longest-waiting first.
+    rules: Vec<&'a QualityRule>,
+    /// Due but left for the next tick.
+    left: usize,
+}
+
+/// Parses the `YYYY-MM-DDTHH:MM:SSZ` form the run times are kept in.
+fn parse_time(text: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// Which rules are due: runnable as written, and never tried or last tried
+/// at least their table's interval ago (`intervals`, minutes by lower-cased
+/// table; [`SCHEDULED_EVERY_MINUTES`] for a table with none) — longest-waiting
+/// first, at most [`SCHEDULED_BATCH`]. A rule was last tried when it last ran
+/// (`runs`, only a run that still describes the rule) or when the schedule
+/// last found it could not be run (`skipped`), whichever is later. Every time
+/// is `YYYY-MM-DDTHH:MM:SSZ`, so they order as text.
 fn due_rules<'a>(
     rules: &'a [QualityRule],
     runs: &HashMap<String, LatestRun>,
     skipped: &HashMap<String, String>,
-    due_before: &str,
-) -> Vec<&'a QualityRule> {
+    intervals: &HashMap<String, i64>,
+    now: &str,
+) -> Due<'a> {
+    let Some(now) = parse_time(now) else {
+        return Due {
+            rules: Vec::new(),
+            left: 0,
+        };
+    };
     let mut due: Vec<(&str, &QualityRule)> = rules
         .iter()
         .filter(|r| threshold_hint(&r.threshold).is_none())
@@ -1190,14 +1216,26 @@ fn due_rules<'a>(
                 .map_or("", |run| run.at.as_str());
             let skipped = skipped.get(&r.id).map_or("", String::as_str);
             let last = ran.max(skipped);
-            (last < due_before).then_some((last, r))
+            let minutes = intervals
+                .get(&r.asset.trim().to_lowercase())
+                .copied()
+                .unwrap_or(SCHEDULED_EVERY_MINUTES);
+            // Never tried (or a time that cannot be read) is due at once.
+            let waited_enough =
+                parse_time(last).is_none_or(|at| at + time::Duration::minutes(minutes) <= now);
+            waited_enough.then_some((last, r))
         })
         .collect();
     due.sort_by_key(|(last, _)| *last);
-    due.into_iter()
-        .take(SCHEDULED_BATCH)
-        .map(|(_, r)| r)
-        .collect()
+    let left = due.len().saturating_sub(SCHEDULED_BATCH);
+    Due {
+        rules: due
+            .into_iter()
+            .take(SCHEDULED_BATCH)
+            .map(|(_, r)| r)
+            .collect(),
+        left,
+    }
 }
 
 /// Runs every due rule once ([`due_rules`]), one after another. A rule
@@ -1217,34 +1255,40 @@ async fn scheduled_pass(state: &AppState) {
     if rules.is_empty() {
         return;
     }
+    // A schedule that cannot be read must not be guessed at: a daily table
+    // would be run hourly. Wait for the next tick.
+    let intervals: HashMap<String, i64> = match lakehouse_store::quality::list_schedules(pg).await {
+        Ok(schedules) => schedules
+            .into_iter()
+            .map(|s| (s.asset, i64::from(s.interval_minutes)))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(?err, "quality schedule: schedules unavailable");
+            return;
+        }
+    };
     let ch = &state.clickhouse;
     // The store's clock, in the form its run times are read back in.
     let clock = match ch
         .rows(
-            &format!(
-                "SELECT formatDateTime(now(), '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS now, \
-                 formatDateTime(now() - INTERVAL {SCHEDULED_EVERY_MINUTES} MINUTE, \
-                 '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS t"
-            ),
+            "SELECT formatDateTime(now(), '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS now",
             None,
         )
         .await
     {
-        Ok(rows) => rows
-            .first()
-            .map(|r| (str_col(r, "now").to_owned(), str_col(r, "t").to_owned())),
+        Ok(rows) => rows.first().map(|r| str_col(r, "now").to_owned()),
         Err(err) => {
             tracing::warn!(?err, "quality schedule: clock unavailable");
             None
         }
     };
-    let Some((now, due_before)) = clock else {
+    let Some(now) = clock else {
         return;
     };
     let runs = latest_runs(ch).await;
-    let due = due_rules(&rules, &runs, &skipped_at(), &due_before);
+    let due = due_rules(&rules, &runs, &skipped_at(), &intervals, &now);
     let mut ran = 0;
-    for rule in &due {
+    for rule in &due.rules {
         match evaluate(state, rule, SCHEDULE_ACTOR).await {
             Ok(_) => ran += 1,
             Err(RunError::NotRunnable(why)) => {
@@ -1254,7 +1298,12 @@ async fn scheduled_pass(state: &AppState) {
             Err(RunError::Failed(_)) => {}
         }
     }
-    tracing::info!(due = due.len(), ran, "quality schedule: pass finished");
+    tracing::info!(
+        due = due.rules.len(),
+        left_for_next_tick = due.left,
+        ran,
+        "quality schedule: pass finished"
+    );
 }
 
 /// Starts a scheduled pass in the background and returns at once — the
@@ -1538,9 +1587,17 @@ mod tests {
         runs.insert("older".to_owned(), ran_at("2026-09-30T08:00:00Z"));
         runs.insert("prose".to_owned(), ran_at("2026-09-01T00:00:00Z"));
 
-        let due = due_rules(&rules, &runs, &HashMap::new(), "2026-10-01T09:00:00Z");
-        let ids: Vec<&str> = due.iter().map(|r| r.id.as_str()).collect();
+        // The tick's clock: an hour after the 09:00 the verdicts are held to.
+        let due = due_rules(
+            &rules,
+            &runs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "2026-10-01T10:00:00Z",
+        );
+        let ids: Vec<&str> = due.rules.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["never", "older", "stale"]);
+        assert_eq!(due.left, 0);
     }
 
     /// A rule the schedule could not run records no verdict. It is tried
@@ -1551,10 +1608,17 @@ mod tests {
         let mut runs = HashMap::new();
         runs.insert("stale".to_owned(), ran_at("2026-10-01T08:00:00Z"));
         let ids = |skipped: &HashMap<String, String>| -> Vec<String> {
-            due_rules(&rules, &runs, skipped, "2026-10-01T09:00:00Z")
-                .iter()
-                .map(|r| r.id.clone())
-                .collect()
+            due_rules(
+                &rules,
+                &runs,
+                skipped,
+                &HashMap::new(),
+                "2026-10-01T10:00:00Z",
+            )
+            .rules
+            .iter()
+            .map(|r| r.id.clone())
+            .collect()
         };
 
         let mut skipped = HashMap::new();
@@ -1566,21 +1630,81 @@ mod tests {
         assert_eq!(ids(&skipped), vec!["stale", "gone"]);
     }
 
-    /// One tick runs a bounded batch; the rest wait their turn.
+    /// One tick runs a bounded batch (`DATA-14`, F3: 100, was 25 — the old
+    /// test pinned 25 by constant and now pins the new bound the same way);
+    /// the rest wait their turn and are counted.
     #[test]
-    fn due_rules_are_capped_per_tick() {
+    fn due_rules_are_capped_per_tick_and_the_rest_are_counted() {
+        assert_eq!(SCHEDULED_BATCH, 100);
         let rules: Vec<QualityRule> = (0..SCHEDULED_BATCH + 5)
             .map(|i| rule(&format!("r{i:03}"), "rows >= 1"))
             .collect();
+        let due = due_rules(
+            &rules,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            "2026-10-01T10:00:00Z",
+        );
+        assert_eq!(due.rules.len(), SCHEDULED_BATCH);
+        assert_eq!(due.left, 5);
+    }
+
+    /// A table runs at its own interval; one with no schedule, hourly.
+    #[test]
+    fn a_table_is_due_at_its_own_interval() {
+        let mut daily = rule("daily", "rows >= 1");
+        daily.asset = "Silver.Daily".to_owned();
+        let hourly = rule("hourly", "rows >= 1");
+        let rules = [daily, hourly];
+        let mut runs = HashMap::new();
+        let mut ran = |id: &str, at: &str, asset: &str| {
+            let mut run = ran_at(at);
+            run.asset = asset.to_owned();
+            runs.insert(id.to_owned(), run);
+        };
+        ran("daily", "2026-10-01T09:00:00Z", "Silver.Daily");
+        ran("hourly", "2026-10-01T09:00:00Z", "silver.orders");
+        let intervals = HashMap::from([("silver.daily".to_owned(), 1440_i64)]);
+        let ids = |now: &str| -> Vec<String> {
+            due_rules(&rules, &runs, &HashMap::new(), &intervals, now)
+                .rules
+                .iter()
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        // 59 minutes on: neither. An hour on: the hourly one only. A day on: both.
+        assert!(ids("2026-10-01T09:59:59Z").is_empty());
+        assert_eq!(ids("2026-10-01T10:00:00Z"), vec!["hourly"]);
+        assert_eq!(ids("2026-10-02T08:59:59Z"), vec!["hourly"]);
+        assert_eq!(ids("2026-10-02T09:00:00Z"), vec!["daily", "hourly"]);
+        // A clock that cannot be read runs nothing rather than everything.
+        assert!(ids("not a time").is_empty());
+    }
+
+    /// Longest-waiting first, across tables with different intervals.
+    #[test]
+    fn the_oldest_due_rule_goes_first() {
+        let rules = [rule("a", "rows >= 1"), rule("b", "rows >= 1")];
+        let mut runs = HashMap::new();
+        runs.insert("a".to_owned(), ran_at("2026-10-01T07:00:00Z"));
+        runs.insert("b".to_owned(), ran_at("2026-10-01T06:00:00Z"));
+        let due = due_rules(
+            &rules,
+            &runs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "2026-10-01T10:00:00Z",
+        );
+        let ids: Vec<&str> = due.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn the_default_interval_is_the_stores_default() {
         assert_eq!(
-            due_rules(
-                &rules,
-                &HashMap::new(),
-                &HashMap::new(),
-                "2026-10-01T09:00:00Z"
-            )
-            .len(),
-            SCHEDULED_BATCH
+            SCHEDULED_EVERY_MINUTES,
+            i64::from(lakehouse_store::quality::DEFAULT_INTERVAL_MINUTES)
         );
     }
 
@@ -1659,8 +1783,14 @@ mod tests {
             ..rule("r1", "payment_id unique")
         };
         let rules = [edited_rule];
-        let due = due_rules(&rules, &runs, &HashMap::new(), "2026-10-01T09:00:00Z");
-        assert_eq!(due.len(), 1);
+        let due = due_rules(
+            &rules,
+            &runs,
+            &HashMap::new(),
+            &HashMap::new(),
+            "2026-10-01T10:00:00Z",
+        );
+        assert_eq!(due.rules.len(), 1);
     }
 
     // ── DATA-14 (F1): the rest of the ready library ────────────────────

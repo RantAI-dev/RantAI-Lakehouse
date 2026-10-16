@@ -37,6 +37,7 @@ mod overview;
 mod pipelines;
 mod quality;
 mod quality_incidents;
+mod quality_schedules;
 mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -413,6 +414,16 @@ fn governance_static_router() -> Router<AppState> {
         .route(
             "/api/governance/quality/incidents/{id}/resolve",
             axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule),
         )
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.

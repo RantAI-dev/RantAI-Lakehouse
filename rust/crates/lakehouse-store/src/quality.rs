@@ -307,6 +307,128 @@ pub async fn resolve_for_rule(
     Ok(done.rows_affected())
 }
 
+// ── Schedules ──────────────────────────────────────────────────────────
+
+/// The shortest and longest interval a table's rules may run at, in
+/// minutes (one hour to one day; the table's `CHECK`).
+pub const MIN_INTERVAL_MINUTES: i32 = 60;
+/// See [`MIN_INTERVAL_MINUTES`].
+pub const MAX_INTERVAL_MINUTES: i32 = 1440;
+
+/// The interval of a table with no schedule row: today's behaviour.
+pub const DEFAULT_INTERVAL_MINUTES: i32 = 60;
+
+/// How a table's rules are run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleMode {
+    /// After every successful load of the table, and every
+    /// `interval_minutes` as a backstop for loads that never report.
+    OnLoad,
+    /// Every `interval_minutes`.
+    Interval,
+}
+
+impl ScheduleMode {
+    /// The value stored in `quality_schedule.mode`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnLoad => "on_load",
+            Self::Interval => "interval",
+        }
+    }
+
+    /// Reads a stored or requested mode; `None` for anything else.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "on_load" => Some(Self::OnLoad),
+            "interval" => Some(Self::Interval),
+            _ => None,
+        }
+    }
+}
+
+/// One table's schedule. Mirrors `QualitySchedule` in
+/// `contracts/governance.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct QualitySchedule {
+    /// The table, lower-cased.
+    pub asset: String,
+    /// `on_load` or `interval`.
+    pub mode: String,
+    /// Minutes between runs (the backstop for `on_load`).
+    pub interval_minutes: i32,
+    /// Who set it last, by name where the person is still known.
+    pub updated_by: Option<String>,
+    /// When it was set.
+    pub updated_at: String,
+}
+
+const SCHEDULE_SELECT: &str = "SELECT s.asset, s.mode, s.interval_minutes, u.name AS updated_by, \
+     to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at \
+     FROM quality_schedule s LEFT JOIN app_user u ON u.id = s.updated_by";
+
+/// Every table that has a schedule. A table not listed runs every
+/// [`DEFAULT_INTERVAL_MINUTES`].
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn list_schedules(pool: &PgPool) -> Result<Vec<QualitySchedule>, StoreError> {
+    let sql = format!("{SCHEDULE_SELECT} ORDER BY s.asset");
+    Ok(sqlx::query_as::<_, QualitySchedule>(&sql)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Sets the schedule of `asset`.
+///
+/// # Errors
+///
+/// [`StoreError::Validation`] when `interval_minutes` is outside
+/// [`MIN_INTERVAL_MINUTES`]..=[`MAX_INTERVAL_MINUTES`] or the table name is
+/// empty or longer than 256 characters; [`StoreError::Database`] otherwise.
+pub async fn put_schedule(
+    pool: &PgPool,
+    asset: &str,
+    mode: ScheduleMode,
+    interval_minutes: i32,
+    by: Uuid,
+) -> Result<QualitySchedule, StoreError> {
+    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&interval_minutes) {
+        return Err(StoreError::Validation(format!(
+            "The interval must be from {MIN_INTERVAL_MINUTES} minutes (1 hour) to \
+             {MAX_INTERVAL_MINUTES} minutes (1 day)."
+        )));
+    }
+    let asset = asset.trim().to_lowercase();
+    if asset.is_empty() || asset.chars().count() > 256 {
+        return Err(StoreError::Validation(
+            "Name the table as zone.table.".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO quality_schedule (asset, mode, interval_minutes, updated_by, updated_at) \
+         VALUES ($1, $2, $3, $4, now()) \
+         ON CONFLICT (asset) DO UPDATE SET mode = EXCLUDED.mode, \
+             interval_minutes = EXCLUDED.interval_minutes, \
+             updated_by = EXCLUDED.updated_by, updated_at = now()",
+    )
+    .bind(&asset)
+    .bind(mode.as_str())
+    .bind(interval_minutes)
+    .bind(by)
+    .execute(pool)
+    .await?;
+    let sql = format!("{SCHEDULE_SELECT} WHERE s.asset = $1");
+    Ok(sqlx::query_as::<_, QualitySchedule>(&sql)
+        .bind(&asset)
+        .fetch_one(pool)
+        .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +440,17 @@ mod tests {
         assert_eq!(clipped.chars().count(), MAX_DETAIL_CHARS);
         assert!(clipped.ends_with('…'));
         assert_eq!(clip("short", MAX_DETAIL_CHARS), "short");
+    }
+
+    #[test]
+    fn the_schedule_mode_reads_only_its_two_words() {
+        assert_eq!(ScheduleMode::parse("on_load"), Some(ScheduleMode::OnLoad));
+        assert_eq!(
+            ScheduleMode::parse("interval"),
+            Some(ScheduleMode::Interval)
+        );
+        assert_eq!(ScheduleMode::parse("hourly"), None);
+        assert_eq!(ScheduleMode::OnLoad.as_str(), "on_load");
     }
 
     #[test]

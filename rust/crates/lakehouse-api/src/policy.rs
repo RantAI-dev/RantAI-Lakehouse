@@ -303,6 +303,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // editing or deleting a rule.
     ("GET",  "/api/governance/quality/incidents", Policy::RequiresAuth),
     ("POST", "/api/governance/quality/incidents/{id}/resolve", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F3): per-table schedules. Reading is open to any login like
+    // the rule list; setting one changes when real checks (and their
+    // incidents and alerts) run, so it is a governance decision.
+    ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
+    ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -889,6 +894,20 @@ mod tests {
         );
         assert_eq!(
             policy_for("POST", "/api/governance/quality/incidents/{id}/resolve"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F3): reading schedules needs only a login; setting one needs
+    /// `governance:write`.
+    #[test]
+    fn quality_schedules_are_read_by_any_login_and_set_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/schedules"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
             Some(Policy::RequiresPermission("governance:write"))
         );
     }

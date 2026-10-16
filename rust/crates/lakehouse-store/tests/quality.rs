@@ -10,7 +10,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::quality::{
-    IncidentKind, Resolution, StatusFilter, list, record_failure, resolve, resolve_for_rule,
+    IncidentKind, Resolution, ScheduleMode, StatusFilter, list, list_schedules, put_schedule,
+    record_failure, resolve, resolve_for_rule,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -268,5 +269,78 @@ async fn a_long_detail_is_clipped(pool: PgPool) -> sqlx::Result<()> {
     .unwrap();
     let open = list(&pool, StatusFilter::Open, None).await.unwrap();
     assert_eq!(open[0].detail.chars().count(), 1000);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_schedule_is_kept_per_table_and_replaced_by_the_next_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // No row is the default: nothing listed.
+    assert!(list_schedules(&pool).await.unwrap().is_empty());
+
+    let first = put_schedule(&pool, " Silver.Orders ", ScheduleMode::Interval, 180, USER)
+        .await
+        .unwrap();
+    assert_eq!(first.asset, "silver.orders");
+    assert_eq!(first.mode, "interval");
+    assert_eq!(first.interval_minutes, 180);
+    assert!(first.updated_by.is_some());
+    assert!(first.updated_at.ends_with('Z'));
+
+    let second = put_schedule(&pool, "silver.orders", ScheduleMode::OnLoad, 1440, USER)
+        .await
+        .unwrap();
+    assert_eq!(second.mode, "on_load");
+    put_schedule(&pool, "serving.mart", ScheduleMode::Interval, 60, USER)
+        .await
+        .unwrap();
+    let all = list_schedules(&pool).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|s| (s.asset.as_str(), s.mode.as_str(), s.interval_minutes))
+            .collect::<Vec<_>>(),
+        vec![
+            ("serving.mart", "interval", 60),
+            ("silver.orders", "on_load", 1440)
+        ]
+    );
+    Ok(())
+}
+
+/// The bounds are one hour and one day, both inclusive.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_schedule_interval_is_between_one_hour_and_one_day(pool: PgPool) -> sqlx::Result<()> {
+    for minutes in [-1, 0, 30, 59, 1441, 100_000] {
+        assert!(
+            matches!(
+                put_schedule(
+                    &pool,
+                    "silver.orders",
+                    ScheduleMode::Interval,
+                    minutes,
+                    USER
+                )
+                .await,
+                Err(StoreError::Validation(_))
+            ),
+            "{minutes}"
+        );
+    }
+    for minutes in [60, 61, 1439, 1440] {
+        put_schedule(
+            &pool,
+            "silver.orders",
+            ScheduleMode::Interval,
+            minutes,
+            USER,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        put_schedule(&pool, "  ", ScheduleMode::Interval, 60, USER).await,
+        Err(StoreError::Validation(_))
+    ));
     Ok(())
 }

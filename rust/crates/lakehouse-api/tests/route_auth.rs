@@ -1687,6 +1687,53 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// `DATA-14` (F3): any login may read the schedules, and setting one needs
+/// `governance:write`. A principal without it is refused (403) and nothing is
+/// stored; one with it is past the gate (an empty body then answers 400).
+#[tokio::test]
+async fn quality_schedule_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let set = "/api/governance/quality/schedules/silver.orders";
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/quality/schedules",
+        &reader_cookie,
+    )
+    .await;
+    assert_ne!(
+        listed.status(),
+        StatusCode::FORBIDDEN,
+        "any login may read schedules"
+    );
+    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
+    let refused = request_with_cookie(&router, "PUT", set, &reader_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to set a schedule"
+    );
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
+    assert_ne!(
+        allowed.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write must be enough to set a schedule"
+    );
+    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
+        .fetch_one(&pool)
+        .await
+        .expect("count schedules");
+    assert_eq!(stored, 0, "no empty-bodied request may store a schedule");
+}
+
 /// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the
 /// policies the plan names, so the table-driven loops above walk them both
 /// ways (a `dashboard:read`-only principal is refused on the withdrawal; the
