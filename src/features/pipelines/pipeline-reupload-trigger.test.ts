@@ -78,19 +78,21 @@ describe("turning the switch on and off changes only that one upstream", () => {
   })
 
   it("drops ingest_job for a source that is not Bronze, but keeps it on Bronze (BLD-4 review R1)", () => {
-    // BLD-4 review R1 / Decision R1:
+    // BLD-4 review R1 / Decision R1, asserted through the exported
+    // constant so the assertion follows the value the filter compares
+    // against rather than a second literal that could drift from it:
     // a Silver source with ["ingest_job", "pl-a"] saves ["pl-a"]
-    expect(withReuploadTrigger(["ingest_job", "pl-a"], "silver", true)).toEqual(["pl-a"])
-    expect(withReuploadTrigger(["ingest_job", "pl-a"], "silver", false)).toEqual(["pl-a"])
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "silver", true)).toEqual(["pl-a"])
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "silver", false)).toEqual(["pl-a"])
 
     // a Bronze source keeps ingest_job
-    expect(withReuploadTrigger(["ingest_job", "pl-a"], "bronze", false)).toEqual([
-      "ingest_job",
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "bronze", false)).toEqual([
+      INGEST_JOB,
       "pl-a",
     ])
-    expect(withReuploadTrigger(["ingest_job", "pl-a"], "bronze", true)).toEqual([
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "bronze", true)).toEqual([
       FILE_INGEST_JOB,
-      "ingest_job",
+      INGEST_JOB,
       "pl-a",
     ])
   })
