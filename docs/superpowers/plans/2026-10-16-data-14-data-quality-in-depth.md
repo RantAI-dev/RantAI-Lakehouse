@@ -233,3 +233,32 @@ None that stopped the work. All anchors in section 2 held at the base. Two thing
 ## Review
 
 *(planner)*
+
+### Planner's review, 2026-10-16, at `50a17b51` (merged into the phase branch as `ac8321cd`)
+
+No `BLOCKER`. The developer's added decisions are accepted:
+- Three read routes the console needs (schedules, learning state, a rule's
+  runs), on the same permission as the quality list.
+- An `on_load` schedule also keeps an interval (default one day), so
+  change-capture tables and tables a failed run committed are still checked.
+- A resolved freshness incident is not reopened until the table loads again,
+  so a dead table does not re-alert every 15 minutes.
+- Alert rules of kind `quality_incident` are for unrestricted
+  administrators only: the alert names tables of any tenant, and a table
+  scope cannot be tenant-checked the way a connector scope is.
+- A new rule runs once at once, so `DATA-14-AC1` does not wait for the
+  tick.
+
+The merge needed two semantic fixes besides the text: `main`'s alert rules
+gained `metric` (BI-2) while `DATA-14` added `asset`; every rule literal and
+the insert carry both (`ac8321cd`).
+
+**Spec rows, as delivered:** checks, expectations, schedules, overview and
+alerts met in code; anomaly detection partly met by nature: the product
+records loads from this release on, so a table is learned only after 14
+days and 5 loads (`DATA-14-AC2` cannot be shown on a fresh install before
+then).
+
+**Not verified.** No Rust test has run; CI on #106 runs them. The
+developer's whole-suite `bun run test` was killed by the machine (memory);
+per-directory runs passed 1,594 tests with 0 failures.
