@@ -129,7 +129,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use lakehouse_core::secret::DynSecretResolver;
+use lakehouse_core::secret::{DynSecretResolver, SecretValue};
 use lakehouse_store::connectors::ConnectorDialInfo;
 use lakehouse_store::ingest_spec::{
     CdcDial, Dial, FilesProtocol, RestAuth, RestDial, SqlDial, SqlDriver,
@@ -141,6 +141,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
+use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
 use crate::internal_hosts::InternalHosts;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
@@ -168,6 +169,12 @@ pub struct Outcome {
     pub latency_ms: Option<i64>,
     /// Human-readable result message.
     pub message: String,
+    /// `SRC-12` part C: the new refresh token an `OAuth2` provider issued while
+    /// the probe used the stored one. A provider that rotates refresh tokens has
+    /// already invalidated the old one, so a probe that dropped this would sign
+    /// the connector out; the caller must store it (`routes::connector_oauth`).
+    /// `None` for every other probe. Never serialized, never logged.
+    pub rotated_refresh_token: Option<SecretValue>,
 }
 
 impl Outcome {
@@ -180,6 +187,7 @@ impl Outcome {
                 "This build cannot test a {kind:?} connector: no live-dial implementation \
                  exists for this connector type yet."
             ),
+            rotated_refresh_token: None,
         }
     }
 
@@ -191,6 +199,7 @@ impl Outcome {
             supported: false,
             latency_ms: None,
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -210,6 +219,7 @@ impl Outcome {
             supported: true,
             latency_ms: Some(elapsed_millis(elapsed)),
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -219,6 +229,7 @@ impl Outcome {
             supported: true,
             latency_ms: Some(elapsed_millis(elapsed)),
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 
@@ -233,6 +244,7 @@ impl Outcome {
             supported: true,
             latency_ms: None,
             message: message.into(),
+            rotated_refresh_token: None,
         }
     }
 }
@@ -267,11 +279,23 @@ pub async fn probe(
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
 ) -> Outcome {
+    probe_with(info, resolver, internal_hosts, OAuthSettings::default()).await
+}
+
+/// [`probe`] with the installation's `OAuth2` settings (`SRC-12` part C): the
+/// routes call this one, so a gate that admits an `http` provider is honoured
+/// by the connection test as well as by the sign-in.
+pub async fn probe_with(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Outcome {
     match info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
             Box::pin(probe_dial(adapter, info, resolver, internal_hosts)).await
         }
-        Some("rest") => probe_rest_info(info, resolver, internal_hosts).await,
+        Some("rest") => probe_rest_info(info, resolver, internal_hosts, oauth).await,
         Some("sheets") => probe_sheets(),
         // SRC-6 F4: these connect only from the orchestrator. Explicit arms,
         // so the answer does not depend on falling through to the `kind`
@@ -598,15 +622,17 @@ async fn probe_rest_info(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
 ) -> Outcome {
     match Dial::parse("rest", &info.dial) {
         Ok(Dial::Rest(dial)) => {
-            probe_rest(
+            probe_rest_with(
                 &dial,
                 &info.secret_ref,
                 info.secret_ref_secondary.as_deref(),
                 resolver,
                 internal_hosts,
+                oauth,
             )
             .await
         }
@@ -619,12 +645,37 @@ async fn probe_rest_info(
 /// `resolve_checked` runs FIRST, against `dial.base_url`'s own
 /// host/port, before any credential is resolved or request sent — see
 /// `probe_rest_blocks_an_internal_host_before_dialing`.
+#[cfg(test)]
 async fn probe_rest(
     dial: &RestDial,
     secret_ref: &str,
     secret_ref_secondary: Option<&str>,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+) -> Outcome {
+    probe_rest_with(
+        dial,
+        secret_ref,
+        secret_ref_secondary,
+        resolver,
+        internal_hosts,
+        OAuthSettings::default(),
+    )
+    .await
+}
+
+/// [`probe_rest`] with the installation's `OAuth2` settings.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per authentication shape, each short; splitting would scatter the one request that follows"
+)]
+async fn probe_rest_with(
+    dial: &RestDial,
+    secret_ref: &str,
+    secret_ref_secondary: Option<&str>,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
 ) -> Outcome {
     let Some((host, port)) = parse_endpoint_host_port(&dial.base_url) else {
         return Outcome::misconfigured(
@@ -641,6 +692,7 @@ async fn probe_rest(
     };
 
     let request = client.get(&dial.base_url);
+    let mut rotated: Option<SecretValue> = None;
     let request = match &dial.auth {
         RestAuth::ApiKey { header } => {
             let key = match resolver.resolve_dyn(secret_ref).await {
@@ -689,23 +741,96 @@ async fn probe_rest(
             };
             request.basic_auth(username.expose_secret(), Some(password.expose_secret()))
         }
-        RestAuth::Oauth2ClientCredentials { .. } => {
-            // Never fabricated: an OAuth2 client-credentials exchange is a
-            // second network call this build's probe does not implement
-            // (mirrors probe_sheets's own "unsupported, honestly" posture
-            // for a credential exchange this workspace cannot verify).
-            // `supported: false`, not misconfigured: nothing about the
-            // connector is wrong, and a misconfigured outcome would make
-            // `set_credential` refuse every OAuth2 credential outright.
-            return Outcome {
-                ok: false,
-                supported: false,
-                latency_ms: None,
-                message: "This build cannot test REST OAuth2 client-credentials auth: the probe \
-                          does not perform the token exchange. Ingest runs still use the stored \
-                          client id and secret."
-                    .to_owned(),
+        RestAuth::Oauth2ClientCredentials { token_url } => {
+            // `SRC-12` part C: the test performs the token request the load
+            // performs (decision 7), so a wrong client id or secret is found
+            // here and not on the first run. The id is the primary slot, the
+            // secret the secondary one (`secret_field_names`).
+            let Some(secondary) = secret_ref_secondary else {
+                return Outcome::misconfigured(
+                    "connector is misconfigured: OAuth2 client credentials need a client id and \
+                     a client secret, and this connector stores only one credential",
+                );
             };
+            let (client_id, client_secret) = match (
+                resolver.resolve_dyn(secret_ref).await,
+                resolver.resolve_dyn(secondary).await,
+            ) {
+                (Ok(id), Ok(secret)) => (id, secret),
+                (Err(err), _) | (_, Err(err)) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            let started = Instant::now();
+            let tokens = match connector_oauth::token_request(
+                token_url,
+                &[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", client_id.expose_secret()),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(failure) => return token_failure_outcome(&failure, started.elapsed()),
+            };
+            request.bearer_auth(tokens.access_token.expose_secret())
+        }
+        RestAuth::Oauth2AuthorizationCode {
+            client_id,
+            token_url,
+            ..
+        } => {
+            // Client secret in the primary slot, refresh token in the
+            // secondary. No refresh token yet means nobody has signed in:
+            // nothing is wrong with the connector, and a failure here would
+            // make `set_credential` refuse the client secret that has to be
+            // saved BEFORE the first sign-in, so this is `supported: false`
+            // with the reason, never a fabricated success.
+            let client_secret = match resolver.resolve_dyn(secret_ref).await {
+                Ok(secret) => secret,
+                Err(err) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            let refresh_token = match secret_ref_secondary {
+                Some(secondary) => resolver.resolve_dyn(secondary).await.ok(),
+                None => None,
+            };
+            let Some(refresh_token) = refresh_token else {
+                return Outcome::not_testable_with(
+                    "Nobody has signed in to this connector yet, so the connection cannot be \
+                     tested. Use Sign in on the connector page, then test again.",
+                );
+            };
+            let started = Instant::now();
+            let tokens = match connector_oauth::token_request(
+                token_url,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.expose_secret()),
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(failure) => return token_failure_outcome(&failure, started.elapsed()),
+            };
+            // A rotating provider has retired the token just used; the caller
+            // stores the new one (`Outcome::rotated_refresh_token`).
+            rotated = tokens.refresh_token;
+            request.bearer_auth(tokens.access_token.expose_secret())
         }
     };
 
@@ -713,7 +838,7 @@ async fn probe_rest(
     let attempt = tokio::time::timeout(DIAL_TIMEOUT, request.send()).await;
     let elapsed = started.elapsed();
 
-    match attempt {
+    let mut outcome = match attempt {
         // SEC-15: a redirect is reported, never followed; the `Location`
         // is not echoed (it is the server's text, and may name an address).
         Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
@@ -740,6 +865,24 @@ async fn probe_rest(
             elapsed,
             format!("REST request timed out after {}s", DIAL_TIMEOUT.as_secs()),
         ),
+    };
+    // Whatever the request to the API itself answered, a provider that rotated
+    // the refresh token has already retired the old one: hand the new one back.
+    outcome.rotated_refresh_token = rotated;
+    outcome
+}
+
+/// The outcome for a token request that did not succeed (`SRC-12` part C): a
+/// refused address is a misconfiguration (no request was made), a refused
+/// credential or an unreachable provider is a failed test. The text is
+/// [`TokenFailure::message`], fixed, never the provider's own words.
+fn token_failure_outcome(failure: &TokenFailure, elapsed: Duration) -> Outcome {
+    match failure {
+        TokenFailure::Address(message) => Outcome::misconfigured(message.clone()),
+        TokenFailure::Refused | TokenFailure::Unavailable => Outcome::failure(
+            elapsed,
+            format!("OAuth token request failed: {}", failure.message()),
+        ),
     }
 }
 
@@ -748,7 +891,7 @@ async fn probe_rest(
 /// URL with [`parse_endpoint_host_port`]'s hand-rolled splitter, the client
 /// with the `url` crate; a URL the two read differently could make the client
 /// dial a host the check never saw, so a mismatch is refused.
-fn url_names_target(url: &str, host: &str, port: u16) -> bool {
+pub(crate) fn url_names_target(url: &str, host: &str, port: u16) -> bool {
     reqwest::Url::parse(url).is_ok_and(|parsed| {
         parsed
             .host_str()
@@ -769,7 +912,7 @@ fn url_names_target(url: &str, host: &str, port: u16) -> bool {
 ///
 /// A fixed message when `url` does not name the checked host and port, or the
 /// client cannot be built.
-fn pinned_http_client(
+pub(crate) fn pinned_http_client(
     url: &str,
     host: &str,
     port: u16,
@@ -846,6 +989,7 @@ fn probe_sheets() -> Outcome {
         message: "This build cannot test a Google Sheets connector: no verified \
                    service-account token exchange exists yet."
             .to_owned(),
+        rotated_refresh_token: None,
     }
 }
 
@@ -1341,7 +1485,7 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
 /// The S3 client for [`probe_s3`], pinned to the [`Approved`] addresses of
 /// `endpoint_host` (see [`PinnedHttpConnector`]). Separate from `probe_s3` so
 /// a test can build the same client against a stand-in server.
-fn s3_client(
+pub(crate) fn s3_client(
     endpoint: &str,
     bucket: &str,
     endpoint_host: &str,
@@ -2653,6 +2797,248 @@ mod tests {
         )
         .await;
         assert!(outcome.ok, "{}", outcome.message);
+    }
+
+    // ── SRC-12 part C: the connection test performs the OAuth token request ──
+
+    const OAUTH_GATE: OAuthSettings = OAuthSettings { allow_http: true };
+
+    fn oauth_code_dial(server: &wiremock::MockServer) -> RestDial {
+        RestDial {
+            base_url: format!("{}/api", server.uri()),
+            auth: RestAuth::Oauth2AuthorizationCode {
+                client_id: "app-1".to_owned(),
+                authorize_url: format!("{}/authorize", server.uri()),
+                token_url: format!("{}/token", server.uri()),
+                revocation_url: None,
+                scopes: vec![],
+            },
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        }
+    }
+
+    fn oauth_secrets(refresh_token: bool) -> EnvSecretResolver {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "OAUTH_CLIENT_SECRET".to_owned(),
+            "client-secret-1".to_owned(),
+        );
+        if refresh_token {
+            map.insert("OAUTH_REFRESH_TOKEN".to_owned(), "refresh-1".to_owned());
+        }
+        EnvSecretResolver::with_map(map)
+    }
+
+    async fn token_endpoint(
+        server: &wiremock::MockServer,
+        response: wiremock::ResponseTemplate,
+        expected_calls: u64,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(response)
+            .expect(expected_calls)
+            .mount(server)
+            .await;
+    }
+
+    async fn api_endpoint(server: &wiremock::MockServer, bearer: &str, status: u16) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                format!("Bearer {bearer}").as_str(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+    }
+
+    async fn probe_code(
+        server: &wiremock::MockServer,
+        resolver: &EnvSecretResolver,
+        secondary: Option<&str>,
+        settings: OAuthSettings,
+    ) -> Outcome {
+        probe_rest_with(
+            &oauth_code_dial(server),
+            "env:OAUTH_CLIENT_SECRET",
+            secondary,
+            resolver,
+            &InternalHosts::ALL,
+            settings,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refreshes_then_calls_the_api_and_hands_back_a_rotated_token()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })),
+            1,
+        )
+        .await;
+        api_endpoint(&server, "access-1", 200).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        // The provider retired refresh-1; the caller must store this one.
+        assert_eq!(
+            outcome
+                .rotated_refresh_token
+                .as_ref()
+                .map(SecretValue::expose_secret),
+            Some("refresh-2")
+        );
+        let token_request = &server.received_requests().await.unwrap()[0];
+        let body = String::from_utf8_lossy(&token_request.body).into_owned();
+        assert!(body.contains("grant_type=refresh_token"), "{body}");
+        assert!(body.contains("refresh_token=refresh-1"), "{body}");
+        assert!(body.contains("client_id=app-1"), "{body}");
+        assert!(!outcome.message.contains("access-1") && !outcome.message.contains("refresh-"));
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_keeps_a_rotated_token_when_the_api_rejects_the_call() {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })),
+            1,
+        )
+        .await;
+        api_endpoint(&server, "access-1", 401).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.supported && !outcome.ok);
+        assert!(
+            outcome.rotated_refresh_token.is_some(),
+            "a failed call must not lose the provider's new refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_without_a_refresh_token_is_not_testable_and_dials_nothing()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(&server, wiremock::ResponseTemplate::new(500), 0).await;
+        // No secondary slot value, and a secondary that names nothing.
+        for secondary in [None, Some("env:OAUTH_REFRESH_TOKEN")] {
+            let outcome = probe_code(&server, &oauth_secrets(false), secondary, OAUTH_GATE).await;
+            assert!(!outcome.supported && !outcome.ok, "{}", outcome.message);
+            assert!(outcome.message.contains("signed in"), "{}", outcome.message);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refused_refresh_is_a_failure_without_the_providers_words()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(
+            &server,
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant", "error_description": "PROVIDER-WORDS"
+            })),
+            1,
+        )
+        .await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.supported && !outcome.ok);
+        assert!(
+            outcome.message.contains("sign in again"),
+            "{}",
+            outcome.message
+        );
+        assert!(!outcome.message.contains("PROVIDER-WORDS"));
+        assert!(!outcome.message.contains("invalid_grant"));
+        assert!(outcome.rotated_refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_authorization_code_refuses_an_http_token_address_unless_the_gate_switch_is_on()
+     {
+        let server = wiremock::MockServer::start().await;
+        token_endpoint(&server, wiremock::ResponseTemplate::new(500), 0).await;
+        let outcome = probe_code(
+            &server,
+            &oauth_secrets(true),
+            Some("env:OAUTH_REFRESH_TOKEN"),
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("https"), "{}", outcome.message);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_client_credentials_performs_the_token_request_the_load_performs() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .and(wiremock::matchers::body_string_contains(
+                "grant_type=client_credentials",
+            ))
+            .and(wiremock::matchers::body_string_contains("client_id=id-1"))
+            .and(wiremock::matchers::body_string_contains(
+                "client_secret=secret-1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "access_token": "access-9" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        api_endpoint(&server, "access-9", 200).await;
+        let dial = RestDial {
+            base_url: format!("{}/api", server.uri()),
+            auth: RestAuth::Oauth2ClientCredentials {
+                token_url: format!("{}/token", server.uri()),
+            },
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("OAUTH_CC_ID".to_owned(), "id-1".to_owned());
+        map.insert("OAUTH_CC_SECRET".to_owned(), "secret-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest_with(
+            &dial,
+            "env:OAUTH_CC_ID",
+            Some("env:OAUTH_CC_SECRET"),
+            &resolver,
+            &InternalHosts::ALL,
+            OAUTH_GATE,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.rotated_refresh_token.is_none());
     }
 
     #[tokio::test]

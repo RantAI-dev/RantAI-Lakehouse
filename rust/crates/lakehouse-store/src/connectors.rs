@@ -174,6 +174,13 @@ pub struct ConnectorDetail {
     /// boolean derived from the ref on read — the ref itself is still never
     /// returned (module doc comment, guarantee 1).
     pub credential_managed: bool,
+    /// How the primary credential is held: `managed` (sealed on the
+    /// credentials volume, `SRC-12`), `env` (an operator's environment
+    /// variable, read at start-up) or `file` (an operator's file). `None` for
+    /// a reference of any other scheme. `SRC-12` decision 10: the connector
+    /// page names it and, for `env`, says a restart is needed after a
+    /// change. A scheme only, never the reference or the value.
+    pub credential_source: Option<CredentialSource>,
     /// The primary credential's kind (password, access key, …), read from
     /// its ref's suffix so the edit page asks for the right thing. `None`
     /// for a ref whose name does not end in a known suffix (e.g. a
@@ -395,6 +402,23 @@ pub async fn connector_in_tenants(
     .await?)
 }
 
+/// The tenant a connector belongs to, or `None` for an unknown id or a
+/// connector with no tenant. Read by the secret-reference check
+/// (`SRC-12 review B1 BLOCKER 1`), which expands `{tenant}` in the operator's
+/// allowed prefixes with it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_tenant_id(pool: &PgPool, id: &str) -> Result<Option<Uuid>, StoreError> {
+    let row: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT tenant_id FROM connector WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.flatten())
+}
+
 /// Which of `ids` are connectors of one of `tenant_ids`: [`connector_in_tenants`]
 /// for many ids in one query, for a caller that filters a list (the alert
 /// rule list, `SRC-7` review BLOCKER 1) and must not pay a round trip per
@@ -476,6 +500,7 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
         return Ok(None);
     };
     let credential_managed = is_managed_secret_ref(&row.secret_ref);
+    let credential_source = credential_source_of_ref(&row.secret_ref);
     let credential_kind = credential_kind_of_ref(&row.secret_ref);
     // Not in `CONNECTOR_COLUMNS` (list rows never need it); read here only
     // to report its KIND — the ref itself is never returned.
@@ -503,6 +528,7 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
     Ok(Some(ConnectorDetail {
         audit_event_id,
         credential_managed,
+        credential_source,
         credential_kind,
         credential_secondary_kind,
         residency,
@@ -574,7 +600,19 @@ pub enum CredentialSource {
     /// one: every id begins `conn-`, so a `File` name always begins
     /// `connector_conn_`.
     Managed,
+    /// A reference to a secret in the installation's secret manager
+    /// (`SRC-12` part B): `vault:…`, `aws-sm:…`, `gcp-sm:…` or `azure-kv:…`.
+    /// Only the reference is stored; the product reads the value from the
+    /// manager at every use. Never derived from a connector id (the user
+    /// names the place), so it is set only by `PUT …/credential`, and
+    /// [`derive_secret_ref`] has no real name to give it.
+    Reference,
 }
+
+/// The schemes of the secret-manager references ([`CredentialSource::Reference`]).
+/// `lakehouse-api`'s `SecretManagerKind::scheme` is the authority and a test
+/// there asserts this list equals it; this crate cannot depend on it.
+pub const MANAGER_REF_SCHEMES: [&str; 4] = ["vault:", "aws-sm:", "gcp-sm:", "azure-kv:"];
 
 /// The fixed prefix every [`CredentialSource::Managed`] ref starts with —
 /// see that variant's doc comment.
@@ -587,6 +625,26 @@ pub const MANAGED_SECRET_REF_PREFIX: &str = "file:/run/secrets/connector_managed
 #[must_use]
 pub fn is_managed_secret_ref(secret_ref: &str) -> bool {
     secret_ref.starts_with(MANAGED_SECRET_REF_PREFIX)
+}
+
+/// How a reference NAME says its credential is held (`SRC-12` decision 10).
+/// A pure predicate over the name, like [`is_managed_secret_ref`].
+#[must_use]
+pub fn credential_source_of_ref(secret_ref: &str) -> Option<CredentialSource> {
+    if is_managed_secret_ref(secret_ref) {
+        Some(CredentialSource::Managed)
+    } else if secret_ref.starts_with("env:") {
+        Some(CredentialSource::Env)
+    } else if secret_ref.starts_with("file:") {
+        Some(CredentialSource::File)
+    } else if MANAGER_REF_SCHEMES
+        .iter()
+        .any(|scheme| secret_ref.starts_with(scheme))
+    {
+        Some(CredentialSource::Reference)
+    } else {
+        None
+    }
 }
 
 /// The credential kind a reference NAME ends in, e.g.
@@ -722,7 +780,12 @@ pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKin
             let key = id.to_ascii_uppercase().replace('-', "_");
             format!("env:CONNECTOR_{key}_{}", kind.suffix())
         }
-        CredentialSource::File => {
+        // A reference is what the user names, not something derived from the
+        // id, so it has no real name to give: callers refuse that source
+        // before asking (`create`, `rotate_secret`). If one ever did not, it
+        // gets the operator-file name of the slot, which nothing provisions:
+        // a read fails closed (not found) and never reads a wrong secret.
+        CredentialSource::File | CredentialSource::Reference => {
             let key = id.replace('-', "_");
             format!(
                 "file:/run/secrets/connector_{key}_{}",
@@ -1306,6 +1369,16 @@ async fn save_ingest_spec_in(
     // the tables that just left it are cleared in the same transaction.
     let removed = removed_object_names(&stored_objects, &spec.source_objects);
     crate::schema_change::clear_removed_tables_in(tx, id, &removed).await?;
+    // `SRC-11` D10: the columns left out of a table that keeps its rows are
+    // marked inactive, and a column ticked again is cleared, in the same
+    // transaction as the spec that says so.
+    crate::schema_change::sync_excluded_columns_in(
+        tx,
+        id,
+        &crate::ingest_spec::inactive_exclusions(&spec.source_objects),
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
     Ok(ingest_spec_from_row(row))
 }
 
@@ -1528,6 +1601,37 @@ pub async fn record_test_result(
 /// the store's health rule and the API's alert trigger, so they cannot drift.
 pub const REPEATED_FAILURE_STREAK: i32 = 3;
 
+/// Failed runs in a row at which a connector is paused (`SRC-11` decision D3,
+/// Airbyte's threshold). The API reads `CONNECTOR_AUTO_DISABLE_AFTER` and
+/// passes the value to [`record_run_once`]; this is the default.
+pub const DEFAULT_AUTO_DISABLE_AFTER: i32 = 30;
+
+/// The words of the pause an auto-disable sets, either side of the number
+/// (`SRC-11` decision D3: "Paused after 30 failed runs in a row"). The number
+/// comes from the setting, so [`is_auto_disable_pause_reason`] recognises the
+/// pause by its shape, not by one number: a pause set when the setting was 30
+/// is still resumable after the setting was changed.
+const AUTO_DISABLE_REASON_HEAD: &str = "Paused after ";
+const AUTO_DISABLE_REASON_TAIL: &str = " failed runs in a row";
+
+/// The `paused_reason` an auto-disable after `after` failed runs writes.
+#[must_use]
+pub fn auto_disable_pause_reason(after: i32) -> String {
+    format!("{AUTO_DISABLE_REASON_HEAD}{after}{AUTO_DISABLE_REASON_TAIL}")
+}
+
+/// Whether `reason` is a pause written by an auto-disable, and so the only
+/// pause [`resume_connector`] lifts (`SRC-11` decision D4). A pause set by
+/// the schema-change policy ([`crate::schema_change::SCHEMA_CHANGE_PAUSE_REASON`])
+/// or by anything else is not.
+#[must_use]
+pub fn is_auto_disable_pause_reason(reason: &str) -> bool {
+    reason
+        .strip_prefix(AUTO_DISABLE_REASON_HEAD)
+        .and_then(|rest| rest.strip_suffix(AUTO_DISABLE_REASON_TAIL))
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// What [`record_run_result`] leaves on the connector row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHealth {
@@ -1559,6 +1663,12 @@ pub struct RunRecord {
     /// value of the first report, also returned to its retries. `None` only
     /// for a run counted before `0069` kept it.
     pub failure_streak: Option<i32>,
+    /// `true` when THIS run's failure paused the connector (`SRC-11` D3): the
+    /// streak reached the auto-disable threshold and nothing had paused the
+    /// connector yet. Also `true` for a retry of that run's report, which is
+    /// what lets the retry deliver `connector_disabled` once after a rule-store
+    /// failure (the same reason the streak is kept per run).
+    pub auto_disabled: bool,
 }
 
 /// Count one real run on the connector exactly once, and remember the streak
@@ -1574,6 +1684,18 @@ pub struct RunRecord {
 /// `kind` is the dedupe kind of the outcome (`"failure"` or `"success"`,
 /// `routes::load_alerts::Outcome::event_kind`).
 ///
+/// # Auto-disable (`SRC-11` decision D3)
+///
+/// A failed run that brings the streak to `auto_disable_after` or more pauses
+/// the connector, in the same transaction as the count, with
+/// [`auto_disable_pause_reason`]. It pauses once: a connector that is already
+/// paused (by the schema-change policy, say) keeps its pause and its reason,
+/// and the run is not reported as having disabled it. When this run did pause
+/// it, a dedupe row `(run_id, "auto_disabled")` is written with it, so
+/// [`RunRecord::auto_disabled`] is the same answer for the run's retries and
+/// the caller raises `connector_disabled` exactly once. A success resets the
+/// streak, as before; it never lifts a pause.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] if `id` does not name a connector (the
@@ -1586,6 +1708,7 @@ pub async fn record_run_once(
     kind: &str,
     succeeded: bool,
     at: OffsetDateTime,
+    auto_disable_after: i32,
 ) -> Result<RunRecord, StoreError> {
     let mut tx = pool.begin().await?;
     let inserted: Option<(String,)> = sqlx::query_as(
@@ -1607,10 +1730,19 @@ pub async fn record_run_once(
         .bind(kind)
         .fetch_optional(&mut *tx)
         .await?;
+        let auto_disabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_run_event \
+             WHERE run_id = $1 AND kind = $2)",
+        )
+        .bind(run_id)
+        .bind(AUTO_DISABLED_KIND)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(RunRecord {
             first_seen: false,
             failure_streak: stored.and_then(|(streak,)| streak),
+            auto_disabled,
         });
     }
     let row: Option<(String, i32)> = sqlx::query_as(RECORD_RUN_SQL)
@@ -1632,11 +1764,97 @@ pub async fn record_run_once(
     .bind(failure_streak)
     .execute(&mut *tx)
     .await?;
+    // `SRC-11` D3: the pause and its dedupe row are part of counting the run.
+    // `paused_at IS NULL` makes it pause once, and leave another pause alone.
+    let mut auto_disabled = false;
+    if !succeeded && failure_streak >= auto_disable_after {
+        let paused: Option<(String,)> = sqlx::query_as(
+            "UPDATE connector SET paused_reason = $2, paused_at = $3 \
+             WHERE id = $1 AND paused_at IS NULL RETURNING id",
+        )
+        .bind(id)
+        .bind(auto_disable_pause_reason(auto_disable_after))
+        .bind(at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if paused.is_some() {
+            sqlx::query(
+                "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(run_id)
+            .bind(format!("connector:{id}"))
+            .bind(AUTO_DISABLED_KIND)
+            .execute(&mut *tx)
+            .await?;
+            auto_disabled = true;
+        }
+    }
     tx.commit().await?;
     Ok(RunRecord {
         first_seen: true,
         failure_streak: Some(failure_streak),
+        auto_disabled,
     })
+}
+
+/// The `pipeline_run_event.kind` of the row that records that a run's failure
+/// paused the connector (`SRC-11` decision D3). Not one of the outcome kinds
+/// (`failure`, `success`, `*_alerted`, `slow`, `volume_drop`).
+const AUTO_DISABLED_KIND: &str = "auto_disabled";
+
+/// What [`resume_connector`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The auto-disable pause was lifted and the failure streak is 0.
+    Resumed,
+    /// The connector is not paused; nothing changed.
+    NotPaused,
+    /// The connector is paused for another reason (the schema-change policy,
+    /// for one); nothing changed.
+    PausedForAnotherReason,
+}
+
+/// Resume a connector that an auto-disable paused (`SRC-11` decision D4): lift
+/// the pause, set the failure streak back to 0 (so it gets the full number of
+/// tries again) and its health to `unknown` until its next run says. Only a
+/// pause [`is_auto_disable_pause_reason`] recognises is lifted; a
+/// schema-change pause is lifted by approving the change (`SRC-8`).
+///
+/// The row is locked while the reason is read, so a pause set a moment later
+/// by something else is not lifted by mistake.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn resume_connector(pool: &PgPool, id: &str) -> Result<ResumeOutcome, StoreError> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, Option<OffsetDateTime>)> =
+        sqlx::query_as("SELECT paused_reason, paused_at FROM connector WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((reason, paused_at)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    if paused_at.is_none() {
+        return Ok(ResumeOutcome::NotPaused);
+    }
+    let Some(reason) = reason.filter(|r| is_auto_disable_pause_reason(r)) else {
+        return Ok(ResumeOutcome::PausedForAnotherReason);
+    };
+    sqlx::query(
+        "UPDATE connector SET paused_reason = NULL, paused_at = NULL, failure_streak = 0, \
+           health = 'unknown' \
+         WHERE id = $1 AND paused_reason = $2",
+    )
+    .bind(id)
+    .bind(&reason)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ResumeOutcome::Resumed)
 }
 
 /// Record the outcome of one real run (not a manual test) on the connector:
@@ -2417,6 +2635,7 @@ mod tests {
             // fabricate.
             audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
             credential_managed: true,
+            credential_source: Some(CredentialSource::Managed),
             credential_kind: Some(CredentialKind::Password),
             credential_secondary_kind: None,
             residency: "in-region".to_owned(),
@@ -2431,6 +2650,10 @@ mod tests {
         assert_eq!(
             value.get("credentialManaged"),
             Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            value.get("credentialSource"),
+            Some(&serde_json::Value::String("managed".to_owned()))
         );
     }
 
@@ -2577,6 +2800,26 @@ mod tests {
         }
         // The seeded, deployment-owned refs are never managed.
         assert!(!is_managed_secret_ref("env:CONNECTOR_PG_PASSWORD"));
+        // SRC-12 decision 10: the scheme the connector page names.
+        assert_eq!(
+            credential_source_of_ref("env:CONNECTOR_PG_PASSWORD"),
+            Some(CredentialSource::Env)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_conn_x_password"),
+            Some(CredentialSource::File)
+        );
+        assert_eq!(
+            credential_source_of_ref("file:/run/secrets/connector_managed_conn_x_password"),
+            Some(CredentialSource::Managed)
+        );
+        // `SRC-12` part B: a secret-manager reference is its own kind (this
+        // asserted `None` before the references existed).
+        assert_eq!(
+            credential_source_of_ref("vault:secret/x#k"),
+            Some(CredentialSource::Reference)
+        );
+        assert_eq!(credential_source_of_ref("consul:secret/x"), None);
         assert!(!is_managed_secret_ref(
             "file:/run/secrets/connector_pg_password"
         ));
