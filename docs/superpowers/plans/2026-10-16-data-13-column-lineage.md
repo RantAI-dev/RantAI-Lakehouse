@@ -202,3 +202,30 @@ on the lock, wait.
 
 
 *(planner)*
+
+### Planner's review, 2026-10-16, at `587f8661` (merged into the phase branch as `ffd71670`)
+
+No `BLOCKER`. The developer's two departures are accepted:
+- The column-lineage gate step went into `ops/g7/g7_pipeline_test.py`, not
+  `g3a`: `g3a` runs only the dlt Bronze job, which produces no column
+  lineage; `g7` runs an authored pipeline in CI. The `build` and `upload`
+  kinds went into `g3a` as planned.
+- SQL-source rows are hidden from callers without `dashboard:read`, the
+  same rule as the charts and the table-level Dependents card.
+
+**Checked.** The walk is a recursive CTE bounded by the hop limit and a row
+limit, so a cycle in the rows cannot run away; identifiers interpolated into
+it are constants. Rows are written only after a confirmed `SUCCESS`; the
+pending SQL survives a restart. The table route's `columnMappings` keeps its
+`[]` for a focus with no rows, so the parity corpus holds.
+
+**Spec rows, as delivered:** column mappings recorded from the next
+successful run, save or tick on (nothing back-filled); view met; impact met
+for saved charts (built-in default tiles and charts saved before chart
+definitions existed are not matched); retention met in code.
+
+**Not verified.** No Rust test, no store query against Postgres, no
+`query_log` read against ClickHouse and no gate step has run; the first run
+of each is CI's on #106. The developer's whole-suite `bun run test` was
+killed by the machine (memory); per-directory runs passed 1,565 tests with
+0 failures, 8 directories printed no count.
