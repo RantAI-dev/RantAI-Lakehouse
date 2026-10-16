@@ -34,6 +34,7 @@ pub mod connector_listing;
 pub mod connector_oauth;
 pub mod connector_probe;
 pub mod connector_secret_store;
+pub mod crypto_provider;
 pub mod csv_export;
 pub mod csv_safe;
 pub mod error;

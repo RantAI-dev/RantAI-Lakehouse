@@ -1155,7 +1155,9 @@ pub(crate) fn pg_connect_options(
 /// dial. `verify-ca` is therefore the strongest mode this helper can use,
 /// and the connection test is what checks the name -- it dials the approved
 /// address with a client of its own (`pg_probe`, D5/E2).
-pub(crate) fn pg_options_for_address(
+// PR #192 review BLOCKER 10: pub for integration tests.
+#[must_use]
+pub fn pg_options_for_address(
     host: &str,
     port: u16,
     user: &str,

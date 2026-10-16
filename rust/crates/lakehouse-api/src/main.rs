@@ -18,6 +18,7 @@ mod connector_listing;
 mod connector_oauth;
 mod connector_probe;
 mod connector_secret_store;
+mod crypto_provider;
 mod csv_export;
 mod csv_safe;
 mod error;
@@ -69,6 +70,12 @@ use state::AppState;
 /// thread stack size: phase 2 catch-up with main (sqlparser 0.63), see
 /// [`config::WORKER_STACK_BYTES`] for the measurement behind the value.
 fn main() -> anyhow::Result<()> {
+    // PR #192 review BLOCKER 10: install `ring` crypto provider before any task dials.
+    if let Err(err) = crypto_provider::install_default_provider() {
+        eprintln!("fatal: failed to install default rustls crypto provider: {err}");
+        std::process::exit(1);
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(config::WORKER_STACK_BYTES)
