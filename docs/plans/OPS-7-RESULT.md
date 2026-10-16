@@ -107,7 +107,7 @@ After the restore completed, the stack was verified against the acceptance check
 | **Extra user sign-in** | `POST /api/auth/login` with `ops7_drill_user@example.com` / `DrillPass123!` | **PASS** | HTTP 200 OK, session cookie issued |
 | **Catalog access** | ClickHouse `icecat_g3a` DataLakeCatalog table listing (`SHOW TABLES FROM icecat_g3a LIKE '%bronze%'`) | **PASS** | `bronze.g3a_orders` (matches pre-backup: `bronze.g3a_orders`) |
 | **Iceberg table row count** | `SELECT count() FROM icecat_g3a.\`bronze.g3a_orders\` WHERE 1` | **PASS** | **2,000 rows** (matches pre-backup: 2,000) |
-| **Change-capture offset** | `SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\`` | **PASS** | **125** for `postgres-cdc-demo` (matches pre-backup: 125) |
+| **Change-capture offset survival** | `SELECT committed_offset FROM lake.\`bronze_meta.ingest_offset\` WHERE connector_id = 'postgres-cdc-demo'` | **PASS** | Pre-seeded committed offset **125** survived restore intact (pre=125, post=125) |
 | **OpenFGA permissions** | OpenFGA Check API (`POST /stores/{id}/check`) for seeded tuple and tuple count | **PASS** | Tuple count preserved: 35 (pre=35, post=35); OpenFGA Check API answered `{"allowed":true,"resolution":""}` |
 | **Dagster run history** | `SELECT count(*) FROM runs WHERE status = 'SUCCESS'` in `dagster` DB | **PASS** | **1 run** (the pre-teardown G3a run is preserved) |
 
@@ -124,6 +124,7 @@ After the restore completed, the stack was verified against the acceptance check
 
 ## 6. Not measured
 
+- **Change capture resuming from its offset:** The drill verified that the stored CDC offset row in ClickHouse (`committed_offset = 125` for `postgres-cdc-demo`) survived stack teardown and restore intact. However, a live change-capture consumer run resuming execution from this offset without re-snapshotting was not measured, as the full G4 CDC ingestion stack (Debezium + Kafka/Redpanda connector pipelines) was not executed in this restore drill.
 - **Large data volume:** Drill executed on ~40 MB of state and 2,000 Iceberg rows. Terabyte-scale restore times will be dominated by object-store sync bandwidth rather than database metadata restoration.
 - **Cross-region / remote latency:** The drill utilized a local S3-compatible service (`rustfs`). Real-world latency to AWS S3, Cloudflare R2, or remote object stores will add network transfer overhead.
 - **Point-in-time recovery (PITR):** Point-in-time recovery via WAL archiving / continuous replication is out of scope for OPS-7.
