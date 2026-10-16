@@ -650,6 +650,18 @@ jobs:
           # `ops/g6/docker-compose.g6.override.yml`'s header comment
           # documents for its own fixtures.
           INGEST_ALLOW_INTERNAL_HOSTS=true
+          # BLD-4: the G7 step PUTs an ingest-spec onto the seeded
+          # `conn-pg-lakehouse`, whose `dial` host is this compose
+          # network's own `postgres` (0034_seed_connector_ingest_spec.sql).
+          # `PUT /api/connectors/{id}/ingest-spec` parses the `dial`
+          # through the same internal-host guard `connector_probe` uses
+          # (`connector_probe.rs`'s refusal), so without this the API
+          # answers 400 before the ingest ever runs. This is the API-side
+          # twin of `INGEST_ALLOW_INTERNAL_HOSTS` above (which covers the
+          # Dagster ingest job's own SSRF guard); the `ops/g6` jobs lift
+          # it the same way through `docker-compose.g6.override.yml`. Only
+          # this job's throwaway stack is affected.
+          CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true
           # SRC-20: the G7 step below authors a real pipeline, and the
           # code location builds ZERO authored jobs when this is unset
           # (`authored_factory._fetch_authored_pipelines` logs
