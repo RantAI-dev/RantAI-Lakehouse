@@ -124,6 +124,102 @@ impl ColumnCache {
     }
 }
 
+/// The table key a dashboard SQL source is written under.
+pub(crate) fn sql_source_key(id: &str) -> String {
+    format!("sql_source:{id}")
+}
+
+/// Why a probed column has no traced source when the statement's own
+/// outputs do not account for it.
+const MSG_UNACCOUNTED: &str = "the column's source could not be determined from the SQL";
+
+/// The rows for a SQL source whose output columns are known from a probe:
+/// the helper's rows that name a probed column, and one partial row for each
+/// probed column the statement did not account for (so every column of the
+/// source is either traced or marked as not). A partial output that names no
+/// probed column (`*` over unknown columns, an unaliased expression the
+/// engine named differently) lends its reason to the unaccounted columns.
+pub(crate) fn rows_for_probed(
+    lineage: &Lineage,
+    probed: &[String],
+    to_table: &str,
+) -> Vec<NewMapping> {
+    let all = rows_for(lineage, to_table);
+    let mut dropped_reason: Option<String> = None;
+    let mut rows = Vec::new();
+    for row in all {
+        if probed.contains(&row.to_column) {
+            rows.push(row);
+        } else if dropped_reason.is_none() {
+            dropped_reason.clone_from(&row.reason);
+        }
+    }
+    for name in probed {
+        let accounted =
+            rows.iter().any(|r| &r.to_column == name) || lineage.constants.contains(name);
+        if !accounted {
+            rows.push(NewMapping {
+                from_table: None,
+                from_column: None,
+                to_table: to_table.to_owned(),
+                to_column: name.clone(),
+                transform: "unknown".to_owned(),
+                partial: true,
+                reason: Some(
+                    dropped_reason
+                        .clone()
+                        .unwrap_or_else(|| MSG_UNACCOUNTED.to_owned()),
+                ),
+            });
+        }
+    }
+    rows
+}
+
+/// A dashboard SQL source was saved: map its SQL against the output columns
+/// the save just probed and replace the source's rows. A statement that
+/// cannot be read marks every probed column partial with the reason.
+pub(crate) async fn record_sql_source(state: &AppState, source: &lakehouse_bi::sources::SqlSource) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let probed: Vec<String> = source.columns.iter().map(|c| c.name.clone()).collect();
+    let to_table = sql_source_key(&source.id);
+    let known = ColumnCache::default()
+        .known_for(state, &source.sql, &[])
+        .await;
+    let rows = match sql_lineage::map_select(&source.sql, &ClickHouseDialect {}, &known) {
+        Ok(lineage) => rows_for_probed(&lineage, &probed, &to_table),
+        Err(unmappable) => probed
+            .iter()
+            .map(|name| NewMapping {
+                from_table: None,
+                from_column: None,
+                to_table: to_table.clone(),
+                to_column: name.clone(),
+                transform: "unknown".to_owned(),
+                partial: true,
+                reason: Some(unmappable.to_string()),
+            })
+            .collect(),
+    };
+    if let Err(err) =
+        column_lineage::replace_producer(pool, "sql_source", &source.id, None, &rows).await
+    {
+        tracing::warn!(%err, source = %source.id, "column lineage: a SQL source's mappings could not be written");
+    }
+}
+
+/// A dashboard SQL source was deleted: its mappings go with it.
+pub(crate) async fn forget_sql_source(state: &AppState, id: &str) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    if let Err(err) = column_lineage::delete_producer(pool, "sql_source", id).await {
+        tracing::warn!(%err, source = id, "column lineage: a SQL source's mappings could not be removed");
+    }
+}
+
 /// Remember the SQL the API approved for `pipeline_id`'s run, to be mapped
 /// when the run is reported successful. Logged, never returned: the
 /// orchestrator's enforce call must not fail because lineage could not be
@@ -394,6 +490,49 @@ mod tests {
         assert_eq!(rows[1].from_column, None);
         assert!(rows[1].partial);
         assert_eq!(rows[1].reason.as_deref(), Some("built with UNION"));
+    }
+
+    #[test]
+    fn every_probed_column_of_a_sql_source_is_traced_or_marked_partial() {
+        let lineage = Lineage {
+            target: None,
+            mappings: vec![Mapping {
+                output: "place".to_owned(),
+                from_table: "serving.mart_x".to_owned(),
+                from_column: "place".to_owned(),
+                transform: Transform::Copy,
+            }],
+            partial: vec![PartialOutput {
+                output: "*".to_owned(),
+                reason: "the columns of serving.other are not known".to_owned(),
+                transform: Transform::Copy,
+            }],
+            constants: vec!["one".to_owned()],
+        };
+        let probed = ["place", "visitors", "one"].map(str::to_owned);
+        let rows = rows_for_probed(&lineage, &probed, "sql_source:s1");
+        assert_eq!(
+            rows.len(),
+            2,
+            "place is traced, visitors is partial, one is a constant"
+        );
+        assert_eq!(rows[0].to_column, "place");
+        assert!(!rows[0].partial);
+        assert_eq!(rows[1].to_column, "visitors");
+        assert!(rows[1].partial);
+        assert_eq!(
+            rows[1].reason.as_deref(),
+            Some("the columns of serving.other are not known"),
+            "the star's reason explains the column it stood for"
+        );
+        assert!(rows.iter().all(|r| r.to_table == "sql_source:s1"));
+    }
+
+    #[test]
+    fn a_probed_column_nothing_accounts_for_says_so() {
+        let rows = rows_for_probed(&Lineage::default(), &["a".to_owned()], "sql_source:s1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason.as_deref(), Some(MSG_UNACCOUNTED));
     }
 
     mod builds_pass {
