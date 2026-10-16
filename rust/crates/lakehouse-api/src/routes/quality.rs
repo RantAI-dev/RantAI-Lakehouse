@@ -11,7 +11,14 @@
 //! - `payment_id unique` — no value of the column repeats (within one
 //!   load, on a Bronze table — see below);
 //! - `amount between 0 and 1000`, `amount >= 0`, `amount <= 1000` — every
-//!   set value of the column lies in the range.
+//!   set value of the column lies in the range;
+//! - `DATA-14` (F1) adds the rest of the ready library, one aggregate and
+//!   one comparison each: `email nulls <= 5%` or `nulls <= 10` (null
+//!   percent or count), `id duplicates <= 0`, `id distinct >= 3`,
+//!   `loaded_at fresh within 6h` (the newest value is no older; `m`, `h`
+//!   or `d`), `status in ('new', 'paid')` (no value outside the list;
+//!   nulls are not counted), and `min(amount) >= 0`, `max(amount) <= 100`,
+//!   `avg(amount) between 10 and 20`.
 //!
 //! A threshold that is not in the grammar is not guessed at: the rule is
 //! reported as not evaluable, with the grammar as the hint.
@@ -55,8 +62,11 @@ use crate::state::AppState;
 
 /// What to write instead, shown wherever a threshold cannot be evaluated.
 pub(crate) const GRAMMAR_HINT: &str = "Write the threshold as one of: \"rows >= 1000\", \
-     \"<column> not null >= 95%\", \"<column> unique\", \"<column> between 0 and 100\", \
-     \"<column> >= 0\".";
+     \"<column> not null >= 95%\", \"<column> nulls <= 5%\" (or a count: \"nulls <= 10\"), \
+     \"<column> unique\", \"<column> duplicates <= 10\", \"<column> distinct >= 3\", \
+     \"<column> fresh within 6h\" (m, h or d), \"<column> in ('a', 'b')\" (nulls are not \
+     counted), \"min(<column>) >= 0\", \"max(<column>) <= 100\", \
+     \"avg(<column>) between 10 and 20\", \"<column> between 0 and 100\", \"<column> >= 0\".";
 
 /// A comparison in a row-count or range threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +109,46 @@ impl Cmp {
             Self::Lt => left < right,
         }
     }
+
+    /// [`Cmp::holds`] for measured decimals (a percent, an average).
+    /// Equality is within a rounding error, as a decimal is never exact.
+    fn holds_f64(self, left: f64, right: f64) -> bool {
+        match self {
+            Self::Ge => left >= right,
+            Self::Gt => left > right,
+            Self::Eq => (left - right).abs() < 1e-9,
+            Self::Le => left <= right,
+            Self::Lt => left < right,
+        }
+    }
+}
+
+/// What a null limit is measured in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NullLimit {
+    /// `nulls <= 10`.
+    Count(i64),
+    /// `nulls <= 5%`.
+    Percent(f64),
+}
+
+/// The statistic of a `min(col)`, `max(col)` or `avg(col)` threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stat {
+    Min,
+    Max,
+    Avg,
+}
+
+impl Stat {
+    /// The `ClickHouse` aggregate and the word the verdict uses; both constant.
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+        }
+    }
 }
 
 /// What a threshold asks of the table.
@@ -116,15 +166,42 @@ enum Check {
         column: Ident,
         bounds: Vec<(Cmp, f64)>,
     },
+    /// `email nulls <= 5%`, `email nulls <= 10` (`DATA-14`, F1).
+    Nulls {
+        column: Ident,
+        cmp: Cmp,
+        limit: NullLimit,
+    },
+    /// `payment_id duplicates <= 10`: how many values repeat. `unique` is
+    /// the same count held to zero.
+    Duplicates { column: Ident, cmp: Cmp, max: i64 },
+    /// `status distinct >= 3`: how many different values the column holds.
+    Distinct { column: Ident, cmp: Cmp, n: i64 },
+    /// `loaded_at fresh within 6h`: the newest value is at most this old.
+    Fresh { column: Ident, within_seconds: i64 },
+    /// `status in ('new', 'paid')`: no set value outside the list.
+    Accepted { column: Ident, values: Vec<String> },
+    /// `min(amount) >= 0`, `avg(amount) between 10 and 20`.
+    Stat {
+        column: Ident,
+        stat: Stat,
+        bounds: Vec<(Cmp, f64)>,
+    },
 }
 
 impl Check {
     fn column(&self) -> Option<&Ident> {
         match self {
             Self::RowCount { .. } => None,
-            Self::NotNull { column, .. } | Self::Unique { column } | Self::Range { column, .. } => {
-                Some(column)
-            }
+            Self::NotNull { column, .. }
+            | Self::Unique { column }
+            | Self::Range { column, .. }
+            | Self::Nulls { column, .. }
+            | Self::Duplicates { column, .. }
+            | Self::Distinct { column, .. }
+            | Self::Fresh { column, .. }
+            | Self::Accepted { column, .. }
+            | Self::Stat { column, .. } => Some(column),
         }
     }
 }
@@ -166,6 +243,110 @@ fn whole_number(token: &str) -> Option<i64> {
     plain.parse::<i64>().ok().filter(|n| *n >= 0)
 }
 
+/// The most values one `in (…)` list holds, and the longest one: the list
+/// is typed into a threshold, not a lookup table.
+const MAX_ACCEPTED_VALUES: usize = 200;
+const MAX_ACCEPTED_VALUE_CHARS: usize = 200;
+
+/// `6h`, `30m`, `2d` as seconds; whole, above zero, and small enough that
+/// the product cannot overflow.
+fn duration_seconds(token: &str) -> Option<i64> {
+    let unit = token.chars().last()?;
+    let per = match unit.to_ascii_lowercase() {
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    let amount = token[..token.len() - unit.len_utf8()].parse::<i64>().ok()?;
+    (1..=1_000_000).contains(&amount).then(|| amount * per)
+}
+
+/// `nulls <= 5%` or `nulls <= 10`.
+fn null_limit(token: &str) -> Option<NullLimit> {
+    match token.strip_suffix('%') {
+        Some(p) => number(p)
+            .filter(|p| (0.0..=100.0).contains(p))
+            .map(NullLimit::Percent),
+        None => whole_number(token).map(NullLimit::Count),
+    }
+}
+
+/// The values of `('a', 'b', 3)`: quoted text (a quote inside is doubled,
+/// as in SQL) or a bare number, comma-separated. `None` when the list is
+/// empty, malformed, or larger than the limits above.
+fn accepted_values(list: &str) -> Option<Vec<String>> {
+    let inner = list.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let mut values: Vec<String> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if chars.next_if_eq(&'\'').is_some() {
+            loop {
+                match chars.next()? {
+                    '\'' if chars.next_if_eq(&'\'').is_some() => value.push('\''),
+                    '\'' => break,
+                    c => value.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| *c != ',') {
+                value.push(c);
+            }
+            let bare = value.trim().to_owned();
+            number(&bare)?;
+            value = bare;
+        }
+        if value.chars().count() > MAX_ACCEPTED_VALUE_CHARS {
+            return None;
+        }
+        values.push(value);
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => break,
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+    (values.len() <= MAX_ACCEPTED_VALUES).then_some(values)
+}
+
+/// `status in ('new', 'paid')`. `None` when the text is not shaped like an
+/// `in` threshold at all, so the other forms get their turn; an error when
+/// it is but the list or the column is not valid. The tokenizer cannot
+/// read it (a value may hold spaces and commas), so it is read here first.
+fn parse_accepted(threshold: &str) -> Option<Result<Check, &'static str>> {
+    let text = threshold.trim();
+    let (column, rest) = text.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let list = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("in"))?;
+    let list = rest[list.len()..].trim_start();
+    if !list.starts_with('(') {
+        return None;
+    }
+    Some(accepted_check(column, list))
+}
+
+fn accepted_check(column: &str, list: &str) -> Result<Check, &'static str> {
+    Ok(Check::Accepted {
+        column: Ident::new(column).map_err(|_| GRAMMAR_HINT)?,
+        values: accepted_values(list).ok_or(GRAMMAR_HINT)?,
+    })
+}
+
+/// `min(col)`, `max(col)`, `avg(col)`: the statistic and the column.
+fn stat_call(word: &str) -> Option<(Stat, &str)> {
+    let lower = word.to_lowercase();
+    let stat = match lower.get(..4)? {
+        "min(" => Stat::Min,
+        "max(" => Stat::Max,
+        "avg(" => Stat::Avg,
+        _ => return None,
+    };
+    Some((stat, word.get(4..)?.strip_suffix(')')?))
+}
+
 /// Reads a rule's `threshold` as a [`Check`].
 ///
 /// # Errors
@@ -178,6 +359,34 @@ fn parse_threshold(threshold: &str) -> Result<Check, &'static str> {
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
     let column = |name: &str| Ident::new(name).map_err(|_| GRAMMAR_HINT);
 
+    if let Some(accepted) = parse_accepted(threshold) {
+        return accepted;
+    }
+    // `min(col) >= 0`: one word for the call, so it would otherwise read as
+    // a range over a column named `min(col)` and be refused.
+    if let Some(&call) = words.first()
+        && let Some((stat, name)) = stat_call(call)
+    {
+        let bounds = match &lower[1..] {
+            ["between", a, "and", b] => vec![
+                (Cmp::Ge, number(a).ok_or(GRAMMAR_HINT)?),
+                (Cmp::Le, number(b).ok_or(GRAMMAR_HINT)?),
+            ],
+            [op, x] => vec![(
+                Cmp::parse(op)
+                    .filter(|c| *c != Cmp::Eq)
+                    .ok_or(GRAMMAR_HINT)?,
+                number(x).ok_or(GRAMMAR_HINT)?,
+            )],
+            _ => return Err(GRAMMAR_HINT),
+        };
+        return Ok(Check::Stat {
+            column: column(name)?,
+            stat,
+            bounds,
+        });
+    }
+
     match lower.as_slice() {
         ["rows" | "row_count", op, n] => Ok(Check::RowCount {
             cmp: Cmp::parse(op).ok_or(GRAMMAR_HINT)?,
@@ -185,6 +394,25 @@ fn parse_threshold(threshold: &str) -> Result<Check, &'static str> {
         }),
         [_, "unique"] => Ok(Check::Unique {
             column: column(words[0])?,
+        }),
+        [_, "nulls", op, limit] => Ok(Check::Nulls {
+            column: column(words[0])?,
+            cmp: Cmp::parse(op).ok_or(GRAMMAR_HINT)?,
+            limit: null_limit(limit).ok_or(GRAMMAR_HINT)?,
+        }),
+        [_, "duplicates", op, n] => Ok(Check::Duplicates {
+            column: column(words[0])?,
+            cmp: Cmp::parse(op).ok_or(GRAMMAR_HINT)?,
+            max: whole_number(n).ok_or(GRAMMAR_HINT)?,
+        }),
+        [_, "distinct", op, n] => Ok(Check::Distinct {
+            column: column(words[0])?,
+            cmp: Cmp::parse(op).ok_or(GRAMMAR_HINT)?,
+            n: whole_number(n).ok_or(GRAMMAR_HINT)?,
+        }),
+        [_, "fresh", "within", d] => Ok(Check::Fresh {
+            column: column(words[0])?,
+            within_seconds: duration_seconds(d).ok_or(GRAMMAR_HINT)?,
         }),
         [_, "not", "null"] => Ok(Check::NotNull {
             column: column(words[0])?,
@@ -256,15 +484,45 @@ fn check_sql(check: &Check, from: &str, per_load: bool) -> String {
         Check::NotNull { column, .. } => format!(
             "SELECT toString(count()) AS n, toString(countIf(isNotNull(`{column}`))) AS k FROM {from}"
         ),
-        Check::Unique { column } if per_load => format!(
+        Check::Unique { column } | Check::Duplicates { column, .. } if per_load => format!(
             "SELECT toString(count()) AS n, \
              toString(uniqExact(`{LOAD_ID_COLUMN}`, `{column}`)) AS k, \
              toString(uniqExact(`{LOAD_ID_COLUMN}`)) AS loads \
              FROM {from} WHERE isNotNull(`{column}`)"
         ),
-        Check::Unique { column } => format!(
+        Check::Unique { column }
+        | Check::Duplicates { column, .. }
+        | Check::Distinct { column, .. } => format!(
             "SELECT toString(count()) AS n, toString(uniqExact(`{column}`)) AS k \
              FROM {from} WHERE isNotNull(`{column}`)"
+        ),
+        Check::Nulls { column, .. } => format!(
+            "SELECT toString(count()) AS n, toString(countIf(isNull(`{column}`))) AS k FROM {from}"
+        ),
+        Check::Fresh { column, .. } => format!(
+            "SELECT toString(count()) AS n, \
+             toString(dateDiff('second', max(`{column}`), now())) AS k \
+             FROM {from} WHERE isNotNull(`{column}`)"
+        ),
+        // DATA-14 (F1): every literal of the list goes through `SqlLiteral`
+        // (backslash and quote escaped), the column through `Ident`; the
+        // column is compared as text so a number list works on any type.
+        Check::Accepted { column, values } => {
+            let list: Vec<String> = values
+                .iter()
+                .map(|v| SqlLiteral::from(v.as_str()).to_string())
+                .collect();
+            format!(
+                "SELECT toString(count()) AS n, \
+                 toString(countIf(toString(`{column}`) NOT IN ({}))) AS k \
+                 FROM {from} WHERE isNotNull(`{column}`)",
+                list.join(", ")
+            )
+        }
+        Check::Stat { column, stat, .. } => format!(
+            "SELECT toString(count()) AS n, toString({}(`{column}`)) AS v \
+             FROM {from} WHERE isNotNull(`{column}`)",
+            stat.sql()
         ),
         Check::Range { column, bounds } => {
             let within: Vec<String> = bounds
@@ -292,6 +550,61 @@ struct Verdict {
 
 fn passed_or_failed(ok: bool) -> &'static str {
     if ok { "passed" } else { "failed" }
+}
+
+/// A null limit judged against `k` nulls in `n` rows.
+fn null_verdict(cmp: Cmp, limit: NullLimit, n: i64, k: i64) -> Verdict {
+    match limit {
+        NullLimit::Count(max) => Verdict {
+            status: passed_or_failed(cmp.holds(k, max)),
+            value: format!("{k} nulls in {n} rows"),
+        },
+        NullLimit::Percent(max) => {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a row count as a percentage; exactness past 2^53 rows is irrelevant"
+            )]
+            let percent = k as f64 / n as f64 * 100.0;
+            Verdict {
+                status: passed_or_failed(cmp.holds_f64(percent, max)),
+                value: format!("{percent:.1}% null ({k} of {n} rows)"),
+            }
+        }
+    }
+}
+
+/// A `min`/`max`/`avg` judged against the aggregate `row`. The aggregate
+/// came back as text; a column that is not numeric has a minimum or
+/// maximum, but not one a bound can judge.
+fn stat_verdict(stat: Stat, bounds: &[(Cmp, f64)], row: &Map<String, Value>) -> Verdict {
+    let measured = str_col(row, "v")
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite());
+    match measured {
+        Some(v) => Verdict {
+            status: passed_or_failed(bounds.iter().all(|(cmp, b)| cmp.holds_f64(v, *b))),
+            value: format!("{} is {v}", stat.sql()),
+        },
+        None => Verdict {
+            status: "warning",
+            value: format!("the {} of the column is not a number", stat.sql()),
+        },
+    }
+}
+
+/// How long, for a verdict: `45s`, `12m`, `3h 5m`, `2d 4h`.
+fn human_seconds(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h {}m", s / 3_600, s % 3_600 / 60)
+    } else {
+        format!("{}d {}h", s / 86_400, s % 86_400 / 3_600)
+    }
 }
 
 /// Judges the aggregate `row` [`check_sql`] returned. A column check over
@@ -341,6 +654,38 @@ fn verdict(check: &Check, row: &Map<String, Value>) -> Verdict {
             status: passed_or_failed(k == 0),
             value: format!("{k} of {n} values out of range"),
         },
+        Check::Nulls { cmp, limit, .. } => null_verdict(*cmp, *limit, n, k),
+        Check::Duplicates { cmp, max, .. } => {
+            let repeats = n - k;
+            let value = if row.contains_key("loads") {
+                let loads = num_or_zero(Some(row), "loads");
+                let s = if loads == 1 { "" } else { "s" };
+                format!("{repeats} repeated values within a load · {n} rows in {loads} load{s}")
+            } else {
+                format!("{repeats} repeated values in {n} rows")
+            };
+            Verdict {
+                status: passed_or_failed(cmp.holds(repeats, *max)),
+                value,
+            }
+        }
+        Check::Distinct { cmp, n: wanted, .. } => Verdict {
+            status: passed_or_failed(cmp.holds(k, *wanted)),
+            value: format!("{k} distinct values in {n} rows"),
+        },
+        Check::Fresh { within_seconds, .. } => Verdict {
+            status: passed_or_failed(k <= *within_seconds),
+            value: format!(
+                "newest value is {} old (limit {})",
+                human_seconds(k),
+                human_seconds(*within_seconds)
+            ),
+        },
+        Check::Accepted { .. } => Verdict {
+            status: passed_or_failed(k == 0),
+            value: format!("{k} of {n} values outside the accepted list"),
+        },
+        Check::Stat { stat, bounds, .. } => stat_verdict(*stat, bounds, row),
     }
 }
 
@@ -1212,5 +1557,344 @@ mod tests {
         assert_eq!(prose["evaluable"], false);
         assert_eq!(prose["hint"], GRAMMAR_HINT);
         assert_eq!(prose["lastStatus"], Value::Null);
+    }
+
+    // ── DATA-14 (F1): the rest of the ready library ────────────────────
+
+    /// Each added form parses to the check it names; the older forms are
+    /// untouched (the tests above still pin them).
+    #[test]
+    fn parses_each_added_check() {
+        assert_eq!(
+            parse_threshold("email nulls <= 5%"),
+            Ok(Check::Nulls {
+                column: ident("email"),
+                cmp: Cmp::Le,
+                limit: NullLimit::Percent(5.0)
+            })
+        );
+        assert_eq!(
+            parse_threshold("email NULLS<10"),
+            Ok(Check::Nulls {
+                column: ident("email"),
+                cmp: Cmp::Lt,
+                limit: NullLimit::Count(10)
+            })
+        );
+        assert_eq!(
+            parse_threshold("id duplicates <= 3"),
+            Ok(Check::Duplicates {
+                column: ident("id"),
+                cmp: Cmp::Le,
+                max: 3
+            })
+        );
+        assert_eq!(
+            parse_threshold("status distinct >= 3"),
+            Ok(Check::Distinct {
+                column: ident("status"),
+                cmp: Cmp::Ge,
+                n: 3
+            })
+        );
+        assert_eq!(
+            parse_threshold("loaded_at fresh within 6h"),
+            Ok(Check::Fresh {
+                column: ident("loaded_at"),
+                within_seconds: 6 * 3_600
+            })
+        );
+        assert_eq!(
+            parse_threshold("loaded_at fresh within 30m"),
+            Ok(Check::Fresh {
+                column: ident("loaded_at"),
+                within_seconds: 30 * 60
+            })
+        );
+        assert_eq!(
+            parse_threshold("loaded_at FRESH WITHIN 2d"),
+            Ok(Check::Fresh {
+                column: ident("loaded_at"),
+                within_seconds: 2 * 86_400
+            })
+        );
+        assert_eq!(
+            parse_threshold("min(amount) >= 0"),
+            Ok(Check::Stat {
+                column: ident("amount"),
+                stat: Stat::Min,
+                bounds: vec![(Cmp::Ge, 0.0)]
+            })
+        );
+        assert_eq!(
+            parse_threshold("MAX(amount) < 1_000"),
+            Ok(Check::Stat {
+                column: ident("amount"),
+                stat: Stat::Max,
+                bounds: vec![(Cmp::Lt, 1000.0)]
+            })
+        );
+        assert_eq!(
+            parse_threshold("avg(amount) between 10 and 20.5"),
+            Ok(Check::Stat {
+                column: ident("amount"),
+                stat: Stat::Avg,
+                bounds: vec![(Cmp::Ge, 10.0), (Cmp::Le, 20.5)]
+            })
+        );
+    }
+
+    /// A value may hold spaces, commas and a doubled quote; a bare number
+    /// is a value too.
+    #[test]
+    fn parses_an_accepted_values_list() {
+        assert_eq!(
+            parse_threshold("status in ('new', 'paid', 'on hold, again', 'it''s', 3)"),
+            Ok(Check::Accepted {
+                column: ident("status"),
+                values: vec![
+                    "new".to_owned(),
+                    "paid".to_owned(),
+                    "on hold, again".to_owned(),
+                    "it's".to_owned(),
+                    "3".to_owned()
+                ]
+            })
+        );
+        assert_eq!(
+            parse_threshold("status IN('a')"),
+            Ok(Check::Accepted {
+                column: ident("status"),
+                values: vec!["a".to_owned()]
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_a_malformed_added_check() {
+        for threshold in [
+            "email nulls <= 120%",
+            "email nulls <= -1",
+            "email nulls <= many",
+            "email nulls",
+            "id duplicates <= 1.5",
+            "id distinct >=",
+            "loaded_at fresh within 0h",
+            "loaded_at fresh within 5s",
+            "loaded_at fresh within h",
+            "loaded_at fresh within 99999999d",
+            "status in ()",
+            "status in ('a',)",
+            "status in ('a' 'b')",
+            "status in (a)",
+            "status in ('a'",
+            "status in 'a'",
+            "a;b in ('x')",
+            "min(amount) = 0",
+            "min(amount)",
+            "min(a b) >= 0",
+            "min(a;b) >= 0",
+            "median(amount) >= 0",
+        ] {
+            assert_eq!(parse_threshold(threshold), Err(GRAMMAR_HINT), "{threshold}");
+        }
+        // A column that merely starts with "in" is not an `in` list.
+        assert_eq!(
+            parse_threshold("inbox unique"),
+            Ok(Check::Unique {
+                column: ident("inbox")
+            })
+        );
+    }
+
+    /// The list is bounded: a threshold is not a lookup table.
+    #[test]
+    fn an_accepted_list_has_a_size_limit() {
+        let many: Vec<String> = (0..=MAX_ACCEPTED_VALUES)
+            .map(|i| format!("'v{i}'"))
+            .collect();
+        assert_eq!(
+            parse_threshold(&format!("status in ({})", many.join(", "))),
+            Err(GRAMMAR_HINT)
+        );
+        let long = "x".repeat(MAX_ACCEPTED_VALUE_CHARS + 1);
+        assert_eq!(
+            parse_threshold(&format!("status in ('{long}')")),
+            Err(GRAMMAR_HINT)
+        );
+    }
+
+    #[test]
+    fn builds_one_bounded_aggregate_for_each_added_check() {
+        let from = "silver.`orders`";
+        let sql = |t: &str| check_sql(&parse_threshold(t).unwrap(), from, false);
+        assert_eq!(
+            sql("email nulls <= 5%"),
+            "SELECT toString(count()) AS n, toString(countIf(isNull(`email`))) AS k \
+             FROM silver.`orders` SETTINGS max_execution_time = 30"
+        );
+        assert!(sql("id duplicates <= 2").contains("uniqExact(`id`)"));
+        assert!(sql("id duplicates <= 2").contains("WHERE isNotNull(`id`)"));
+        assert!(sql("status distinct >= 2").contains("toString(uniqExact(`status`)) AS k"));
+        assert!(
+            sql("ts fresh within 1h")
+                .contains("toString(dateDiff('second', max(`ts`), now())) AS k")
+        );
+        assert!(sql("min(amount) >= 0").contains("toString(min(`amount`)) AS v"));
+        assert!(sql("max(amount) >= 0").contains("toString(max(`amount`)) AS v"));
+        assert!(sql("avg(amount) >= 0").contains("toString(avg(`amount`)) AS v"));
+        // Per load, a duplicates check counts like `unique` does.
+        let per_load = check_sql(&parse_threshold("id duplicates <= 2").unwrap(), from, true);
+        assert!(per_load.contains("uniqExact(`_dlt_load_id`, `id`)"));
+    }
+
+    /// Every literal of the list is escaped the way `SqlLiteral` escapes
+    /// it, so a value cannot end the string and run SQL.
+    #[test]
+    fn accepted_values_are_escaped_into_the_list() {
+        let check = parse_threshold("status in ('ok', 'x'') OR 1=1 --', 'a\\b')").unwrap();
+        let sql = check_sql(&check, "silver.`orders`", false);
+        let expected = ["ok", "x') OR 1=1 --", "a\\b"]
+            .map(|v| SqlLiteral::from(v).to_string())
+            .join(", ");
+        assert!(
+            sql.contains(&format!("toString(`status`) NOT IN ({expected})")),
+            "{sql}"
+        );
+        // The injected quote is doubled, so the text stays inside the literal.
+        assert!(sql.contains("'x'') OR 1=1 --'"), "{sql}");
+    }
+
+    #[test]
+    fn judges_each_added_check_from_its_aggregate() {
+        let verdict_of = |t: &str, r: Map<String, Value>| verdict(&parse_threshold(t).unwrap(), &r);
+
+        // Null count and percent.
+        assert_eq!(
+            verdict_of("email nulls <= 10", row("200", "10")),
+            Verdict {
+                status: "passed",
+                value: "10 nulls in 200 rows".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("email nulls <= 10", row("200", "11")).status,
+            "failed"
+        );
+        assert_eq!(
+            verdict_of("email nulls <= 5%", row("200", "10")),
+            Verdict {
+                status: "passed",
+                value: "5.0% null (10 of 200 rows)".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("email nulls <= 5%", row("200", "11")).status,
+            "failed"
+        );
+        assert_eq!(
+            verdict_of("email nulls <= 5%", row("0", "0")).status,
+            "warning"
+        );
+
+        // Duplicates: the same count `unique` holds to zero.
+        assert_eq!(
+            verdict_of("id duplicates <= 3", row("50", "47")),
+            Verdict {
+                status: "passed",
+                value: "3 repeated values in 50 rows".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("id duplicates <= 2", row("50", "47")).status,
+            "failed"
+        );
+
+        // Distinct.
+        assert_eq!(
+            verdict_of("status distinct >= 3", row("50", "3")),
+            Verdict {
+                status: "passed",
+                value: "3 distinct values in 50 rows".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("status distinct >= 3", row("50", "2")).status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn judges_freshness_values_and_statistics_from_their_aggregate() {
+        let verdict_of = |t: &str, r: Map<String, Value>| verdict(&parse_threshold(t).unwrap(), &r);
+
+        // Freshness: `k` is the age of the newest value in seconds.
+        assert_eq!(
+            verdict_of("ts fresh within 6h", row("50", "7200")),
+            Verdict {
+                status: "passed",
+                value: "newest value is 2h 0m old (limit 6h 0m)".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("ts fresh within 6h", row("50", "21601")).status,
+            "failed"
+        );
+        assert_eq!(
+            verdict_of("ts fresh within 1h", row("0", "0")).status,
+            "warning"
+        );
+
+        // Accepted values.
+        assert_eq!(
+            verdict_of("status in ('a', 'b')", row("50", "0")),
+            Verdict {
+                status: "passed",
+                value: "0 of 50 values outside the accepted list".to_owned()
+            }
+        );
+        assert_eq!(
+            verdict_of("status in ('a', 'b')", row("50", "4")).status,
+            "failed"
+        );
+
+        // Min, max, average.
+        let stat = |t: &str, v: &str| {
+            let mut r = row("50", "");
+            r.insert("v".to_owned(), json!(v));
+            verdict_of(t, r)
+        };
+        assert_eq!(
+            stat("min(amount) >= 0", "0"),
+            Verdict {
+                status: "passed",
+                value: "min is 0".to_owned()
+            }
+        );
+        assert_eq!(stat("min(amount) >= 0", "-2.5").status, "failed");
+        assert_eq!(stat("max(amount) <= 100", "100").status, "passed");
+        assert_eq!(stat("max(amount) <= 100", "100.5").status, "failed");
+        assert_eq!(
+            stat("avg(amount) between 10 and 20", "15.25").status,
+            "passed"
+        );
+        assert_eq!(stat("avg(amount) between 10 and 20", "21").status, "failed");
+        // A column that is not numeric has no average a bound can judge.
+        assert_eq!(
+            stat("max(amount) <= 100", "zebra"),
+            Verdict {
+                status: "warning",
+                value: "the max of the column is not a number".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn says_how_old_in_words() {
+        assert_eq!(human_seconds(-5), "0s");
+        assert_eq!(human_seconds(59), "59s");
+        assert_eq!(human_seconds(60), "1m");
+        assert_eq!(human_seconds(3_600 + 5 * 60), "1h 5m");
+        assert_eq!(human_seconds(2 * 86_400 + 4 * 3_600), "2d 4h");
     }
 }

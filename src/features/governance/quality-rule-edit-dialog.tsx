@@ -18,6 +18,7 @@ import { notifySuccess } from "@/lib/notify"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
+import { ThresholdForms } from "./quality-check-fields"
 
 const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -119,10 +120,7 @@ export function EditRuleDialog({
               placeholder="email not null >= 95%"
             />
             <p className="text-xs text-muted-foreground">
-              To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
-              <span className="font-mono">column not null &gt;= 95%</span>,{" "}
-              <span className="font-mono">column unique</span> or{" "}
-              <span className="font-mono">column between 0 and 100</span>, and name the table as
+              To be runnable, write it as one of: <ThresholdForms />. Name the table as
               silver.table, serving.table or bronze.table.
             </p>
           </div>

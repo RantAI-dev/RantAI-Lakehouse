@@ -30,6 +30,8 @@ import {
   SEVERITY_OPTIONS,
   getDataQualityColumns,
 } from "./data-quality-columns"
+import { CheckFields, ThresholdForms } from "./quality-check-fields"
+import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
 
 const selectClassName =
@@ -43,6 +45,14 @@ export function DataQualityPage() {
   const [asset, setAsset] = React.useState("")
   const [formDimension, setFormDimension] = React.useState("")
   const [threshold, setThreshold] = React.useState("")
+  // DATA-14 (F7): a check is picked by default, so the threshold is always
+  // one the API can run; the typed form stays for what a picker cannot say.
+  const [typedThreshold, setTypedThreshold] = React.useState(false)
+  const [checkForm, setCheckForm] = React.useState<RuleForm>(EMPTY_FORM)
+  const builtThreshold = ruleThreshold(checkForm)
+  const finalThreshold = typedThreshold ? threshold.trim() : (builtThreshold ?? "")
+  const finalDimension =
+    formDimension.trim() || (typedThreshold ? "" : KINDS[checkForm.kind].dimension)
   const [severity, setSeverity] = React.useState<Severity>("medium")
   const tableUrlState = useTableUrlState()
 
@@ -121,6 +131,8 @@ export function DataQualityPage() {
     setAsset("")
     setFormDimension("")
     setThreshold("")
+    setTypedThreshold(false)
+    setCheckForm(EMPTY_FORM)
     setSeverity("medium")
   }
 
@@ -151,8 +163,8 @@ export function DataQualityPage() {
     const result = await create.run({
       name: name.trim(),
       asset: asset.trim(),
-      dimension: formDimension.trim(),
-      threshold: threshold.trim(),
+      dimension: finalDimension,
+      threshold: finalThreshold,
       severity,
     })
     if (result) {
@@ -297,9 +309,7 @@ export function DataQualityPage() {
         }}
         title="Add Quality Rule"
         description="Define a quality check with dimension, threshold, and severity."
-        canSubmit={Boolean(
-          name.trim() && asset.trim() && formDimension.trim() && threshold.trim()
-        )}
+        canSubmit={Boolean(name.trim() && asset.trim() && finalDimension && finalThreshold)}
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
@@ -319,30 +329,57 @@ export function DataQualityPage() {
             onChange={(e) => setAsset(e.target.value)}
           />
         </div>
+        {typedThreshold ? (
+          <div className="space-y-1.5">
+            <Label htmlFor="qr-threshold">Threshold</Label>
+            <Input
+              id="qr-threshold"
+              className="font-mono"
+              value={threshold}
+              onChange={(e) => setThreshold(e.target.value)}
+              placeholder="email not null >= 99%"
+            />
+            <p className="text-xs text-muted-foreground">
+              To be runnable, write it as one of: <ThresholdForms />. Name the asset as
+              silver.table, serving.table or bronze.table.
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-3">
+            <CheckFields
+              form={checkForm}
+              onChange={(patch) => setCheckForm((f) => ({ ...f, ...patch }))}
+              columns={null}
+              idPrefix="qr"
+            />
+            <p className="text-xs text-muted-foreground">
+              {builtThreshold ? (
+                <>
+                  Threshold: <span className="font-mono text-foreground">{builtThreshold}</span>
+                </>
+              ) : (
+                "Fill in the check to see its threshold."
+              )}
+            </p>
+          </div>
+        )}
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="self-start px-0"
+          onClick={() => setTypedThreshold((t) => !t)}
+        >
+          {typedThreshold ? "Pick a check instead" : "Write the threshold myself"}
+        </Button>
         <div className="space-y-1.5">
           <Label htmlFor="qr-dim">Dimension</Label>
           <Input
             id="qr-dim"
             value={formDimension}
             onChange={(e) => setFormDimension(e.target.value)}
-            placeholder="completeness"
+            placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}
           />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-threshold">Threshold</Label>
-          <Input
-            id="qr-threshold"
-            value={threshold}
-            onChange={(e) => setThreshold(e.target.value)}
-            placeholder="email not null >= 99%"
-          />
-          <p className="text-xs text-muted-foreground">
-            To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
-            <span className="font-mono">column not null &gt;= 95%</span>,{" "}
-            <span className="font-mono">column unique</span> or{" "}
-            <span className="font-mono">column between 0 and 100</span>. Name the asset as
-            silver.table, serving.table or bronze.table.
-          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="qr-severity">Severity</Label>
