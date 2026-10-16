@@ -120,7 +120,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse | AI Copilot | P2 | Todo |  | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds. **Blocked by `BI-18` (locking a dashboard filter in an embed)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26`. **Blocked by `RPT-1` (digest schedules)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
-| `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. | Build | P2 | Building |  | PRODUCT §2; [spec](specs/bld-1.md) |
+| `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. | Build | P2 | Building | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) (slice 1: a pipeline reads as its author) | PRODUCT §2; [spec](specs/bld-1.md) |
 | `VER-1` | Task | Verify SFTP, Google Sheets and Oracle sources end to end; test row filters. The connector half is now `SRC-9`; row filters stay here | Data | P2 | Todo |  | PRODUCT §2 |
 | `BI-2` | Feature | Metrics users can define once and reuse across dashboards (a semantic layer). **Blocked by `DATA-12` (certified metrics part)** | Dashboards | P2 | Planned |  | PRODUCT §2; `reference/competitive-comparison.md` (BI matrix) |
 | `DATA-9` | Feature | Upload a file from the console | Data | P2 | In Acceptance | #71, #73 | `features/upload-file.md` |
@@ -191,7 +191,7 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-18` | Task | A paused connector still loads when a run was already queued or is launched from Dagster: only the due list and the run route check the pause. The schema-observation routes use `ingest:read` instead of their own permission | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8`) |
 | `SRC-19` | Task | A wrong password for a PostgreSQL source is retried as if it were a passing fault: the driver gives no error code to tell it apart, so the run fails after the retries instead of at once (MySQL, SQL Server and Oracle fail at once since `SRC-7`'s gate) | Data | P3 | Todo |  | `superpowers/plans/2026-10-10-src-9-connector-gates.md` |
 | `SEC-29` | Task | 25 responses in `routes/pipelines.rs` put the orchestrator's error text in the body (`js_error(err)`; `DagsterError::Server` is Dagster's own GraphQL text). Same rule as `SEC-6`: a fixed body, the detail to `tracing`. Closed by `SEC-11`'s change: no `js_error` is left; orchestrator failures answer a fixed message and a reference id | Administration & Security | P2 | Done | #105 | PR #80 review |
-| `GOV-4` | Task | A masking policy on a column does not follow its rows through a pipeline: the pipeline copies unmasked rows into its Silver or Gold table, and the policy on the source column does not apply to the copy. Decide whether policies carry to outputs or outputs must be classified again. **Decided by the product owner, 2026-10-14:** a pipeline reads as its author, through the same masking and row-filter rewrite as the author's own queries; built in `BLD-1`. **Blocked by `BLD-1` (closed by slice 1)** | Governance | P2 | Todo |  | `BLD-3` plan, D5 |
+| `GOV-4` | Task | A masking policy on a column does not follow its rows through a pipeline: the pipeline copies unmasked rows into its Silver or Gold table, and the policy on the source column does not apply to the copy. Decide whether policies carry to outputs or outputs must be classified again. **Decided by the product owner, 2026-10-14:** a pipeline reads as its author, through the same masking and row-filter rewrite as the author's own queries; built in `BLD-1`. Closed by `BLD-1` slice 1 | Governance | P2 | Done | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) | `BLD-3` plan, D5 |
 | `SRC-20` | Task | The pipeline gate `ops/g7` is run by no CI job | Data | P3 | Done | #155 | `plans/SRC-9-RESULT.md` |
 | `SRC-21` | Task | Load-mode follow-ups from `SRC-10`: the assistant's `set_ingest_spec` schema does not know `loadMode` or `primaryKey`, so a spec it saves drops each table's mode and key (the job then replaces); no test covers a pending removal of a key column next to an approvable change when the pause is lifted | Data | P2 | Done | #145 | PR #115 review; `superpowers/plans/2026-10-14-src-21-load-modes-followups.md` |
 | `DATA-24` | Task | Catalog search follow-ups: measure the 500 ms target on 10,000 tables (`DATA-11-RESULT.md`); keep the Owner and Tags filters reachable on a laptop-width window; read column rows with `FINAL`; run acceptance rows 10, 11 and 13 | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`DATA-11`) |
@@ -263,7 +263,7 @@ parity), built after it.
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BI-6` | Planned | — | `AI-6` |
 | `BI-7` | Planned | — | `AI-6` |
-| `BLD-1` | Building | — | `GOV-4` (closed by slice 1), `REL-6` |
+| `BLD-1` | Building | — | `REL-6` |
 | `BLD-2` | Building | — | `REL-6` |
 | `DATA-12` | Planned | — | `BI-2` (certified metrics part) |
 | `DATA-13` | Planned | — | `BI-14` (column part) |
@@ -286,16 +286,15 @@ parity), built after it.
 | `AI-8` | Planned | `BI-17` | — |
 | `AI-9` | Planned | `BI-18` (layout part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
-| `GOV-4` | Todo | `BLD-1` (closed by slice 1) | — |
 | `QS-2` | Planned | `SEC-21` (full-result download) | — |
 | `QS-3` | Planned | `SEC-20` | — |
+| `REL-6` | Todo | `BLD-1`, `BLD-2` | — |
 | `SRC-3` | Planned | `DEC-9`, `SRC-12` (OAuth sign-in) | — |
 | `SRC-4` | Planned | `SRC-11` (column choice), `SEC-14` (credentials) | — |
-| `REL-6` | Todo | `BLD-1`, `BLD-2` | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `BLD-4`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-7`, `REL-8`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-15`, `AI-19`, `AI-20`, `BI-1`, `BI-10`, `BI-13`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-4`, `BI-5`, `BI-6`, `BI-7`, `BIZ-1`, `BIZ-2`, `BLD-4`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-7`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-3`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-4`, `SEC-7`, `SRC-11`, `SRC-12`, `SRC-13`, `SRC-15`, `SRC-18`, `SRC-19`, `SRC-2`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -356,6 +355,7 @@ set by the product owner and are left empty until they are.
 | `BLD-1` | 2026-10-15 | | |
 | `BLD-2` | 2026-10-15 | | |
 | `SEC-35` | 2026-10-14 | 2026-10-15 | |
+| `GOV-4` | 2026-10-15 | 2026-10-16 | |
 
 ## Decide
 
