@@ -1016,6 +1016,10 @@ pub async fn runnable(
 /// caller's tenant; 503 when no Postgres is configured; 500 on a store
 /// failure; 503 when the orchestrator could not be asked about an
 /// outstanding run (the sensor skips that tick and asks again).
+#[allow(
+    clippy::too_many_lines,
+    reason = "orchestrates lag-check permissions, inputs resolution, state preservation, and alert evaluation"
+)]
 pub async fn lag_check(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1038,24 +1042,41 @@ pub async fn lag_check(
     let Some(pipeline) = pipelines::get_pipeline(pool, &id).await? else {
         return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
     };
+    // BLD-2 review R2 SHOULD-FIX 2: guard: pipeline has no target lag configured
+    let (target_seconds, downstream) = crate::pipeline_lag::target_of(&pipeline);
+    if target_seconds.is_none() && !downstream {
+        return Ok(ApiJson(serde_json::json!({
+            "decision": "wait",
+            "runKey": serde_json::Value::Null,
+            "jobName": crate::routes::authored_pipelines::job_name(&pipeline.id),
+            "status": "not_measured",
+            "lagSeconds": serde_json::Value::Null,
+            "targetSeconds": serde_json::Value::Null,
+            "behindStreak": 0,
+            "reason": "pipeline has no target lag configured",
+        })));
+    }
+
     let Some(inputs) = crate::pipeline_lag::inputs_of(pool, &pipeline).await? else {
-        // BLD-2 review R1 SHOULD-FIX 13: unparseable source yields not_measured
+        // BLD-2 review R2 SHOULD-FIX 2: unparseable source preserves existing row and propagates errors
         let now = time::OffsetDateTime::now_utc();
+        let existing = pipelines::get_lag_state(pool, &pipeline.id).await?;
         let p_update = lakehouse_store::pipelines::LagStateUpdate {
             pipeline_id: pipeline.id.clone(),
             tenant_id: pipeline.tenant_id,
-            consumed_tokens: None,
-            consumed_at: None,
-            pending_since: None,
-            requested_run_key: None,
-            requested_tokens: None,
-            requested_at: None,
-            request_attempt: 0,
+            consumed_tokens: existing.as_ref().and_then(|s| s.consumed_tokens.clone()),
+            consumed_at: existing.as_ref().and_then(|s| s.consumed_at),
+            pending_since: existing.as_ref().and_then(|s| s.pending_since),
+            requested_run_key: existing.as_ref().and_then(|s| s.requested_run_key.clone()),
+            requested_tokens: existing.as_ref().and_then(|s| s.requested_tokens.clone()),
+            requested_at: existing.as_ref().and_then(|s| s.requested_at),
+            request_attempt: existing.as_ref().map_or(0, |s| s.request_attempt),
             last_check_at: now,
             last_status: "not_measured".to_owned(),
             behind_streak: 0,
         };
-        let _ = pipelines::upsert_lag_state(pool, &p_update).await;
+        // BLD-2 review R2 SHOULD-FIX 2: do not let _ = a database error; propagate it
+        pipelines::upsert_lag_state(pool, &p_update).await?;
         return Ok(ApiJson(serde_json::json!({
             "decision": "wait",
             "runKey": serde_json::Value::Null,

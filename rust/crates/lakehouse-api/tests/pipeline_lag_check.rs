@@ -288,3 +288,131 @@ async fn a_dagster_native_job_name_is_not_checked() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "Pipeline ingest_job not found");
 }
+
+/// BLD-2 review R2 SHOULD-FIX 2: A pipeline with no target lag configured
+/// returns wait with `not_measured` and does not touch `pipeline_lag_state` even if source is unparseable.
+#[tokio::test]
+async fn unparseable_source_with_no_target_lag_does_not_persist_state() {
+    let app = spin_up().await;
+    let token = "lag-check-token-no-target";
+    seed_orchestrator(&app.pool, token).await;
+
+    let created = pipelines::create_pipeline(
+        &app.pool,
+        &CreatePipelineInput {
+            name: "no-target-unparseable".to_owned(),
+            kind: "batch".to_owned(),
+            source_zone: "bronze".to_owned(),
+            source_table: "orders".to_owned(),
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            target_zone: "silver".to_owned(),
+            target_table: "out".to_owned(),
+            schedule: "manual".to_owned(),
+            owner: None,
+            description: None,
+            max_retries: None,
+            tenant_id: None,
+            depends_on: Vec::new(),
+            connector_id: None,
+            id: None,
+            target_lag: None,
+            run_as: None,
+        },
+        None,
+    )
+    .await
+    .expect("create pipeline");
+
+    sqlx::query("UPDATE pipeline_definition SET source = 'invalid' WHERE id = $1")
+        .bind(&created.id)
+        .execute(&app.pool)
+        .await
+        .expect("corrupt source");
+
+    let (status, body) = lag_check(
+        &app,
+        &created.id,
+        &[("authorization", format!("Bearer {token}"))],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "wait");
+    assert_eq!(body["reason"], "pipeline has no target lag configured");
+
+    let stored = pipelines::get_lag_state(&app.pool, &created.id)
+        .await
+        .expect("get lag state");
+    assert!(
+        stored.is_none(),
+        "no state should be recorded when pipeline has no target lag"
+    );
+}
+
+/// BLD-2 review R2 SHOULD-FIX 2: Unparseable source preserves existing row
+/// (consumed tokens, requested run key, request attempt) and records `not_measured`.
+#[tokio::test]
+async fn unparseable_source_preserves_existing_state() {
+    let app = spin_up().await;
+    let token = "lag-check-token-unparseable";
+    seed_orchestrator(&app.pool, token).await;
+    let id = seed_lagged_pipeline(&app.pool, "unparseable-preserve", 10).await;
+
+    let now = time::OffsetDateTime::now_utc();
+    let initial_update = lakehouse_store::pipelines::LagStateUpdate {
+        pipeline_id: id.clone(),
+        tenant_id: None,
+        consumed_tokens: Some(serde_json::json!({"bronze.orders": "fp:1"})),
+        consumed_at: Some(now),
+        pending_since: Some(now),
+        requested_run_key: Some("pl-run-key:0".to_owned()),
+        requested_tokens: Some(serde_json::json!({"bronze.orders": "fp:1"})),
+        requested_at: Some(now),
+        request_attempt: 2,
+        last_check_at: now,
+        last_status: "behind".to_owned(),
+        behind_streak: 2,
+    };
+    pipelines::upsert_lag_state(&app.pool, &initial_update)
+        .await
+        .expect("seed initial state");
+
+    sqlx::query("UPDATE pipeline_definition SET source = 'invalid' WHERE id = $1")
+        .bind(&id)
+        .execute(&app.pool)
+        .await
+        .expect("corrupt source");
+
+    let (status, body) =
+        lag_check(&app, &id, &[("authorization", format!("Bearer {token}"))]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["decision"], "wait");
+    assert_eq!(body["status"], "not_measured");
+    assert_eq!(
+        body["reason"],
+        "pipeline source is not a valid <zone>.<table> location"
+    );
+
+    let stored = pipelines::get_lag_state(&app.pool, &id)
+        .await
+        .expect("read lag state")
+        .expect("state exists");
+    assert_eq!(stored.last_status.as_deref(), Some("not_measured"));
+    assert_eq!(stored.behind_streak, 0);
+    assert_eq!(
+        stored.request_attempt, 2,
+        "request_attempt must be preserved"
+    );
+    assert_eq!(
+        stored.requested_run_key.as_deref(),
+        Some("pl-run-key:0"),
+        "requested_run_key must be preserved"
+    );
+    assert!(
+        stored.consumed_tokens.is_some(),
+        "consumed_tokens must be preserved"
+    );
+}

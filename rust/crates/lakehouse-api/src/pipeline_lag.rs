@@ -364,7 +364,7 @@ pub struct LagCheckOutcome {
 /// The target lag's own value, split for the decision: a numeric target in
 /// seconds, and whether this pipeline is `downstream` (plan D7), which has
 /// a target but none of its own.
-fn target_of(pipeline: &Pipeline) -> (Option<i32>, bool) {
+pub(crate) fn target_of(pipeline: &Pipeline) -> (Option<i32>, bool) {
     match pipeline.target_lag {
         Some(TargetLag::Lag { minutes }) => (Some(minutes.saturating_mul(60)), false),
         Some(TargetLag::Downstream) => (None, true),
