@@ -543,9 +543,10 @@ async fn discover_dial(
                     target.user,
                     password.expose_secret(),
                 ));
-                // Same "state the TLS posture explicitly" reasoning as
-                // `connector_probe::probe_mssql`.
-                config.trust_cert();
+                // `SEC-14` part B (D5/E3): encryption required, and the CA
+                // verified when one is configured -- the same posture as
+                // `connector_probe::probe_mssql`, from one helper.
+                connector_probe::apply_mssql_tls(&mut config, ca);
                 // SEC-15: the socket goes to the approved address;
                 // `config.host` keeps the name for the TDS handshake.
                 // `TcpStream::connect`/`set_nodelay` return `std::io::Error`,
@@ -590,7 +591,7 @@ async fn discover_dial(
 /// `dial_info.adapter`. `schema` is required for the `sql`/`cdc`
 /// adapters (the caller-supplied string every driver's discovery query
 /// binds — see the module doc comment) and ignored otherwise. `ca` is the
-/// CA its Postgres/SQL Server dials verify the server against (`SEC-14`
+/// CA its Postgres and SQL Server dials verify the server against (`SEC-14`
 /// part B, D5; `None` = require TLS, trust the certificate).
 ///
 /// # Errors

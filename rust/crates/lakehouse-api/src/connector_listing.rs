@@ -797,7 +797,8 @@ async fn run_sql(
                 out
             }
             SqlDriver::Mssql => {
-                let mut client = connect_mssql(&approved, target, password.expose_secret()).await?;
+                let mut client =
+                    connect_mssql(&approved, target, password.expose_secret(), ca).await?;
                 run_mssql(&mut client, op).await
             }
             // Oracle is read by the orchestrator (`dispatch` never gets here).
@@ -812,14 +813,17 @@ async fn connect_mssql(
     approved: &Approved,
     target: &DialTarget<'_>,
     password: &str,
+    ca: Option<&Path>,
 ) -> Result<MssqlClient, ErrorClass> {
     let mut config = tiberius::Config::new();
     config.host(target.host);
     config.port(target.port);
     config.database(target.database);
     config.authentication(tiberius::AuthMethod::sql_server(target.user, password));
-    // The same stated TLS posture as `connector_probe::probe_mssql`.
-    config.trust_cert();
+    // `SEC-14` part B (D5/E3): the same stated TLS posture as
+    // `connector_probe::probe_mssql`, from the same helper, so a listing
+    // dial cannot accept a certificate the connection test would refuse.
+    connector_probe::apply_mssql_tls(&mut config, ca);
     // The socket goes to the approved address; `config.host` keeps the name for
     // the TDS handshake (`SEC-15`).
     let tcp = connector_probe::connect_pinned(approved)

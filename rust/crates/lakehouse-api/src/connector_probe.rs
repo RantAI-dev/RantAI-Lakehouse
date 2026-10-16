@@ -440,6 +440,7 @@ async fn probe_dial(
                 &info.secret_ref,
                 resolver,
                 internal_hosts,
+                ca,
             ))
             .await
         }
@@ -537,11 +538,15 @@ pub(crate) fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static 
 /// before `secret_ref` is resolved or a `TcpStream` is even opened — see
 /// `probe_mssql_blocks_an_internal_host_before_dialing`, which mirrors
 /// `probe_mysql`'s own SSRF test with a panicking resolver.
+///
+/// `SEC-14` part B (D5/E3): the session always requests encryption
+/// ([`apply_mssql_tls`]) and, with a CA, verifies the chain against it.
 async fn probe_mssql(
     target: &DialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Outcome {
     let approved = match resolve_checked(target.host, target.port, internal_hosts).await {
         Ok(approved) => approved,
@@ -564,12 +569,7 @@ async fn probe_mssql(
         target.user,
         password.expose_secret(),
     ));
-    // Tier 1 has no cert-pinning story for an arbitrary operator-supplied
-    // SQL Server host -- same "state the TLS posture explicitly" reasoning
-    // as probe_postgres's PgSslMode::Prefer, applied to tiberius's own
-    // "accept the presented certificate without verifying its chain"
-    // knob.
-    config.trust_cert();
+    apply_mssql_tls(&mut config, ca);
     // SEC-15: the socket goes to the approved address; `config.host` keeps
     // the configured name for the TDS handshake, which is what `SEC-14`
     // needs for certificate verification.
@@ -1172,6 +1172,34 @@ pub(crate) fn pg_options_for_address(
     match ca {
         Some(path) => options.ssl_mode(PgSslMode::VerifyCa).ssl_root_cert(path),
         None => options.ssl_mode(PgSslMode::Require),
+    }
+}
+
+/// `SEC-14` part B (D5/E3): the ONE place a SQL Server dial's TLS posture
+/// is set, shared by the connection test ([`probe_mssql`]), schema discovery
+/// and listing so no dial can drift from another.
+///
+/// Stated rather than inherited: `tiberius`'s own default already requires
+/// encryption with its `rustls` feature, but a default that changes with a
+/// feature flag is not a decision this module makes, and the previous
+/// comment here said only "Tier 1 has no cert-pinning story".
+///
+/// * No CA (D5's `require`): the session is encrypted and the presented
+///   certificate is accepted without a chain check — the same posture
+///   [`pg_options_for_address`] takes with no CA.
+/// * With a CA: [`tiberius::Config::trust_cert_ca`] verifies the chain
+///   against it. tiberius checks the certificate's names against
+///   `config.host`, which is the CONFIGURED name (see the `SEC-15` socket
+///   note at each call site), so this is verify-full for SQL Server, not
+///   verify-ca.
+///
+/// The two arms are mutually exclusive on purpose: `trust_cert_ca` panics
+/// when it is called after `trust_cert`, so one `match` keeps them apart.
+pub(crate) fn apply_mssql_tls(config: &mut tiberius::Config, ca: Option<&Path>) {
+    config.encryption(tiberius::EncryptionLevel::Required);
+    match ca {
+        Some(path) => config.trust_cert_ca(path.to_string_lossy().into_owned()),
+        None => config.trust_cert(),
     }
 }
 
@@ -2382,6 +2410,50 @@ mod tests {
         assert_eq!(mysql.get_port(), 6543);
     }
 
+    /// `SEC-14` part B (E3, D5): a SQL Server dial always requires
+    /// encryption, and verifies the CA when one is configured. tiberius
+    /// exposes no getter for either (`Config`'s fields are crate-private),
+    /// so both are read through its `Debug` -- `encryption: Required`,
+    /// `bypass: true` for the accept-anything posture, and the
+    /// `File("<path>")` an extra CA is recorded as.
+    #[test]
+    fn mssql_tls_requires_encryption_and_uses_the_ca_when_set() {
+        let mut without_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut without_ca, None);
+        let without_ca = format!("{without_ca:?}");
+        assert!(
+            without_ca.contains("encryption: Required"),
+            "encryption must be required, never optional: {without_ca}"
+        );
+        assert!(
+            without_ca.contains("bypass: true"),
+            "with no CA the certificate is taken as-is (D5's require): {without_ca}"
+        );
+        assert!(
+            !without_ca.contains("VerifyCa") && !without_ca.contains("VerifyFull"),
+            "the bypass posture must not claim to verify: {without_ca}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").unwrap();
+        let mut with_ca = tiberius::Config::new();
+        apply_mssql_tls(&mut with_ca, Some(ca.as_path()));
+        let with_ca = format!("{with_ca:?}");
+        assert!(
+            with_ca.contains("encryption: Required"),
+            "a CA must not change the encryption level: {with_ca}"
+        );
+        assert!(
+            with_ca.contains(&format!("File({:?})", ca.to_str().unwrap())),
+            "the CA file must be attached to the config: {with_ca}"
+        );
+        assert!(
+            !with_ca.contains("bypass: true"),
+            "with a CA the chain is verified, not bypassed: {with_ca}"
+        );
+    }
+
     /// `SEC-14` part B (E1, D5): the sqlx `PostgreSQL` TLS mode is `Require`
     /// with no CA -- never `Prefer`, which falls back to plaintext, and never
     /// `Disable` -- and `VerifyCa` with that CA attached when
@@ -2746,6 +2818,7 @@ mod tests {
             "env:UNUSED",
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await;
         assert!(!outcome.ok);
