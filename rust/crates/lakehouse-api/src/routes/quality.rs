@@ -818,6 +818,70 @@ pub(crate) async fn latest_runs(ch: &ChClient) -> HashMap<String, LatestRun> {
     }
 }
 
+/// How many runs a rule's history lists (`DATA-14`, F7).
+const HISTORY_RUNS: usize = 50;
+
+/// One recorded run of a rule, newest first in [`rule_runs`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRecord {
+    status: String,
+    value: String,
+    /// Who ran it: a person's display name, `schedule` or `load`.
+    run_by: String,
+    /// `YYYY-MM-DDTHH:MM:SSZ`.
+    at: String,
+    /// What the rule said when it ran; `None` for a run from before the
+    /// threshold was recorded.
+    threshold: Option<String>,
+}
+
+/// `GET /api/governance/quality/{id}/runs` — the last 50 runs of one rule,
+/// newest first, each with the threshold it ran with. Kept across edits
+/// (`DATA-14`, F2), so a rule that was tightened shows both what it found
+/// and against what. Readable by any login, like the rule list.
+///
+/// # Errors
+///
+/// `404` when no rule has that id; `503` when the store or the run table
+/// cannot be read (the cause is logged, not returned).
+pub async fn rule_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let rules = lakehouse_store::governance::list_quality_rules(pool(&state)?).await?;
+    let rule = rules
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| ApiError::NotFound("Quality rule not found".to_owned()))?;
+    let ch = &state.clickhouse;
+    ensure_table(ch).await.map_err(|err| {
+        tracing::warn!(?err, rule = %rule.name, "quality: the run table is unavailable");
+        ApiError::Unavailable("The run history could not be read.".to_owned())
+    })?;
+    let sql = format!(
+        "SELECT status, value, run_by, threshold, \
+                formatDateTime(at, '%Y-%m-%dT%H:%i:%SZ', 'UTC') AS ran_at \
+         FROM console.quality_run WHERE rule_id = {} ORDER BY at DESC LIMIT {HISTORY_RUNS}",
+        SqlLiteral::from(rule.id.as_str())
+    );
+    let rows = ch.rows(&sql, None).await.map_err(|err| {
+        tracing::warn!(?err, rule = %rule.name, "quality: the run history failed");
+        ApiError::Unavailable("The run history could not be read.".to_owned())
+    })?;
+    let runs: Vec<RunRecord> = rows
+        .iter()
+        .map(|r| RunRecord {
+            status: str_col(r, "status").to_owned(),
+            value: str_col(r, "value").to_owned(),
+            run_by: str_col(r, "run_by").to_owned(),
+            at: str_col(r, "ran_at").to_owned(),
+            threshold: Some(str_col(r, "threshold").to_owned()).filter(|t| !t.is_empty()),
+        })
+        .collect();
+    Ok(ApiJson(json!({ "runs": runs })))
+}
+
 /// Puts what running a rule would give, and last gave, onto its JSON
 /// (`QualityRule` in `contracts/governance.ts`): `evaluable`, the `hint`
 /// when it is not, and — once it has run — `lastStatus`, `lastRunAt` and

@@ -311,6 +311,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // DATA-14 (F5): a table's learned-or-learning state; open to any login
     // like the quality list it is shown beside.
     ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
+    // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
+    // any login, and the history shows what that list shows (a verdict).
+    ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -912,6 +915,15 @@ mod tests {
         assert_eq!(
             policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
             Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F7): a rule's run history is readable by any login.
+    #[test]
+    fn a_rules_run_history_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/{id}/runs"),
+            Some(Policy::RequiresAuth)
         );
     }
 

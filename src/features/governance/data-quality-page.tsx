@@ -22,7 +22,7 @@ import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { withNotify } from "@/lib/notify"
+import { notifyError, withNotify } from "@/lib/notify"
 import type { Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule } from "@/services/contracts/governance"
@@ -32,7 +32,9 @@ import {
 } from "./data-quality-columns"
 import { CheckFields, ThresholdForms } from "./quality-check-fields"
 import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
+import { QualityIncidents } from "./quality-incidents"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
+import { RuleRuns } from "./quality-rule-runs"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -168,6 +170,15 @@ export function DataQualityPage() {
       severity,
     })
     if (result) {
+      // DATA-14 (AC1): run the new rule once now, so a check that already
+      // fails opens its incident at once; the rule stays whatever this says.
+      if (hasPermission("query:read") && result.evaluable !== false) {
+        try {
+          await governanceService.runQualityRule(result.id)
+        } catch (err) {
+          notifyError("The rule was added, but its first run failed", err)
+        }
+      }
       setCreateOpen(false)
       resetForm()
       state.reload()
@@ -190,6 +201,9 @@ export function DataQualityPage() {
           ) : null
         }
       />
+
+      {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
+      <QualityIncidents />
 
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
@@ -242,6 +256,16 @@ export function DataQualityPage() {
                 },
               ]}
             />
+            {selected.evaluable !== undefined ? (
+              <section className="flex flex-col gap-2">
+                <h3 className="text-sm font-semibold">Run history</h3>
+                <RuleRuns
+                  key={`${selected.id}-${selected.lastRunAt ?? "never"}`}
+                  ruleId={selected.id}
+                  threshold={selected.threshold}
+                />
+              </section>
+            ) : null}
             <div className="flex flex-wrap gap-2">
               {selected.evaluable ? (
                 <Button
@@ -295,7 +319,7 @@ export function DataQualityPage() {
         onOpenChange={(open) => (open ? undefined : setDeleting(null))}
         title="Delete quality rule"
         description={`Delete ${deleting?.name ?? "this rule"}?`}
-        impact="The rule and the results recorded for it are removed."
+        impact={`The rule and the results recorded for it are removed, and its open incidents are resolved as "rule deleted".`}
         confirmLabel="Delete rule"
         confirming={removeRule.status === "pending"}
         destructive

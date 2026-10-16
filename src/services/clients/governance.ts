@@ -3,6 +3,11 @@ import type {
   Policy,
   QualityRule,
   QualityRunResult,
+  QualityRunRecord,
+  QualityIncident,
+  QualitySchedule,
+  QualitySchedules,
+  QualityLearning,
   LineageGraph,
   ColumnLineage,
   AuditEvent,
@@ -150,6 +155,49 @@ export const clickhouseGovernanceService: GovernanceService = {
       undefined,
       signal
     );
+  },
+  async listQualityRuns(id, signal) {
+    return (
+      await get<{ runs: QualityRunRecord[] }>(
+        `/api/governance/quality/${encodeURIComponent(id)}/runs`,
+        signal
+      )
+    ).runs
+  },
+  async listQualityIncidents(filter, signal) {
+    const query = new URLSearchParams()
+    if (filter?.status) query.set("status", filter.status)
+    if (filter?.asset) query.set("asset", filter.asset)
+    const qs = query.toString()
+    return (
+      await get<{ incidents: QualityIncident[] }>(
+        `/api/governance/quality/incidents${qs ? `?${qs}` : ""}`,
+        signal
+      )
+    ).incidents
+  },
+  resolveQualityIncident(id, resolution, signal) {
+    return post<QualityIncident>(
+      `/api/governance/quality/incidents/${encodeURIComponent(id)}/resolve`,
+      { resolution },
+      signal
+    )
+  },
+  listQualitySchedules(signal) {
+    return get<QualitySchedules>("/api/governance/quality/schedules", signal)
+  },
+  setQualitySchedule(asset, input, signal) {
+    return put<QualitySchedule>(
+      `/api/governance/quality/schedules/${encodeURIComponent(asset)}`,
+      input,
+      signal
+    )
+  },
+  getQualityLearning(asset, signal) {
+    return get<QualityLearning>(
+      `/api/governance/quality/learning/${encodeURIComponent(asset)}`,
+      signal
+    )
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);

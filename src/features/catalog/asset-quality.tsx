@@ -37,6 +37,8 @@ import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { CreateQualityRuleInput } from "@/services/contracts/governance"
 import { CheckFields } from "@/features/governance/quality-check-fields"
+import { QualityIncidents } from "@/features/governance/quality-incidents"
+import { QualitySchedulePanel } from "@/features/governance/quality-schedule"
 import {
   EMPTY_FORM,
   KINDS,
@@ -67,6 +69,7 @@ function AddRuleDialog({
   onCreated: () => void
 }) {
   // The evaluator addresses a column by a plain identifier.
+  const { hasPermission } = useAuth()
   const columns = a.schema.map((c) => c.name).filter((n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n))
   const key = lineageKey(a)
   const [form, setForm] = React.useState<RuleForm>({ ...EMPTY_FORM, column: columns[0] ?? "" })
@@ -91,6 +94,15 @@ function AddRuleDialog({
     })
     if (created === null) return
     notifySuccess("Quality rule added")
+    // DATA-14 (AC1): run it once now, so a check that already fails opens its
+    // incident at once instead of at the next scheduled pass.
+    if (hasPermission("query:read") && created.evaluable !== false) {
+      try {
+        await governanceService.runQualityRule(created.id)
+      } catch (err) {
+        notifyError("The rule was added, but its first run failed", err)
+      }
+    }
     onCreated()
   }
 
@@ -320,102 +332,107 @@ export function AssetQuality({
   }
 
   return (
-    <SectionCard
-      size="sm"
-      title="Quality checks"
-      description={parts.length > 0 ? parts.join(" · ") : "Rules and recorded results for this asset."}
-      action={
-        <div className="flex flex-wrap justify-end gap-1.5">
-          {hasPermission("query:read") && runnable.length > 0 ? (
-            <Button size="sm" variant="outline" onClick={() => void runAll()} disabled={running}>
-              <Play />
-              {running ? "Running…" : "Run checks"}
+    <div className="flex flex-col gap-4">
+      {/* DATA-14 (F7): what is wrong now on this table, above the checks. */}
+      <QualityIncidents asset={lineageKey(a)} />
+      <SectionCard
+        size="sm"
+        title="Quality checks"
+        description={parts.length > 0 ? parts.join(" · ") : "Rules and recorded results for this asset."}
+        action={
+          <div className="flex flex-wrap justify-end gap-1.5">
+            {hasPermission("query:read") && runnable.length > 0 ? (
+              <Button size="sm" variant="outline" onClick={() => void runAll()} disabled={running}>
+                <Play />
+                {running ? "Running…" : "Run checks"}
+              </Button>
+            ) : null}
+            {/* SEC-23 (F4): adding a rule needs governance:write, like editing and deleting one. */}
+            {canWrite ? (
+              <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
+                <Plus />
+                Add rule
+              </Button>
+            ) : null}
+            <Button size="sm" variant="ghost" render={<Link href="/governance/data-quality" />}>
+              Open data quality
             </Button>
-          ) : null}
-          {/* SEC-23 (F4): adding a rule needs governance:write, like editing and deleting one. */}
-          {canWrite ? (
-            <Button size="sm" variant="outline" onClick={() => setAdding(true)}>
-              <Plus />
-              Add rule
-            </Button>
-          ) : null}
-          <Button size="sm" variant="ghost" render={<Link href="/governance/data-quality" />}>
-            Open data quality
-          </Button>
-        </div>
-      }
-    >
-      {a.qualityChecks.length === 0 ? (
-        <EmptyState
-          title="No quality checks for this asset"
-          description="Add a rule to check its row count, freshness, or that a column is filled in, unique, within a range or holds only accepted values."
-          className="py-4"
+          </div>
+        }
+      >
+        <QualitySchedulePanel asset={lineageKey(a)} canWrite={canWrite} />
+        {a.qualityChecks.length === 0 ? (
+          <EmptyState
+            title="No quality checks for this asset"
+            description="Add a rule to check its row count, freshness, or that a column is filled in, unique, within a range or holds only accepted values."
+            className="py-4"
+          />
+        ) : (
+          <div className="overflow-hidden rounded-lg border border-border">
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="text-xs">Check</TableHead>
+                  <TableHead className="text-xs">Dimension</TableHead>
+                  <TableHead className="text-xs">Threshold</TableHead>
+                  <TableHead className="text-xs">Severity</TableHead>
+                  <TableHead className="text-xs">Result</TableHead>
+                  <TableHead className="text-xs">Last run</TableHead>
+                  <TableHead className="text-xs" aria-label="Actions" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {a.qualityChecks.map((q) => (
+                  <CheckRow
+                    key={q.id}
+                    q={q}
+                    onEdit={canWrite ? setEditing : undefined}
+                    onDelete={canWrite ? setDeleting : undefined}
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        <ConfirmActionDialog
+          open={deleting !== null}
+          onOpenChange={(open) => (open ? undefined : setDeleting(null))}
+          title="Delete quality rule"
+          description={`Delete ${deleting?.name ?? "this rule"}?`}
+          impact={`The rule and the results recorded for it are removed, and its open incidents are resolved as "rule deleted". It will no longer count toward this asset's health.`}
+          confirmLabel="Delete rule"
+          confirming={remove.status === "pending"}
+          destructive
+          onConfirm={() => void confirmDelete()}
         />
-      ) : (
-        <div className="overflow-hidden rounded-lg border border-border">
-          <Table>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                <TableHead className="text-xs">Check</TableHead>
-                <TableHead className="text-xs">Dimension</TableHead>
-                <TableHead className="text-xs">Threshold</TableHead>
-                <TableHead className="text-xs">Severity</TableHead>
-                <TableHead className="text-xs">Result</TableHead>
-                <TableHead className="text-xs">Last run</TableHead>
-                <TableHead className="text-xs" aria-label="Actions" />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {a.qualityChecks.map((q) => (
-                <CheckRow
-                  key={q.id}
-                  q={q}
-                  onEdit={canWrite ? setEditing : undefined}
-                  onDelete={canWrite ? setDeleting : undefined}
-                />
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-      <ConfirmActionDialog
-        open={deleting !== null}
-        onOpenChange={(open) => (open ? undefined : setDeleting(null))}
-        title="Delete quality rule"
-        description={`Delete ${deleting?.name ?? "this rule"}?`}
-        impact="The rule and the results recorded for it are removed. It will no longer count toward this asset's health."
-        confirmLabel="Delete rule"
-        confirming={remove.status === "pending"}
-        destructive
-        onConfirm={() => void confirmDelete()}
-      />
-      {editing ? (
-        <EditRuleDialog
-          rule={{
-            id: editing.id,
-            name: editing.name,
-            // An API build older than `asset` on a check: the asset's own table.
-            asset: editing.asset ?? lineageKey(a),
-            threshold: editing.threshold ?? "",
-            severity: editing.severity ?? "medium",
-          }}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
-            setEditing(null)
-            onChanged()
-          }}
-        />
-      ) : null}
-      {adding ? (
-        <AddRuleDialog
-          asset={a}
-          onClose={() => setAdding(false)}
-          onCreated={() => {
-            setAdding(false)
-            onChanged()
-          }}
-        />
-      ) : null}
-    </SectionCard>
+        {editing ? (
+          <EditRuleDialog
+            rule={{
+              id: editing.id,
+              name: editing.name,
+              // An API build older than `asset` on a check: the asset's own table.
+              asset: editing.asset ?? lineageKey(a),
+              threshold: editing.threshold ?? "",
+              severity: editing.severity ?? "medium",
+            }}
+            onClose={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null)
+              onChanged()
+            }}
+          />
+        ) : null}
+        {adding ? (
+          <AddRuleDialog
+            asset={a}
+            onClose={() => setAdding(false)}
+            onCreated={() => {
+              setAdding(false)
+              onChanged()
+            }}
+          />
+        ) : null}
+      </SectionCard>
+    </div>
   )
 }

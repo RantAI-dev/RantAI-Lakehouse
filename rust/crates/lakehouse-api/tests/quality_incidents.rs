@@ -457,3 +457,69 @@ async fn editing_a_rule_keeps_its_runs_and_records_the_threshold_each_ran_with()
     assert!(insert.contains("threshold"), "{insert}");
     assert!(insert.contains("'email not null >= 90%'"), "{insert}");
 }
+
+/// A rule's history lists every run, newest first, each with the threshold it
+/// ran with, and survives an edit (`DATA-14`, F2 and F7). The stand-in answers
+/// the history query with two rows, one from before the threshold was kept.
+#[tokio::test]
+async fn a_rules_history_lists_its_runs_with_the_threshold_each_ran_with() {
+    let (router, pool, ch) = app().await;
+    let cookie = admin(&pool).await;
+    let id = rule(&pool, "email_filled", "email not null >= 90%").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.quality_run WHERE rule_id",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [],
+            "rows": 2,
+            "data": [
+                {"status": "passed", "value": "75.0% not null", "run_by": "schedule",
+                 "threshold": "email not null >= 70%", "ran_at": "2026-10-02T09:00:00Z"},
+                {"status": "failed", "value": "75.0% not null", "run_by": "Ayu",
+                 "threshold": "", "ran_at": "2026-10-01T09:00:00Z"},
+            ],
+        })))
+        .with_priority(1)
+        .mount(&ch)
+        .await;
+
+    let (code, body) = call(
+        &router,
+        &cookie,
+        "GET",
+        &format!("/api/governance/quality/{id}/runs"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["status"], "passed");
+    assert_eq!(runs[0]["runBy"], "schedule");
+    assert_eq!(runs[0]["threshold"], "email not null >= 70%");
+    assert_eq!(runs[0]["at"], "2026-10-02T09:00:00Z");
+    assert_eq!(
+        runs[1]["threshold"],
+        Value::Null,
+        "a run from before the threshold was kept"
+    );
+
+    let sent = sent_to_clickhouse(&ch).await;
+    let query = sent
+        .iter()
+        .find(|b| b.contains("FROM console.quality_run WHERE rule_id"))
+        .unwrap();
+    assert!(query.contains(&format!("'{id}'")), "{query}");
+    assert!(query.contains("ORDER BY at DESC LIMIT 50"), "{query}");
+
+    let (code, _) = call(
+        &router,
+        &cookie,
+        "GET",
+        "/api/governance/quality/00000000-0000-4000-8000-000000000000/runs",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+}

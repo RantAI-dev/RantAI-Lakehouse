@@ -432,6 +432,9 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/quality/learning/{asset}",
             get(quality_anomaly::learning_status),
         )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(
