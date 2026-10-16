@@ -1122,6 +1122,11 @@ pub async fn enforce_pipeline_sql(
     .map_err(|err| {
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })?;
+    // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the SQL
+    // as the orchestrator submitted it, not `rewritten` (masking wraps the
+    // source in subqueries, which would make every column partial); the
+    // mapping is written when the run is reported successful.
+    super::lineage::columns::note_pipeline_sql(pool, &id, &sql).await;
     Ok(ApiJson(json!({ "sql": rewritten })))
 }
 

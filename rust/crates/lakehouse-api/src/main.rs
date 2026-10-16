@@ -33,6 +33,7 @@ mod policy_engine;
 mod routes;
 mod rustfs_client;
 mod sql_guard;
+mod sql_lineage;
 mod sql_rewrite;
 mod state;
 mod tenant;

@@ -919,6 +919,9 @@ pub async fn run(
     // (switch off, no key, one already running) is not a fault to show.
     if query.id.is_none() {
         crate::routes::ai::semantic::spawn_pass(&state);
+        // DATA-13 (F3): the builds `ClickHouse` logged since the last tick
+        // become column lineage, in the background for the same reason.
+        crate::routes::lineage::columns::spawn_builds_pass(&state);
     }
 
     Ok(ApiJson(json!({

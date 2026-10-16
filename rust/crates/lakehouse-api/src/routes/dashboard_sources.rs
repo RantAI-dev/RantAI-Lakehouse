@@ -229,6 +229,10 @@ async fn save(
     sources::save_source(&state.clickhouse, &source)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // DATA-13 (F4): the output columns are known from the probe above, so the
+    // source's column lineage is recorded now; a failure there is logged and
+    // never fails the save.
+    super::lineage::columns::record_sql_source(state, &source).await;
     Ok(source)
 }
 
@@ -317,6 +321,8 @@ pub async fn delete(
     sources::delete_source(ch, &id)
         .await
         .map_err(|err| classify_ch_error(&err))?;
+    // DATA-13 (F4): the source's column mappings go with it.
+    super::lineage::columns::forget_sql_source(&state, &id).await;
     // BI-8: the source's calculated fields go with it (no chart uses the
     // source any more, so none can use them).
     let orphans =

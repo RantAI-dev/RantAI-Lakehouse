@@ -389,8 +389,21 @@ def step_verify_run_audited() -> None:
 
 
 # Edge kinds `routes/lineage.rs` draws, each from a record it names in the
-# edge's `evidence`. Anything else is a guess.
-RECORDED_LINEAGE_EDGE_KINDS = {"publisher", "catalog", "ingest", "pipeline", "view", "export"}
+# edge's `evidence`. Anything else is a guess. `build` (what a Silver or Gold
+# table was last built from, read from ClickHouse's query log:
+# `routes/lineage/builds.rs`) and `upload` (the claim on an uploaded Bronze
+# table: `routes/lineage.rs`, `DATA-19`) were missing: the route drew them
+# and this step failed on them as if they were guesses (`DATA-13`, F7).
+RECORDED_LINEAGE_EDGE_KINDS = {
+    "publisher",
+    "catalog",
+    "ingest",
+    "pipeline",
+    "view",
+    "export",
+    "build",
+    "upload",
+}
 
 
 def step_verify_lineage_is_recorded_not_guessed() -> None:

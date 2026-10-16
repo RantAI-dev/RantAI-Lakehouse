@@ -623,6 +623,27 @@ pub async fn lineage(
     Ok(ApiJson(body))
 }
 
+/// `GET /api/governance/lineage/columns?table=&column=&direction=up|down`
+/// (`DATA-13`): the columns a column comes from, or the columns (and saved
+/// charts, with their dashboards) built from it, following recorded mappings
+/// up to ten hops. Same permission and tenant rules as [`lineage`]; charts
+/// and dashboards are listed only to a caller with `dashboard:read`.
+///
+/// # Errors
+///
+/// 400 for a missing or malformed parameter; 404 when `X-Tenant` names a
+/// tenant the caller does not belong to; 503 without a Postgres pool or when
+/// the shared-catalog rule cannot be evaluated; 500 on a database failure.
+pub(crate) async fn column_lineage(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<lakehouse_auth::Principal>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<crate::routes::lineage::columns::ColumnQuery>,
+) -> crate::error::ApiResult<ApiJson<Value>> {
+    let body = crate::routes::lineage::columns::read(&state, &principal, &headers, &q).await?;
+    Ok(ApiJson(body))
+}
+
 // ── `GET /api/governance/ingest-runs?connectorId=` (WS3 item 17) ───────
 //
 // Same shape as `lineage` immediately above: a dedicated route (mounted

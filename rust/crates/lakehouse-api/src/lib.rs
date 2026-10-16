@@ -49,6 +49,7 @@ pub mod policy_engine;
 pub mod routes;
 pub mod rustfs_client;
 pub mod sql_guard;
+pub mod sql_lineage;
 pub mod sql_rewrite;
 pub mod state;
 pub mod tenant;

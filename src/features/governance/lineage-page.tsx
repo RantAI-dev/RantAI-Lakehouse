@@ -16,6 +16,7 @@ import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { assetService, governanceService } from "@/services"
 import type { LineageGraph } from "@/services/contracts/governance"
+import { MappingList } from "@/features/catalog/column-lineage"
 import { getLineageColumns } from "./lineage-columns"
 
 function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
@@ -131,14 +132,7 @@ export function LineagePage() {
           </SectionCard>
           {state.data.columnMappings.length > 0 ? (
             <SectionCard title="Column mappings">
-              <ul className="space-y-2 text-sm">
-                {state.data.columnMappings.map((m) => (
-                  <li key={`${m.source}-${m.target}`} className="font-mono text-xs">
-                    {m.source} → {m.target}{" "}
-                    <span className="text-muted-foreground">({m.transform})</span>
-                  </li>
-                ))}
-              </ul>
+              <MappingList mappings={state.data.columnMappings} />
             </SectionCard>
           ) : null}
           {state.data.coverage?.length ? (

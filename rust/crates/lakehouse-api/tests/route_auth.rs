@@ -548,6 +548,60 @@ async fn a_seeded_data_engineer_is_denied_catalog_certification_write() {
     assert_eq!(stored, 0, "a refused write must store nothing");
 }
 
+/// `DATA-13`: `GET /api/governance/lineage/columns` needs `lineage:read`.
+/// A seeded Data Engineer holds `pipeline:*`, `catalog:write` and
+/// `connector:manage` but not `lineage:read`, so the permission middleware
+/// refuses it with a 403 naming the permission. The table-driven loops above
+/// walk the new `POLICY_TABLE` row both ways; this names the case.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_column_lineage() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/lineage/columns?table=serving.x&column=y",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: lineage:read")
+    );
+}
+
+/// `DATA-13`: the other half. A seeded Analyst holds `lineage:read`, so the
+/// permission middleware lets it through to the handler (whatever the
+/// handler then answers for an unreachable `ClickHouse` is not an auth
+/// failure).
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_column_lineage() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/lineage/columns?table=serving.x&column=y",
+        &cookie,
+    )
+    .await;
+    assert!(
+        !matches!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "lineage:read must reach the handler, got {}",
+        resp.status()
+    );
+}
+
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
 /// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
 /// reuse the catalog's read permission.
