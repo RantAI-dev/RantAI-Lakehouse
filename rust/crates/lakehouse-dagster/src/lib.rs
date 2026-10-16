@@ -1454,15 +1454,49 @@ impl DgClient {
         job_name: &str,
         run_config: &Value,
     ) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!) { \
+        self.launch_run_with_config_and_tags(job_name, run_config, &[])
+            .await
+    }
+
+    /// [`DgClient::launch_run_with_config`] with run tags (`SRC-11` review 1
+    /// SHOULD-FIX 1: the API tags a person's launch `lakehouse/trigger: user`,
+    /// which the orchestrator's run report reads). `tags` go in
+    /// `ExecutionParams.executionMetadata.tags` (`[ExecutionTag!]`, each a
+    /// `{ key, value }`). With no tags the request is exactly the one
+    /// [`DgClient::launch_run_with_config`] always sent, so its other callers
+    /// are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`DgClient::launch_run_with_config`].
+    pub async fn launch_run_with_config_and_tags(
+        &self,
+        job_name: &str,
+        run_config: &Value,
+        tags: &[(&str, &str)],
+    ) -> Result<LaunchOutcome, DgError> {
+        let tagged = !tags.is_empty();
+        let query = if tagged {
+            "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!, \
+                      $tags: [ExecutionTag!]!) { \
+                      launchRun(executionParams: { selector: $sel, mode: \"default\", \
+                      runConfigData: $cfg, executionMetadata: { tags: $tags } }) { \
+                      __typename \
+                      ... on LaunchRunSuccess { run { runId } } \
+                      ... on PythonError { message } \
+                      ... on RunConfigValidationInvalid { errors { message } } \
+                      } }"
+        } else {
+            "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!) { \
                       launchRun(executionParams: { selector: $sel, mode: \"default\", \
                       runConfigData: $cfg }) { \
                       __typename \
                       ... on LaunchRunSuccess { run { runId } } \
                       ... on PythonError { message className } \
                       ... on RunConfigValidationInvalid { errors { message } } \
-                      } }";
-        let variables = json!({
+                      } }"
+        };
+        let mut variables = json!({
             "sel": {
                 "repositoryName": self.repo,
                 "repositoryLocationName": self.location,
@@ -1470,6 +1504,12 @@ impl DgClient {
             },
             "cfg": run_config,
         });
+        if tagged {
+            variables["tags"] = tags
+                .iter()
+                .map(|(key, value)| json!({ "key": key, "value": value }))
+                .collect();
+        }
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
         Ok(launch_outcome_from(data.launch_run))
     }
@@ -3107,6 +3147,43 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("run-456"));
         assert!(outcome.failure.is_none());
+    }
+
+    /// `SRC-11` review 1 SHOULD-FIX 1: tags go in
+    /// `executionMetadata.tags` as `{ key, value }` objects, and the mutation
+    /// declares `$tags: [ExecutionTag!]!`.
+    #[tokio::test]
+    async fn launch_run_with_config_and_tags_sends_the_tags_as_execution_metadata() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("$tags: [ExecutionTag!]!"))
+            .and(body_string_contains("executionMetadata: { tags: $tags }"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "cfg": run_config,
+                    "tags": [{ "key": "lakehouse/trigger", "value": "user" }]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-789" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_run_with_config_and_tags(
+                "ingest_job",
+                &run_config,
+                &[("lakehouse/trigger", "user")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("run-789"));
     }
 
     /// A GraphQL-level failure (`RunConfigValidationInvalid`) must still

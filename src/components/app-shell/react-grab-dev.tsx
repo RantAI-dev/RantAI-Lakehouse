@@ -26,11 +26,26 @@ import * as React from "react";
  *    it off the server render path — the library touches `document` on
  *    load.
  *
+ * 3. **Opt-in (`NEXT_PUBLIC_REACT_GRAB=1`), phase 2 QA R21.** React Grab's
+ *    UI is built on Solid, whose delegated event handler redefines
+ *    `event.currentTarget` on the shared native event object (it ends up as
+ *    `<html>`), and that value outlives Solid's own listener. Every later
+ *    `document` listener of another library then reads a wrong
+ *    `currentTarget`: `react-resizable-panels` compares it with the document
+ *    it armed on pointer down, concludes the move is not its own, and drops
+ *    it, so the chart builder's form/preview divider showed the resize cursor
+ *    and highlighted but never moved (measured with CDP mouse events; with
+ *    React Grab's listeners withheld the same drag resized 463/463 to
+ *    363/562). It is dev-only, so it never affected a production build, but
+ *    it made drag handles untestable on the dev console. Turn it on only
+ *    while handing context to an agent, and expect drag handles to stall.
+ *
  * Remove the `<ReactGrabDev />` line in `app/layout.tsx` to disable it.
  */
 export function ReactGrabDev() {
   React.useEffect(() => {
     if (process.env.NODE_ENV !== "development") return;
+    if (process.env.NEXT_PUBLIC_REACT_GRAB !== "1") return;
 
     let cancelled = false;
     void (async () => {

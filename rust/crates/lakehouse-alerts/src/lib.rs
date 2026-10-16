@@ -343,6 +343,13 @@ pub struct AlertRule {
     /// back into `None` on read).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pipeline: Option<String>,
+    /// `BI-2`: the name of the saved metric a threshold alert watches, in
+    /// place of `mart`, `measure` and `agg`. The metric is read through the
+    /// same builder path as a KPI tile, with the fixed viewer role every rule
+    /// is evaluated with (a rule has no owner), not with its author's access.
+    /// `None` for a rule that watches a column.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub metric: Option<String>,
     /// Connector id (or `"*"`) for the `connector_*` kinds, and `"*"` for
     /// `upload_failure` (`SRC-7`). `None` for every other kind; the column
     /// stores the empty string then, like `pipeline`.
@@ -413,6 +420,9 @@ pub struct AlertRuleInput {
     /// [`AlertKind::PipelineFailure`] rules. Required for that kind, not
     /// read for any other.
     pub pipeline: Option<String>,
+    /// `BI-2`: the metric a threshold alert watches, by name. When present
+    /// (and not blank) `mart`, `measure` and `agg` are not read.
+    pub metric: Option<String>,
     /// Connector id (or `"*"`) for the `connector_*` kinds (`SRC-7`).
     /// Required for them, ignored for `upload_failure` (always stored as
     /// `"*"`) and for every other kind.
@@ -439,6 +449,8 @@ struct NormalizedRule {
     /// string for every other kind (matches the `mart`/`board`/
     /// `severity` "empty means absent" convention on this table).
     pipeline: String,
+    /// `BI-2`: the watched metric's name; empty for any rule that watches a column.
+    metric: String,
     /// Connector id or `"*"` for the `SRC-7` kinds; empty for every other
     /// kind.
     connector: String,
@@ -547,6 +559,37 @@ fn normalize_alert(
     input: &AlertRuleInput,
     common: NormalizedCommon,
 ) -> Result<NormalizedRule, AlertError> {
+    // BI-2: a rule that watches a metric reads no mart, measure or aggregate.
+    let metric = input.metric.as_deref().map_or("", str::trim);
+    if !metric.is_empty() {
+        let threshold = input.threshold.unwrap_or(0.0);
+        if Ident::new(metric).is_err() {
+            return Err(AlertError::Validation("invalid metric.".to_owned()));
+        }
+        if !threshold.is_finite() {
+            return Err(AlertError::Validation("invalid threshold.".to_owned()));
+        }
+        return Ok(NormalizedRule {
+            name: common.name,
+            kind: common.kind,
+            channel: common.channel,
+            target: common.target,
+            mart: String::new(),
+            measure: String::new(),
+            agg: default_agg(),
+            op: input
+                .op
+                .as_deref()
+                .and_then(AlertOp::parse_exact)
+                .unwrap_or(AlertOp::Gt),
+            threshold,
+            board: String::new(),
+            severity: common.severity,
+            metric: metric.to_owned(),
+            pipeline: String::new(),
+            connector: String::new(),
+        });
+    }
     let raw_mart = input.mart.as_deref().unwrap_or("");
     let mart = raw_mart
         .strip_prefix("serving.")
@@ -581,6 +624,7 @@ fn normalize_alert(
         threshold,
         board: String::new(),
         severity: common.severity,
+        metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
     })
@@ -629,6 +673,7 @@ fn normalize_freshness(
         threshold: 0.0,
         board: String::new(),
         severity: common.severity,
+        metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
     })
@@ -658,6 +703,7 @@ fn normalize_pipeline_failure(
         threshold: 0.0,
         board: String::new(),
         severity: common.severity,
+        metric: String::new(),
         pipeline: raw,
         connector: String::new(),
     })
@@ -685,6 +731,7 @@ fn normalize_pipeline_scoped(
         threshold: 0.0,
         board: String::new(),
         severity: common.severity,
+        metric: String::new(),
         pipeline: raw,
         connector: String::new(),
     })
@@ -777,6 +824,7 @@ fn normalize_connector_scoped(
         threshold: 0.0,
         board: String::new(),
         severity: common.severity,
+        metric: String::new(),
         pipeline: String::new(),
         connector,
     })
@@ -805,6 +853,7 @@ fn normalize_digest(
         threshold: 0.0,
         board,
         severity: common.severity,
+        metric: String::new(),
         pipeline: String::new(),
         connector: String::new(),
     })
@@ -876,6 +925,12 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // BI-2: the metric a threshold alert watches; same additive convention.
+    ch.exec(
+        "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS metric String DEFAULT ''",
+        None,
+    )
+    .await?;
     // `SRC-7`: the `connector` column carries a connector id or "*" for the
     // `connector_*` kinds and "*" for `upload_failure`. Additive, like
     // `pipeline` above; existing rows read back as `None`.
@@ -887,7 +942,7 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,connector";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline,metric,connector";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -957,6 +1012,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         created_at: non_empty(row_str(row, "created_at")),
         severity: non_empty(row_str(row, "severity")),
         pipeline: non_empty(row_str(row, "pipeline")),
+        metric: non_empty(row_str(row, "metric")),
         connector: non_empty(row_str(row, "connector")),
     }
 }
@@ -1021,6 +1077,18 @@ pub async fn save_rule(
             .await
             .map_err(|err| AlertError::Validation(err.to_string()))?;
     }
+    // BI-2: a rule can only watch a metric that exists.
+    if !normalized.metric.is_empty() {
+        let known = lakehouse_bi::metrics::list_metrics(ch)
+            .await?
+            .iter()
+            .any(|m| m.name == normalized.metric);
+        if !known {
+            return Err(AlertError::Validation(
+                "no metric has that name.".to_owned(),
+            ));
+        }
+    }
     let rid = id.map_or_else(new_rule_id, str::to_owned);
     let enabled: u8 = u8::from(input.enabled != Some(false));
     let threshold = normalized.threshold;
@@ -1031,7 +1099,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,connector) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline,metric,connector) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -1044,6 +1112,7 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.target.as_str()),
         SqlLiteral::from(normalized.severity.as_deref().unwrap_or("")),
         SqlLiteral::from(normalized.pipeline.as_str()),
+        SqlLiteral::from(normalized.metric.as_str()),
         SqlLiteral::from(normalized.connector.as_str()),
     );
     ch.exec(&sql, None).await?;
@@ -1159,6 +1228,90 @@ async fn current_value(
     Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
 }
 
+/// `BI-2`: the current value of the metric `name`, read through the very
+/// builder path a KPI tile on the metric uses (`lakehouse_bi::metrics::value_chart`)
+/// and the same gate every rule's statement goes through (the fixed viewer
+/// role: a rule has no owner, so a metric alert is evaluated with that role,
+/// never with its author's access).
+///
+/// Every way this can fail is a fixed sentence and the rule is recorded as
+/// skipped with it, so a rule whose metric is gone or cannot be evaluated is
+/// neither fired nor silently treated as fine, and no engine text is kept.
+async fn metric_value(ch: &ChClient, gate: &dyn SqlGate, name: &str) -> Result<f64, AlertError> {
+    use lakehouse_bi::builder::ReadContext;
+    use lakehouse_bi::fields::{FieldCatalog, SourceKind};
+    use lakehouse_bi::metrics::{ValueQuery, value_chart};
+    let fail = |reason: &str| AlertError::Validation(reason.to_owned());
+    let Ok(all) = lakehouse_bi::metrics::list_metrics(ch).await else {
+        return Err(fail("the metric could not be read."));
+    };
+    let Some(def) = all.into_iter().find(|m| m.name == name) else {
+        return Err(fail("the metric no longer exists."));
+    };
+    let unavailable = || fail("the metric's source is not available.");
+    let (cols, source) = match def.source_kind {
+        SourceKind::Mart => {
+            let Ok(cols) = lakehouse_bi::store::validated_mart_columns(ch, &def.source_id).await
+            else {
+                return Err(unavailable());
+            };
+            (cols, None)
+        }
+        SourceKind::SqlSource => {
+            let Ok(Some(src)) = lakehouse_bi::sources::get_source(ch, &def.source_id).await else {
+                return Err(unavailable());
+            };
+            (src.column_kinds(), Some(src))
+        }
+    };
+    let Ok(fields) =
+        lakehouse_bi::fields::list_catalog_fields_for(ch, def.source_kind, &def.source_id).await
+    else {
+        return Err(fail("the metric could not be read."));
+    };
+    let catalog = FieldCatalog::from_fields(fields);
+    let time = lakehouse_bi::grain::TimeContext::default();
+    let read = ReadContext {
+        time: &time,
+        grain: None,
+        fields: &catalog,
+    };
+    let chart = value_chart(&ValueQuery {
+        metric: &def.name,
+        source_kind: def.source_kind,
+        source_id: &def.source_id,
+        group_by: None,
+        grain: None,
+        filters: Vec::new(),
+    });
+    if catalog.broken_reference(&chart.def, &cols, &time) {
+        return Err(fail("the metric no longer checks out."));
+    }
+    let sql = if let Some(src) = &source {
+        lakehouse_bi::builder::sql_for_sql_source_report(
+            &chart,
+            &src.sql,
+            &src.column_kinds(),
+            &[],
+            &[],
+            &read,
+        )
+        .map(|f| f.sql)
+    } else {
+        let marts = std::collections::HashMap::from([(def.source_id.clone(), cols)]);
+        Some(lakehouse_bi::builder::sql_with_filters_report(&chart, &[], &[], &marts, &read).sql)
+    };
+    // A value chart has no stored statement: an empty one is "cannot be built".
+    let Some(sql) = sql.filter(|s| !s.is_empty()) else {
+        return Err(fail("the metric cannot be evaluated."));
+    };
+    let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
+    let Ok(rows) = ch.rows(&sql, None).await else {
+        return Err(fail("the metric could not be read."));
+    };
+    Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
+}
+
 /// `Math.round(n).toLocaleString("id-ID")` — round to the nearest integer,
 /// then group digits with `.` every three places (Indonesian locale
 /// convention). Ports `fmt`.
@@ -1214,7 +1367,7 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         lakehouse_bi::fields::FieldCatalog::default()
     } else {
         lakehouse_bi::fields::FieldCatalog::from_fields(
-            lakehouse_bi::fields::list_fields(ch).await?,
+            lakehouse_bi::fields::list_catalog_fields(ch).await?,
         )
     };
     let time = lakehouse_bi::grain::TimeContext::default();
@@ -2150,9 +2303,19 @@ async fn run_alert(
 ) -> RunResult {
     let mart = rule.mart.as_deref().unwrap_or("");
     let measure = rule.measure.as_deref().unwrap_or("");
-    let value = match current_value(ch, gate, mart, measure, &rule.agg).await {
-        Ok(v) => v,
-        Err(err) => return skipped(rule, err.to_string()),
+    // BI-2: a rule that watches a metric reads the metric, not a column.
+    let value = match rule.metric.as_deref() {
+        Some(metric) => match metric_value(ch, gate, metric).await {
+            Ok(v) => v,
+            Err(AlertError::Validation(reason)) => return skipped(rule, reason),
+            Err(AlertError::Clickhouse(_)) => {
+                return skipped(rule, "the metric could not be read.".to_owned());
+            }
+        },
+        None => match current_value(ch, gate, mart, measure, &rule.agg).await {
+            Ok(v) => v,
+            Err(err) => return skipped(rule, err.to_string()),
+        },
     };
     let fired = compare(value, rule.op, rule.threshold);
     if !fired {
@@ -2166,9 +2329,12 @@ async fn run_alert(
             skipped: None,
         };
     }
+    let watched = rule.metric.as_deref().map_or_else(
+        || format!("{}({measure}) on {mart}", rule.agg),
+        |m| format!("metric {m}"),
+    );
     let text = format!(
-        "{}({measure}) on {mart} = {} {} {} (threshold breached)",
-        rule.agg,
+        "{watched} = {} {} {} (threshold breached)",
         fmt_id_id(value),
         rule.op.as_str(),
         fmt_id_id(rule.threshold),
@@ -3608,6 +3774,7 @@ mod tests {
             created_at: None,
             severity: None,
             pipeline: None,
+            metric: None,
             connector: None,
         }
     }
@@ -3867,6 +4034,163 @@ mod tests {
         let email = no_smtp_email_sender();
         let delivered = deliver_unless_silenced(&http, &email, None, &rule, "title", "text").await;
         assert!(delivered.is_some());
+    }
+
+    // ── BI-2: a rule that watches a metric ──────────────────────────────
+
+    #[test]
+    fn a_rule_that_watches_a_metric_needs_no_mart_measure_or_aggregate() {
+        let normalized = normalize_input(&AlertRuleInput {
+            metric: Some(" total_visitors ".to_owned()),
+            mart: None,
+            measure: None,
+            op: Some(">".to_owned()),
+            threshold: Some(100_000.0),
+            ..valid_alert_input()
+        })
+        .unwrap();
+        assert_eq!(normalized.metric, "total_visitors");
+        assert_eq!(
+            (normalized.mart.as_str(), normalized.measure.as_str()),
+            ("", "")
+        );
+        assert_eq!(normalized.threshold, 100_000.0);
+        for bad in ["bad name", "x;DROP", "1abc"] {
+            let err = normalize_input(&AlertRuleInput {
+                metric: Some(bad.to_owned()),
+                ..valid_alert_input()
+            })
+            .unwrap_err();
+            assert_eq!(err.to_string(), "invalid metric.", "{bad}");
+        }
+        // A blank metric is a rule on a column, as before.
+        let plain = normalize_input(&AlertRuleInput {
+            metric: Some("  ".to_owned()),
+            ..valid_alert_input()
+        })
+        .unwrap();
+        assert_eq!(plain.metric, "");
+    }
+
+    fn metric_rule(metric: &str, op: AlertOp, threshold: f64) -> AlertRule {
+        AlertRule {
+            id: "al_metric".to_owned(),
+            name: "watch".to_owned(),
+            kind: AlertKind::Alert,
+            mart: None,
+            measure: None,
+            agg: "sum".to_owned(),
+            op,
+            threshold,
+            board: None,
+            channel: AlertChannel::Webhook,
+            target: "http://hooks.test/x".to_owned(),
+            enabled: true,
+            created_at: None,
+            severity: None,
+            pipeline: None,
+            metric: Some(metric.to_owned()),
+            connector: None,
+        }
+    }
+
+    struct EverythingSilenced;
+    #[async_trait::async_trait]
+    impl SilenceSource for EverythingSilenced {
+        async fn is_silenced(&self, _rule_id: &str) -> bool {
+            true
+        }
+    }
+
+    /// A metric that does not exist (or whose store cannot be read) makes the
+    /// rule's evaluation fail with a fixed reason: it is neither fired nor
+    /// reported as a value that did not breach.
+    #[tokio::test]
+    async fn a_metric_that_is_gone_makes_the_rule_skip_with_a_fixed_reason_and_never_fire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
+        let email = no_smtp_email_sender();
+        let rule = metric_rule("gone", AlertOp::Gt, 0.0);
+        let result = run_one(&ch, &http, &email, None, None, &RewriteGate, &rule).await;
+        assert!(!result.fired);
+        assert_eq!(result.value, None);
+        assert_eq!(
+            result.skipped.as_deref(),
+            Some("the metric no longer exists.")
+        );
+        // A store that cannot be read says so, without any engine text.
+        let down = ChClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            "default".to_owned(),
+            String::new(),
+        );
+        let result = run_one(&down, &http, &email, None, None, &RewriteGate, &rule).await;
+        assert!(!result.fired);
+        assert_eq!(
+            result.skipped.as_deref(),
+            Some("the metric could not be read.")
+        );
+    }
+
+    struct PassGate;
+    #[async_trait::async_trait]
+    impl SqlGate for PassGate {
+        async fn gate(&self, sql: &str) -> Result<String, String> {
+            Ok(sql.to_owned())
+        }
+    }
+
+    /// Against the dev engine: the metric `total_visitors_demo` (`Sum([visitors])`
+    /// on `serving.mart_demo_map_points`, 278,955) must already exist in
+    /// `console.bi_metric`. Read-only; the rule is silenced so nothing is
+    /// delivered. Run by hand with `LAYER_ENGINE_URL`, `LAYER_ENGINE_USER`,
+    /// `LAYER_ENGINE_PASSWORD` and `-- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "needs the dev engine and the demo metric; see the doc comment"]
+    async fn a_rule_on_the_demo_metric_fires_above_its_value_and_not_below_it() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let ch = ChClient::new(
+            var("LAYER_ENGINE_URL"),
+            var("LAYER_ENGINE_USER"),
+            var("LAYER_ENGINE_PASSWORD"),
+        );
+        let http = WebhookSender::new(std::sync::Arc::new(RefuseAll));
+        let email = no_smtp_email_sender();
+        let silence = EverythingSilenced;
+        for (op, threshold, expect_fired) in [
+            (AlertOp::Gt, 100_000.0, true),
+            (AlertOp::Lt, 100_000.0, false),
+            (AlertOp::Ge, 278_955.0, true),
+            (AlertOp::Gt, 278_955.0, false),
+        ] {
+            let rule = metric_rule("total_visitors_demo", op, threshold);
+            let r = run_one(&ch, &http, &email, None, Some(&silence), &PassGate, &rule).await;
+            eprintln!(
+                "RULE total_visitors_demo {} {threshold} -> fired {} value {:?} skipped {:?}",
+                op.as_str(),
+                r.fired,
+                r.value,
+                r.skipped
+            );
+            assert_eq!(r.skipped, None);
+            assert_eq!(r.value, Some(278_955.0));
+            assert_eq!(r.fired, expect_fired);
+        }
+        let gone = metric_rule("no_such_metric_here", AlertOp::Gt, 0.0);
+        let r = run_one(&ch, &http, &email, None, Some(&silence), &PassGate, &gone).await;
+        eprintln!(
+            "RULE no_such_metric_here -> fired {} skipped {:?}",
+            r.fired, r.skipped
+        );
+        assert!(!r.fired && r.skipped.as_deref() == Some("the metric no longer exists."));
     }
 
     // ── SRC-7: connector and upload kinds ───────────────────────────────

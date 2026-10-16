@@ -105,7 +105,8 @@ pub enum RelativeAnchor {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterDef {
-    /// The column to filter on.
+    /// The column to filter on. Empty for a reference to a segment.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub column: String,
     /// Values for `in` / `not_in`. Always serialized, as before BI-18.
     #[serde(default)]
@@ -144,6 +145,13 @@ pub struct FilterDef {
     /// SQL, so public and embed views (which use the default) are unaffected.
     #[serde(default, skip_serializing_if = "is_false")]
     pub required: bool,
+    /// `BI-2`: a reference to a saved segment, `{ "segment": <name> }`, in a
+    /// chart's own filters or a metric's. It stands for the segment's filters
+    /// and is expanded before any predicate is built
+    /// ([`crate::metrics::expand_segments`]); a reference that is not expanded
+    /// has no column and so never becomes a predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<String>,
 }
 
 #[allow(
@@ -172,6 +180,16 @@ impl FilterDef {
             min_exclusive: false,
             max_exclusive: false,
             required: false,
+            segment: None,
+        }
+    }
+
+    /// A reference to the segment called `name`.
+    #[must_use]
+    pub fn segment_ref(name: impl Into<String>) -> Self {
+        Self {
+            segment: Some(name.into()),
+            ..Self::in_values(String::new(), Vec::new())
         }
     }
 
@@ -181,6 +199,9 @@ impl FilterDef {
     /// they never reach SQL and are not reported as skipped.
     #[must_use]
     pub fn is_active(&self) -> bool {
+        if self.segment.is_some() {
+            return true;
+        }
         match self.op {
             FilterOp::In | FilterOp::NotIn => !self.values.is_empty(),
             FilterOp::Between => self.min.is_some() || self.max.is_some(),
@@ -201,6 +222,13 @@ impl FilterDef {
     /// A message for the caller, naming what is wrong. It never echoes the
     /// offending value.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.segment {
+            // A reference carries nothing but the name.
+            if Ident::new(name.clone()).is_err() || !self.column.is_empty() {
+                return Err("a segment is referred to by its name alone".to_owned());
+            }
+            return Ok(());
+        }
         if Ident::new(self.column.clone()).is_err() {
             return Err("the column name is not a valid identifier".to_owned());
         }

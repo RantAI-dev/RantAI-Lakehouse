@@ -51,6 +51,12 @@ export type AlertRule = {
   type: AlertRuleKind
   mart?: string
   measure?: string
+  /**
+   * BI-2: the name of a metric this rule watches, in place of `mart`, `measure`
+   * and `agg`. It is evaluated with the fixed viewer role every rule uses, not
+   * with its author's access. Omitted when the rule watches a column.
+   */
+  metric?: string
   agg: string
   op: AlertOp
   threshold: number
@@ -88,6 +94,7 @@ export type SaveAlertRuleInput = {
   type?: string
   mart?: string
   measure?: string
+  metric?: string
   agg?: string
   op?: string
   threshold?: number

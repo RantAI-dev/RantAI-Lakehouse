@@ -458,16 +458,17 @@ async fn a_re_point_with_credentials_is_probed_and_saved_together() {
         dial_of(&fx.app.pool, "conn-pg-lakehouse").await["host"],
         host.as_str()
     );
-    let stored = std::fs::read_to_string(
-        fx.secrets
-            .path()
-            .join("connector_managed_conn_pg_lakehouse_password"),
-    )
-    .unwrap();
+    let stored = common::stored_credential(
+        fx.secrets.path(),
+        "connector_managed_conn_pg_lakehouse_password",
+    );
     assert_eq!(stored, password);
 
-    // Audited as a re-point: the slots and whether it was verified, no ref,
-    // no value.
+    // Audited as a re-point: the slots, how each is held, whether it was
+    // verified, no value and no derived name. `sources`, `manager` and
+    // `references` were added by design (`SRC-12 review B3 SHOULD-FIX 1`, ADR
+    // 0002 addendum 6): no manager here and a typed value, so `managed`, null
+    // and empty. The exact comparison is what proves nothing else leaks.
     let args: Value = sqlx::query_scalar(
         "SELECT args FROM audit_event WHERE action = 'connector.repoint' \
          AND resource_id = 'conn-pg-lakehouse'",
@@ -475,7 +476,16 @@ async fn a_re_point_with_credentials_is_probed_and_saved_together() {
     .fetch_one(&fx.app.pool)
     .await
     .expect("one connector.repoint audit event");
-    assert_eq!(args, json!({ "slots": ["primary"], "verified": true }));
+    assert_eq!(
+        args,
+        json!({
+            "slots": ["primary"],
+            "sources": ["managed"],
+            "references": [],
+            "manager": null,
+            "verified": true
+        })
+    );
     assert!(!args.to_string().contains(&password));
 }
 

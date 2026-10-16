@@ -140,6 +140,13 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
       header: "Condition / Board",
       cell: ({ row }) => {
         const r = row.original
+        if (r.type === "alert" && r.metric) {
+          return (
+            <span className="font-mono text-xs text-muted-foreground">
+              metric {r.metric} {r.op} {r.threshold}
+            </span>
+          )
+        }
         // A load rule has no mart, measure or board: its scope is the next column.
         if (isLoadAlertKind(r.type)) {
           return <span className="text-sm text-muted-foreground">—</span>

@@ -124,6 +124,7 @@ pub fn resource_for(
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
             (Some("calculated_field"), str_field("id"))
         }
+        "create_metric" | "update_metric" | "delete_metric" => (Some("metric"), str_field("id")),
         "trigger_lakehouse_build" | "run_bronze_maintenance" => {
             (Some("pipeline"), str_field("runId"))
         }

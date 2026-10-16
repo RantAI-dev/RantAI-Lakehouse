@@ -14,6 +14,7 @@
  */
 
 import { toBoxplot } from "@/lib/chart-transforms"
+import type { BinInfo } from "@/lib/chart-bins"
 import type { Grain } from "@/lib/time-grain"
 import type { ChartKind, ChartSource } from "@/lib/dashboard-specs"
 
@@ -27,6 +28,8 @@ export type ChartHit = {
   seriesType?: string
   /** Sankey: "node" or "edge". */
   dataType?: string
+  /** The series the mark belongs to (BI-13: which question of a combined chart). */
+  seriesIndex?: number
   /** Sunburst: the path from the root; its length less one is the ring. */
   treePathInfo?: { name: string }[]
 }
@@ -57,7 +60,22 @@ export type ClickContext = {
    */
   grain?: Grain
   labelledRows?: Row[]
+  /** BI-6: the labels of the computed "Other" groups; a click on one names no value. */
+  otherLabels?: ReadonlySet<string>
+  /**
+   * BI-10: the dimension is binned. `labelledRows` hold the label ("500 – 1,000") and `rows` the
+   * bin's lower edge, so a clicked label is mapped back to the bin it stands for.
+   */
+  bin?: BinInfo
+  /**
+   * BI-13: the mark belongs to one of the chart's other questions, not to the chart's own. The value
+   * is then one of that question's dimension, and the rows to list are from its own source.
+   */
+  layer?: LayerClick
 }
+
+/** The question of a combined chart that a click was on. */
+export type LayerClick = { index: number; mart: string; sqlSource?: string; dimension: string }
 
 export type ChartClickHandler = (hit: ChartHit, pos: { x: number; y: number }, ctx: ClickContext) => void
 
@@ -67,8 +85,10 @@ export type DrillValue = {
   value: string
   /** Set when `value` is a bucket of a grouped chart (BI-9). */
   grain?: Grain
-  /** The label the person clicked ("Mar 2026"). */
+  /** The label the person clicked ("Mar 2026", "500 – 1,000"). */
   label?: string
+  /** Set when `value` is the lower edge of a bin of a binned chart (BI-10). */
+  bin?: BinInfo
 }
 
 /**
@@ -116,6 +136,8 @@ function sankeyNode(name: string): { side: "a" | "b"; value: string } | null {
  */
 export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = {}): DrillValue | null {
   if (!canDrill(spec)) return null
+  // BI-6: the computed "Other" group is not one stored value, so it has no rows to list.
+  if (ctx.otherLabels?.has(hit.name)) return null
   const column = spec.dimension ?? ""
   const named = (value: string, col = column): DrillValue | null => (value !== "" && col !== "" ? { column: col, value } : null)
 
@@ -158,8 +180,17 @@ export function drillTarget(spec: ClickSpec, hit: ChartHit, ctx: ClickContext = 
       return typeof index === "number" && index >= 0 && index < categories.length ? named(categories[index]) : null
     }
     default:
+      if (ctx.bin) return binTarget(column, ctx.bin, hit.name, ctx)
       return ctx.grain ? bucketTarget(column, ctx.grain, hit.name, ctx) : named(hit.name)
   }
+}
+
+/** A clicked axis label of a binned chart → the bin's lower edge; null for the empty bin or a label no row has. */
+function binTarget(column: string, bin: BinInfo, label: string, ctx: ClickContext): DrillValue | null {
+  const index = (ctx.labelledRows ?? []).findIndex((r) => String(r[column] ?? "") === label)
+  const raw = index >= 0 ? ctx.rows?.[index]?.[column] : undefined
+  if (raw === null || raw === undefined || raw === "" || !Number.isFinite(Number(raw))) return null
+  return { column, value: String(raw), label, bin }
 }
 
 /** A clicked axis label of a grouped chart → the bucket it stands for; null for the empty bucket or a label no row has. */

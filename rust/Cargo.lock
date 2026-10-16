@@ -2622,6 +2622,7 @@ dependencies = [
 name = "lakehouse-api"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arrow-array",
  "arrow-schema",
@@ -2631,6 +2632,8 @@ dependencies = [
  "calamine",
  "chrono",
  "croner",
+ "futures",
+ "hmac 0.13.0",
  "iceberg",
  "ipnet",
  "jsonwebtoken",

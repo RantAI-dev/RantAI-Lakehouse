@@ -7,6 +7,7 @@ import {
   alertRuleFormFields,
   alertRuleSaveInput,
   connectorForKind,
+  isMetricRule,
   seesEveryTenant,
 } from "./alerts-page"
 import { ruleKindLabel, ruleScope } from "./rules-columns"
@@ -62,9 +63,24 @@ describe("alertRuleFormFields", () => {
   })
 })
 
+describe("a rule that watches a metric (BI-2)", () => {
+  it("is a metric rule as soon as it has a metric field, even before one is picked, and not otherwise", () => {
+    expect(isMetricRule({ metric: "" })).toBe(true)
+    expect(isMetricRule({ metric: "total_visitors" })).toBe(true)
+    expect(isMetricRule({})).toBe(false)
+    expect(isMetricRule({ metric: undefined })).toBe(false)
+  })
+
+  it("still shows the condition fields of an alert rule, which hold the metric choice", () => {
+    expect(alertRuleFormFields("alert").martMeasure).toBe(true)
+  })
+})
+
 const NONE = { martMeasure: false, board: false, freshnessTarget: false }
-const NOT_RAISED_SRC11 =
-  "Nothing raises this yet. It starts working when automatic pausing (SRC-11) is installed."
+// SRC-11 D3: the disabled kind used to pin "Nothing raises this yet..." which became false once automatic
+// pausing landed; it now pins the true sentence.
+const RAISED_BY_AUTO_DISABLE =
+  "Raised once when a connector fails runs in a row (30 by default) and is paused. Resume it from its page."
 // SRC-17 D-c: this constant used to pin "Nothing raises this yet..." for the
 // schema change kind, which was false once SRC-8 landed (it raises the kind).
 // It now pins the true sentence; the disabled kind's sentence is unchanged.
@@ -95,8 +111,8 @@ describe("alertRuleFormFields for connector and upload rules", () => {
     })
   })
 
-  it("says the disabled kind is not raised yet, and that schema changes raise the schema change kind", () => {
-    expect(alertRuleFormFields("connector_disabled").note).toBe(NOT_RAISED_SRC11)
+  it("says automatic pausing raises the disabled kind, and that schema changes raise the schema change kind", () => {
+    expect(alertRuleFormFields("connector_disabled").note).toBe(RAISED_BY_AUTO_DISABLE)
     expect(alertRuleFormFields("connector_schema_change").note).toBe(
       RAISED_BY_SCHEMA_CHANGES
     )

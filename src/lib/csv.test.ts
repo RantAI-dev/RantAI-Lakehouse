@@ -65,3 +65,41 @@ test("toCsv membungkus header yang mengandung koma", () => {
 test("toCsv menghasilkan header saja ketika tidak ada baris", () => {
   assert.equal(toCsv(["a", "b"], []), "a,b")
 })
+
+// SEC-17: the same rule as `needs_apostrophe` in the API's csv_safe.rs.
+
+test("toCsv memberi apostrof pada sel yang diawali karakter rumus", () => {
+  for (const value of ["=1+1", "+cmd", "-cmd", "@SUM(A1)", "\tx"]) {
+    assert.equal(toCsv(["v"], [{ v: value }]), `v\r\n'${value}`)
+  }
+})
+
+test("toCsv memberi apostrof di dalam tanda kutip, bukan di luarnya", () => {
+  assert.equal(
+    toCsv(["v"], [{ v: '=HYPERLINK("http://example.invalid","x")' }]),
+    `v\r\n"'=HYPERLINK(""http://example.invalid"",""x"")"`
+  )
+  assert.equal(toCsv(["v"], [{ v: "\rx" }]), 'v\r\n"\'\rx"')
+})
+
+test("toCsv membiarkan angka polos tetap angka", () => {
+  for (const value of ["-5", "+3.2e4", ".5", "-.5", "5.", "-0.0", "-1.5E-3"]) {
+    assert.equal(toCsv(["v"], [{ v: value }]), `v\r\n${value}`)
+  }
+})
+
+test("toCsv memberi apostrof pada sel yang hanya mirip angka", () => {
+  for (const value of ["-1+1", "-", "+", "-.", "-5e", "--5", "-5 ", "-5\n"]) {
+    const csv = toCsv(["v"], [{ v: value }])
+    assert.ok(csv.startsWith("v\r\n") && csv.slice(3).includes(`'${value}`), value)
+  }
+})
+
+test("toCsv membiarkan sel biasa dan sel kosong", () => {
+  assert.equal(toCsv(["a", "b", "c"], [{ a: "a=b", b: "x-y", c: "" }]), "a,b,c\r\na=b,x-y,")
+})
+
+test("toCsv memperlakukan header seperti sel lain", () => {
+  assert.equal(toCsv(["=total", "@x"], []), "'=total,'@x")
+})
+

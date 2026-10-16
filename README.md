@@ -106,7 +106,10 @@ bun install
 #    default credentials. docker-compose.yml refuses to start while
 #    POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY or
 #    LAKEKEEPER_ENCRYPTION_KEY is empty, and `cp .env.example .env` alone
-#    does not start the stack. This writes a `.env` with generated values
+#    does not start the stack. SRC-12: CONNECTOR_SECRETS_KEY, the key
+#    stored connector credentials are encrypted with, is generated too.
+#    Keep it: without it, every stored credential has to be entered
+#    again (docs/OPERATIONS.md). This writes a `.env` with generated values
 #    (and refuses to overwrite an existing one):
 sh ops/init-env.sh
 $EDITOR .env    # set AUTH_BOOTSTRAP_EMAIL; see .env.example and the
@@ -132,7 +135,7 @@ no admin account is created and you'll need to seed one directly in
 Postgres.
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for what's in/out of the
-compose stack, what `/health` actually checks, the Postgres backup/restore
+compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
 being down fails quietly, not loudly).
 

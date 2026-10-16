@@ -17,6 +17,14 @@ const nextConfig: NextConfig = {
     // value here cuts uploads the API would take, and a larger one buys
     // nothing because the API refuses the excess itself.
     proxyClientMaxBodySize: 51 * 1024 * 1024,
+    // Next.js's /api proxy gives up on an upstream that has not answered in 30
+    // seconds (`proxyTimeout`, 30000 ms by default, in next's `proxy-request.js`).
+    // `SRC-13` decision D9 lets a table listing take up to 120 seconds (a schema of
+    // 10,000 tables) and the API's route timeout for the two discovery paths is 130
+    // (`DISCOVERY_REQUEST_TIMEOUT` in `rust/crates/lakehouse-api/src/routes/mod.rs`), so with the
+    // default the console would report a failure for a listing the API was still
+    // answering. Keep this equal to that route timeout.
+    proxyTimeout: 130_000,
   },
 
   // Proxy /api/* to the Rust backend service. Browser URLs stay the same;
