@@ -6,12 +6,12 @@
 | Backlog | `DATA-18` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-18.md` (one *(proposed)* number: the 10,000-row sample, decision 1) |
-| Status | Planned |
+| Status | Building (#186) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
 | Plan | `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md` (Phase 3 master plan, slice 3) |
-| Started | |
+| Started | 2026-10-16; also in `BACKLOG.md` Dates |
 | Shipped | |
 | Evidence | |
 

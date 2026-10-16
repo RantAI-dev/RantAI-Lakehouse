@@ -6,7 +6,7 @@
 | Backlog | `DATA-17` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-17.md` (no *(proposed)* number; the 2 GB figure ships only once measured, decision 3) |
-| Status | Building (Excel and Parquet merged in #76; the rest is planned) |
+| Status | Building (Excel and Parquet merged in #76; the rest in #186) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
