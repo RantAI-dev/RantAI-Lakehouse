@@ -1,0 +1,156 @@
+# ops/sso/docker-compose.keycloak.override.yml -- SEC-3 (decision D1): the
+# Keycloak the automated single-sign-on gate signs in through. Keycloak runs
+# HERE and only here: the default docker-compose.yml (no `-f` pointing at this
+# file) never starts it, so a real `docker compose up` is unchanged by it.
+#
+# Why Keycloak, and why a gate-only override (E1): `ops/oidc-mock` says of
+# itself that it is not a real identity provider, so the issuer string, where
+# the signing keys are published, which claim carries the groups, and how a
+# group arrives (a name, or an opaque id) were exactly the parts no gate
+# exercised. Keycloak is a real, Apache-2.0 OIDC server. It is started in
+# development mode (`start-dev`, below), which is acceptable for a gate: it
+# enables plain HTTP and an in-container H2 database, and nothing here is a
+# deployment.
+#
+# Image: `quay.io/keycloak/keycloak:26.8.1`, pinned by tag AND digest. The
+# digest was read from the Quay registry API
+# (`https://quay.io/api/v1/repository/keycloak/keycloak/tag/?specificTag=26.8.1`,
+# the `manifest_digest` field) on 2026-10-16. Amendment of this file without a
+# new digest is a review finding.
+#
+# No literal password or client secret is in this file, nor in
+# `ops/sso/realm.template.json` (E2, `AGENTS.md` rule 5): the caller generates
+# them into `.env` at run time, `keycloak-realm-init` renders the generated
+# client secret and the two test users' passwords into the realm Keycloak
+# imports, and every `${VAR:?}` below fails closed when one is missing.
+# `.env` is gitignored (`.gitignore`), so gitleaks stays clean.
+#
+# Nothing here publishes a host port. The gate runs INSIDE the compose network
+# as `sso-test-runner`, and Keycloak's issuer is fixed to the in-network
+# address `http://keycloak:8080` (KC_HOSTNAME) so `iss` is stable and exact --
+# the API requires `iss` to equal `OIDC_ISSUER` byte for byte.
+volumes:
+  # The rendered realm file `keycloak-realm-init` writes and `keycloak` reads
+  # (read-only) through `--import-realm`. A named volume, not a host bind: the
+  # rendered file carries the generated client secret, so it must not land in
+  # the checkout (`git status` stays clean, rule 11).
+  keycloak_realm_import:
+
+services:
+  # ── keycloak-realm-init ────────────────────────────────────────────────
+  # One-shot (CODE-STANDARD §6): renders `realm.template.json` into
+  # `lakehouse-realm.json` in the shared volume, injecting the run's generated
+  # secret. Idempotent -- it overwrites its own output -- so a re-run of the
+  # gate against the same volume is safe.
+  keycloak-realm-init:
+    profiles: ["sso"]
+    image: python:3.12-slim
+    restart: "no"
+    working_dir: /template
+    volumes:
+      - ./ops/sso:/template:ro
+      - type: volume
+        source: keycloak_realm_import
+        target: /import
+    environment:
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET is required for the SEC-3 gate}
+      SSO_USER_A_PASSWORD: ${SSO_USER_A_PASSWORD:?}
+      SSO_USER_B_PASSWORD: ${SSO_USER_B_PASSWORD:?}
+    entrypoint: ["python3", "/template/render_realm.py"]
+
+  # ── keycloak ───────────────────────────────────────────────────────────
+  # The real OIDC provider under test. `--import-realm` imports the realm
+  # rendered above exactly once, on the first start against a fresh
+  # (in-container, ephemeral H2) database. The gate always runs against a
+  # fresh project (`down -v`), so the import always happens; a re-used
+  # container would skip it (Keycloak does not overwrite an existing realm),
+  # which is why the T2 run and CI both start clean.
+  keycloak:
+    profiles: ["sso"]
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
+    restart: "no"
+    command: ["start-dev", "--import-realm"]
+    environment:
+      # Gate-only bootstrap admin, generated at run time. The gate never opens
+      # the admin console (it drives the login form and the token endpoint);
+      # this exists only so `start-dev` has a defined admin instead of printing
+      # a one-time setup URL. Username is not a secret; the password is.
+      KC_BOOTSTRAP_ADMIN_USERNAME: temp-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?}
+      # The issuer every token carries, and the address both the API and the
+      # gate resolve inside the network.
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HTTP_ENABLED: "true"
+    volumes:
+      - type: volume
+        source: keycloak_realm_import
+        target: /opt/keycloak/data/import
+        read_only: true
+    depends_on:
+      keycloak-realm-init:
+        condition: service_completed_successfully
+
+  # ── lakehouse-api (SEC-3 gate values) ──────────────────────────────────
+  # Only the OIDC_* keys differ from the base file, and only under this `-f`.
+  # No `depends_on` on Keycloak is added on purpose: the API needs no IdP to
+  # boot (it fetches JWKS lazily on the first login), so the gate -- not the
+  # API's boot -- waits for Keycloak (see `ops/g10/g10_sso_test.py`).
+  lakehouse-api:
+    environment:
+      OIDC_ISSUER: http://keycloak:8080/realms/lakehouse
+      OIDC_CLIENT_ID: lakehouse
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?}
+      OIDC_PROVIDER_NAME: keycloak
+      # Not `{issuer}/.well-known/jwks.json`: Keycloak publishes its keys at
+      # the discovery `jwks_uri`, `.../protocol/openid-connect/certs`.
+      OIDC_JWKS_URL: http://keycloak:8080/realms/lakehouse/protocol/openid-connect/certs
+      OIDC_AUTHORIZE_URL: http://keycloak:8080/realms/lakehouse/protocol/openid-connect/auth
+      OIDC_TOKEN_URL: http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token
+      OIDC_REDIRECT_URI: http://lakehouse-api:8080/api/auth/oidc/callback
+      # First login provisions the user: the realm's users have no
+      # pre-existing `auth_identity` row in the API's database.
+      OIDC_JIT_PROVISIONING: "true"
+      # The realm's group-membership mapper runs with `full.path=false`, so the
+      # `groups` claim carries bare group names and `analysts` maps to the
+      # seeded `Analyst` role.
+      OIDC_ROLE_MAP: analysts=Analyst
+      OIDC_GROUPS_CLAIM: groups
+      # The expired-token step is deterministic only with no grace window, so a
+      # token past its `exp` is refused the instant it is.
+      OIDC_CLOCK_SKEW_SECONDS: "0"
+
+  # ── sso-test-runner ────────────────────────────────────────────────────
+  # `ops/g10/g10_sso_test.py`, the SEC-3 gate (E3). Runs in-network like every
+  # other `g*-test-runner`; `requests` is installed in the command because the
+  # stock python image has no HTTP client (same as `g4-test-runner`).
+  sso-test-runner:
+    profiles: ["sso"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g10:/work
+      - ./ops/gates:/opt/gates:ro
+    environment:
+      API_URL: http://lakehouse-api:8080
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: lakehouse
+      OIDC_CLIENT_ID: lakehouse
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?}
+      SSO_USER_A: alice
+      SSO_USER_A_PASSWORD: ${SSO_USER_A_PASSWORD:?}
+      SSO_USER_B: bob
+      SSO_USER_B_PASSWORD: ${SSO_USER_B_PASSWORD:?}
+      WRONG_AUD_CLIENT_ID: lakehouse-wrongaud
+      EXPIRED_CLIENT_ID: lakehouse-expired
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      keycloak:
+        condition: service_started
+      keycloak-realm-init:
+        condition: service_completed_successfully
+      lakehouse-api:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python g10_sso_test.py"]
+    restart: "no"
