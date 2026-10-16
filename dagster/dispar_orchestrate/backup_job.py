@@ -32,6 +32,26 @@ Read access to the warehouse uses dedicated read-only credentials
 never the backup bucket's pair (the backup bucket stays write-only for
 warehouse credentials and vice versa).
 
+# ClickHouse's own databases (OPS-7 E3)
+
+`ClickHouse` holds state the catalog does not: ingest runs, change-capture
+offsets, and the slot bookkeeping under `bronze_meta`. Its non-system,
+non-catalog databases are backed up with `BACKUP DATABASE <db> TO S3(...)`
+into `<BACKUP_S3_BUCKET>/clickhouse/<timestamp>/<db>/`. The
+`DataLakeCatalog`-engine databases (`icecat_*`) are views onto the Iceberg
+catalog, not data, and are recreated by `clickhouse-iceberg-init`, so they
+are skipped rather than copied.
+
+Measured on the pinned image (`clickhouse/clickhouse-server:26.8`, version
+26.8.10.6) before this was written, because the statement carries the
+destination's credentials in its body: `system.query_log` records the
+`BACKUP` statement with the secret access key replaced by `[HIDDEN]`, and
+the server log contains neither credential. What ClickHouse DOES return
+verbatim is the failed query itself -- a refused `BACKUP` answered with the
+whole statement, credentials included, in its response body. This module
+therefore never puts an upstream response body in a `Failure` message: the
+HTTP status code is the only thing it reports (E5).
+
 # Invocation: the `backups` compose profile, not an automatic Dagster schedule
 
 This module is invoked as `python -m dispar_orchestrate.backup_job` by the
@@ -52,17 +72,22 @@ This job resolves them via `resolve_secret_ref`.
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import quote
 
+import requests
 from dagster import Failure
 from s3fs import S3FileSystem
+
+from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _sql_string_literal
 
 logger = logging.getLogger("backup_job")
 
@@ -108,6 +133,11 @@ class BackupConfig:
     warehouse_bucket: str
     warehouse_access_key: str
     warehouse_secret_key: str
+    # `bronze_catalog.ClickHouseTarget` owns the `CH_URL`/`CH_USER`/
+    # `CH_PASSWORD` convention every Dagster job and the API already read,
+    # so this job reads them through it rather than a fourth copy.
+    ch: ClickHouseTarget
+    ch_timeout_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "BackupConfig":
@@ -150,6 +180,8 @@ class BackupConfig:
             warehouse_bucket=wh_bucket,
             warehouse_access_key=resolve_secret_ref(wh_access_ref),
             warehouse_secret_key=resolve_secret_ref(wh_secret_ref),
+            ch=ClickHouseTarget.from_env(),
+            ch_timeout_seconds=int(os.environ.get("CH_BACKUP_TIMEOUT_SECONDS", "300")),
         )
 
 
@@ -244,6 +276,182 @@ def mirror_warehouse(
     )
 
 
+# ClickHouse's own databases (E3). Three exclusions, each for its own
+# reason: `system` and the two `INFORMATION_SCHEMA` spellings belong to
+# the server and are never a user's to restore; a `DataLakeCatalog`
+# database (`icecat_*`, created by `clickhouse-iceberg-init`) is a VIEW
+# onto the Iceberg catalog rather than data, so copying it would restore
+# a catalog whose ownership no longer matches, when `clickhouse-iceberg-init`
+# recreates it on a rebuild anyway.
+EXCLUDED_DATABASES: frozenset[str] = frozenset(
+    {"system", "INFORMATION_SCHEMA", "information_schema"}
+)
+EXCLUDED_ENGINES: frozenset[str] = frozenset({"DataLakeCatalog"})
+
+
+def quote_clickhouse_identifier(name: str) -> str:
+    """Quotes a `ClickHouse` identifier by doubling any backtick in it."""
+    return f"`{name.replace('`', '``')}`"
+
+
+def filter_clickhouse_databases(db_entries: list[tuple[str, str]]) -> list[str]:
+    """Keeps only the databases worth copying: everything but the server's
+    own databases and the `DataLakeCatalog` views (E3)."""
+    return [
+        name
+        for name, engine in db_entries
+        if name not in EXCLUDED_DATABASES and engine not in EXCLUDED_ENGINES
+    ]
+
+
+def build_clickhouse_backup_sql(
+    db_name: str,
+    *,
+    endpoint: str,
+    bucket: str,
+    timestamp: str,
+    access_key: str,
+    secret_key: str,
+) -> str:
+    """Builds one `BACKUP DATABASE` statement. The database name comes from
+    `system.databases` (the server, not a caller) and is quoted as an
+    identifier and percent-escaped in the URL; the endpoint, bucket and
+    timestamp come from `BackupConfig` and this job's own clock. Every
+    string is rendered through `bronze_catalog._sql_string_literal`, so a
+    quote or backslash in a credential cannot break out of its literal
+    (reused from `authored_transforms.py`'s precedent)."""
+    s3_url = (
+        f"{endpoint.rstrip('/')}/{bucket.strip('/')}/clickhouse/"
+        f"{quote(timestamp, safe='')}/{quote(db_name, safe='')}/"
+    )
+    return (
+        f"BACKUP DATABASE {quote_clickhouse_identifier(db_name)} TO S3("
+        f"{_sql_string_literal(s3_url)}, {_sql_string_literal(access_key)}, "
+        f"{_sql_string_literal(secret_key)})"
+    )
+
+
+@dataclass(frozen=True)
+class ClickHouseBackupStats:
+    databases: list[str]
+    object_count: int
+    size_bytes: int
+    duration_seconds: float
+
+
+def _post_clickhouse(
+    cfg: BackupConfig,
+    sql: str,
+    *,
+    what: str,
+    post_fn: Callable[..., Any] | None = None,
+) -> str:
+    """POSTs one statement to this job's `ClickHouse` and returns its body.
+
+    The response BODY is deliberately NOT put in the `Failure` message.
+    Measured on `clickhouse-server:26.8`: a refused `BACKUP ... TO S3(...)`
+    answers with the whole statement echoed back, credentials included,
+    so echoing the body here would write a live S3 secret into the job's
+    log (E5). The HTTP status is the only upstream fact reported.
+
+    Errors
+    ------
+    `requests.RequestException`: the request never completed (DNS,
+    connection, timeout) -- reported with the exception's type only.
+    `requests.HTTPError`: `ClickHouse` answered a non-2xx status.
+    """
+    _post = post_fn if post_fn is not None else requests.post
+    try:
+        resp = _post(
+            cfg.ch.url,
+            auth=(cfg.ch.user, cfg.ch.password),
+            data=sql.encode("utf-8"),
+            timeout=cfg.ch_timeout_seconds,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        raise Failure(f"ClickHouse {what} failed: HTTP status {status}")
+    except requests.RequestException as exc:
+        raise Failure(f"ClickHouse {what} failed: {type(exc).__name__}")
+    return resp.text
+
+
+def backup_clickhouse(
+    cfg: BackupConfig,
+    stamp: str,
+    backup_fs: S3FileSystem,
+    *,
+    post_fn: Callable[..., Any] | None = None,
+) -> ClickHouseBackupStats:
+    """Backs every eligible `ClickHouse` database to the dedicated bucket
+    and measures the result, so the job's log can name each component and
+    its size (AC1, E3).
+
+    The database list is read from `system.databases` and filtered by
+    `filter_clickhouse_databases`; each `BACKUP` writes under
+    `<bucket>/clickhouse/<stamp>/<db>/`, and the size reported is what the
+    backup bucket actually holds under that prefix -- measured after the
+    `BACKUP` succeeded, never assumed.
+    """
+    t0 = time.monotonic()
+
+    listing = _post_clickhouse(
+        cfg,
+        "SELECT name, engine FROM system.databases "
+        "WHERE name NOT IN ('system', 'INFORMATION_SCHEMA', "
+        "'information_schema') AND engine != 'DataLakeCatalog' "
+        "ORDER BY name FORMAT TabSeparated",
+        what="database listing",
+        post_fn=post_fn,
+    )
+    entries: list[tuple[str, str]] = []
+    for line in listing.strip().splitlines():
+        parts = line.strip().split("\t")
+        if not parts or parts[0] == "":
+            continue
+        entries.append((parts[0], parts[1] if len(parts) > 1 else ""))
+
+    eligible_dbs = filter_clickhouse_databases(entries)
+    backed_up: list[str] = []
+    for db in eligible_dbs:
+        sql = build_clickhouse_backup_sql(
+            db,
+            endpoint=cfg.endpoint,
+            bucket=cfg.bucket,
+            timestamp=stamp,
+            access_key=cfg.access_key,
+            secret_key=cfg.secret_key,
+        )
+        _post_clickhouse(cfg, sql, what=f"backup of database {db}", post_fn=post_fn)
+        backed_up.append(db)
+
+    # Measured, not assumed: what the backup bucket actually holds for
+    # this run. A `BACKUP` that answered 200 but left nothing is a broken
+    # backup, and a silently reported 0 bytes would hide it.
+    prefix = f"{cfg.bucket}/clickhouse/{stamp}"
+    object_count = 0
+    size_bytes = 0
+    for path, info in backup_fs.find(prefix, detail=True).items():
+        if info.get("type") == "directory":
+            continue
+        object_count += 1
+        size_bytes += int(info.get("size", info.get("Size", 0)))
+    if object_count == 0:
+        raise Failure(
+            f"ClickHouse backup wrote nothing: no objects under {prefix} "
+            f"after {len(backed_up)} successful BACKUP statement(s)",
+            allow_retries=False,
+        )
+
+    return ClickHouseBackupStats(
+        databases=backed_up,
+        object_count=object_count,
+        size_bytes=size_bytes,
+        duration_seconds=time.monotonic() - t0,
+    )
+
+
 def run_backups() -> None:
     """Runs the Lakehouse backup: dumps every Postgres database, incrementally
     mirrors the warehouse bucket, and (in full stack) backs up ClickHouse databases.
@@ -308,13 +516,26 @@ def run_backups() -> None:
         wh_stats.duration_seconds,
     )
 
+    # Part 3: ClickHouse databases
+    ch_stats = backup_clickhouse(cfg, stamp, backup_fs)
+    logger.info(
+        "ClickHouse backup: %d databases backed up (%s), %d objects (%d bytes) in %.2fs",
+        len(ch_stats.databases),
+        ", ".join(ch_stats.databases),
+        ch_stats.object_count,
+        ch_stats.size_bytes,
+        ch_stats.duration_seconds,
+    )
+
     _prune_expired(backup_fs, cfg)
 
 
 def _prune_expired(fs: S3FileSystem, cfg: BackupConfig) -> None:
     """Deletes any object under this job's own bucket older than
-    `retention_days` for timestamped dumps. Warehouse mirrored objects
-    are not pruned by age (E2)."""
+    `retention_days` for timestamped dumps and `ClickHouse` backup files
+    (E2/E3). Warehouse mirrored objects are not pruned by age: an Iceberg
+    file still referenced by a catalog is needed however old the mirror is
+    (E2)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.retention_days)
     for path, info in fs.find(cfg.bucket, detail=True).items():
         rel = path.removeprefix(cfg.bucket).lstrip("/")

@@ -14,14 +14,20 @@ import io
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import requests
 from dagster import Failure
 
 from dispar_orchestrate.backup_job import (
     DATABASES,
     BackupConfig,
+    ClickHouseBackupStats,
     WarehouseMirrorStats,
+    backup_clickhouse,
+    build_clickhouse_backup_sql,
+    filter_clickhouse_databases,
     mirror_warehouse,
     pg_dump_argv,
+    quote_clickhouse_identifier,
     resolve_secret_ref,
     run_backups,
 )
@@ -56,6 +62,13 @@ def test_backup_config_reads_all_required_fields_from_env(monkeypatch):
     assert cfg.warehouse_bucket == "lakehouse-warehouse"
     assert cfg.warehouse_access_key == "wak"
     assert cfg.warehouse_secret_key == "wsk"
+    # The ClickHouse half of the config is `bronze_catalog.ClickHouseTarget`'s
+    # own env convention (`CH_URL`/`CH_USER`/`CH_PASSWORD`), left at its
+    # defaults here; a deployment overrides them per service.
+    assert cfg.ch.url == "http://clickhouse:8123"
+    assert cfg.ch.user == "default"
+    assert cfg.ch.password == ""
+    assert cfg.ch_timeout_seconds == 300
 
 
 def test_backup_config_honors_a_caller_supplied_retention_days(monkeypatch):
@@ -340,6 +353,15 @@ def test_run_backups_dumps_every_database_and_uploads_to_the_dedicated_bucket(
         return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr("dispar_orchestrate.backup_job.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "dispar_orchestrate.backup_job.backup_clickhouse",
+        lambda cfg, stamp, backup_fs: ClickHouseBackupStats(
+            databases=["default"],
+            object_count=3,
+            size_bytes=1024,
+            duration_seconds=0.01,
+        ),
+    )
     monkeypatch.chdir(tmp_path)
 
     run_backups()
@@ -390,3 +412,221 @@ def test_prune_expired_deletes_only_objects_older_than_retention_days(monkeypatc
     _prune_expired(fs, cfg)
 
     assert fs.rm_calls == ["lakehouse-backups/lakehouse/old.dump"]
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse backup unit tests (OPS-7 T2)
+# ---------------------------------------------------------------------------
+
+
+def test_quote_clickhouse_identifier_doubles_a_backtick_inside_the_name():
+    assert quote_clickhouse_identifier("serving") == "`serving`"
+    assert quote_clickhouse_identifier("db`with`ticks") == "`db``with``ticks`"
+
+
+def test_filter_clickhouse_databases_excludes_the_servers_own_and_the_catalog_views():
+    entries = [
+        ("system", "Atomic"),
+        ("INFORMATION_SCHEMA", "Memory"),
+        ("information_schema", "Memory"),
+        ("icecat_api", "DataLakeCatalog"),
+        ("bronze_meta", "Atomic"),
+        ("default", "Atomic"),
+    ]
+    assert filter_clickhouse_databases(entries) == ["bronze_meta", "default"]
+
+
+def test_the_backup_statement_is_built_from_the_config_endpoint_bucket_and_stamp():
+    """The statement this job sends is derived only from its own config and
+    the database name `system.databases` returned -- never from a caller --
+    and the credentials travel inside it, which is why E3 requires the
+    query-log masking measured on 26.8."""
+    sql = build_clickhouse_backup_sql(
+        "bronze_meta",
+        endpoint="http://backup-s3:9000",
+        bucket="dedicated-backups",
+        timestamp="20261015T120000Z",
+        access_key="my_ak",
+        secret_key="my_sk",
+    )
+    assert sql == (
+        "BACKUP DATABASE `bronze_meta` TO S3("
+        "'http://backup-s3:9000/dedicated-backups/clickhouse/20261015T120000Z/bronze_meta/', "
+        "'my_ak', 'my_sk')"
+    )
+
+
+def test_the_backup_statement_renders_every_string_as_an_escaped_sql_literal():
+    """A credential carrying a quote or a backslash must not be able to
+    end its own string literal and rewrite the statement (`_sql_string_literal`
+    is reused from `bronze_catalog.py`, not re-invented)."""
+    sql = build_clickhouse_backup_sql(
+        "weird`db",
+        endpoint="http://backup-s3:9000/",
+        bucket="/dedicated-backups/",
+        timestamp="20261015T120000Z",
+        access_key="ak'xk",
+        secret_key="sk\\xk",
+    )
+    assert sql == (
+        "BACKUP DATABASE `weird``db` TO S3("
+        "'http://backup-s3:9000/dedicated-backups/clickhouse/20261015T120000Z/weird%60db/', "
+        "'ak\\'xk', 'sk\\\\xk')"
+    )
+
+
+def _fake_response(status_code: int, text: str) -> requests.Response:
+    """A REAL `requests.Response`, so `raise_for_status()` behaves exactly
+    as the code under test expects it to."""
+    resp = requests.Response()
+    resp.status_code = status_code
+    resp._content = text.encode("utf-8")
+    return resp
+
+
+def test_clickhouse_backup_backs_up_each_eligible_database_and_reports_the_size_it_wrote(
+    monkeypatch,
+):
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    calls = []
+
+    def _fake_post(url, auth, data, timeout):
+        body = data.decode("utf-8")
+        calls.append({"url": url, "auth": auth, "data": body, "timeout": timeout})
+        if "FROM system.databases" in body:
+            return _fake_response(200, "console\tAtomic\nsystem\tAtomic\ndefault\tAtomic\n")
+        return _fake_response(200, "")
+
+    backup_fs = _FakeS3FileSystem()
+    backup_fs.find_result = {
+        "lakehouse-backups/clickhouse/20261015T120000Z/console/.backup": {
+            "size": 40,
+            "type": "file",
+        },
+        "lakehouse-backups/clickhouse/20261015T120000Z/default/data.bin": {
+            "size": 250,
+            "type": "file",
+        },
+        "lakehouse-backups/clickhouse/20261014T120000Z/lakehouse.dump": {
+            "size": 9999,
+            "type": "file",
+        },
+    }
+
+    stats = backup_clickhouse(
+        cfg, "20261015T120000Z", backup_fs, post_fn=_fake_post
+    )
+
+    assert stats.databases == ["console", "default"]
+    assert calls[0]["auth"] == ("default", "")
+    assert calls[0]["timeout"] == 300
+    assert "BACKUP DATABASE `console`" in calls[1]["data"]
+    assert "BACKUP DATABASE `default`" in calls[2]["data"]
+    assert "clickhouse/20261015T120000Z/console/" in calls[1]["data"]
+    # Only this run's prefix is measured, not the whole bucket.
+    assert stats.object_count == 2
+    assert stats.size_bytes == 290
+    assert stats.duration_seconds >= 0.0
+
+
+def test_clickhouse_backup_skips_the_backup_statements_when_no_database_is_eligible(
+    monkeypatch,
+):
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    calls = []
+
+    def _fake_post(url, auth, data, timeout):
+        calls.append(data.decode("utf-8"))
+        return _fake_response(200, "system\tAtomic\nINFORMATION_SCHEMA\tMemory\n")
+
+    backup_fs = _FakeS3FileSystem()
+    backup_fs.find_result = {
+        "lakehouse-backups/clickhouse/20261015T120000Z/default/.backup": {
+            "size": 10,
+            "type": "file",
+        }
+    }
+    stats = backup_clickhouse(cfg, "20261015T120000Z", backup_fs, post_fn=_fake_post)
+
+    assert stats.databases == []
+    assert len(calls) == 1
+
+
+def test_clickhouse_backup_refuses_to_report_a_size_when_the_backup_wrote_nothing(
+    monkeypatch,
+):
+    """A `BACKUP` that answered 200 and left the bucket empty is a broken
+    backup; reporting zero bytes would hide it (never fabricate)."""
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    def _fake_post(url, auth, data, timeout):
+        if "FROM system.databases" in data.decode("utf-8"):
+            return _fake_response(200, "default\tAtomic\n")
+        return _fake_response(200, "")
+
+    with pytest.raises(Failure, match="ClickHouse backup wrote nothing"):
+        backup_clickhouse(
+            cfg, "20261015T120000Z", _FakeS3FileSystem(), post_fn=_fake_post
+        )
+
+
+def test_clickhouse_backup_reports_the_status_and_never_the_body_when_the_listing_fails(
+    monkeypatch,
+):
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    def _fake_post(url, auth, data, timeout):
+        return _fake_response(500, "Code: 499 ... ACCESS_DENIED ... 'drillsk1234'")
+
+    with pytest.raises(Failure) as exc:
+        backup_clickhouse(
+            cfg, "20261015T120000Z", _FakeS3FileSystem(), post_fn=_fake_post
+        )
+
+    assert "database listing" in str(exc.value)
+    assert "HTTP status 500" in str(exc.value)
+    assert "ACCESS_DENIED" not in str(exc.value), "upstream body must not be logged"
+
+
+def test_clickhouse_backup_reports_the_status_and_never_the_body_when_a_backup_fails(
+    monkeypatch,
+):
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    def _fake_post(url, auth, data, timeout):
+        if "FROM system.databases" in data.decode("utf-8"):
+            return _fake_response(200, "default\tAtomic\n")
+        return _fake_response(403, "S3 url: 'http://...', 'my_ak', 'my_sk'")
+
+    with pytest.raises(Failure) as exc:
+        backup_clickhouse(
+            cfg, "20261015T120000Z", _FakeS3FileSystem(), post_fn=_fake_post
+        )
+
+    assert "backup of database default" in str(exc.value)
+    assert "HTTP status 403" in str(exc.value)
+    assert "my_ak" not in str(exc.value), "a failed BACKUP echoes its credentials"
+
+
+def test_clickhouse_backup_reports_a_transport_error_by_exception_type_only(monkeypatch):
+    _set_backup_env(monkeypatch)
+    cfg = BackupConfig.from_env()
+
+    def _fake_post(url, auth, data, timeout):
+        raise requests.ConnectionError("dial tcp clickhouse:8123: no route to host")
+
+    with pytest.raises(Failure) as exc:
+        backup_clickhouse(
+            cfg, "20261015T120000Z", _FakeS3FileSystem(), post_fn=_fake_post
+        )
+
+    assert "database listing" in str(exc.value)
+    assert "ConnectionError" in str(exc.value)
+    assert "no route to host" not in str(exc.value)
