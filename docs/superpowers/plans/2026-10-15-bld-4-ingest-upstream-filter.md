@@ -612,3 +612,40 @@ two doubled sensor intervals; `docs/core/` untouched.
 9. `dc18159e` is a "wip:" commit. Leave history as it is (no force-push on
    a pushed branch); the PR is merged as a merge commit, so name what it
    contains in the Handoff.
+
+### Round 2 (planner, at `6cacf541aab4`): no open BLOCKER, merged as #189
+
+Read `64588f2d..6cacf541` and Handoff round 1 against round 1's findings.
+
+- **BLOCKER 1 fixed** (`ce3ac1cd`): the SUCCESS-run lookup is keyed on the
+  materializations' own run ids
+  (`RunsFilter(run_ids=…, statuses=[SUCCESS])`), with a test where more
+  than `PER_TABLE_UPSTREAM_SCAN_LIMIT` other-table SUCCESS runs follow the
+  table's own run, and a stub that honours `run_ids` and `statuses`.
+- **BLOCKERs 2 and 3 fixed**: the Handoff no longer claims
+  `docs/ARCHITECTURE.md` or doc-file merge conflicts, quotes counts only
+  from runs on the commit it names, and lists what it did not re-run.
+- SHOULD-FIX 1-9 fixed as the Handoff's table says; R1 is in the console
+  with its tests; the gate was re-run from a clean project (`bld4r1`) on
+  `937213a0` (the only later commit changes one TypeScript test file).
+- **Accepted, not changed:** the run lookup no longer filters on
+  `job_name=ingest_job`. Today nothing but `ingest_job` materializes a
+  `bronze.*` asset key: authored pipelines materialize their target and a
+  Bronze target is refused (`BLD-3`, #155), and `file_ingest` logs no
+  materialization. If another writer of Bronze asset keys appears, add
+  `job_name=INGEST_JOB` back to that `RunsFilter`.
+
+Reviewer's verification on `6cacf541aab4` (`review-pr.sh`, under the
+heavy lock): `cargo fmt --check` OK; clippy workspace OK; `cargo test -j 2
+--workspace --no-fail-fast` 115 result lines, 6019 passed, 11 failed, 38
+ignored. All 11 were the shared test Postgres (`53100 could not resize
+shared memory segment … No space left on device`, `UnexpectedEof`;
+`OPS-10`) in three binaries, each re-run alone and green:
+`gold_publication` 13/13, `home_layout` 4/4, `identity_user_tenants` 5/5.
+`bun run typecheck` OK; `bun run lint` 0 errors, 8 warnings; `bun test`
+2034 pass, 0 fail, 2 skip; the two `ops/lint` checks OK; Dagster pytest
+1518 passed in one run; compose config OK; gitleaks (working tree) no
+leaks. CI on #189 at this head: 37/37 after one re-run of
+`Rust · SRC-11 connector operations`, whose auto-disable step timed out
+at 150 s (the same flake as #160; BLD-4 does not touch connectors; filed
+as `SRC-25`).
