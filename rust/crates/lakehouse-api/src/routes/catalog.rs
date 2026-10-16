@@ -5483,7 +5483,11 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             define_key(&pool).await;
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             put_body(
                 &state,
                 "serving.mart_x",
@@ -5535,7 +5539,11 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             define_key(&pool).await;
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             let (status, message) = put_body(
                 &state,
                 "serving.mart_x",
@@ -5559,7 +5567,11 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             define_key(&pool).await;
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             let (status, message) = put_body(
                 &state,
                 "serving.mart_x",
@@ -5593,7 +5605,11 @@ mod tests {
             pool: lakehouse_store::PgPool,
         ) {
             define_key(&pool).await;
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // SEC-16: `put_annotation` checks the asset exists before it reads
+            // the body, so a dead address answers 503; the mock catalog
+            // holds `serving.mart_x`.
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             put_body(
                 &state,
                 "serving.mart_x",
