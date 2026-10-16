@@ -272,6 +272,100 @@ assistant's tool schema.
 - **Gitleaks:**
   - `zricethezav/gitleaks:v8.30.1` -> clean (0 leaks found, ~24.27 MB scanned)
 
+### Merge of main after #165 and #87
+
+**Commits on the branch for this round:** `6d000fb9` (merge of
+`origin/main`, 83 files, +9938/-421) and `4de93ade` (the fixture fix,
+`rust/crates/lakehouse-api/src/routes/authored_pipelines.rs`, +4). Head after
+this entry: `4de93ade`.
+
+**The one conflict, resolved by hand hunk by hunk** (AGENTS.md rule 9), in
+`dagster/dispar_orchestrate/authored_factory.py`'s import block:
+`origin/main` (DATA-19, #165) adds
+`from dispar_orchestrate.file_ingest import JOB_NAME as FILE_INGEST_JOB`,
+while this branch (BLD-1 D5) removes
+`from dispar_orchestrate.connector_catalog import ensure_catalog_database`.
+Both sides' intent is kept: `FILE_INGEST_JOB` is imported and used at
+`authored_factory.py:1136` (DATA-19 / D1), and `ensure_catalog_database` is
+**not** restored, because the module no longer creates its own catalog
+database — the API's policy rewriter only recognises a governed table under
+the database the API reads it from (`ICEBERG_QUERY_DB`), so a private one
+produced unmasked SQL. No `CATALOG_DB` or private-database name remains in
+the module or its tests, and `test_authored_factory.py:312` still asserts
+the attribute is gone.
+
+**The fixture fix `4de93ade`.** The merge brought
+`mod file_ingest_upstream_is_refused` (DATA-19) into a tree where BLD-1 D1
+had added `run_as` to `CreatePipelineInput` (migration `0076`), so the
+fixture's construction no longer compiled —
+`E0063 missing field run_as in
+lakehouse_store::pipelines::CreatePipelineInput`. The fix adds
+`run_as: None`, matching the six other fixtures in the same file: that test
+seeds a row the update and restore routes then refuse, so it never reaches
+the orchestrator and has no author to read as. No behaviour changes; only
+the merged tree's compile is restored. Cited `BLD-1 merge fix` in the
+commit body. This was a compile break, not a behaviour regression: without
+it CI clippy, the Rust tests and the MSRV job were all red on the branch.
+
+**Commands run on the merged head `4de93ade`, with their counts.** Rust and
+the heavy frontend commands were run in the foreground; every cargo command
+except `fmt` went through `/home/shiro/rantai/bin/cargo-locked`, the other
+heavy ones under `flock /home/shiro/rantai/.heavy.lock`.
+
+- `python3 ops/lint/check_intra_package_imports.py` -> OK
+- `python3 ops/lint/check_bare_iceberg_count.py` -> OK
+- `cd dagster && /home/shiro/rantai/venv-bld3/bin/python -m pytest
+  dispar_orchestrate -q` -> 1081 passed, 0 failed, 874 warnings in 922.58s
+  (full suite, one run)
+- `cd rust && cargo fmt --check` -> clean (0 issues), re-run on `4de93ade`
+- `/home/shiro/rantai/bin/cargo-locked clippy --workspace --all-targets
+  --all-features -- -D warnings` -> clean (0 warnings)
+- `/home/shiro/rantai/bin/cargo-locked test --workspace --no-fail-fast` ->
+  **4643 passed, 11 failed, 5 ignored across 64 test binaries.** All 11
+  failures were test-database connection errors in two binaries that share
+  a database under concurrent load, not assertions. Each was re-run alone
+  and is green: `--test ai_tool` -> 9 passed, 0 failed;
+  `--test connector_delete_deprovision` -> 8 passed, 0 failed.
+- `/home/shiro/rantai/bin/cargo-locked test -p lakehouse-api --lib
+  authored_pipelines` -> **41 passed, 0 failed, 1736 filtered out** in
+  5.72s (run on `4de93ade`, so the fixture fix is proven)
+- `flock /home/shiro/rantai/.heavy.lock bun run typecheck` -> clean
+  (0 errors)
+- `flock /home/shiro/rantai/.heavy.lock bun run lint` -> **0 errors, 6
+  warnings**, all pre-existing on `main` and none in a BLD-1 file:
+  `src/components/data-table/data-table.tsx`,
+  `src/components/ui/sidebar.tsx`, `src/features/alerts/alerts-page.tsx`,
+  `src/features/catalog/open-format-card.test.tsx`,
+  `src/hooks/use-data-table.ts`, `src/lib/dashboard-specs.ts`
+- The frontend tests were run per folder under
+  `flock /home/shiro/rantai/.heavy.lock`; there is no test file in `src/`
+  outside those four folders, so the four runs cover all of `bun test src`:
+  - `bun test src/features` -> **802 passed, 0 failed**, 2593 expect()
+    calls, 70 files, 137.87s
+  - `bun test src/services` -> **77 passed, 0 failed**, 226 expect() calls,
+    12 files
+  - `bun test src/lib` -> **596 passed, 1 skipped, 0 failed**, 551 expect()
+    calls, 70 files
+  - `bun test src/components` -> **27 passed, 0 failed**, 54 expect() calls,
+    5 files
+  - Total: **1502 passed, 1 skipped, 0 failed across 157 files**
+- `docker compose --profile '*' config --quiet` (throwaway values for
+  `POSTGRES_PASSWORD`, `RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`,
+  `LAKEKEEPER_ENCRYPTION_KEY`, per SEC-18) -> clean, exit code 0
+
+**Not verified this round, with the reason.**
+- **The g7 acceptance gate (`ops/g7/bld1_pipeline_author_test.py`) was not
+  re-run.** Nothing in this slice changed the gate, the compose service or
+  the CI step; the merge brought no change to any of the three. The gate's
+  own evidence is the earlier handoff entry above. The reviewer should
+  re-run it only if it wants the merged stack proven end to end.
+- **No real `docker compose up` on the g7 profile.** The merge brought
+  `origin/main`'s compose changes, which their own PRs proved; this slice
+  edits no compose file. `config` alone is not that proof (rule 8), so it is
+  written as `config`, not as `up`.
+- **Gitleaks was not re-run**; the merge adds upstream files, and CI's
+  `gitleaks` job runs on the PR.
+
 ## 8. Review
 
 (Reviewer.)
