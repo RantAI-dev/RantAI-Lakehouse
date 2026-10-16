@@ -166,24 +166,21 @@ const MSG_TABLE_FUNCTION: &str = "read through a table function or another relat
 const MSG_WILDCARD_OPTIONS: &str =
     "the * has EXCEPT, REPLACE, RENAME or similar options, which are not traced";
 
-/// Map the output columns of `sql` to their source columns.
-///
-/// `known_columns` maps a table key (`silver.x`) to its column names, as read
-/// from the engine; it expands `*`, picks the table an unqualified column
-/// belongs to among several, and names the target columns of a positional
-/// `INSERT`.
-///
-/// # Errors
-///
-/// [`Unmappable`] when `sql` does not parse, is not exactly one statement of
-/// a kind listed in the module doc, reads `VALUES` or another non-`SELECT`
-/// body, or is an `INSERT` whose target columns are not known or do not match
-/// the `SELECT` in number.
-pub(crate) fn map_select(
-    sql: &str,
-    dialect: &dyn Dialect,
-    known_columns: &HashMap<String, Vec<String>>,
-) -> Result<Lineage, Unmappable> {
+/// What one statement writes (`INSERT` and `CREATE TABLE ... AS`), an
+/// `INSERT`'s explicit column list, and the query that fills it.
+type Parsed = (Option<String>, Option<Vec<String>>, Query);
+
+/// The table `sql` writes, as a key, when it is an `INSERT ... SELECT` or a
+/// `CREATE TABLE ... AS SELECT`; `None` for anything else, including a
+/// statement [`map_select`] would refuse. It needs no column knowledge, so a
+/// caller can find the target before it fetches any columns.
+pub(crate) fn statement_target(sql: &str, dialect: &dyn Dialect) -> Option<String> {
+    parse_statement(sql, dialect)
+        .ok()
+        .and_then(|(target, ..)| target)
+}
+
+fn parse_statement(sql: &str, dialect: &dyn Dialect) -> Result<Parsed, Unmappable> {
     let mut statements =
         Parser::parse_sql(dialect, sql).map_err(|_| unmappable("the statement does not parse"))?;
     if statements.len() != 1 {
@@ -218,6 +215,28 @@ pub(crate) fn map_select(
             ));
         }
     };
+    Ok((target, insert_columns, query))
+}
+
+/// Map the output columns of `sql` to their source columns.
+///
+/// `known_columns` maps a table key (`silver.x`) to its column names, as read
+/// from the engine; it expands `*`, picks the table an unqualified column
+/// belongs to among several, and names the target columns of a positional
+/// `INSERT`.
+///
+/// # Errors
+///
+/// [`Unmappable`] when `sql` does not parse, is not exactly one statement of
+/// a kind listed in the module doc, reads `VALUES` or another non-`SELECT`
+/// body, or is an `INSERT` whose target columns are not known or do not match
+/// the `SELECT` in number.
+pub(crate) fn map_select(
+    sql: &str,
+    dialect: &dyn Dialect,
+    known_columns: &HashMap<String, Vec<String>>,
+) -> Result<Lineage, Unmappable> {
+    let (target, insert_columns, query) = parse_statement(sql, dialect)?;
     let ctes: Vec<String> = query
         .with
         .iter()

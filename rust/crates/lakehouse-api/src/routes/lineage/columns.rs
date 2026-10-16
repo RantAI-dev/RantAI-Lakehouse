@@ -18,11 +18,13 @@
 //! mapped at all REPLACES its producer's earlier rows with none, so a
 //! changed statement never leaves the old mapping on display.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 
 use lakehouse_store::PgPool;
 use lakehouse_store::column_lineage::{self, NewMapping};
 use sqlparser::dialect::ClickHouseDialect;
+use time::OffsetDateTime;
 
 use crate::sql_lineage::{self, Lineage};
 use crate::state::AppState;
@@ -79,31 +81,47 @@ pub(crate) fn rows_for(lineage: &Lineage, to_table: &str) -> Vec<NewMapping> {
     rows
 }
 
-/// The columns of every table `sql` reads, plus `extra`, keyed the way the
-/// helper keys them. A table whose columns cannot be read is left out, which
-/// makes the helper mark what depends on it partial rather than guess.
-pub(crate) async fn known_columns(
-    state: &AppState,
-    sql: &str,
-    extra: &[String],
-) -> HashMap<String, Vec<String>> {
-    let mut tables: BTreeSet<String> =
-        crate::sql_rewrite::referenced_tables(sql, &ClickHouseDialect {})
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-    tables.extend(extra.iter().cloned());
-    let engine = crate::policy_engine::PolicyEngineObligations::from_state(state);
-    let mut known = HashMap::new();
-    for table in tables.into_iter().take(MAX_TABLES_PER_STATEMENT) {
-        let Some((schema, name)) = table.split_once('.') else {
-            continue;
-        };
-        if let Some(columns) = engine.table_columns(schema, name).await {
-            known.insert(table, columns);
+/// Column names already read from the engine during one piece of work, so a
+/// pass over many statements asks once per table. `None` is remembered too:
+/// a table whose columns could not be read is not asked again.
+#[derive(Default)]
+pub(crate) struct ColumnCache {
+    tables: HashMap<String, Option<Vec<String>>>,
+}
+
+impl ColumnCache {
+    /// The columns of every table `sql` reads, plus `extra`, keyed the way
+    /// the helper keys them. A table whose columns cannot be read is left
+    /// out, which makes the helper mark what depends on it partial rather
+    /// than guess.
+    pub(crate) async fn known_for(
+        &mut self,
+        state: &AppState,
+        sql: &str,
+        extra: &[String],
+    ) -> HashMap<String, Vec<String>> {
+        let mut wanted: BTreeSet<String> =
+            crate::sql_rewrite::referenced_tables(sql, &ClickHouseDialect {})
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        wanted.extend(extra.iter().cloned());
+        let engine = crate::policy_engine::PolicyEngineObligations::from_state(state);
+        let mut known = HashMap::new();
+        for table in wanted.into_iter().take(MAX_TABLES_PER_STATEMENT) {
+            if !self.tables.contains_key(&table) {
+                let columns = match table.split_once('.') {
+                    Some((schema, name)) => engine.table_columns(schema, name).await,
+                    None => None,
+                };
+                self.tables.insert(table.clone(), columns);
+            }
+            if let Some(Some(columns)) = self.tables.get(&table) {
+                known.insert(table, columns.clone());
+            }
         }
+        known
     }
-    known
 }
 
 /// Remember the SQL the API approved for `pipeline_id`'s run, to be mapped
@@ -146,7 +164,7 @@ pub(crate) async fn record_pipeline_run(state: &AppState, pool: &PgPool, pipelin
         );
         return;
     };
-    let known = known_columns(state, &sql, &[]).await;
+    let known = ColumnCache::default().known_for(state, &sql, &[]).await;
     let rows = match sql_lineage::map_select(&sql, &ClickHouseDialect {}, &known) {
         Ok(lineage) => rows_for(&lineage, &target),
         Err(unmappable) => {
@@ -169,8 +187,170 @@ pub(crate) async fn record_pipeline_run(state: &AppState, pool: &PgPool, pipelin
     }
 }
 
+/// Statements read from the query log per pass. A deployment with more waits
+/// for the next tick; the cursor moves only past what was handled.
+const BUILD_BATCH: usize = 200;
+/// A statement longer than this is not read (the log keeps the whole text).
+const MAX_BUILD_QUERY_CHARS: usize = 20_000;
+/// How far back the first pass looks: `ClickHouse`'s own query-log horizon,
+/// the same one the table-level build edges use (`builds::BUILDS_SQL`).
+const FIRST_PASS_DAYS: i64 = 180;
+
+static BUILDS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The builds written to `silver`/`serving` after `after_ms` (Unix
+/// milliseconds), oldest first. `after_ms` is an `i64` this module computed,
+/// never text from a request. Like `builds::BUILDS_SQL` it keeps statements
+/// that read at least one other table (`length(tables) > 1`) and only the
+/// initiating query of a distributed one.
+fn builds_sql(after_ms: i64) -> String {
+    format!(
+        "SELECT toString(toUnixTimestamp64Milli(event_time_microseconds)) AS ts, query \
+         FROM system.query_log \
+         WHERE type = 'QueryFinish' AND is_initial_query = 1 \
+           AND query_kind IN ('Create', 'Insert') AND length(tables) > 1 \
+           AND hasAny(databases, ['silver', 'serving']) \
+           AND length(query) <= {MAX_BUILD_QUERY_CHARS} \
+           AND event_date >= toDate(fromUnixTimestamp64Milli({after_ms})) \
+           AND event_time_microseconds > fromUnixTimestamp64Milli({after_ms}) \
+         ORDER BY event_time_microseconds LIMIT {BUILD_BATCH}"
+    )
+}
+
+fn unix_ms(at: OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+}
+
+fn from_unix_ms(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+}
+
+/// The warehouse table a build writes, as a table key; `None` for anything
+/// that is not a Silver or Gold table, and for a pipeline's staging table
+/// (`__staging_<target>`, swapped into place by `EXCHANGE TABLES`).
+fn build_target(target: &str) -> Option<String> {
+    let key = graph_key(target);
+    let (zone, table) = key.split_once('.')?;
+    ((zone == "silver" || zone == "serving") && !table.starts_with("__staging_")).then_some(key)
+}
+
+/// Map the builds the query log recorded since the last pass and write one
+/// producer per target table (`build`, ref = the table, shared: the log is
+/// one per deployment). Returns how many targets were written.
+///
+/// * A pipeline's own target is skipped: the pipeline's success event writes
+///   a better record, and its statements in the log are the rewritten ones.
+/// * Of several statements for one target in a batch, the newest wins, as in
+///   the table-level edge.
+/// * A statement that cannot be mapped clears its target's rows (the table
+///   was last written by something that cannot be traced).
+/// * The cursor moves only to the newest time handled, so a pass that failed
+///   reading the log changes nothing and the next tick retries.
+pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
+    let cursor = match column_lineage::builds_cursor(pool).await {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            tracing::warn!(%err, "column lineage: the build cursor could not be read");
+            return 0;
+        }
+    };
+    let after =
+        cursor.unwrap_or_else(|| OffsetDateTime::now_utc() - time::Duration::days(FIRST_PASS_DAYS));
+    let rows = match state
+        .clickhouse
+        .rows(&builds_sql(unix_ms(after)), None)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(?err, "column lineage: the query log could not be read");
+            return 0;
+        }
+    };
+    let pipeline_targets: HashSet<String> = lakehouse_store::pipelines::list_pipelines(
+        pool,
+        &lakehouse_store::pipelines::PipelineFilter {
+            tenant_id: None,
+            all_tenants: true,
+        },
+    )
+    .await
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|p| zone_key(&p.target))
+    .collect();
+
+    let mut cache = ColumnCache::default();
+    let mut latest: HashMap<String, Vec<NewMapping>> = HashMap::new();
+    let mut newest_ms: Option<i64> = None;
+    for row in &rows {
+        let ts = super::text(row, "ts").parse::<i64>().ok();
+        newest_ms = newest_ms.max(ts);
+        let query = super::text(row, "query");
+        // The target is known from the statement's own text; the columns of
+        // the tables it reads come second, and a positional INSERT needs the
+        // target's own.
+        let Some(target) = sql_lineage::statement_target(&query, &ClickHouseDialect {})
+            .as_deref()
+            .and_then(build_target)
+        else {
+            continue;
+        };
+        if pipeline_targets.contains(&target) {
+            continue;
+        }
+        let known = cache
+            .known_for(state, &query, std::slice::from_ref(&target))
+            .await;
+        let rows = match sql_lineage::map_select(&query, &ClickHouseDialect {}, &known) {
+            Ok(lineage) => rows_for(&lineage, &target),
+            Err(unmappable) => {
+                tracing::info!(table = %target, reason = %unmappable, "column lineage: a build cannot be mapped");
+                Vec::new()
+            }
+        };
+        latest.insert(target, rows);
+    }
+    let mut written = 0;
+    for (target, rows) in &latest {
+        match column_lineage::replace_producer(pool, "build", target, None, rows).await {
+            Ok(()) => written += 1,
+            Err(err) => {
+                tracing::warn!(%err, table = %target, "column lineage: a build's mappings could not be written");
+            }
+        }
+    }
+    if let Some(at) = newest_ms.and_then(from_unix_ms)
+        && let Err(err) = column_lineage::set_builds_cursor(pool, at).await
+    {
+        tracing::warn!(%err, "column lineage: the build cursor could not be moved");
+    }
+    written
+}
+
+/// Starts [`run_builds_pass`] in the background and returns at once (the
+/// alerts tick must not wait on the query log). `false`, starting nothing,
+/// while another pass runs or when there is no Postgres pool.
+pub(crate) fn spawn_builds_pass(state: &AppState) -> bool {
+    let Some(running) = crate::routes::schema_versions::PassGuard::claim(&BUILDS_RUNNING) else {
+        return false;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _running = running;
+        let Some(pool) = state.pg.as_deref() else {
+            return;
+        };
+        let written = run_builds_pass(&state, pool).await;
+        tracing::info!(written, "column lineage: build pass finished");
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::sql_lineage::{Mapping, PartialOutput, Transform};
 
@@ -214,5 +394,244 @@ mod tests {
         assert_eq!(rows[1].from_column, None);
         assert!(rows[1].partial);
         assert_eq!(rows[1].reason.as_deref(), Some("built with UNION"));
+    }
+
+    mod builds_pass {
+        use std::collections::HashMap;
+
+        use lakehouse_store::column_lineage::{Direction, Scope, touching_table, walk};
+        use serde_json::json;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &sqlx::PgPool, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let database_url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url);
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn everything() -> Scope {
+            Scope {
+                tenant: None,
+                all_tenants: true,
+                shared: true,
+            }
+        }
+
+        /// `system.columns` answers the same two columns for every table:
+        /// enough for a positional INSERT and for `*`.
+        async fn mount_columns(ch: &MockServer) {
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "name", "type": "String"},
+                        {"name": "default_kind", "type": "String"},
+                        {"name": "default_expression", "type": "String"}
+                    ],
+                    "data": [
+                        {"name": "id", "default_kind": "", "default_expression": ""},
+                        {"name": "name", "default_kind": "", "default_expression": ""},
+                    ],
+                    "rows": 2,
+                })))
+                .mount(ch)
+                .await;
+        }
+
+        async fn mount_log(ch: &MockServer, rows: &[(&str, &str)]) {
+            let data: Vec<_> = rows
+                .iter()
+                .map(|(ts, query)| json!({ "ts": ts, "query": query }))
+                .collect();
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.query_log"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [{"name": "ts", "type": "String"}, {"name": "query", "type": "String"}],
+                    "data": data,
+                    "rows": rows.len(),
+                })))
+                .mount(ch)
+                .await;
+        }
+
+        async fn seed_pipeline_into_silver_orders_clean(pool: &sqlx::PgPool) {
+            lakehouse_store::pipelines::create_pipeline(
+                pool,
+                &lakehouse_store::pipelines::CreatePipelineInput {
+                    name: "builds-probe".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "silver".to_owned(),
+                    source_table: "users".to_owned(),
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    description: None,
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    max_retries: None,
+                    owner: None,
+                    tenant_id: None,
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: None,
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed the pipeline");
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_newest_build_of_a_target_wins_and_pipeline_and_staging_targets_are_skipped(
+            pool: sqlx::PgPool,
+        ) {
+            let ch = MockServer::start().await;
+            mount_columns(&ch).await;
+            mount_log(
+                &ch,
+                &[
+                    (
+                        "1760000000000",
+                        "INSERT INTO serving.mart SELECT id, name FROM silver.users",
+                    ),
+                    (
+                        "1760000001000",
+                        "CREATE TABLE IF NOT EXISTS silver.orders_clean ENGINE = MergeTree \
+                         ORDER BY tuple() AS SELECT id FROM silver.users LIMIT 0",
+                    ),
+                    (
+                        "1760000002000",
+                        "INSERT INTO silver.__staging_x SELECT id FROM silver.users",
+                    ),
+                    (
+                        "1760000003000",
+                        "INSERT INTO serving.mart SELECT id, upper(name) AS name FROM silver.users",
+                    ),
+                    ("1760000004000", "OPTIMIZE TABLE serving.mart"),
+                ],
+            )
+            .await;
+            seed_pipeline_into_silver_orders_clean(&pool).await;
+            let state = state_for(&pool, &ch.uri());
+
+            let written = run_builds_pass(&state, &pool).await;
+            assert_eq!(written, 1, "only serving.mart is a build target here");
+
+            let mart = touching_table(&pool, "serving.mart", everything())
+                .await
+                .expect("read");
+            let pairs: Vec<(String, String, String)> = mart
+                .iter()
+                .map(|r| {
+                    (
+                        r.from_column.clone().unwrap_or_default(),
+                        r.to_column.clone(),
+                        r.transform.clone(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("id".to_owned(), "id".to_owned(), "copy".to_owned()),
+                    (
+                        "name".to_owned(),
+                        "name".to_owned(),
+                        "expression".to_owned()
+                    ),
+                ]
+            );
+            assert!(
+                mart.iter()
+                    .all(|r| r.producer_kind == "build" && r.producer_ref == "serving.mart")
+            );
+            for skipped in ["silver.orders_clean", "silver.__staging_x"] {
+                assert!(
+                    touching_table(&pool, skipped, everything())
+                        .await
+                        .expect("read")
+                        .is_empty(),
+                    "{skipped} must not be recorded by the build pass"
+                );
+            }
+            let cursor = column_lineage::builds_cursor(&pool).await.expect("cursor");
+            assert_eq!(cursor.map(unix_ms), Some(1_760_000_004_000));
+
+            // The mapping also walks from the Bronze/Silver side.
+            let down = walk(&pool, "silver.users", "name", Direction::Down, everything())
+                .await
+                .expect("walk");
+            assert_eq!(down.len(), 1);
+            assert_eq!(down[0].to_table, "serving.mart");
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_pass_that_cannot_read_the_log_writes_nothing_and_keeps_the_cursor(
+            pool: sqlx::PgPool,
+        ) {
+            let ch = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&ch)
+                .await;
+            let state = state_for(&pool, &ch.uri());
+            assert_eq!(run_builds_pass(&state, &pool).await, 0);
+            assert_eq!(
+                column_lineage::builds_cursor(&pool).await.expect("cursor"),
+                None
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn the_next_pass_asks_only_for_statements_after_the_cursor(pool: sqlx::PgPool) {
+            let ch = MockServer::start().await;
+            mount_log(&ch, &[]).await;
+            let state = state_for(&pool, &ch.uri());
+            column_lineage::set_builds_cursor(
+                &pool,
+                from_unix_ms(1_760_000_004_000).expect("time"),
+            )
+            .await
+            .expect("cursor");
+
+            run_builds_pass(&state, &pool).await;
+
+            let requests = ch.received_requests().await.expect("recorded");
+            let body = String::from_utf8_lossy(&requests[0].body).into_owned();
+            assert!(
+                body.contains("fromUnixTimestamp64Milli(1760000004000)"),
+                "{body}"
+            );
+        }
+
+        #[test]
+        fn a_build_target_is_a_warehouse_table_that_is_not_a_staging_copy() {
+            assert_eq!(
+                build_target("serving.mart").as_deref(),
+                Some("serving.mart")
+            );
+            assert_eq!(build_target("gold.mart").as_deref(), Some("serving.mart"));
+            assert_eq!(build_target("silver.x").as_deref(), Some("silver.x"));
+            assert_eq!(build_target("silver.__staging_x"), None);
+            assert_eq!(build_target("console.alerts"), None);
+            assert_eq!(build_target("nodot"), None);
+        }
     }
 }
