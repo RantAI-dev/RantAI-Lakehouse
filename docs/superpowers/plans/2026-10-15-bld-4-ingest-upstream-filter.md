@@ -259,4 +259,108 @@ reads the RUN's status and not only the event: the anchor for that chain is
 
 ## 7. Review
 
-(Reviewer.)
+### Round 1 (planner, at `b627db25d616`)
+
+Read the whole diff against this plan and `AGENTS.md`; draft PR #189 is
+open so CI runs the `g3a-dagster` gate on the merged head. The reviewer's
+own full verification block is running on this commit and its result is
+added below when it lands.
+
+Checked and correct: D3 (authored `pl-` and other job upstreams, `run_key`,
+the queued-downstream skip and the `RunRecord` time reads unchanged; the
+`file_ingest_job` skip texts identical); D2 in the sensor (a non-Bronze
+source makes no instance call and skips fail-closed, tested); the
+two-component `AssetKey(["bronze", sourceTable])`, proven on the real
+classes, including "materialized then FAILED"; one window constant
+(`PER_TABLE_UPSTREAM_SCAN_LIMIT`, renamed with its reason, rule 4); module
+doc and sensor docstring; one generalised validator on create, update and
+restore with constant refusal text; compose adds no must-set variable,
+token or password; `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS` and the ingest
+service token are only in the CI job's throwaway `.env`, and compose's
+default posture is unchanged; the gate loads one table per run and waits
+two doubled sensor intervals; `docs/core/` untouched.
+
+#### Decision for this round (planner)
+
+- **R1. The console drops `ingest_job` from a non-Bronze pipeline's chain
+  on save**, exactly as it already drops `file_ingest_job`
+  (`src/features/pipelines/pipeline-reupload-trigger.ts`
+  `withReuploadTrigger`): the server now refuses that upstream (D2) and the
+  form has no control for it, so a stored Silver/Gold chain naming it would
+  make every save a 400. Keep every other entry as it is. Update the module
+  doc (it still names `validate_file_ingest_upstream`) and add tests: a
+  Silver source with `["ingest_job", "pl-a"]` saves `["pl-a"]`; a Bronze
+  source keeps `ingest_job`. This adds TypeScript to the PR, so the bun
+  checks run.
+
+#### BLOCKER
+
+1. **The SUCCESS-run window is the deployment's, not the table's (D1).**
+   `authored_factory.py` (`_latest_ingest_record_for_table`, ~:1085) joins
+   the 20 newest materializations of `bronze.<table>` with the 20 newest
+   `ingest_job` SUCCESS runs *of every connector*. Twenty loads of other
+   tables after this table's own SUCCESS run push it out of the second
+   window, so the chain waits with a false reason ("no SUCCESS run that
+   loaded '<table>' in its last 20 loads"); a busy deployment or a chain
+   like `["ingest_job", "pl-a"]` whose other upstream lands hours later
+   hits it. Key the run lookup on the materializations instead:
+   `instance.get_run_records(filters=RunsFilter(run_ids=[m.run_id for m in
+   materializations.records], statuses=[DagsterRunStatus.SUCCESS]),
+   limit=PER_TABLE_UPSTREAM_SCAN_LIMIT)` (`RunsFilter.run_ids` exists in
+   the pinned 1.13.20; still one bounded call per tick, so 5.1's reason
+   for rejecting per-run lookups still holds). Test: more than 20 SUCCESS
+   runs of other tables after the table's own SUCCESS run, and the stub
+   must honour `run_ids` and `statuses` (SHOULD-FIX 5).
+2. **The Handoff states things the history does not show (rule 7).** Line
+   211 says `docs/ARCHITECTURE.md` was updated; it is not in the diff.
+   Line 216 says the merge resolved conflicts in `docs/CI.md`,
+   `docs/OPERATIONS.md` and `CHANGELOG.md`; the merge commit's own message
+   and `git show --cc 1694b060` show the only conflicts in
+   `authored_factory.py` and its test. Correct both.
+3. **Test counts quoted for a commit they cannot belong to (rule 7).** T1
+   (`5e1494ad`) has 79 test functions; HEAD has 87; the Handoff gives the
+   same "87 passed, 218 warnings in 10.69s" for both. And "in the partial
+   runs executed before the 600 s limit, all executed tests passed" has no
+   command or counts. Quote only runs you made, on the commit you name;
+   anything else is *not verified*.
+
+#### SHOULD-FIX
+
+1. The stale-anchor skip (`authored_factory.py` ~:1315, "no SUCCESS run
+   after the downstream's most-recent start") does not name the table for a
+   per-table upstream, and is false when other tables loaded after that
+   start. Name the table (D4).
+2. Stale line anchors (rule 1): `authored_factory.py` cites
+   `ingest_factory.py:1268` and `:1263` (also `test_authored_factory.py`
+   ~:1710); after the merge they are ~:1498 and ~:1493. Prefer the
+   function or symbol name over a line number.
+3. Stale names: `validate_file_ingest_upstream` / `FILE_INGEST_SCAN_LIMIT`
+   are still cited in `test_authored_factory.py` (~:1602),
+   `src/features/pipelines/pipeline-reupload-trigger.ts`,
+   `src/services/contracts/pipelines.ts` (~:246) and `docs/OPERATIONS.md`
+   (~:530, whose "last 20 loads of its job" wording must follow B1).
+4. The console, per R1.
+5. Stub tests: the FAILED `broken` run in `test_authored_factory.py`
+   (~:1812, ~:1830) is built but never given to the stub, and
+   `_StubInstance.get_run_records` ignores `statuses`, so dropping
+   `statuses=[SUCCESS]` would pass them. Make the stub honour the filters
+   and feed it the failed run.
+6. T2: add the `ingest_job` refusal test on **create** (only
+   `file_ingest_job` is tested there; update and restore are covered).
+7. Gate (`ops/g7/g7_pipeline_test.py`): assert the Silver row count it
+   prints (~:866; the module doc and CHANGELOG claim it); turn
+   `requests.HTTPError` from `_chain_run_ids` / `_dagster_run_status` into
+   `G7Failure`; make `_dependency_sensor_has_ticked` fail fast on 401/5xx
+   instead of a misleading 300 s timeout; say in the Handoff that the gate
+   loads A then B (the plan said B then A; it still separates the bug,
+   because A's anchor is then stale and B would fire under the old rule).
+   Then re-run the gate from a clean project on the **final** head and
+   quote it; until then G7 on the merged head is *not verified* (rule 8;
+   CI on #189 is the other proof).
+8. `CHANGELOG.md` (~:340): quote the real skip reason, do not say a
+   non-Bronze row "waits with that same reason" (the sensor's text is
+   different), drop "up to a dozen times a day" (unmeasured), and do not
+   claim the output "carries the rows" until SHOULD-FIX 7 asserts it.
+9. `dc18159e` is a "wip:" commit. Leave history as it is (no force-push on
+   a pushed branch); the PR is merged as a merge commit, so name what it
+   contains in the Handoff.
