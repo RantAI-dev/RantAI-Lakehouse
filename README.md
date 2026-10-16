@@ -462,15 +462,15 @@ issue about any of the following — they're known, not bugs:
   therefore still runs out-of-band via a Trino-as-cron container (`trino`
   compose profile, ADR 0009); a deployment that never enables that profile
   accumulates small Bronze files unbounded.
-- **Bronze snapshot history is currently unbounded.** This follows from the
-  line above and is an operational gap now, not a future one: nothing
-  expires snapshots. ClickHouse 26.8 refuses `expire_snapshots` for
-  catalog-backed tables, the maintenance job probes it each run and logs
-  the live refusal rather than skipping silently, and Lakekeeper-side
-  expiry does not exist yet. ADR 0004 deferred retention to P4; with P5
-  CDC volume landing continuously, metadata grows without a bound until
-  that is built. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` and
-  `docs/plans/G3-RESULT.md`.
+- **Bronze snapshot history has a default 7-day retention floor (OPS-1), but requires the `trino` profile to actually run expiry.**
+  Tables without an explicit governance policy or with `snapshotsToKeep: None`
+  expire snapshots older than 7 days when `bronze_maintenance_job` runs.
+  Because ClickHouse 26.8 refuses `expire_snapshots` for catalog-backed
+  tables, expiry is dispatched via Trino (`ALTER TABLE iceberg.<ns>."<name>" EXECUTE expire_snapshots(retention_threshold => '7d')`).
+  Deployments that do not enable the `trino` compose profile skip expiry
+  with a logged warning, leaving snapshot growth unbounded until Trino is
+  started or Lakekeeper gains native retention support. See
+  `docs/adr/0004-bronze-naming-partitioning-retention.md`.
 - **A bare `count()` overcounts on CDC-fed Bronze tables — measured on
   26.3, not re-verified on the pinned 26.8.** Reproducing it needs a
   CDC-fed table carrying merge-on-read equality deletes, i.e. the full
