@@ -262,3 +262,108 @@ async fn a_refused_soft_delete_profile_fails_the_provisioning_call() {
         .unwrap_err();
     assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
 }
+
+fn deleted(id: &str, name: &str, ns: &[&str], typ: &str, at: &str) -> serde_json::Value {
+    json!({
+        "id": id, "name": name, "namespace": ns, "typ": typ,
+        "warehouse-id": "wh-1",
+        "created-at": "2026-10-01T00:00:00Z",
+        "deleted-at": at,
+        "expiration-date": "2026-10-23T00:00:00Z"
+    })
+}
+
+/// `DATA-15` F4: the deleted-tabulars list is read page by page, only a
+/// *table* of that namespace and name matches, and the newest drop wins.
+#[tokio::test]
+async fn find_deleted_table_pages_matches_exactly_and_picks_the_newest_drop() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .and(wiremock::matchers::query_param("pageToken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [deleted("t-new", "orders", &["bronze"], "table", "2026-10-16T09:00:00Z")]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [
+                deleted("t-old", "orders", &["bronze"], "table", "2026-10-10T09:00:00Z"),
+                deleted("t-view", "orders", &["bronze"], "view", "2026-10-15T09:00:00Z"),
+                deleted("t-other-ns", "orders", &["silver"], "table", "2026-10-15T09:00:00Z"),
+                deleted("t-other", "orders_archive", &["bronze"], "table", "2026-10-15T09:00:00Z")
+            ],
+            "next-page-token": "p2"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let found = client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap()
+        .expect("a dropped table");
+    assert_eq!(found.id, "t-new");
+    assert_eq!(found.expires_at, "2026-10-23T00:00:00Z");
+    assert!(
+        client
+            .find_deleted_table("wh-1", "bronze", "nothing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// `DATA-15` F4: undrop sends the table's id as a `table` target.
+#[tokio::test]
+async fn undrop_table_sends_the_table_id_as_a_table_target() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .and(body_json(
+            json!({"targets": [{"id": "t-1", "type": "table"}]}),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    client.undrop_table("wh-1", "t-1").await.unwrap();
+}
+
+/// `DATA-15` F4: a refused undrop is `Rejected`, and the warehouse lookup
+/// answers by name.
+#[tokio::test]
+async fn a_refused_undrop_is_rejected_and_a_warehouse_is_found_by_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/management/v1/warehouse/wh-1/deleted-tabulars/undrop",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "warehouses": [{"id": "wh-1", "name": "default"}]
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let err = client.undrop_table("wh-1", "t-1").await.unwrap_err();
+    assert!(matches!(err, OpenfgaError::Rejected), "{err:?}");
+    assert_eq!(
+        client
+            .find_warehouse_id("default")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("wh-1")
+    );
+    assert!(client.find_warehouse_id("other").await.unwrap().is_none());
+}

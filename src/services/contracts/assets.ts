@@ -481,6 +481,23 @@ export type GrantAccessInput = {
   permission: string
 }
 
+/**
+ * `GET /api/catalog/{id}/restore` (`DATA-15`): whether a dropped Iceberg
+ * table can be brought back. `supported: false` where restore does not
+ * apply (a `ClickHouse` table) or is not configured on the install;
+ * otherwise `restorable`, with the drop and expiry dates when a dropped copy
+ * is kept, and the `reason` when there is nothing to restore.
+ */
+export type AssetRestoreStatus =
+  | { supported: false; reason: string }
+  | {
+      supported?: undefined
+      restorable: boolean
+      reason?: string
+      droppedAt?: string
+      expiresAt?: string
+    }
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
   /**
@@ -581,6 +598,19 @@ export interface AssetService {
    * unknown e-mail, for oneself, and for a permission the user already holds.
    */
   grantAccess?(id: string, input: GrantAccessInput, signal?: AbortSignal): Promise<void>
+  /**
+   * `GET /api/catalog/{id}/restore` — whether the asset's dropped table can
+   * be restored. Optional for the same dead-fixture reason as
+   * `requestAccess`; no mock implements it.
+   */
+  getRestoreStatus?(id: string, signal?: AbortSignal): Promise<AssetRestoreStatus>
+  /**
+   * `POST /api/catalog/{id}/restore` — undrop the table (needs
+   * `governance:write`). Refused with the server's sentence when a table of
+   * that name exists again (409), nothing is kept (404) or the window has
+   * passed (410).
+   */
+  restoreTable?(id: string, signal?: AbortSignal): Promise<void>
   /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
   revokeGrant?(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

@@ -194,6 +194,8 @@ function stubApi({
   annotationRefusal,
   grants = [],
   grantRefusal,
+  tableMissing = false,
+  restore = { restorable: false, reason: "no dropped copy of this table is kept" },
 }: {
   permissions?: string[]
   lineage?: unknown
@@ -207,6 +209,10 @@ function stubApi({
   grants?: unknown[]
   /** When set, `POST .../grants` is refused with this status and sentence. */
   grantRefusal?: { status: number; error: string }
+  /** The Iceberg table is gone (404), as after a drop (`DATA-15`). */
+  tableMissing?: boolean
+  /** What `GET .../restore` answers. */
+  restore?: unknown
 } = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
@@ -214,6 +220,7 @@ function stubApi({
     if (method === "PUT" && path.endsWith("/annotation")) {
       return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
     }
+    if (path.endsWith("/restore")) return method === "GET" ? json(restore) : json({ ok: true })
     if (path.includes("/grants")) {
       if (method === "GET") return json({ grants })
       if (method === "POST") {
@@ -247,7 +254,9 @@ function stubApi({
     if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
     if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
-    if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
+    if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) {
+      return tableMissing ? json({ error: "table not found" }, 404) : json(TABLE)
+    }
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
 }
@@ -1562,6 +1571,45 @@ describe("Sample tab: the data preview", () => {
       fireEvent.keyDown(cityName, { key: "End" })
       expect(document.activeElement).toBe(within(headerOf("free")).getByRole("button", { name: "free" }))
     })
+  })
+})
+
+describe("Activity tab: a dropped table", () => {
+  const DROPPED = { restorable: true, droppedAt: "2026-10-16T08:00:00Z", expiresAt: "2026-10-23T08:00:00Z" }
+
+  it("says when the table was dropped and offers Restore until the window ends, then reloads the table", async () => {
+    const fetchSpy = stubApi({ tableMissing: true, restore: DROPPED })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText("No Iceberg table for this asset")).toBeTruthy()
+    expect(await screen.findByText("It was dropped on October 16, 2026. It can be restored until October 23, 2026.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Restore (until October 23, 2026)" }))
+    await waitFor(() =>
+      expect(writes(fetchSpy).some((w) => w[0] === "POST" && w[1] === "/api/catalog/demo-orders/restore")).toBe(true)
+    )
+    // The table is read again after the restore.
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/api/lakehouse/tables/bronze/demo_orders")).length).toBeGreaterThan(1)
+    )
+  })
+
+  it("offers no Restore to a reader without governance:write, but still says when it was dropped", async () => {
+    stubApi({ tableMissing: true, restore: DROPPED, permissions: ["catalog:read"] })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText(/It was dropped on October 16, 2026/)).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Restore/ })).toBeNull()
+  })
+
+  it("shows only the reason where nothing can be restored", async () => {
+    stubApi({ tableMissing: true })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText("no dropped copy of this table is kept")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Restore/ })).toBeNull()
   })
 })
 

@@ -581,6 +581,53 @@ async fn a_seeded_data_engineer_is_denied_all_three_catalog_grant_routes() {
     assert_eq!(stored, 0, "a refused grant must store nothing");
 }
 
+/// `DATA-15` F4: undropping a table needs `governance:write`. A seeded Data
+/// Engineer holds `catalog:write` but not `governance:write`, so the
+/// permission middleware refuses `POST /api/catalog/{id}/restore` with the
+/// permission named; the status read (`catalog:read`) is not refused by it.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_the_undrop_but_not_the_restore_status() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let resp = request_with_cookie(
+        &router,
+        "POST",
+        "/api/catalog/commerce_orders/restore",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: governance:write"),
+    );
+
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/catalog/commerce_orders/restore",
+        &cookie,
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    if resp.status() == StatusCode::FORBIDDEN {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_ne!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: catalog:read"),
+            "catalog:read must pass the permission middleware"
+        );
+    }
+}
+
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
 /// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
 /// reuse the catalog's read permission.

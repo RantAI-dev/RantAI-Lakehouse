@@ -3,6 +3,7 @@ import type {
   Asset,
   AssetDetail,
   AssetGrant,
+  AssetRestoreStatus,
   AssetProfile,
   AssetFilter,
   CatalogNamespace,
@@ -182,6 +183,20 @@ export const clickhouseAssetService: AssetService = {
     });
     const json = await res.json().catch(() => null);
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to grant access");
+  },
+  async getRestoreStatus(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/restore`, { signal });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to check whether the table can be restored");
+    return json as AssetRestoreStatus;
+  },
+  async restoreTable(id, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/restore`, {
+      method: "POST",
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to restore the table");
   },
   async revokeGrant(id, grantId, signal) {
     const res = await apiFetch(

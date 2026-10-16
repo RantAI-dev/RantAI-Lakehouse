@@ -230,6 +230,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/catalog/{id}/grants",                 Policy::RequiresPermission("access:approve")),
     ("DELETE", "/api/catalog/{id}/grants/{grant_id}",    Policy::RequiresPermission("access:approve")),
 
+    // DATA-15 F4: whether a dropped table can come back (anyone who can see
+    // the asset), and bringing it back (a governance decision, like the
+    // certification mark and unlike an edit of the details).
+    ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
+
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
     //    as the dataset registry above. ────────────────────────────────────
@@ -840,6 +846,20 @@ mod tests {
     fn the_certification_write_needs_governance_write() {
         assert_eq!(
             policy_for("PUT", "/api/catalog/{id}/certification"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-15` F4: the restore status is `catalog:read`; undropping a table
+    /// is `governance:write`.
+    #[test]
+    fn restore_status_needs_catalog_read_and_the_undrop_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/restore"),
             Some(Policy::RequiresPermission("governance:write"))
         );
     }

@@ -28,11 +28,12 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { useAuth } from "@/features/auth/auth-provider"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { assetSnapshotQueryHref } from "@/lib/asset-query"
 import { snapshotRetentionText } from "@/lib/snapshot-picker"
 import {
   formatCompactNumber,
+  formatDate,
   formatDateTime,
   formatLagSeconds,
   formatNumber,
@@ -47,7 +48,7 @@ import {
 import { fmtMeasured, type Measured } from "@/lib/measured"
 import { notifyError, notifySuccess } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
-import { governanceService } from "@/services"
+import { assetService, governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { DatasetSla } from "@/services/contracts/governance"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
@@ -108,6 +109,62 @@ function signed(value: Measured, sign: "+" | "−") {
 }
 
 /**
+ * Where the asset's Iceberg table is missing: says so and, when the catalog
+ * still keeps a dropped copy, when it was dropped and until when it can come
+ * back (`DATA-15` F4). A holder of `governance:write` gets Restore; after it
+ * the page reloads the table. Where restore does not apply, or nothing is
+ * kept, only the plain sentence shows, with the reason when there is one.
+ */
+function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored: () => void }) {
+  const { hasPermission } = useAuth()
+  const status = useService(
+    (s) => (assetService.getRestoreStatus ? assetService.getRestoreStatus(a.id, s) : Promise.resolve(null)),
+    [a.id]
+  )
+  const restore = useServiceAction((signal) => {
+    if (!assetService.restoreTable) return Promise.reject(new Error("This deployment cannot restore a table."))
+    return assetService.restoreTable(a.id, signal)
+  })
+  const restorable = status.status === "success" && status.data && status.data.supported === undefined && status.data.restorable
+    ? status.data
+    : null
+  const reason =
+    status.status === "success" && status.data && !restorable
+      ? status.data.reason
+      : undefined
+
+  async function run() {
+    if ((await restore.run()) === null) {
+      notifyError("Failed to restore the table", restore.error)
+      return
+    }
+    notifySuccess("Table restored")
+    onRestored()
+  }
+
+  return (
+    <EmptyState
+      title="No Iceberg table for this asset"
+      description={
+        restorable?.droppedAt
+          ? `It was dropped on ${formatDate(restorable.droppedAt)}.${
+              restorable.expiresAt ? ` It can be restored until ${formatDate(restorable.expiresAt)}.` : ""
+            }`
+          : reason
+      }
+      action={
+        restorable && hasPermission("governance:write") ? (
+          <Button size="sm" onClick={() => void run()} disabled={restore.status === "pending"}>
+            {`Restore${restorable.expiresAt ? ` (until ${formatDate(restorable.expiresAt)})` : ""}`}
+          </Button>
+        ) : undefined
+      }
+      className="py-4"
+    />
+  )
+}
+
+/**
  * The asset's Iceberg snapshots, newest first — one per load — from the
  * table the whole page shares (`useIcebergTable`). Each can be queried as
  * the table stood right after it. A `not_found` means the registry's
@@ -127,7 +184,7 @@ function IcebergSnapshots({
   if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
   if (state.status === "error") {
     if (state.error.code === "not_found") {
-      return <QuietEmpty title="No Iceberg table for this asset" />
+      return <DroppedTable asset={a} onRestored={state.reload} />
     }
     return <ErrorState error={state.error} onRetry={state.reload} />
   }
