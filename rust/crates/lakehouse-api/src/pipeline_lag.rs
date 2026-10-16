@@ -1042,14 +1042,14 @@ async fn evaluate_upstream_chain(
                 behind_streak: 0,
             };
             pipelines::upsert_lag_state_conn(tx, &p_update).await.map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+                tracing::error!(%err, pipeline = %pipeline.id, "target lag: state row unwritable");
+                crate::upstream_error::report(
+                    &crate::upstream_error::STORE,
+                    crate::upstream_error::Class::Unavailable,
+                    &err.to_string(),
+                );
+                ApiError::Internal("the request could not be completed".to_owned())
+            })?;
             return Ok(Some(LagCheckOutcome {
                 decision: Decision::Wait,
                 run_key: state.requested_run_key.clone(),
