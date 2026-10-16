@@ -266,6 +266,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "serde error over the model's own tool arguments",
     ),
     (
+        "ai/tools/pipelines.rs",
+        "invalid targetLag: {err}",
+        "serde error over the model's own tool arguments, the same class as dashboards.rs above: it tells the model which of its `targetLag` fields is wrong, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
         "ai/tools/data.rs",
         "err.to_string().contains(\"UNKNOWN_DATABASE\")",
         "classification only: picks the supported:false answer",

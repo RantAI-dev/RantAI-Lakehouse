@@ -98,6 +98,7 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+#[allow(clippy::too_many_lines, reason = "dispatch arm per assistant tool")]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,

@@ -547,10 +547,13 @@ pub(super) async fn set_pipeline_target_lag(
     };
     let pool = match crate::routes::pipelines::pool(state) {
         Ok(pool) => pool,
-        Err(err) => return json!({ "error": err.to_string() }),
+        // Through `api_result_to_value`'s choke point, the same way the
+        // `apply_set_target_lag` error below it is returned: the rejection's
+        // own classified body, never this error value's text copied by hand.
+        Err(err) => return api_result_to_value::<()>(Err(crate::error::ApiRejection(err))).await,
     };
     let pipeline_id = if pipeline_arg.starts_with("pl-") {
-        pipeline_arg.to_string()
+        pipeline_arg.clone()
     } else {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM pipeline_definition WHERE name = $1 OR target = $1 LIMIT 1",
@@ -561,7 +564,7 @@ pub(super) async fn set_pipeline_target_lag(
         .unwrap_or(None);
         match row {
             Some((id,)) => id,
-            None => pipeline_arg.to_string(),
+            None => pipeline_arg.clone(),
         }
     };
     let res = crate::routes::authored_pipelines::apply_set_target_lag(
