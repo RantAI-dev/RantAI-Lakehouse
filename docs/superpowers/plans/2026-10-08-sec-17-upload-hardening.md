@@ -274,3 +274,64 @@ developer's read-only count before the claim is accepted as built.
 - For the product owner: the job still builds a 50 MB header in memory
   before refusing it; the API refuses first, so this is reachable only by a
   load started without the API.
+
+## 9. Round 2 (2026-10-16): bring the branch up to `main`
+
+Planner: the Security & Delivery lane. The branch was 566 commits behind
+`origin/main`. `DATA-19` (#165, uploads feed pipelines) merged on
+2026-10-15 and changed the same upload code; this round waited for it.
+The feature page's decisions D1–D9 were signed by the product owner on
+2026-10-15 as built. The review of the merged result goes under §10.
+
+### Decisions already made
+
+- Merge, do not rebase: one merge commit. Nobody force-pushes this branch.
+- Conflicts expected in `docs/core/features/upload-file.md`,
+  `ops/g9/upload_test.py`, `lakehouse-api` `config.rs`, `lib.rs`,
+  `main.rs`, `routes/uploads.rs`, `state.rs`, `tests/query_download.rs`,
+  `lakehouse-store/tests/uploads.rs`, `src/features/connectors/upload-check-step.tsx`
+  and `upload-file-page.test.tsx`. Resolve hunk by hunk (rule 9); keep
+  both sides' intent; adapt this branch's code to `main`'s shapes.
+- `lakehouse-store/src/uploads.rs` merges without a textual conflict but
+  both sides changed it: read the merged `under_limits`,
+  `loads_under_limits`, `mark_ingesting_within_limits` and every function
+  `DATA-19` added, and make sure a load started by `DATA-19`'s new path
+  (an upload feeding a pipeline, a re-run on re-upload) is counted by the
+  same limits (D2–D4, D9) and settles the same way. If `DATA-19` added a
+  second way into `ingesting` that bypasses the limit check, that is a
+  gap: stop and report it with the anchors.
+- Upstream errors through `upstream_error` (SEC-11; `tests/sec11_guard.rs`
+  must pass). Config booleans `== "true"`; new settings in README and
+  `.env.example` (rule 5: no default credentials; `.env.example` is
+  must-set-free since `SEC-18`).
+
+### Tasks (one commit each, in order)
+
+**M1. Merge `origin/main`.** Acceptance: `cargo check -j 4 -p lakehouse-store -p lakehouse-api --all-targets`
+compiles; `bun run typecheck` passes.
+
+**M2. Make the merged branch pass** (separate commit, body lists each fix).
+Never weaken a test (rule 2); a `main` test that fails because of a
+SEC-17 decision is changed and named in the body.
+
+**M3. Verification on the final commit, foreground or detached-and-polled,
+under the heavy lock:**
+```
+cd rust && cargo fmt --check
+cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings
+RUST_TEST_THREADS=4 cargo test -j 4 -p lakehouse-store -p lakehouse-api --no-fail-fast
+```
+Quote the `test result:` line of EVERY test binary (about 70) and the
+totals; a failure in a suite this branch does not touch is rerun alone with
+`RUST_TEST_THREADS=2` before it is called flaky. Then `bun run typecheck`,
+`bun run lint`, `bun test src/lib`, `bun test src/services`,
+`bun test src/features/connectors` (counts); Dagster on Python 3.11 as CI:
+`cd dagster && ~/.cache/rantai-dagster-venv-311/bin/python -m pytest dispar_orchestrate -q -m "not loader"`;
+`python3 ops/lint/check_intra_package_imports.py`,
+`python3 -m py_compile ops/g9/upload_test.py`; gitleaks `dir` (ignore only
+an untracked, gitignored `.env`).
+
+### Out of scope
+
+Unchanged from §5. New gaps you notice outside SEC-17: list them in the
+handoff; the planner files them.
