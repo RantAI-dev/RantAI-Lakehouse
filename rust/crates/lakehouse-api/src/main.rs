@@ -29,6 +29,7 @@ mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
+mod pg_probe;
 mod pipeline_source;
 mod policy;
 mod policy_engine;

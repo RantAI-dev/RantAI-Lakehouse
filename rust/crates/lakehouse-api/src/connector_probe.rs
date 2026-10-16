@@ -8,8 +8,10 @@
 //! `host` shape `<endpoint>|<bucket>` is read only for a row with no
 //! adapter):
 //!
-//! - **`PostgreSQL`** (`sqlx`, already a `lakehouse-api` dependency for
-//!   `lakehouse-store`) — opens a real connection and runs `SELECT 1`.
+//! - **`PostgreSQL`** ([`crate::pg_probe`], `SEC-14` part B) — a minimal
+//!   TLS-first client that authenticates only with `SCRAM-SHA-256` and runs
+//!   `SELECT 1`; `sqlx` still backs discovery, listing and deprovisioning,
+//!   never the connection test.
 //! - **S3-compatible object storage** (`object_store`, already a workspace
 //!   dependency via `lakehouse-iceberg`) — does an authenticated
 //!   `list_with_delimiter` (a cheap, bounded listing call; no data read or
@@ -139,7 +141,7 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use sqlx::Connection;
 use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
@@ -1381,6 +1383,13 @@ async fn probe_postgres(
 /// legacy `host` string) and [`probe_dial`] (a `sql`/`cdc` adapter's
 /// `dial`). `resolve_checked` runs FIRST, before `secret_ref` is resolved —
 /// the same SSRF ordering every other probe here keeps.
+///
+/// Since `SEC-14` part B (E2/D8) this dial is [`crate::pg_probe`], not
+/// `sqlx`: the test must refuse a server that asks for a cleartext or MD5
+/// password rather than answer it, which `sqlx` offers no way to do, and it
+/// upgrades to TLS before the startup packet, so no credential can leave
+/// over a plaintext channel. `sqlx` still backs the other Postgres dials
+/// (discovery, listing, deprovisioning), which now require TLS too.
 async fn dial_postgres(
     target: &PgDialTarget<'_>,
     secret_ref: &str,
@@ -1400,32 +1409,23 @@ async fn dial_postgres(
             ));
         }
     };
-    let options = pg_connect_options(
-        &approved,
-        target.user,
-        password.expose_secret(),
-        target.database,
-        ca,
-    );
-
     let started = Instant::now();
-    let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
-        let mut conn = PgConnection::connect_with(&options).await?;
-        sqlx::query("SELECT 1").execute(&mut conn).await?;
-        conn.close().await
-    })
+    // `pg_probe` speaks the protocol itself so it can refuse every
+    // authentication method but SCRAM-SHA-256, and it requires TLS before
+    // the startup packet (D5/D8). The credential stays a `SecretValue` and
+    // is exposed only inside the SCRAM computation.
+    let attempt = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        crate::pg_probe::connect_and_select(target, &approved, &password, ca),
+    )
     .await;
     let elapsed = started.elapsed();
 
     match attempt {
         Ok(Ok(())) => Outcome::success(elapsed, "Connected via PostgreSQL and ran SELECT 1."),
-        Ok(Err(err)) => Outcome::failure(
-            elapsed,
-            format!(
-                "PostgreSQL connection failed: {}",
-                classify_sqlx_error(&err)
-            ),
-        ),
+        // `PgProbeError`'s Display is one fixed class per failure kind, never
+        // upstream text (`SEC-11`).
+        Ok(Err(err)) => Outcome::failure(elapsed, format!("PostgreSQL connection failed: {err}")),
         Err(_) => Outcome::failure(
             elapsed,
             format!(

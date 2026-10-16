@@ -83,17 +83,31 @@ croner = { version = "4" }
 # 0.63 verified latest via docs.rs/sqlparser/latest as of 2026-10-14;
 # `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
 sqlparser = "0.63"
-# SEC-14 part B (D5): the TLS a connector dial makes. First used by the
-# test-only TLS-terminating proxy in front of the shared test Postgres
-# (`lakehouse-api::tls_proxy`), and by the Postgres connection test's own
-# client, which speaks the wire protocol itself so it can refuse every
-# authentication method but SCRAM-SHA-256 (`lakehouse-api::pg_probe`).
+# SEC-14 part B (E2, D5/D8): the Postgres connection test speaks the wire
+# protocol itself (`lakehouse-api::pg_probe`) so it can refuse every
+# authentication method but SCRAM-SHA-256, which `sqlx` offers no way to
+# do. This is the crate `sqlx`'s own Postgres driver is built on; MIT OR
+# Apache-2.0.
+postgres-protocol = "0.6"
+# `postgres-protocol`'s `SaslMechanisms` is a
+# `fallible_iterator::FallibleIterator`, and reading its mechanisms needs the
+# trait in scope. Declared directly because `postgres-protocol` already pulls
+# the crate in, so it adds no package of its own. MIT OR Apache-2.0.
+fallible-iterator = "0.2"
+# `postgres-protocol` frames messages in `bytes::BytesMut`; already in
+# `Cargo.lock` (a `tokio`/`sqlx` dependency) -- this is the first direct use.
+bytes = "1"
+# SEC-14 part B (D5): the TLS a connector dial makes. Used by the
+# connection test's own client and by the test-only TLS-terminating proxy in
+# front of the shared test Postgres (`lakehouse-api::tls_proxy`).
 # `default-features = false` with `ring`, not the default `aws_lc_rs`, so the
 # workspace keeps one rustls provider story and matches
 # `sqlx`/`tiberius`/`reqwest`, which all use `ring` on rustls 0.23.
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-# `ClientConfig`/`ServerConfig` and the `require`-posture certificate
-# verifier are built against the rustls `tokio-rustls` above re-exports.
+# `ClientConfig`/`ServerConfig`, the `require`-posture certificate verifier,
+# and `rustls::pki_types` (the `CertificateDer` PEM reader `pg_probe` uses for
+# `CONNECTOR_TLS_CA_FILE`) all come from the rustls `tokio-rustls` above
+# re-exports, so no direct `rustls-pki-types` dependency is needed.
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 
 [workspace.lints.rust]

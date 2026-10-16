@@ -137,6 +137,16 @@ parquet = "58"
 # rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104, no fixed 0.101.x);
 # the 0.13 line is on rustls 0.23 -> webpki 0.103.15, all three fixed.
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# SEC-14 part B (`pg_probe`): the Postgres connection test speaks the wire
+# protocol itself, so it can refuse every authentication method but
+# SCRAM-SHA-256, and always upgrades to TLS before the startup packet. See
+# the workspace `Cargo.toml` entries for what each crate is and why it is
+# here.
+postgres-protocol = { workspace = true }
+fallible-iterator = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
@@ -206,12 +216,6 @@ rsa = "0.9"
 # leak). `ring` and no `crypto` defaults, matching the workspace's one
 # rustls provider story (the workspace `rustls` entry); MIT OR Apache-2.0.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
-# `tls_proxy.rs`, the TLS-terminating proxy the tests that dial a database
-# through the production helper need. Both move to `[dependencies]` with the
-# Postgres connection test's own client (`pg_probe`), which uses them for a
-# client connection rather than a server one.
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
 
 tempfile = { workspace = true }
 
