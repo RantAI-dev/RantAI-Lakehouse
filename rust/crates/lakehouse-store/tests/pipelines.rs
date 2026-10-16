@@ -1988,10 +1988,10 @@ async fn target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values(
             .await
             .unwrap_or_else(|e| panic!("{accepted} seconds must be accepted: {e}"));
     }
-    // 60 s is under the measured 2-minute floor, 604801 over the 7-day
-    // ceiling, and 90 s is inside the range but not a whole number of
-    // minutes — the wire format has no way to ask for it.
-    for refused in [60_i32, 90, 604_801] {
+    // BLD-2 review R2 SHOULD-FIX 5: 60 s is under the measured 2-minute floor,
+    // 604801 over the 7-day ceiling, and 150 s is inside the range (120..=604800)
+    // but not a whole number of minutes (90 s is below the 2-minute floor).
+    for refused in [60_i32, 150, 604_801] {
         let result =
             sqlx::query("UPDATE pipeline_definition SET target_lag_seconds = $2 WHERE id = $1")
                 .bind(&created.id)

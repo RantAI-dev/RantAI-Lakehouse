@@ -1385,10 +1385,20 @@ async fn decide(
         }
     }
 
-    let status = if never_consumed || lag_seconds > target {
-        LagStatus::Behind
+    // BLD-2 review R2 decision R10: retries exhausted reads behind whatever the lag
+    let (status, reason) = if state.request_attempt > max_retries {
+        let n = max_retries + 1;
+        (
+            LagStatus::Behind,
+            format!("the last {n} runs for this change failed; the next input change starts again"),
+        )
     } else {
-        LagStatus::Met
+        let st = if never_consumed || lag_seconds > target {
+            LagStatus::Behind
+        } else {
+            LagStatus::Met
+        };
+        (st, reason_for(st, never_consumed).to_owned())
     };
     Ok(LagCheckOutcome {
         decision,
@@ -1398,7 +1408,7 @@ async fn decide(
         lag_seconds: Some(lag_seconds),
         target_seconds,
         behind_streak: 0,
-        reason: Some(reason_for(status, never_consumed).to_owned()),
+        reason: Some(reason),
     })
 }
 
@@ -3141,7 +3151,86 @@ mod tests {
             "stops requesting after max_retries + 1 attempts"
         );
         assert_eq!(c3.status, LagStatus::Behind, "status stays behind");
+        assert_eq!(
+            c3.reason.as_deref(),
+            Some("the last 2 runs for this change failed; the next input change starts again")
+        );
         assert!(c3.run_key.is_none(), "no run key requested");
+
+        // BLD-2 review R2 decision R10 / SHOULD-FIX 5: consumed-before case.
+        // Even when lag (30s) is within target (10m = 600s), exhausted retries
+        // must read behind with the exhausted reason, not met.
+        let pipe_consumed = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "pl-retry-consumed".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "orders_clean2".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: None,
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-retry-consumed".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create pipeline");
+
+        let t_past = t0 - time::Duration::seconds(30);
+        let old_tokens = tokens_of(&[("bronze.orders", "iceberg:7")]);
+        let new_tokens = tokens_of(&[("bronze.orders", "iceberg:8")]);
+        let update_consumed = LagStateUpdate {
+            pipeline_id: pipe_consumed.id.clone(),
+            tenant_id: pipe_consumed.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&old_tokens)),
+            consumed_at: Some(t_past),
+            pending_since: Some(t_past),
+            requested_run_key: None,
+            requested_tokens: Some(tokens_to_json(&new_tokens)),
+            requested_at: None,
+            request_attempt: 2,
+            last_check_at: t0,
+            last_status: "behind".to_owned(),
+            behind_streak: 2,
+        };
+        pipelines::upsert_lag_state(&pool, &update_consumed)
+            .await
+            .unwrap();
+
+        let (dagster_fail2, _s3) = dagster_with(&job_name("pl-retry-consumed"), None, &[]).await;
+        let c_consumed = run_lag_check(
+            &pool,
+            &dagster_fail2,
+            &reader,
+            &pipe_consumed,
+            &[source_input()],
+            t0,
+        )
+        .await
+        .expect("check consumed-before with retries exhausted");
+
+        assert_eq!(c_consumed.decision, Decision::Wait);
+        assert_eq!(
+            c_consumed.status,
+            LagStatus::Behind,
+            "retries exhausted reads behind even when lag is within target"
+        );
+        assert_eq!(
+            c_consumed.reason.as_deref(),
+            Some("the last 2 runs for this change failed; the next input change starts again")
+        );
     }
 
     /// BLD-2 review R1 BLOCKER 5: downstream keeps P's outstanding `requested_run_key`

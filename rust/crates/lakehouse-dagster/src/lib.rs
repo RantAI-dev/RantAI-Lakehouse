@@ -3947,8 +3947,9 @@ mod tests {
         assert!(other.schedules.is_empty());
     }
 
-    /// BLD-2: the lag check looks a requested run up by its `runKey`, so
-    /// BLD-2 review R1 SHOULD-FIX 11: tags filter and ordered by creationTime
+    /// BLD-2: the lag check looks a requested run up by its `runKey`.
+    /// BLD-2 review R1 SHOULD-FIX 11 / R2 SHOULD-FIX 5: tags filter and ordered by creationTime
+    /// (differing creationTime and startTime prove ordering is by creationTime, not startTime).
     #[tokio::test]
     async fn find_run_by_run_key_sends_the_key_as_a_variable_and_returns_the_newest() {
         use wiremock::matchers::body_partial_json;
@@ -3961,9 +3962,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
                     { "runId": "old", "jobName": "authored__pl-x", "status": "SUCCESS",
-                      "startTime": 100.0, "endTime": 160.0, "creationTime": 100.0 },
+                      "startTime": 120.0, "endTime": 160.0, "creationTime": 100.0 },
                     { "runId": "new", "jobName": "authored__pl-x", "status": "STARTED",
-                      "startTime": 900.0, "creationTime": 900.0 }
+                      "startTime": 950.0, "creationTime": 900.0 }
                 ] } }
             })))
             .mount(&server)
@@ -3977,7 +3978,7 @@ mod tests {
             .expect("a run carries that key");
         assert_eq!(run.run_id, "new");
         assert_eq!(run.status, "STARTED");
-        assert_eq!(run.start_time, Some(900.0));
+        assert_eq!(run.start_time, Some(950.0));
     }
 
     /// No run with that key is the orchestrator's normal "not created
