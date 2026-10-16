@@ -24,6 +24,7 @@
 
 mod alerts;
 mod ask;
+mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
@@ -99,6 +100,17 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+///
+/// The match is the registry-to-domain lookup and nothing more: 66 arms
+/// naming a tool, plus a catch-all, over 16 per-domain modules. All but
+/// `create_chart | update_chart` are a one-line delegation; that one reads
+/// the report time zone first, because a chart's SQL is built in it (`BI-9`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lookup table over 16 domain modules, 65 of its 66 arms a \
+              one-line delegation; the split by domain already happened, so \
+              splitting the table itself would only scatter that lookup"
+)]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,
@@ -151,6 +163,12 @@ pub(in crate::routes) async fn run_tool(
         "list_charts" => dashboards::list_charts(ch).await,
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "rename_board"
+        | "delete_board"
+        | "arrange_board"
+        | "move_chart"
+        | "set_board_view_filters"
+        | "save_board_filters" => boards::run(state, principal, name, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,

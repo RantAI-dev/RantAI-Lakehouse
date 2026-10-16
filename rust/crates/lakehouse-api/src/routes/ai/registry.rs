@@ -619,6 +619,123 @@ fn delete_calculated_field_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── AI-1 / AI-2 / AI-20: dashboard-board tools (plan 20) ────────────────
+
+/// The `FilterDef` JSON schema shared by `set_board_view_filters` and
+/// `save_board_filters`. The values are read from
+/// `lakehouse_bi::filters::{FilterOp, RelativeUnit, RelativeAnchor}` so
+/// the schema cannot drift from what the server accepts. The shape and
+/// the per-op requirements mirror `validate_filters` /
+/// `FilterDef::validate`.
+fn filter_def_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "column": { "type": "string" },
+            "values": { "type": "array", "items": { "type": "string" } },
+            "op": {
+                "type": "string",
+                "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"],
+                "description": "How the column is compared; absent means in."
+            },
+            "min": { "type": "string", "description": "between only: a number or an ISO date YYYY-MM-DD" },
+            "max": { "type": "string", "description": "between only: a number or an ISO date YYYY-MM-DD" },
+            "minExclusive": { "type": "boolean", "description": "between only: true leaves min out (after, not from)" },
+            "maxExclusive": { "type": "boolean", "description": "between only: true leaves max out (before, not to)" },
+            "unit": {
+                "type": "string",
+                "enum": ["day", "week", "month", "quarter", "year"],
+                "description": "relative only: the unit of the period"
+            },
+            "n": { "type": "integer", "minimum": 1, "maximum": 3650, "description": "relative only with anchor last: how many units back from today" },
+            "anchor": {
+                "type": "string",
+                "enum": ["last", "this", "previous", "next"],
+                "description": "relative only: which period"
+            },
+            "text": { "type": "string", "description": "contains / starts_with / ends_with / not_contains only: the needle" },
+            "required": { "type": "boolean", "description": "saved-default only: the console may not remove this filter" }
+        },
+        "required": ["column"]
+    })
+}
+
+/// The `filters` array property shared by `set_board_view_filters` and
+/// `save_board_filters`. `MAX_FILTERS` is the `lakehouse_bi` limit.
+fn filters_array_property() -> Value {
+    json!({
+        "type": "array",
+        "items": filter_def_schema(),
+        "maxItems": 20,
+        "description": "Filters to apply; up to 20. Each filter is a column plus how to compare it."
+    })
+}
+
+fn rename_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "rename_board",
+        "description": "Rename a board (by id). The built-in Main board refuses any name change. The same check the console runs applies.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" } },
+            "required": ["id", "name"] } } })
+}
+
+fn delete_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_board",
+        "description": "Delete a board (by id) and every chart on it. The built-in Main board refuses. Needs human approval before it runs; the approval message names the board and says its charts are deleted with it.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn arrange_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "arrange_board",
+        "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change; the rest keep their boxes. Refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tiles": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "minimum": 0, "maximum": 11 },
+                        "y": { "type": "integer", "minimum": 0 },
+                        "w": { "type": "integer", "minimum": 1, "maximum": 12 },
+                        "h": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["x", "y", "w", "h"]
+                },
+                "description": "Map of chart id to its new box on the 12-column grid. Each box is {x, y, w, h}; the tool refuses a chart not on this board, a box that does not fit the grid, or w or h below 1."
+            } },
+            "required": ["board", "tiles"] } } })
+}
+
+fn move_chart_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "move_chart",
+        "description": "Move a saved chart (by id) to another board. The chart's other fields stay the same; its tile is removed from the old board's layout.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "board": { "type": "string" } },
+            "required": ["id", "board"] } } })
+}
+
+fn set_board_view_filters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_board_view_filters",
+        "description": "Change the filters visible to the person on this page, this time only. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "filters": filters_array_property() },
+            "required": ["board", "filters"] } } })
+}
+
+fn save_board_filters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "save_board_filters",
+        "description": "Save a board's default filters, so the next person to open the board sees them. Use only when the person asks to save for everyone. The built-in Main board refuses.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "filters": filters_array_property() },
+            "required": ["board", "filters"] } } })
+}
+
 // ── BI-10 value groups and hierarchies (with AI-6) ───────────────────────
 
 fn create_value_group_schema() -> Value {
@@ -1377,6 +1494,47 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // AI-1 / AI-2 / AI-20 (plan 20): dashboard-board tools. The
+    // permission mirrors the console route each tool stands in for
+    // (see POLICY_TABLE in `src/policy.rs`): every write takes
+    // `dashboard:write`; `set_board_view_filters` is a viewer-side
+    // no-op and takes `dashboard:read`, so Ask mode can offer it.
+    ToolSpec {
+        name: "rename_board",
+        schema: rename_board_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_board",
+        schema: delete_board_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "arrange_board",
+        schema: arrange_board_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "move_chart",
+        schema: move_chart_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "set_board_view_filters",
+        schema: set_board_view_filters_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "save_board_filters",
+        schema: save_board_filters_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
     // BI-2 / AI-7: reusable metrics. Reading, describing and querying need
     // `dashboard:read` (query_metric runs as the caller); the writes mirror
     // `/api/dashboard/metrics` and need `metric:write`; deleting asks for
@@ -1851,7 +2009,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_eighty_five_entries() {
+    fn tool_schemas_has_ninety_two_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -1864,8 +2022,10 @@ mod tests {
         // `create_parameter`, `update_parameter` and `delete_parameter` (`BI-11`)
         // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
         // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
-        // (`AI-12`, plan 15; merged from main).
-        assert_eq!(tool_schemas().len(), 86);
+        // (`AI-12`, plan 15; merged from main) + the 6 dashboard-board tools
+        // (plan 20: `rename_board`, `delete_board`, `arrange_board`,
+        // `move_chart`, `set_board_view_filters`, `save_board_filters`).
+        assert_eq!(tool_schemas().len(), 92);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,

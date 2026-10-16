@@ -261,6 +261,64 @@ once a first release is tagged.
   the attempt count on the shared `DEFAULT_RETRY_POLICY`; delay, backoff
   and jitter come from the shared policy. (R2)
 
+- The assistant manages dashboards (backlog `AI-1`, `AI-2`, `AI-20`; plan
+  `plans/20-the-assistant-renames-arranges-and-filters-dashboards.md`;
+  feature page `docs/core/features/assistant-manages-dashboards.md`;
+  decisions 2026-10-15). Six new assistant tools, each named after `board`
+  or `chart` so the console's capability test covers them unchanged:
+  `rename_board` (`dashboard:write`, WriteLow) renames a board through
+  `boards_update` with `{id, name}`; `delete_board` (`dashboard:write`,
+  WriteHigh) calls `boards_delete` after an approval whose reason names
+  the board and says its charts are deleted too; `arrange_board`
+  (`dashboard:write`, WriteLow) takes only the tiles that change
+  (`{chartId: {x, y, w, h}}`), reads the current layout, refuses a chart
+  id that is not on that board, refuses a box outside the 12-column grid
+  or with `w < 1` or `h < 1`, merges the boxes and saves through the
+  console's `boards_update` with `layout`; `move_chart` (`dashboard:write`,
+  WriteLow) reads the stored chart, changes only its board, saves through
+  the path `specs_update` uses, and removes the chart's tile from the old
+  board's layout; `set_board_view_filters` (`dashboard:read`, Read)
+  validates the filters with `validate_filters` and `without_inert`,
+  writes nothing, and returns the full list that should be active (an
+  empty list clears) — Read risk, so it is also offered in Ask mode;
+  `save_board_filters` (`dashboard:write`, WriteLow) saves the board's
+  default through `boards_update` with `{id, filters}` and is used only
+  when the person asks to save or to make it the default for everyone.
+  Each tool goes through the same console route handlers the console
+  uses (`tools/calc_fields.rs` pattern), so the same validation
+  (`board_edit_allowed`, `validate_filters`) and the same console
+  refusals carry through unchanged: the built-in `default` board accepts
+  only a layout, and `boards_update` with a non-layout field on it
+  refuses with the console's message. **Dashboard page applies a view
+  filter result.** When a chat reply's trace holds a
+  `set_board_view_filters` step with `ok: true` and its `board` is the
+  board on screen, the page writes the filters into the address with the
+  same helpers a chip change uses (`encodeFilters`, `filtersToParam`).
+  On any other board the step card shows a link to that board with the
+  filters in the address, built with the same helpers. The hook sits
+  beside the existing way the dock tells the page about a tool result
+  (`use-copilot.ts` handle for `create_chart`); no new global channel.
+  **Page context for the tools.** The assistant's page context gains
+  `summarizeGrain(shown, saved)`, new and beside `summarizeFilters`, so
+  the on-screen time grain (the override on the dashboard's grain
+  control) and the board's saved grain reach the prompt and the
+  dashboard page's effect dependency list. The active filters also enter
+  as compact JSON (`FilterDef[]`) within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap; when
+  over, the JSON is left out and the chip summary stays. **Limits.**
+  **Undo is not built** — boards have no version history yet; the row
+  waits for `BI-18` (version history part) and a new backlog row is
+  added for it (`AI-21`, P2, Planned, source `AI-1` spec). **Layout:
+  last write wins** — there is no undo and no version history. The
+  built-in **Main** board cannot be renamed, deleted or given default
+  filters. **View filters live in the address**, so they belong to the
+  person looking, not to the board; the board's saved default is
+  unchanged unless the person asks to save it. "Linked filters" named
+  in `docs/core/specs/ai-2.md` are not in the `BI-18` code at the base
+  the planner read; no code for it and the row is left unmet. The
+  `FilterDef` schema lists every `FilterOp` value and the relative-date
+  fields. The dashboard page context the assistant reads is gated by
+  the same permissions as before.
+
 ### Security
 
 - **History secret scan scoped to `HEAD` on `main` and pull requests (`SEC-36`, decisions D1–D2).** In `.github/workflows/security.yml`, the `history-scan` job no longer fetches all branches and runs `gitleaks detect` with `--log-opts="HEAD"`, scanning only `main`'s history or `main` plus the pull request's commits. Unrelated branches carrying findings (such as `#144`) no longer turn `main` or other pull requests red. A separate daily workflow (`.github/workflows/security-all-branches.yml`, cron `17 3 * * *` and `workflow_dispatch`) scans all branches across the repository history with `--log-opts="--all"`, failing loudly when any branch carries an un-baselined finding without blocking unrelated pull requests.

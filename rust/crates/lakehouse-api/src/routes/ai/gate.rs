@@ -18,12 +18,12 @@
 //!
 //! | Role | Loses copilot access to | Keeps |
 //! | --- | --- | --- |
-//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
+//! | Analyst (`query:read, catalog:read, lineage:read`) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` (need `dashboard:read`); `create_chart`/`update_chart`/`create_board`/`delete_chart`/`rename_board`/`delete_board`/`arrange_board`/`move_chart`/`save_board_filters` (need `dashboard:write`) | `run_sql`, `list_datasets`, `describe_dataset`, `get_lineage` |
 //! | Data Scientist (`query:read, feature:write, notebook:run`) | same dashboard tools as Analyst | `run_sql`, `list_datasets`, `describe_dataset` |
 //! | Approver (`agent:approve, policy:review`) | all dashboard tools; also `run_sql`/`list_datasets`/etc (no `query:read`/`catalog:read`) | — |
 //! | Governance Admin (`policy:*, residency:*, audit:read`) | all dashboard tools; data tools too (no `query:read`/`catalog:read`/`lineage:read`) | — |
 //! | Data Engineer (`pipeline:*, catalog:write, connector:manage`) | all dashboard tools | `trigger_lakehouse_build`, `get_build_status` (`pipeline:*`) |
-//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard` |
+//! | Dashboard Viewer (`dashboard:read`) | dashboard **writes** only (incl. the five new write tools) | `describe_mart`, `list_charts`, `list_boards`, `suggest_dashboard`, `set_board_view_filters` |
 //! | Platform Admin (`*:*`) | nothing | everything |
 //!
 //! This is **correct** — it matches exactly what each role can already do
@@ -132,6 +132,10 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
+        "delete_board" => format!(
+            "Menghapus board {} berikut seluruh chart di dalamnya secara permanen.",
+            s("id")
+        ),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
@@ -216,6 +220,56 @@ pub async fn create_write_high_approval(
     }
 }
 
+/// The `trigger_pipeline` arm of [`summary_for`], split out because it is
+/// the only arm that inspects a nested argument rather than reading a flat
+/// key. F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+/// f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9 gate had no
+/// `trigger_pipeline` arm, so the user confirmed a call without seeing WHICH
+/// pipeline the copilot was about to run, or whether it carried a `runConfig`
+/// override (the latter being the operationally interesting half, because a
+/// non-default config is what elevates the tool's risk to `WriteHigh` — see
+/// [`effective_risk`]).
+///
+/// The format follows the same Indonesian one-liner shape every other
+/// `WriteLow` arm produces, with the pipeline id and the top-level keys of
+/// `runConfig` when one was supplied. Listing the KEYS (not the values)
+/// matches [`crate::routes::pipelines::record_pipeline_audit`]'s own
+/// `configKeys` audit shape, so the chat confirmation and the audit row agree
+/// on what the run actually carried.
+fn pipeline_summary(args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
+    // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
+    // gate had no `trigger_pipeline` arm, so the user confirmed
+    // a call without seeing WHICH pipeline the copilot was
+    // about to run, or whether it carried a `runConfig`
+    // override (the latter being the operationally interesting
+    // half, because a non-default config is what elevates the
+    // tool's risk to `WriteHigh` — see [`effective_risk`]).
+    //
+    // The summary's format follows the same Indonesian one-liner
+    // shape every other `WriteLow` arm produces, with the
+    // pipeline id and the top-level keys of `runConfig` when
+    // one was supplied. Listing the KEYS (not the values)
+    // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
+    // own `configKeys` audit shape, so the chat confirmation and
+    // the audit row agree on what the run actually carried.
+    let pipeline_id = s("id");
+    match args.get("runConfig") {
+        Some(Value::Object(map)) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let keys_part = if keys.is_empty() {
+                "tanpa kunci konfigurasi".to_owned()
+            } else {
+                format!("dengan runConfig ({})", keys.join(", "))
+            };
+            format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
+        }
+        _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
+    }
+}
+
 /// A short, deterministic Indonesian sentence describing exactly what a
 /// [`Risk::WriteLow`] tool call is about to do, generated from the tool
 /// name and its (not yet stripped of `confirmed`) arguments — NEVER from
@@ -235,38 +289,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "trigger_lakehouse_build" => {
             "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
         }
-        "trigger_pipeline" => {
-            // F2.9 (PR #59 review, `plans/pipelines/day-1-fixes/
-            // f2-tenant-scope-and-run-config.md` Part D): the pre-F2.9
-            // gate had no `trigger_pipeline` arm, so the user confirmed
-            // a call without seeing WHICH pipeline the copilot was
-            // about to run, or whether it carried a `runConfig`
-            // override (the latter being the operationally interesting
-            // half, because a non-default config is what elevates the
-            // tool's risk to `WriteHigh` — see [`effective_risk`]).
-            //
-            // The summary's format follows the same Indonesian one-liner
-            // shape every other `WriteLow` arm produces, with the
-            // pipeline id and the top-level keys of `runConfig` when
-            // one was supplied. Listing the KEYS (not the values)
-            // matches [`crate::routes::pipelines::record_pipeline_audit`]'s
-            // own `configKeys` audit shape, so the chat confirmation and
-            // the audit row agree on what the run actually carried.
-            let pipeline_id = s("id");
-            match args.get("runConfig") {
-                Some(Value::Object(map)) => {
-                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-                    keys.sort_unstable();
-                    let keys_part = if keys.is_empty() {
-                        "tanpa kunci konfigurasi".to_owned()
-                    } else {
-                        format!("dengan runConfig ({})", keys.join(", "))
-                    };
-                    format!("Menjalankan pipeline {pipeline_id} {keys_part}.")
-                }
-                _ => format!("Menjalankan pipeline {pipeline_id} dengan konfigurasi bawaan."),
-            }
-        }
+        "trigger_pipeline" => pipeline_summary(args),
         "create_chart" => {
             // A chart reads either a mart or a dashboard SQL source; name
             // whichever one the call actually uses.
@@ -288,6 +311,32 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("kind")
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "rename_board" => format!(
+            "Mengganti nama board {} menjadi \"{}\".",
+            s("id"),
+            s("name")
+        ),
+        "arrange_board" => {
+            let n = args
+                .get("tiles")
+                .and_then(Value::as_object)
+                .map_or(0, Map::len);
+            format!(
+                "Menata ulang {n} tile pada board {} (grid 12 kolom, hanya tile yang disebut berubah).",
+                s("board")
+            )
+        }
+        "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        "save_board_filters" => {
+            let n = args
+                .get("filters")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!(
+                "Menyimpan {n} filter sebagai default board {} untuk semua pengguna.",
+                s("board")
+            )
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),

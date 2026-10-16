@@ -21,8 +21,9 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { summarizeFilters, summarizeParams, summarizeTiles } from "@/lib/page-context-summary";
+import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
+import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { ChartClick, LayoutMap, FilterDef, FilterField } from "@/services/clients/bi-store";
@@ -519,7 +520,43 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const results = data?.results ?? NO_RESULTS;
 
   // Tell Copilot what is on this dashboard — the built-in one included.
-  const { setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded } = useCopilot();
+  const {
+    messages: messagesFromCopilot,
+    setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded,
+  } = useCopilot();
+  // AI-2 (plan 20): a `set_board_view_filters` step in the most recent
+  // assistant answer applies when its `board` matches the board on screen —
+  // mirror what it set into the page address (`?f=`) with the same helper a
+  // chip change uses. A step for another board is ignored here; the step
+  // card carries the link instead.
+  const chatViewFilters = React.useMemo(
+    () => extractViewFiltersFromChat(messagesFromCopilot, board),
+    [messagesFromCopilot, board],
+  );
+  // Re-applying the same filters (a re-render of the same message) loops back
+  // through `writeAddress` and reloads the page; key on the filter JSON so a
+  // single apply is one navigation.
+  const chatViewFilterKey = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (chatViewFilters === null) return;
+    const key = JSON.stringify(chatViewFilters);
+    if (chatViewFilterKey.current === key) return;
+    chatViewFilterKey.current = key;
+    writeAddress(filtersToParam(chatViewFilters, defaultFilters));
+  }, [chatViewFilters, defaultFilters, writeAddress]);
+  // AI-2 (plan 20) — the page context carries the grain (shown, saved) and
+  // the active filters as compact JSON so the model's table context lists
+  // them in machine-readable form too. Each is bounded by its own budget;
+  // `summarizeFilterJson` returns `null` over budget so the chip text stays
+  // as the single source of truth.
+  const grainText = React.useMemo(
+    () => summarizeGrain(shownGrainValue, data?.grain),
+    [shownGrainValue, data?.grain],
+  );
+  const filterJson = React.useMemo(
+    () => summarizeFilterJson(filters, { maxChars: 4000 }),
+    [filters],
+  );
   React.useEffect(() => {
     // The numbers on screen, not just tile titles (plan §6): KPIs and tiles
     // with their first rows, and the filters in force. Built from data this
@@ -531,6 +568,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ],
       results,
     );
+    const filterLine = filterJson
+      ? `Active filters: ${summarizeFilters(filters)} (raw: ${filterJson}).`
+      : `Active filters: ${summarizeFilters(filters)}.`;
     setPageContext({
       key: "dashboard-view",
       title: `Working on "${dashName}"`,
@@ -541,14 +581,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       },
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `Active filters: ${summarizeFilters(filters)}. ` +
+        `${grainText}. ` +
+        `${filterLine} ` +
         `Parameters shown (a formula reads one as {name}; list_parameters has them all): ${summarizeParams(paramControls)}. ` +
         `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, kpis, results, filters, paramControls, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, grainText, filterJson, paramControls, setPageContext]);
 
   // Carry out a chart's saved click destination (BI-18·B) for the clicked
   // value. The server did not check that the target exists, so the console
