@@ -335,3 +335,39 @@ an untracked, gitignored `.env`).
 
 Unchanged from §5. New gaps you notice outside SEC-17: list them in the
 handoff; the planner files them.
+
+## 10. Review of round 2 (planner, 2026-10-16)
+
+Reviewed the merged result at `c1ce5fe8` (developer: MiniMax-M3; its
+quota ran out after M2, so there is no handoff for this round). The merge
+(`588b8b34`), `cargo fmt` (`a752d582`) and the `too_many_lines` split of
+`ingest` (`c1ce5fe8`, behaviour unchanged: the launch tail moved into
+`finish_launch_and_audit`) were read.
+
+The §9 semantic check holds: the only production path into `ingesting`
+is `mark_ingesting_within_limits` (`routes/uploads.rs`); the unlimited
+`mark_ingesting` is called only from a test (`routes/load_alerts.rs`,
+inside `#[cfg(test)]`), and `DATA-19`'s re-upload goes through the same
+route, so it is counted.
+
+Planner's runs on `c1ce5fe8`: `cargo fmt --check` ok; workspace clippy
+`-D warnings` exit 0; `cargo test -p lakehouse-store -p lakehouse-api
+--no-fail-fast`: 71 binaries, 4645 passed, 0 failed, 4 ignored;
+`bun run typecheck` exit 0; `bun run lint` 0 errors, 8 warnings;
+`bun test src/lib` 602 pass, 1 skip; `src/services` 79 pass; Dagster on
+Python 3.11 (`-m "not loader"`) 821 passed; imports lint OK;
+`py_compile ops/g9/upload_test.py` ok; gitleaks `dir` no leaks.
+
+**BLOCKER 1. One console test fails against `main`'s upload wizard.**
+`bun test src/features/connectors`: 241 pass, 1 fail —
+`UploadFilePage, limits > shows the too-many-uploads sentence for a file
+that was not accepted and sends again on the next press`
+(`src/features/connectors/upload-file-page.test.tsx`): "Unable to find a
+label with the text of: Choose a file". `main` reworked the wizard
+(`5bbca542`, `1dd235d1`, `9d6df397`); the label lives in
+`upload-file-step.tsx` and is rendered only in some states, so this test's
+second step looks for a control the new wizard does not show there. Fix
+the test to drive the current wizard to the same point (the refusal is
+shown, and pressing again sends again); do not change the component to fit
+the test, and do not weaken what the test asserts (rule 2). Check:
+`bun test src/features/connectors` 0 fail, the count quoted.
