@@ -37,6 +37,7 @@ mod overview;
 mod pipelines;
 mod quality;
 mod quality_incidents;
+mod quality_load;
 mod quality_schedules;
 mod query;
 mod schema_changes;

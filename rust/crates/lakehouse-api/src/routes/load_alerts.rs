@@ -122,13 +122,13 @@ impl Outcome {
 }
 
 /// Where a run's dedupe, summary and alerts hang: a connector that exists.
-struct ConnectorRef {
-    id: String,
-    name: String,
+pub(super) struct ConnectorRef {
+    pub(super) id: String,
+    pub(super) name: String,
 }
 
 /// What looking for the thing a run belongs to found.
-enum Found<T> {
+pub(super) enum Found<T> {
     This(T),
     /// Nothing to do, with the reason the response carries (`{"matched": 0}`
     /// as an unknown job answers today).
@@ -158,7 +158,7 @@ fn run_end(end_time: Option<f64>) -> OffsetDateTime {
 
 /// Read the connector a run belongs to from the run's config, and check it
 /// exists.
-async fn find_connector(
+pub(super) async fn find_connector(
     state: &AppState,
     pool: &PgPool,
     run_id: &str,
@@ -203,7 +203,7 @@ async fn find_connector(
 
 /// The orchestrator's status for `run_id`, refused with 409 when it is not
 /// the one the sensor claims, as the pipeline path does.
-async fn confirm_status(
+pub(super) async fn confirm_status(
     state: &AppState,
     run_id: &str,
     outcome: Outcome,

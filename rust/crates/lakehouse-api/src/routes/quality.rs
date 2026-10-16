@@ -1306,6 +1306,63 @@ async fn scheduled_pass(state: &AppState) {
     );
 }
 
+/// Who the runs started by a load are recorded as.
+const LOAD_ACTOR: &str = "load";
+
+/// Runs the rules of `tables` (lower-cased `zone.table` keys) whose schedule
+/// is `on_load`, once each, as the load that just finished (`DATA-14`, F3 and
+/// F4). Called from `routes::quality_load` after the load is confirmed; a
+/// table with no schedule, or an `interval` one, is left to the tick. Returns
+/// how many rules ran. A rule that cannot be run is skipped quietly (its row
+/// already says so), and nothing here can fail the event that started it.
+pub(crate) async fn run_on_load(state: &AppState, tables: &[String]) -> usize {
+    let Some(pg) = state.pg.as_deref() else {
+        return 0;
+    };
+    let on_load: std::collections::HashSet<String> =
+        match lakehouse_store::quality::list_schedules(pg).await {
+            Ok(schedules) => schedules
+                .into_iter()
+                .filter(|s| s.mode == lakehouse_store::quality::ScheduleMode::OnLoad.as_str())
+                .map(|s| s.asset)
+                .filter(|asset| tables.contains(asset))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(?err, "quality on load: schedules unavailable");
+                return 0;
+            }
+        };
+    if on_load.is_empty() {
+        return 0;
+    }
+    let rules = match lakehouse_store::governance::list_quality_rules(pg).await {
+        Ok(rules) => rules,
+        Err(err) => {
+            tracing::warn!(?err, "quality on load: rules unavailable");
+            return 0;
+        }
+    };
+    let mut ran = 0;
+    for rule in rules
+        .iter()
+        .filter(|r| on_load.contains(&r.asset.trim().to_lowercase()))
+    {
+        match evaluate(state, rule, LOAD_ACTOR).await {
+            Ok(_) => ran += 1,
+            Err(RunError::NotRunnable(why)) => {
+                tracing::debug!(rule = %rule.name, %why, "quality on load: rule skipped");
+            }
+            Err(RunError::Failed(_)) => {}
+        }
+    }
+    tracing::info!(
+        tables = on_load.len(),
+        ran,
+        "quality on load: pass finished"
+    );
+    ran
+}
+
 /// Starts a scheduled pass in the background and returns at once — the
 /// caller is the platform's evaluation tick (`POST /api/alerts/run`),
 /// which must answer its scheduler promptly whatever a table scan takes.
