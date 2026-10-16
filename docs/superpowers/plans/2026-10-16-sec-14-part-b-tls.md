@@ -156,7 +156,134 @@ lines).
 
 ## 8. Handoff
 
-(developer)
+### Commits on branch `fix/sec-14-part-b-tls`
+- `832df0fc`: feat(config): CONNECTOR_TLS_CA_FILE for connector dials (SEC-14 part B)
+- `4dfbd687`: feat(connectors): require TLS for every sqlx Postgres dial (SEC-14 part B)
+- `75a192de`: feat(connectors): Postgres connection test speaks the protocol itself, SCRAM-SHA-256 only (SEC-14 part B)
+- `bbe40ee8`: feat(connectors): require TLS for SQL Server dials and verify CA when set (SEC-14 part B)
+- `053eacb8`: feat(compose): TLS for bundled postgres and verify-full connector probe (SEC-14 part B)
+- `7638a4a5`: docs: document CONNECTOR_TLS_CA_FILE and compose TLS posture (SEC-14 part B)
+- `78cb75de`: test(connectors): route integration probes through TlsProxy for TLS requirement (SEC-14 part B)
+
+### Verification Summary
+
+1. **`cargo fmt --check`**
+   - Command: `cd rust && cargo fmt --check`
+   - Output: clean exit (0 diffs).
+
+2. **Workspace Clippy (`-D warnings`)**
+   - Command: `cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target flock /home/shiro/rantai/.locks/heavy.lock cargo clippy -j 4 -p lakehouse-api --all-targets -- -D warnings`
+   - Output:
+     ```
+         Checking lakehouse-api v0.1.0 (/home/shiro/rantai/wt/sec-14b/rust/crates/lakehouse-api)
+         Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 22s
+     ```
+     0 errors, 0 warnings.
+
+3. **`cargo test -j 4 -p lakehouse-api --no-fail-fast`**
+   - Command: `cd rust && CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target RUST_TEST_THREADS=2 flock /home/shiro/rantai/.locks/heavy.lock cargo test -j 4 -p lakehouse-api --no-fail-fast`
+   - Verbatim `test result:` lines:
+     - `src/lib.rs`: `test result: ok. 1927 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 308.66s`
+     - `src/main.rs`: `test result: ok. 1973 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 284.58s`
+     - `tests/agents_approval.rs`: `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.67s`
+     - `tests/agents_run.rs`: `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.90s`
+     - `tests/ai_ask_back_turn.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.54s`
+     - `tests/ai_chart_draft.rs`: `test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.87s`
+     - `tests/ai_chat_stream.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s`
+     - `tests/ai_citations.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s`
+     - `tests/ai_sql_help.rs`: `test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.39s`
+     - `tests/ai_terms.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.95s`
+     - `tests/ai_tool.rs`: `test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s`
+     - `tests/connector_delete_deprovision.rs`: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.18s`
+     - `tests/connector_discovery_launch.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s`
+     - `tests/connector_discovery_routes.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.00s`
+     - `tests/connector_not_testable.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s`
+     - `tests/connector_oauth_flow.rs`: `test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.01s`
+     - `tests/connector_probe_history_route.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.07s`
+     - `tests/connector_repoint.rs`: `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.41s`
+     - `tests/connector_secret_reference.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.39s`
+     - `tests/connector_secret_rotate.rs`: `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.80s`
+     - `tests/connector_tenant_access.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.41s`
+     - `tests/connector_upload_table.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.37s`
+     - `tests/dashboard_export.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.69s`
+     - `tests/debezium_properties.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.00s`
+     - `tests/embed_tokens.rs`: `test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.33s`
+     - `tests/explain_rewrite.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.83s`
+     - `tests/gold_export_auth.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s`
+     - `tests/gold_publication.rs`: `test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.26s`
+     - `tests/home_layout.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.34s`
+     - `tests/identity_user_tenants.rs`: `test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s`
+     - `tests/ingest_run.rs`: `test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 34.75s`
+     - `tests/lakehouse_maintenance.rs`: `test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.62s`
+     - `tests/login_throttle.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.00s`
+     - `tests/parity.rs`: `test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s`
+     - `tests/pipeline_enforce.rs`: `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.20s`
+     - `tests/pipeline_routing.rs`: `test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s`
+     - `tests/query_author_exception.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s`
+     - `tests/query_download.rs`: `test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.67s`
+     - `tests/reporting_settings_route.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.64s`
+     - `tests/route_auth.rs`: `test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.16s`
+     - `tests/sec11_guard.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s`
+     - `tests/security_regressions.rs`: `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.77s`
+     - `tests/semantic_api.rs`: `test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.50s`
+     - `tests/tenant_provisioning.rs`: `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.38s`
+     - `tests/test_connection_route.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.48s`
+     - `tests/tier1_saved_query_guard.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.09s`
+     - `tests/tier1_writehigh_approval.rs`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.82s`
+     - `tests/tier2_governance_drafts.rs`: `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.19s`
+     - `tests/tier2_writehigh_approval.rs`: `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.43s`
+     - `tests/upload_routes.rs`: `test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 128.72s`
+     - `tests/upstream_errors.rs`: `test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.46s`
+     - `Doc-tests lakehouse_api`: `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`
+
+4. **Mutation Evidence for T3(b)**
+   - Mutated `src/pg_probe.rs` to write `password_message(password.as_bytes(), &mut out)` when `Message::AuthenticationCleartextPassword` was received from server.
+   - Test `pg_probe::tests::cleartext_password_is_refused_and_no_password_is_sent` failed as expected:
+     ```
+     thread 'pg_probe::tests::cleartext_password_is_refused_and_no_password_is_sent' panicked at crates/lakehouse-api/src/pg_probe.rs:583:13:
+     no PasswordMessage may follow a cleartext request: [112, 0, 0, 0, 7, 112, 119, 0]
+     test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1927 filtered out; finished in 0.05s
+     ```
+   - Restored `src/pg_probe.rs` to pristine HEAD. Test passed:
+     ```
+     test pg_probe::tests::cleartext_password_is_refused_and_no_password_is_sent ... ok
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1927 filtered out; finished in 0.05s
+     ```
+
+5. **T5 Compose Drill Evidence (`sec14b-t5.log`)**
+   - Verified `docker compose --profile '*' config --quiet` passed cleanly with `.env` from `ops/init-env.sh`.
+   - Real `up` of default profile with project `sec14b` under heavy lock:
+     - `postgres-cert-init` generated self-signed root CA and `postgres` server certificate/key with ownership 999:999 mode 0600, exiting 0.
+     - `psql` execution inside `postgres` confirmed:
+       ```
+        ssl 
+       -----
+        on
+       (1 row)
+
+        ssl | version |         cipher         | bits 
+       -----+---------+------------------------+------
+        t   | TLSv1.3 | TLS_AES_256_GCM_SHA384 |  256
+       (1 row)
+       ```
+     - Seeded connector probe `POST /api/connectors/conn-pg-lakehouse/test` (authenticated as bootstrap admin) verified over verify-full:
+       ```json
+       {"ok":true,"supported":true,"latencyMs":27,"message":"Connected via PostgreSQL and ran SELECT 1.","testedAt":"2026-10-16T11:36:26.280Z"}
+       ```
+     - `pg_stat_ssl` confirmed active connection encrypted via `TLSv1.3` / `TLS_AES_256_GCM_SHA384`.
+     - Re-running `up` on existing volume left certificates identical (idempotent):
+       `server.crt`: `e9e69801c0dd896b3d9a326673004104`
+       `ca.crt`: `988ed601b2dc3b88aff7d83a3e96f0dd`
+       `server.key`: `0d7acb0d22a64f31ab170da8cd564475`
+     - Teardown cleanly cleaned all containers and volumes via `docker compose -p sec14b down -v`.
+
+6. **`cargo deny check`**
+   - Command: `cd rust && cargo deny check`
+   - Output: `advisories ok, bans ok, licenses ok, sources ok` (exit 0).
+
+7. **Gitleaks Scan**
+   - Command: `gitleaks git --log-opts="origin/main..HEAD" -v`
+   - Output: `8 commits scanned`, `no leaks found` (exit 0).
 
 ## 9. Review
 
