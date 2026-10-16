@@ -452,3 +452,9 @@ No open `BLOCKER`. Open for the product owner: the browser check of the
 credential form, "Reference a secret" and "Sign in" at the end of the phase,
 and the staging secret `STAGING_CONNECTOR_SECRETS_KEY` before the merge.
 
+### Browser check, 2026-10-16 (product owner)
+
+Passed on the QA instance built from #144 at `ff7616e9`. The instance shares
+an older orchestrator, so runs, loads, orchestrator-run listings,
+secret-manager references and OAuth sign-in were not reachable there; those
+are proven by the CI gates of #144.

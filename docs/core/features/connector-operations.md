@@ -6,7 +6,7 @@
 | Backlog | `SRC-11` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-11.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". Three *(proposed)* numbers: decisions 1, 5 and 7 |
-| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gate on 2026-10-15 |
+| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; built and proven by its gate on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
 | Plan | `docs/superpowers/plans/2026-10-14-src-11-connector-operations.md` |
 
 ## Problem

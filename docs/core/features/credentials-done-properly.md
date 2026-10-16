@@ -6,7 +6,7 @@
 | Backlog | `SRC-12` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-12.md`. This page follows it row by row; anything the spec does not say is under "Beyond the spec". One *(proposed)* number, decision 4 |
-| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; all three parts built and proven by their gates on 2026-10-15 |
+| Status | Building, in #144 (the one pull request for the rest of Phase 1). Decisions signed 2026-10-14; all three parts built and proven by their gates on 2026-10-15. Product owner's browser check on the QA instance passed on 2026-10-16 (the screens only: runs, loads, secret-manager references and OAuth sign-in were not reachable there and are proven by the CI gates) |
 | Plan | `docs/superpowers/plans/2026-10-15-src-12-credentials.md` (three parts) |
 
 ## Problem
