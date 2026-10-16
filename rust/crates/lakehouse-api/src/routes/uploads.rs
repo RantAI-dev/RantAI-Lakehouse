@@ -1573,6 +1573,43 @@ fn load_limits(state: &AppState) -> LoadLimits {
     }
 }
 
+/// `SEC-17`: count the header's cells under the reading the user confirmed,
+/// AND ask the load limit, before any claim, mark or launch. A file the job
+/// would refuse leaves no table claim behind, and a request that passes
+/// the read but loses the locked count in `mark_ingesting_within_limits`
+/// below keeps its claim, as a claim does when a launch fails (a claim
+/// is never released).
+///
+/// # Errors
+///
+/// 429 (`Retry-After: 5`) when the `uploaded_by` already has the configured
+/// number of loads running, or the installation has; 400 when the header
+/// has more than 1,000 columns under the confirmed reading; 503 when the
+/// object store cannot serve the head.
+async fn check_within_limits_and_column_cap(
+    state: &AppState,
+    pool: &PgPool,
+    row: &Upload,
+    request: &IngestRequest,
+) -> ApiResult<LoadLimits> {
+    let limits = load_limits(state);
+    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
+        return Err(too_many_uploads().into());
+    }
+    let store = UploadStore::connect(&state.config).await?;
+    let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
+    let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
+    let confirmed = Overrides {
+        encoding: Some(request.encoding),
+        delimiter: Some(request.delimiter),
+        header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+    };
+    if upload_parse::header_width(&head, head_is_truncated, confirmed) > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+    }
+    Ok(limits)
+}
+
 /// Launch `file_ingest_job` for the claimed upload and return the run id. A
 /// launch that does not happen settles the claim as failed
 /// ([`COULD_NOT_START`]) before the error is returned, so the upload is not
@@ -1731,30 +1768,7 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
-    // `SEC-17`: count the header's cells under the reading the user confirmed,
-    // before any claim, mark or launch, so a file the job would refuse
-    // leaves no table claim behind. The job counts the whole file and stays
-    // the authority.
-    let limits = load_limits(&state);
-    // `SEC-17`: asked before the table name is claimed, so a refusal leaves
-    // no claim behind. A read: the decision is the locked count in
-    // `mark_ingesting_within_limits` below, and a request that passes here and
-    // loses there keeps its claim, as a claim does when a launch fails (a
-    // claim is never released).
-    if !uploads::loads_under_limits(pool, &row.id, limits).await? {
-        return Err(too_many_uploads().into());
-    }
-    let store = UploadStore::connect(&state.config).await?;
-    let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
-    let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
-    let confirmed = Overrides {
-        encoding: Some(request.encoding),
-        delimiter: Some(request.delimiter),
-        header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
-    };
-    if upload_parse::header_width(&head, head_is_truncated, confirmed) > upload_parse::MAX_COLUMNS {
-        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
-    }
+    let limits = check_within_limits_and_column_cap(&state, pool, &row, &request).await?;
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
@@ -1814,6 +1828,41 @@ pub async fn ingest(
     };
 
     let run_id = launch(&state, pool, &claimed, &request, load_key).await?;
+    let attached = finish_launch_and_audit(
+        pool,
+        &principal,
+        &claimed,
+        run_id.clone(),
+        &request,
+        converted.as_ref(),
+        conversion,
+    )
+    .await?;
+    Ok(ApiJson(IngestResponse {
+        upload: attached.into(),
+        run_id,
+    }))
+}
+
+/// Attach the run the launch gave us to the `ingesting` row, and record the
+/// `upload.ingest` audit event the rest of the system reads. Extracted from
+/// `ingest` so the handler stays under the clippy `too_many_lines` cap.
+///
+/// # Errors
+///
+/// 500 when the launched run could not be attached to its upload (an
+/// `ingesting` row with no run is the only one that takes a run, so the only
+/// way this happens is a row settled or was deleted between the launch and
+/// the attach — a logged error, not a panic).
+async fn finish_launch_and_audit(
+    pool: &PgPool,
+    principal: &Principal,
+    claimed: &Upload,
+    run_id: String,
+    request: &IngestRequest,
+    converted: Option<&Converted>,
+    conversion: Option<Conversion>,
+) -> ApiResult<Upload> {
     let Some(attached) = uploads::attach_run(pool, &claimed.id, &run_id).await? else {
         // Not reachable through this API: only an `ingesting` row with no run
         // takes a run, and nothing settles or deletes the claim in the
@@ -1829,7 +1878,7 @@ pub async fn ingest(
         "mode": request.mode.as_str(),
     });
     if let Value::Object(map) = &mut args {
-        match (&converted, conversion) {
+        match (converted, conversion) {
             (
                 Some(Converted {
                     sheet: Some(sheet), ..
@@ -1844,12 +1893,9 @@ pub async fn ingest(
             _ => {}
         }
     }
-    let event = upload_audit_event(&principal, "upload.ingest", &attached.id, args, "executed");
+    let event = upload_audit_event(principal, "upload.ingest", &attached.id, args, "executed");
     record_audit(pool, event).await;
-    Ok(ApiJson(IngestResponse {
-        upload: attached.into(),
-        run_id,
-    }))
+    Ok(attached)
 }
 
 // ── Delete ───────────────────────────────────────────────────────────────
