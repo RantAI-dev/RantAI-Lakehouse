@@ -992,8 +992,13 @@ describe("UploadFilePage, limits", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(TOO_MANY_UPLOADS)
-    // The form is as it was: the file control is there and Next is on.
-    expect(screen.getByLabelText("Choose a file")).toBeDefined()
+    // The form is as it was: the file is still chosen, so the file control is
+    // the one the picked state shows ("Choose another"), and Next is on.
+    // PR #86 review round 2, BLOCKER 1: main's reworked wizard labels the input
+    // "Choose a file" only before a file is chosen, so this is the control the
+    // step actually shows here.
+    expect(screen.getByText("stock.csv")).toBeDefined()
+    expect(screen.getByLabelText("Choose another")).toBeDefined()
     expect(next().disabled).toBe(false)
     fireEvent.click(next())
     await waitFor(() => expect(calls.filter((c) => c.method === "POST").length).toBe(2))
