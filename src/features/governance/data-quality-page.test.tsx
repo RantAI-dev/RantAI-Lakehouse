@@ -15,7 +15,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -154,7 +154,14 @@ describe("DataQualityPage: incidents (DATA-14)", () => {
     expect(confirm.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Why is it resolved?"), { target: { value: "Known outage" } })
     fireEvent.click(confirm)
-    await waitFor(() => expect(screen.queryByLabelText("Why is it resolved?")).toBeNull())
+    // Poll on a timer, not with `waitFor`: started while the resolve is in
+    // flight, its DOM observer made Bun's happy-dom grow to GBs and crash the
+    // whole run in CI (run 38881397576). The page sends no extra request: the
+    // stub saw one POST and one reload.
+    for (let i = 0; i < 100 && screen.queryByLabelText("Why is it resolved?"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    expect(screen.queryByLabelText("Why is it resolved?")).toBeNull()
     expect(writesSeen).toEqual([
       ["POST", "/api/governance/quality/incidents/i1/resolve", { resolution: "Known outage" }],
     ])
