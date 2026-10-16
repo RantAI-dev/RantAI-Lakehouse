@@ -19,7 +19,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -634,7 +634,8 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
     const incidentsRequest = fetchSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes("/quality/incidents"))
     expect(incidentsRequest).toBe("/api/governance/quality/incidents?status=open&asset=bronze.demo_orders")
 
-    fireEvent.click(screen.getByRole("button", { name: "Resolve" }))
+    // The Resolve button waits for the session (governance:write), a separate request.
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve" }))
     const confirm = screen.getAllByRole("button", { name: "Resolve" }).at(-1) as HTMLButtonElement
     // A reason is required.
     expect(confirm.disabled).toBe(true)
@@ -682,7 +683,8 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
       await screen.findByText("learning: 3 days and 7 loads so far; anomalies start after 14 days and 5 loads")
     ).toBeTruthy()
     // No schedule is saved: the default is said.
-    expect(screen.getByText("Every 1 hour (the default).")).toBeTruthy()
+    // The schedule is its own request, so it may land after the learning state.
+    expect(await screen.findByText("Every 1 hour (the default).")).toBeTruthy()
   })
 
   it("says a learned table is watched", async () => {
@@ -698,8 +700,12 @@ describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
     url.search = "tab=quality"
     renderTabs(BRONZE)
 
-    fireEvent.change(await screen.findByLabelText("Run the checks"), { target: { value: "on_load" } })
-    fireEvent.change(screen.getByLabelText("And at least every"), { target: { value: "360" } })
+    const mode = await screen.findByLabelText("Run the checks")
+    // The panel seeds the control from the saved schedule in an effect; let it
+    // run, or it would put the mode back after the change below (CI race).
+    await act(async () => {})
+    fireEvent.change(mode, { target: { value: "on_load" } })
+    fireEvent.change(await screen.findByLabelText("And at least every"), { target: { value: "360" } })
     fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
 
     await waitFor(() =>
