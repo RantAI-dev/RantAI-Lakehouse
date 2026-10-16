@@ -106,8 +106,8 @@ bun install
 #    default credentials. docker-compose.yml refuses to start while
 #    POSTGRES_PASSWORD, RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY or
 #    LAKEKEEPER_ENCRYPTION_KEY is empty, and `cp .env.example .env` alone
-#    does not start the stack. SRC-12: CONNECTOR_SECRETS_KEY is required
-#    too, the key stored connector credentials are encrypted with.
+#    does not start the stack. SRC-12: CONNECTOR_SECRETS_KEY, the key
+#    stored connector credentials are encrypted with, is generated too.
 #    Keep it: without it, every stored credential has to be entered
 #    again (docs/OPERATIONS.md). This writes a `.env` with generated values
 #    (and refuses to overwrite an existing one):
