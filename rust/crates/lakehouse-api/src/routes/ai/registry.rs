@@ -622,9 +622,10 @@ fn delete_calculated_field_schema() -> Value {
 // ── AI-1 / AI-2 / AI-20: dashboard-board tools (plan 20) ────────────────
 
 /// The `FilterDef` JSON schema shared by `set_board_view_filters` and
-/// `save_board_filters`. The values are read from
-/// `lakehouse_bi::filters::{FilterOp, RelativeUnit, RelativeAnchor}` so
-/// the schema cannot drift from what the server accepts. The shape and
+/// `save_board_filters`. The enum values MIRROR
+/// `lakehouse_bi::filters::{FilterOp, RelativeUnit, RelativeAnchor}` —
+/// the schema is a hand-written `json!` literal, so a variant added to
+/// one of those enums is not picked up here automatically. The shape and
 /// the per-op requirements mirror `validate_filters` /
 /// `FilterDef::validate`.
 fn filter_def_schema() -> Value {

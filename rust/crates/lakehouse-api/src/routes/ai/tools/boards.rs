@@ -116,7 +116,7 @@ pub(super) async fn delete_board(state: &AppState, args: &Map<String, Value>) ->
 /// Read the current layout for `board` from `state`. Returns an empty
 /// `LayoutMap` for the built-in Main board when it has no row yet
 /// (`store::get_board` returns `Ok(None)` until the first layout save,
-/// per `store.rs:684-687`); a model arrange on the empty Main board
+/// per `store.rs:904`); a model arrange on the empty Main board
 /// therefore becomes a fresh save, the same as the console.
 ///
 /// The `Err` arm carries the *classified* upstream-error JSON, not
@@ -223,7 +223,15 @@ fn parse_arrange_tiles(tiles_obj: &Map<String, Value>) -> Result<Vec<(String, Ti
                 "tile {chart_id}: w and h must be at least {MIN_TILE_SIDE}"
             ));
         }
-        if box_.x < 0 || box_.y < 0 || box_.x + box_.w > GRID_COLUMNS {
+        if box_.x < 0
+            || box_.y < 0
+            // `box_.x + box_.w` is `i32 + i32` and overflows at `i32::MAX`
+            // (panicking in debug, wrapping to a negative in release, where
+            // the negative then fails `> GRID_COLUMNS` and the off-grid box
+            // is silently accepted). Both operands are `i32`, so the sum
+            // always fits in `i64` and the comparison is exact.
+            || i64::from(box_.x) + i64::from(box_.w) > i64::from(GRID_COLUMNS)
+        {
             // Plan 20 Decisions, lines 74-77: a box outside the
             // 12-column grid is refused.
             return Err(format!(
@@ -524,6 +532,35 @@ mod tests {
         tiles.insert("c-1".to_owned(), tile(-1, 0, 1, 1));
         let err = parse_arrange_tiles(&tiles).expect_err("negative x");
         assert!(err.contains("12-column grid"), "{err}");
+    }
+
+    /// `tile_box_from` parses every component as an `i32`, so `x` and
+    /// `w` can both reach `i32::MAX`. The horizontal-extent check must
+    /// refuse such a box (plan 20 Decisions, lines 74-77) — an `i32`
+    /// sum overflows in debug (panicking in the request handler) and
+    /// wraps in release to a large negative, where the negative then
+    /// fails `> GRID_COLUMNS` and the off-grid box is silently
+    /// accepted. The same wire input has to be refused, not silently
+    /// saved.
+    #[test]
+    fn parse_arrange_tiles_refuses_x_at_i32_max() {
+        let mut tiles = Map::new();
+        tiles.insert("c-overflow".to_owned(), tile(i32::MAX, 0, 1, 1));
+        let err = parse_arrange_tiles(&tiles).expect_err("must refuse");
+        assert!(err.contains("12-column grid"), "{err}");
+        assert!(err.contains("c-overflow"), "{err}");
+    }
+
+    /// The overflow is in the SUM, not in `x` alone: `x` and `w` are each
+    /// individually representable, and `(i32::MAX - 5) + 10` is what wraps.
+    /// A fix that only range-checked `x` would let this box through.
+    #[test]
+    fn parse_arrange_tiles_refuses_a_box_whose_sum_overflows_i32() {
+        let mut tiles = Map::new();
+        tiles.insert("c-sum-overflow".to_owned(), tile(i32::MAX - 5, 0, 10, 1));
+        let err = parse_arrange_tiles(&tiles).expect_err("must refuse");
+        assert!(err.contains("12-column grid"), "{err}");
+        assert!(err.contains("c-sum-overflow"), "{err}");
     }
 
     /// `set_board_view_filters`: an empty list clears the view; the
