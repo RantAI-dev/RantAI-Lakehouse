@@ -128,8 +128,9 @@ services:
     image: python:3.12-slim
     working_dir: /work
     volumes:
+      # `ops/g10` only: unlike the connector gates, G10 imports nothing from
+      # `ops/gates`, so `gate_summary` is not mounted and not on PYTHONPATH.
       - ./ops/g10:/work
-      - ./ops/gates:/opt/gates:ro
     environment:
       API_URL: http://lakehouse-api:8080
       KEYCLOAK_URL: http://keycloak:8080
@@ -142,7 +143,6 @@ services:
       SSO_USER_B_PASSWORD: ${SSO_USER_B_PASSWORD:?}
       WRONG_AUD_CLIENT_ID: lakehouse-wrongaud
       EXPIRED_CLIENT_ID: lakehouse-expired
-      PYTHONPATH: /opt/gates
       PYTHONDONTWRITEBYTECODE: "1"
     depends_on:
       keycloak:
