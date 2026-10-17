@@ -15,13 +15,12 @@ import type { PipelineDetail, TargetLag } from "@/services/contracts/pipelines"
 /**
  * The bounds the console offers, and the API accepts.
  *
- * BLD-2 review round 1 / plan D11: the floor is 2 minutes because the
- * acceptance gate measured a worst sample of 68.94 s on the compose stack
- * and a 1-minute target is not met there. They live here, next to the input
+ * BLD-2 review round 2 / R8: the floor is 1 minute, confirmed by the gate
+ * measurement on the compose stack. They live here, next to the input
  * that uses them, so the panel, its validation message and the API's own
  * bound (`MIN_TARGET_LAG_MINUTES`) name the same number.
  */
-const MIN_MINUTES = 2
+const MIN_MINUTES = 1
 const MAX_MINUTES = 10080
 
 /**

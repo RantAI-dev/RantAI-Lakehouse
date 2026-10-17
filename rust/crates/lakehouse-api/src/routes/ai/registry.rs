@@ -1278,7 +1278,7 @@ fn get_pipeline_schema() -> Value {
 
 fn set_pipeline_target_lag_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_pipeline_target_lag",
-        "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (minimum 2 minutes, up to 10080 minutes / 7 days), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+        "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (minimum 1 minute, up to 10080 minutes / 7 days), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
         "parameters": { "type": "object", "properties": {
             "pipeline": { "type": "string", "description": "pipeline id (pl-…) or pipeline name" },
             "targetLag": {
@@ -1289,7 +1289,7 @@ fn set_pipeline_target_lag_schema() -> Value {
                         "type": "object",
                         "properties": {
                             "kind": { "type": "string", "enum": ["lag"] },
-                            "minutes": { "type": "integer", "minimum": 2, "maximum": 10080 }
+                            "minutes": { "type": "integer", "minimum": 1, "maximum": 10080 }
                         },
                         "required": ["kind", "minutes"]
                     },

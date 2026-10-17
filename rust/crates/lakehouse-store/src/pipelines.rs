@@ -144,8 +144,8 @@ pub struct Pipeline {
 
 /// BLD-2: how fresh a pipeline's output must be (migration `0084`). The
 /// wire form is plan D2's internally tagged union: `null`, or
-/// `{"kind":"lag","minutes":N}` for `2..=10080` whole minutes (the floor
-/// is the measured one, plan D11; see
+/// `{"kind":"lag","minutes":N}` for `1..=10080` whole minutes (the floor
+/// is the measured one, plan D11/R8; see
 /// `routes::authored_pipelines::MIN_TARGET_LAG_MINUTES`), or
 /// `{"kind":"downstream"}` for Snowflake's `DOWNSTREAM` (refresh only when
 /// a pipeline that reads this one needs it).
@@ -159,8 +159,8 @@ pub struct Pipeline {
 pub enum TargetLag {
     /// A maximum age, in whole minutes.
     Lag {
-        /// The target, in whole minutes, `2..=10080` (2 minutes to 7 days;
-        /// the floor is measured — plan D11).
+        /// The target, in whole minutes, `1..=10080` (1 minute to 7 days;
+        /// the floor is measured — plan D11/R8).
         minutes: i32,
     },
     /// Snowflake's `DOWNSTREAM`: this pipeline's own inputs decide, but a

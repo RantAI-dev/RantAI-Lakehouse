@@ -174,7 +174,7 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
       const configBtn = screen.getByLabelText("Configure target lag")
       fireEvent.click(configBtn)
 
-      const minutesInput = screen.getByLabelText("Minutes (2 - 10080)") as HTMLInputElement
+      const minutesInput = screen.getByLabelText("Minutes (1 - 10080)") as HTMLInputElement
       fireEvent.change(minutesInput, { target: { value: "25" } })
 
       const saveBtn = screen.getByText("Save target lag")
@@ -278,14 +278,14 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
 
       fireEvent.click(screen.getByLabelText("Configure target lag"))
 
-      const minutesInput = screen.getByLabelText("Minutes (2 - 10080)") as HTMLInputElement
-      fireEvent.change(minutesInput, { target: { value: "1" } })
+      const minutesInput = screen.getByLabelText("Minutes (1 - 10080)") as HTMLInputElement
+      fireEvent.change(minutesInput, { target: { value: "0" } })
 
       const form = screen.getByText("Save target lag").closest("form")!
       fireEvent.submit(form)
 
       await waitFor(() => {
-        expect(screen.getByRole("alert").textContent).toContain("Minutes must be between 2 and 10080")
+        expect(screen.getByRole("alert").textContent).toContain("Minutes must be between 1 and 10080")
         expect(called).toBe(false)
       })
     } finally {

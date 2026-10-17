@@ -39,7 +39,7 @@
 -- constraint violation; this CHECK is defense in depth.
 ALTER TABLE pipeline_definition
     ADD COLUMN target_lag_seconds INTEGER
-        CHECK (target_lag_seconds BETWEEN 120 AND 604800 AND target_lag_seconds % 60 = 0),
+        CHECK (target_lag_seconds BETWEEN 60 AND 604800 AND target_lag_seconds % 60 = 0),
     ADD COLUMN target_lag_downstream BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE pipeline_definition

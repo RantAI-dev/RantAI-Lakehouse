@@ -1157,7 +1157,7 @@ def trigger_bronze_ingest() -> str:
 # a 1-minute target was measured at a worst sample of 68.94 s on this stack
 # and refused, so the API's minimum, the migration's CHECK and this gate's
 # target all sit at 2. They move together, and only with a measurement.
-TARGET_LAG_MINUTES = 2
+TARGET_LAG_MINUTES = 1
 TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
 
 
