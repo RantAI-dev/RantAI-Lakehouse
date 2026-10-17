@@ -1711,9 +1711,10 @@ pub struct PipelineLagState {
     /// When the first check saw tokens differ from `consumed_tokens`;
     /// `None` once a check found them equal again.
     pub pending_since: Option<OffsetDateTime>,
-    /// The `Dagster` run key of the outstanding request, and the tokens
-    /// that request was made to consume. Both `None` when no run is
-    /// outstanding; the table CHECK refuses one without the other.
+    /// The `Dagster` run key of the outstanding request, if one is currently in
+    /// flight. When a run fails or is canceled, the key is cleared while
+    /// `requested_tokens` and `request_attempt` are preserved as the retry anchor
+    /// (the table CHECK allows tokens without a key; review R1 decision R2).
     pub requested_run_key: Option<String>,
     /// See [`Self::requested_run_key`].
     pub requested_tokens: Option<serde_json::Value>,

@@ -24,11 +24,11 @@
 -- is 120 (2 minutes), and the difference is a measurement, not a
 -- preference. Plan D11 says the gate measures the lag on the compose stack
 -- and that a minimum which the measurement does not support is raised in
--- the same PR rather than claimed. The gate's run on this branch measured
--- a worst sample of 68.94 s (five samples 40.70, 68.94, 56.85, 56.90,
--- 52.82 — `docs/plans/BLD-2-TARGET-LAG-RESULT.md`), so a 1-minute target
--- is not met on this stack and the minimum moves up to the next whole
--- minute above it. The route's own bound
+-- the same PR rather than claimed. Under review round 1 R6b (`47fcf9ad4618` in
+-- `bld2-gate-r6.log`), a 2-minute target passed all 5 samples [77.2, 95.13, 68.9,
+-- 71.11, 89.1] s (avg 80.29 s <= 120 s), whereas pre-R6a runs exceeded 120 s
+-- (worst sample 129.77 s in `bld2-gate-r1.log`). The floor is confirmed or updated
+-- by the R8 gate runs (`docs/plans/BLD-2-TARGET-LAG-RESULT.md`). The route's own bound
 -- (`routes::authored_pipelines::validate_target_lag`) carries the same
 -- number, and the two move together.
 --

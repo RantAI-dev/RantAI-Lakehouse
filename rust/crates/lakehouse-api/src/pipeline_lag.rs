@@ -339,7 +339,7 @@ pub struct LagCheckOutcome {
     /// The `Dagster` run key to launch with, when the decision is
     /// [`Decision::Run`]; the outstanding request's key when one is still
     /// in flight; `None` when there is no request at all. It is
-    /// `lag:<pipeline id>:<12 hex chars of the token map's hash>`.
+    /// `lag:<pipeline id>:<12 hex chars of the token map's hash>:<attempt>`.
     pub run_key: Option<String>,
     /// The job to launch — the pipeline's own `authored__<id>` job, or an
     /// upstream pipeline's when plan D7's downstream rule moved the
@@ -568,6 +568,8 @@ impl CheckState {
 ///   (The pipeline's own failure alert and `maxRetries` are what cover a
 ///   run that keeps failing; this loop must not spin.)
 /// * still running, or not created yet → `true`, and the caller waits.
+/// * not found after 2 minutes ([`LOST_REQUEST_SECONDS`]) → request is cleared
+///   as lost to decide again without incrementing `request_attempt` (R1/R9).
 /// * the lookup itself failed → an error the caller propagates, because a
 ///   tick that cannot see Dagster must not decide anything (fail closed:
 ///   the alternative is a second run for the same change).

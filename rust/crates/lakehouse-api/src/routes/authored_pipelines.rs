@@ -1154,13 +1154,12 @@ pub struct SetTargetLagBody {
 
 /// The smallest target lag a pipeline may be given, in whole minutes.
 ///
-/// BLD-2 review round 1, plan D11: the spec's floor is 1 minute, but the
-/// gate's measurement on this stack did not support it (worst of five
-/// samples 68.94 s), so the floor is raised to the next whole minute above
-/// the measurement. It is a measured floor, not a preference: change it
-/// only with a new measurement behind it, and change
-/// `0084_pipeline_target_lag.sql`'s CHECK in the same PR so the route and
-/// the column cannot disagree.
+/// BLD-2 review round 1 R6b / round 2 R8, plan D11: the spec's floor is 1 minute,
+/// but gate measurements on this stack supported 2 minutes (R6b run on `47fcf9ad4618`,
+/// samples [77.2, 95.13, 68.9, 71.11, 89.1] s all <= 120 s in `bld2-gate-r6.log`).
+/// It is a measured floor, not a preference: change it only with a new measurement
+/// behind it (R8), and change `0084_pipeline_target_lag.sql`'s CHECK in the same PR
+/// so the route and the column cannot disagree.
 pub const MIN_TARGET_LAG_MINUTES: i32 = 2;
 
 /// The largest target lag a pipeline may be given: 7 days, Snowflake's.
