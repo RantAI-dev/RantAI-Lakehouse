@@ -459,6 +459,77 @@ almost everything.
   loaded as artifacts.
 - Nothing was verified in a browser.
 
+### Handoff round 2
+
+#### Round 2 Findings and Review Decisions
+
+| Finding / Decision | Fixing commit (12 chars) | Note |
+| --- | --- | --- |
+| BLOCKER 1: `apply_set_target_lag` drops `X-Tenant` | `89e050629c5b` | Pass caller's headers in; test user in tenants [A, B] acting in B, and Platform Admin |
+| BLOCKER 2: Downstream upstream U retry limit and token reset | `d6f288874676` | Shared retry helper applies to U; test U whose runs keep failing |
+| BLOCKER 3: Lock and write U's row in same transaction as P | `eb1760debc04` | `get_lag_state_for_update` and transactional upsert for U |
+| BLOCKER 4: Result file quotes non-existent numbers | `1d08a9818f84` | Rewritten strictly from surviving logs (`bld2-gate-r1.log`, `bld2-gate-r6.log`, `bld2-gate-r8-1min.log`, `bld2-gate-r8-final.log`) with 12-char commits, dates, commands, computed headroom, and real 3-column fingerprint query |
+| BLOCKER 5: `CHANGELOG.md` quotes unlogged sample numbers | `1d08a9818f84` | Updated with real measurements from R8 gate run at 1-minute floor |
+| BLOCKER 6: Handoff misstates evidence in `bld2-gate-r1.log` | `1d08a9818f84` | Corrected handoff lines to note all 5 samples survive in `bld2-gate-r1.log` and note real 3-column fingerprint times |
+| SHOULD-FIX 1: Status writes for U | `f011c7b9b038` | Never hard-code `behind` for pipeline without target, record check on unchanged, do not copy old status forward on settle |
+| SHOULD-FIX 2: Unparseable source branch | `5a0627cb888b` | No `let _ =`, preserve state row, run after no-target-lag guard |
+| SHOULD-FIX 3: Manual `lag-check` on `downstream` pipeline | `3823e23e2f5b` | Manual check on `downstream` pipeline answers `wait` |
+| SHOULD-FIX 4: Stale doc comments and citations | `4d1d91b6c907` | Updated doc comments in Rust, Python, migrations |
+| SHOULD-FIX 5: Store test for migration 0084 CHECK | `8fb46da5a495` | `target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values` covering floor, ceiling, and whole minutes (updated to 1m in `29d889340b1a`) |
+| SHOULD-FIX 6: Tool registry description floor | `16d007662702` | Mention minimum floor in tool schema description (updated to 1m in `29d889340b1a`) |
+| SHOULD-FIX 7: `authored_factory.py` typing and error handling | `16d007662702` | Typed `inputs_of` and robust Dagster error handling |
+| SHOULD-FIX 8: Gate scripts cleanup | `16d007662702` | Isolated compose project and volume teardown |
+| SHOULD-FIX 9: Compose config dummy env | `16d007662702` | Automated dummy env validation script |
+| SHOULD-FIX 10: Console validation for floor | `16d007662702` | Validate floor in `pipeline-freshness-panel.tsx` and test (updated to 1m in `29d889340b1a`) |
+| SHOULD-FIX 11: Tool schema description & fixture | `16d007662702` | Updated description in registry and generated fixture (updated to 1m in `29d889340b1a`) |
+| SHOULD-FIX 12: Python sensor logging | `16d007662702` | Log warning on missing token |
+| R7: Merge `origin/main` | `3b418d07de54` | Clean merge of origin/main, kept BLD-4 ingest_job logic and BLD-2 lag sensor, regenerated fixture |
+| R8: Clean compose gate runs and 1-min floor | `29d889340b1a` | Ran 1-minute target runs (`bld2r81m` and `bld2r8fin`), all samples <= 60s, lowered floor to 1m permanently across route, migration CHECK, store, schemas, console, tests, docs |
+| R9: Rust scoped checks | `16d007662702` | Clippy, fmt, and per-crate tests run on each commit and verified on final head |
+| R10: Machine lock rules | N/A | Strictly adhered to: cargo commands via `cargo-locked -j 2` without flock, heavy non-cargo wrapped in flock |
+| R11: History preservation of `1bc2e332` | `1bc2e332` | Described below; preserved as-is in git history |
+
+#### Description of Catch-all Commit `1bc2e332` (R11)
+
+Commit `1bc2e332` ("wip: BLD-2 review round 1 fixes in progress") was the catch-all checkpoint from the round 1 review session that bundled multiple in-progress changes across the API, Dagster, and store. Per decision R11, it is preserved intact in branch history without rebasing or force-pushing. Its contents were audited, completed, and tested by subsequent targeted commits:
+- Tenant-scoped headers and validation: completed and tested in `89e050629c5b`.
+- Upstream retry limit and token handling: completed and tested in `d6f288874676`.
+- Transactional lock for upstream lag state: completed and tested in `eb1760debc04`.
+- Upstream status writes and edge cases: completed in `f011c7b9b038`.
+- Migration CHECK constraint tests: completed in `8fb46da5a495` and `29d889340b1a`.
+- TypeScript freshness panel and tool schema fixture: completed in `16d007662702`, `29d889340b1a`, and `a56f89de0428`.
+
+#### Commands Run on Final Head (`a56f89de0428`)
+
+| Command | Real Count / Output Result |
+| --- | --- |
+| `cargo fmt --check` | rc 0 (clean) |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | rc 0 ("Finished dev profile ... in 11.54s", 0 errors, 0 warnings) |
+| `cargo-locked test -j 2 -p lakehouse-dagster` | 71 passed, 0 failed, 0 ignored |
+| `cargo-locked test -j 2 -p lakehouse-alerts` | 96 passed, 0 failed, 1 ignored |
+| `cargo-locked test -j 2 -p lakehouse-store --lib` | 213 passed, 0 failed, 0 ignored |
+| `cargo-locked test -j 2 -p lakehouse-store --test pipelines` | 56 passed, 0 failed, 0 ignored |
+| `cargo-locked test -j 2 -p lakehouse-api --lib pipeline_lag` | 34 passed, 0 failed, 0 ignored |
+| `cargo-locked test -j 2 -p lakehouse-api target_lag` | 14 passed (12 unit, 2 integration), 0 failed |
+| `bun run typecheck` (under flock) | rc 0 (`$ bun --bun tsc --noEmit`) |
+| `bun run lint` (under flock) | rc 0 (`✖ 8 problems (0 errors, 8 warnings)`) |
+| `bun test src/features` (under flock) | 1043 passed, 0 failed (91 files) |
+| `bun test src/services` (under flock) | 85 passed, 0 failed (13 files) |
+| `bun test src/lib` (under flock) | 756 passed, 1 skipped, 0 failed (85 files) |
+| `bun test src/components` (under flock) | 27 passed, 0 failed (5 files) |
+| `bun test` sum across folders | 1911 passed, 1 skipped, 0 failed (194 test files) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `venv-bld3/bin/python -m pytest dispar_orchestrate -q --basetemp=/home/shiro/rantai/review/pytest-bld2` | 1533 passed, 585 warnings, 33 subtests passed in 966.09s (0:16:06), 0 failed |
+| Compose config with dummy env | `COMPOSE_OK` |
+| Gate run initial 1-min (`3b418d07de54`, project `bld2r81m`) | `[g7] PASS`: 5 samples = `[16.37, 22.36, 22.32, 26.35, 16.35]` s, avg 20.75 s; 5 unchanged checks met; log `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
+| Gate run final 1-min (`29d889340b1a`, project `bld2r8fin`) | `[g7] PASS`: 5 samples = `[18.34, 32.70, 16.37, 28.41, 32.39]` s, avg 25.64 s; 5 unchanged checks met; 3-column fingerprint elapsed: 0.011s, 0.012s, 0.009s; log `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
+
+#### Not Verified
+
+- Full workspace `cargo test` is not verified (tool execution limit; the reviewer runs it).
+- Nothing was verified in a browser.
+
 ## 8. Review
 
 ### Round 1 (planner, at `5c5a85ffde6f`)
