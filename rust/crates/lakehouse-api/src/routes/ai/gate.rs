@@ -295,6 +295,28 @@ fn look_summary(name: &str, args: &Map<String, Value>) -> String {
     )
 }
 
+/// The confirmation sentence of `arrange_board` and `save_board_filters`.
+/// Split out of [`summary_for`] when the board tools of main met phase 3's tab
+/// and look tools there and took it over the line limit (merge of main into
+/// phase 3).
+fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
+    let board = args.get("board").and_then(Value::as_str).unwrap_or("");
+    if name == "arrange_board" {
+        let n = args
+            .get("tiles")
+            .and_then(Value::as_object)
+            .map_or(0, Map::len);
+        return format!(
+            "Menata ulang {n} tile pada board {board} (grid 12 kolom, hanya tile yang disebut berubah)."
+        );
+    }
+    let n = args
+        .get("filters")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -346,27 +368,8 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id"),
             s("name")
         ),
-        "arrange_board" => {
-            let n = args
-                .get("tiles")
-                .and_then(Value::as_object)
-                .map_or(0, Map::len);
-            format!(
-                "Menata ulang {n} tile pada board {} (grid 12 kolom, hanya tile yang disebut berubah).",
-                s("board")
-            )
-        }
+        "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
-        "save_board_filters" => {
-            let n = args
-                .get("filters")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            format!(
-                "Menyimpan {n} filter sebagai default board {} untuk semua pengguna.",
-                s("board")
-            )
-        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),

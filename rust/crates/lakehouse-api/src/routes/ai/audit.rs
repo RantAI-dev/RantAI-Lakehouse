@@ -132,17 +132,19 @@ pub fn resource_for(
         // result first, so an id the handler returned still wins.
         "create_board" | "rename_board" | "delete_board" => (Some("board"), str_field("id")),
         // The tab tools change a board: the audit names the board, not the tab.
-        "create_tab" | "rename_tab" | "move_charts_to_tab" | "move_tab" | "delete_tab" => {
-            (Some("board"), str_field("board"))
-        }
-        "arrange_board" | "save_board_filters" | "set_board_view_filters" => {
-            (Some("board"), str_field("board"))
-        }
+        "create_tab"
+        | "rename_tab"
+        | "move_charts_to_tab"
+        | "move_tab"
+        | "delete_tab"
+        | "arrange_board"
+        | "save_board_filters"
+        | "set_board_view_filters"
+        | "set_dashboard_theme" => (Some("board"), str_field("board")),
         // The look tools (`BI-17` part A) read `chart` and `board`, not `id`
         // (merge of main into phase 3: the table was main's, written before
         // they existed).
         "format_chart" => (Some("chart"), str_field("chart")),
-        "set_dashboard_theme" => (Some("board"), str_field("board")),
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
             (Some("calculated_field"), str_field("id"))
         }

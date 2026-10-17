@@ -722,7 +722,7 @@ mod tests {
         }
     }
 
-    fn args_of(value: Value) -> Map<String, Value> {
+    fn args_of(value: &Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
     }
 
@@ -862,7 +862,7 @@ mod tests {
             ),
         ];
         for (name, args) in calls {
-            let reply = run(&state, None, name, &args_of(args)).await;
+            let reply = run(&state, None, name, &args_of(&args)).await;
             assert!(
                 reply["error"]
                     .as_str()
@@ -884,7 +884,7 @@ mod tests {
             &state,
             Some(&person()),
             "delete_board",
-            &args_of(json!({ "id": "b1" })),
+            &args_of(&json!({ "id": "b1" })),
         )
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
@@ -906,7 +906,7 @@ mod tests {
             &state,
             Some(&person()),
             "arrange_board",
-            &args_of(json!({ "board": "b1", "tiles": { "c3": tile(0, 0, 12, 2) } })),
+            &args_of(&json!({ "board": "b1", "tiles": { "c3": tile(0, 0, 12, 2) } })),
         )
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
@@ -935,7 +935,7 @@ mod tests {
             &state,
             Some(&person()),
             "save_board_filters",
-            &args_of(tied("t_nope")),
+            &args_of(&tied("t_nope")),
         )
         .await;
         assert!(reply.get("error").is_some(), "{reply}");
@@ -945,7 +945,7 @@ mod tests {
             &state,
             Some(&person()),
             "save_board_filters",
-            &args_of(tied("t_b")),
+            &args_of(&tied("t_b")),
         )
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
@@ -962,7 +962,7 @@ mod tests {
             &state,
             Some(&person()),
             "rename_board",
-            &args_of(json!({ "id": "b1", "name": "Renamed" })),
+            &args_of(&json!({ "id": "b1", "name": "Renamed" })),
         )
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
@@ -980,7 +980,7 @@ mod tests {
             &state,
             Some(&person()),
             "move_chart",
-            &args_of(json!({ "id": "c1", "board": "b2" })),
+            &args_of(&json!({ "id": "c1", "board": "b2" })),
         )
         .await;
         assert_eq!(reply["ok"], json!(true), "{reply}");
@@ -1032,7 +1032,7 @@ mod tests {
         for (name, args) in calls {
             let server = MockServer::start().await;
             let state = state_on(&server, true).await;
-            let reply = run(&state, Some(&person()), name, &args_of(args)).await;
+            let reply = run(&state, Some(&person()), name, &args_of(&args)).await;
             let error = reply["error"].as_str().unwrap_or_default().to_lowercase();
             assert!(error.contains("not found"), "{name}: {reply}");
             let sent = sent(&server).await;
