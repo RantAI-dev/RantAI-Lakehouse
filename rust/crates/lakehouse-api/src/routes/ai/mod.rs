@@ -804,8 +804,14 @@ async fn run_chat(
                     Some("stopped"),
                 ));
             }
-            let args: Map<String, Value> =
-                serde_json::from_str(&call.function.arguments).unwrap_or_default();
+            // `confirmed` is the console Confirm button's signal, sent only
+            // through `POST /api/ai/tool`; a model may not send it (backlog
+            // AI-18, ADR 0012 Decision 3). It is stripped here, before the
+            // gate, so the gate, the audit record and `run_tool` never see it.
+            let args = gate::strip_confirmed(
+                &serde_json::from_str::<Map<String, Value>>(&call.function.arguments)
+                    .unwrap_or_default(),
+            );
             // plan 14: an ask after any tool that ran in this turn is refused
             // before the gate. The prompt asks the model to ask first; this
             // is the check that holds when it does not.
@@ -892,9 +898,7 @@ async fn run_chat(
                 let error = not_offered_refusal(&call.function.name);
                 (json!({ "error": error }), "failed", None, None)
             } else {
-                let clean_args = gate::strip_confirmed(&args);
-                let result =
-                    tools::run_tool(state, principal, &call.function.name, &clean_args).await;
+                let result = tools::run_tool(state, principal, &call.function.name, &args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
