@@ -21,6 +21,7 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
+import { readableErrorMessage } from "@/lib/notify-message";
 import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
@@ -1088,7 +1089,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         }
       />
 
-      {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
+      {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
