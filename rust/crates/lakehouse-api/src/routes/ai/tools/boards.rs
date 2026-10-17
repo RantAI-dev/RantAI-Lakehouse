@@ -953,6 +953,28 @@ mod tests {
         assert_eq!(version_inserts(&sent, "b1"), 1, "{sent:#?}");
     }
 
+    /// The route's own 20-filter limit surfaces through `save_board_filters`
+    /// (it runs after the board is looked up, so this needs a live board;
+    /// the HTTP harness has none) and nothing is written.
+    #[tokio::test]
+    async fn save_board_filters_refuses_more_than_twenty_filters() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let too_many: Vec<Value> = (0..21)
+            .map(|i| json!({ "column": format!("c{i}"), "values": ["A"] }))
+            .collect();
+        let reply = run(
+            &state,
+            Some(&person()),
+            "save_board_filters",
+            &args_of(&json!({ "board": "b1", "filters": too_many })),
+        )
+        .await;
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(error.contains("at most 20"), "{reply}");
+        assert_eq!(writes(&sent(&server).await), 0);
+    }
+
     /// `rename_board` records a version, as the console's rename does.
     #[tokio::test]
     async fn rename_board_records_a_version() {
@@ -1040,17 +1062,12 @@ mod tests {
         }
     }
 
-    // `save_board_filters`' own 21-filter and invalid-op refusals are NOT
-    // tested in this module, because they cannot be: the tool takes an
-    // `&AppState`, and this unit-test module has none to give it. They are not
-    // untested, though — both run before any `ClickHouse` call (the invalid op
-    // in the tool's own parse, the count in the route's `validate_filters`
-    // ahead of its first store call), so they are asserted through the HTTP
-    // harness in `tests/ai_tool.rs` as
-    // `save_board_filters_refuses_more_than_twenty_filters` and
-    // `save_board_filters_refuses_an_invalid_op`.
-    //
-    // What is genuinely untested here is the half no harness can reach:
-    // `save_board_filters` writing a valid filter list to `bi_board.filters_json`
-    // needs a real `ClickHouse`. That gap is recorded in `tests/ai_tool.rs`.
+    // The invalid-op refusal of `save_board_filters` runs in the tool's own
+    // parse, before any `ClickHouse` call, so it is asserted through the HTTP
+    // harness in `tests/ai_tool.rs` (`save_board_filters_refuses_an_invalid_op`).
+    // The 20-filter limit is the route's and runs after the board lookup, so it
+    // is tested above against a mocked live board. A save to a real
+    // `bi_board.filters_json` row is only covered by the mocked statements
+    // above, not by a real `ClickHouse`; that gap is recorded in
+    // `tests/ai_tool.rs`.
 }
