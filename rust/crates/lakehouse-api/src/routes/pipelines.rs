@@ -212,6 +212,12 @@ async fn list_body(
             .collect();
         let lag_states = pipelines::list_lag_states(pg, &lag_ids).await?;
         let no_readers = crate::pipeline_lag::downstream_without_readers(pg, &authored).await?;
+        // BLD-2 review R5 SHOULD-FIX 1: the whole list's chain walks share
+        // ONE connection and the stop answers come from the `lag_states`
+        // map above — a per-row walk plus a per-upstream state read used
+        // to multiply the round trips by rows.
+        let upstream_stops =
+            crate::pipeline_lag::upstream_stops_for_list(pg, &authored, &lag_states).await?;
         let now = time::OffsetDateTime::now_utc();
         for p in &authored {
             if let Ok(mut val) = serde_json::to_value(p) {
@@ -221,13 +227,12 @@ async fn list_body(
                     // check walks, and the walk stops where the check's own
                     // upstream evaluation stops — first open request, deepest
                     // first — not from `dependsOn` alone. A pipeline with no
-                    // target lag is never shown a `lag` object, so its chain
-                    // is not walked.
-                    let upstream_stop = if p.target_lag.is_some() {
-                        crate::pipeline_lag::upstream_stop_of(pg, p).await?
-                    } else {
-                        None
-                    };
+                    // target lag is never shown a `lag` object, and its chain
+                    // was not walked either, so it has no entry in
+                    // `upstream_stops` at all.
+                    let upstream_stop = upstream_stops
+                        .get(&p.id)
+                        .and_then(std::option::Option::as_ref);
                     obj.insert(
                         "lag".to_owned(),
                         crate::pipeline_lag::lag_json(
@@ -236,7 +241,7 @@ async fn list_body(
                             now,
                             no_readers.contains(&p.id),
                             i32::from(p.max_retries),
-                            upstream_stop.as_ref(),
+                            upstream_stop,
                         ),
                     );
                 }

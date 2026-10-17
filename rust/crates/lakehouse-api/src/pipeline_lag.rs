@@ -36,7 +36,7 @@
 //! to a number therefore pins the clock to the same number, instead of
 //! sleeping and hoping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{DgClient, DgError};
@@ -1610,6 +1610,68 @@ pub async fn upstream_stop_of(
     let chain_ids: Vec<&str> = chain.iter().map(|u| u.id.as_str()).collect();
     let states = pipelines::list_lag_states(pool, &chain_ids).await?;
     Ok(first_upstream_stop(&chain, &|id| states.get(id)))
+}
+
+/// BLD-2 review R5 SHOULD-FIX 1: the WHOLE list's upstream stops, in one
+/// connection. The list route used to call [`upstream_stop_of`] per row,
+/// and each of those paid one chain walk plus one `list_lag_states` per
+/// upstream — an `N+1` (a list page of 100 lag pipelines paid hundreds of
+/// round trips, and every one of them is a page nobody is waiting for
+/// interactively). One walk per row is unavoidable (the chains differ),
+/// but one connection for all of them is not, and the per-row lag-state
+/// read is not needed at all.
+///
+/// `states` is the map the list route already loaded with
+/// `ANY($1)` over the rows it is listing, and reading the chain's state
+/// from it rather than from a fresh query is SAFE — not merely cheaper —
+/// because every chain upstream is already a key of that map:
+///
+/// * `upstream_downstream_pipelines_conn` only returns rows with
+///   `target_lag_downstream = true`, and `TargetLag::from_columns` maps
+///   that column to `Some(TargetLag::Downstream)` — so a chain upstream
+///   always has a target lag, which is the same predicate the route built
+///   `states`' ids from;
+/// * that query is tenant-scoped to the pipeline being walked
+///   (`tenant_id = $4`, and a tenantless pipeline walks nothing at all),
+///   and the route listed under that same tenant (or under `all_tenants`,
+///   which lists more), so the upstream row was in `authored` too.
+///
+/// A chain upstream with no state row is absent from `states` — which is
+/// what the query would have answered as well, and what
+/// [`first_upstream_stop`] already treats as "never checked, not a stop".
+///
+/// Pinned by the route test
+/// `adding_a_listed_lag_pipeline_does_not_add_a_statement_to_the_list`
+/// in `tests/pipeline_lag_page.rs`, which counts the statements one
+/// request commits on the test's own database.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if any chain read fails — a swallowed failure
+/// would report every blocked pipeline as unblocked.
+// BLD-2 review R5 SHOULD-FIX 1
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the map is the store's own `list_lag_states` return value, \
+              default SipHash; generalizing over BuildHasher would add a \
+              type parameter to the one caller for a capability nothing \
+              here uses"
+)]
+pub async fn upstream_stops_for_list(
+    pool: &PgPool,
+    authored: &[Pipeline],
+    states: &HashMap<String, pipelines::PipelineLagState>,
+) -> Result<HashMap<String, Option<UpstreamStop>>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    let mut stops = HashMap::new();
+    for p in authored.iter().filter(|p| p.target_lag.is_some()) {
+        let chain = pipelines::upstream_downstream_chain_conn(&mut conn, p).await?;
+        stops.insert(
+            p.id.clone(),
+            first_upstream_stop(&chain, &|id| states.get(id)),
+        );
+    }
+    Ok(stops)
 }
 
 /// BLD-2 plan D8: compute the `lag: { status, lagSeconds, lastCheckAt,

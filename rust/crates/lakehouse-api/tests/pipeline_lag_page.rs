@@ -20,6 +20,8 @@
 
 mod common;
 
+use std::sync::atomic::Ordering;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -29,6 +31,7 @@ use uuid::Uuid;
 
 use common::{
     TestApp, create_principal_with_permissions, session_cookie_for_user, spin_up_with_env,
+    spin_up_with_env_counting_acquires,
 };
 use lakehouse_store::pipelines::{self, CreatePipelineInput, TargetLag};
 use sqlx::PgPool;
@@ -86,20 +89,33 @@ async fn get_json(app: &TestApp, path: &str, cookie: &str) -> (StatusCode, Value
     (status, body)
 }
 
-/// A `pipeline:read` member of one tenant (the one whose pipelines are
-/// seeded), with a second tenant and a `CATALOG_TENANT_ID` it does not
-/// own so the Dagster-job half of the list is refused without a round
-/// trip to the dead upstream.
-async fn spin_up_with_member(pool_user: &str) -> (TestApp, Uuid, String) {
+/// The env every list test runs under: a `CATALOG_TENANT_ID` the member
+/// does not own, so the Dagster-job half of the list is refused without a
+/// round trip to the dead upstream.
+fn list_overrides() -> std::collections::HashMap<String, String> {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert(
         "CATALOG_TENANT_ID".to_owned(),
         a_qualifying_but_unowned_catalog_tenant().to_string(),
     );
-    let app = spin_up_with_env(&overrides).await;
-    let tenant = provision_tenant(&app.pool, pool_user).await;
+    overrides
+}
+
+/// A `pipeline:read` member of one tenant (the one whose pipelines are
+/// seeded), with a second tenant and a `CATALOG_TENANT_ID` it does not
+/// own so the Dagster-job half of the list is refused without a round
+/// trip to the dead upstream.
+async fn spin_up_with_member(pool_user: &str) -> (TestApp, Uuid, String) {
+    member_of(spin_up_with_env(&list_overrides()).await, pool_user).await
+}
+
+/// The provisioning half of [`spin_up_with_member`], over an app the caller
+/// may have built differently (a counted pool, say) — the test file needs
+/// both shapes and the member must be the same member either way.
+async fn member_of(app: TestApp, pool_user: &str) -> (TestApp, Uuid, String) {
     // The refusal rule counts the deployment's tenants: there must be
     // more than one, or a member is never refused.
+    let tenant = provision_tenant(&app.pool, pool_user).await;
     provision_tenant(&app.pool, "lag-page-else").await;
 
     let user = create_principal_with_permissions(&app.pool, "pipeline:read").await;
@@ -455,5 +471,126 @@ async fn the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_o
         detail_body["lag"]["reason"],
         format!("waiting for upstream pipeline {u1_id} to finish"),
         "the detail page names the same U the list page names"
+    );
+}
+
+/// Every listed row reads as blocked by `u_id`, by the same chain the check
+/// walks — the answer must not depend on how many rows share it.
+fn assert_each_row_names_u(body: &Value, p_ids: &[String], u_id: &str) {
+    for p_id in p_ids {
+        let row = body["pipelines"]
+            .as_array()
+            .expect("a pipelines array")
+            .iter()
+            .find(|row| row["id"].as_str() == Some(p_id.as_str()))
+            .expect("the lag pipeline is listed");
+        assert_eq!(
+            row["lag"]["status"], "behind",
+            "a P blocked by an exhausted U is behind"
+        );
+        assert_eq!(
+            row["lag"]["reason"],
+            format!(
+                "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+                 the next input change starts again"
+            ),
+            "every listed row names the shared U"
+        );
+    }
+}
+
+/// BLD-2 review R5 SHOULD-FIX 1: the list is not N+1. Two target-lag rows
+/// (then three) share ONE exhausted upstream, every row must answer with
+/// that U, and the number of pool checkouts one `GET /api/pipelines` makes
+/// must not grow when a row is added to the list.
+///
+/// Before the batch this fails: the third row cost a chain walk AND a
+/// `list_lag_states` of its own, because the list route called
+/// `upstream_stop_of` per row (checkouts grow by two per row). The rows
+/// themselves were right either way — the finding was the round trips, so
+/// the row assertions here are the other half of it: batching must not
+/// change an answer.
+#[tokio::test]
+async fn adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list() {
+    let (app, checkouts) = spin_up_with_env_counting_acquires(&list_overrides()).await;
+    let (app, tenant, cookie) = member_of(app, "lag-page-shared").await;
+
+    let u_id = create_pipeline(
+        &app.pool,
+        "lag-page-shared-upstream",
+        tenant,
+        Some(TargetLag::Downstream),
+        "bronze.raw",
+        "silver.orders_shared",
+        Vec::new(),
+        Some(0),
+    )
+    .await;
+    set_ready(&app.pool, &u_id).await;
+    // attempt 1 > max_retries 0, asked and never consumed: exhausted
+    // under `upstream_retries_exhausted`.
+    seed_exhausted_state(&app.pool, &u_id, tenant, 1).await;
+
+    let mut p_ids = Vec::new();
+    for name in ["lag-page-shared-one", "lag-page-shared-two"] {
+        let p_id = create_pipeline(
+            &app.pool,
+            name,
+            tenant,
+            Some(TargetLag::Lag { minutes: 10 }),
+            "silver.orders_shared",
+            &format!("gold.p_{name}"),
+            Vec::new(),
+            None,
+        )
+        .await;
+        set_ready(&app.pool, &p_id).await;
+        seed_unmeasured_state(&app.pool, &p_id, tenant).await;
+        p_ids.push(p_id);
+    }
+
+    // One unmeasured request first (it opens nothing the measured ones do
+    // not, but it keeps the measured pair from being the very first two):
+    // it answers the two-row question on its own.
+    let (status, body) = get_json(&app, "/api/pipelines", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_each_row_names_u(&body, &p_ids, &u_id);
+
+    let before = checkouts.load(Ordering::SeqCst);
+    let (status, body) = get_json(&app, "/api/pipelines", &cookie).await;
+    let with_two_rows = checkouts.load(Ordering::SeqCst) - before;
+    assert_eq!(status, StatusCode::OK);
+    assert_each_row_names_u(&body, &p_ids, &u_id);
+    assert!(
+        with_two_rows > 0,
+        "the counter must see this request's checkouts at all, or it pins \
+         nothing (measured {with_two_rows})"
+    );
+
+    let third = create_pipeline(
+        &app.pool,
+        "lag-page-shared-three",
+        tenant,
+        Some(TargetLag::Lag { minutes: 10 }),
+        "silver.orders_shared",
+        "gold.p_lag-page-shared-three",
+        Vec::new(),
+        None,
+    )
+    .await;
+    set_ready(&app.pool, &third).await;
+    seed_unmeasured_state(&app.pool, &third, tenant).await;
+
+    let before = checkouts.load(Ordering::SeqCst);
+    let (status, body) = get_json(&app, "/api/pipelines", &cookie).await;
+    let with_three_rows = checkouts.load(Ordering::SeqCst) - before;
+    assert_eq!(status, StatusCode::OK);
+    assert_each_row_names_u(&body, &[p_ids[0].clone(), p_ids[1].clone(), third], &u_id);
+
+    assert!(
+        with_three_rows <= with_two_rows,
+        "a third listed lag pipeline over the SAME upstream must not cost a \
+         checkout: two rows checked out {with_two_rows}, three checked out \
+         {with_three_rows}"
     );
 }
