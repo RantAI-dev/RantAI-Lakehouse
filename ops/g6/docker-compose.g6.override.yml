@@ -53,8 +53,8 @@ volumes:
   # `sftp-g6-hostkey-init`; read-only in `sftp-g6` and in `g6-test-runner`.
   sftp_g6_hostkey:
   # PR #192 review BLOCKER 11, GATE-ONLY: a combined CA bundle containing the
-  # Postgres CA (`ca.crt`) plus `mssql-g6`'s self-signed certificate
-  # (`mssql-g6.pem`), written by `g6-ca-bundle-init`.
+  # Postgres CA (`ca.crt`) plus `mssql-g6`'s CA certificate
+  # (`ca.crt`), written by `g6-ca-bundle-init`.
   g6_connector_ca:
 
 services:
@@ -63,12 +63,13 @@ services:
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
       # OpenSSL (Microsoft ODBC Driver 18's TLS implementation on Linux)
       # honours SSL_CERT_FILE for the default trust store -- pointed at
-      # mssql-g6-cert-init's self-signed cert (mounted below) so the
+      # mssql-g6-cert-init's CA cert (mounted below) so the
       # `mssql` adapter's real `TrustServerCertificate=no` verification
       # has a CA it can actually verify `mssql-g6`'s certificate against.
       # Gate-only: a real deployment dials real, CA-issued SQL Server
       # certificates and needs no override of the system trust store.
-      SSL_CERT_FILE: /etc/mssql-tls/mssql-g6.pem
+      # PR #192 review BLOCKER 11: point at fixture's CA cert, not server cert.
+      SSL_CERT_FILE: /etc/mssql-tls/ca.crt
     volumes:
       - type: volume
         source: g6_secrets
@@ -80,7 +81,7 @@ services:
         read_only: true
 
   # PR #192 review BLOCKER 11, GATE-ONLY: combine the Postgres CA (`ca.crt`)
-  # and mssql-g6's self-signed certificate (`mssql-g6.pem`) into a single CA bundle
+  # and mssql-g6's CA certificate (`ca.crt`) into a single CA bundle
   # for lakehouse-api. The API trusts this bundle via CONNECTOR_TLS_CA_FILE so both
   # the bundled Postgres connector and mssql-g6 verify TLS without loosening
   # encryption levels or using trust_cert.
@@ -101,8 +102,8 @@ services:
     command:
       - >
         cat /postgres-ca/ca.crt > /out/ca-bundle.crt &&
-        if [ -f /mssql-tls/mssql-g6.pem ]; then
-          cat /mssql-tls/mssql-g6.pem >> /out/ca-bundle.crt;
+        if [ -f /mssql-tls/ca.crt ]; then
+          cat /mssql-tls/ca.crt >> /out/ca-bundle.crt;
         fi &&
         chmod 644 /out/ca-bundle.crt
 
