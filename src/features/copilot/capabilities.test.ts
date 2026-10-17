@@ -70,3 +70,20 @@ describe("the dashboard capability against the server's tool list", () => {
     for (const name of toolsFromCaps(new Set(["dashboard"]), "build")) expect(serverTools).toContain(name)
   })
 })
+
+// BI-1 / AI-10: the export tools, named here or they never reach the model.
+describe("the export tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+
+  it("are on the server and offered with Query Data in both modes and with the Dashboard Builder", () => {
+    expect(serverTools).toContain("export_dashboard")
+    expect(serverTools).toContain("export_chart")
+    for (const mode of ["ask", "build"] as const) {
+      for (const tool of ["export_dashboard", "export_chart"]) expect(toolsFromCaps(new Set(["data"]), mode)).toContain(tool)
+    }
+    for (const tool of ["export_dashboard", "export_chart"]) expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+  })
+})

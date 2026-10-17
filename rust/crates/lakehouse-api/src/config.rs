@@ -334,6 +334,17 @@ pub struct Config {
     /// plain-text `console.app_kv` row); `None` means signed embedding is
     /// unavailable and says so, while the API still starts.
     pub embed_secret: Option<String>,
+    /// Base URL of the Gotenberg container that makes PDFs (`GOTENBERG_URL`,
+    /// `BI-1` D1/D5). `None` when unset or empty. Operator configuration,
+    /// never taken from a request.
+    pub gotenberg_url: Option<String>,
+    /// The console's address as the Gotenberg container reaches it
+    /// (`CONSOLE_INTERNAL_URL`, e.g. `http://lakehouse-frontend:3000`): the
+    /// print view lives at `<this>/render/dashboard/<token>`. `None` when
+    /// unset or empty. PDF export needs this, `GOTENBERG_URL` and
+    /// `EMBED_SECRET` (the render token's key); any one missing means "PDF
+    /// export is not set up on this deployment" (feature decision 6).
+    pub console_internal_url: Option<String>,
     /// The longest lifetime (`exp - iat`) a signed embed token may have, in
     /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
     /// 86400. A value that is not a positive integer fails start-up
@@ -910,6 +921,8 @@ impl std::fmt::Debug for Config {
                 "embed_secret",
                 &self.embed_secret.as_ref().map(|_| REDACTED),
             )
+            .field("gotenberg_url", &self.gotenberg_url)
+            .field("console_internal_url", &self.console_internal_url)
             .field(
                 "embed_token_max_lifetime_seconds",
                 &self.embed_token_max_lifetime_seconds,
@@ -1296,6 +1309,8 @@ impl Config {
             llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            gotenberg_url: truthy(env, "GOTENBERG_URL"),
+            console_internal_url: truthy(env, "CONSOLE_INTERNAL_URL"),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
@@ -1614,6 +1629,8 @@ mod tests {
         assert_eq!(cfg.llm_model, "MiniMax-M3");
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
+        assert_eq!(cfg.gotenberg_url, None);
+        assert_eq!(cfg.console_internal_url, None);
         assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
@@ -2626,5 +2643,29 @@ mod tests {
             err,
             ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
         ));
+    }
+
+    /// `BI-1` D1: the PDF renderer's two addresses are plain configuration;
+    /// empty is unset, so a compose default of `""` means "not set up".
+    #[test]
+    fn the_pdf_renderer_addresses_are_read_and_empty_means_unset() {
+        let mut env = HashMap::new();
+        env.insert(
+            "GOTENBERG_URL".to_owned(),
+            "http://gotenberg:3000".to_owned(),
+        );
+        env.insert(
+            "CONSOLE_INTERNAL_URL".to_owned(),
+            "http://lakehouse-frontend:3000".to_owned(),
+        );
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gotenberg_url.as_deref(), Some("http://gotenberg:3000"));
+        assert_eq!(
+            cfg.console_internal_url.as_deref(),
+            Some("http://lakehouse-frontend:3000")
+        );
+        env.insert("CONSOLE_INTERNAL_URL".to_owned(), String::new());
+        let blank = Config::from_map(&env).unwrap();
+        assert_eq!(blank.console_internal_url, None);
     }
 }

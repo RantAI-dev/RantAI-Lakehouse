@@ -27,6 +27,8 @@ pub(crate) mod dashboard_organise;
 mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
+mod pdf_export;
+mod render;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
@@ -1059,8 +1061,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
+        .route("/api/dashboard/chart-export", get(dashboard::chart_export))
+        .route("/api/dashboard/export/pdf", get(pdf_export::export_pdf))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
+        .route("/api/render/data", axum::routing::post(render::data))
         .route(
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),

@@ -87,3 +87,36 @@ describe("DashboardActionsMenu history and personal space", () => {
     expect(onShare).toHaveBeenCalledTimes(1)
   })
 })
+
+describe("DashboardActionsMenu downloads (BI-1)", () => {
+  it("offers Download PDF and Print when the deployment can make a PDF", async () => {
+    const onDownloadPdf = mock(() => {})
+    const onExportPdf = mock(() => {})
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: true })
+    fireEvent.click(await screen.findByText("Download PDF…"))
+    expect(onDownloadPdf).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: true })
+    fireEvent.click(await screen.findByText("Print…"))
+    expect(onExportPdf).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText("Export PDF (print)")).toBeNull()
+  })
+
+  it("keeps Download PDF disabled, saying why, when the deployment has no renderer, and Print still works", async () => {
+    const onDownloadPdf = mock(() => {})
+    const onExportPdf = mock(() => {})
+    renderMenu({ onDownloadPdf, onExportPdf, pdfSupported: false })
+    const item = (await screen.findByText("Download PDF…")).closest("[role='menuitem']") as HTMLElement
+    expect(item.getAttribute("aria-disabled") === "true" || item.hasAttribute("data-disabled")).toBe(true)
+    fireEvent.click(item)
+    expect(onDownloadPdf).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByText("Print…"))
+    expect(onExportPdf).toHaveBeenCalledTimes(1)
+  })
+
+  it("hides Download PDF for a person whose every role is switched off from downloading, and keeps Print", async () => {
+    renderMenu({ onDownloadPdf: () => {}, pdfSupported: true, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Download PDF…")).toBeNull()
+  })
+})

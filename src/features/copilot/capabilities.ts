@@ -25,7 +25,9 @@ export const CAPABILITIES: Capability[] = [
     icon: Database,
     tools: ["run_sql", "ask_user", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart",
       // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
-      "list_metrics", "describe_metric", "query_metric"],
+      "list_metrics", "describe_metric", "query_metric",
+      // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
+      "export_dashboard", "export_chart"],
   },
   {
     key: "dashboard",
@@ -49,7 +51,9 @@ export const CAPABILITIES: Capability[] = [
       // AI-1 / AI-2 / AI-20 (plan 20): rename and delete the board, move tiles,
       // move a chart to another board, set the view's filters (read-only, so
       // Ask mode can offer it too) and save the board's default filters.
-      "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters"],
+      "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters",
+      // BI-1 / AI-10: a download link for a dashboard (PDF) or a chart's data (Excel, CSV). Read-only, so Ask mode can offer them too.
+      "export_dashboard", "export_chart"],
   },
   {
     key: "pipeline",

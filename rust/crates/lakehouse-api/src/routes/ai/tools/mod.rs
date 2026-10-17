@@ -11,6 +11,8 @@
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`export`] — `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`): a
+//!   download link, made when the person opens it.
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
@@ -30,6 +32,7 @@ mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
+mod export;
 // `pub(in crate::routes)` (not merely `mod`) so `routes::lineage` — a
 // SIBLING module of `routes::ai`, not a descendant — can reuse
 // `data::CATALOG_UNION`, the SAME bronze-catalog query `list_datasets`
@@ -171,6 +174,7 @@ pub(in crate::routes) async fn run_tool(
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
         n if look::handles(n) => look::run(state, principal, name, args).await,
+        n if export::handles(n) => export::run(state, principal, name, args).await,
         "rename_board"
         | "delete_board"
         | "arrange_board"

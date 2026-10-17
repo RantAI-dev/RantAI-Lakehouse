@@ -6600,6 +6600,83 @@
   {
     "type": "function",
     "function": {
+      "name": "export_dashboard",
+      "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "the dashboard's id, from list_boards"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "pdf"
+            ],
+            "description": "pdf, the default"
+          },
+          "paper": {
+            "type": "string",
+            "enum": [
+              "a4",
+              "letter"
+            ],
+            "description": "default a4"
+          },
+          "orientation": {
+            "type": "string",
+            "enum": [
+              "portrait",
+              "landscape"
+            ],
+            "description": "default portrait"
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "export_chart",
+      "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "chart": {
+            "type": "string",
+            "description": "the chart's id, from list_charts"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "xlsx",
+              "csv"
+            ]
+          },
+          "values": {
+            "type": "string",
+            "enum": [
+              "formatted",
+              "raw"
+            ],
+            "description": "formatted as on the chart (default) or the raw values"
+          }
+        },
+        "required": [
+          "chart",
+          "format"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "ask_user",
       "description": "Ask the user which reading of an unclear word they mean, with two to four options taken from the DATA MAP. Use it only when a word fits two or more tables, columns or values and nothing in the DATA MAP or THIS USER'S WORDS settles it. Ask once, run no query in that turn, and write nothing else after the call.",
       "parameters": {

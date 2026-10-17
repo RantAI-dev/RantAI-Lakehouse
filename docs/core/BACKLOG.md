@@ -273,7 +273,7 @@ parity), built after it.
 | `BLD-2` | Building | — | `REL-6` |
 | `DATA-13` | Planned | — | `BI-14` (column part) |
 | `DATA-4` | Planned | — | `DATA-3` |
-| `DEC-8` | Open (decision) | — | `AI-11` |
+| `DEC-8` | Decided | — | `AI-11` |
 | `DEC-9` | Open (decision) | — | `SRC-3` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
@@ -399,7 +399,6 @@ rejected** with the date.
 | `DEC-4` | Train and serve models | Build · No | No | Product owner |
 | `DEC-5` | Mobile app | Build · No | No | Product owner |
 | `DEC-6` | Share data with another organisation | Build · Defer · No | Defer | Product owner |
-| `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Add: make a dashboard public or embeddable · change who can see a dashboard · email outside the company · delete a dashboard — each on or off | Add all four | Product owner |
 | `DEC-9` | How to get SaaS connectors | Reuse dlt verified sources (our loader already runs on dlt) · adopt another connector library · build each by hand | Reuse dlt verified sources first | Product owner |
 | `DEC-10` | Data and Query Studio edge cases: entity-relationship diagram, a no-code connector builder, business glossary and domains, table favourites, real-time query co-editing, Git for queries | Drop · Defer · Build, each of the six | Drop or defer all six | Product owner |
 | `INT-1` | Digital employees | Build · Park | Parked (product owner, 2026-10-02) | Product owner |
@@ -423,6 +422,7 @@ rejected** with the date.
 | `DEC-12` | Name staff as Owner and Acceptor in the public repo | Decided: no. The repo names the module; the base holds the person through the module's owner | 2026-10-09 |
 | `DEC-13` | Query Studio as a module in the base | Decided: yes, its own module | 2026-10-09 |
 | `DEC-14` | Priority of `SEC-14` and `SEC-15` | Decided: P0 | 2026-10-09 |
+| `DEC-8` | Which assistant actions need human approval before they run | Decided: besides deletions and pauses, all four wait for approval: making a dashboard public or embeddable, changing who can see a dashboard, emailing outside the company, deleting a dashboard | 2026-10-17 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
 

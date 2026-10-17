@@ -26,7 +26,7 @@ import {
 } from "@/lib/formatting-settings"
 import { listTimeZones } from "@/lib/time-zones"
 import { withNotify } from "@/lib/notify"
-import { settingsService } from "@/services"
+import { identityService, settingsService } from "@/services"
 import type { ReportingSettingsInput } from "@/services/contracts/settings"
 
 const WEEK_STARTS = { monday: "Monday", sunday: "Sunday" } as const
@@ -65,6 +65,10 @@ export function ReportingSettingsForm({
   const [hex, setHex] = React.useState("")
   const [sites, setSites] = React.useState<string[]>([])
   const [site, setSite] = React.useState("")
+  const [denied, setDenied] = React.useState<string[]>([])
+  // The role names come from the identity service; a person who can save
+  // settings but not read roles still sees (and can clear) the saved list.
+  const roles = useService((signal) => identityService.listRoles(signal), [])
   const save = useServiceAction(
     withNotify(
       { success: "Settings saved", error: "Settings were not saved" },
@@ -82,6 +86,7 @@ export function ReportingSettingsForm({
       setPalette(loaded.companyPalette)
       setFonts(loaded.fonts)
       setSites(loaded.contentSites ?? [])
+      setDenied(loaded.downloadDeniedRoles ?? [])
     }
   }, [loaded])
 
@@ -94,7 +99,18 @@ export function ReportingSettingsForm({
       locale !== loaded.numberLocale ||
       palette.join() !== loaded.companyPalette.join() ||
       fonts.join() !== loaded.fonts.join() ||
-      sites.join() !== (loaded.contentSites ?? []).join())
+      sites.join() !== (loaded.contentSites ?? []).join() ||
+      denied.join() !== (loaded.downloadDeniedRoles ?? []).join())
+
+  // Sorted like the server stores it, so the comparison with the saved list is stable.
+  const roleNames = React.useMemo(() => {
+    const listed = roles.status === "success" && Array.isArray(roles.data) ? roles.data.map((r) => r.name) : []
+    return [...new Set([...listed, ...denied])].sort()
+  }, [roles, denied])
+
+  function toggleDenied(name: string, off: boolean) {
+    setDenied(roleNames.filter((r) => (r === name ? off : denied.includes(r))))
+  }
 
   function addColour() {
     const colour = hex.trim().toLowerCase()
@@ -128,6 +144,7 @@ export function ReportingSettingsForm({
       companyPalette: palette,
       fonts,
       contentSites: sites,
+      downloadDeniedRoles: denied,
     })
     if (result) state.reload()
   }
@@ -328,6 +345,27 @@ export function ReportingSettingsForm({
                 </Button>
               </div>
             ) : null}
+          </section>
+          <section className="flex flex-col gap-1.5" aria-labelledby="settings-downloads">
+            <h2 id="settings-downloads" className="text-sm font-medium">
+              Downloads
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Roles that may not download dashboards as PDF or data as Excel or CSV. A
+              person who holds any other role still can, and Platform Admin always can.
+              With none chosen, everyone who can see a dashboard can download it.
+            </p>
+            {roleNames.map((name) => (
+              <div key={name} className="flex items-center gap-2">
+                <Checkbox
+                  id={`download-denied-${name}`}
+                  checked={denied.includes(name)}
+                  onCheckedChange={(on) => toggleDenied(name, on === true)}
+                  disabled={!canWrite}
+                />
+                <Label htmlFor={`download-denied-${name}`}>{name}</Label>
+              </div>
+            ))}
           </section>
           {canWrite ? (
             <Button

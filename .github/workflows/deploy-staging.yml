@@ -117,6 +117,11 @@ jobs:
             sed -i "/^${name}=/d" .env
             printf '\n%s=%s\n' "$name" "$value" >> .env
           done
+          # BI-1: the address the Gotenberg container uses to reach the console,
+          # which is deployed below as `lakehouse-frontend` on this network.
+          # Not a secret; a plain line so the PDF item is on in staging.
+          sed -i '/^CONSOLE_INTERNAL_URL=/d' .env
+          printf '\nCONSOLE_INTERNAL_URL=%s\n' 'http://lakehouse-frontend:3000' >> .env
           if [ -n "$missing" ]; then
             echo "::error::staging secrets not set:$missing (Settings > Secrets and variables > Actions)"
             exit 1

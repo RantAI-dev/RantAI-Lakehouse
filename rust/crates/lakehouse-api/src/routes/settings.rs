@@ -70,9 +70,16 @@ use crate::upstream_error;
 const CONTENT_SITES_REFUSED: &str = "contentSites must be at most 50 sites, each written \
 https://host or https://host:port, with no wildcard, path or user name.";
 
+/// What the person is told when `downloadDeniedRoles` names a role that does
+/// not exist.
+const DOWNLOAD_ROLES_REFUSED: &str = "downloadDeniedRoles must name roles that exist.";
+
+/// What the person is told when their roles may not download (`BI-1`, D7).
+pub(crate) const DOWNLOADS_OFF: &str = "Downloads are switched off for your role.";
+
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...]}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -83,6 +90,7 @@ struct SettingsBody {
     company_palette: Option<Vec<String>>,
     fonts: Option<Vec<String>>,
     content_sites: Option<Vec<String>>,
+    download_denied_roles: Option<Vec<String>>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -92,6 +100,12 @@ pub(crate) struct FormatSettings {
     pub company_palette: Vec<String>,
     pub fonts: Vec<String>,
     pub content_sites: Vec<String>,
+    /// Role names that may not download (`BI-1`, D7). Not part of
+    /// [`Self::to_json`]: the payload every view reads (a public link and a
+    /// signed embed included) must not list the deployment's role names; the
+    /// settings screen reads it through `body_json`, and the dashboard page
+    /// gets only the answer for its own viewer (`canDownload`).
+    pub download_denied_roles: Vec<String>,
 }
 
 impl Default for FormatSettings {
@@ -103,6 +117,7 @@ impl Default for FormatSettings {
             company_palette: Vec::new(),
             fonts: SHIPPED_FONTS.iter().map(|f| (*f).to_owned()).collect(),
             content_sites: Vec::new(),
+            download_denied_roles: Vec::new(),
         }
     }
 }
@@ -114,6 +129,7 @@ impl FormatSettings {
             company_palette: row.company_palette.clone(),
             fonts: row.fonts.clone(),
             content_sites: row.content_sites.clone(),
+            download_denied_roles: row.download_denied_roles.clone(),
         }
     }
 
@@ -162,6 +178,7 @@ pub(crate) fn add_formatting(body: &mut Value, format: &FormatSettings) {
 fn checked_formatting(
     parsed: &SettingsBody,
     current: &FormatSettings,
+    known_roles: Option<&[String]>,
 ) -> Result<FormatSettings, ApiError> {
     let number_locale = match &parsed.number_locale {
         Some(l) if NUMBER_LOCALES.contains(&l.as_str()) => l.clone(),
@@ -211,12 +228,71 @@ fn checked_formatting(
             .map_err(|_| ApiError::BadRequest(CONTENT_SITES_REFUSED.to_owned()))?,
         None => current.content_sites.clone(),
     };
+    let download_denied_roles = match (&parsed.download_denied_roles, known_roles) {
+        (Some(roles), Some(known)) => {
+            // `BI-1` D7: only names of roles that exist, so a typo does not
+            // look like a rule. A fixed sentence (the names are the
+            // caller's own text).
+            if roles.iter().all(|r| known.contains(r)) {
+                let mut roles = roles.clone();
+                roles.sort();
+                roles.dedup();
+                roles
+            } else {
+                return Err(ApiError::BadRequest(DOWNLOAD_ROLES_REFUSED.to_owned()));
+            }
+        }
+        _ => current.download_denied_roles.clone(),
+    };
     Ok(FormatSettings {
         number_locale,
         company_palette,
         fonts,
         content_sites,
+        download_denied_roles,
     })
+}
+
+/// Whether `principal` may download (`BI-1`, D7): a Platform Admin always,
+/// and when no role is switched off everyone; otherwise a person who holds
+/// at least one role that is not on the list. The one copy: the PDF route,
+/// the chart and table exports, the dashboard payload's `canDownload` and the
+/// assistant's tools all call it (rule 4).
+#[must_use]
+pub(crate) fn may_download(principal: &Principal, denied_roles: &[String]) -> bool {
+    if denied_roles.is_empty()
+        || principal
+            .role_names
+            .iter()
+            .any(|r| r == PLATFORM_ADMIN_ROLE)
+    {
+        return true;
+    }
+    principal
+        .role_names
+        .iter()
+        .any(|role| !denied_roles.contains(role))
+}
+
+/// The role that always may download, whatever the list says.
+const PLATFORM_ADMIN_ROLE: &str = "Platform Admin";
+
+/// Refuse with [`DOWNLOADS_OFF`] unless `principal` may download.
+///
+/// # Errors
+///
+/// 403 when every role of the person is switched off; the settings read
+/// failing is reported through `upstream_error`.
+pub(crate) async fn require_download(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    let settings = format_settings(state).await?;
+    if may_download(principal, &settings.download_denied_roles) {
+        Ok(())
+    } else {
+        Err(ApiError::PermissionDenied(DOWNLOADS_OFF.to_owned()))
+    }
 }
 
 /// The time context every dashboard read uses, loaded once per request.
@@ -253,6 +329,7 @@ fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
         "timeZone": ctx.zone(),
         "weekStart": ctx.week_start().as_str(),
         "saved": saved,
+        "downloadDeniedRoles": format.download_denied_roles,
     });
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), format.to_json()) {
         map.extend(fields);
@@ -308,7 +385,20 @@ pub async fn put_reporting(
         .into());
     };
     let current = format_settings(&state).await?;
-    let format = checked_formatting(&parsed, &current)?;
+    // Role names are read only when the body sends the list.
+    let known_roles = if parsed.download_denied_roles.is_some() {
+        Some(
+            lakehouse_store::identity::list_roles(pool)
+                .await
+                .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+                .into_iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    let format = checked_formatting(&parsed, &current, known_roles.as_deref())?;
     if !engine_knows_zone(&state, ctx.zone()).await? {
         return Err(ApiError::BadRequest("Unknown time zone.".to_owned()).into());
     }
@@ -321,6 +411,7 @@ pub async fn put_reporting(
             company_palette: format.company_palette,
             fonts: format.fonts,
             content_sites: format.content_sites,
+            download_denied_roles: format.download_denied_roles,
         },
         &principal.id.uuid().to_string(),
     )
@@ -392,7 +483,7 @@ mod tests {
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
-                "contentSites": [],
+                "contentSites": [], "downloadDeniedRoles": [],
             })
         );
         assert_eq!(
@@ -415,8 +506,12 @@ mod tests {
             company_palette: vec!["#112233".to_owned(), "#445566".to_owned()],
             fonts: vec!["inter".to_owned()],
             content_sites: vec!["https://img.example".to_owned()],
+            download_denied_roles: vec!["Viewer".to_owned()],
         };
-        assert_eq!(checked_formatting(&body(""), &current).unwrap(), current);
+        assert_eq!(
+            checked_formatting(&body(""), &current, None).unwrap(),
+            current
+        );
     }
 
     #[test]
@@ -440,7 +535,8 @@ mod tests {
             ),
         ];
         for (extra, message) in cases {
-            let err = checked_formatting(&body(extra), &FormatSettings::default()).unwrap_err();
+            let err =
+                checked_formatting(&body(extra), &FormatSettings::default(), None).unwrap_err();
             assert!(
                 matches!(&err, ApiError::BadRequest(m) if m == message),
                 "{extra}: {err:?}"
@@ -449,12 +545,13 @@ mod tests {
         let wildcard = checked_formatting(
             &body(r#","contentSites":["https://*.example"]"#),
             &FormatSettings::default(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(&wildcard, ApiError::BadRequest(m) if m == CONTENT_SITES_REFUSED));
         let thirteen: Vec<String> = (0..13).map(|_| "\"#000000\"".to_owned()).collect();
         let extra = format!(r#","companyPalette":[{}]"#, thirteen.join(","));
-        assert!(checked_formatting(&body(&extra), &FormatSettings::default()).is_err());
+        assert!(checked_formatting(&body(&extra), &FormatSettings::default(), None).is_err());
     }
 
     #[test]
@@ -464,10 +561,84 @@ mod tests {
                 r##","companyPalette":["#AABBCC","#112233"],"fonts":["system","inter","inter"]"##,
             ),
             &FormatSettings::default(),
+            None,
         )
         .unwrap();
         assert_eq!(got.company_palette, ["#aabbcc", "#112233"]);
         assert_eq!(got.fonts, ["inter", "system"]);
+    }
+
+    fn person(roles: &[&str]) -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "Test".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("dashboard:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: roles.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn nothing_is_switched_off_until_an_administrator_chooses() {
+        assert!(may_download(&person(&["Viewer"]), &[]));
+        assert!(may_download(&person(&[]), &[]));
+    }
+
+    #[test]
+    fn a_platform_admin_may_download_whatever_the_list_says() {
+        let denied = vec!["Platform Admin".to_owned(), "Viewer".to_owned()];
+        assert!(may_download(&person(&["Platform Admin"]), &denied));
+    }
+
+    #[test]
+    fn one_role_off_does_not_stop_a_person_who_holds_another() {
+        let denied = vec!["Viewer".to_owned()];
+        assert!(may_download(&person(&["Viewer", "Analyst"]), &denied));
+        assert!(!may_download(&person(&["Viewer"]), &denied));
+    }
+
+    #[test]
+    fn a_person_whose_every_role_is_off_cannot_download() {
+        let denied = vec!["Viewer".to_owned(), "Analyst".to_owned()];
+        assert!(!may_download(&person(&["Viewer", "Analyst"]), &denied));
+        assert!(
+            !may_download(&person(&[]), &denied),
+            "no role is not a way around the list"
+        );
+    }
+
+    #[test]
+    fn denied_roles_must_exist_and_are_sorted_without_duplicates() {
+        let known = vec!["Analyst".to_owned(), "Viewer".to_owned()];
+        let got = checked_formatting(
+            &body(r#","downloadDeniedRoles":["Viewer","Analyst","Viewer"]"#),
+            &FormatSettings::default(),
+            Some(&known),
+        )
+        .unwrap();
+        assert_eq!(got.download_denied_roles, ["Analyst", "Viewer"]);
+        let err = checked_formatting(
+            &body(r#","downloadDeniedRoles":["Nobody"]"#),
+            &FormatSettings::default(),
+            Some(&known),
+        )
+        .unwrap_err();
+        assert!(matches!(&err, ApiError::BadRequest(m) if m == DOWNLOAD_ROLES_REFUSED));
+    }
+
+    #[test]
+    fn the_payload_reporting_object_never_lists_role_names() {
+        let denied = FormatSettings {
+            download_denied_roles: vec!["Viewer".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert!(denied.to_json().get("downloadDeniedRoles").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &denied, true)["downloadDeniedRoles"],
+            json!(["Viewer"])
+        );
     }
 
     #[test]

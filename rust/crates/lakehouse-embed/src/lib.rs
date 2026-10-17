@@ -33,6 +33,7 @@
 //! check failed; the variant exists for tests and the log.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -163,6 +164,29 @@ pub fn sign_embed(claims: &EmbedClaims, secret: &str) -> String {
     format!("{data}.{sig}")
 }
 
+/// The payload of `token` once its signature checks out under `key`, before
+/// any claim is read (`SEC-12`): three segments, a decodable signature, a
+/// constant-time comparison, then the payload parsed. Shared by
+/// [`verify_embed`] and [`verify_render`], so the order of those checks has
+/// one copy.
+fn open_signed(token: &str, key: &str) -> Result<Value, TokenError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    let [header, payload, sig] = parts.as_slice() else {
+        return Err(TokenError::Malformed);
+    };
+    let data = format!("{header}.{payload}");
+    let given = from_b64url(sig).map_err(|_| TokenError::Malformed)?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_bytes())
+        .map_err(|_| TokenError::BadSignature)?;
+    mac.update(data.as_bytes());
+    // Constant-time comparison, matching `crypto.timingSafeEqual`.
+    // `verify_slice` folds the length check into the same call.
+    mac.verify_slice(&given)
+        .map_err(|_| TokenError::BadSignature)?;
+    let payload_bytes = from_b64url(payload).map_err(|_| TokenError::Malformed)?;
+    serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::Malformed)
+}
+
 /// Verify a token's signature and claims (`SEC-12`). Returns the claims when
 /// the token is acceptable at `now_unix_seconds`.
 ///
@@ -191,22 +215,7 @@ pub fn verify_embed(
     max_lifetime_seconds: u64,
     now_unix_seconds: f64,
 ) -> Result<EmbedClaims, TokenError> {
-    let parts: Vec<&str> = token.split('.').collect();
-    let [header, payload, sig] = parts.as_slice() else {
-        return Err(TokenError::Malformed);
-    };
-    let data = format!("{header}.{payload}");
-    let given = from_b64url(sig).map_err(|_| TokenError::Malformed)?;
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes())
-        .map_err(|_| TokenError::BadSignature)?;
-    mac.update(data.as_bytes());
-    // Constant-time comparison, matching `crypto.timingSafeEqual`.
-    // `verify_slice` folds the length check into the same call.
-    mac.verify_slice(&given)
-        .map_err(|_| TokenError::BadSignature)?;
-
-    let payload_bytes = from_b64url(payload).map_err(|_| TokenError::Malformed)?;
-    let raw: Value = serde_json::from_slice(&payload_bytes).map_err(|_| TokenError::Malformed)?;
+    let raw = open_signed(token, secret)?;
     // `exp` and `iat` are read from the raw value so a string or null is
     // reported as missing, not as a payload that failed to parse.
     let exp = finite_number(&raw, "exp").ok_or(TokenError::MissingExp)?;
@@ -226,6 +235,133 @@ pub fn verify_embed(
     if let Some(jti) = &claims.jti
         && !is_valid_jti(jti)
     {
+        return Err(TokenError::BadJti);
+    }
+    Ok(claims)
+}
+
+// ── render tokens (BI-1, plan decision D2) ────────────────────────────────
+
+/// The audience of a render token.
+pub const RENDER_AUDIENCE: &str = "render";
+
+/// How long a render token lives: 2 minutes (feature decision 2). Not
+/// configurable: the token is minted and spent inside one PDF request, and a
+/// longer life would only be more time to misuse a copy.
+pub const RENDER_LIFETIME_SECONDS: u64 = 120;
+
+/// What the PDF renderer is allowed to read, and as whom (`BI-1`, D2).
+///
+/// The renderer is a headless browser that opens the console's print view with
+/// this token in the address. It names one dashboard, one person and the
+/// filter and parameter values the person had on screen, so the token is good
+/// for that and nothing else, for two minutes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RenderClaims {
+    /// Always [`RENDER_AUDIENCE`]; a token with another audience is refused.
+    #[serde(default)]
+    pub aud: String,
+    /// The dashboard to print.
+    pub board: String,
+    /// The person who asked (`app_user.id`): the data is read as them.
+    pub principal: String,
+    /// The dashboard's filters, as the JSON list `GET /api/dashboard` takes in
+    /// `filters` (one encoding, the page's own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
+    /// The parameter values, as the JSON object `GET /api/dashboard` takes in `params`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+    /// The grain switch, as `GET /api/dashboard` takes it in `grain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain: Option<String>,
+    /// `a4` or `letter`.
+    pub paper: String,
+    /// `portrait` or `landscape`.
+    pub orientation: String,
+    /// Unix-seconds expiry.
+    #[serde(default)]
+    pub exp: f64,
+    /// Unix-seconds issue time.
+    #[serde(default)]
+    pub iat: f64,
+    /// A unique id for the log.
+    pub jti: String,
+}
+
+/// When a render token issued at `iat` expires.
+#[must_use]
+pub fn render_expiry(iat: f64) -> f64 {
+    iat + seconds_as_f64(RENDER_LIFETIME_SECONDS)
+}
+
+/// The label the render key is derived under; changing it retires every token.
+const RENDER_KEY_LABEL: &str = "lakehouse/render-token/v1";
+
+/// The key render tokens are signed with: `HMAC-SHA256(EMBED_SECRET, label)`
+/// in hex. A render token therefore never verifies as an embed token, whose
+/// key is the secret itself, and an embed token never verifies as a render
+/// token (tested both ways).
+fn render_key(secret: &str) -> String {
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
+        return String::new();
+    };
+    mac.update(RENDER_KEY_LABEL.as_bytes());
+    let mut hex = String::new();
+    for byte in mac.finalize().into_bytes() {
+        // Writing to a `String` cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Sign `claims` as a render token under the key derived from `secret`.
+/// Returns an empty string only if the HMAC key cannot be set up, which no
+/// key length causes (see [`sign_embed`]).
+#[must_use]
+pub fn sign_render(claims: &RenderClaims, secret: &str) -> String {
+    let header = b64url_json(&serde_json::json!({ "alg": "HS256", "typ": "JWT" }))
+        .unwrap_or_else(|_| "e30".to_owned());
+    let payload = b64url_json(claims).unwrap_or_else(|_| "e30".to_owned());
+    let data = format!("{header}.{payload}");
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(render_key(secret).as_bytes()) else {
+        return String::new();
+    };
+    mac.update(data.as_bytes());
+    format!("{data}.{}", b64url(&mac.finalize().into_bytes()))
+}
+
+/// Verify a render token at `now_unix_seconds`: the signature first, then the
+/// audience, the lifetime (at most [`RENDER_LIFETIME_SECONDS`]), the clock
+/// window (as [`verify_embed`]) and the `jti`.
+///
+/// # Errors
+///
+/// A [`TokenError`] naming the first check that failed; a caller answers with
+/// one fixed message.
+pub fn verify_render(
+    token: &str,
+    secret: &str,
+    now_unix_seconds: f64,
+) -> Result<RenderClaims, TokenError> {
+    let raw = open_signed(token, &render_key(secret))?;
+    let exp = finite_number(&raw, "exp").ok_or(TokenError::MissingExp)?;
+    let iat = finite_number(&raw, "iat").ok_or(TokenError::MissingIat)?;
+    let claims: RenderClaims = serde_json::from_value(raw).map_err(|_| TokenError::Malformed)?;
+    if claims.aud != RENDER_AUDIENCE {
+        return Err(TokenError::Malformed);
+    }
+    let lifetime = exp - iat;
+    if lifetime < 0.0 || lifetime > seconds_as_f64(RENDER_LIFETIME_SECONDS) {
+        return Err(TokenError::Lifetime);
+    }
+    if iat > now_unix_seconds + CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::IssuedInFuture);
+    }
+    if exp < now_unix_seconds - CLOCK_TOLERANCE_SECONDS {
+        return Err(TokenError::Expired);
+    }
+    if !is_valid_jti(&claims.jti) {
         return Err(TokenError::BadJti);
     }
     Ok(claims)
@@ -465,5 +601,93 @@ mod tests {
         let bogus_sig = b64url(b"not-the-real-signature-bytes!!!!");
         let tampered = format!("{}.{}.{}", parts[0], parts[1], bogus_sig);
         assert_eq!(verify(&tampered), Err(TokenError::BadSignature));
+    }
+
+    fn render_claims(iat: f64, exp: f64) -> RenderClaims {
+        RenderClaims {
+            aud: RENDER_AUDIENCE.to_owned(),
+            board: "b_test".to_owned(),
+            principal: "7d1e1c52-2f6b-4f3a-9c58-0c5d1d3f9a11".to_owned(),
+            filters: Some(r#"[{"column":"region","values":["north"]}]"#.to_owned()),
+            params: Some(r#"{"p":1}"#.to_owned()),
+            grain: None,
+            paper: "a4".to_owned(),
+            orientation: "landscape".to_owned(),
+            exp,
+            iat,
+            jti: "r-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_render_token_round_trips_and_lives_two_minutes() {
+        let claims = render_claims(NOW, NOW + 120.0);
+        let token = sign_render(&claims, SECRET);
+        assert_eq!(verify_render(&token, SECRET, NOW), Ok(claims));
+        let long = sign_render(&render_claims(NOW, NOW + 121.0), SECRET);
+        assert_eq!(verify_render(&long, SECRET, NOW), Err(TokenError::Lifetime));
+    }
+
+    #[test]
+    fn an_embed_token_is_not_a_render_token_and_the_reverse() {
+        let embed = sign_embed(&claims(NOW, NOW + 60.0), SECRET);
+        assert_eq!(
+            verify_render(&embed, SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let render = sign_render(&render_claims(NOW, NOW + 60.0), SECRET);
+        assert_eq!(verify(&render), Err(TokenError::BadSignature));
+        // Even a render payload signed with the embed secret itself is not a render token.
+        let forged = sign_payload(&serde_json::to_value(render_claims(NOW, NOW + 60.0)).unwrap());
+        assert_eq!(
+            verify_render(&forged, SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn an_expired_or_future_or_wrong_audience_render_token_is_refused() {
+        let at = |iat: f64, exp: f64| sign_render(&render_claims(iat, exp), SECRET);
+        assert_eq!(
+            verify_render(&at(NOW - 400.0, NOW - 280.0), SECRET, NOW),
+            Err(TokenError::Expired)
+        );
+        assert_eq!(
+            verify_render(&at(NOW + 400.0, NOW + 500.0), SECRET, NOW),
+            Err(TokenError::IssuedInFuture)
+        );
+        let mut other = render_claims(NOW, NOW + 60.0);
+        other.aud = "embed".to_owned();
+        assert_eq!(
+            verify_render(&sign_render(&other, SECRET), SECRET, NOW),
+            Err(TokenError::Malformed)
+        );
+        let mut bad_jti = render_claims(NOW, NOW + 60.0);
+        bad_jti.jti = "has space".to_owned();
+        assert_eq!(
+            verify_render(&sign_render(&bad_jti, SECRET), SECRET, NOW),
+            Err(TokenError::BadJti)
+        );
+        assert_eq!(
+            verify_render(
+                &sign_render(&render_claims(NOW, NOW + 60.0), "other"),
+                SECRET,
+                NOW
+            ),
+            Err(TokenError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_tampered_render_payload_is_refused() {
+        let token = sign_render(&render_claims(NOW, NOW + 60.0), SECRET);
+        let parts: Vec<&str> = token.split('.').collect();
+        let mut evil = render_claims(NOW, NOW + 60.0);
+        evil.board = "b_evil".to_owned();
+        let tampered = format!("{}.{}.{}", parts[0], b64url_json(&evil).unwrap(), parts[2]);
+        assert_eq!(
+            verify_render(&tampered, SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
     }
 }

@@ -12,7 +12,7 @@ use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
 /// Settings with the formatting defaults of migration `0085` and the empty
-/// content-site list of `0086`.
+/// content-site list of `0086` and the empty denied-roles list of `0087`.
 fn settings(zone: &str, week: &str) -> ReportingSettings {
     ReportingSettings {
         time_zone: zone.to_owned(),
@@ -21,6 +21,7 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         company_palette: Vec::new(),
         fonts: SHIPPED.iter().map(|f| (*f).to_owned()).collect(),
         content_sites: Vec::new(),
+        download_denied_roles: Vec::new(),
     }
 }
 
@@ -106,8 +107,26 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
         "https://img.example".to_owned(),
         "https://cdn.example:8443".to_owned(),
     ];
+    chosen.download_denied_roles = vec!["Viewer".to_owned(), "Guest".to_owned()];
     assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
+    Ok(())
+}
+
+/// `BI-1` T1 (D7): the table is the backstop for the denied-role list's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_an_empty_role_name_and_more_than_a_hundred(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for roles in [
+        vec![String::new()],
+        (0..101).map(|i| format!("role-{i}")).collect::<Vec<_>>(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.download_denied_roles = roles;
+        assert!(upsert(&pool, &s, "u").await.is_err());
+    }
+    assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
     Ok(())
 }
 

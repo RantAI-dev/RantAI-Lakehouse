@@ -2656,6 +2656,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rsa",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2676,6 +2677,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -4177,6 +4179,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34f2d2cda7223168a14fb86bc7411dbc3379bd7d49749ecc53b91ed98585b6b0"
+dependencies = [
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
