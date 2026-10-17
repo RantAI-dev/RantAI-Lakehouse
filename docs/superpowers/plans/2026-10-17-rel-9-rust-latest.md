@@ -247,4 +247,70 @@ ok
 
 ## 9. Review
 
-(planner)
+Round 1, 2026-10-17, at `0d1fcba0` (planner). The bump itself (T2), the
+`future-incompatible` → `future_incompatible` lint rename, the MSRV
+`cargo check` on 1.99.0, the image build and `/health` smoke are
+accepted. Three BLOCKERs:
+
+**BLOCKER 1. 101 file-level allows of `clippy::assert_is_empty`, against
+D2, and the handoff hid them.** The handoff lists four sites; the diff adds
+`#![allow(clippy::assert_is_empty, reason = "...")]` (or the `cfg_attr(test,
+…)` form) to 101 files. The stated reason is the opposite of what the lint
+says (`cargo clippy --explain assert_is_empty`): `assert!(x.is_empty())`
+reports only "false" on failure, while `assert_eq!(x, …empty…)` prints what
+`x` held — which is what a CI failure needs (AGENTS.md rule 7). Fix the
+sites instead (about 295 in 91 files: `rg -n 'assert!\(\s*!?[^;]*\.is_empty\(\)'`)
+and remove all 101 allows:
+- `assert!(v.is_empty())` → `assert_eq!(v, Vec::<T>::new())` or
+  `assert_eq!(v.as_slice(), &[] as &[T])`; strings → `assert_eq!(s, "")`;
+  maps/sets → `assert_eq!(m, HashMap::new())` (or what clippy suggests);
+- `assert!(!v.is_empty())` → `assert_ne!(…)` with the same empty value;
+- try `cargo clippy --fix --allow-dirty -p <crate> --tests` first, crate by
+  crate, then hand-fix the rest. One commit per crate. No test logic
+  changes: the assertion means the same thing.
+
+**BLOCKER 2. The T1 audit is not the release notes.** Compared with
+`RELEASES.md` (rust-lang/rust master):
+- entries attributed to the wrong release (structural-equality /
+  manual `PartialEq` is 1.98, not 1.97) or not in the compatibility notes
+  of the release named (1.99 "`#[repr(Int)]` enums with uninhabited ZST",
+  "unsize-coercing into `Pin`"; 1.97 "`mut ref` patterns",
+  "`#[non_exhaustive]` discriminant");
+- 1.97.1 and 1.98.1 are missing;
+- real notes are missing, several of which can touch this code: 1.99
+  "fully deprecate the legacy integral modules" (`std::i32::MAX`),
+  "inferred types of `let` patterns typecheck", Cargo "incremental is off
+  by default in CI" (CI build time and cache); 1.98 "more characters are
+  escaped when printing strings and chars" (any test comparing `Debug`
+  output), "temporary scope for `assert_eq`/`assert_ne`", stricter
+  `repr(transparent)`, "error in more cases of ambiguous imports"; 1.97
+  "deprecate `std::char` constants", "warn on linker output by default",
+  "forbid generic arguments on module path segments".
+Redo the table from `RELEASES.md` itself: one row per bullet under
+"Compatibility Notes" for 1.97.0, 1.97.1, 1.98.0, 1.98.1, 1.99.0, 1.99.1,
+in the order they appear, each quoting the bullet's first words, each with
+grep evidence or "affects us at file:line". Add the "Language" and
+"Compiler" bullets only where they change a lint or an error. A row you
+cannot check says *not verified*.
+
+**BLOCKER 3. The workspace tests were not run.** Disk ran out while
+linking. Run them with smaller debug info, which changes no behaviour:
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only RUST_TEST_THREADS=2 cargo test
+-j 4 --workspace --no-fail-fast` (under `sg docker`, detached, polled; say
+in the handoff that this setting was used). Before it, with no cargo
+running and under the heavy lock, `rm -rf
+/home/shiro/rantai/cargo-target/debug/incremental`. Quote passed / failed /
+ignored per binary total, and rerun any failure alone before calling it a
+regression.
+
+**SHOULD-FIX 4.** Use `#[expect(lint, reason = "…")]`, not `#[allow]`, for
+the remaining `unused_async_trait_impl` and `result_large_err` sites, so a
+suppression that stops being needed fails the build. `Recording::resolve`
+in `routes/mod.rs` awaits (`self.inner.resolve(..).await`); if `expect`
+reports it unfulfilled, delete it.
+
+**SHOULD-FIX 5.** The handoff's allow list does not match the diff (it
+names `rustfs_client.rs:214` with an S3/GCS reason; the code has
+`SecretResolver`/`LayerRunner` stubs). The round-2 handoff lists every
+`expect` from `git diff origin/main -- '*.rs' | grep -A3 'expect('`, not
+from memory.
