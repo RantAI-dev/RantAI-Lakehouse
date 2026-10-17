@@ -2,7 +2,7 @@
 //! answer "is this pipeline blocked by an exhausted upstream?" from the
 //! SAME chain walk the check uses, never from `dependsOn` alone.
 //!
-//! The failure being proven is one a unit test of `exhausted_upstream_of`
+//! The failure being proven is one a unit test of `upstream_stop_of`
 //! cannot show: P lists no `dependsOn` entry because its console record
 //! never added one, yet P's source is U's target — the exact edge
 //! (`target = ANY($2)` in `upstream_downstream_pipelines_conn`) the check
@@ -350,5 +350,110 @@ async fn an_outstanding_not_exhausted_upstream_does_not_make_the_page_read_behin
     assert_eq!(
         row["lag"]["status"], "not_measured",
         "an outstanding upstream is what the check is still scheduling, not a page block"
+    );
+}
+
+/// BLD-2 review R5 decision R18 / SHOULD-FIX 2: the page stops where the
+/// check stops. The chain is walked deepest-first, and the check's
+/// upstream evaluation answers at the FIRST upstream whose request is
+/// still open — here the deeper U1 (outstanding: asked, never consumed,
+/// attempts left) is named long before the nearer U2 (exhausted) is ever
+/// reached. This test used to fail the other way round: the page walked
+/// past every outstanding upstream to the first EXHAUSTED one, so it put
+/// U2's failed-runs sentence on P while the check was saying
+/// "waiting for upstream pipeline U1 to finish".
+#[tokio::test]
+async fn the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_outstanding() {
+    let (app, tenant, cookie) = spin_up_with_member("lag-page-two").await;
+
+    // The deepest U1: requested but not consumed with attempts left —
+    // outstanding, never exhausted (attempt 1 <= max_retries 2).
+    let u1_id = create_pipeline(
+        &app.pool,
+        "lag-page-far-upstream",
+        tenant,
+        Some(TargetLag::Downstream),
+        "bronze.raw",
+        "silver.orders_far",
+        Vec::new(),
+        Some(2),
+    )
+    .await;
+    set_ready(&app.pool, &u1_id).await;
+    seed_exhausted_state(&app.pool, &u1_id, tenant, 1).await;
+
+    // The nearer U2: exhausted (attempt 3 > max_retries 2, three failed runs).
+    let u2_id = create_pipeline(
+        &app.pool,
+        "lag-page-near-upstream",
+        tenant,
+        Some(TargetLag::Downstream),
+        "silver.orders_far",
+        "silver.orders_near",
+        Vec::new(),
+        Some(2),
+    )
+    .await;
+    set_ready(&app.pool, &u2_id).await;
+    seed_exhausted_state(&app.pool, &u2_id, tenant, 3).await;
+
+    let p_id = create_pipeline(
+        &app.pool,
+        "lag-page-two-downstream",
+        tenant,
+        Some(TargetLag::Lag { minutes: 10 }),
+        "silver.orders_near",
+        "gold.p_two",
+        Vec::new(),
+        None,
+    )
+    .await;
+    set_ready(&app.pool, &p_id).await;
+    seed_unmeasured_state(&app.pool, &p_id, tenant).await;
+
+    let p_row = pipelines::get_pipeline(&app.pool, &p_id)
+        .await
+        .expect("read back P")
+        .expect("P exists");
+    let chain = pipelines::upstream_downstream_chain(&app.pool, &p_row)
+        .await
+        .expect("walk P's chain");
+    assert_eq!(
+        chain[0].id, u1_id,
+        "the walk really is deepest-first: U1 comes before U2"
+    );
+
+    let (list_status, list_body) = get_json(&app, "/api/pipelines", &cookie).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let row = list_body["pipelines"]
+        .as_array()
+        .expect("a pipelines array")
+        .iter()
+        .find(|row| row["id"].as_str() == Some(p_id.as_str()))
+        .expect("the lag pipeline is listed");
+    assert_eq!(
+        row["lag"]["status"], "not_measured",
+        "an outstanding first stop keeps the status derived from P's own row"
+    );
+    assert_eq!(
+        row["lag"]["reason"],
+        format!("waiting for upstream pipeline {u1_id} to finish"),
+        "the page names U1, the one the check's evaluation stops at"
+    );
+    assert!(
+        !row["lag"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("failed"),
+        "U2's exhausted sentence must not leak onto P while U1 is outstanding"
+    );
+
+    let (detail_status, detail_body) =
+        get_json(&app, &format!("/api/pipelines/{p_id}"), &cookie).await;
+    assert_eq!(detail_status, StatusCode::OK);
+    assert_eq!(
+        detail_body["lag"]["reason"],
+        format!("waiting for upstream pipeline {u1_id} to finish"),
+        "the detail page names the same U the list page names"
     );
 }

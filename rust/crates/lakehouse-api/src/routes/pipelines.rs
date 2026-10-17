@@ -216,15 +216,15 @@ async fn list_body(
         for p in &authored {
             if let Ok(mut val) = serde_json::to_value(p) {
                 if let Value::Object(obj) = &mut val {
-                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16: the
-                    // answer comes from the SAME chain the check walks,
-                    // not from `dependsOn` alone — a pipeline that reads
-                    // its upstream only through its source table used to
-                    // show the wrong page while the check scheduled that
-                    // upstream. A pipeline with no target lag is never
-                    // shown a `lag` object, so its chain is not walked.
-                    let upstream_exhausted = if p.target_lag.is_some() {
-                        crate::pipeline_lag::exhausted_upstream_of(pg, p).await?
+                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + R5
+                    // decision R18: the answer comes from the SAME chain the
+                    // check walks, and the walk stops where the check's own
+                    // upstream evaluation stops — first open request, deepest
+                    // first — not from `dependsOn` alone. A pipeline with no
+                    // target lag is never shown a `lag` object, so its chain
+                    // is not walked.
+                    let upstream_stop = if p.target_lag.is_some() {
+                        crate::pipeline_lag::upstream_stop_of(pg, p).await?
                     } else {
                         None
                     };
@@ -236,7 +236,7 @@ async fn list_body(
                             now,
                             no_readers.contains(&p.id),
                             i32::from(p.max_retries),
-                            upstream_exhausted.as_ref(),
+                            upstream_stop.as_ref(),
                         ),
                     );
                 }
@@ -1080,14 +1080,14 @@ async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Val
     // walked `dependsOn` and swallowed every store error with
     // `if let Ok(...)`, so a failing read silently answered "nothing is
     // blocking this pipeline".
-    let upstream_exhausted = crate::pipeline_lag::exhausted_upstream_of(pool, pipeline).await?;
+    let upstream_stop = crate::pipeline_lag::upstream_stop_of(pool, pipeline).await?;
     Ok(crate::pipeline_lag::lag_json(
         pipeline.target_lag,
         state.as_ref(),
         time::OffsetDateTime::now_utc(),
         no_readers.contains(&pipeline.id),
         i32::from(pipeline.max_retries),
-        upstream_exhausted.as_ref(),
+        upstream_stop.as_ref(),
     ))
 }
 

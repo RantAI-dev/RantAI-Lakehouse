@@ -1504,15 +1504,21 @@ pub async fn downstream_without_readers(
 /// that reads its upstream only through its source table showed a page
 /// while the check scheduled U — the two answers must come from one store
 /// walk, the same shape as [`downstream_without_readers`].
-pub struct ExhaustedUpstream {
-    /// The id of the upstream pipeline whose retries are exhausted.
+/// BLD-2 review R4 BLOCKER 1 (a) / decision R16, widened by decision R18:
+/// which upstream in `pipeline`'s (deepest-first) chain the check's
+/// upstream evaluation stops at. The page and the check must name the SAME
+/// `U` — see [`first_upstream_stop`] for the walk.
+pub struct UpstreamStop {
+    /// The id of the upstream pipeline the check's evaluation stops at.
     pub pipeline_id: String,
-    /// `u.max_retries + 1`: how many runs of U for this input change were
-    /// attempted and failed — the count the reason text names. The state
-    /// row's `request_attempt` is the checker's attempt bookkeeping; the
-    /// reason claims `u.max_retries + 1` from U's OWN definition, so a
-    /// page and the check cannot quote different numbers for one state.
-    pub failed_runs: i32,
+    /// `Some(u.max_retries + 1)` when U's retries are exhausted — how many
+    /// runs of U for this input change were attempted and failed, the
+    /// count the reason text names; `None` when U's run is merely
+    /// outstanding. The state row's `request_attempt` is the checker's
+    /// attempt bookkeeping; the exhausted reason claims
+    /// `u.max_retries + 1` from U's OWN definition, so a page and the
+    /// check cannot quote different numbers for one state (R16).
+    pub failed_runs: Option<i32>,
 }
 
 /// The three-part condition every retry-exhausted consumer derives from U's
@@ -1532,37 +1538,78 @@ pub fn upstream_retries_exhausted(
         && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
 }
 
-/// BLD-2 review R4 BLOCKER 1 (a) / decision R16: which upstream pipeline
-/// blocks `pipeline` with exhausted retries, answered by walking the SAME
-/// chain the check walks (`pipelines::upstream_downstream_chain`) — never
-/// `pipeline.depends_on` alone, because an edge the check schedules on
-/// (P's source = U's target) shows up there and not in `dependsOn`.
-/// Deepest-first order means the upstream furthest from P is named, which
-/// is also the one the check reports first.
+/// A request to `u_state`'s pipeline is still open: it was asked (its
+/// requested tokens are set) and what it was asked to produce has not been
+/// consumed. This is the state the check's upstream evaluation stops at —
+/// exhausted (attempt counter past `max_retries`, predicate
+/// [`upstream_retries_exhausted`]) or merely outstanding (an in-flight
+/// run, decision R18).
+#[must_use]
+fn request_still_open(u_state: &pipelines::PipelineLagState) -> bool {
+    u_state.requested_tokens.is_some()
+        && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
+}
+
+/// BLD-2 review R5 SHOULD-FIX 2 / decision R18 — the page stops where the
+/// check stops: which upstream does [`evaluate_upstream_chain`] name? Its
+/// `for u_pipe in chain` loop walks the FULL chain in the check's own
+/// deepest-first order and answers at the FIRST upstream whose request is
+/// still open — exhausted (its own distinct reason, R4 BLOCKER 1 (b)) or
+/// merely outstanding ("waiting for upstream pipeline {U} to finish") —
+/// and so does this. It used to walk past outstanding upstreams to the
+/// first EXHAUSTED one: with a deeper U1 outstanding and a nearer U2
+/// exhausted, the check names U1 while the page named U2. A nearer
+/// exhausted U2 is never named while a deeper U1 is still being waited
+/// on — the check reports U1 first and only reaches U2 after U1 finishes.
 ///
-/// A U with no state row has never been checked, so it is not exhausted.
+/// The same rule on the state side: a U with no state row has never been
+/// checked, so it cannot be what the check stops at (R16, unchanged).
+///
+/// Empirically pinned by the route test
+/// `the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_outstanding`
+/// in `tests/pipeline_lag_page.rs`.
+pub fn first_upstream_stop<'a>(
+    chain: &[Pipeline],
+    state_of: &dyn Fn(&str) -> Option<&'a pipelines::PipelineLagState>,
+) -> Option<UpstreamStop> {
+    for u in chain {
+        let Some(u_state) = state_of(&u.id) else {
+            continue;
+        };
+        if !request_still_open(u_state) {
+            continue;
+        }
+        let failed_runs = if upstream_retries_exhausted(u_state, i32::from(u.max_retries)) {
+            Some(i32::from(u.max_retries) + 1)
+        } else {
+            None
+        };
+        return Some(UpstreamStop {
+            pipeline_id: u.id.clone(),
+            failed_runs,
+        });
+    }
+    None
+}
+
+/// The upstream stop for ONE pipeline, answered by walking the SAME chain
+/// the check walks (`pipelines::upstream_downstream_chain`) — never
+/// `pipeline.depends_on`
+/// alone, because an edge the check schedules on (P's source = U's target)
+/// shows up there and not in `dependsOn` (R16).
 ///
 /// # Errors
 ///
 /// Returns [`StoreError`] if chain discovery or a lag-state read fails —
 /// a swallowed failure would report every blocked pipeline as unblocked.
-pub async fn exhausted_upstream_of(
+pub async fn upstream_stop_of(
     pool: &PgPool,
     pipeline: &Pipeline,
-) -> Result<Option<ExhaustedUpstream>, StoreError> {
+) -> Result<Option<UpstreamStop>, StoreError> {
     let chain = pipelines::upstream_downstream_chain(pool, pipeline).await?;
-    for u in &chain {
-        let Some(u_state) = pipelines::get_lag_state(pool, &u.id).await? else {
-            continue;
-        };
-        if upstream_retries_exhausted(&u_state, i32::from(u.max_retries)) {
-            return Ok(Some(ExhaustedUpstream {
-                pipeline_id: u.id.clone(),
-                failed_runs: i32::from(u.max_retries) + 1,
-            }));
-        }
-    }
-    Ok(None)
+    let chain_ids: Vec<&str> = chain.iter().map(|u| u.id.as_str()).collect();
+    let states = pipelines::list_lag_states(pool, &chain_ids).await?;
+    Ok(first_upstream_stop(&chain, &|id| states.get(id)))
 }
 
 /// BLD-2 plan D8: compute the `lag: { status, lagSeconds, lastCheckAt,
@@ -1585,7 +1632,7 @@ pub fn lag_json(
     now: OffsetDateTime,
     downstream_no_readers: bool,
     max_retries: i32,
-    upstream_exhausted: Option<&ExhaustedUpstream>,
+    upstream_stop: Option<&UpstreamStop>,
 ) -> serde_json::Value {
     if target_lag.is_none() {
         return serde_json::Value::Null;
@@ -1643,16 +1690,25 @@ pub fn lag_json(
     // `lag_json` cannot disagree about what "exhausted" means.
     let retries_exhausted = upstream_retries_exhausted(st, max_retries);
 
-    let reason = if let Some(u) = upstream_exhausted {
-        status = LagStatus::Behind;
-        // BLD-2 review R4 BLOCKER 1 (b) / decision R16: the same words the
-        // check's exhausted branch orders for P, with the count derived
-        // from U's own `max_retries` in [`ExhaustedUpstream::failed_runs`].
-        format!(
-            "upstream pipeline {}'s last {} runs for this change failed; \
-             the next input change starts again",
-            u.pipeline_id, u.failed_runs
-        )
+    let reason = if let Some(u) = upstream_stop {
+        if let Some(failed_runs) = u.failed_runs {
+            status = LagStatus::Behind;
+            // BLD-2 review R4 BLOCKER 1 (b) / decision R16: the same words the
+            // check's exhausted branch orders for P, with the count derived
+            // from U's own `max_retries` in [`UpstreamStop::failed_runs`].
+            format!(
+                "upstream pipeline {}'s last {failed_runs} runs for this change failed; \
+                 the next input change starts again",
+                u.pipeline_id
+            )
+        } else {
+            // BLD-2 review R5 decision R18: the walk stopped at an
+            // OUTSTANDING upstream — the same one the check names with
+            // these same words in its outstanding branch, so the page
+            // keeps the status derived from P's own row here (the check
+            // does not force `behind` for an outstanding U either).
+            format!("waiting for upstream pipeline {} to finish", u.pipeline_id)
+        }
     } else if retries_exhausted {
         status = LagStatus::Behind;
         let n = max_retries + 1;
@@ -3073,9 +3129,9 @@ mod tests {
             now,
             false,
             1,
-            Some(&ExhaustedUpstream {
+            Some(&UpstreamStop {
                 pipeline_id: "pl-upstream-orders".to_owned(),
-                failed_runs: 2,
+                failed_runs: Some(2),
             }),
         );
         assert_eq!(res["status"], "behind");
@@ -3667,9 +3723,9 @@ mod tests {
             t0,
             false,
             i32::from(p.max_retries),
-            Some(&ExhaustedUpstream {
+            Some(&UpstreamStop {
                 pipeline_id: "pl-u-exh".to_owned(),
-                failed_runs: 2,
+                failed_runs: Some(2),
             }),
         );
         assert_eq!(page["status"], "behind");
