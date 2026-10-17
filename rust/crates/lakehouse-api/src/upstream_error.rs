@@ -142,9 +142,11 @@ pub const ORCHESTRATOR_JOB_NOT_LOADED: Context = Context::new(
     "The orchestrator has not loaded this job yet. Try again shortly.",
 );
 
-/// The orchestrator could not be reached at all (`PR #105 CI fix`): a
-/// restarting webserver looks the same from here as an outage, and both are
-/// answered "try again" with a code.
+/// The orchestrator did not answer usefully (`PR #105 CI fix`). `unavailable`
+/// is the "could not be reached, try again shortly" sentence, shown only for
+/// the failures [`orchestrator_unreachable`] classifies as unreachable;
+/// `failed` is shown for an orchestrator that answered and whose answer
+/// could not be used.
 pub const ORCHESTRATOR_UNREACHABLE: Context = Context::new(
     "orchestrator request",
     "The orchestrator did not accept the request.",
@@ -171,20 +173,50 @@ pub fn job_not_loaded(raw: &dyn Display) -> ApiError {
         .into_not_ready(CODE_JOB_NOT_LOADED)
 }
 
-/// A `Dagster` transport or protocol failure as a `503` with
-/// `code: orchestrator_unreachable` (`PR #105 CI fix`). While the code
-/// location reloads, the webserver can refuse or garble a request, which from
-/// here is indistinguishable from an outage; both mean "retry". The raw error
-/// and its source chain (`DgError::Transport`'s `Display` is the fixed "fetch
-/// failed"; the cause is its source) go to the log only.
+/// A `Dagster` failure as this API answers it (`PR #105 CI fix`, narrowed by
+/// `PR #105 review SHOULD-FIX 5`).
+///
+/// Only a failure that means "the same request will work shortly" earns the
+/// retryable answer, `503` + `code: orchestrator_unreachable`:
+///
+/// - a [`lakehouse_dagster::DgError::Transport`] — connection refused, TLS,
+///   timeout. While the code location reloads, the webserver can refuse or
+///   garble a request, which from here is indistinguishable from an outage;
+/// - a [`lakehouse_dagster::DgError::Status`] of `500` or more — the same
+///   outage arriving as an HTTP answer instead of a refused connection: the
+///   orchestrator is up and serving this request a server-side error.
+///   Nothing in between is typed, so `>= 500` is the whole rule.
+///
+/// Everything else is a `502` carrying [`ORCHESTRATOR_UNREACHABLE`]'s `failed`
+/// sentence and NO code: a GraphQL `errors` array, a body that does not
+/// parse, or a `4xx` is an orchestrator that answered this request, and
+/// repeating the request unchanged gets the same answer. The acceptance gates
+/// retry on a `503` carrying one of the two codes and raise on anything else
+/// (`RETRYABLE_ORCHESTRATOR_CODES` in `ops/g6/g6_ingest_matrix_test.py`), so a
+/// code here would have them wait on a retry that cannot succeed.
+///
+/// The raw error and its source chain (`DgError::Transport`'s `Display` is
+/// the fixed "fetch failed"; the cause is its source) go to the log only, in
+/// either class.
 #[must_use]
 pub fn orchestrator_unreachable(err: &lakehouse_dagster::DgError) -> ApiError {
     let raw = match std::error::Error::source(err) {
         Some(source) => format!("{err}: {source}"),
         None => err.to_string(),
     };
-    report(&ORCHESTRATOR_UNREACHABLE, Class::Unavailable, &raw)
-        .into_not_ready(CODE_ORCHESTRATOR_UNREACHABLE)
+    match err {
+        lakehouse_dagster::DgError::Transport(_) => {
+            report(&ORCHESTRATOR_UNREACHABLE, Class::Unavailable, &raw)
+                .into_not_ready(CODE_ORCHESTRATOR_UNREACHABLE)
+        }
+        lakehouse_dagster::DgError::Status(status) if *status >= 500 => {
+            report(&ORCHESTRATOR_UNREACHABLE, Class::Unavailable, &raw)
+                .into_not_ready(CODE_ORCHESTRATOR_UNREACHABLE)
+        }
+        lakehouse_dagster::DgError::Status(_) | lakehouse_dagster::DgError::Server(_) => {
+            report(&ORCHESTRATOR_UNREACHABLE, Class::Failed, &raw).into_bad_gateway()
+        }
+    }
 }
 
 /// A reported upstream error: our fixed message and the reference id the raw
@@ -232,6 +264,15 @@ impl UpstreamFailure {
             code,
             retry_after_secs: NOT_READY_RETRY_AFTER_SECS,
         }
+    }
+
+    /// A `502` [`ApiError`] — the fixed text followed by the reference — for
+    /// an upstream that answered with something this service could not use.
+    /// Unlike [`Self::into_not_ready`] it carries no code: the upstream was
+    /// reachable, so the same request is not expected to work on a retry.
+    #[must_use]
+    pub fn into_bad_gateway(self) -> ApiError {
+        ApiError::BadGateway(self.to_string())
     }
 
     /// An [`ApiError`] whose message is the fixed text followed by the
@@ -929,5 +970,102 @@ mod tests {
                 assert!(!out.contains(gone), "{gone} in {out}");
             }
         }
+    }
+
+    /// A genuine `reqwest::Error` for the `Transport` arm: `reqwest::Error`
+    /// has no public constructor, and the cheapest real one is a request that
+    /// cannot even be built (a host with a space in it) rather than a dead
+    /// port — no network, no flake. The classification reads the variant, so
+    /// the variant is what this pins.
+    fn dagster_transport_error() -> lakehouse_dagster::DgError {
+        match reqwest::Client::new()
+            .get("http://dagster internal.invalid/graphql")
+            .build()
+        {
+            Ok(_) => panic!("a URL with a space in its host must fail to build"),
+            Err(err) => lakehouse_dagster::DgError::from(err),
+        }
+    }
+
+    /// `PR #105 review SHOULD-FIX 5`: an orchestrator that is not there at
+    /// all is still `503` + `code: orchestrator_unreachable` + `Retry-After`,
+    /// which is what the gates and the console retry on.
+    #[test]
+    fn an_unreachable_orchestrator_is_still_a_503_with_the_retry_code() {
+        let (api, log) = with_captured_log(|| orchestrator_unreachable(&dagster_transport_error()));
+        assert_eq!(api.status(), 503);
+        assert!(
+            matches!(
+                &api,
+                ApiError::NotReady { code, .. } if *code == CODE_ORCHESTRATOR_UNREACHABLE
+            ),
+            "{api:?}"
+        );
+        assert!(
+            api.to_string()
+                .starts_with("The orchestrator is not reachable. Try again shortly. Reference: "),
+            "{api}"
+        );
+        assert!(log.contains("WARN"), "{log}");
+    }
+
+    /// A `5xx` is the same condition from the other side: a code location
+    /// still loading answers `500`/`503` instead of refusing the connection,
+    /// and that must keep the retry code.
+    #[test]
+    fn a_5xx_status_keeps_the_retry_code() {
+        let (api, _log) = with_captured_log(|| {
+            orchestrator_unreachable(&lakehouse_dagster::DgError::Status(502))
+        });
+        assert_eq!(api.status(), 503);
+        assert!(
+            matches!(
+                &api,
+                ApiError::NotReady { code, .. } if *code == CODE_ORCHESTRATOR_UNREACHABLE
+            ),
+            "{api:?}"
+        );
+    }
+
+    /// A `4xx` is not unreachable: the orchestrator answered and refused, so
+    /// the same request gets the same refusal. No code, and no `Retry-After`
+    /// to make a caller wait for it.
+    #[test]
+    fn a_4xx_status_is_a_502_without_a_code() {
+        let (api, _log) = with_captured_log(|| {
+            orchestrator_unreachable(&lakehouse_dagster::DgError::Status(400))
+        });
+        assert_eq!(api.status(), 502);
+        assert!(!matches!(&api, ApiError::NotReady { .. }), "{api:?}");
+        assert!(
+            api.to_string()
+                .starts_with("The orchestrator did not accept the request. Reference: "),
+            "{api}"
+        );
+        assert!(
+            !api.to_string().contains("Dagster HTTP"),
+            "the status is not the caller's business: {api}"
+        );
+    }
+
+    /// Same class for an answer `Dagster` did send and this service cannot
+    /// use (a GraphQL `errors` array here): `502`, no code, and not one
+    /// character of the upstream's own text in the body — it is in the log.
+    #[test]
+    fn a_graphql_error_is_a_502_and_its_text_stays_in_the_log() {
+        let raw = r#"[{"message":"Could not reach user code server planted-marker"}]"#;
+        let (api, log) = with_captured_log(|| {
+            orchestrator_unreachable(&lakehouse_dagster::DgError::Server(raw.to_owned()))
+        });
+        assert_eq!(api.status(), 502);
+        assert!(!matches!(&api, ApiError::NotReady { .. }), "{api:?}");
+        assert!(
+            api.to_string()
+                .starts_with("The orchestrator did not accept the request. Reference: "),
+            "{api}"
+        );
+        assert!(!api.to_string().contains("planted-marker"), "{api}");
+        assert!(log.contains("planted-marker"), "{log}");
+        assert!(log.contains("ERROR"), "{log}");
     }
 }
