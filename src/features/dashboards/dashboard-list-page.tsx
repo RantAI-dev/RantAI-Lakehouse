@@ -585,10 +585,13 @@ export function DashboardListPage() {
                     Folders
                   </Button>
                 ) : null}
-                <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
-                  <Trash2 data-icon="inline-start" />
-                  Trash
-                </Button>
+                {/* BI-18 part C review fix (SHOULD-FIX) R18: the trash is for those who can restore. */}
+                {canFile ? (
+                  <Button variant="outline" size="sm" onClick={() => setTrashOpen(true)}>
+                    <Trash2 data-icon="inline-start" />
+                    Trash
+                  </Button>
+                ) : null}
                 {newButton}
               </div>
             }

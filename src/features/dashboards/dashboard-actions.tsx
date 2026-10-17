@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Copy, Download, FileDown, History, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
+  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,10 +19,16 @@ import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  isDefault, canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
 }: {
   readonly isDefault: boolean;
+  /**
+   * The caller holds `dashboard:write`. Without it Rename, Duplicate and Delete
+   * are left out, not shown to fail on click (BI-18 part C review fix
+   * (SHOULD-FIX) R18); Share keeps its own rule.
+   */
+  readonly canWrite: boolean;
   /** In somebody's personal space: it cannot be shared until it is moved to a folder. */
   readonly isPrivate?: boolean;
   /** Opens the version history; the item is left out when absent. */
@@ -96,6 +102,8 @@ export function DashboardActionsMenu({
                 the reader wondering what else is missing here. The wrapping
                 span carries the hover — the disabled item itself has
                 `pointer-events-none`. */}
+            {canWrite ? (
+              <>
             {isDefault ? (
               <Tooltip>
                 <TooltipTrigger render={<span className="block" />}>
@@ -112,6 +120,8 @@ export function DashboardActionsMenu({
                 <Pencil className="size-4" /> Rename
               </DropdownMenuItem>
             )}
+              </>
+            ) : null}
             {!isDefault && isPrivate ? (
               <Tooltip>
                 <TooltipTrigger render={<span className="block" />}>
@@ -145,11 +155,13 @@ export function DashboardActionsMenu({
             <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
               <Download className="size-4" /> Export YAML
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={onDuplicate}>
-              <Copy className="size-4" /> Duplicate
-            </DropdownMenuItem>
+            {canWrite ? (
+              <DropdownMenuItem onClick={onDuplicate}>
+                <Copy className="size-4" /> Duplicate
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuGroup>
-          {!isDefault ? (
+          {!isDefault && canWrite ? (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuGroup>
@@ -196,5 +208,28 @@ export function RenameDashboardDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * "Edit layout"/"Done". Left out for a caller without `dashboard:write`
+ * (BI-18 part C review fix (SHOULD-FIX) R18).
+ */
+export function EditLayoutButton({ canWrite, edit, onToggle }: { readonly canWrite: boolean; readonly edit: boolean; readonly onToggle: () => void }) {
+  if (!canWrite) return null;
+  return (
+    <Button variant={edit ? "default" : "outline"} size="sm" onClick={onToggle}>
+      {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
+    </Button>
+  );
+}
+
+/** "New chart", in the header and in the empty state; left out without `dashboard:write` (R18). */
+export function NewChartButton({ canWrite, onClick }: { readonly canWrite: boolean; readonly onClick: () => void }) {
+  if (!canWrite) return null;
+  return (
+    <Button size="sm" onClick={onClick}>
+      <ChartColumn className="size-4" /> New chart
+    </Button>
   );
 }

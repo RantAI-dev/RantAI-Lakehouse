@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -41,7 +41,8 @@ import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { fmtInt } from "./chart-option";
-import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
+import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
 import { dashboardLook, type DashboardTheme } from "@/lib/dashboard-look";
 import { NOTE_KINDS, withNote } from "@/lib/style-draft";
@@ -940,6 +941,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const clickSpec = clickSpecOf(spec, level);
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
+    const write = chartWriteItems({
+      canWrite, own, hasDef: Boolean(spec.def),
+      onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
+      onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
+    });
     const menu: TileMenuItem[] = [
       { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
       { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
@@ -963,13 +969,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : hasRows(cell) && cell.rows.length
           ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
           : []),
-      ...(own && spec.def
-        ? [{ label: "Edit chart", icon: <Pencil />, separatorBefore: true, onSelect: () => setEditing({ id: spec.id, def: spec.def as ChartDef }) }]
-        : []),
+      ...write.edit,
       ...moveItems(spec.id),
-      ...(own
-        ? [{ label: "Delete chart", icon: <Trash2 />, destructive: true, separatorBefore: !spec.def, onSelect: () => setRemoving({ id: spec.id, title: spec.title }) }]
-        : []),
+      ...write.remove,
     ];
     return {
       id: spec.id,
@@ -1059,9 +1061,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <Moon className="size-4" /> Dark
               </Button>
             ) : null}
-            <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
-              {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
-            </Button>
+            <EditLayoutButton canWrite={canWrite} edit={edit} onToggle={() => setEdit((e) => !e)} />
             {!isDefault ? (
               <FavouriteButton
                 on={isFavourite}
@@ -1073,6 +1073,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
+              canWrite={canWrite}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
               onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
@@ -1097,9 +1098,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <SlidersHorizontal className="size-4" /> Parameters
               </Button>
             ) : null}
-            <Button size="sm" onClick={() => setNewChartOpen(true)}>
-              <ChartColumn className="size-4" /> New chart
-            </Button>
+            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
           </span>
         }
       />
@@ -1165,9 +1164,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="flex-row justify-center gap-2">
-            <Button size="sm" onClick={() => setNewChartOpen(true)}>
-              <ChartColumn className="size-4" /> New chart
-            </Button>
+            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
             <Button
               size="sm"
               variant="outline"
