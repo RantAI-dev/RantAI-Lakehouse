@@ -6609,6 +6609,30 @@
             "type": "string",
             "description": "the dashboard's id, from list_boards"
           },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none"
+          },
+          "params": {
+            "type": "object",
+            "description": "the parameter values in force, name to value, if the page context lists any"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "minute",
+              "hour",
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "the dashboard's time grain switch if the page context shows one"
+          },
           "format": {
             "type": "string",
             "enum": [
@@ -6650,6 +6674,30 @@
           "chart": {
             "type": "string",
             "description": "the chart's id, from list_charts"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none"
+          },
+          "params": {
+            "type": "object",
+            "description": "the parameter values in force, name to value, if the page context lists any"
+          },
+          "grain": {
+            "type": "string",
+            "enum": [
+              "minute",
+              "hour",
+              "day",
+              "week",
+              "month",
+              "quarter",
+              "year"
+            ],
+            "description": "the dashboard's time grain switch if the page context shows one"
           },
           "format": {
             "type": "string",

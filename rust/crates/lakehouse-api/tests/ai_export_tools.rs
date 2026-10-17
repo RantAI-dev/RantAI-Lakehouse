@@ -88,7 +88,7 @@ async fn app(pdf: bool) -> (TestApp, MockServer, String) {
             "http://console:3000".to_owned(),
         );
         env.insert(
-            "EMBED_SECRET".to_owned(),
+            "RENDER_TOKEN_SECRET".to_owned(),
             "test-embed-secret-not-real".to_owned(),
         );
     }
@@ -312,4 +312,79 @@ async fn without_dashboard_read_the_tools_are_refused_by_the_gate() {
     .await;
     assert_eq!(body["outcome"], "refused", "{body}");
     assert_eq!(body["result"]["required"], "dashboard:read");
+}
+
+/// `BI-1` review fix (SHOULD-FIX) R7: the link carries the page's filters,
+/// parameters and grain, in the encoding the menus use, and a value the console
+/// would refuse is refused with its sentence.
+#[tokio::test]
+async fn the_links_carry_the_pages_filters_parameters_and_grain() {
+    let (app, _ch, cookie) = app(true).await;
+    let filters = json!([{ "column": "region", "values": ["north"] }]);
+    let body = call(
+        &app,
+        &cookie,
+        "export_dashboard",
+        json!({ "board": BOARD, "filters": filters, "params": { "top": 5 }, "grain": "month" }),
+        "ask",
+    )
+    .await;
+    let url = body["result"]["url"].as_str().unwrap();
+    let parsed = url::Url::parse(&format!("http://x{url}")).unwrap();
+    let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs["filters"], filters.to_string());
+    assert_eq!(pairs["params"], r#"{"top":5}"#);
+    assert_eq!(pairs["grain"], "month");
+    assert_eq!(pairs["board"], BOARD);
+
+    let chart = call(
+        &app,
+        &cookie,
+        "export_chart",
+        json!({ "chart": "c_visits", "format": "csv", "filters": filters }),
+        "ask",
+    )
+    .await;
+    assert!(
+        chart["result"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("filters=%5B%7B%22column%22"),
+        "{chart}"
+    );
+
+    // Empty lists add nothing; a bad grain or a bad filter is refused.
+    let plain = call(
+        &app,
+        &cookie,
+        "export_dashboard",
+        json!({ "board": BOARD, "filters": [], "params": {} }),
+        "ask",
+    )
+    .await;
+    assert_eq!(
+        plain["result"]["url"],
+        "/api/dashboard/export/pdf?board=b_ai&paper=a4&orientation=portrait"
+    );
+    let bad = call(
+        &app,
+        &cookie,
+        "export_dashboard",
+        json!({ "board": BOARD, "grain": "fortnight" }),
+        "ask",
+    )
+    .await;
+    assert_eq!(
+        bad["result"]["error"],
+        "grain must be one of minute, hour, day, week, month, quarter, year."
+    );
+    let bad = call(
+        &app,
+        &cookie,
+        "export_chart",
+        json!({ "chart": "c_visits", "format": "csv", "filters": [{"column": 5}] }),
+        "ask",
+    )
+    .await;
+    assert!(bad["result"]["error"].is_string(), "{bad}");
 }

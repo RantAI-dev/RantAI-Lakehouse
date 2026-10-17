@@ -40,7 +40,7 @@ use crate::upstream_error;
 /// which check failed).
 pub(crate) const RENDER_TOKEN_REFUSED: &str = "render token is invalid or expired";
 
-/// What the route says when PDF export is not set up (`EMBED_SECRET` unset).
+/// What the route says when PDF export is not set up (`RENDER_TOKEN_SECRET` unset).
 pub(crate) const PDF_NOT_SET_UP: &str = "PDF export is not set up on this deployment";
 
 #[derive(Debug, Deserialize)]
@@ -74,14 +74,18 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
-    let Some(secret) = state.config.embed_secret.as_deref() else {
+    let Some(secret) = state.config.render_token_secret.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "error": PDF_NOT_SET_UP })),
         )
             .into_response();
     };
-    let claims = match lakehouse_embed::verify_render(&token, secret, lakehouse_embed::unix_now()) {
+    let claims = match lakehouse_embed::verify_render(
+        &token,
+        secret.expose_secret(),
+        lakehouse_embed::unix_now(),
+    ) {
         Ok(claims) => claims,
         Err(reason) => {
             tracing::info!(%reason, "render token refused");
@@ -93,6 +97,22 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(None) => return refused(),
         Err(response) => return response,
     };
+    // BI-1 review fix (SHOULD-FIX) R9: the person's rights are read now, on every
+    // data call, not taken from the moment the token was minted. A role removed,
+    // or downloads switched off for it, inside the token's two minutes stops the
+    // data at the next call. (Replaying the token inside those two minutes by
+    // someone who holds it stays accepted, D2.)
+    if !principal.has("dashboard:read") {
+        return refused();
+    }
+    match crate::routes::settings::format_settings(&state).await {
+        Ok(settings) => {
+            if !crate::routes::settings::may_download(&principal, &settings.download_denied_roles) {
+                return refused();
+            }
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    }
     let query = DashboardQuery::for_render(
         &claims.board,
         claims.filters.as_deref(),

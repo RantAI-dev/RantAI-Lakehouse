@@ -126,6 +126,18 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
 const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The chart and table downloads' timeout (`BI-1` review fix (BLOCKER) R2). The
+/// stream from `ClickHouse` has 300 seconds (`export::EXPORT_TIMEOUT`) and its
+/// query 280 (`max_execution_time`), then the file is written and sent; the 60
+/// second default cut a long export with a bare `request timeout`. Ten seconds
+/// above the stream, so the sentence the export itself gives wins.
+const EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// The PDF route's timeout (`BI-1` review fix (BLOCKER) R2): the wait for a
+/// free slot ([`crate::pdf::PDF_SLOT_WAIT`]), the client's 70 seconds with
+/// Gotenberg, and ten seconds for the token, the audit and the answer.
+const PDF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 + 70 + 10);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
@@ -149,6 +161,8 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
+        "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
@@ -1186,6 +1200,32 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) — a blanket 60s bound 408'd a
     /// legitimate in-flight request. Pins the per-route table to the TS
     /// `export const maxDuration` grep.
+    /// `BI-1` review fix (BLOCKER) R2: the downloads keep the budgets they were
+    /// built for. The console proxy (`next.config.ts` `proxyTimeout`) must be at
+    /// least the largest of these.
+    #[test]
+    fn the_download_routes_have_their_own_timeouts() {
+        assert_eq!(
+            route_timeout("/api/dashboard/chart-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/table-export"),
+            Duration::from_secs(310)
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/export/pdf"),
+            Duration::from_secs(140)
+        );
+        assert!(Duration::from_secs(310) > crate::export::EXPORT_TIMEOUT);
+        assert!(PDF_REQUEST_TIMEOUT > crate::pdf::PDF_SLOT_WAIT + crate::pdf::PDF_DEADLINE);
+        // Everything else keeps the default.
+        assert_eq!(
+            route_timeout("/api/dashboard/export"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
     #[test]
     fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
         assert_eq!(chat_timeout_from(None), Duration::from_secs(120));

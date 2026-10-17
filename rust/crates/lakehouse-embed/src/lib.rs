@@ -33,7 +33,6 @@
 //! check failed; the variant exists for tests and the log.
 
 use std::collections::HashMap;
-use std::fmt::Write;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -295,27 +294,10 @@ pub fn render_expiry(iat: f64) -> f64 {
     iat + seconds_as_f64(RENDER_LIFETIME_SECONDS)
 }
 
-/// The label the render key is derived under; changing it retires every token.
-const RENDER_KEY_LABEL: &str = "lakehouse/render-token/v1";
-
-/// The key render tokens are signed with: `HMAC-SHA256(EMBED_SECRET, label)`
-/// in hex. A render token therefore never verifies as an embed token, whose
-/// key is the secret itself, and an embed token never verifies as a render
-/// token (tested both ways).
-fn render_key(secret: &str) -> String {
-    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
-        return String::new();
-    };
-    mac.update(RENDER_KEY_LABEL.as_bytes());
-    let mut hex = String::new();
-    for byte in mac.finalize().into_bytes() {
-        // Writing to a `String` cannot fail.
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// Sign `claims` as a render token under the key derived from `secret`.
+/// Sign `claims` as a render token under `secret`, the server-only
+/// `RENDER_TOKEN_SECRET` (BI-1 review fix (BLOCKER) R1: it is not `EMBED_SECRET`
+/// and not derived from it, because the embedding customer holds that one and
+/// a render token reads as any person it names).
 /// Returns an empty string only if the HMAC key cannot be set up, which no
 /// key length causes (see [`sign_embed`]).
 #[must_use]
@@ -324,7 +306,7 @@ pub fn sign_render(claims: &RenderClaims, secret: &str) -> String {
         .unwrap_or_else(|_| "e30".to_owned());
     let payload = b64url_json(claims).unwrap_or_else(|_| "e30".to_owned());
     let data = format!("{header}.{payload}");
-    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(render_key(secret).as_bytes()) else {
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
         return String::new();
     };
     mac.update(data.as_bytes());
@@ -344,7 +326,7 @@ pub fn verify_render(
     secret: &str,
     now_unix_seconds: f64,
 ) -> Result<RenderClaims, TokenError> {
-    let raw = open_signed(token, &render_key(secret))?;
+    let raw = open_signed(token, secret)?;
     let exp = finite_number(&raw, "exp").ok_or(TokenError::MissingExp)?;
     let iat = finite_number(&raw, "iat").ok_or(TokenError::MissingIat)?;
     let claims: RenderClaims = serde_json::from_value(raw).map_err(|_| TokenError::Malformed)?;
@@ -416,6 +398,7 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+    use std::fmt::Write;
 
     const SECRET: &str = "s3cret";
     /// A fixed "now" so no test reads the clock or sleeps.
@@ -603,6 +586,10 @@ mod tests {
         assert_eq!(verify(&tampered), Err(TokenError::BadSignature));
     }
 
+    /// BI-1 review fix (BLOCKER) R1: the render key is its own server-only
+    /// secret, never `EMBED_SECRET` (the customer's) or a key derived from it.
+    const RENDER_SECRET: &str = "render-only-secret";
+
     fn render_claims(iat: f64, exp: f64) -> RenderClaims {
         RenderClaims {
             aud: RENDER_AUDIENCE.to_owned(),
@@ -622,56 +609,80 @@ mod tests {
     #[test]
     fn a_render_token_round_trips_and_lives_two_minutes() {
         let claims = render_claims(NOW, NOW + 120.0);
-        let token = sign_render(&claims, SECRET);
-        assert_eq!(verify_render(&token, SECRET, NOW), Ok(claims));
-        let long = sign_render(&render_claims(NOW, NOW + 121.0), SECRET);
-        assert_eq!(verify_render(&long, SECRET, NOW), Err(TokenError::Lifetime));
+        let token = sign_render(&claims, RENDER_SECRET);
+        assert_eq!(verify_render(&token, RENDER_SECRET, NOW), Ok(claims));
+        let long = sign_render(&render_claims(NOW, NOW + 121.0), RENDER_SECRET);
+        assert_eq!(
+            verify_render(&long, RENDER_SECRET, NOW),
+            Err(TokenError::Lifetime)
+        );
     }
 
     #[test]
     fn an_embed_token_is_not_a_render_token_and_the_reverse() {
         let embed = sign_embed(&claims(NOW, NOW + 60.0), SECRET);
         assert_eq!(
-            verify_render(&embed, SECRET, NOW),
+            verify_render(&embed, RENDER_SECRET, NOW),
             Err(TokenError::BadSignature)
         );
-        let render = sign_render(&render_claims(NOW, NOW + 60.0), SECRET);
+        let render = sign_render(&render_claims(NOW, NOW + 60.0), RENDER_SECRET);
         assert_eq!(verify(&render), Err(TokenError::BadSignature));
-        // Even a render payload signed with the embed secret itself is not a render token.
-        let forged = sign_payload(&serde_json::to_value(render_claims(NOW, NOW + 60.0)).unwrap());
+    }
+
+    /// R1: whoever holds `EMBED_SECRET` (the embedding customer) cannot mint a
+    /// render token, signing the render claims with it directly or with the key
+    /// the first version derived from it.
+    #[test]
+    fn a_token_signed_with_the_embed_secret_or_a_key_derived_from_it_is_refused() {
+        let claims = render_claims(NOW, NOW + 60.0);
         assert_eq!(
-            verify_render(&forged, SECRET, NOW),
+            verify_render(&sign_render(&claims, SECRET), RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(b"lakehouse/render-token/v1");
+        let mut derived = String::new();
+        for byte in mac.finalize().into_bytes() {
+            write!(derived, "{byte:02x}").unwrap();
+        }
+        assert_eq!(
+            verify_render(&sign_render(&claims, &derived), RENDER_SECRET, NOW),
+            Err(TokenError::BadSignature)
+        );
+        let forged = sign_payload(&serde_json::to_value(&claims).unwrap());
+        assert_eq!(
+            verify_render(&forged, RENDER_SECRET, NOW),
             Err(TokenError::BadSignature)
         );
     }
 
     #[test]
     fn an_expired_or_future_or_wrong_audience_render_token_is_refused() {
-        let at = |iat: f64, exp: f64| sign_render(&render_claims(iat, exp), SECRET);
+        let at = |iat: f64, exp: f64| sign_render(&render_claims(iat, exp), RENDER_SECRET);
         assert_eq!(
-            verify_render(&at(NOW - 400.0, NOW - 280.0), SECRET, NOW),
+            verify_render(&at(NOW - 400.0, NOW - 280.0), RENDER_SECRET, NOW),
             Err(TokenError::Expired)
         );
         assert_eq!(
-            verify_render(&at(NOW + 400.0, NOW + 500.0), SECRET, NOW),
+            verify_render(&at(NOW + 400.0, NOW + 500.0), RENDER_SECRET, NOW),
             Err(TokenError::IssuedInFuture)
         );
         let mut other = render_claims(NOW, NOW + 60.0);
         other.aud = "embed".to_owned();
         assert_eq!(
-            verify_render(&sign_render(&other, SECRET), SECRET, NOW),
+            verify_render(&sign_render(&other, RENDER_SECRET), RENDER_SECRET, NOW),
             Err(TokenError::Malformed)
         );
         let mut bad_jti = render_claims(NOW, NOW + 60.0);
         bad_jti.jti = "has space".to_owned();
         assert_eq!(
-            verify_render(&sign_render(&bad_jti, SECRET), SECRET, NOW),
+            verify_render(&sign_render(&bad_jti, RENDER_SECRET), RENDER_SECRET, NOW),
             Err(TokenError::BadJti)
         );
         assert_eq!(
             verify_render(
                 &sign_render(&render_claims(NOW, NOW + 60.0), "other"),
-                SECRET,
+                RENDER_SECRET,
                 NOW
             ),
             Err(TokenError::BadSignature)
@@ -680,13 +691,13 @@ mod tests {
 
     #[test]
     fn a_tampered_render_payload_is_refused() {
-        let token = sign_render(&render_claims(NOW, NOW + 60.0), SECRET);
+        let token = sign_render(&render_claims(NOW, NOW + 60.0), RENDER_SECRET);
         let parts: Vec<&str> = token.split('.').collect();
         let mut evil = render_claims(NOW, NOW + 60.0);
         evil.board = "b_evil".to_owned();
         let tampered = format!("{}.{}.{}", parts[0], b64url_json(&evil).unwrap(), parts[2]);
         assert_eq!(
-            verify_render(&tampered, SECRET, NOW),
+            verify_render(&tampered, RENDER_SECRET, NOW),
             Err(TokenError::BadSignature)
         );
     }

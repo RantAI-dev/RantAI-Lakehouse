@@ -20,7 +20,9 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
-const SECRET: &str = "test-embed-secret-not-real";
+/// `RENDER_TOKEN_SECRET`; `EMBED_SECRET` is not set at all (BI-1 review fix
+/// (BLOCKER) R1: PDF export does not depend on it).
+const SECRET: &str = "test-render-secret-not-real";
 const CONSOLE: &str = "http://console.test:3000";
 const BOARD: &str = "b_pdf";
 
@@ -40,6 +42,12 @@ impl Respond for BoardOnly {
             });
             return ResponseTemplate::new(200)
                 .set_body_json(json!({ "meta": [], "data": [row], "rows": 1 }));
+        }
+        // "Today" in the report zone: the engine is asked, and answers a date
+        // that is not today's UTC date, so the file name must carry this one.
+        if sql.contains("toDate(now(") {
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({ "meta": [], "data": [{ "d": "2031-02-03" }], "rows": 1 }));
         }
         ResponseTemplate::new(200).set_body_string("Ok.\n")
     }
@@ -68,7 +76,7 @@ async fn fixture(env: &[(&str, Option<&str>)], pdf: ResponseTemplate) -> Fixture
         ("CH_URL".to_owned(), ch.uri()),
         ("GOTENBERG_URL".to_owned(), gotenberg.uri()),
         ("CONSOLE_INTERNAL_URL".to_owned(), CONSOLE.to_owned()),
-        ("EMBED_SECRET".to_owned(), SECRET.to_owned()),
+        ("RENDER_TOKEN_SECRET".to_owned(), SECRET.to_owned()),
     ]);
     for (key, value) in env {
         match value {
@@ -200,7 +208,11 @@ async fn the_download_is_audited_with_its_paper_and_size() {
 
 #[tokio::test]
 async fn without_gotenberg_the_console_url_or_the_secret_pdf_is_not_set_up() {
-    for missing in ["GOTENBERG_URL", "CONSOLE_INTERNAL_URL", "EMBED_SECRET"] {
+    for missing in [
+        "GOTENBERG_URL",
+        "CONSOLE_INTERNAL_URL",
+        "RENDER_TOKEN_SECRET",
+    ] {
         for blank in [None, Some("")] {
             let f = fixture(&[(missing, blank)], ok_pdf()).await;
             let (status, _, body) =
@@ -312,4 +324,72 @@ async fn at_most_two_pdfs_are_made_at_once_and_a_third_waits() {
         elapsed < delay * 3 + Duration::from_millis(900),
         "not three in a row: {elapsed:?}"
     );
+}
+
+/// `BI-1` review fix (SHOULD-FIX) R3: a service identity cannot ask for a PDF; it
+/// is told so, and Gotenberg is not asked.
+#[tokio::test]
+async fn a_service_token_is_refused_in_a_sentence_and_gotenberg_is_not_asked() {
+    const TOKEN: &str = "svc-pdf-fixture-token";
+    let f = fixture(&[], ok_pdf()).await;
+    let identity = lakehouse_store::identity::create_service_identity(
+        &f.app.pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "test-pdf".to_owned(),
+            scopes: vec!["dashboard:read".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    lakehouse_auth::service_token::ensure_service_credential(
+        &f.app.pool,
+        identity.id.parse().unwrap(),
+        &lakehouse_auth::Secret::new(TOKEN.to_owned()),
+    )
+    .await
+    .unwrap();
+    let resp = f
+        .app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/dashboard/export/pdf?board={BOARD}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        text(&bytes)["error"],
+        "A PDF is made for a signed-in person; a service token cannot ask for one."
+    );
+    assert!(f.gotenberg.received_requests().await.unwrap().is_empty());
+}
+
+/// R3: Gotenberg failing the conversion (a print view that raised an exception,
+/// HTTP 409) is "The PDF could not be made." and is not audited or sent.
+#[tokio::test]
+async fn a_conversion_gotenberg_fails_is_not_handed_over() {
+    let f = fixture(
+        &[],
+        ResponseTemplate::new(409).set_body_string("console exceptions: render data refused"),
+    )
+    .await;
+    let (status, _, body) = get(&f, &format!("/api/dashboard/export/pdf?board={BOARD}")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = text(&body)["error"].as_str().unwrap().to_owned();
+    assert!(error.starts_with("The PDF could not be made."), "{error}");
+    assert!(!error.contains("console exceptions"));
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.pdf_export'",
+    )
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 0);
 }

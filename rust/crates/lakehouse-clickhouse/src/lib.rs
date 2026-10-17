@@ -301,7 +301,11 @@ impl ChClient {
     /// two columns with one name do not collapse.) The request has its own
     /// `timeout` in place of the client's 60 seconds, which would cut a big
     /// download short; the body is read as it arrives. Dropping the returned
-    /// [`RowStream`] closes the connection, and `ClickHouse` stops the query.
+    /// [`RowStream`] closes the connection; closing it does not by itself stop a
+    /// running `SELECT`, so every request carries
+    /// `cancel_http_readonly_queries_on_client_close=1`, which makes `ClickHouse`
+    /// cancel the query when the client goes (`BI-1` review fix (SHOULD-FIX)
+    /// R10; the comment used to say the close alone did it).
     ///
     /// # Errors
     ///
@@ -322,6 +326,7 @@ impl ChClient {
             .basic_auth(&self.user, Some(&self.password))
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .header(CACHE_CONTROL, "no-store")
+            .query(&[("cancel_http_readonly_queries_on_client_close", "1")])
             .timeout(timeout)
             .body(body)
             .send()
@@ -851,6 +856,12 @@ mod tests {
             .query_stream("SELECT 1;", std::time::Duration::from_secs(5))
             .await
             .unwrap();
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(
+            sent[0].url.query(),
+            Some("cancel_http_readonly_queries_on_client_close=1"),
+            "a dropped download cancels its query (R10)"
+        );
         assert_eq!(rows.names(), ["a", "b"]);
         assert_eq!(rows.types(), ["Int64", "String"]);
         assert_eq!(

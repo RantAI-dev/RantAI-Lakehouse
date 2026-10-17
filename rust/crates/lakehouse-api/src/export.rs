@@ -7,8 +7,11 @@
 //! was cut (`X-Export-Rows`, `X-Export-Cut`) and the audit record has to carry
 //! the same counts before the file is sent (D8): both are known only when the
 //! last row has been read. The file is unlinked the moment it is open, so it
-//! is gone after the download ends and on every error path alike (a crash
-//! leaves nothing named behind).
+//! is gone after the download ends and on every error path alike. What is true
+//! of a killed process: a CSV file is already unlinked, but an `.xlsx` is named
+//! in the temp directory from the end of the write until it is open (and the
+//! writer's own working files sit there while it runs), so a process killed in
+//! that window leaves them behind (BI-1 review fix (SHOULD-FIX) R10).
 //!
 //! One rule per concern, shared with the older export: formula
 //! neutralising is `csv_export::neutralise` for a CSV cell and an Excel text
@@ -225,6 +228,15 @@ fn csv_cell(
         && let Some(text) = format_text(n, fmt, locale)
     {
         return csv_export::neutralise(&text);
+    }
+    // BI-1 review fix (SHOULD-FIX) R5: a number the engine sent as text (a 64-bit
+    // integer) is a number, not a formula: `"-5"` is written as `-5`, with no
+    // apostrophe, as a JSON number is.
+    if numeric_column
+        && let Value::String(text) = value
+        && numeric_string(text).is_some()
+    {
+        return text.clone();
     }
     csv_export::cell_text(Some(value))
 }
@@ -681,6 +693,29 @@ mod tests {
         )
         .await;
         assert!(matches!(err, Err(ExportError::Xlsx(_))));
+    }
+
+    /// R5: a quoted 64-bit integer in a numeric column keeps its sign unchanged
+    /// in "raw" CSV; a text column starting with `-` is still neutralised.
+    #[tokio::test]
+    async fn a_negative_quoted_integer_is_written_unchanged_and_text_is_still_neutralised() {
+        let (labels, formats) = (HashMap::new(), HashMap::new());
+        let make = |_| vec![json!("-5"), json!("-5")];
+        let mut src = Generated {
+            names: vec!["code".to_owned(), "amount".to_owned()],
+            types: vec!["String".to_owned(), "Int64".to_owned()],
+            total: 1,
+            next: 0,
+            make,
+        };
+        let w = write_export(
+            &mut src,
+            &options(FileFormat::Csv, Values::Raw, 10, &labels, &formats),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(read_all(w).await).unwrap();
+        assert!(text.ends_with("code,amount\r\n'-5,-5\r\n"), "{text:?}");
     }
 
     #[test]

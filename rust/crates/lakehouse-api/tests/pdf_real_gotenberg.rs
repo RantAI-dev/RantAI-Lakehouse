@@ -75,3 +75,42 @@ async fn render_pdf_against_real_gotenberg() {
         started.elapsed()
     );
 }
+
+/// `BI-1` review fix (SHOULD-FIX) R3: a print view that raises an uncaught
+/// exception fails the conversion (`failOnConsoleExceptions`), so the route does
+/// not send a PDF of an error sentence.
+#[tokio::test]
+#[ignore = "needs a Gotenberg container, see the module notes"]
+async fn a_page_that_raises_an_exception_fails_the_conversion_on_the_real_gotenberg() {
+    const BROKEN: &str = "<!doctype html><html><body><p>This dashboard could not be loaded.</p>\
+<script>window.__lakehouseRenderReady = true; setTimeout(function () { throw new Error('render data refused'); }, 0);</script>\
+</body></html>";
+    let gotenberg = std::env::var("GOTENBERG_TEST_URL").expect("GOTENBERG_TEST_URL");
+    let host = std::env::var("GOTENBERG_TEST_PAGE_HOST")
+        .unwrap_or_else(|_| "host.docker.internal".to_owned());
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BROKEN}",
+                BROKEN.len()
+            );
+        }
+    });
+    let result = convert_url(
+        &gotenberg,
+        &format!("http://{host}:{port}/"),
+        (Paper::A4, Orientation::Portrait),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(lakehouse_api::pdf::PdfError::Refused(_))),
+        "an exception in the page must fail the conversion: {result:?}"
+    );
+}

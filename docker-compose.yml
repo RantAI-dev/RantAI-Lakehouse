@@ -300,10 +300,15 @@ services:
       # it (the console is not a compose service: it is run next to the stack,
       # `lakehouse-frontend:3000` on staging) and is empty by default, which
       # makes the PDF item say "PDF export is not set up on this deployment".
-      # PDF export also needs EMBED_SECRET, the key of the 2-minute render
-      # token. An internal address, not a credential.
+      # PDF export also needs RENDER_TOKEN_SECRET, the key of the 2-minute render
+      # token (BI-1 review fix (BLOCKER) R1): its own server-only secret, never
+      # EMBED_SECRET (the embedding customer holds that one, and a render token
+      # reads as whoever it names). No default (AGENTS.md rule 5): unset, PDF
+      # export is not set up and the API still starts. GOTENBERG_URL and
+      # CONSOLE_INTERNAL_URL are internal addresses, not credentials.
       GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
       CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-}
+      RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
       # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
       # means 86400. A value that is not a positive whole number stops the
       # API at start, on purpose (a typo must not silently keep 24 hours).

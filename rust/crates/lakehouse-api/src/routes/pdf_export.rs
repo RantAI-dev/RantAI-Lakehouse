@@ -39,6 +39,13 @@ use crate::upstream_error::{self, Context, FailedAs};
 /// decision 6). The browser's print stays available in the console.
 pub(crate) const PDF_NOT_SET_UP: &str = "PDF export is not set up on this deployment";
 
+/// What a service token is told (R3).
+pub(crate) const PDF_FOR_PEOPLE: &str =
+    "A PDF is made for a signed-in person; a service token cannot ask for one.";
+
+/// A request waited a minute for a free PDF slot (`BI-1` review fix (BLOCKER) R2).
+pub(crate) const PDF_BUSY: &str = "Too many PDFs are being made right now; try again in a minute.";
+
 /// The PDF was not ready in time.
 const PDF_TIMEOUT: Context = Context::new(
     "pdf render timeout",
@@ -104,6 +111,12 @@ pub async fn export_pdf(
     Extension(principal): Extension<Principal>,
     Query(q): Query<PdfQuery>,
 ) -> ApiResult<Response> {
+    // BI-1 review fix (SHOULD-FIX) R3: the print view reads as a person (their
+    // roles, their masks), and a service identity is not one; refuse it here,
+    // in a sentence, instead of printing a page that cannot load.
+    if matches!(principal.id, lakehouse_auth::PrincipalId::Service(_)) {
+        return Err(ApiError::BadRequest(PDF_FOR_PEOPLE.to_owned()).into());
+    }
     crate::routes::settings::require_download(&state, &principal).await?;
     if !pdf_supported(&state.config) {
         return Err(ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()).into());
@@ -142,16 +155,15 @@ pub async fn export_pdf(
     }
     let name = board.as_ref().map_or("Main", |b| b.name.as_str());
 
-    // The slots are taken for the whole conversion; a third request waits here.
-    let _slot = state
-        .pdf_slots
-        .clone()
-        .acquire_owned()
+    // The slots are taken for the whole conversion. A further request waits for
+    // one, but not longer than a minute (BI-1 review fix (BLOCKER) R2): then it
+    // is told, in a sentence, instead of meeting the route's deadline.
+    let _slot = crate::pdf::acquire_slot(&state.pdf_slots, crate::pdf::PDF_SLOT_WAIT)
         .await
-        .map_err(|_| ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()))?;
+        .ok_or_else(|| ApiError::Unavailable(PDF_BUSY.to_owned()))?;
 
     let (Some(secret), Some(gotenberg), Some(console)) = (
-        state.config.embed_secret.as_deref(),
+        state.config.render_token_secret.as_ref(),
         state.config.gotenberg_url.as_deref(),
         state.config.console_internal_url.as_deref(),
     ) else {
@@ -172,7 +184,7 @@ pub async fn export_pdf(
             exp: lakehouse_embed::render_expiry(now),
             jti: uuid::Uuid::new_v4().to_string(),
         },
-        secret,
+        secret.expose_secret(),
     );
     // The address comes from configuration and the token only.
     let page_url = format!("{}/render/dashboard/{token}", console.trim_end_matches('/'));
@@ -198,7 +210,7 @@ pub async fn export_pdf(
     )
     .await?;
 
-    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let date = crate::routes::settings::report_date(&state).await;
     let file_name = format!("{}-{date}.pdf", file_slug(name, "dashboard"));
     Ok((
         [
@@ -217,6 +229,17 @@ pub async fn export_pdf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2: the sentence a request gets when no slot came free in a minute, and
+    /// that it is not the "took too long" one (that is Gotenberg's).
+    #[test]
+    fn a_request_that_waited_for_a_slot_is_told_so() {
+        assert_eq!(
+            PDF_BUSY,
+            "Too many PDFs are being made right now; try again in a minute."
+        );
+        assert_ne!(PDF_BUSY, "The PDF took too long to make.");
+    }
 
     #[test]
     fn each_failure_has_its_own_fixed_sentence_and_never_the_raw_text() {

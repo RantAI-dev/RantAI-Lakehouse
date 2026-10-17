@@ -26,6 +26,22 @@ use std::time::Duration;
 /// (feature decision 5).
 pub const PDF_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long a PDF request waits for one of the process's slots
+/// ([`crate::state::PDF_AT_ONCE`]) before it is told so (`BI-1` review fix
+/// (BLOCKER) R2).
+pub const PDF_SLOT_WAIT: Duration = Duration::from_secs(60);
+
+/// Take a slot, waiting at most `wait`; `None` when none came free in time.
+pub async fn acquire_slot(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(wait, slots.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
 /// The total timeout of the HTTP client, a backstop above [`PDF_DEADLINE`]
 /// that matches Gotenberg's `--api-timeout=70s` (D5).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(70);
@@ -213,6 +229,11 @@ pub async fn convert_url(
     form.text("printBackground", "true");
     form.text("emulatedMediaType", "print");
     form.text("waitForExpression", READY_EXPRESSION);
+    // BI-1 review fix (SHOULD-FIX) R3: a print view that could not load its data
+    // raises an uncaught exception (`render-view.tsx`, `renderFailure`); with this
+    // Gotenberg fails the conversion (HTTP 409) and the route says "The PDF could
+    // not be made." instead of sending a PDF of an error sentence.
+    form.text("failOnConsoleExceptions", "true");
     form.file("files", "footer.html", "text/html", FOOTER_HTML);
     let (content_type, body) = form.finish();
 
@@ -303,6 +324,7 @@ mod tests {
             "name=\"paperHeight\"\r\n\r\n11\r\n".to_owned(),
             "name=\"landscape\"\r\n\r\ntrue\r\n".to_owned(),
             "name=\"printBackground\"\r\n\r\ntrue\r\n".to_owned(),
+            "name=\"failOnConsoleExceptions\"\r\n\r\ntrue\r\n".to_owned(),
             "name=\"emulatedMediaType\"\r\n\r\nprint\r\n".to_owned(),
             format!("name=\"waitForExpression\"\r\n\r\n{READY_EXPRESSION}\r\n"),
             "name=\"files\"; filename=\"footer.html\"".to_owned(),
@@ -381,6 +403,28 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PdfError::Unreachable(_)), "{err}");
+    }
+
+    /// `BI-1` review fix (BLOCKER) R2: a request that cannot get a slot gives up
+    /// when told to, instead of waiting for the route's deadline.
+    #[tokio::test]
+    async fn a_slot_wait_that_runs_out_gives_none_and_a_free_slot_is_taken() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let first = acquire_slot(&slots, Duration::from_millis(50)).await;
+        assert!(first.is_some());
+        let started = std::time::Instant::now();
+        assert!(
+            acquire_slot(&slots, Duration::from_millis(100))
+                .await
+                .is_none()
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(first);
+        assert!(
+            acquire_slot(&slots, Duration::from_millis(50))
+                .await
+                .is_some()
+        );
     }
 
     #[test]

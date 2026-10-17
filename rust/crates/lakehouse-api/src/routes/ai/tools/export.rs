@@ -63,6 +63,43 @@ fn downloads_off_sentence(err: &lakehouse_core::ApiError) -> String {
     }
 }
 
+/// What the page was reading with, from the arguments, as the texts
+/// `GET /api/dashboard` takes: `filters` (a JSON list), `params` (a JSON
+/// object) and `grain`. The model copies them from the page context, which lists
+/// the active filters as raw JSON (`BI-1` review fix (SHOULD-FIX) R7); a value
+/// the console would refuse is refused here with its sentence.
+fn view_pairs(args: &Map<String, Value>) -> Result<Vec<(&'static str, String)>, String> {
+    let mut out = Vec::new();
+    if let Some(filters) = args
+        .get("filters")
+        .filter(|f| f.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        let text = filters.to_string();
+        crate::routes::dashboard::check_filters_text(Some(&text)).map_err(|_| {
+            "filters must be the dashboard's filter list, copied from the page context.".to_owned()
+        })?;
+        out.push(("filters", text));
+    }
+    if let Some(params) = args
+        .get("params")
+        .filter(|p| p.as_object().is_some_and(|o| !o.is_empty()))
+    {
+        out.push(("params", params.to_string()));
+    }
+    let grain = arg_str(args, "grain");
+    if !grain.is_empty() {
+        let fits = lakehouse_bi::grain::Grain::parse(&grain)
+            .is_some_and(lakehouse_bi::grain::Grain::is_truncation);
+        if !fits {
+            return Err(
+                "grain must be one of minute, hour, day, week, month, quarter, year.".to_owned(),
+            );
+        }
+        out.push(("grain", grain));
+    }
+    Ok(out)
+}
+
 /// `path?key=value&...` with every value percent-encoded.
 fn link(path: &str, pairs: &[(&str, &str)]) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
@@ -116,16 +153,19 @@ async fn export_dashboard(
         return json!({ "error": "this dashboard does not exist" });
     }
     let name = board.as_ref().map_or("Main", |b| b.name.as_str());
-    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let date = crate::routes::settings::report_date(state).await;
+    let view = match view_pairs(args) {
+        Ok(view) => view,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    let mut pairs = vec![
+        ("board", board_id),
+        ("paper", paper.as_str()),
+        ("orientation", orientation.as_str()),
+    ];
+    pairs.extend(view.iter().map(|(k, v)| (*k, v.as_str())));
     json!({
-        "url": link(
-            "/api/dashboard/export/pdf",
-            &[
-                ("board", board_id),
-                ("paper", paper.as_str()),
-                ("orientation", orientation.as_str()),
-            ],
-        ),
+        "url": link("/api/dashboard/export/pdf", &pairs),
         "fileName": format!("{}-{date}.pdf", file_slug(name, "dashboard")),
         "format": "pdf",
         "note": "Give the person this link; the PDF is made when they open it, with their own permissions.",
@@ -168,18 +208,21 @@ async fn export_chart(state: &AppState, principal: &Principal, args: &Map<String
     } else {
         "formatted"
     };
+    let view = match view_pairs(args) {
+        Ok(view) => view,
+        Err(sentence) => return json!({ "error": sentence }),
+    };
+    let mut pairs = vec![
+        ("chart", chart_id),
+        ("format", format.extension()),
+        ("values", values_word),
+    ];
+    pairs.extend(view.iter().map(|(k, v)| (*k, v.as_str())));
     json!({
-        "url": link(
-            "/api/dashboard/chart-export",
-            &[
-                ("chart", chart_id),
-                ("format", format.extension()),
-                ("values", values_word),
-            ],
-        ),
+        "url": link("/api/dashboard/chart-export", &pairs),
         "fileName": format!("{}.{}", file_slug(&chart.spec.title, "table"), format.extension()),
         "format": format.extension(),
-        "note": "Give the person this link; the file is made when they open it, with their own permissions and the filters of the page they are on.",
+        "note": "Give the person this link; the file is made when they open it, with their own permissions and the filters, parameters and grain in the link.",
     })
 }
 

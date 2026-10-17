@@ -171,11 +171,12 @@ pub async fn get(
 
 /// Whether the deployment can make a PDF: a Gotenberg to ask, an address the
 /// renderer reaches the console at, and the secret the render token is signed
-/// with. Any one missing is "not set up" (`BI-1`, feature decision 6).
+/// with (`RENDER_TOKEN_SECRET`, its own server-only secret, BI-1 review fix
+/// (BLOCKER) R1). Any one missing is "not set up" (`BI-1`, feature decision 6).
 pub(crate) fn pdf_supported(config: &crate::config::Config) -> bool {
     config.gotenberg_url.is_some()
         && config.console_internal_url.is_some()
-        && config.embed_secret.is_some()
+        && config.render_token_secret.is_some()
 }
 
 /// The payload `GET /api/dashboard` answers for `principal`: the board's
@@ -3295,10 +3296,23 @@ async fn export_tile_statement(
             grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
         (statement, HashMap::new())
     };
-    // D6: a SQL source's 2 000-row cap is a tile's; a download reads up to the cap.
-    let statement =
-        lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1);
-    Ok((chart, statement, labels))
+    Ok((
+        chart,
+        export_statement_settings(rows_mode, statement),
+        labels,
+    ))
+}
+
+/// The statement as the download sends it. A raw table's rows lift a SQL
+/// source's 2 000-row cap to the download's (D6); a grouped tile stays byte for
+/// byte the tile's own statement, because a grouped chart exports its own result
+/// (feature decision 8; `BI-1` review fix (SHOULD-FIX) R4).
+fn export_statement_settings(rows_mode: bool, statement: String) -> String {
+    if rows_mode {
+        lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1)
+    } else {
+        statement
+    }
 }
 
 async fn export_chart(
@@ -4174,6 +4188,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// `BI-1` review fix (SHOULD-FIX) R4: only a raw table's rows lift a SQL
+    /// source's tile cap; a grouped statement is sent exactly as the tile reads it.
+    #[test]
+    fn only_a_raw_table_lifts_the_sql_source_cap_in_its_download() {
+        let tile = format!(
+            "SELECT region, sum(n) AS n FROM (SELECT 1\n) AS src GROUP BY region{}",
+            lakehouse_bi::builder::SQL_SOURCE_SETTINGS
+        );
+        assert_eq!(export_statement_settings(false, tile.clone()), tile);
+        let rows = export_statement_settings(true, tile.clone());
+        assert_ne!(rows, tile);
+        assert!(rows.contains("max_result_rows = 1000001"), "{rows}");
+        assert!(!rows.contains("max_result_rows = 2000"), "{rows}");
+    }
 
     #[test]
     fn strip_non_ident_removes_everything_but_word_chars() {

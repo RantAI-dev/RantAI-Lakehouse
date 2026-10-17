@@ -2069,3 +2069,33 @@ fn the_render_data_route_is_public_and_token_authenticated() {
         Some(Policy::Public)
     );
 }
+
+/// BI-1 review fix (SHOULD-FIX) R8: the PDF route needs `dashboard:read` and
+/// nothing more, and not the Query Studio permission; both ways, as for the
+/// chart download.
+#[tokio::test]
+async fn the_pdf_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/export/pdf")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/export/pdf?board=x";
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

@@ -1516,6 +1516,9 @@ fn export_dashboard_schema() -> Value {
         "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
         "parameters": { "type": "object", "properties": {
             "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none" },
+            "params": { "type": "object", "description": "the parameter values in force, name to value, if the page context lists any" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"], "description": "the dashboard's time grain switch if the page context shows one" },
             "format": { "type": "string", "enum": ["pdf"], "description": "pdf, the default" },
             "paper": { "type": "string", "enum": ["a4", "letter"], "description": "default a4" },
             "orientation": { "type": "string", "enum": ["portrait", "landscape"], "description": "default portrait" } },
@@ -1527,6 +1530,9 @@ fn export_chart_schema() -> Value {
         "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
         "parameters": { "type": "object", "properties": {
             "chart": { "type": "string", "description": "the chart's id, from list_charts" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters in force on the page, copied from the page context's raw JSON, so the file matches the screen; leave out when there are none" },
+            "params": { "type": "object", "description": "the parameter values in force, name to value, if the page context lists any" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"], "description": "the dashboard's time grain switch if the page context shows one" },
             "format": { "type": "string", "enum": ["xlsx", "csv"] },
             "values": { "type": "string", "enum": ["formatted", "raw"], "description": "formatted as on the chart (default) or the raw values" } },
             "required": ["chart", "format"] } } })

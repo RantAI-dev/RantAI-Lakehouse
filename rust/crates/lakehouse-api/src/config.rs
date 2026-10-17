@@ -338,11 +338,17 @@ pub struct Config {
     /// `BI-1` D1/D5). `None` when unset or empty. Operator configuration,
     /// never taken from a request.
     pub gotenberg_url: Option<String>,
+    /// The key render tokens are signed with (`RENDER_TOKEN_SECRET`, `BI-1`
+    /// review fix (BLOCKER) R1). Server-only and independent of every other
+    /// secret: `EMBED_SECRET` is held by the embedding customer, and a render
+    /// token reads as whichever person it names. `None` when unset or empty:
+    /// PDF export is then not set up (fail closed).
+    pub render_token_secret: Option<lakehouse_core::secret::SecretValue>,
     /// The console's address as the Gotenberg container reaches it
     /// (`CONSOLE_INTERNAL_URL`, e.g. `http://lakehouse-frontend:3000`): the
     /// print view lives at `<this>/render/dashboard/<token>`. `None` when
     /// unset or empty. PDF export needs this, `GOTENBERG_URL` and
-    /// `EMBED_SECRET` (the render token's key); any one missing means "PDF
+    /// `RENDER_TOKEN_SECRET` (the render token's key); any one missing means "PDF
     /// export is not set up on this deployment" (feature decision 6).
     pub console_internal_url: Option<String>,
     /// The longest lifetime (`exp - iat`) a signed embed token may have, in
@@ -921,6 +927,10 @@ impl std::fmt::Debug for Config {
                 "embed_secret",
                 &self.embed_secret.as_ref().map(|_| REDACTED),
             )
+            .field(
+                "render_token_secret",
+                &self.render_token_secret.as_ref().map(|_| REDACTED),
+            )
             .field("gotenberg_url", &self.gotenberg_url)
             .field("console_internal_url", &self.console_internal_url)
             .field(
@@ -1309,6 +1319,8 @@ impl Config {
             llm_model: or_default(env, "LLM_MODEL", "MiniMax-M3"),
             llm_key,
             embed_secret: truthy(env, "EMBED_SECRET"),
+            render_token_secret: truthy(env, "RENDER_TOKEN_SECRET")
+                .map(lakehouse_core::secret::SecretValue::new),
             gotenberg_url: truthy(env, "GOTENBERG_URL"),
             console_internal_url: truthy(env, "CONSOLE_INTERNAL_URL"),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
@@ -1583,6 +1595,7 @@ mod tests {
             ("CH_PASSWORD", "s3cret-ch-pass"),
             ("LLM_KEY", "s3cret-llm-key"),
             ("EMBED_SECRET", "s3cret-embed"),
+            ("RENDER_TOKEN_SECRET", "s3cret-render"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
             ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
@@ -1601,6 +1614,7 @@ mod tests {
             "s3cret-ch-pass",
             "s3cret-llm-key",
             "s3cret-embed",
+            "s3cret-render",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
             "s3cret-agent-run-token",
@@ -1630,6 +1644,7 @@ mod tests {
         assert_eq!(cfg.llm_key, "");
         assert_eq!(cfg.embed_secret, None);
         assert_eq!(cfg.gotenberg_url, None);
+        assert!(cfg.render_token_secret.is_none());
         assert_eq!(cfg.console_internal_url, None);
         assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);

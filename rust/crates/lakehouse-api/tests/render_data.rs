@@ -32,7 +32,8 @@ use uuid::Uuid;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
-const SECRET: &str = "test-embed-secret-not-real";
+const SECRET: &str = "test-render-secret-not-real";
+const EMBED_SECRET: &str = "test-embed-secret-not-real";
 const PUBLIC_BOARD: &str = "b_public";
 const PRIVATE_BOARD: &str = "b_private";
 
@@ -169,7 +170,9 @@ async fn fixture(secret: Option<&str>) -> Fixture {
         .await;
     let mut env: HashMap<String, String> = HashMap::from([("CH_URL".to_owned(), ch.uri())]);
     if let Some(secret) = secret {
-        env.insert("EMBED_SECRET".to_owned(), secret.to_owned());
+        env.insert("RENDER_TOKEN_SECRET".to_owned(), secret.to_owned());
+        // The embedding customer's secret is a different one (R1).
+        env.insert("EMBED_SECRET".to_owned(), EMBED_SECRET.to_owned());
     }
     let app = spin_up_with_env(&env).await;
     // The owner row is created with the id the fake already knows.
@@ -377,7 +380,7 @@ async fn an_embed_token_an_expired_token_and_a_foreign_secret_are_refused_with_o
             iat: Some(unix_now() - 5.0),
             jti: None,
         },
-        SECRET,
+        EMBED_SECRET,
     );
     let expired = render_token(f.owner, PUBLIC_BOARD, 600.0, 120.0);
     let too_long = render_token(f.owner, PUBLIC_BOARD, 5.0, 3600.0);
@@ -421,12 +424,41 @@ async fn without_a_configured_secret_pdf_export_is_not_set_up() {
     assert_eq!(body["error"], "PDF export is not set up on this deployment");
 }
 
-/// A person whose roles were all switched off from downloading still has a
-/// print view only through a token that the PDF route (T4) refuses to mint; the
-/// payload tells the console what the person may do (`canDownload`).
+// (The test that read `canDownload: false` from a switched-off person's payload is
+// replaced by the one at the end of this file: with R9 that person gets no payload.)
+
+/// BI-1 review fix (BLOCKER) R1: an embedding host holds `EMBED_SECRET`; with it
+/// it cannot mint a render token naming any person and any board.
 #[tokio::test]
-async fn the_payload_says_whether_the_person_may_download() {
+async fn a_render_token_signed_with_the_embed_secret_is_refused() {
     let f = fixture(Some(SECRET)).await;
+    let claims = lakehouse_embed::RenderClaims {
+        aud: "render".to_owned(),
+        board: PUBLIC_BOARD.to_owned(),
+        principal: f.owner.to_string(),
+        filters: None,
+        params: None,
+        grain: None,
+        paper: "a4".to_owned(),
+        orientation: "portrait".to_owned(),
+        exp: unix_now().floor() + 60.0,
+        iat: unix_now().floor(),
+        jti: "forged".to_owned(),
+    };
+    let forged = sign_render(&claims, EMBED_SECRET);
+    let (status, body) = post(&f.app, &json!({ "token": forged }), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+/// BI-1 review fix (SHOULD-FIX) R9: rights are read on every data call, so a
+/// revoke inside the token's two minutes stops the data at once.
+#[tokio::test]
+async fn a_revoked_permission_or_a_download_switch_inside_the_tokens_life_stops_the_data() {
+    let f = fixture(Some(SECRET)).await;
+    let token = render_token(f.other, PUBLIC_BOARD, 5.0, 120.0);
+    let (status, _) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::OK, "the token works before the change");
+
     sqlx::query(
         "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
          VALUES (TRUE, 'UTC', 'monday', ARRAY['Other Role'])",
@@ -434,11 +466,28 @@ async fn the_payload_says_whether_the_person_may_download() {
     .execute(&f.app.pool)
     .await
     .unwrap();
-    let (_, body) = post(
-        &f.app,
-        &json!({ "token": render_token(f.other, PUBLIC_BOARD, 5.0, 120.0) }),
-        None,
-    )
-    .await;
-    assert_eq!(body["canDownload"], false, "{body}");
+    let (status, _) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "downloads switched off for the role"
+    );
+
+    sqlx::query("UPDATE reporting_settings SET download_denied_roles = '{}'")
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let (status, _) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(status, StatusCode::OK, "and back");
+
+    sqlx::query("UPDATE role SET permissions = '' WHERE name = 'Other Role'")
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let (status, _) = post(&f.app, &json!({ "token": token }), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "dashboard:read taken away"
+    );
 }

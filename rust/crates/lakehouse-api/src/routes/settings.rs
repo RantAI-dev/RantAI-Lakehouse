@@ -295,6 +295,31 @@ pub(crate) async fn require_download(
     }
 }
 
+/// Today's date in the report time zone, `YYYY-MM-DD`, for a download's file
+/// name (`BI-1` review note: it was the UTC date). The engine knows the zone
+/// list, so it is asked (`toDate(now(zone))`, the same expression "today" is
+/// everywhere else); when it cannot answer, the UTC date stands and the failure
+/// is logged under a reference.
+pub(crate) async fn report_date(state: &AppState) -> String {
+    let utc = || chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let Ok(time) = time_context(state).await else {
+        return utc();
+    };
+    let sql = format!("SELECT toString({}) AS d", time.today_expr());
+    match state.clickhouse.rows(&sql, None).await {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.get("d"))
+            .and_then(Value::as_str)
+            .filter(|d| d.len() == 10 && d.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+            .map_or_else(utc, str::to_owned),
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            utc()
+        }
+    }
+}
+
 /// The time context every dashboard read uses, loaded once per request.
 ///
 /// No Postgres pool or no saved row means the defaults, not an error: a
