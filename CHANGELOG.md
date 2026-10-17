@@ -264,6 +264,64 @@ once a first release is tagged.
   the attempt count on the shared `DEFAULT_RETRY_POLICY`; delay, backoff
   and jitter come from the shared policy. (R2)
 
+- The assistant manages dashboards (backlog `AI-1`, `AI-2`, `AI-20`; plan
+  `plans/20-the-assistant-renames-arranges-and-filters-dashboards.md`;
+  feature page `docs/core/features/assistant-manages-dashboards.md`;
+  decisions 2026-10-15). Six new assistant tools, each named after `board`
+  or `chart` so the console's capability test covers them unchanged:
+  `rename_board` (`dashboard:write`, WriteLow) renames a board through
+  `boards_update` with `{id, name}`; `delete_board` (`dashboard:write`,
+  WriteHigh) calls `boards_delete` after an approval whose reason names
+  the board and says its charts are deleted too; `arrange_board`
+  (`dashboard:write`, WriteLow) takes only the tiles that change
+  (`{chartId: {x, y, w, h}}`), reads the current layout, refuses a chart
+  id that is not on that board, refuses a box outside the 12-column grid
+  or with `w < 1` or `h < 1`, merges the boxes and saves through the
+  console's `boards_update` with `layout`; `move_chart` (`dashboard:write`,
+  WriteLow) reads the stored chart, changes only its board, saves through
+  the path `specs_update` uses, and removes the chart's tile from the old
+  board's layout; `set_board_view_filters` (`dashboard:read`, Read)
+  validates the filters with `validate_filters` and `without_inert`,
+  writes nothing, and returns the full list that should be active (an
+  empty list clears) — Read risk, so it is also offered in Ask mode;
+  `save_board_filters` (`dashboard:write`, WriteLow) saves the board's
+  default through `boards_update` with `{id, filters}` and is used only
+  when the person asks to save or to make it the default for everyone.
+  Each tool goes through the same console route handlers the console
+  uses (`tools/calc_fields.rs` pattern), so the same validation
+  (`board_edit_allowed`, `validate_filters`) and the same console
+  refusals carry through unchanged: the built-in `default` board accepts
+  only a layout, and `boards_update` with a non-layout field on it
+  refuses with the console's message. **Dashboard page applies a view
+  filter result.** When a chat reply's trace holds a
+  `set_board_view_filters` step with `ok: true` and its `board` is the
+  board on screen, the page writes the filters into the address with the
+  same helpers a chip change uses (`encodeFilters`, `filtersToParam`).
+  On any other board the step card shows a link to that board with the
+  filters in the address, built with the same helpers. The hook sits
+  beside the existing way the dock tells the page about a tool result
+  (`use-copilot.ts` handle for `create_chart`); no new global channel.
+  **Page context for the tools.** The assistant's page context gains
+  `summarizeGrain(shown, saved)`, new and beside `summarizeFilters`, so
+  the on-screen time grain (the override on the dashboard's grain
+  control) and the board's saved grain reach the prompt and the
+  dashboard page's effect dependency list. The active filters also enter
+  as compact JSON (`FilterDef[]`) within their own 4,000-character budget, leaving room inside the page context's 5,000-character cap; when
+  over, the JSON is left out and the chip summary stays. **Limits.**
+  **Undo is not built** — boards have no version history yet; the row
+  waits for `BI-18` (version history part) and a new backlog row is
+  added for it (`AI-21`, P2, Planned, source `AI-1` spec). **Layout:
+  last write wins** — there is no undo and no version history. The
+  built-in **Main** board cannot be renamed, deleted or given default
+  filters. **View filters live in the address**, so they belong to the
+  person looking, not to the board; the board's saved default is
+  unchanged unless the person asks to save it. "Linked filters" named
+  in `docs/core/specs/ai-2.md` are not in the `BI-18` code at the base
+  the planner read; no code for it and the row is left unmet. The
+  `FilterDef` schema lists every `FilterOp` value and the relative-date
+  fields. The dashboard page context the assistant reads is gated by
+  the same permissions as before.
+
 ### Security
 
 - **History secret scan scoped to `HEAD` on `main` and pull requests (`SEC-36`, decisions D1–D2).** In `.github/workflows/security.yml`, the `history-scan` job no longer fetches all branches and runs `gitleaks detect` with `--log-opts="HEAD"`, scanning only `main`'s history or `main` plus the pull request's commits. Unrelated branches carrying findings (such as `#144`) no longer turn `main` or other pull requests red. A separate daily workflow (`.github/workflows/security-all-branches.yml`, cron `17 3 * * *` and `workflow_dispatch`) scans all branches across the repository history with `--log-opts="--all"`, failing loudly when any branch carries an un-baselined finding without blocking unrelated pull requests.
@@ -340,6 +398,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A pipeline that lists a connector load in its **Run after** no longer runs on every connector's load (`BLD-4`; plan `docs/superpowers/plans/2026-10-15-bld-4-ingest-upstream-filter.md`). `ingest_job` is one job for every connector and loads every table it was given in a single run, so the chain behind such a pipeline counted "the newest successful connector run", which said nothing about which table had loaded: any connector's load in the deployment re-ran the pipeline on a source table that had not changed. The chain now counts only the successful runs that loaded the pipeline's **own** raw table, read from the materialization each loaded table records inside the run that loaded it, so a deployment whose other tables keep loading cannot push the run this pipeline needs out of the window. One load fires exactly the pipelines that read that table and nothing else. A load of another table leaves the pipeline waiting, and the reason says so ("upstream 'ingest_job' has no SUCCESS run that loaded '<its raw table>' in its last 20 loads; a load of another table never triggers this pipeline"). Naming a connector load is accepted only on a pipeline that reads a raw table now: refused on create, on edit, on restoring an earlier version and from the assistant, with the reason `ingest_job can only be an upstream of a pipeline whose source is a bronze table`. A pipeline saved with another source before this change is not run either, and waits with the reason `upstream 'ingest_job' loads every selected object of one connector into bronze tables and this pipeline reads <its source>, so no connector load can trigger it`. Every other upstream (another pipeline, a `Dagster` job) keeps the rule it had. Proven end to end by the existing G7 gate (`ops/g7/g7_pipeline_test.py`, run by the `g7-test-runner` compose service inside the existing G3a job) on a clean stack: a load of the chain's own table runs it and writes one Silver row per distinct id of the Bronze table it read, counted on both sides through `ClickHouse`, and a load of a different table leaves it waiting for twice the sensor interval. The G7 job also needed the ingest service credential (`INGEST_SERVICE_TOKEN`) its new step authenticates with, like every other job that starts an ingest run.
 - The chat no longer says a request is waiting in Approvals unless an approval exists. The Build instructions asked for that sentence for every approval-gated tool, so the assistant said it before it had called anything, and again after a result that asked for something else. It now says it only when a tool result comes back `needs_approval`.
 - A number marked as unverified inside bold or italic text now shows as a marked number instead of its own markup. The Copilot's Markdown passed the contents of `**` and `*` through as one string, so a mark inside them came out as literal tag text; bold and italic now render what they hold, as the rest of the inline text does.
 - A chart draft on a table that cannot be charted is refused with the reason instead of being offered for confirmation. A draft over a Silver or Bronze table used to reach the person as a card with a Confirm button and fail when it was confirmed. The draft is now checked with the same validation the tool runs, before the gate offers it, and the check writes nothing.

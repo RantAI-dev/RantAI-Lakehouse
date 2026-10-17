@@ -259,7 +259,7 @@ export type CreatePipelineInput = {
    * (migration `0052`). `"file_ingest_job"` is accepted only for a
    * `bronze` source and means "re-upload of this table runs me again";
    * the server refuses it otherwise
-   * (`routes::authored_pipelines::validate_file_ingest_upstream`).
+   * (`routes::authored_pipelines::validate_per_table_upstream`).
    */
   dependsOn?: string[]
   /** BLD-2: the freshness promise this pipeline is created with, if any. */
