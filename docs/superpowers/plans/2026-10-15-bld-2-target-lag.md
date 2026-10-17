@@ -1166,7 +1166,7 @@ call site). Nothing skipped; no finding is left open.
 | `git status` | clean; nothing generated staged |
 
 Scoped per-commit runs are quoted in each commit body; the notable ones:
-holly `pipeline_lag_page` 2 passed; `lakehouse-api` full 4681 then 4670+
+route page tests (`pipeline_lag_page`) 2 passed; `lakehouse-api` full 4681 then 4670+
 re-runs; `lakehouse-store` 647 three times; `test_authored_factory.py`
 105 passed and the full Dagster suite twice (1534). The machine's
 `53100 / No space left on device` shared-memory flake hit four full-run
