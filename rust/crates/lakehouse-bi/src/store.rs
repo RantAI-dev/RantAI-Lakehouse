@@ -651,6 +651,13 @@ const LEGACY_EMBED_EPOCH: &str = "toDateTime64(0, 6, 'UTC')";
 /// written since wins; it is idempotent because a board that already has an
 /// event at the epoch is skipped by the query itself; values are bound with
 /// [`SqlLiteral`], never formatted in.
+///
+/// PR #105 review R-A3 SHOULD-FIX: a board's events go in ONE multi-row
+/// `INSERT` (`ClickHouse` writes one block whole or not at all), so a process
+/// that stops mid-copy cannot leave the epoch marker without the withdrawn
+/// `jti`s. PR #105 review R-A4 SHOULD-FIX: the query does not filter on
+/// `is_deleted`, so a board in the trash (restorable) keeps its withdrawals;
+/// an event for a deleted board is never read and costs nothing.
 async fn copy_legacy_embed_state(ch: &ChClient) -> Result<(), ChError> {
     let present = ch
         .rows(
@@ -687,32 +694,33 @@ async fn copy_legacy_embed_state(ch: &ChClient) -> Result<(), ChError> {
     let sql = format!(
         "SELECT id, {before} AS embed_revoked_before, {jti} AS embed_revoked_jti_json, \
          {origins} AS embed_origins_json FROM console.bi_board FINAL \
-         WHERE is_deleted = 0 AND ({before} > 0 OR {jti} NOT IN ('', '[]') \
+         WHERE ({before} > 0 OR {jti} NOT IN ('', '[]') \
          OR {origins} NOT IN ('', '[]')) \
          AND id NOT IN (SELECT board_id FROM console.bi_board_embed_event \
          WHERE at = {LEGACY_EMBED_EPOCH})"
     );
     for row in ch.rows(&sql, None).await? {
-        for insert in legacy_embed_inserts(&row) {
+        if let Some(insert) = legacy_embed_insert(&row) {
             ch.exec(&insert, None).await?;
         }
     }
     Ok(())
 }
 
-/// The event `INSERT`s that carry one legacy board row's embed state over.
-/// Always at least one when the row has any state, so the epoch marker that
-/// makes [`copy_legacy_embed_state`] idempotent is always written.
-fn legacy_embed_inserts(row: &serde_json::Map<String, Value>) -> Vec<String> {
+/// The single `INSERT` that carries one legacy board row's embed state over
+/// (PR #105 review R-A3 SHOULD-FIX: one statement, so it lands whole or not
+/// at all). `None` when the row holds no state, so no epoch marker is written
+/// and the board is looked at again next time, which is harmless.
+fn legacy_embed_insert(row: &serde_json::Map<String, Value>) -> Option<String> {
     let board = SqlLiteral::from(row_str(row, "id"));
     let revoked_before = row_u64(row, "embed_revoked_before");
     let jti_json = row_str(row, "embed_revoked_jti_json").trim();
     let origins_json = row_str(row, "embed_origins_json").trim();
-    let mut out = Vec::new();
+    // Column order: board_id, kind, revoked_before, jti, exp, origins_json, at.
+    let mut tuples: Vec<String> = Vec::new();
     let mut revoke_all = |value: u64| {
-        out.push(format!(
-            "INSERT INTO console.bi_board_embed_event (board_id, kind, revoked_before, at) \
-             VALUES ({board}, 'revoke_all', {value}, {LEGACY_EMBED_EPOCH})"
+        tuples.push(format!(
+            "({board}, 'revoke_all', {value}, '', 0, '[]', {LEGACY_EMBED_EPOCH})"
         ));
     };
     if revoked_before > 0 {
@@ -723,31 +731,34 @@ fn legacy_embed_inserts(row: &serde_json::Map<String, Value>) -> Vec<String> {
     } else {
         serde_json::from_str(jti_json).ok()
     };
-    let mut withdraws = Vec::new();
     match tokens {
+        // Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
+        // does not parse withdraws every token of the board.
+        None => revoke_all(u64::MAX),
         Some(list) => {
             for t in list {
-                withdraws.push(format!(
-                    "INSERT INTO console.bi_board_embed_event (board_id, kind, jti, exp, at) \
-                     VALUES ({board}, 'withdraw', {}, {}, {LEGACY_EMBED_EPOCH})",
+                tuples.push(format!(
+                    "({board}, 'withdraw', 0, {}, {}, '[]', {LEGACY_EMBED_EPOCH})",
                     SqlLiteral::from(t.jti.as_str()),
                     t.exp
                 ));
             }
         }
-        // Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
-        // does not parse withdraws every token of the board.
-        None => revoke_all(u64::MAX),
     }
-    out.extend(withdraws);
     if !origins_json.is_empty() && origins_json != "[]" {
-        out.push(format!(
-            "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json, at) \
-             VALUES ({board}, 'origins', {}, {LEGACY_EMBED_EPOCH})",
+        tuples.push(format!(
+            "({board}, 'origins', 0, '', 0, {}, {LEGACY_EMBED_EPOCH})",
             SqlLiteral::from(origins_json)
         ));
     }
-    out
+    if tuples.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "INSERT INTO console.bi_board_embed_event \
+         (board_id, kind, revoked_before, jti, exp, origins_json, at) VALUES {}",
+        tuples.join(", ")
+    ))
 }
 
 /// The tables behind saved fields and hierarchies (`BI-8`, `BI-10`). Split
@@ -4939,13 +4950,12 @@ mod tests {
     #[tokio::test]
     async fn the_legacy_embed_state_is_copied_and_still_refuses_what_it_refused() {
         let inserts = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
-        assert_eq!(inserts.len(), 3, "{inserts:?}");
+        // R-A3: a cut-off, a jti and origins go in ONE multi-row INSERT.
+        assert_eq!(inserts.len(), 1, "{inserts:?}");
         assert!(
-            inserts.iter().all(
-                |s| s.starts_with("INSERT INTO console.bi_board_embed_event")
-                    && s.contains(LEGACY_EMBED_EPOCH)
-                    && !s.contains("console.bi_board ")
-            ),
+            inserts[0].starts_with("INSERT INTO console.bi_board_embed_event")
+                && !inserts[0].contains("console.bi_board ")
+                && inserts[0].matches(LEGACY_EMBED_EPOCH).count() == 3,
             "{inserts:?}"
         );
         let rows = [
@@ -4969,7 +4979,7 @@ mod tests {
     async fn a_second_run_of_the_legacy_embed_copy_inserts_nothing() {
         let once = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
         let twice = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 2).await;
-        assert_eq!(once.len(), 3);
+        assert_eq!(once.len(), 1);
         assert_eq!(twice.len(), once.len(), "{twice:?}");
     }
 
@@ -5010,12 +5020,43 @@ mod tests {
             "embed_revoked_jti_json": "[]",
             "embed_origins_json": r#"["https://old.example"]"#,
         });
-        let inserts = legacy_embed_inserts(row.as_object().unwrap());
-        assert_eq!(inserts.len(), 1);
-        assert!(inserts[0].contains("'origins'") && inserts[0].contains(LEGACY_EMBED_EPOCH));
+        let insert = legacy_embed_insert(row.as_object().unwrap()).unwrap();
+        assert!(insert.contains("'origins'") && insert.contains(LEGACY_EMBED_EPOCH));
         // Real writers stamp `now64(6)` (column default), later than the epoch.
         let read = include_str!("store.rs");
         assert!(read.contains("argMax(origins_json, at) AS origins_json"));
+    }
+
+    /// PR #105 review R-A4 SHOULD-FIX: the copy does not filter on
+    /// `is_deleted`, so a trashed (restorable) board keeps its withdrawals.
+    /// The mock serves the legacy row whatever the filter, so this pins the
+    /// query text and that the row is copied.
+    #[tokio::test]
+    async fn the_legacy_embed_copy_does_not_skip_boards_in_the_trash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns: ALL_LEGACY_COLUMNS.to_vec(),
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        copy_legacy_embed_state(&client(&server.uri()))
+            .await
+            .unwrap();
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let select = bodies
+            .iter()
+            .find(|b| b.contains("FROM console.bi_board FINAL"))
+            .expect("the legacy select");
+        assert!(!select.contains("is_deleted"), "{select}");
+        assert!(bodies.iter().any(|b| b.starts_with("INSERT INTO")));
     }
 
     /// Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
@@ -5026,9 +5067,8 @@ mod tests {
             "id": "b1", "embed_revoked_before": "0",
             "embed_revoked_jti_json": "not json", "embed_origins_json": "[]",
         });
-        let inserts = legacy_embed_inserts(row.as_object().unwrap());
-        assert_eq!(inserts.len(), 1);
-        assert!(inserts[0].contains(&u64::MAX.to_string()));
+        let insert = legacy_embed_insert(row.as_object().unwrap()).unwrap();
+        assert!(insert.contains(&u64::MAX.to_string()));
     }
 
     struct MockBiCh;
