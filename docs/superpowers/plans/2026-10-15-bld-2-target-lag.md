@@ -891,3 +891,128 @@ quoted as measured.
 days"; it is updated with the floor R8 settles on, and decision 2 needs the
 owner's signature if that floor is not 1 minute. 6.4 (`BLD-2-AC4`) still
 stands.
+
+### Round 3 (planner, at `f26640f8dc31`)
+
+Two review passes plus the reviewer's own run. Round 2's code blockers are
+fixed (the PUT keeps `X-Tenant`, U has the retry limit and reset through
+one helper, U's row is locked and written in P's transaction, R9 and the
+store CHECK test are right for a 60 s floor), and the merge of `main`
+(`3b418d07`) lost nothing from #188, #189 or #190 (`tool_schemas.json` has
+main's tools byte-identical plus `set_pipeline_target_lag`).
+
+**The 1-minute floor stands, like-for-like.** The gate measures the same
+thing in r1, r6 and r8 (`commit_t` after the ingest run's SUCCESS, one row
+per sample, Silver ≥ Bronze distinct count, 30 s sensor). The drop from
+40.7–68.94 s (pre-R6a) to 16–33 s is R6a itself: at a 60 s target the
+budget (request-to-land median + 60 s) exceeds the target, so the run is
+requested at the first check that sees the change, as note 6.3 predicted;
+before R6a the threshold was positive and the pipeline waited one more
+tick. The result file must say this.
+
+#### Decisions for this round (planner)
+
+- **R12. One ordered lock for the chain.** Lock P's row and every U row the
+  chain will touch in one statement, `… WHERE pipeline_id = ANY($1) ORDER BY
+  pipeline_id FOR UPDATE`, before any read-modify-write, so two checks can
+  never take U rows in different orders (a deadlock 500 loses a tick).
+- **R13. Bounded while locked.** Inside the lag-check transaction,
+  `SET LOCAL lock_timeout = '5s'` and `SET LOCAL statement_timeout = '8s'`,
+  and every network call made while it is open (Dagster run lookups and
+  budget reads, token reads) runs under one `tokio::time::timeout` budget of
+  8 s, below the sensor's 10 s request timeout. On timeout: roll back and
+  answer the classified 503 the route already uses for an unavailable
+  orchestrator. Use `tx` (not `pool`) for reads inside the transaction, so a
+  check holds one connection, not two. Moving the network reads out of the
+  transaction is not required in this PR.
+- **R14. The page tells the truth when retries run out.** `lag_json` derives
+  "the last N runs for this change failed; the next input change starts
+  again" from the state row (`request_attempt` over the pipeline's
+  `max_retries`, tokens not consumed) — no new column — and the alert's
+  reason says the same. For a P waiting on an exhausted U, P is `behind`
+  with a reason naming U.
+
+#### BLOCKER
+
+1. **Retries exhausted: the page and the alert say "past the target lag"
+   with a lag below the target** (`lag_json` / `reason_for` rebuild the reason
+   from the status alone). Fix per R14; test the page payload for the case
+   the R10 test uses (lag 30 s, target 600 s) and for P waiting on an
+   exhausted U.
+2. **R12 and R13** (the U lock order can deadlock; row locks and a pool
+   connection are held across unbounded network calls — `DgClient` has no
+   timeout). Tests: two chains whose DFS orders differ lock the same rows
+   without deadlock (or a unit test of the ordered-id lock call); a fake
+   Dagster that never answers makes the check return 503 within the budget
+   and leaves the state row unchanged.
+3. **Migration `0084` and every floor doc say 2 minutes** (`0084` header
+   "the floor here is 120", "120..604800 is 2 minutes to 7 days";
+   `MIN_TARGET_LAG_MINUTES` doc; `2..=10080` in `authored_pipelines.rs` and
+   `lakehouse-store/src/pipelines.rs` docs; the test comment "the column CHECK
+   refuses 1"; `lakehouse-store/src/pipelines.rs` "120..604800";
+   `authored_factory.py:33`; `ops/g7/g7_pipeline_test.py` floor comments;
+   `pipeline-freshness-panel.tsx` "not the spec's 1"). The migration is not
+   applied anywhere yet, so its header is fixed now (it never can be after):
+   1 minute, citing the R8 runs (`bld2-gate-r8-1min.log`,
+   `bld2-gate-r8-final.log`) and the R6/R6a history.
+4. **The Handoff round 2 table maps findings to the wrong commits** and
+   redefines R9/R10 (rule 7). Correct mapping per the reviewers: round-2
+   BLOCKER 2 and 3 → `f011c7b9`; R9 → `d6f28887`; R10 → `eb1760de`;
+   SHOULD-FIX 5 → `eb1760de`, `29d88934`; SHOULD-FIX 6 → `f011c7b9`;
+   SHOULD-FIX 7 and 12 → `8fb46da5`; SHOULD-FIX 11 → `4d1d91b6`, `29d88934`.
+   Rewrite the table against `git show` of each commit.
+5. **The first R8 run is credited to `3b418d07de54`, which did not run it**:
+   at that commit the floor and the gate were 2 minutes, but the log says
+   "configuring targetLag=1 minutes"; it ran on `3b418d07` plus the
+   uncommitted floor patch (saved as
+   `/home/shiro/rantai/review/bld2-r2-wip-0101.patch`). Label it so in the
+   result file and the Handoff; the final run on `29d889340b1a` is clean.
+
+#### SHOULD-FIX
+
+1. Result file: add the like-for-like explanation above; fix the path
+   `src/routes/gold_export_history.rs` →
+   `rust/crates/lakehouse-api/src/gold_export_history.rs`; label the `[fp]`
+   lines assembled from two log lines and the reconstructed r1 command as
+   such (not verbatim quotes).
+2. `CHANGELOG.md`: "the pipeline's own run time plus one check" → the R6a
+   budget; "every write reached the target table inside the target" → "from
+   the ingest run's completion", as the result file says.
+3. U statuses: an unchanged U writes `met` while every other branch writes
+   `not_measured` — a U has no target, so it is never `met`; record its check
+   while its run is outstanding so a run over 90 s does not read "no check
+   recorded"; remove the unreachable `u_target.is_some()` branches.
+4. `find_run_by_run_key` ordering test: make the older-created run start
+   *after* the newer one, so sorting by `startTime` would pick the wrong run;
+   fix the doc claim.
+5. Stale docs: `run_key_for` (`lag:<id>:<hash>:<attempt>`, and the same change
+   no longer always gives the same key); `settle_request`'s FAILURE bullet
+   (retries are handled here now); the orphaned `lag_pipelines_reading`
+   paragraph glued onto `count_lag_pipelines_reading`.
+6. Copies (rule 4): the two inline store `map_err`s → `store_err`; one helper
+   for the orchestrator-unavailable `map_err` (5 copies); the handler's
+   hand-built `LagStateUpdate` → `make_lag_update`.
+7. `routes/ai/tools/mod.rs:111`: the merge turned main's `\` line
+   continuations into runs of spaces inside the `reason` string, and "65 of
+   its 66 arms" is now stale (67, the new arm is not a one-liner). Restore
+   main's string and correct the count.
+8. Sensor jobs, tenant: `authored_factory.py` filters downstream jobs by
+   `tenantId`, but `RunnablePipeline` carries no tenant, so the filter never
+   applies and its test exercises a path production never takes. Either add
+   `tenantId` to `RunnablePipeline` (and keep the test) or drop the filter,
+   the docstring claim and that test case. Also say in the docstring that a
+   U read only through a `dependsOn` target edge is not attached (the sensor
+   fails closed with an "unexpected jobName" skip), or attach it.
+9. `docker-compose.yml` BLD-1 comment ("the `pip install requests` its
+   `entrypoint` relies on… Same image") is stale now that `g7-test-runner` has
+   its own image.
+10. `ops/ai_eval/ai_eval.py`: the dotted-key match is still a substring
+    (`minutes: 10` matches 100); compare equal for scalars.
+
+#### Not this PR's: dependency advisories
+
+The PR's `cargo audit` and `cargo deny` are red on `RUSTSEC-2026-0367`,
+`-0368`, `-0369` (`zip` 8.6.0, patched in ≥ 9.0.0), published after `main`'s
+last green run; `zip` comes only through `calamine` 0.36.1. This branch
+touches no dependency, so it does not block it; the planner files `SEC-41`
+to fix it on `main`.
