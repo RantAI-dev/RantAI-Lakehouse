@@ -11,6 +11,7 @@ import {
   CheckCircle,
   ChevronDown,
   Clock,
+  Download,
   Database,
   GitBranch,
   Hammer,
@@ -73,7 +74,25 @@ export const TOOL_LABEL: Record<string, string> = {
   move_chart: "Move chart",
   set_board_view_filters: "Set view filters",
   save_board_filters: "Save default filters",
+  // BI-1 / AI-10: the link opens the same download the dashboard's menu makes.
+  export_dashboard: "Export dashboard",
+  export_chart: "Export chart data",
 };
+
+/**
+ * The only addresses an export step may link to: the console's own download
+ * routes (`BI-1`). A result is data from the server, but the card never turns
+ * an arbitrary string into a link.
+ */
+const EXPORT_LINK = /^\/api\/dashboard\/(export\/pdf|chart-export)\?/;
+
+/** A tool result that is a download link (`export_dashboard`, `export_chart`), or null. */
+export function exportLink(tool: string, result: unknown): { url: string; fileName: string } | null {
+  if (tool !== "export_dashboard" && tool !== "export_chart") return null;
+  const r = asObj(result);
+  if (typeof r.url !== "string" || !EXPORT_LINK.test(r.url)) return null;
+  return { url: r.url, fileName: typeof r.fileName === "string" ? r.fileName : "download" };
+}
 
 /**
  * The board the dashboard page is showing, extracted from `/dashboards/<id>`.
@@ -227,6 +246,24 @@ function StepBody({ step }: { step: ToolStep }) {
         {columns.length ? <ResultTable columns={columns} rows={rows} /> : null}
         {columns.length ? <MiniBar columns={columns} rows={rows} /> : null}
         {typeof res.note === "string" ? <p className="mt-1 text-[11px] text-muted-foreground">{res.note}</p> : null}
+      </div>
+    );
+  }
+
+  const download = exportLink(step.tool, step.result);
+  if (download) {
+    // A plain link: the browser sends the person's own session with it, so the
+    // file is made when they open it, with their permissions (AI-10, D9).
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+        <a
+          href={download.url}
+          download={download.fileName}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 font-medium text-foreground hover:bg-muted"
+        >
+          <Download className="size-3.5" aria-hidden /> Download {download.fileName}
+        </a>
+        <span className="text-muted-foreground">Made when you open it, with your permissions.</span>
       </div>
     );
   }

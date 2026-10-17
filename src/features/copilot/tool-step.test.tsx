@@ -77,3 +77,39 @@ describe("ToolStepCard set_board_view_filters rendering", () => {
     expect(link.getAttribute("href")).toContain("f=")
   })
 })
+
+describe("ToolStepCard export links (BI-1, AI-10)", () => {
+  const step = (tool: string, result: unknown): ToolStep => ({ tool, args: {}, ok: true, result })
+
+  it("labels the two export tools", () => {
+    expect(toolLabel("export_dashboard")).toBe("Export dashboard")
+    expect(toolLabel("export_chart")).toBe("Export chart data")
+  })
+
+  it("renders a download link to the console's own PDF route", () => {
+    render(<ToolStepCard step={step("export_dashboard", { url: "/api/dashboard/export/pdf?board=b1&paper=a4&orientation=portrait", fileName: "Sales-2026-10-17.pdf" })} />)
+    fireEvent.click(screen.getByRole("button"))
+    const link = screen.getByRole("link", { name: /Download Sales-2026-10-17\.pdf/ }) as HTMLAnchorElement
+    expect(link.getAttribute("href")).toBe("/api/dashboard/export/pdf?board=b1&paper=a4&orientation=portrait")
+    expect(link.hasAttribute("download")).toBe(true)
+  })
+
+  it("renders a download link for a chart's data", () => {
+    render(<ToolStepCard step={step("export_chart", { url: "/api/dashboard/chart-export?chart=c1&format=xlsx&values=raw", fileName: "Visits.xlsx" })} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect((screen.getByRole("link") as HTMLAnchorElement).getAttribute("href")).toContain("/api/dashboard/chart-export?chart=c1")
+  })
+
+  it("never links to an address that is not one of the two download routes", () => {
+    render(<ToolStepCard step={step("export_dashboard", { url: "https://evil.example/x?y=1", fileName: "x.pdf" })} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.queryByRole("link")).toBeNull()
+  })
+
+  it("shows the refusal sentence instead of a link", () => {
+    render(<ToolStepCard step={{ tool: "export_dashboard", args: {}, ok: false, result: { error: "PDF export is not set up on this deployment" } }} />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText(/PDF export is not set up on this deployment/)).toBeTruthy()
+    expect(screen.queryByRole("link")).toBeNull()
+  })
+})

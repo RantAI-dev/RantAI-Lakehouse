@@ -1511,6 +1511,27 @@ fn set_table_maintenance_schema() -> Value {
             "required": ["namespace", "table", "compactSmallFiles"] } } })
 }
 
+fn export_dashboard_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "export_dashboard",
+        "description": "Give a link that downloads a dashboard as a PDF, every tab with the filters applied. Nothing is made until the person opens the link, and it is made with their permissions. Use the board id from list_boards.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "format": { "type": "string", "enum": ["pdf"], "description": "pdf, the default" },
+            "paper": { "type": "string", "enum": ["a4", "letter"], "description": "default a4" },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"], "description": "default portrait" } },
+            "required": ["board"] } } })
+}
+
+fn export_chart_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "export_chart",
+        "description": "Give a link that downloads one chart's data as Excel or CSV (up to 1,000,000 rows). Nothing is made until the person opens the link, and it is made with their permissions. Use the chart id from list_charts.",
+        "parameters": { "type": "object", "properties": {
+            "chart": { "type": "string", "description": "the chart's id, from list_charts" },
+            "format": { "type": "string", "enum": ["xlsx", "csv"] },
+            "values": { "type": "string", "enum": ["formatted", "raw"], "description": "formatted as on the chart (default) or the raw values" } },
+            "required": ["chart", "format"] } } })
+}
+
 fn get_capacity_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_capacity",
         "description": "Storage capacity: each object-storage bucket's size and growth from the daily capacity snapshot, and ClickHouse's bytes on disk.",
@@ -2175,6 +2196,21 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "catalog:read",
     },
+    // `BI-1` / `AI-10`: a download link, nothing made until the person opens it
+    // with their own session, so `Read` and the permission of seeing a
+    // dashboard; whether their roles may download is checked in the tool.
+    ToolSpec {
+        name: "export_dashboard",
+        schema: export_dashboard_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "export_chart",
+        schema: export_chart_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     // Asks the person a question and stores nothing, so it needs no
     // permission beyond being signed in. The console's click is what saves
     // the answer.
@@ -2261,8 +2297,9 @@ mod tests {
         // + `format_chart` and `set_dashboard_theme` (`BI-17` part A, `AI-8`)
         // + the 6 dashboard-board tools from main (plan 20: `rename_board`,
         // `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`,
-        // `save_board_filters`).
-        assert_eq!(tool_schemas().len(), 99);
+        // `save_board_filters`) + `export_dashboard` and `export_chart` (`AI-10`,
+        // with `BI-1`).
+        assert_eq!(tool_schemas().len(), 101);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
