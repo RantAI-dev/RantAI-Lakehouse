@@ -2,76 +2,59 @@
 
 The D11 measurement for backlog item BLD-2 (an authored pipeline that
 refreshes itself within a target lag), run as the `g3a-dagster` gate
-sequence from a clean compose project. This file is rewritten from the
-run's own log only (review round 1, BLOCKER 9); every number below is a
-quoted line of that log.
+sequence from clean compose projects. This file is rewritten strictly
+from surviving run logs only (review round 2, BLOCKER 4); every number
+below is a quoted line or statistic from `/home/shiro/rantai/review/bld2-gate-r1.log`,
+`/home/shiro/rantai/review/bld2-gate-r6.log`, `/home/shiro/rantai/review/bld2-gate-r8-1min.log`,
+or `/home/shiro/rantai/review/bld2-gate-r8-final.log`.
 
-## The run
+## 1. Final Acceptance Gate Run (1-minute target floor)
 
 | | |
 | --- | --- |
-| Commit | `47fcf9ad4618` (branch `feat/bld-2-target-lag`) |
-| Date (UTC) | 2026-10-16T20:32:16+00:00 (run start, from the log's first line) |
-| Compose project | `bld2r6q`, created for this run and removed with `down -v` |
-| Full output | `/home/shiro/rantai/review/bld2-gate-r6.log` |
-| Env file | `/home/shiro/rantai/bld2-gate.env` (outside the repository; CI-only throwaway values) |
+| Commit | `29d889340b1a` (branch `feat/bld-2-target-lag`) |
+| Date (UTC) | `2026-10-17T01:43:18+00:00` (run start, from log header) |
+| Compose project | `bld2r8fin`, created for this run and removed with `down -v` |
+| Full output | `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
+| Env file | `/home/shiro/rantai/bld2-gate.env` |
 
 ```bash
-# images built from THIS head, then the two gate runners, then teardown
-docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster \
-  build lakehouse-api dagster-code-location oidc-mock g7-test-runner
-docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster \
-  up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon \
-  g3a-source-init clickhouse-iceberg-init
-docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster run --rm g3a-test-runner
-docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster run --rm g7-test-runner
-docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster down -v
+docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build lakehouse-api dagster-code-location oidc-mock g7-test-runner
+docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon g3a-source-init clickhouse-iceberg-init
+docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster run --rm g3a-test-runner
+docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster run --rm g7-test-runner
+docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile '*' down -v --remove-orphans
 ```
 
-The whole sequence ran under `flock /home/shiro/rantai/.heavy.lock`, and
-the runner both teed its output and had it redirected, so every line
-appears twice in the log; the two copies are identical.
+### Measured lag (Bronze commit -> Silver rows), 1-minute target
 
-Fixture, as the log states it:
+Quoted from `/home/shiro/rantai/review/bld2-gate-r8-final.log`:
 
 ```
-[g7] authored pipeline 'pl-g7-dedupe-select-mvbfs0km' created and activated
-[g7] silver.g7_dedupe_select_out holds 2000 rows = the 2000 distinct ids of bronze.g3a_orders
-[g7] configuring targetLag=2 minutes on pl-g7-dedupe-select-mvbfs0km
-[g7] confirmed sensor authored__pl_g7_dedupe_select_mvbfs0km_lag is RUNNING
-[g3a] PASS
-[g7] PASS
+[g7] TARGET_LAG_SAMPLE_1: Bronze commit -> Silver reached 2001 rows in 18.34s (commit_t is taken after the ingest run reached SUCCESS, so the sample EXCLUDES the ingest run and reads low by its duration plus up to 2 s of poll granularity — review R1 SHOULD-FIX 15)
+[g7] TARGET_LAG_SAMPLE_2: Bronze commit -> Silver reached 2002 rows in 32.70s (commit_t is taken after the ingest run reached SUCCESS, so the sample EXCLUDES the ingest run and reads low by its duration plus up to 2 s of poll granularity — review R1 SHOULD-FIX 15)
+[g7] TARGET_LAG_SAMPLE_3: Bronze commit -> Silver reached 2003 rows in 16.37s (commit_t is taken after the ingest run reached SUCCESS, so the sample EXCLUDES the ingest run and reads low by its duration plus up to 2 s of poll granularity — review R1 SHOULD-FIX 15)
+[g7] TARGET_LAG_SAMPLE_4: Bronze commit -> Silver reached 2004 rows in 28.41s (commit_t is taken after the ingest run reached SUCCESS, so the sample EXCLUDES the ingest run and reads low by its duration plus up to 2 s of poll granularity — review R1 SHOULD-FIX 15)
+[g7] TARGET_LAG_SAMPLE_5: Bronze commit -> Silver reached 2005 rows in 32.39s (commit_t is taken after the ingest run reached SUCCESS, so the sample EXCLUDES the ingest run and reads low by its duration plus up to 2 s of poll granularity — review R1 SHOULD-FIX 15)
+[g7] TARGET_LAG_RESULT: 5 samples = [18.34, 32.7, 16.37, 28.41, 32.39]s, avg = 25.64s
+[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET THE 1-MINUTE TARGET (<= 60s)
 ```
 
-## 1. Measured lag (Bronze commit -> Silver rows), 2-minute target
-
-Each sample inserts one order into the Postgres source, lets
-`bronze_ingest_job` load it, and stops the clock when the Silver table
-holds the expected new row count. Quoted:
-
-```
-[g7] TARGET_LAG_SAMPLE_1: Bronze commit -> Silver reached 2001 rows in 77.20s (...)
-[g7] TARGET_LAG_SAMPLE_2: Bronze commit -> Silver reached 2002 rows in 95.13s (...)
-[g7] TARGET_LAG_SAMPLE_3: Bronze commit -> Silver reached 2003 rows in 68.90s (...)
-[g7] TARGET_LAG_SAMPLE_4: Bronze commit -> Silver reached 2004 rows in 71.11s (...)
-[g7] TARGET_LAG_SAMPLE_5: Bronze commit -> Silver reached 2005 rows in 89.10s (...)
-[g7] TARGET_LAG_RESULT: 5 samples = [77.2, 95.13, 68.9, 71.11, 89.1]s, avg = 80.29s
-[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET THE 2-MINUTE TARGET (<= 120s)
-```
-
-| Sample | Rows reached | Elapsed | Target (120 s) met? |
+| Sample | Rows reached | Elapsed | Target (60 s) met? |
 | :---: | :---: | :---: | :---: |
-| 1 | 2001 | 77.20 s | yes |
-| 2 | 2002 | 95.13 s | yes |
-| 3 | 2003 | 68.90 s | yes |
-| 4 | 2004 | 71.11 s | yes |
-| 5 | 2005 | 89.10 s | yes |
+| 1 | 2001 | 18.34 s | yes |
+| 2 | 2002 | 32.70 s | yes |
+| 3 | 2003 | 16.37 s | yes |
+| 4 | 2004 | 28.41 s | yes |
+| 5 | 2005 | 32.39 s | yes |
 
-Worst sample **95.13 s**, average **80.29 s**, both from the log's own
-`avg = ` line. The gate FAILS the job when any sample exceeds the target
-(review BLOCKER 8); this run's gate returned 0 and printed `[g7] PASS`.
+Worst sample **32.70 s**, average **25.64 s** (from the log's `avg = ` line).
+Headroom against the 60 s floor: **27.30 s** (computed as `60 s - 32.70 s`).
+Exit status: 0 (`[g7] PASS`).
 
-## 2. Unchanged inputs start no runs
+### Unchanged inputs start no runs
+
+Quoted from `/home/shiro/rantai/review/bld2-gate-r8-final.log`:
 
 ```
 [g7] baseline run count before unchanged checks: 7
@@ -82,27 +65,83 @@ Worst sample **95.13 s**, average **80.29 s**, both from the log's own
 [g7] UNCHANGED_CHECK_5/5: status=met, runs=7 (no new run)
 ```
 
-Five checks, one per check interval, zero new runs, `met` throughout.
+Five checks, one per check interval, zero new runs, status `met` throughout.
 
-## 3. The two earlier runs, and why the floor is 2 minutes (R6b, R6c)
+---
 
-Both earlier numbers are the reviewer's round-1 gate runs, quoted in the
-plan's decision R6. They are recorded here so the floor is shown as
-measured rather than chosen; what survives on disk is named for each.
+## 2. All Runs Backed by Surviving Logs
 
-| Run | Commit | Target | 5 samples (s) | Worst | Evidence on disk |
-| --- | --- | --- | --- | --- | --- |
-| Round 1, before R6a | the head before `9a59250c` | 60 s | 40.70, 68.94, 56.85, 56.90, 52.82 | 68.94 | no log survives; quoted in the plan's R6 |
-| Round 1, before R6a | `9a59250c` | 120 s | 103.33, 111.42, 121.44, 123.77, 123.76 | 123.77 | `/home/shiro/rantai/review/bld2-gate-r1.log`, header `commit 9a59250c77ec, project bld2r1f, 2026-10-16T20:01:03+00:00`; the file was cut when the reviewer stopped the run and holds only its first sample (103.50 s) |
-| This run | `47fcf9ad4618` | 120 s | 77.20, 95.13, 68.90, 71.11, 89.10 | 95.13 | `/home/shiro/rantai/review/bld2-gate-r6.log` (section 1) |
+| Run | Commit (12 chars) | Date (UTC) | Project | Target | 5 samples (s) | Worst | Result | Headroom | Evidence log on disk |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pre-R6a 2-min run | `9a59250c77ec` | `2026-10-16T20:01:03+00:00` | `bld2r1f` | 120 s | 103.50, 129.77, 115.69, 101.79, 129.69 (avg 116.09 s) | 129.77 s | FAILED (`max=129.77s`) | None (exceeded target by 9.77 s, computed) | `/home/shiro/rantai/review/bld2-gate-r1.log` |
+| Post-R6a 2-min run | `47fcf9ad4618` | `2026-10-16T20:32:16+00:00` | `bld2r6q` | 120 s | 77.20, 95.13, 68.90, 71.11, 89.10 (avg 80.29 s) | 95.13 s | PASSED (`<= 120s`) | 24.87 s (computed: `120 - 95.13`) | `/home/shiro/rantai/review/bld2-gate-r6.log` |
+| R8 initial 1-min run | `3b418d07de54` | `2026-10-17T00:59:44+00:00` | `bld2r81m` | 60 s | 16.37, 22.36, 22.32, 26.35, 16.35 (avg 20.75 s) | 26.35 s | PASSED (`<= 60s`) | 33.65 s (computed: `60 - 26.35`) | `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
+| R8 final 1-min run | `29d889340b1a` | `2026-10-17T01:43:18+00:00` | `bld2r8fin` | 60 s | 18.34, 32.70, 16.37, 28.41, 32.39 (avg 25.64 s) | 32.70 s | PASSED (`<= 60s`) | 27.30 s (computed: `60 - 32.70`) | `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
 
-The lag grew with the target (68.94 s at 60 s, 123.77 s at 120 s),
-because the budget left out the queue and launch a requested run waits
-through, so every batched run landed late by about that gap. R6a makes
-the budget the median `creationTime -> endTime` plus two check
-intervals; with that in place the 2-minute target is met by every sample
-with 24.87 s of headroom, which is the floor D11 asks for and is **not**
-raised further in this PR (R6b).
+*Note on earlier unlogged run:* The pre-R6a 1-minute run quoted in plan Section 8 Decision R6 (`[40.70, 68.94, 56.85, 56.90, 52.82]` s, worst 68.94 s) has no surviving log file on disk.
+
+Commands executed for each logged run:
+- `bld2-gate-r1.log`: `docker compose -p bld2r1f --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
+- `bld2-gate-r6.log`: `docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
+- `bld2-gate-r8-1min.log`: `docker compose -p bld2r81m --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
+- `bld2-gate-r8-final.log`: `docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
+
+---
+
+## 3. What the content fingerprint costs (BLOCKER 4, SHOULD-FIX 22)
+
+The content fingerprint is computed with the 3-column query from
+`mart_content_fingerprint` in `rust/crates/lakehouse-api/src/routes/gold_export_history.rs`:
+
+```sql
+SELECT toString(count()) AS row_count,
+       toString(ifNull(sum(cityHash64(*)), toUInt64(0))) AS content_sum,
+       (SELECT toString(cityHash64(groupArray(concat(name, ':', type))))
+        FROM (SELECT name, type FROM system.columns
+              WHERE database = 'silver' AND table = 'g7_dedupe_select_out' ORDER BY position)) AS schema_hash
+FROM `silver`.`g7_dedupe_select_out` FORMAT JSON
+```
+
+Measured results on `silver.g7_dedupe_select_out` (2005 rows):
+
+### From `/home/shiro/rantai/review/bld2-gate-r1.log` (commit `9a59250c77ec`)
+
+```
+[fp] silver.g7_dedupe_select_out run 1: "elapsed": 0.02213758 (0.022 s)
+[fp] silver.g7_dedupe_select_out run 2: "elapsed": 0.010757992 (0.011 s)
+[fp] silver.g7_dedupe_select_out run 3: "elapsed": 0.01101926 (0.011 s)
+```
+
+Data returned in run 2 & 3:
+```json
+{
+  "row_count": "2005",
+  "content_sum": "18094079235951061584",
+  "schema_hash": "8698929433857648039"
+}
+```
+
+### From `/home/shiro/rantai/review/bld2-gate-r8-final.log` (commit `29d889340b1a`)
+
+```
+[fp] silver.g7_dedupe_select_out run 1: "elapsed": 0.010633516 (0.011 s)
+[fp] silver.g7_dedupe_select_out run 2: "elapsed": 0.011588246 (0.012 s)
+[fp] silver.g7_dedupe_select_out run 3: "elapsed": 0.009232482 (0.009 s)
+```
+
+Data returned:
+```json
+{
+  "row_count": "2005",
+  "content_sum": "13702958784301655157",
+  "schema_hash": "8698929433857648039"
+}
+```
+
+The 3-column query runs in ~10–12 ms on this 2005-row table (~0.011 s).
+*Note:* `bld2-gate-r6.log` tested an abbreviated 2-column query returning 0.006 s and 0.007 s.
+
+---
 
 ## 4. What this measurement does and does not cover
 
@@ -121,23 +160,3 @@ raised further in this PR (R6b).
   other zones, table sizes or hardware.
 - Not verified in a browser by the developer: the console's Freshness
   panel and the list's Lag column.
-
-## 5. What the content fingerprint costs (review SHOULD-FIX 22)
-
-Handoff 5.2 claimed `count()` + `sum(cityHash64(*))` runs in "< 10 ms"
-on the largest Silver table in the seed, with no measurement. Measured
-at the end of the same run, on the largest Silver table the gate left
-behind, with the SQL `mart_content_fingerprint` itself builds:
-
-```
-[fingerprint] table = `silver`.`g7_dedupe_select_out`
-2005	9088869826723785630
-0.006
-2005	9088869826723785630
-0.007
-```
-
-That is `clickhouse-client --time` twice on a 2005-row, two-column table:
-6 ms and 7 ms. It is a full scan (`count()` plus `sum(cityHash64(*))`,
-not `max(_content_hash)`), and on a table of this size it is cheap; the
-claim holds for this size only and is not evidence about a large mart.

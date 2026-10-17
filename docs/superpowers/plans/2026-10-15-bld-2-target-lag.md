@@ -421,7 +421,7 @@ Found while running the round-1 verification block, not in the review:
 | `cargo fmt --check` | rc 0, on `05137df1` and again on `f7bcf57d` |
 | `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | rc 0 ("Finished dev profile … in 2m 42s"), on `05137df1`; no Rust changed after it |
 | `cargo-locked test -j 2 --workspace --no-fail-fast > /home/shiro/rantai/review/bld2-r1-ws.log` | rc 0; **116** `test result:` lines; 6132 passed, 0 failed, 38 ignored |
-| gate: `docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster build lakehouse-api dagster-code-location oidc-mock g7-test-runner`, `up -d --no-build`, `run --rm g3a-test-runner`, `run --rm g7-test-runner`, `down -v` (one `flock /home/shiro/rantai/.heavy.lock`) | rc 0 on commit `47fcf9ad4618`, project `bld2r6q`, started 2026-10-16T20:32:16+00:00; `[g3a] PASS`, `[g7] PASS`, samples `[77.2, 95.13, 68.9, 71.11, 89.1]s`, avg 80.29 s, all ≤ 120 s; 5 unchanged checks, 0 new runs; fingerprint 0.006 s / 0.007 s; teardown removed the project. Full log: `/home/shiro/rantai/review/bld2-gate-r6.log` |
+| gate: `docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster build lakehouse-api dagster-code-location oidc-mock g7-test-runner`, `up -d --no-build`, `run --rm g3a-test-runner`, `run --rm g7-test-runner`, `down -v` (one `flock /home/shiro/rantai/.heavy.lock`) | rc 0 on commit `47fcf9ad4618`, project `bld2r6q`, started 2026-10-16T20:32:16+00:00; `[g3a] PASS`, `[g7] PASS`, samples `[77.2, 95.13, 68.9, 71.11, 89.1]s`, avg 80.29 s, all ≤ 120 s; 5 unchanged checks, 0 new runs; fingerprint 0.006 s / 0.007 s (2-column test; the real 3-column mart_content_fingerprint query is 0.011 s in `bld2-gate-r1.log` and 0.009–0.012 s in R8); teardown removed the project. Full log: `/home/shiro/rantai/review/bld2-gate-r6.log` |
 | `bun test src/features` | 1035 passed, 0 failed (90 files) — after `f7bcf57d`; before it: 1001 passed, **34 failed** |
 | `bun test src/services` | 85 passed, 0 failed (13 files) |
 | `bun test src/lib` | 748 tests, 1 skipped, 0 failed (84 files) |
@@ -449,9 +449,11 @@ almost everything.
 - `1bc2e332` ("wip: BLD-2 review round 1 fixes in progress") is the
   previous session's catch-all commit and stays in the history; this round
   did not rewrite it.
-- The reviewer's 1-minute and 2-minute pre-R6a samples survive only as the
-  numbers quoted in the plan's R6 (and, for the 2-minute run, one sample in
-  `bld2-gate-r1.log`). They were not re-measured here.
+- The reviewer's 1-minute pre-R6a samples survive only as the numbers
+  quoted in the plan's R6 (no log file survives on disk). For the pre-R6a
+  2-minute run on `9a59250c77ec`, `/home/shiro/rantai/review/bld2-gate-r1.log`
+  holds all 5 samples [103.5, 129.77, 115.69, 101.79, 129.69] s and its
+  FAILED (max=129.77s) line, not just one sample.
 - The gate run's stack was the compose `dagster` profile on this machine,
   not CI's runner: the images were built locally from this head rather than
   loaded as artifacts.
