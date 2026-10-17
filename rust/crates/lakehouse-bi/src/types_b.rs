@@ -14,9 +14,14 @@
 //!   second value is the chart's second measure (`measures: [value, goal]`) and
 //!   `goal: {"measure": "<its column>"}` says so; the statement then returns
 //!   both numbers in one row, so a filter narrows them together.
-//! - **`histogram`**: the width of the ranges, or how many at most, never
-//!   both. Neither means automatic ranges aiming at [`AUTO_HISTOGRAM_BINS`]
-//!   (`BI-10`'s bins aim at about ten and do not change).
+//! - **`histogram`**: the width of the ranges, or how many, never both. A
+//!   number of ranges is honoured (`BinMode::Ranges`: that many equal ranges
+//!   over the shown minimum to maximum, the width rounded up to two
+//!   significant digits), and neither means automatic ranges (`BinMode::Nearest`:
+//!   the nice width whose ranges are closest to [`AUTO_HISTOGRAM_BINS`]); both
+//!   are `BI-18` part C review fix (SHOULD-FIX) R21, because "at most N" gave 5
+//!   ranges for 10 and 12 for "about 20". `BI-10`'s bins aim at about ten and do
+//!   not change.
 //! - **`url`** (image and web cards): the card loads a page or a picture into
 //!   every viewer's browser, so the address is checked here, at save, for both
 //!   the console and the assistant: `https` only, a plain host, no user-info
@@ -178,8 +183,8 @@ fn loose_number_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option
 }
 
 impl HistogramBins {
-    /// The mode the ranges are cut with: a fixed width, at most `count`
-    /// ranges, or about [`AUTO_HISTOGRAM_BINS`].
+    /// The mode the ranges are cut with: a fixed width, `count` ranges, or the
+    /// nice width nearest [`AUTO_HISTOGRAM_BINS`] ranges.
     ///
     /// # Errors
     ///
@@ -193,11 +198,11 @@ impl HistogramBins {
             (Some(_), None) => Err(format!(
                 "a histogram's width must be between {MIN_WIDTH} and {MAX_WIDTH}."
             )),
-            (None, Some(c)) if (1..=MAX_HISTOGRAM_COUNT).contains(&c) => Ok(BinMode::Count(c)),
+            (None, Some(c)) if (1..=MAX_HISTOGRAM_COUNT).contains(&c) => Ok(BinMode::Ranges(c)),
             (None, Some(_)) => Err(format!(
                 "a histogram has 1 to {MAX_HISTOGRAM_COUNT} ranges."
             )),
-            (None, None) => Ok(BinMode::Count(AUTO_HISTOGRAM_BINS)),
+            (None, None) => Ok(BinMode::Nearest(AUTO_HISTOGRAM_BINS)),
         }
     }
 }
@@ -646,13 +651,13 @@ mod tests {
     #[test]
     fn the_modes_of_a_histogram_are_a_width_a_count_or_about_twenty_ranges() {
         let mode = |h: HistogramBins| h.mode().unwrap();
-        assert_eq!(mode(HistogramBins::default()), BinMode::Count(20));
+        assert_eq!(mode(HistogramBins::default()), BinMode::Nearest(20));
         assert_eq!(
             mode(HistogramBins {
                 width: None,
                 count: Some(10)
             }),
-            BinMode::Count(10)
+            BinMode::Ranges(10)
         );
         assert_eq!(
             mode(HistogramBins {
@@ -787,9 +792,12 @@ mod tests {
             "{}",
             got.sql
         );
-        // Aims at about 20 (BI-10's own automatic bins aim at ten).
-        assert!(got.sql.contains("<= 20, 1 * p"), "{}", got.sql);
-        assert!(!got.sql.contains("<= 10, 1 * p"), "{}", got.sql);
+        // Aims at the nice width nearest 20 ranges (BI-10's own automatic bins
+        // aim at ten); BI-18 part C review fix (SHOULD-FIX) R21 changed this from
+        // "the smallest width giving at most 20", which gave 12 ranges.
+        assert!(got.sql.contains("log10((mx - mn) / 20)"), "{}", got.sql);
+        assert!(got.sql.contains("arraySort(c ->"), "{}", got.sql);
+        assert!(!got.sql.contains("<= 20, 1 * p"), "{}", got.sql);
         assert_eq!(
             got.bins.len(),
             1,
@@ -801,12 +809,14 @@ mod tests {
             ChartKind::Histogram,
             &serde_json::json!({"dimension": "price", "histogram": {"count": 10}}),
         );
-        assert!(built(&count, &[]).sql.contains("<= 10, 1 * p"));
+        // A count is honoured, not "at most" (R21).
+        assert!(built(&count, &[]).sql.contains("(mx - mn) / 10 AS raw"));
+        assert!(!built(&count, &[]).sql.contains("<= 10, 1 * p"));
         let seven = stored(
             ChartKind::Histogram,
             &serde_json::json!({"dimension": "price", "histogram": {"count": 7}}),
         );
-        assert!(built(&seven, &[]).sql.contains("<= 7, 1 * p"));
+        assert!(built(&seven, &[]).sql.contains("(mx - mn) / 7 AS raw"));
 
         let width = stored(
             ChartKind::Histogram,

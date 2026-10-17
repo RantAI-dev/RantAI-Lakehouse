@@ -709,8 +709,10 @@ mod tests {
         assert_eq!(ten["created"], json!(true), "{ten}");
         let all = sent(&server).await;
         let ran = statements(&all);
-        assert!(ran[0].contains("<= 20, 1 * p"), "{}", ran[0]);
-        assert!(ran[1].contains("<= 10, 1 * p"), "{}", ran[1]);
+        // BI-18 part C review fix (SHOULD-FIX) R21: automatic aims at the nice width
+        // nearest 20 ranges, and a count of 10 is ten ranges, not "at most 10".
+        assert!(ran[0].contains("log10((mx - mn) / 20)"), "{}", ran[0]);
+        assert!(ran[1].contains("(mx - mn) / 10 AS raw"), "{}", ran[1]);
         assert!(ran.iter().all(|s| s.contains("count() AS __count")));
         // The same refusals as the console, in the same words.
         for (extra, sentence) in [
