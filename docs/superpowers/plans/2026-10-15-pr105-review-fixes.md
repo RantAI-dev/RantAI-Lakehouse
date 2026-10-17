@@ -348,3 +348,34 @@ conflicts in `store.rs` and this file resolved by hand (see the merge commit).
   and `bun run test`, anything against a live ClickHouse.
 
 ## 7. Review
+
+### Review — slice A merged onto `main`, 2026-10-17, planner
+
+- **R-A1 BLOCKER — withdrawals already stored on `main` stop being read.**
+  The plan said the board row's embed columns never reached `main`; they
+  did (SEC-12, `5d8f61e1`: `embed_revoked_before`, `embed_revoked_jti_json`,
+  `embed_origins_json`, checked in `origin/main` `store.rs`). After the
+  merge nothing reads them, so on a deployed database a withdrawn token is
+  accepted again and a board's allowed origins are lost. That is the
+  failure D1 exists to prevent, so the fix is in scope. Decision: a
+  one-time copy into `console.bi_board_embed_event`, run by
+  `ensure_bi_table` after the event table is created:
+  - Only when `system.columns` shows the legacy columns on
+    `console.bi_board` (a fresh database has none; skip without error).
+  - Read each board's current row (`FINAL`, not deleted) and insert a
+    `revoke_all` event when `embed_revoked_before > 0`, a `withdraw` event
+    per `{jti, exp}` in `embed_revoked_jti_json`, and an `origins` event
+    when `embed_origins_json` is not `[]`.
+  - Every copied event gets `at` = the Unix epoch, so any real event
+    written since wins over it (origins are read latest-first).
+  - Idempotent: a second run inserts nothing (skip a board that already
+    has an event at the epoch). Values bound, never formatted in.
+  - The legacy columns are left in place and not written; dropping them is
+    not this PR's (a migration header-style comment at the site says why).
+  - Accept: a mocked legacy database with one withdrawn jti, a cut-off and
+    two origins → after `ensure_bi_table` the jti is refused, a token older
+    than the cut-off is refused and the origins are served; a second run
+    inserts nothing; a fresh database (no legacy columns) runs no copy; a
+    real `origins` event newer than the copy wins.
+- **R-A2** — the three clippy fixes in `embed_tokens.rs` may stay in the
+  merge commit; they are mechanical.
