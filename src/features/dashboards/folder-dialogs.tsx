@@ -15,7 +15,9 @@ import { useServiceAction } from "@/hooks/use-service";
 import {
   MAX_FOLDER_DEPTH, buildFolderTree, flattenFolders, folderPath, type FolderLike,
 } from "@/lib/folder-tree";
+import { folderOptionText } from "@/lib/dashboard-organise";
 import { dashboardService } from "@/services";
+import { FolderOptions } from "./folder-options";
 
 /** Select value for "no folder" (base-ui needs a non-empty value). */
 const ROOT = "__root__";
@@ -187,13 +189,10 @@ export function MoveBoardDialog({
         <DialogHeader><DialogTitle>Move to folder</DialogTitle></DialogHeader>
         <Select value={target} onValueChange={(v) => setTarget(v ?? ROOT)}>
           <SelectTrigger>
-            <SelectValue>{target === ROOT ? "Top level (no folder)" : folderPath(folders, target)}</SelectValue>
+            <SelectValue>{folderOptionText(folders, target === ROOT ? "" : target, "Top level (no folder)")}</SelectValue>
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ROOT}>Top level (no folder)</SelectItem>
-            {flat.map(({ folder }) => (
-              <SelectItem key={folder.id} value={folder.id}>{folderPath(folders, folder.id)}</SelectItem>
-            ))}
+            <FolderOptions folders={folders} noneValue={ROOT} noneLabel="Top level (no folder)" />
           </SelectContent>
         </Select>
         {flat.length === 0 ? (
