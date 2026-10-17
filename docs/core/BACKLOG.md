@@ -207,6 +207,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-32` | Task | Admin-written mask and row-filter expressions are not re-encoded by the `SEC-31` fix; check whether they need it. The validator now refuses a backslash in a text value and every text form but a plain quoted string, so the generic-dialect check and ClickHouse agree | Administration & Security | P2 | Done | #203 | `superpowers/plans/2026-10-07-dashboard-filters.md` follow-up, PR #104 review |
 | `SEC-33` | Task | A Query Studio download rewrites the history's statement, which was stored already rewritten, so an old mask or row filter stays inside and the current one applies on top. Fails closed, but the doc says today's policy governs the file; store the original statement or test the stored shape and correct the doc (`query.rs`, `tests/query_download.rs` seeds raw SQL) | Administration & Security | P2 | Done | #203 | PR #104 review SHOULD-FIX 1 |
 | `SEC-43` | Task | The row-filter validator checked only a function's arguments, an operator's sides and a column's last name part; every other part of a call, any operator and any qualifier now must match a fixed shape | Administration & Security | P2 | Done | #205 | `SEC-32` follow-up, batch review 2026-10-17 |
+| `SEC-44` | Task | A checked row filter could print differently from how it was checked: two signs in a row printed as a `--` comment, a text could span lines, and `LIKE ANY` was not checked | Administration & Security | P2 | Done |  | PR #205 review |
 | `SEC-34` | Task | Calculated-field names read back from storage enter the SQL as a plain alias, not re-validated (`fields.rs` `row_to_field`, `builder.rs`). Not reachable through the API; wrap the name in `Ident` on read | Administration & Security | P2 | Todo |  | PR #104 review SHOULD-FIX 2 |
 | `BI-27` | Task | Whole-result export holds up to three copies of 100,001 rows and mart exports have no time or byte limit (`dashboard.rs`). Take the rows instead of cloning, add a byte cap and a timeout, or stream | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 3 |
 | `BI-28` | Task | Export honesty: negative `Int64` values are written `'-5` (decide number columns from `result.meta`); a file can include rows a tile skipped with nothing saying so (`RecordsSql.skipped` dropped); a raw table with a calculated column cannot be exported (400) | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 4 |
@@ -346,6 +347,7 @@ set by the product owner and are left empty until they are.
 | `SEC-33` | | 2026-10-17 | |
 | `SEC-32` | | 2026-10-17 | |
 | `SEC-43` | 2026-10-17 | 2026-10-17 | |
+| `SEC-44` | 2026-10-17 | | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
