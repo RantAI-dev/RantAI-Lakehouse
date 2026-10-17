@@ -692,7 +692,6 @@ async fn settle_request(
     }
 }
 
-// BLD-2 review R2 SHOULD-FIX 6: helper for mapping store errors
 /// BLD-2 review R4 SHOULD-FIX 4: is this failure the lag check's own budget
 /// being enforced inside its transaction — the row-level `lock_timeout`
 /// (55P03) or the per-statement `statement_timeout` (57014) the check sets
@@ -700,13 +699,21 @@ async fn settle_request(
 /// `sqlx::Error` into [`StoreError::Database`], which keeps it as `source`;
 /// the raw `sqlx::Error` itself is the chain's first hop when the check
 /// makes one directly (`SET LOCAL`s, commits).
-/// BLD-2 review R4 SHOULD-FIX 4: is this failure the lag check's own budget
-/// being enforced inside its transaction — the row-level `lock_timeout`
-/// (55P03) or the per-statement `statement_timeout` (57014) the check sets
-/// under R13? It chases `source` links because the store folds a raw
-/// `sqlx::Error` into [`StoreError::Database`], which keeps it as `source`;
-/// the raw `sqlx::Error` itself is the chain's first hop when the check
-/// makes one directly (`SET LOCAL`s, commits).
+// BLD-2 review R5 SHOULD-FIX 4: the two SQLSTATEs are matched here instead
+// of through an existing helper, deliberately (rule 4). Both of those take a
+// `&sqlx::Error` and answer a different question:
+// `connector_probe::classify_sqlx_error` is a generic CONNECTION failure
+// class for probe messages (its `Database` arm is about authentication),
+// and `connector_listing::class_of_sqlx` buckets IO/TLS/pool-timeout and
+// listing errors. Neither knows 55P03 from 57014, and neither walks a whole
+// error CHAIN — which is what this predicate needs, because the store folds
+// the `sqlx::Error` into `StoreError::Database` and only the raw error is
+// its `source`. Sharing a helper would have given it a question no other
+// caller has; the two tests below pin both SQLSTATEs and one code that is
+// neither.
+// BLD-2 review R5 SHOULD-FIX 4: the stray `R2 SHOULD-FIX 6` line that stood
+// above this doc labelled nothing here — that finding's helper is
+// `make_lag_update`, whose own site carries the tag.
 fn is_check_budget_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
