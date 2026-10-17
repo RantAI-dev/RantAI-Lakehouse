@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! HTTP client for `ClickHouse`'s plain HTTP interface.
 //!
 //! Ports `src/services/clients/clickhouse.ts` — the client every
@@ -21,7 +14,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 /// A single column descriptor from `ClickHouse`'s `FORMAT JSON` envelope.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChColumn {
     /// The column name.
     pub name: String,
@@ -504,8 +497,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows, 0);
-        assert!(result.data.is_empty());
-        assert!(result.meta.is_empty());
+        assert_eq!(
+            result.data,
+            [] as [serde_json::Map<std::string::String, serde_json::Value>; 0]
+        );
+        assert_eq!(result.meta, []);
     }
 
     #[tokio::test]
