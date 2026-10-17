@@ -232,9 +232,17 @@ e297bd7d216f fix(security): ignore unreachable zip advisories in deny.toml (SEC-
 4f7041f354e2 docs(plan): SEC-42 zip advisories
 
 $ git ls-remote --heads origin fix/sec-42-zip-advisories
-61c10810d86978d767b9f35b0aedae415bcae94a	refs/heads/fix/sec-42-zip-advisories
+61c10810d869	refs/heads/fix/sec-42-zip-advisories
 ```
 
 ## 5. Review
 
 (planner)
+
+Reviewed 2026-10-17 at `cb2a0f64` (planner): the diff matches §2–§3.
+Planner's own run in `rust/`: `cargo deny check advisories` → "advisories
+ok"; `cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0367
+--ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369` → exit 0 (2
+allowed warnings, the existing unmaintained ones). The handoff pasted a
+full commit hash; the planner shortened it to 12 characters. No open
+BLOCKER.
