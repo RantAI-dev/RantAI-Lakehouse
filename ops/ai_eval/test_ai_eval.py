@@ -1379,6 +1379,42 @@ class ToolArgsMatchTest(unittest.TestCase):
     def test_an_absent_key_never_matches(self) -> None:
         self.assertFalse(m.tool_args_match({"mart": "x"}, {"grain": ""}))
 
+    def test_a_wanted_bool_matches_only_a_bool_of_the_same_value(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: Python says `1 == True` and
+        `1.0 == True`, so a wanted `True` used to score a call that sent the
+        number 1 -- a case asking for a flag could pass on a numeric one."""
+        self.assertTrue(m.tool_args_match({"enabled": True}, {"enabled": True}))
+        self.assertTrue(m.tool_args_match({"enabled": False}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": 1}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 1.0}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 0}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": "true"}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": True}, {"enabled": False}))
+        self.assertTrue(
+            m.tool_args_match(
+                {"spec": {"ifChanged": True, "ttlDays": 30}}, {"spec.ifChanged": True}
+            )
+        )
+        self.assertFalse(
+            m.tool_args_match({"spec": {"ifChanged": 1, "ttlDays": 30}}, {"spec.ifChanged": True}),
+            "a dotted key reads the same values and is held to the same rule",
+        )
+
+    def test_a_wanted_string_matches_a_non_ascii_member_of_a_list(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: `json.dumps` escapes non-ASCII by
+        default, so a wanted string carrying an accented or CJK character
+        was looked for as `\\uXXXX` and could never be found inside a list
+        or object value. The wanted string has to carry the character itself
+        for this to differ -- a wanted ASCII substring of a non-ASCII value
+        matched either way."""
+        members = ["São Paulo", "Berlin"]
+        self.assertTrue(m.tool_args_match({"regions": members}, {"regions": "são paulo"}))
+        self.assertTrue(m.tool_args_match({"region": "São Paulo"}, {"region": "São Paulo"}))
+        self.assertTrue(
+            m.tool_args_match({"filters": [{"region": "São Paulo"}]}, {"filters": "São Paulo"})
+        )
+        self.assertFalse(m.tool_args_match({"regions": ["Berlin"]}, {"regions": "São Paulo"}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -291,12 +291,23 @@ def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
     text of a list or object value (`"filters": "tahun"` matches a filters
     array of objects, `silver.orders_clean` matches `"pipeline":
     "orders_clean"`), because a schema never guarantees a value's exact
-    string shape. A wanted string never matches a number and vice versa."""
+    string shape. A wanted string never matches a number and vice versa.
+
+    BLD-2 review R5 SHOULD-FIX 5: a wanted BOOL matches only a bool of the
+    same value. In Python `1 == True` and `1.0 == True`, so comparing
+    without a type check scored a call that sent `1` for a case that asked
+    for `true` -- the same number-is-not-a-bool rule the other two arms
+    already enforce. The JSON text is dumped with `ensure_ascii=False`, so a
+    wanted non-ASCII string is looked for as itself and not as the
+    `\\uXXXX` escape `json.dumps` writes by default."""
     for key, wanted in want.items():
         got = _tool_arg(args, key)
         if got is None:
             return False
-        if isinstance(wanted, bool) or wanted is None:
+        if isinstance(wanted, bool):
+            if not isinstance(got, bool) or got != wanted:
+                return False
+        elif wanted is None:
             if got != wanted:
                 return False
         elif isinstance(wanted, (int, float)):
@@ -319,7 +330,7 @@ def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
             if isinstance(got, str):
                 matched = wanted_text in got.lower()
             elif isinstance(got, (list, dict)):
-                matched = wanted_text in json.dumps(got).lower()
+                matched = wanted_text in json.dumps(got, ensure_ascii=False).lower()
             else:
                 matched = False
             if not matched:
