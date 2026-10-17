@@ -402,10 +402,11 @@ DELETE_ROUTES = {
     "field": "/api/dashboard/calc-fields",
     "source": "/api/dashboard/sources",
     "board": "/api/dashboard/boards",
+    "metric": "/api/dashboard/metrics",
 }
 # Newest first: a chart may use a field, a field a source, and a board holds
 # charts, so the dependants go before what they depend on.
-CLEANUP_ORDER = ("chart", "field", "source", "board")
+CLEANUP_ORDER = ("chart", "metric", "field", "source", "board")
 
 
 def kind_of_path(path: str) -> str | None:
