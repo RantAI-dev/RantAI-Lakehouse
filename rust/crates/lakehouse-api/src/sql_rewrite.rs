@@ -1317,7 +1317,7 @@ fn validate_literal(value: &Value) -> Result<(), RewriteError> {
                 // DEL at U+007F) inside a single-quoted string lets the
                 // text cross a line — what the validator read and what
                 // `ClickHouse` reads can then differ. `char::is_control`
-                // covers U+0080–U+009F too; that range is plain ASCII
+                // covers U+0080–U+009F too; that range is ordinary
                 // text to `ClickHouse` and the plan's decision is the
                 // narrow set, so the comparison is written by hand.
                 Err(RewriteError::InvalidRowFilter {
