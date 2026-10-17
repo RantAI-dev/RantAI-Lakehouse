@@ -358,11 +358,11 @@ pub async fn run(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
-    let sql = match parsed.sql {
+    let statement = match parsed.sql {
         Some(s) if !s.is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
-    if !is_read_only(&sql) {
+    if !is_read_only(&statement) {
         return Err(ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
@@ -380,7 +380,7 @@ pub async fn run(
     let user_id = p.id.uuid().to_string();
 
     let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
-    if engine == "trino" && !is_trino_safe(&sql) {
+    if engine == "trino" && !is_trino_safe(&statement) {
         return Err(ApiError::Unprocessable(
             "This statement is not permitted against Trino (write, session, or procedure \
              keyword detected)."
@@ -395,13 +395,18 @@ pub async fn run(
     // before `started`/`Instant::now()` below so the elapsed time recorded
     // for `policyDecisionP95Ms` covers exactly the rewrite step, nothing
     // else.
-    let sql = rewrite_sql_for_principal(&state, &sql, &engine, &p).await?;
+    //
+    // `statement` stays what the user wrote: query history records it (and
+    // `download` re-rewrites it for the caller's roles at that time), while
+    // `rewritten` is what the engine runs and the audit event records
+    // (`SEC-21`, `SEC-33`).
+    let rewritten = rewrite_sql_for_principal(&state, &statement, &engine, &p).await?;
 
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
     let (columns, mut rows, duration_ms, scanned_bytes) =
-        execute_query_against_engine(&state, &engine, &sql, &user_id, started).await?;
+        execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await?;
 
     // The console renders every row it receives, so an unbounded `SELECT *`
     // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
@@ -425,7 +430,7 @@ pub async fn run(
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
     if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(&p, &id, &sql);
+        let event = query_run_audit_event(&p, &id, &rewritten);
         if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
             tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
         }
@@ -449,7 +454,7 @@ pub async fn run(
         )]
         let input = RecordHistoryInput {
             id: &id,
-            sql: &sql,
+            sql: &statement,
             user: &user_id,
             owner_id: Some(p.id.uuid()),
             status: "completed",
@@ -1117,6 +1122,13 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// capped at [`DOWNLOAD_ROW_CAP`] rows. Data ingested or deleted since the
 /// original run changes what comes back. The statement is rewritten for the
 /// caller's current roles first, exactly as the run route does.
+///
+/// The stored statement is the one the user wrote ([`run`] records it, not
+/// the rewritten form), so today's policy is applied to it once. A row
+/// recorded before that change holds the rewritten form: an old mask or row
+/// filter sits inside it and today's policy applies on top, which only adds
+/// restriction (it fails closed). Those rows are left as they are (`SEC-21`,
+/// `SEC-33`).
 ///
 /// Only rows whose `engine` is `"clickhouse"` or the legacy `"hot-store"`
 /// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
