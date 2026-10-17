@@ -772,6 +772,16 @@ class AuthoredScheduleTest(unittest.TestCase):
         schedule = authored_factory.build_authored_schedule(pipeline, self._job(pipeline))
         self.assertEqual(schedule.default_status, DefaultScheduleStatus.STOPPED)
 
+    def test_pipeline_with_target_lag_builds_no_schedule(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no schedule,
+        even when its schedule is a valid cron expression. Removing the lag
+        returns the pipeline to the schedule."""
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": lag}
+            self.assertIsNone(authored_factory.build_authored_schedule(pipeline, self._job(pipeline)))
+        restored = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": None}
+        self.assertIsNotNone(authored_factory.build_authored_schedule(restored, self._job(restored)))
+
     def test_an_on_demand_pipeline_gets_no_schedule(self) -> None:
         for label in ("manual", "On demand", "", None):
             pipeline = {**_ready_pipeline(), "schedule": label}
@@ -1008,6 +1018,18 @@ class TestDependencySensor:
     """Sensor-body tests for R3 plan 2a. Plain pytest class (no
     `unittest.TestCase`) so the per-test asserts render with pytest's
     own introspection instead of `self.assertEqual`'s."""
+
+    def test_returns_none_when_target_lag_is_set(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no dependency sensor,
+        even when dependsOn is populated. Removing target lag restores the sensor."""
+        @job(name="authored__pl_lag_dep")
+        def _job() -> None:
+            return None
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": lag}
+            assert build_authored_dependency_sensor(pipeline, _job) is None
+        restored = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": None}
+        assert build_authored_dependency_sensor(restored, _job) is not None
 
     def test_returns_none_when_depends_on_is_empty(self) -> None:
         """A pipeline with `depends_on=[]` produces NO `run_status_sensor`:
@@ -2374,6 +2396,350 @@ class TestFileIngestRunConfigReader:
                 authored_factory._latest_record_for_table([record], "invoices_raw")
                 is None
             )
+
+
+class TestLagSensor:
+    """BLD-2 D3 + D6: target-lag sensor tests."""
+
+    @job(name="authored__pl_lag_order")
+    def _order_job() -> None:
+        return None
+
+    def test_returns_none_when_target_lag_is_absent_or_not_lag_kind(self) -> None:
+        """Pipelines without targetLag or with kind='downstream' build no lag sensor."""
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-none", "targetLag": None}, self._order_job) is None
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-down", "targetLag": {"kind": "downstream"}}, self._order_job) is None
+
+    def test_returns_none_when_pipeline_is_paused(self) -> None:
+        """A paused pipeline gets no lag sensor."""
+        pipeline = {
+            "id": "pl-paused",
+            "status": "paused",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        assert authored_factory.build_authored_lag_sensor(pipeline, self._order_job) is None
+
+    def test_builds_running_sensor_with_30s_interval_when_ready(self) -> None:
+        """A ready pipeline with kind='lag' gets a sensor named authored__<safe_id>_lag with 30s interval."""
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job)
+        assert sensor is not None
+        assert sensor.name == "authored__pl_lag_order_lag"
+        assert sensor.minimum_interval_seconds == 30
+        assert sensor.default_status == authored_factory.DefaultSensorStatus.RUNNING
+        assert sensor.job.name == "authored__pl_lag_order"
+
+    def _eval_sensor(self, response_mock: Any) -> list[Any]:
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        with mock.patch.object(authored_factory.requests, "post", response_mock):
+            return list(sensor(build_sensor_context()))
+
+    def test_sensor_yields_one_run_request_on_run_decision(self) -> None:
+        """Decision 'run' yields one RunRequest with the given run key and job."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__pl_lag_order",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-abc"
+        assert req.job_name == "authored__pl_lag_order"
+
+    def test_sensor_yields_nothing_on_wait_decision(self) -> None:
+        """Decision 'wait' yields nothing."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "wait",
+            "reason": "inputs unchanged",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_4xx_without_raising(self) -> None:
+        """4xx is logged and skipped, yields nothing, never raises."""
+        resp = mock.Mock(status_code=404, text="Pipeline not found")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_5xx_without_raising(self) -> None:
+        """5xx is skipped for this tick, yields nothing, never raises."""
+        resp = mock.Mock(status_code=503, text="Service Unavailable")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_transport_error_without_raising(self) -> None:
+        """Transport error is skipped for this tick, yields nothing, never raises."""
+        requests_ = self._eval_sensor(mock.Mock(side_effect=requests.ConnectionError("unreachable")))
+        assert len(requests_) == 0
+
+
+    @job(name="authored__pl_u")
+    def _upstream_job() -> None:
+        return None
+
+    def test_sensor_yields_run_request_with_different_allowed_job_name(self) -> None:
+        """BLD-2 review R1 BLOCKER 2: sensor can launch upstream job when API directs."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(
+            pipeline,
+            self._order_job,
+            allowed_jobs=[self._order_job, self._upstream_job],
+            cfg=cfg,
+        )
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-upstream",
+            "jobName": "authored__pl_u",
+        }
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            requests_ = list(sensor(build_sensor_context()))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-upstream"
+        assert req.job_name == "authored__pl_u"
+
+    def test_sensor_skips_when_job_name_not_allowed(self) -> None:
+        """BLD-2 review R1 BLOCKER 2 / R2 SHOULD-FIX 7: unexpected jobName is logged and skipped."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__unknown_job",
+        }
+        ctx = build_sensor_context()
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            with mock.patch.object(ctx.log, "warning") as mock_warn:
+                requests_ = list(sensor(ctx))
+        assert len(requests_) == 0
+        mock_warn.assert_called_once()
+        assert "unexpected jobName 'authored__unknown_job'" in mock_warn.call_args[0][0]
+
+    def test_sensor_skips_when_run_key_missing(self) -> None:
+        """BLD-2 review R1 BLOCKER 2 / R2 SHOULD-FIX 7: missing runKey is logged and skipped."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "jobName": "authored__pl_lag_order",
+        }
+        ctx = build_sensor_context()
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            with mock.patch.object(ctx.log, "warning") as mock_warn:
+                requests_ = list(sensor(ctx))
+        assert len(requests_) == 0
+        mock_warn.assert_called_once()
+        assert "without runKey" in mock_warn.call_args[0][0]
+
+    def test_sensor_logs_warning_when_run_token_unset(self) -> None:
+        """BLD-2 review R1 SHOULD-FIX 17 / R2 SHOULD-FIX 12: sensor logs warning once when run_token is unset."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        ctx = build_sensor_context()
+        with mock.patch.object(ctx.log, "warning") as mock_warn:
+            reqs = list(sensor(ctx))
+        assert len(reqs) == 0
+        mock_warn.assert_called_once()
+        assert "DISPAR_RUN_TOKEN is unset" in mock_warn.call_args[0][0]
+
+        # Second evaluation with the same cursor must NOT log again
+        ctx2 = build_sensor_context(cursor=ctx.cursor)
+        with mock.patch.object(ctx2.log, "warning") as mock_warn2:
+            reqs2 = list(sensor(ctx2))
+        assert len(reqs2) == 0
+        mock_warn2.assert_not_called()
+
+    def test_build_authored_lag_sensors_attaches_only_read_downstream_jobs(self) -> None:
+        """BLD-2 review R2 SHOULD-FIX 7: lag sensor attaches only jobs of downstream pipelines it actually reads."""
+        # P: reads silver.u1, tenant t1
+        p_pipe = {
+            "id": "pl-p",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "silver.u1",
+            "target": "gold.p",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        # U1: reads bronze.u2, produces silver.u1, downstream, tenant t1
+        u1_pipe = {
+            "id": "pl-u1",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.u2",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U2: reads bronze.orders, produces bronze.u2, downstream, tenant t1 (transitive upstream of P)
+        u2_pipe = {
+            "id": "pl-u2",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.orders",
+            "target": "bronze.u2",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U3: downstream, tenant t1, but produces silver.unrelated (nobody reads it)
+        u3_pipe = {
+            "id": "pl-u3",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.other",
+            "target": "silver.unrelated",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U4: downstream, produces silver.u1, but tenant t2 (different tenant!)
+        u4_pipe = {
+            "id": "pl-u4",
+            "status": "ready",
+            "tenantId": "t2",
+            "source": "bronze.orders",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_p")
+        def j_p() -> None:
+            pass
+
+        @job(name="authored__pl_u1")
+        def j_u1() -> None:
+            pass
+
+        @job(name="authored__pl_u2")
+        def j_u2() -> None:
+            pass
+
+        @job(name="authored__pl_u3")
+        def j_u3() -> None:
+            pass
+
+        @job(name="authored__pl_u4")
+        def j_u4() -> None:
+            pass
+
+        pipeline_jobs = [
+            (p_pipe, j_p),
+            (u1_pipe, j_u1),
+            (u2_pipe, j_u2),
+            (u3_pipe, j_u3),
+            (u4_pipe, j_u4),
+        ]
+        sensors = authored_factory.build_authored_lag_sensors(pipeline_jobs)
+        # Exactly one sensor built (for P; downstream pipelines get no lag sensor)
+        assert len(sensors) == 1
+        p_sensor = sensors[0]
+        # Inspect jobs attached to P sensor
+        attached_job_names = {j.name for j in p_sensor.jobs}
+        assert "authored__pl_p" in attached_job_names
+        assert "authored__pl_u1" in attached_job_names, "Direct downstream upstream must be attached"
+        assert "authored__pl_u2" in attached_job_names, "Transitive downstream upstream must be attached"
+        assert "authored__pl_u3" not in attached_job_names, "Unrelated downstream must NOT be attached"
+        assert "authored__pl_u4" not in attached_job_names, "Different tenant downstream must NOT be attached"
+
+    def test_an_unassigned_lag_pipeline_links_no_downstream_even_to_another_unassigned_pipeline(
+        self,
+    ) -> None:
+        """BLD-2 review R4 SHOULD-FIX 2: an unassigned pipeline's runtime
+        `tenantId` is None, and per R3 a NULL tenant matches no membership —
+        so an unassigned lag pipeline has no reader edge at all, not even to
+        another unassigned pipeline, and it must attach nothing beyond its
+        own job. The R3 text claimed two unassigned pipelines match each
+        other; this test pins that they cannot."""
+        # Reading pipeline with no tenant at all.
+        p_pipe = {
+            "id": "pl-p-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "silver.u1",
+            "target": "gold.p",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        # Unassigned downstream pipeline producing silver.u1 — the tenant
+        # filter would pair them under the old None == None rule.
+        u_pipe = {
+            "id": "pl-u-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "bronze.x",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_p_unassigned")
+        def j_p() -> None:
+            pass
+
+        @job(name="authored__pl_u_unassigned")
+        def j_u() -> None:
+            pass
+
+        sensors = authored_factory.build_authored_lag_sensors([(p_pipe, j_p), (u_pipe, j_u)])
+        assert len(sensors) == 1
+        attached_job_names = {j.name for j in sensors[0].jobs}
+        assert attached_job_names == {"authored__pl_p_unassigned"}, (
+            "an unassigned lag pipeline links nothing: only its own job is attached"
+        )
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

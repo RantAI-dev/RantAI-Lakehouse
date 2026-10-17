@@ -601,11 +601,10 @@ jobs:
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    # SRC-20: raised from 25 for the G7 step added below. The budget is
-    # the measured G7 wall time (30 s on a clean local stack, with the
-    # authored run itself at 5.6 s) plus 5 minutes of slack, which the
-    # plan allows rather than assuming.
-    timeout-minutes: 30
+    # BLD-2 review R1 SHOULD-FIX 16: raised to 45 for the BLD-2 D11 target lag
+    # verification step inside G7, which takes 5 append iterations with settling
+    # intervals plus 5 unchanged checks (~20 minutes worst-case inside G7).
+    timeout-minutes: 45
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
@@ -731,8 +730,17 @@ jobs:
       # Bronze-to-Silver pipeline over the table G3a just loaded, runs it
       # and asserts the rows it produced. It runs HERE, in this job, not
       # in a new one: no second image download, no second stack boot, and
-      # no CI time of its own beyond the test itself (measured 30 s on a
-      # clean local stack -- see the `timeout-minutes` above).
+      # no CI time of its own beyond the test itself.
+      #
+      # BLD-2 review R1 BLOCKER 8: the runner's dependencies (requests,
+      # psycopg2-binary) are pinned in `ops/g7/Dockerfile` and baked into
+      # the image, so the image is built here rather than pip-installing a
+      # driver into a stock `python:3.12-slim` at run time. The BLD-2
+      # target-lag step added to this gate is why `timeout-minutes` above
+      # is 45 and not 30.
+      - name: Build the G7 test-runner fixture image
+        run: docker compose -p g3aci --profile dagster build g7-test-runner
+
       - name: Run the G7 authored-pipeline test inside the compose network
         run: docker compose -p g3aci --profile dagster run --rm g7-test-runner
 

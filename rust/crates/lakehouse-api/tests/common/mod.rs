@@ -121,6 +121,81 @@ pub async fn spin_up_with_connector_secret_resolver(
     TestApp { router, pool }
 }
 
+/// Same as [`spin_up_with_env`], but the pool the ROUTES see
+/// ([`AppState::pg`], swapped after `AppState::new` — the same swap the
+/// resolver variant above does) is a **one-connection pool over the same
+/// fresh database that counts every connection checkout** in the returned
+/// [`std::sync::atomic::AtomicUsize`], via
+/// [`sqlx::pool::PoolOptions::before_acquire`]. The returned
+/// [`TestApp::pool`] is the ORIGINAL pool, so the caller's own setup writes
+/// (fixtures, sessions) go around the counter and only what a request does
+/// is measured.
+///
+/// The delta across one request is the number of separate connection
+/// checkouts it made, which is the `N+1` shape
+/// `BLD-2 review R5 SHOULD-FIX 1` is about.
+///
+/// Two things it is NOT, and why: it does not count statements (sqlx's own
+/// `sqlx::query` tracing events cannot be captured reliably here — the tests
+/// of one binary run in parallel in one process and a callsite's `Interest`
+/// is cached process-wide the first time it is hit, so a subscriber
+/// registered later captures nothing), and it does not use
+/// `pg_stat_database.xact_commit` (measured on this harness: a request's
+/// statements are not in that counter yet when the next query asks for it,
+/// so the delta reads 0).
+///
+/// Determinism: sqlx counts neither a new physical connection nor
+/// [`PoolOptions::before_acquire`] on one, so the warm-up `SELECT 1` below
+/// (which opens THE connection) runs before the counter is reset, and
+/// `max_connections(1)` means every later checkout is a checkout of that one
+/// idle connection — counted exactly once, in order.
+/// `acquire_timeout` is deliberately short: nothing on a request path holds
+/// a connection across another checkout, so if a test ever did it would fail
+/// loudly with a pool timeout instead of waiting forever.
+pub async fn spin_up_with_env_counting_acquires(
+    overrides: &HashMap<String, String>,
+) -> (TestApp, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let (mut state, harness_pool) = build_state_and_pool(overrides).await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let measured = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .before_acquire({
+            let counter = Arc::clone(&counter);
+            move |_conn, _meta| {
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        })
+        .connect(&state.config.database_url)
+        .await
+        .expect("connect the counted pool to the fresh per-test database");
+    // Open THE connection now, so the physical connect is not the first
+    // thing a measured request does, then start counting from zero.
+    sqlx::query("SELECT 1")
+        .execute(&measured)
+        .await
+        .expect("warm the counted pool");
+    counter.store(0, Ordering::SeqCst);
+
+    state.pg = Some(Arc::new(measured));
+    let router = lakehouse_api::routes::router(state);
+    (
+        TestApp {
+            router,
+            pool: harness_pool,
+        },
+        counter,
+    )
+}
+
 /// Shared by [`spin_up_with_env`] and
 /// [`spin_up_with_connector_secret_resolver`]: provisions a fresh,
 /// migrated, isolated database and builds the [`AppState`] over it, but

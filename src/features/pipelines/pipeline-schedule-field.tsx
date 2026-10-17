@@ -36,9 +36,11 @@ export function isSchedulable(value: string): boolean {
 export function PipelineScheduleField({
   value,
   onChange,
+  hasTargetLag = false,
 }: {
   value: string
   onChange: (value: string) => void
+  hasTargetLag?: boolean
 }) {
   const preset = PRESETS.find((p) => p.value === value.trim())
   const [mode, setMode] = React.useState<string>(preset ? preset.value : CUSTOM)
@@ -95,6 +97,11 @@ export function PipelineScheduleField({
             : `Cron ${value}; times are UTC, the orchestrator's schedule timezone.`}
         </p>
       )}
+      {hasTargetLag ? (
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400" role="status">
+          This schedule is not used while a target lag is set.
+        </div>
+      ) : null}
     </div>
   )
 }

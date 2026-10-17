@@ -268,6 +268,76 @@ def dig(value: Any, path: str) -> list[Any]:
     return current
 
 
+def _tool_arg(args: Any, key: str) -> Any:
+    """The value at a dotted `key` of a tool call's args, or `None` when any
+    part of the path is absent (so a missing key never matches an empty want)."""
+    current = args
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
+    """Whether a tool call's args carry every `want` key (dotted keys read
+    into nested args, so the match does not depend on key order).
+
+    BLD-2 review R4 BLOCKER 2 / decision R15, restoring the string
+    semantics commit `5ec778414e86` broke: a wanted NUMBER matches only a
+    number EQUAL to it (`minutes: 10` never matches `100` -- the
+    SHOULD-FIX 9/10 intent stays), but a wanted STRING matches
+    case-insensitively as a substring of a string value AND of the JSON
+    text of a list or object value (`"filters": "tahun"` matches a filters
+    array of objects, `silver.orders_clean` matches `"pipeline":
+    "orders_clean"`), because a schema never guarantees a value's exact
+    string shape. A wanted string never matches a number and vice versa.
+
+    BLD-2 review R5 SHOULD-FIX 5: a wanted BOOL matches only a bool of the
+    same value. In Python `1 == True` and `1.0 == True`, so comparing
+    without a type check scored a call that sent `1` for a case that asked
+    for `true` -- the same number-is-not-a-bool rule the other two arms
+    already enforce. The JSON text is dumped with `ensure_ascii=False`, so a
+    wanted non-ASCII string is looked for as itself and not as the
+    `\\uXXXX` escape `json.dumps` writes by default."""
+    for key, wanted in want.items():
+        got = _tool_arg(args, key)
+        if got is None:
+            return False
+        if isinstance(wanted, bool):
+            if not isinstance(got, bool) or got != wanted:
+                return False
+        elif wanted is None:
+            if got != wanted:
+                return False
+        elif isinstance(wanted, (int, float)):
+            # The number comparison is member-wise over a list but is an
+            # equality per member: 10 must never match 100.
+            if isinstance(got, list):
+                if not any(
+                    isinstance(member, (int, float))
+                    and not isinstance(member, bool)
+                    and member == wanted
+                    for member in got
+                ):
+                    return False
+            elif not (
+                isinstance(got, (int, float)) and not isinstance(got, bool) and got == wanted
+            ):
+                return False
+        else:
+            wanted_text = str(wanted).lower()
+            if isinstance(got, str):
+                matched = wanted_text in got.lower()
+            elif isinstance(got, (list, dict)):
+                matched = wanted_text in json.dumps(got, ensure_ascii=False).lower()
+            else:
+                matched = False
+            if not matched:
+                return False
+    return True
+
+
 def where_matches(item: Any, where: dict[str, Any]) -> bool:
     """Whether `item` satisfies every `where` key. A flat key reads the item's
     own field; a dotted key reads into it (`def.grain` is the `grain` of the
@@ -945,7 +1015,7 @@ def score_case(
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
         want = fill_value(expect_tool.get("args_contains", {}), names or {})
-        if any(all(str(v).lower() in str(t.get("args", {}).get(k, "")).lower() for k, v in want.items()) for t in trace):
+        if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")
