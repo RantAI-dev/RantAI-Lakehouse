@@ -1060,3 +1060,71 @@ The PR's `cargo audit` and `cargo deny` are red on `RUSTSEC-2026-0367`,
 last green run; `zip` comes only through `calamine` 0.36.1. This branch
 touches no dependency, so it does not block it; the planner files `SEC-41`
 to fix it on `main`.
+
+### Round 4 (planner, at `fe7e8103`)
+
+Review of the round-3 delta (`30aec886..fe7e8103`). The Handoff round 3 table
+maps findings to the right commits, and the corrected round-2 table matches.
+R12 (one ordered lock statement), R13 (both `SET LOCAL` timeouts, one 8 s
+budget over the network calls, rollback and the classified 503, reads on
+`tx`; the never-answering-Dagster test can fail), BLOCKERs 3–5 and
+SHOULD-FIX 1–7 and 9 are fixed. P waiting on an *outstanding* U uses lag
+against target (the `8eaeeb86` over-reach was undone in `f7f53e56`).
+
+#### Decisions (planner)
+
+- **R15. `args_contains` in `ops/ai_eval`:** a wanted **number** matches a
+  number equal to it (so `minutes: 10` never matches 100); a wanted
+  **string** matches case-insensitively as a substring of a string, and of the
+  JSON text of a list or object (so `"filters": "tahun"` matches a filters
+  array, and `"orders_clean"` matches `silver.orders_clean`), as before
+  `5ec77841`. Dotted keys stay.
+- **R16. One "upstream exhausted" helper.** The page, the alert and the check
+  answer "is this P blocked by an exhausted U?" from one store/API helper that
+  walks the same chain the check walks (`upstream_downstream_pipelines_conn`),
+  not `dependsOn` alone.
+
+#### BLOCKER
+
+1. **R14 is still not truthful for U.** (a) The page's `upstream_exhausted`
+   reads only `p.depends_on` (`routes/pipelines.rs`), while the check walks
+   the full chain (source ↔ target, transitively): a P that reads U's target
+   as its source, or an exhausted U two levels up, is stored `behind` but the
+   page shows "past the target lag" with a lag below target. (b) The
+   exhausted-U reason is the outstanding-U text ("waiting for upstream
+   pipeline {U} to finish", also in the alert) — an exhausted U will not run
+   again until its next input change. Fix per R16 with a distinct reason
+   ("upstream pipeline {U}'s last N runs for this change failed; …"); add a
+   route-level test where P reads U only through its source table.
+2. **`ops/ai_eval` regression (`5ec77841`).** `tool_args_match` now compares
+   for equality against list members, so `"filters": "tahun"` / `"wilayah"`
+   (`dashboard_cases.json`, three of AI-15's 30 cases) can never pass, and
+   `"pipeline": "orders_clean"` no longer matches `silver.orders_clean`.
+   Fix per R15; tests for a filters-shaped list of objects, a qualified
+   table name, and 10 vs 100. The AI team owns this file: say so in the
+   commit body.
+3. **Migration `0084` header (last chance before it is ever applied):** lines
+   ~25–27 say "Under R6b (`47fcf9ad4618` in `bld2-gate-r6.log`) a 2-minute
+   target was used while pre-R6a runs exceeded 120 s" — `47fcf9ad` was the
+   post-R6a run and passed (worst 95.13 s); the run over 120 s was
+   `9a59250c` in `bld2-gate-r1.log` (worst 129.77 s). The heading "The floor
+   is the MEASURED one, not the spec's" is now misleading (they agree); say
+   "1 minute, the spec's target, measured" with the R8 logs.
+
+#### SHOULD-FIX
+
+1. `lock_lag_states_ordered`: sort the ids inside the function (the
+   missing-row `INSERT`s run in caller order), and make the test able to fail
+   (rows come back in sorted order from an unsorted input, or a second
+   transaction blocks); its doc is the old single-row text — rewrite it;
+   delete the now-unused `get_lag_state_for_update`.
+2. Sensor tenant filter (`authored_factory.py`): a NULL tenant links nothing
+   (R3) — skip when the reading pipeline's tenant is `None`; fix the docstring
+   that says unassigned pipelines link to each other.
+3. `detail_lag` (`routes/pipelines.rs`) swallows a store error with
+   `if let Ok(…)`; propagate it (classified).
+4. `lock_timeout` (55P03) and `statement_timeout` (57014) inside the lag check
+   come back as 500 through `store_err`; classify both as the same 503 as the
+   8 s budget. `decide`'s own-budget error is `FailedAs::Internal` (500) while
+   U's is 503: make them one.
+5. The outstanding-U test's comment says "request_attempt = 2" but seeds 0.
