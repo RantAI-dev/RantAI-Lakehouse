@@ -693,7 +693,54 @@ async fn settle_request(
 }
 
 // BLD-2 review R2 SHOULD-FIX 6: helper for mapping store errors
-fn store_err(pipeline_id: &str, msg: &str, err: impl std::fmt::Display) -> ApiError {
+/// BLD-2 review R4 SHOULD-FIX 4: is this failure the lag check's own budget
+/// being enforced inside its transaction — the row-level `lock_timeout`
+/// (55P03) or the per-statement `statement_timeout` (57014) the check sets
+/// under R13? It chases `source` links because the store folds a raw
+/// `sqlx::Error` into [`StoreError::Database`], which keeps it as `source`;
+/// the raw `sqlx::Error` itself is the chain's first hop when the check
+/// makes one directly (`SET LOCAL`s, commits).
+/// BLD-2 review R4 SHOULD-FIX 4: is this failure the lag check's own budget
+/// being enforced inside its transaction — the row-level `lock_timeout`
+/// (55P03) or the per-statement `statement_timeout` (57014) the check sets
+/// under R13? It chases `source` links because the store folds a raw
+/// `sqlx::Error` into [`StoreError::Database`], which keeps it as `source`;
+/// the raw `sqlx::Error` itself is the chain's first hop when the check
+/// makes one directly (`SET LOCAL`s, commits).
+fn is_check_budget_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let is_budget = e.downcast_ref::<sqlx::Error>().is_some_and(|err| {
+            matches!(err, sqlx::Error::Database(db)
+                if matches!(db.code().as_deref(), Some("55P03" | "57014")))
+        });
+        if is_budget {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+fn store_err(pipeline_id: &str, msg: &str, err: impl std::error::Error + 'static) -> ApiError {
+    // BLD-2 review R4 SHOULD-FIX 4: the two cuts the check sets itself
+    // enforce the same 8 s budget as the outer clock (they exist for it, R13),
+    // so they answer the same classified 503 the clock answers — "this tick
+    // decides nothing" is one failure to the caller whichever tripwire
+    // fired. Every other storage failure keeps the generic 500 and neither
+    // branch ever carries upstream text (principle 4).
+    if is_check_budget_error(&err) {
+        tracing::warn!(
+            pipeline = %pipeline_id,
+            "target lag: {msg} (the check's own budget was enforced)"
+        );
+        crate::upstream_error::report(
+            &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+            crate::upstream_error::Class::Unavailable,
+            &"storage was locked or filtered slower than the check's own budget",
+        );
+        return ApiError::Unavailable("the orchestrator is unavailable".to_owned());
+    }
     tracing::error!(%err, pipeline = %pipeline_id, "target lag: {msg}");
     crate::upstream_error::report(
         &crate::upstream_error::STORE,
@@ -1334,17 +1381,12 @@ async fn decide(
                 true
             } else {
                 let budget = run_budget_seconds(dagster, job_name).await.map_err(|err| {
-                    tracing::warn!(
-                        %err,
-                        pipeline = %pipeline.id,
-                        "target lag: run budget unreadable; this tick decides nothing"
-                    );
-                    crate::upstream_error::report(
-                        &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    )
-                    .into_api_error(crate::upstream_error::FailedAs::Internal)
+                    // BLD-2 review R4 SHOULD-FIX 4: the pipeline's own
+                    // budget reads answer the same classified 503 as the
+                    // chain's (the shared helper), chosen explicitly —
+                    // not a `FailedAs::Internal` request folded over a
+                    // `Class::Unavailable` failure.
+                    orchestrator_unavailable(err, &pipeline.id, "run budget unreadable")
                 })? + extra_budget;
                 lag_seconds >= target.saturating_sub(budget)
             };
@@ -1642,6 +1684,92 @@ mod tests {
 
     use super::*;
     use crate::routes::authored_pipelines::job_name;
+
+    /// BLD-2 review R4 SHOULD-FIX 4: a Postgres `DatabaseError` double with
+    /// a chosen SQLSTATE, so the budget classification can be pinned without
+    /// waiting for a real `lock_timeout` under contention. The driver error
+    /// traits are what `sqlx::Error::Database` carries, so this is all the
+    /// classifier can ever see.
+    #[derive(Debug)]
+    struct FakePgError {
+        code: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for FakePgError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for FakePgError {}
+
+    impl sqlx::error::DatabaseError for FakePgError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.code))
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    /// BLD-2 review R4 SHOULD-FIX 4: `lock_timeout` (55P03) and
+    /// `statement_timeout` (57014) — the two cuts the lag check sets inside
+    /// its own transaction — are the same budget tripwire as the outer clock,
+    /// so through `store_err` they answer the same classified 503. The chase
+    /// must reach the postgre SQLSTATE through `StoreError::Database`
+    /// wrapping it, exactly as production store failures arrive.
+    #[test]
+    fn a_set_lock_or_statement_timeout_maps_store_err_to_the_classified_503() {
+        for (code, what) in [("55P03", "lock_timeout"), ("57014", "statement_timeout")] {
+            let err = StoreError::Database(sqlx::Error::Database(Box::new(FakePgError {
+                code,
+                message: format!("{what} fired while a chain writer held the row"),
+            })));
+            assert!(
+                matches!(
+                    super::store_err("pl-x", "upstream state row unwritable", err),
+                    ApiError::Unavailable(msg) if msg == "the orchestrator is unavailable"
+                ),
+                "{what} must be the classified 503, not the generic 500"
+            );
+        }
+    }
+
+    /// Any other storage failure — here a check-violation SQLSTATE, which is
+    /// neither of the two budget cuts — keeps `store_err`'s generic 500 with
+    /// the generic words; upstream text still never reaches the response.
+    #[test]
+    fn another_store_error_than_the_two_budget_cuts_keeps_the_generic_500() {
+        let err = StoreError::Database(sqlx::Error::Database(Box::new(FakePgError {
+            code: "23514",
+            message: "a check-violation state that is nobody's 8 s tripwire".to_owned(),
+        })));
+        assert!(
+            matches!(
+                super::store_err("pl-x", "state row unreadable", err),
+                ApiError::Internal(msg) if msg == "the request could not be completed"
+            ),
+            "a non-budget store failure keeps the generic 500"
+        );
+    }
 
     /// A reader that answers from a fixed map, so a test states the inputs
     /// it means instead of standing up `ClickHouse`/Lakekeeper. The
