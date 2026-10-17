@@ -1059,6 +1059,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/table-export", get(dashboard::table_export))
+        .route("/api/dashboard/chart-export", get(dashboard::chart_export))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route(

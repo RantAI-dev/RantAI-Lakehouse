@@ -115,6 +115,18 @@ async fn mount(ch: &MockServer, data: Vec<Value>) {
                     }],
                 }),
             ),
+            // BI-1: a raw table with a numeric column that has a value format.
+            chart_row(
+                "c_amount",
+                "table",
+                &json!({
+                    "tableMode": "rows", "columns": ["email", "amount"],
+                    "valueFormats": {
+                        "amount": { "style": "compact", "currency": "IDR", "decimals": 2 }
+                    },
+                }),
+            ),
+            chart_row("c_text", "text", &json!({ "text": "hello" })),
             chart_row(
                 "c_gone",
                 "table",
@@ -133,19 +145,28 @@ async fn mount(ch: &MockServer, data: Vec<Value>) {
             {"name": "name", "type": "String"}, {"name": "type", "type": "String"},
             {"name": "default_kind", "type": "String"}, {"name": "default_expression", "type": "String"}
         ]),
-        ["email", "region", "secret"]
+        ["email", "region", "secret", "amount"]
             .iter()
             .map(|n| json!({"name": n, "type": "String", "default_kind": "", "default_expression": ""}))
             .collect(),
     )
     .await;
-    answer(
-        ch,
-        "ORDER BY",
-        json!([{"name": "email", "type": "String"}]),
-        data,
-    )
-    .await;
+    // The rows of the file arrive as a stream: names, types, then one array a row.
+    let names: Vec<String> = data.first().and_then(Value::as_object).map_or_else(
+        || vec!["email".to_owned(), "region".to_owned()],
+        |first| first.keys().cloned().collect(),
+    );
+    let mut body = format!("{}\n{}\n", json!(names), json!(vec!["String"; names.len()]));
+    for row in &data {
+        let cells: Vec<&Value> = names.iter().map(|n| &row[n]).collect();
+        body.push_str(&json!(cells).to_string());
+        body.push('\n');
+    }
+    Mock::given(method("POST"))
+        .and(body_string_contains("JSONCompactEachRowWithNamesAndTypes"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(ch)
+        .await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
@@ -262,7 +283,7 @@ async fn the_export_writes_every_visible_column_masked_filtered_sorted_and_audit
         "tile sort: {}",
         sent[0]
     );
-    assert!(sent[0].contains("LIMIT 100001"), "{}", sent[0]);
+    assert!(sent[0].contains("LIMIT 1000001"), "{}", sent[0]);
     assert!(
         sent[0].starts_with("SELECT email, region FROM"),
         "a hidden column is not selected: {}",
@@ -470,12 +491,16 @@ fn urlencoding_free(raw: &str) -> String {
         .collect()
 }
 
+/// `BI-1` T2 (feature decision 8): the cap is a million rows now; a result
+/// below it is not cut and says what the cap is. The cut itself (1,000,001
+/// generated rows) is proved against the writer in `export.rs`, because a mock
+/// engine answering a million lines would only measure the mock.
 #[tokio::test]
-async fn a_result_beyond_the_cap_is_cut_at_100000_and_says_so() {
+async fn the_cap_is_a_million_rows_and_a_smaller_result_is_not_cut() {
     let ch = MockServer::start().await;
     mount(
         &ch,
-        (0..100_001)
+        (0..1_000)
             .map(|i| json!({"email": format!("e{i}"), "region": "r"}))
             .collect(),
     )
@@ -483,22 +508,22 @@ async fn a_result_beyond_the_cap_is_cut_at_100000_and_says_so() {
     let (router, pool, cookie) = app(&ch).await;
     let resp = get(&router, "/api/dashboard/table-export?chart=c_rows", &cookie).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers()["x-export-rows"], "100000");
-    assert_eq!(resp.headers()["x-export-cut"], "true");
-    assert_eq!(resp.headers()["x-export-cap"], "100000");
+    assert_eq!(resp.headers()["x-export-rows"], "1000");
+    assert_eq!(resp.headers()["x-export-cut"], "false");
+    assert_eq!(resp.headers()["x-export-cap"], "1000000");
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(
         body.windows(2).filter(|w| w == b"\r\n").count(),
-        100_001,
-        "header + 100000 rows"
+        1_001,
+        "header + 1000 rows"
     );
     let args: Value =
         sqlx::query_scalar("SELECT args FROM audit_event WHERE action = 'dashboard.table_export'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(args["cut"], true);
-    assert_eq!(args["rows"], 100_000);
+    assert_eq!(args["cut"], false);
+    assert_eq!(args["rows"], 1_000);
 }
 
 #[tokio::test]
@@ -617,4 +642,226 @@ async fn a_person_whose_every_role_is_switched_off_cannot_export() {
     let cookie = session_cookie_for_user(&pool, user).await;
     let resp = get(&router, "/api/dashboard/table-export?chart=c_rows", &cookie).await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// `BI-1` T2: a masked column is masked in the Excel file, the number column
+/// stays a number in the cell with the chart's number format, and the same
+/// tile as "formatted" CSV holds the text the chart shows. Audited with the
+/// file kind and the value mode.
+#[tokio::test]
+async fn the_excel_download_is_masked_keeps_numbers_as_numbers_and_is_audited() {
+    use std::io::Read;
+
+    let ch = MockServer::start().await;
+    mount(&ch, vec![json!({"email": "***", "amount": 1_234_567})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+    governance::create_policy(
+        &pool,
+        &CreatePolicyInput {
+            name: "xlsx-mask".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "Exporter".to_owned(),
+            resources: "serving.mart_x".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            conditions: Some(
+                r#"{"roles":["Exporter"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+            ),
+            activate: true,
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = get(
+        &router,
+        "/api/dashboard/chart-export?chart=c_amount&format=xlsx&values=formatted",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers().clone();
+    assert_eq!(
+        h["content-type"],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    assert_eq!(
+        h["content-disposition"],
+        "attachment; filename=\"Visits-by-place.xlsx\""
+    );
+    assert_eq!(h["x-export-rows"], "1");
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(h["content-length"], bytes.len().to_string().as_str());
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let mut sheet = String::new();
+    zip.by_name("xl/worksheets/sheet1.xml")
+        .unwrap()
+        .read_to_string(&mut sheet)
+        .unwrap();
+    assert!(sheet.contains("<v>1234567</v>"), "a number cell: {sheet}");
+    let mut styles = String::new();
+    zip.by_name("xl/styles.xml")
+        .unwrap()
+        .read_to_string(&mut styles)
+        .unwrap();
+    assert!(
+        styles.contains("IDR "),
+        "the chart's number format: {styles}"
+    );
+
+    let sent: Vec<String> = statements(&ch)
+        .await
+        .into_iter()
+        .filter(|s| s.contains("serving.mart_x") && !s.contains("system."))
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("replaceRegexpOne(toString(`email`)"),
+        "the mask is in the statement that fed the file: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("JSONCompactEachRowWithNamesAndTypes"),
+        "{}",
+        sent[0]
+    );
+
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT action, args FROM audit_event WHERE action = 'dashboard.chart_export' ORDER BY at",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1["format"], "xlsx");
+    assert_eq!(rows[0].1["values"], "formatted");
+    assert_eq!(rows[0].1["rows"], 1);
+}
+
+/// `BI-1` T2: the same tile as CSV holds the text the chart shows when
+/// "formatted" and the plain digits when "raw".
+#[tokio::test]
+async fn the_csv_download_is_formatted_or_raw_as_asked() {
+    let ch = MockServer::start().await;
+    mount(&ch, vec![json!({"email": "***", "amount": 1_234_567})]).await;
+    let (router, _pool, cookie) = app(&ch).await;
+    let resp = get(
+        &router,
+        "/api/dashboard/chart-export?chart=c_amount&format=csv&values=formatted",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text, "\u{feff}email,amount\r\n***,IDR 1.23 M\r\n");
+    let raw = get(
+        &router,
+        "/api/dashboard/chart-export?chart=c_amount&format=csv&values=raw",
+        &cookie,
+    )
+    .await;
+    let text = String::from_utf8(
+        to_bytes(raw.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text, "\u{feff}email,amount\r\n***,1234567\r\n");
+}
+
+/// `BI-1` T2: a grouped chart downloads its own result through the statement
+/// the tile reads; a text tile, an unknown format and a switched-off role are
+/// refused and nothing is audited.
+#[tokio::test]
+async fn a_grouped_chart_downloads_and_the_refusals_read_and_audit_nothing() {
+    let ch = MockServer::start().await;
+    // The all-marts column read comes first so it wins over the generic answer.
+    answer(
+        &ch,
+        "SELECT table, name, type FROM system.columns",
+        json!([
+            {"name": "table", "type": "String"}, {"name": "name", "type": "String"},
+            {"name": "type", "type": "String"}
+        ]),
+        ["email", "region", "secret"]
+            .iter()
+            .map(|n| json!({"table": "mart_x", "name": n, "type": "String"}))
+            .collect(),
+    )
+    .await;
+    mount(&ch, vec![json!({"region": "north", "email": 3})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+    let resp = get(
+        &router,
+        "/api/dashboard/chart-export?chart=c_bar&format=csv&values=raw",
+        &cookie,
+    )
+    .await;
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text, "\u{feff}region,email\r\nnorth,3\r\n");
+    let sent = statements(&ch).await;
+    assert!(
+        sent.iter()
+            .any(|s| s.contains("SELECT stored") && s.contains("JSONCompactEachRow")),
+        "the statement the tile stores, streamed: {sent:?}"
+    );
+
+    for (uri, status) in [
+        (
+            "/api/dashboard/chart-export?chart=c_text&format=csv",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/dashboard/chart-export?chart=c_bar&format=pdf",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/dashboard/chart-export?chart=c_bar&values=rounded",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/dashboard/chart-export?chart=nope&format=csv",
+            StatusCode::NOT_FOUND,
+        ),
+        ("/api/dashboard/chart-export", StatusCode::BAD_REQUEST),
+    ] {
+        let resp = get(&router, uri, &cookie).await;
+        assert_eq!(resp.status(), status, "{uri}");
+    }
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
+         VALUES (TRUE, 'UTC', 'monday', ARRAY['Exporter'])",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let resp = get(
+        &router,
+        "/api/dashboard/chart-export?chart=c_bar&format=xlsx",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_event WHERE action = 'dashboard.chart_export'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1, "only the download that was handed over");
 }

@@ -21,6 +21,7 @@ mod connector_secret_store;
 mod csv_export;
 mod csv_safe;
 mod error;
+mod export;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;

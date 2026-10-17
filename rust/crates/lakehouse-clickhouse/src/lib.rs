@@ -290,6 +290,145 @@ impl ChClient {
         };
         run_cancellable(fut, cancel).await
     }
+
+    /// Run `sql` and hand the rows back one at a time, without holding the
+    /// result (`BI-1` D6, a download of up to a million rows).
+    ///
+    /// The statement gets `FORMAT JSONCompactEachRowWithNamesAndTypes`: a
+    /// line of column names, a line of column types, then one JSON array per
+    /// row. (Not `JSONEachRow`: an empty result still has its header, so a file
+    /// of no rows still has its column names, and a row is an ordered array, so
+    /// two columns with one name do not collapse.) The request has its own
+    /// `timeout` in place of the client's 60 seconds, which would cut a big
+    /// download short; the body is read as it arrives. Dropping the returned
+    /// [`RowStream`] closes the connection, and `ClickHouse` stops the query.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] on a network failure, [`ChError::Server`] on a
+    /// non-2xx status or when the header lines are not what the format promises.
+    pub async fn query_stream(
+        &self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<RowStream, ChError> {
+        let body = format!(
+            "{}\nFORMAT JSONCompactEachRowWithNamesAndTypes",
+            strip_trailing_semicolon(sql)
+        );
+        let response = self
+            .client
+            .post(&self.url)
+            .basic_auth(&self.user, Some(&self.password))
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CACHE_CONTROL, "no-store")
+            .timeout(timeout)
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await?;
+            return Err(ChError::Server(server_error_message(status, &text)));
+        }
+        let mut stream = RowStream {
+            response,
+            buffer: Vec::new(),
+            finished: false,
+            names: Vec::new(),
+            types: Vec::new(),
+        };
+        let names = stream.next_line().await?;
+        let types = stream.next_line().await?;
+        stream.names = header_strings(names.as_deref())?;
+        stream.types = header_strings(types.as_deref())?;
+        Ok(stream)
+    }
+}
+
+/// The longest line a [`RowStream`] buffers. One row of a table of text
+/// columns is far below it; a body with no line break past it is not rows.
+const MAX_STREAM_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// A `ClickHouse` result read line by line (see [`ChClient::query_stream`]).
+pub struct RowStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    finished: bool,
+    names: Vec<String>,
+    types: Vec<String>,
+}
+
+/// A header line: a JSON array of strings.
+fn header_strings(line: Option<&[u8]>) -> Result<Vec<String>, ChError> {
+    line.and_then(|l| serde_json::from_slice::<Vec<String>>(l).ok())
+        .ok_or_else(|| ChError::Server("the result stream has no header".to_owned()))
+}
+
+impl RowStream {
+    /// The column names, in the order a row lists its values.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The column types (`Int64`, `Nullable(String)`, ...), same order.
+    #[must_use]
+    pub fn types(&self) -> &[String] {
+        &self.types
+    }
+
+    /// The next row, or `None` at the end of the result.
+    ///
+    /// # Errors
+    ///
+    /// [`ChError::Transport`] when the connection fails or times out
+    /// mid-result; [`ChError::Server`] when a line is not a JSON array (the
+    /// engine writes an error into the body when it fails after it began to
+    /// answer, so a truncated result is never taken for a complete one).
+    pub async fn next_row(&mut self) -> Result<Option<Vec<Value>>, ChError> {
+        let Some(line) = self.next_line().await? else {
+            return Ok(None);
+        };
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Array(row)) => Ok(Some(row)),
+            _ => Err(ChError::Server(
+                "the result stream broke off or held a line that is not a row".to_owned(),
+            )),
+        }
+    }
+
+    /// The next non-empty line without its line break.
+    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, ChError> {
+        loop {
+            if let Some(at) = self.buffer.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=at).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                return Ok(Some(line));
+            }
+            if self.finished {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(std::mem::take(&mut self.buffer)));
+            }
+            if self.buffer.len() > MAX_STREAM_LINE_BYTES {
+                return Err(ChError::Server(
+                    "a line of the result is too long".to_owned(),
+                ));
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => self.buffer.extend_from_slice(&chunk),
+                None => self.finished = true,
+            }
+        }
+    }
 }
 
 /// Race `fut` against `cancel` being cancelled, when a token is supplied.
@@ -692,5 +831,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChError::Server(msg) if msg.contains("Unknown identifier")));
+    }
+
+    #[tokio::test]
+    async fn query_stream_reads_the_header_then_one_row_per_line() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "FORMAT JSONCompactEachRowWithNamesAndTypes",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "[\"a\",\"b\"]\n[\"Int64\",\"String\"]\n[1,\"x\"]\n[2,null]\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let mut rows = client(&server.uri())
+            .query_stream("SELECT 1;", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rows.names(), ["a", "b"]);
+        assert_eq!(rows.types(), ["Int64", "String"]);
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(vec![serde_json::json!(1), serde_json::json!("x")])
+        );
+        assert_eq!(
+            rows.next_row().await.unwrap(),
+            Some(vec![serde_json::json!(2), Value::Null])
+        );
+        assert_eq!(rows.next_row().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn query_stream_of_an_empty_result_still_has_its_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[\"a\"]\n[\"Int64\"]\n"))
+            .mount(&server)
+            .await;
+        let mut rows = client(&server.uri())
+            .query_stream("SELECT 1", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rows.names(), ["a"]);
+        assert_eq!(rows.next_row().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn query_stream_reports_a_server_error_and_a_line_that_is_not_a_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("bad"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Code: 62. DB::Exception"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    "[\"a\"]\n[\"Int64\"]\n[1]\nCode: 241. DB::Exception: memory\n",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let c = client(&server.uri());
+        assert!(matches!(
+            c.query_stream("SELECT bad", std::time::Duration::from_secs(5))
+                .await,
+            Err(ChError::Server(_))
+        ));
+        let mut rows = c
+            .query_stream("SELECT 1", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(rows.next_row().await.unwrap().is_some());
+        assert!(matches!(rows.next_row().await, Err(ChError::Server(_))));
     }
 }

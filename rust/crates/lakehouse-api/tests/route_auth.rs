@@ -1833,6 +1833,35 @@ async fn the_table_export_needs_dashboard_read_and_not_query_read() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// BI-1 (D6): the chart download needs `dashboard:read` and nothing more,
+/// and not the Query Studio permission. Both ways, as for the table export.
+#[tokio::test]
+async fn the_chart_export_needs_dashboard_read_and_not_query_read() {
+    let TestApp { router, pool } = spin_up().await;
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "GET" && *p == "/api/dashboard/chart-export")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::RequiresPermission("dashboard:read"))
+    );
+    let uri = "/api/dashboard/chart-export?chart=x&format=xlsx";
+    let viewer = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let cookie = common::session_cookie_for_user(&pool, viewer).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert!(
+        resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+        "a dashboard viewer must get past the gate, got {}",
+        resp.status()
+    );
+    let analyst = common::create_principal_with_permissions(&pool, "query:read").await;
+    let cookie = common::session_cookie_for_user(&pool, analyst).await;
+    let resp = request_with_cookie(&router, "GET", uri, &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = request_with_cookie(&router, "GET", uri, "").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// BI-7: the join suggestions need `dashboard:read` and nothing more. Asserted
 /// both ways: a principal holding only `dashboard:read` gets past the gate, one
 /// holding only `query:read` is refused.

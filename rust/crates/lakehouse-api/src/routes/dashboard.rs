@@ -2731,19 +2731,11 @@ fn rows_statements(
     ))
 }
 
-// ── /api/dashboard/table-export (BI-16 part A, T8) ───────────────────────
+// ── /api/dashboard/chart-export and /table-export (BI-16 part A, T8; BI-1 T2) ──
 
-/// The most rows a whole-result export writes (owner's decision, BI-16A
-/// addendum). One more is read so a result of exactly this size is not
-/// reported as cut.
-const EXPORT_ROW_CAP: u32 = 100_000;
-
-/// Over a SQL source `ClickHouse` itself returns at most 2 000 rows
-/// ([`lakehouse_bi::builder::SQL_SOURCE_SETTINGS`]); the cap is one below so
-/// the probe row still fits and a cut is seen, not hidden by the engine.
-const EXPORT_SQL_SOURCE_ROW_CAP: u32 = 1_999;
-
-/// Query parameters for `GET /api/dashboard/table-export`.
+/// Query parameters for `GET /api/dashboard/table-export`, the older route
+/// (CSV, raw values, a raw table only). It runs the same code as
+/// `chart-export` with those three things fixed.
 #[derive(Debug, Default, Deserialize)]
 pub struct TableExportQuery {
     /// The raw-table tile to export (its stored definition decides the
@@ -2765,9 +2757,59 @@ pub struct TableExportQuery {
     params: Option<String>,
 }
 
+/// Query parameters for `GET /api/dashboard/chart-export` (`BI-1`, D6): the
+/// tile, the file kind, and everything the dashboard page itself sends to read
+/// the tile, so the file holds the rows the viewer saw (no second encoding).
+#[derive(Debug, Default, Deserialize)]
+pub struct ChartExportQuery {
+    /// The tile to download.
+    #[serde(default)]
+    chart: Option<String>,
+    /// `xlsx` or `csv` (default `csv`).
+    #[serde(default)]
+    format: Option<String>,
+    /// `formatted` (default) or `raw`.
+    #[serde(default)]
+    values: Option<String>,
+    /// The dashboard's active filters (JSON list), as `GET /api/dashboard`.
+    #[serde(default)]
+    filters: Option<String>,
+    /// The sort the viewer chose on a raw table, in place of the saved one.
+    #[serde(default, rename = "sortColumn")]
+    sort_column: Option<String>,
+    #[serde(default, rename = "sortDir")]
+    sort_dir: Option<String>,
+    /// The parameter values the tile was drawn with (JSON object).
+    #[serde(default)]
+    params: Option<String>,
+    /// The year list a built-in dashboard filters by (`1,2`), as `GET /api/dashboard`.
+    #[serde(default)]
+    year: Option<String>,
+    /// The grain switch, as `GET /api/dashboard`.
+    #[serde(default)]
+    grain: Option<String>,
+}
+
+impl From<TableExportQuery> for ChartExportQuery {
+    fn from(q: TableExportQuery) -> Self {
+        Self {
+            chart: q.chart,
+            format: Some("csv".to_owned()),
+            values: Some("raw".to_owned()),
+            filters: q.filters,
+            sort_column: q.sort_column,
+            sort_dir: q.sort_dir,
+            params: q.params,
+            year: None,
+            grain: None,
+        }
+    }
+}
+
 /// A file name from a tile's title: letters, digits, `-` and `_` only, so it
-/// can sit in a `Content-Disposition` header unquoted-safe.
-fn export_file_name(title: &str) -> String {
+/// can sit in a `Content-Disposition` header unquoted-safe. A file that was
+/// cut at the row cap says so in its name (feature decision 8).
+fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
     let slug: String = title
         .trim()
         .chars()
@@ -2784,14 +2826,25 @@ fn export_file_name(title: &str) -> String {
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    format!(
-        "{}.csv",
-        if slug.is_empty() {
-            "table"
-        } else {
-            slug.as_str()
-        }
-    )
+    let slug = if slug.is_empty() {
+        "table"
+    } else {
+        slug.as_str()
+    };
+    match cut_at {
+        Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
+        None => format!("{slug}.{extension}"),
+    }
+}
+
+/// What one download did, for the audit record.
+struct ExportOutcome {
+    action: &'static str,
+    rows: usize,
+    cut: bool,
+    cap: u32,
+    format: crate::export::FileFormat,
+    values: crate::export::Values,
 }
 
 /// The audit entry of one export, written before the file is returned: an
@@ -2800,7 +2853,7 @@ async fn record_export_audit(
     state: &AppState,
     principal: &Principal,
     chart: &StoredChartSpec,
-    (rows, cut, cap): (usize, bool, u32),
+    outcome: &ExportOutcome,
 ) -> Result<(), ApiError> {
     let pool = state
         .pg
@@ -2810,15 +2863,17 @@ async fn record_export_audit(
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
         actor_label: Some(principal.display_name.clone()),
-        action: "dashboard.table_export".to_owned(),
+        action: outcome.action.to_owned(),
         resource_kind: Some("dashboard_tile".to_owned()),
         resource_id: Some(chart.spec.id.clone()),
         args: Some(json!({
             "board": chart.board,
             "tile": chart.spec.id,
-            "rows": rows,
-            "cut": cut,
-            "cap": cap,
+            "rows": outcome.rows,
+            "cut": outcome.cut,
+            "cap": outcome.cap,
+            "format": outcome.format.extension(),
+            "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
         })),
         outcome: "executed".to_owned(),
         ..lakehouse_store::audit::NewAuditEvent::default()
@@ -2857,16 +2912,16 @@ fn export_columns(chart: &StoredChartSpec) -> (Vec<String>, Vec<String>) {
     (shown, labels)
 }
 
-/// The statement of an export and the row cap it was built for: the tile's
-/// visible columns, its saved sort or the viewer's, the dashboard's filters,
-/// and one row more than the cap so a cut is seen.
+/// The statement of a raw-table export: the tile's visible columns, its saved
+/// sort or the viewer's, the dashboard's filters, and one row more than the
+/// cap so a cut is seen.
 fn export_statement(
     chart: &StoredChartSpec,
     relation: &RecordsRelation,
-    q: &TableExportQuery,
+    q: &ChartExportQuery,
     (shown, filters): (&[String], &[FilterDef]),
     time: &TimeContext,
-) -> Result<(String, u32), ApiError> {
+) -> Result<String, ApiError> {
     let chosen_sort = q.sort_column.clone().filter(|c| !c.is_empty());
     let fields = lakehouse_bi::tables::TableFields {
         columns: Some(shown.to_vec()),
@@ -2882,83 +2937,25 @@ fn export_statement(
     };
     let known: HashSet<String> = relation.cols.keys().cloned().collect();
     let plan = lakehouse_bi::tables::plan_rows(&fields, &known).map_err(ApiError::BadRequest)?;
-    let cap = if chart.def.sql_source.is_some() {
-        EXPORT_SQL_SOURCE_ROW_CAP
-    } else {
-        EXPORT_ROW_CAP
-    };
-    let statement = lakehouse_bi::builder::rows_page_sql(
+    Ok(lakehouse_bi::builder::rows_page_sql(
         &relation.from,
         &relation.cols,
         filters,
         &plan,
-        (cap + 1, 0),
+        (crate::export::EXPORT_ROW_CAP + 1, 0),
         time,
     )
-    .rows;
-    Ok((statement, cap))
+    .rows)
 }
 
-/// `GET /api/dashboard/table-export?chart=` — every row of a raw table's
-/// result as a CSV file (`BI-16` part A, T8).
-///
-/// The statement is the tile's own ([`lakehouse_bi::builder::rows_page_sql`]):
-/// the tile's visible columns in order, the dashboard's filters, the saved
-/// sort or the one the viewer chose, read through the same guard and role
-/// rewrite as a tile (`rewrite_sql_for_roles`), so masks and row filters apply
-/// to the file. Values are the engine's raw values; headers are the columns'
-/// labels. At most [`EXPORT_ROW_CAP`] rows are written; the response says
-/// whether it was cut (`X-Export-Cut`) and how many rows it holds
-/// (`X-Export-Rows`), so the console can tell the person.
-///
-/// Needs `dashboard:read` (whoever can see the tile may export it; owner's
-/// decision, 2026-10-11) and is not offered to embeds or public links. Every
-/// export is written to the audit trail before the file is returned, and an
-/// audit store that cannot be written refuses the export.
-///
-/// Response headers follow Query Studio's download (`Content-Type`,
-/// `Content-Disposition: attachment`); the body is built in memory like that
-/// one, bounded by the row cap. The raw-bytes response bypasses `ApiJson`
-/// because the body is a file, not a JSON value.
-///
-/// # Errors
-///
-/// 400 for a missing or non-raw-table `chart`, bad filters or sort; 404 for an
-/// unknown tile; 403 when every role of the person is switched off from
-/// downloading (`BI-1` D7); 422 when the role rewrite refuses or the engine rejects the
-/// statement; 503 when the engine or the audit store is unavailable.
-pub async fn table_export(
-    State(state): State<AppState>,
-    Extension(principal): Extension<Principal>,
-    Query(q): Query<TableExportQuery>,
-) -> ApiResult<Response> {
-    crate::routes::settings::require_download(&state, &principal).await?;
-    let ch = &state.clickhouse;
-    let chart_id = q
-        .chart
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let stored = store::list_stored_charts(ch, &viewer_of(&principal))
-        .await
-        .map_err(|err| classify_dashboard_ch_error(&err))?;
-    let chart = stored
-        .iter()
-        .find(|c| c.spec.id == chart_id)
-        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
-    if !chart.def.tables.is_rows_mode(chart.spec.kind) {
-        return Err(ApiError::BadRequest(
-            "only a table in rows mode can be exported this way".to_owned(),
-        )
-        .into());
-    }
-    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    // BI-18 part C: a filter tied to another tab is not in this tile's file.
-    let dashboard_filters = filters_for_chart_tab(ch, chart, dashboard_filters).await;
-    let time = crate::routes::settings::time_context(&state).await?;
-    let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
-    let time = time.with_params(loaded.values);
+/// The statement of a raw table's rows, with the labels of its columns.
+async fn rows_export_statement(
+    ch: &ChClient,
+    chart: &StoredChartSpec,
+    q: &ChartExportQuery,
+    dashboard_filters: Vec<FilterDef>,
+    time: &TimeContext,
+) -> Result<(String, HashMap<String, String>), ApiError> {
     let relation_query = RecordsQuery {
         mart: Some(chart.def.mart.clone()),
         sql_source: chart.def.sql_source.clone(),
@@ -2975,11 +2972,274 @@ pub async fn table_export(
     )
     .await?;
     let own = own.as_slice();
-    let relation = with_calculated_columns(ch, relation, (&relation_query, own), &time).await?;
-    let filters = with_chart_filters(own, dashboard_filters, &relation.cols, &time)?;
-
+    let relation = with_calculated_columns(ch, relation, (&relation_query, own), time).await?;
+    let filters = with_chart_filters(own, dashboard_filters, &relation.cols, time)?;
     let (shown, labels) = export_columns(chart);
-    let (statement, cap) = export_statement(chart, &relation, &q, (&shown, &filters), &time)?;
+    let statement = export_statement(chart, &relation, q, (&shown, &filters), time)?;
+    Ok((statement, shown.into_iter().zip(labels).collect()))
+}
+
+/// The statement a grouped tile (a chart, a pivot, a summary table, a KPI)
+/// reads, built the way `GET /api/dashboard` builds it for that tile, so the
+/// file holds what the tile shows. The tile's own row limit stays: a grouped
+/// chart exports its own result (feature decision 8).
+async fn grouped_export_statement(
+    ch: &ChClient,
+    (viewer, chart): (&Viewer, &StoredChartSpec),
+    q: &ChartExportQuery,
+    filters: &[FilterDef],
+    time: &TimeContext,
+) -> Result<String, ApiError> {
+    let years: Vec<i64> = q
+        .year
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    let board_id = if chart.board.is_empty() {
+        store::DEFAULT_BOARD_ID
+    } else {
+        chart.board.as_str()
+    };
+    let board = store::get_board(ch, board_id, viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let saved_grain = board
+        .as_ref()
+        .and_then(|b| b.grain.as_deref())
+        .and_then(Grain::parse)
+        .filter(|g| g.is_truncation());
+    let grain = match parse_grain_request(q.grain.as_deref())? {
+        GrainRequest::Switch(g) => Some(g),
+        GrainRequest::Own => None,
+        GrainRequest::Saved => saved_grain,
+    };
+    let fields = lakehouse_bi::fields::list_catalog_fields(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let fields = lakehouse_bi::fields::FieldCatalog::from_fields(fields);
+    let cols = mart_columns(ch)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let sources = sources_for(ch, std::iter::once(chart))
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let read = ReadContext {
+        time,
+        grain,
+        fields: &fields,
+    };
+    let effective = effective_chart(chart, &cols, &sources, &read).map_err(ApiError::BadRequest)?;
+    stored_chart_sql(&effective, &years, filters, &cols, &sources, &read)
+        .map(|filtered| filtered.sql)
+        .map_err(|message| ApiError::Unprocessable(message.to_owned()))
+}
+
+/// The header of each column and the value format of each, by column name.
+///
+/// A column's format is the chart's per-value one; a numeric column without
+/// one takes the chart's default format unless it is the tile's dimension or
+/// breakdown (a year or an id is not an amount). A metric's saved hint is not
+/// read here: the file has the chart's formats only.
+fn export_labels_and_formats(
+    chart: &StoredChartSpec,
+    labels: HashMap<String, String>,
+    names: &[String],
+    types: &[String],
+) -> (
+    HashMap<String, String>,
+    HashMap<String, lakehouse_bi::style::ValueFormat>,
+) {
+    let style = &chart.def.style;
+    let mut formats = HashMap::new();
+    for (i, name) in names.iter().enumerate() {
+        if let Some(f) = style.value_formats.get(name) {
+            formats.insert(name.clone(), f.clone());
+            continue;
+        }
+        let numeric = types.get(i).is_some_and(|t| is_numeric_type(t));
+        let is_axis = *name == chart.def.dimension || chart.def.breakdown.as_deref() == Some(name);
+        if let (true, false, Some(f)) = (numeric, is_axis, &style.format) {
+            formats.insert(name.clone(), f.clone());
+        }
+    }
+    (labels, formats)
+}
+
+/// The download response: the file streamed from disk, with the counts the
+/// console tells the person (`X-Export-Rows`, `X-Export-Cut`, `X-Export-Cap`).
+/// The body is a file, not a JSON value, so it bypasses `ApiJson`.
+fn export_response(
+    written: crate::export::Written,
+    file_name: &str,
+    format: crate::export::FileFormat,
+    cap: u32,
+) -> Response {
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(written.file));
+    (
+        [
+            (header::CONTENT_TYPE, format.content_type().to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{file_name}\""),
+            ),
+            (header::CONTENT_LENGTH, written.len.to_string()),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                header::HeaderName::from_static("x-export-rows"),
+                written.rows.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-export-cut"),
+                written.cut.to_string(),
+            ),
+            (
+                header::HeaderName::from_static("x-export-cap"),
+                cap.to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A failure of the file itself, reported under a reference with a fixed
+/// sentence (SEC-11).
+fn export_failure(err: &crate::export::ExportError) -> ApiError {
+    match err {
+        crate::export::ExportError::Source(ch) => classify_dashboard_ch_error(ch),
+        other => upstream_error::internal_error(&upstream_error::SERVICE, other),
+    }
+}
+
+/// `GET /api/dashboard/chart-export?chart=&format=&values=` — the whole result
+/// of a tile as an Excel or CSV file (`BI-1`, D6).
+///
+/// The statement is the tile's own: a raw table's rows
+/// ([`lakehouse_bi::builder::rows_page_sql`], up to
+/// [`crate::export::EXPORT_ROW_CAP`] rows, also over a SQL source), or what
+/// `GET /api/dashboard` runs for a grouped tile. Either is read through the
+/// same role rewrite as a tile (`rewrite_sql_for_roles`), so masks and row
+/// filters apply to the file. Rows are streamed from the engine into a file
+/// on disk (`crate::export`), then the file is streamed to the client.
+///
+/// Needs `dashboard:read` and a role that is not switched off from
+/// downloading (D7); is not offered to embeds or public links. Every download
+/// is written to the audit trail before the file is returned, and an audit
+/// store that cannot be written refuses the download (D8).
+///
+/// # Errors
+///
+/// 400 for a missing `chart`, an unknown `format`/`values`, a tile with no
+/// data, bad filters or sort; 403 when every role of the person is switched
+/// off from downloading; 404 for an unknown tile; 422 when the role rewrite
+/// refuses or the engine rejects the statement; 503 when the engine or the
+/// audit store is unavailable.
+pub async fn chart_export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<ChartExportQuery>,
+) -> ApiResult<Response> {
+    export_chart(&state, &principal, &q, "dashboard.chart_export", false).await
+}
+
+/// `GET /api/dashboard/table-export?chart=` — [`chart_export`] fixed to a raw
+/// table, as CSV, with raw values (`BI-16` part A, T8).
+///
+/// # Errors
+///
+/// As [`chart_export`]; 400 also for a tile that is not a raw table.
+pub async fn table_export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<TableExportQuery>,
+) -> ApiResult<Response> {
+    export_chart(
+        &state,
+        &principal,
+        &q.into(),
+        "dashboard.table_export",
+        true,
+    )
+    .await
+}
+
+/// The tile a download is for and the statement that reads it, before the
+/// role rewrite: found through the viewer's own reads (a tile in the trash or
+/// in somebody else's personal space does not exist), refused when it holds
+/// no data, or is not a raw table for the older route.
+async fn export_tile_statement(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    rows_only: bool,
+) -> Result<(StoredChartSpec, String, HashMap<String, String>), ApiError> {
+    let ch = &state.clickhouse;
+    let chart_id = q
+        .chart
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
+    let viewer = viewer_of(principal);
+    let chart = store::list_stored_charts(ch, &viewer)
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?
+        .into_iter()
+        .find(|c| c.spec.id == chart_id)
+        .ok_or_else(|| ApiError::NotFound("this tile does not exist".to_owned()))?;
+    if chart.spec.kind.is_static() {
+        return Err(ApiError::BadRequest(
+            "this tile shows no data, so there is nothing to download".to_owned(),
+        ));
+    }
+    let rows_mode = chart.def.tables.is_rows_mode(chart.spec.kind);
+    if rows_only && !rows_mode {
+        return Err(ApiError::BadRequest(
+            "only a table in rows mode can be exported this way".to_owned(),
+        ));
+    }
+    let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    // BI-18 part C: a filter tied to another tab is not in this tile's file.
+    let dashboard_filters = filters_for_chart_tab(ch, &chart, dashboard_filters).await;
+    let time = crate::routes::settings::time_context(state).await?;
+    let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
+    let time = time.with_params(loaded.values);
+    let (statement, labels) = if rows_mode {
+        rows_export_statement(ch, &chart, q, dashboard_filters, &time).await?
+    } else {
+        let statement =
+            grouped_export_statement(ch, (&viewer, &chart), q, &dashboard_filters, &time).await?;
+        (statement, HashMap::new())
+    };
+    // D6: a SQL source's 2 000-row cap is a tile's; a download reads up to the cap.
+    let statement =
+        lakehouse_bi::builder::with_export_settings(&statement, crate::export::EXPORT_ROW_CAP + 1);
+    Ok((chart, statement, labels))
+}
+
+async fn export_chart(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    action: &'static str,
+    rows_only: bool,
+) -> ApiResult<Response> {
+    use crate::export::{FileFormat, Values};
+
+    crate::routes::settings::require_download(state, principal).await?;
+    let format = q
+        .format
+        .as_deref()
+        .map_or(Some(FileFormat::Csv), FileFormat::parse)
+        .ok_or_else(|| ApiError::BadRequest("format must be xlsx or csv.".to_owned()))?;
+    let values = q
+        .values
+        .as_deref()
+        .map_or(Some(Values::Formatted), Values::parse)
+        .ok_or_else(|| ApiError::BadRequest("values must be formatted or raw.".to_owned()))?;
+    let (chart, statement, labels) = export_tile_statement(state, principal, q, rows_only).await?;
 
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -2989,7 +3249,7 @@ pub async fn table_export(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations = PolicyEngineObligations::from_state(&state);
+    let obligations = PolicyEngineObligations::from_state(state);
     let rewritten = crate::policy_engine::rewrite_sql_for_roles(
         &statement,
         &sqlparser::dialect::ClickHouseDialect {},
@@ -3001,56 +3261,52 @@ pub async fn table_export(
     .map_err(|err| {
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })?;
-    let result = ch
-        .query(&rewritten, None)
+    let mut stream = state
+        .clickhouse
+        .query_stream(&rewritten, crate::export::EXPORT_TIMEOUT)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
-
-    let cut = result.data.len() > cap as usize;
-    let rows: Vec<Map<String, Value>> = result.data.iter().take(cap as usize).cloned().collect();
-    let body = crate::csv_export::write_csv(&labels, &shown, &rows);
-
-    record_export_audit(&state, &principal, chart, (rows.len(), cut, cap)).await?;
-
-    Ok(export_response(
-        body,
-        &export_file_name(&chart.spec.title),
-        (rows.len(), cut, cap),
-    ))
-}
-
-/// The CSV response of an export: the file, its name, and the counts the
-/// console tells the person (`X-Export-Rows`, `X-Export-Cut`, `X-Export-Cap`).
-/// The raw-bytes response bypasses `ApiJson` because the body is a file.
-fn export_response(
-    body: String,
-    file_name: &str,
-    (rows, cut, cap): (usize, bool, u32),
-) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{file_name}\""),
-            ),
-            (header::CACHE_CONTROL, "no-store".to_owned()),
-            (
-                header::HeaderName::from_static("x-export-rows"),
-                rows.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-export-cut"),
-                cut.to_string(),
-            ),
-            (
-                header::HeaderName::from_static("x-export-cap"),
-                cap.to_string(),
-            ),
-        ],
-        body,
+    let (labels, formats) =
+        export_labels_and_formats(&chart, labels, stream.names(), stream.types());
+    let locale = crate::routes::settings::format_settings(state)
+        .await?
+        .number_locale;
+    let cap = crate::export::EXPORT_ROW_CAP;
+    let written = crate::export::write_export(
+        &mut stream,
+        &crate::export::ExportOptions {
+            format,
+            values,
+            cap: cap as usize,
+            locale: &locale,
+            labels: &labels,
+            formats: &formats,
+        },
     )
-        .into_response()
+    .await
+    .map_err(|err| export_failure(&err))?;
+
+    record_export_audit(
+        state,
+        principal,
+        &chart,
+        &ExportOutcome {
+            action,
+            rows: written.rows,
+            cut: written.cut,
+            cap,
+            format,
+            values,
+        },
+    )
+    .await?;
+
+    let file_name = export_file_name(
+        &chart.spec.title,
+        format.extension(),
+        written.cut.then_some(cap),
+    );
+    Ok(export_response(written, &file_name, format, cap))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
