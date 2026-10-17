@@ -138,6 +138,11 @@ pub fn resource_for(
         "arrange_board" | "save_board_filters" | "set_board_view_filters" => {
             (Some("board"), str_field("board"))
         }
+        // The look tools (`BI-17` part A) read `chart` and `board`, not `id`
+        // (merge of main into phase 3: the table was main's, written before
+        // they existed).
+        "format_chart" => (Some("chart"), str_field("chart")),
+        "set_dashboard_theme" => (Some("board"), str_field("board")),
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
             (Some("calculated_field"), str_field("id"))
         }
@@ -432,6 +437,24 @@ mod tests {
                 "{tool} must not file the write under the stray id"
             );
         }
+    }
+
+    /// The look tools name the chart or board under the arg they read
+    /// (`chart`, `board`), not `id`, so a stray `id` is not recorded.
+    #[test]
+    fn resource_for_names_the_chart_or_board_a_look_tool_changed() {
+        let mut args = Map::new();
+        args.insert("chart".to_owned(), json!("c-9"));
+        args.insert("board".to_owned(), json!("b-9"));
+        args.insert("id".to_owned(), json!("stray"));
+        assert_eq!(
+            resource_for("format_chart", &args, &json!({})),
+            (Some("chart"), Some("c-9".to_owned()))
+        );
+        assert_eq!(
+            resource_for("set_dashboard_theme", &args, &json!({})),
+            (Some("board"), Some("b-9".to_owned()))
+        );
     }
 
     #[test]
