@@ -31,6 +31,35 @@ export type Pipeline = {
   incrementalColumn?: string
   transforms?: string[]
   fbicEnabled?: boolean
+  /**
+   * BLD-1 / D1 (`pipeline_definition.run_as`): the id of the user this
+   * pipeline reads as. Every statement it runs is rewritten for that
+   * user's current permissions, so this is a governance fact, not a label.
+   *
+   * ABSENT rather than `null` when no author is recorded — the Rust side
+   * skips serializing the column when it is NULL. Absent means the pipeline
+   * does not run: an administrator must assign an author through
+   * `PUT /api/pipelines/{id}/run-as`.
+   *
+   * Only ever set on an authored pipeline, and never changed by editing
+   * the pipeline.
+   */
+  runAs?: string
+  /**
+   * The author's display name, on the DETAIL read only (the list does not
+   * join it). Present exactly when `runAs` is, and null when the row has
+   * since lost its user — so the console never has to resolve a name
+   * through `GET /api/identity/users`, which is `identity:read` and which
+   * no ordinary role holds.
+   */
+  runAsName?: string | null
+  /**
+   * The tenant this pipeline belongs to, absent when it has none
+   * (`tenant_id` is NULL until one is assigned). Decides whose membership
+   * counts when assigning a reader: the author must belong to the
+   * pipeline's own tenant.
+   */
+  tenantId?: string
 }
 
 /**
@@ -149,6 +178,20 @@ export type PipelineDetail = Omit<Pipeline, "description"> & {
    */
   orchestratorJob?: string | null
   /**
+   * Authored pipelines only: the upstream ids whose successful runs must
+   * precede this one's, exactly as `POST /api/pipelines` and
+   * `PUT /api/pipelines/{id}` take it (migration `0052`). The detail
+   * route returns it as part of the pipeline row
+   * (`routes::pipelines::authored_detail`); a Dagster job has no row and
+   * no such chain, so the key is absent for one — read it only on the
+   * edit page, which is authored by definition.
+   *
+   * `"file_ingest_job"` in this list is what makes a re-upload of the
+   * pipeline's own Bronze table run it again
+   * (`docs/core/features/uploads-feed-pipelines.md`, decision 2).
+   */
+  dependsOn?: string[]
+  /**
    * NOT part of `GET /api/pipelines/{id}`. `routes::pipelines::detail`
    * (WS4 item C1) returns no `runs` field -- runs have their own route,
    * `GET /api/pipelines/{id}/runs`, reached through `listRuns`. Declaring
@@ -195,6 +238,14 @@ export type CreatePipelineInput = {
   /** Optional ingress connector this pipeline reads through (WS4 item F5) — mirrors `Pipeline.connectorId`. */
   connectorId?: string
   description?: string
+  /**
+   * Upstream ids whose successful runs must precede this one's
+   * (migration `0052`). `"file_ingest_job"` is accepted only for a
+   * `bronze` source and means "re-upload of this table runs me again";
+   * the server refuses it otherwise
+   * (`routes::authored_pipelines::validate_per_table_upstream`).
+   */
+  dependsOn?: string[]
 }
 
 /**
@@ -222,6 +273,13 @@ export type UpdatePipelineInput = {
   schedule: string
   owner?: string
   description?: string
+  /**
+   * Replaces the stored chain; omitting it leaves the stored chain
+   * alone (`routes::authored_pipelines::UpdateBody::depends_on`, PR #57
+   * F1.8 — an absent field used to write `[]` and erase every upstream).
+   * See [`CreatePipelineInput.dependsOn`] for the `file_ingest_job` rule.
+   */
+  dependsOn?: string[]
 }
 
 /** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */
@@ -282,4 +340,17 @@ export interface PipelineService {
   deletePipeline(id: string, signal?: AbortSignal): Promise<void>
   /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
   getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
+  /**
+   * `PUT /api/pipelines/{id}/run-as` — assign the user this pipeline reads
+   * as (BLD-1 / D2). The only way `runAs` changes after create, and it is
+   * the way out of the "no author, so no run" state.
+   *
+   * Platform Admin only (`identity:write`): deciding whose permissions
+   * every future run of a row is governed by is a governance decision, not
+   * a pipeline-operation grant. Answers 204, so there is nothing to
+   * return; a 409 means the pipeline has no tenant yet (assign it one
+   * first) and a 422 that the user is not a member of the pipeline's
+   * tenant.
+   */
+  assignRunAs(id: string, userId: string, signal?: AbortSignal): Promise<void>
 }

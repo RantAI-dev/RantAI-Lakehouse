@@ -1,4 +1,4 @@
-//! The deployment's reporting settings (migrations `0070`, `0072` and `0073`): the
+//! The deployment's reporting settings (migrations `0070`, `0085` and `0086`): the
 //! report time zone, the first day of the week, and (`BI-17` part A) the
 //! number locale, the company palette and the allowed fonts, and (`BI-16`
 //! part B) the sites image and web cards may load from.
@@ -28,7 +28,7 @@ pub struct ReportingSettings {
     /// The font ids dashboards may use, a subset of the console's shipped ones.
     pub fonts: Vec<String>,
     /// The sites image and web cards may load from: `https://host[:port]`,
-    /// at most 50 (`BI-16` part B, migration `0073`).
+    /// at most 50 (`BI-16` part B, migration `0086`).
     pub content_sites: Vec<String>,
 }
 

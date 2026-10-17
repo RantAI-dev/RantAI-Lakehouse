@@ -70,12 +70,26 @@ pub enum ConfigError {
     /// would quietly refuse the hosts the operator meant to allow.
     #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
     MalformedAllowedCidrs(String),
+    /// `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set but
+    /// is not a whole number of 1 or more (`SEC-17`).
+    ///
+    /// Fails config resolution, unlike the login-throttle numbers: a limit
+    /// that silently fell back to its default would leave an operator who
+    /// meant to tighten it believing it holds (fail closed). Holds the
+    /// variable's name and the value as given.
+    #[error("{0} must be a whole number of 1 or more, got {1:?}")]
+    InvalidUploadLimit(&'static str, String),
     /// `WEBHOOK_ALLOWED_CIDRS` holds an entry that is not a network or an
     /// address (`SEC-10`). Fails config resolution for the same reason
     /// [`ConfigError::MalformedAllowedCidrs`] does: a dropped entry would
     /// quietly keep refusing the internal webhook target the operator listed.
     #[error("WEBHOOK_ALLOWED_CIDRS: {0}")]
     MalformedWebhookAllowedCidrs(String),
+    /// `SECRET_MANAGER` or the settings of the manager it names are unusable
+    /// (`SRC-12` part B). Fails config resolution: an operator who named a
+    /// manager must not get an installation that quietly has none.
+    #[error("{0}")]
+    SecretManager(#[from] crate::secret_manager::SettingsError),
     /// `AI_DEFAULT_REPLY_LANGUAGE` was set to something other than `"id"` or
     /// `"en"`.
     ///
@@ -120,6 +134,16 @@ pub enum ConfigError {
         "AI_RELEVANT_TABLES must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
     )]
     UnsupportedAiRelevantTables(String),
+    /// `CONNECTOR_TYPED_CREDENTIALS` was set to something other than `"true"`
+    /// or `"false"` (`SRC-12` decision 2).
+    ///
+    /// Fails config resolution for the same reason as
+    /// [`Self::UnsupportedAiSemanticLayer`]: a typo such as `"no"` would keep
+    /// typed credentials on for an operator who meant to turn them off.
+    #[error(
+        "CONNECTOR_TYPED_CREDENTIALS must be \"true\" or \"false\" (unset or empty means \"true\"), got {0:?}"
+    )]
+    UnsupportedConnectorTypedCredentials(String),
     /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` was set to something that is not a
     /// positive whole number (`SEC-12`).
     ///
@@ -226,6 +250,42 @@ pub struct Config {
     /// them — e.g. when it runs outside Docker, where `/run/secrets` does
     /// not exist and every stored credential would fail with a 503.
     pub connector_secrets_dir: std::path::PathBuf,
+    /// The installation key managed connector credentials are sealed with
+    /// (`CONNECTOR_SECRETS_KEY`: 32 random bytes, base64; `SRC-12` decision
+    /// 4). `None` when unset: the config still resolves (many tests and
+    /// tools do not touch credentials), but `main` refuses to start without
+    /// it and the credential store refuses every write.
+    pub connector_secrets_key: Option<String>,
+    /// The key being retired during a key change
+    /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
+    /// never seals.
+    pub connector_secrets_key_previous: Option<String>,
+    /// The installation's secret manager and how to sign in to it
+    /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
+    /// sign-in settings are secrets: this field's `Debug` prints the manager
+    /// only.
+    pub secret_manager: crate::secret_manager::SecretManagerSettings,
+    /// Whether a user may type a credential value (`CONNECTOR_TYPED_CREDENTIALS`,
+    /// default on; only the exact word `false` turns it off). Off leaves
+    /// "reference a secret in the secret manager" as the only way to give a
+    /// connector a credential (`SRC-12` decision 2).
+    pub connector_typed_credentials: bool,
+    /// The address of this product's own OAuth callback as the provider and the
+    /// person's browser reach it (`CONNECTOR_OAUTH_REDIRECT_URI`, for example
+    /// `https://console.example.com/api/connectors/oauth/callback`; `SRC-12`
+    /// part C). Operator-set, never taken from a request (the same open-redirect
+    /// reasoning as `oidc_redirect_uri`). Unset: starting an OAuth sign-in is
+    /// refused with a message that names this setting. It is also the address the
+    /// connector form shows, to be copied into the provider's app settings.
+    pub connector_oauth_redirect_uri: Option<String>,
+    /// Gate-only switch (`CONNECTOR_OAUTH_ALLOW_HTTP`, default off; only the exact
+    /// word `true` turns it on): admit `http://` token, revocation and sign-in
+    /// addresses of an `OAuth2` connector. Every address the product dials for
+    /// `OAuth2` carries a client secret or a refresh token, so `https` is the
+    /// rule; this exists so the acceptance gate (`ops/g6`) can run its own
+    /// provider on a private network without a certificate. Never set it on a
+    /// real installation. The address check (`resolve_checked`) applies either way.
+    pub connector_oauth_allow_http: bool,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -803,6 +863,22 @@ pub struct Config {
     /// task deletes them. Zero, negative, or unparseable values fall back
     /// to the default (30).
     pub auth_retention_days: u32,
+    /// Files one user may have being received, and loads one user may have
+    /// running, at once: `UPLOAD_MAX_CONCURRENT_PER_USER`, default 4
+    /// (`SEC-17`). A value that is not a whole number of 1 or more fails
+    /// config resolution ([`ConfigError::InvalidUploadLimit`]).
+    pub upload_max_concurrent_per_user: u32,
+    /// The same, for the whole installation: `UPLOAD_MAX_CONCURRENT`,
+    /// default 16 (`SEC-17`).
+    pub upload_max_concurrent: u32,
+    /// Failed connector runs in a row at which the connector is paused and
+    /// `connector_disabled` is raised (`SRC-11` decision D3), from
+    /// `CONNECTOR_AUTO_DISABLE_AFTER`. Zero, negative, or unparseable values
+    /// fall back to the default (30,
+    /// `lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER`). The gate
+    /// lowers it for its own job and says so; it is not a per-connector
+    /// setting.
+    pub connector_auto_disable_after: i32,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -903,6 +979,30 @@ impl std::fmt::Debug for Config {
             .field("webhook_test_allow_all", &self.webhook_test_allow_all)
             .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
+                "connector_secrets_key",
+                &self.connector_secrets_key.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "connector_secrets_key_previous",
+                &self
+                    .connector_secrets_key_previous
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field("secret_manager", &self.secret_manager)
+            .field(
+                "connector_typed_credentials",
+                &self.connector_typed_credentials,
+            )
+            .field(
+                "connector_oauth_redirect_uri",
+                &self.connector_oauth_redirect_uri,
+            )
+            .field(
+                "connector_oauth_allow_http",
+                &self.connector_oauth_allow_http,
+            )
+            .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
@@ -999,6 +1099,15 @@ impl std::fmt::Debug for Config {
             .field("login_failure_window_secs", &self.login_failure_window_secs)
             .field("login_lockout_secs", &self.login_lockout_secs)
             .field("auth_retention_days", &self.auth_retention_days)
+            .field(
+                "upload_max_concurrent_per_user",
+                &self.upload_max_concurrent_per_user,
+            )
+            .field("upload_max_concurrent", &self.upload_max_concurrent)
+            .field(
+                "connector_auto_disable_after",
+                &self.connector_auto_disable_after,
+            )
             .finish()
     }
 }
@@ -1052,6 +1161,24 @@ fn parse_positive_u32_or_default(env: &HashMap<String, String>, key: &str, defau
         .filter(|v| *v > 0)
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(default)
+}
+
+/// Parses `key` as a whole number of 1 or more, `default` when unset or
+/// empty (see [`truthy`]). Anything else is an error: see
+/// [`ConfigError::InvalidUploadLimit`]. Used by the two `SEC-17` upload limits.
+fn parse_limit(
+    env: &HashMap<String, String>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match truthy(env, key) {
+        None => Ok(default),
+        Some(raw) => raw
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or(ConfigError::InvalidUploadLimit(key, raw)),
+    }
 }
 
 /// `EMBED_TOKEN_MAX_LIFETIME_SECONDS` (`SEC-12`): unset or empty is the
@@ -1112,6 +1239,9 @@ impl Config {
     /// - [`ConfigError::UnsupportedAiRelevantTables`], if
     ///   `AI_RELEVANT_TABLES` is set and non-empty but is neither `true`
     ///   nor `false`.
+    /// - [`ConfigError::InvalidUploadLimit`], if
+    ///   `UPLOAD_MAX_CONCURRENT_PER_USER` or `UPLOAD_MAX_CONCURRENT` is set
+    ///   and non-empty but is not a whole number of 1 or more.
     ///
     /// An unparseable `SMTP_PORT` does NOT error — see [`Config::smtp_port`].
     #[allow(
@@ -1212,6 +1342,18 @@ impl Config {
                 || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
                 std::path::PathBuf::from,
             ),
+            connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
+            connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
+            secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
+            connector_typed_credentials: parse_switch(
+                env,
+                "CONNECTOR_TYPED_CREDENTIALS",
+                ConfigError::UnsupportedConnectorTypedCredentials,
+            )?,
+            connector_oauth_redirect_uri: truthy(env, "CONNECTOR_OAUTH_REDIRECT_URI"),
+            connector_oauth_allow_http: env
+                .get("CONNECTOR_OAUTH_ALLOW_HTTP")
+                .is_some_and(|v| v == "true"),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -1340,6 +1482,14 @@ impl Config {
             ),
             login_lockout_secs: parse_positive_u32_or_default(env, "LOGIN_LOCKOUT_SECS", 300),
             auth_retention_days: parse_positive_u32_or_default(env, "AUTH_RETENTION_DAYS", 30),
+            upload_max_concurrent_per_user: parse_limit(env, "UPLOAD_MAX_CONCURRENT_PER_USER", 4)?,
+            upload_max_concurrent: parse_limit(env, "UPLOAD_MAX_CONCURRENT", 16)?,
+            connector_auto_disable_after: i32::try_from(parse_positive_u32_or_default(
+                env,
+                "CONNECTOR_AUTO_DISABLE_AFTER",
+                30,
+            ))
+            .unwrap_or(lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER),
         })
     }
 
@@ -1361,6 +1511,15 @@ impl Config {
         crate::internal_hosts::InternalHosts {
             allow_all: self.connector_probe_allow_internal_hosts,
             allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
+    }
+
+    /// What an `OAuth2` connector may dial (`SRC-12` part C): `https` only,
+    /// unless the gate-only switch admits `http`.
+    #[must_use]
+    pub fn oauth_settings(&self) -> crate::connector_oauth::OAuthSettings {
+        crate::connector_oauth::OAuthSettings {
+            allow_http: self.connector_oauth_allow_http,
         }
     }
 
@@ -1674,6 +1833,26 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         assert_eq!(cfg.gold_export_max_rows, 5_000_000);
         assert_eq!(cfg.gold_export_batch_size, 20_000);
+    }
+
+    /// `SRC-11` decision D3: 30 failed runs in a row unless the gate (or an
+    /// operator) sets another positive number; garbage keeps the default.
+    #[test]
+    fn connector_auto_disable_after_defaults_to_thirty_and_ignores_garbage() {
+        let default = lakehouse_store::connectors::DEFAULT_AUTO_DISABLE_AFTER;
+        assert_eq!(default, 30);
+        assert_eq!(
+            Config::from_map(&map(&[]))
+                .unwrap()
+                .connector_auto_disable_after,
+            default
+        );
+        for bad in ["0", "-3", "many", ""] {
+            let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", bad)])).unwrap();
+            assert_eq!(cfg.connector_auto_disable_after, default, "{bad:?}");
+        }
+        let cfg = Config::from_map(&map(&[("CONNECTOR_AUTO_DISABLE_AFTER", "4")])).unwrap();
+        assert_eq!(cfg.connector_auto_disable_after, 4);
     }
 
     /// The compose stack's documented opt-out — only the literal string
@@ -2232,6 +2411,54 @@ mod tests {
         assert!(message.contains("\"false\""), "{message}");
     }
 
+    /// `SRC-12` decision 2: typing a credential value is on unless the
+    /// operator says exactly `false`, and a typo is refused at start-up.
+    #[test]
+    fn typed_credentials_are_on_unless_the_operator_says_false() {
+        for unset in [None, Some(""), Some("true")] {
+            let env = unset.map_or_else(HashMap::new, |v| {
+                HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), v.to_owned())])
+            });
+            assert!(Config::from_map(&env).unwrap().connector_typed_credentials);
+        }
+        let off = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "false".to_owned())]);
+        assert!(!Config::from_map(&off).unwrap().connector_typed_credentials);
+        let typo = HashMap::from([("CONNECTOR_TYPED_CREDENTIALS".to_owned(), "no".to_owned())]);
+        assert_eq!(
+            Config::from_map(&typo).unwrap_err(),
+            ConfigError::UnsupportedConnectorTypedCredentials("no".to_owned())
+        );
+    }
+
+    /// `SRC-12` part C: the callback address is the operator's; the gate-only
+    /// `http` switch is off unless the operator says exactly `true`.
+    #[test]
+    fn the_oauth_callback_is_the_operators_and_http_is_off_unless_exactly_true() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_oauth_redirect_uri, None);
+        assert!(!cfg.connector_oauth_allow_http);
+        for off in ["", "TRUE", "1", "yes", "false"] {
+            let env = HashMap::from([("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), off.to_owned())]);
+            assert!(
+                !Config::from_map(&env).unwrap().connector_oauth_allow_http,
+                "{off:?} must not turn it on"
+            );
+        }
+        let on = HashMap::from([
+            ("CONNECTOR_OAUTH_ALLOW_HTTP".to_owned(), "true".to_owned()),
+            (
+                "CONNECTOR_OAUTH_REDIRECT_URI".to_owned(),
+                "https://console.example.com/api/connectors/oauth/callback".to_owned(),
+            ),
+        ]);
+        let cfg = Config::from_map(&on).unwrap();
+        assert!(cfg.connector_oauth_allow_http);
+        assert_eq!(
+            cfg.connector_oauth_redirect_uri.as_deref(),
+            Some("https://console.example.com/api/connectors/oauth/callback")
+        );
+    }
+
     fn env_with(key: &str, value: &str) -> HashMap<String, String> {
         HashMap::from([(key.to_owned(), value.to_owned())])
     }
@@ -2362,5 +2589,42 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("\"true\""), "{message}");
         assert!(message.contains("\"false\""), "{message}");
+    }
+
+    // ── SEC-17: upload limits ───────────────────────────────────────────
+
+    #[test]
+    fn the_upload_limits_default_to_4_per_user_and_16_in_total() {
+        for env in [HashMap::new(), env_with("UPLOAD_MAX_CONCURRENT", "")] {
+            let cfg = Config::from_map(&env).unwrap();
+            assert_eq!(cfg.upload_max_concurrent_per_user, 4);
+            assert_eq!(cfg.upload_max_concurrent, 16);
+        }
+    }
+
+    #[test]
+    fn the_upload_limits_are_read_from_their_variables() {
+        let mut env = env_with("UPLOAD_MAX_CONCURRENT_PER_USER", "2");
+        env.insert("UPLOAD_MAX_CONCURRENT".to_owned(), "9".to_owned());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.upload_max_concurrent_per_user, 2);
+        assert_eq!(cfg.upload_max_concurrent, 9);
+    }
+
+    #[test]
+    fn an_upload_limit_that_is_not_a_whole_number_of_one_or_more_is_refused() {
+        for bad in ["0", "-1", "abc", "2.5", " 3"] {
+            let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT_PER_USER", bad))
+                .expect_err("a bad limit must stop start-up, not fall back to the default");
+            assert_eq!(
+                err,
+                ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT_PER_USER", bad.to_owned())
+            );
+        }
+        let err = Config::from_map(&env_with("UPLOAD_MAX_CONCURRENT", "0")).expect_err("zero");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidUploadLimit("UPLOAD_MAX_CONCURRENT", _)
+        ));
     }
 }

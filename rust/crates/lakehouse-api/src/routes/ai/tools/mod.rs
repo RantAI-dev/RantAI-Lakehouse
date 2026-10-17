@@ -26,6 +26,7 @@
 
 mod alerts;
 mod ask;
+mod boards;
 mod calc_fields;
 mod connectors;
 mod dashboards;
@@ -105,6 +106,18 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
+///
+/// The match is the registry-to-domain lookup and nothing more: 65 arms
+/// naming a tool, plus one guard arm (`n if calc_fields::handles(n)`),
+/// plus a catch-all, over 16 per-domain modules. All but
+/// `create_chart | update_chart` are a one-line delegation; that one reads
+/// the report time zone first, because a chart's SQL is built in it (`BI-9`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lookup table over 16 domain modules, 65 of its 66 arms a \
+              one-line delegation; the split by domain already happened, so \
+              splitting the table itself would only scatter that lookup"
+)]
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
     principal: Option<&Principal>,
@@ -158,6 +171,12 @@ pub(in crate::routes) async fn run_tool(
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
         "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
         n if look::handles(n) => look::run(state, principal, name, args).await,
+        "rename_board"
+        | "delete_board"
+        | "arrange_board"
+        | "move_chart"
+        | "set_board_view_filters"
+        | "save_board_filters" => boards::run(state, principal, name, args).await,
         n if calc_fields::handles(n) => calc_fields::run(state, principal, name, args).await,
         "list_alert_rules" => alerts::list_alert_rules(state, principal).await,
         "create_alert_rule" => alerts::create_alert_rule(state, principal, args).await,
@@ -213,6 +232,31 @@ pub(in crate::routes) async fn run_tool(
             )
         }
     }
+}
+
+/// Checks a chart call before the gate offers it as a draft (plan 18). `None`
+/// when the call is not a chart call, or when the draft can be built; the
+/// error otherwise, so a draft on a mart or column that does not exist is
+/// refused rather than offered. Writes nothing.
+///
+/// When the reporting settings cannot be read, this returns the same error
+/// the dispatch arm returns, instead of skipping the check.
+///
+/// `confirmed` is dropped during parse because `ChartInput` and its flattened `TableFields` lack
+/// `deny_unknown_fields` (`Compare` has it; adding it here would refuse drafts the Confirm path accepts).
+pub(crate) async fn check_draft(
+    state: &AppState,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<Value> {
+    if name != "create_chart" && name != "update_chart" {
+        return None;
+    }
+    let Ok(time) = crate::routes::settings::time_context(state).await else {
+        return Some(json!({ "error": "The reporting settings could not be read." }));
+    };
+    let id = (name == "update_chart").then(|| arg_str(args, "id"));
+    dashboards::check_chart_draft(&state.clickhouse, args, id, &time).await
 }
 
 /// Reads `args[key]` as a string, matching `String(args[key] ?? "")`: a

@@ -13,7 +13,8 @@
 import { isStaticKind } from "./dashboard-tabs"
 import type { FilterDef } from "@/services/clients/bi-store"
 import { type BinDef, type BinMeta, binLabel, binsOfTile } from "./chart-bins"
-import { filterLabel, isActiveFilter } from "./dashboard-filter-state"
+import { filterLabel, isActiveFilter, normalizeFilters } from "./dashboard-filter-state"
+import { GRAIN_LABELS, isGrain, isTruncation, type Grain } from "./time-grain"
 
 export type TileLike = {
   id: string
@@ -107,6 +108,41 @@ export function summarizeTiles(
 export function summarizeFilters(filters: FilterLike[]): string {
   const parts = filters.filter(isActiveFilter).map((f) => filterLabel(f))
   return parts.length ? parts.join("; ") : "none"
+}
+
+/**
+ * The dashboard's grain, in words the control already uses: "Day" is the
+ * board's own grain, "Month (overrides saved Day)" is what the page shows
+ * when the address picks one that is not the saved default, and "each
+ * chart's own" is the empty choice (the chart picks its own truncation).
+ * `shown` is what the page actually shows today; `saved` is the board's
+ * default. The label reuses `GRAIN_LABELS` from the control so a reader
+ * never meets a vocabulary the UI does not show.
+ */
+export function summarizeGrain(shown: Grain | "", saved: string | undefined): string {
+  if (shown === "") return "Time grain: each chart's own"
+  const shownLabel = GRAIN_LABELS[shown]
+  const savedGrain = saved && isGrain(saved) && isTruncation(saved) ? saved : undefined
+  if (savedGrain && savedGrain !== shown) {
+    return `Time grain: ${shownLabel} (overrides saved ${GRAIN_LABELS[savedGrain]})`
+  }
+  return `Time grain: ${shownLabel}`
+}
+
+/**
+ * The active filters as compact JSON, for the page context when there is
+ * room (the chip text alone leaves the model guessing). The helpers in
+ * `lib/dashboard-filter-state` normalize the list so equal filters compare
+ * equal; an over-budget JSON is dropped (`null`) so the chip summary stays
+ * the only filter context, never a half-truncated bracket.
+ */
+export function summarizeFilterJson(
+  filters: FilterLike[],
+  opts: { maxChars?: number } = {}
+): string | null {
+  const json = JSON.stringify(normalizeFilters(filters))
+  const max = opts.maxChars ?? DEFAULT_CHARS
+  return json.length <= max ? json : null
 }
 
 /**

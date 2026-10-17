@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils"
 import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
 import type { RunSummary } from "./pipeline-run-stats"
 import { runDurationMs } from "./pipeline-run-stats"
+import { readsAsLine, type ReadsAs } from "./pipeline-reads-as"
 import { describeCron, localizeScheduleTime, type ParsedSchedule } from "./pipeline-schedule"
 
 /** A status the shared badge knows, or `null` for what the API sends outside it ("unknown" for a never-run job). */
@@ -65,15 +66,21 @@ export function PipelineMasthead({
   schedule,
   schedulePaused,
   actions,
+  readsAs,
 }: {
   pipeline: PipelineDetail
   latest: PipelineRun | null
   schedule: ParsedSchedule
   schedulePaused: boolean
   actions: React.ReactNode
+  readsAs: ReadsAs
 }) {
   const authored = pipeline.engine === "authored"
   const health = latest ? latest.status : knownStatus(pipeline.status)
+  // BLD-1 / D2: who the pipeline READS AS, which is a different fact from
+  // who owns it — editing the pipeline needs `pipeline:write`, changing
+  // this needs `identity:write`. `null` for a Dagster job, which has none.
+  const readsAsText = readsAsLine(readsAs)
   return (
     <header className="relative isolate overflow-hidden rounded-2xl border border-border bg-card/60 px-5 pb-5 pt-4">
       <BrandBackdrop className="opacity-60" />
@@ -106,6 +113,20 @@ export function PipelineMasthead({
             <span className="text-xs text-muted-foreground">
               Owner <span className="font-medium text-foreground">{pipeline.owner}</span>
             </span>
+            {/* BLD-1 / D2: who the pipeline READS AS, which is a different
+                fact from who owns it — editing it needs `pipeline:write`,
+                changing it needs `identity:write`. Only an authored
+                pipeline has one. */}
+            {readsAsText ? (
+              <span
+                className={cn(
+                  "text-xs text-muted-foreground",
+                  readsAs.kind === "unset" && "text-amber-600 dark:text-amber-400"
+                )}
+              >
+                {readsAsText}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>

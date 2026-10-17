@@ -1,0 +1,70 @@
+# ops/g6/docker-compose.src12-managers.override.yml -- SRC-12 part B gate only.
+#
+# Layered AFTER the g6 and the src12 overrides:
+#   docker compose -p src12mci -f docker-compose.yml \
+#     -f ops/g6/docker-compose.g6.override.yml \
+#     -f ops/g6/docker-compose.src12.override.yml \
+#     -f ops/g6/docker-compose.src12-managers.override.yml \
+#     --profile g6-sql --profile g6-ops --profile dagster ...
+#
+# Why it exists: part B lets a connector's credential be a reference to a secret
+# in the installation's secret manager. Two of the four managers have a local
+# stand-in, and this gate runs them (decision 3; Google and Azure have none and
+# are proven by tests against recorded responses):
+#   - `vault-g6`: Vault's official development server (in-memory, KV version 2
+#     mounted at `secret/`, a fixed root token given on its command line). It is
+#     a test fixture: the token below is CI-only and protects nothing.
+#   - `moto-g6`: the `moto` server, an AWS-compatible stand-in that answers
+#     Secrets Manager (`AWS_ENDPOINT_URL_SECRETS_MANAGER` points the product at it).
+# An installation has ONE secret manager, so the job runs the gate twice and
+# switches `SECRET_MANAGER` in `.env` (and recreates the API and the code
+# location) between the two. The settings themselves (`SECRET_MANAGER`,
+# `VAULT_*`, `AWS_*`) reach `lakehouse-api` and `dagster-code-location` from the
+# base file's own pass-through block, from `.env`; this file only starts the two
+# fixtures and gives the gate's runner the same settings, to write to them.
+#
+# Image tags are pinned (no `latest`). The values below are CI-only fixtures
+# (`ci-…-not-real` / `testing`), never defaults of the product.
+services:
+  # Licence note (SRC-12 review B1 SHOULD-FIX 2): the hashicorp/vault image is
+  # BUSL-1.1 from 1.15 on. It is used here only as a CI test fixture and is not
+  # distributed with the product. OpenBao (MPL-2.0, API-compatible, image
+  # `openbao/openbao`) is the drop-in if that is ever not acceptable.
+  vault-g6:
+    image: hashicorp/vault:1.18.5
+    command:
+      - server
+      - -dev
+      - -dev-root-token-id=${VAULT_TOKEN:?}
+      - -dev-listen-address=0.0.0.0:8200
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  moto-g6:
+    image: motoserver/moto:5.0.9
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/moto-api/')"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  g6-ops-test-runner:
+    depends_on:
+      vault-g6:
+        condition: service_healthy
+      moto-g6:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_ENDPOINT_URL_SECRETS_MANAGER: ${AWS_ENDPOINT_URL_SECRETS_MANAGER:-}

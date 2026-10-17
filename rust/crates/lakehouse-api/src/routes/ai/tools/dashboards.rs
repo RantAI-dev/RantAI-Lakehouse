@@ -81,6 +81,33 @@ pub(super) async fn create_chart(
     }
 }
 
+/// Checks a chart draft before the gate offers it: a draft that cannot be
+/// built must not be offered as a card the person can confirm. It runs the
+/// same validation as the tools (`store::spec_from_input`) and stops there,
+/// so it writes nothing.
+///
+/// `id` is `None` for a create and `Some` for an update; an update with no
+/// `id` is refused here, as the tool refuses it. Returns `None` when the
+/// draft can be built, and the error the tool would return otherwise.
+pub(super) async fn check_chart_draft(
+    ch: &ChClient,
+    args: &Map<String, Value>,
+    id: Option<String>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Option<Value> {
+    if id.as_deref().is_some_and(str::is_empty) {
+        return Some(json!({ "error": "id is required" }));
+    }
+    let input = match parse_chart_input(args) {
+        Ok(i) => i,
+        Err(e) => return Some(json!({ "error": e })),
+    };
+    match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
+        Ok(_) => None,
+        Err(err) => Some(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
+    }
+}
+
 pub(super) async fn update_chart(
     ch: &ChClient,
     principal: Option<&Principal>,

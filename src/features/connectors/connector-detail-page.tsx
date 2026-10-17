@@ -21,6 +21,7 @@ import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { SECRET_MANAGER_LABEL, type SecretManager } from "@/lib/connectors/secret-reference"
 import { TEST_OUTCOME_TOAST, testOutcome, type TestOutcome } from "@/lib/connectors/test-result"
 import { formatDateTime, formatRelativeTime } from "@/lib/format"
 import { notifyError, notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify"
@@ -29,6 +30,7 @@ import { connectorService } from "@/services"
 import type { ConnectorDetail, ConnectorTestResult } from "@/services/contracts/connectors"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOAuthPanel, oauthSignIn } from "./connector-oauth-panel"
 import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { ConnectorSchemaChangesPanel } from "./connector-schema-changes-panel"
@@ -49,18 +51,41 @@ function parseTab(raw: string | null): ConnectorTab {
 }
 
 /**
+ * How the credential is held, in words (`SRC-12` decision 10). An
+ * environment variable is read when the API and the orchestrator start, so
+ * the page says a restart is needed after changing one.
+ */
+function credentialFact(source: ConnectorDetail["credentialSource"]): string {
+  switch (source) {
+    case "managed":
+      return "Stored by lakehouse, encrypted"
+    case "env":
+      return "Environment variable on the server (a restart is needed after a change)"
+    case "file":
+      return "File on the server"
+    case "reference":
+      return "Reference to a secret in the secret manager (read at every use, never copied)"
+    default:
+      return "Provisioned on the server"
+  }
+}
+
+/**
  * The row of facts under the title, the asset page's `MetadataList` with the
  * connector's own: who it belongs to, how its credential is held and when it
  * was last tested. The type (the description) and the environment (a pill by
  * the name) are already in the header and are not repeated here (reviewer
  * SHOULD-FIX R1).
  */
-function connectorFacts(c: ConnectorDetail): MetadataItem[] {
+function connectorFacts(c: ConnectorDetail, secretManager: SecretManager | null): MetadataItem[] {
   return [
     { label: "Tenant", value: c.tenant || "Unassigned" },
     { label: "Residency", value: c.residency || "—" },
     { label: "Owner", value: c.owner || "—" },
-    { label: "Credential", value: c.credentialManaged ? "Stored by lakehouse" : "Provisioned on the server" },
+    { label: "Credential", value: credentialFact(c.credentialSource) },
+    // `SRC-12` part B: which secret manager this installation reads from, when
+    // the operator set one up.
+    ...(secretManager ? [{ label: "Secret manager", value: SECRET_MANAGER_LABEL[secretManager] }] : []),
     {
       label: "Last test",
       value:
@@ -193,6 +218,13 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
   // The latest test, for the red count on the Connection tests tab. Reloaded
   // after a test of this page; `keepDataOnReload` so the count does not blink
   // out while it is asked again.
+  // What this installation offers for a credential. A failed read only means
+  // the "Secret manager" fact is left out; nothing else on the page needs it.
+  const credentialSettings = useService((s) => connectorService.getCredentialSettings(s), [])
+  // Only a connector that signs in with OAuth shows the Sign in panel
+  // (`SRC-12` part C); its ingest spec says which one that is.
+  const ingestSpec = useService((s) => connectorService.getIngestSpec(id, s), [id])
+  const oauth = ingestSpec.status === "success" ? oauthSignIn(ingestSpec.data) : null
   const latestProbe = useService((s) => connectorService.listProbeHistory(id, 1, s), [id], {
     keepDataOnReload: true,
   })
@@ -324,14 +356,16 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
           </>
         }
       />
-      <MetadataList density="compact" columns={3} items={connectorFacts(c)} />
+      <MetadataList density="compact" columns={3} items={connectorFacts(c, credentialSettings.status === "success" ? credentialSettings.data.secretManager : null)} />
       <ConnectorDeleteDialog
         connector={c}
         dependents={c.dependentPipelines}
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
         onDeleted={() => router.push("/connectors")}
+        oauth={oauth}
       />
+      {oauth ? <ConnectorOAuthPanel connectorId={id} onChanged={state.reload} /> : null}
       {testAction.data ? <TestNotice result={testAction.data} /> : null}
       <div ref={tabsRootRef}>
         <Tabs value={tab} onValueChange={(v) => selectTab(v as ConnectorTab)} className="gap-3">
@@ -349,6 +383,7 @@ export function ConnectorDetailPage({ connectorId: id }: { connectorId: string }
               onTableCount={setSavedTables}
               pausedReason={c.pausedReason}
               waitingTables={waiting.tables}
+              onResumed={state.reload}
             />
           </TabsContent>
           <TabsContent value="schema" keepMounted>

@@ -1,5 +1,5 @@
 {
-  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest supported:false today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'.",
+  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest not_supported failure today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'.",
   "types": {
     "PostgreSQL": {
       "gate": "g6",
@@ -8,6 +8,9 @@
         "discover": "real",
         "load": "real",
         "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13 D12: the schemas hold ingest_demo, its tables hold ingest_demo.orders, and the preview shows id, customer, amount and created_at with declared types."
       }
     },
     "PostgreSQL CDC": {
@@ -21,7 +24,7 @@
       "notes": {
         "all": "SRC-9 plan task 6: ops/g4/g4_test.py records all four steps through gate_summary.",
         "connect": "ops/g4 registers the demo source as a 'PostgreSQL CDC' connector (adapter cdc) and POST .../test must answer supported:true, ok:true, like its SQL twin.",
-        "discover": "ops/g4: POST .../discover?schema=p5_cdc must list p5_cdc.orders with its columns.",
+        "discover": "ops/g4: the schemas hold p5_cdc, the list of p5_cdc holds p5_cdc.orders, and its preview shows its columns (SRC-13 routes).",
         "load": "ops/g4: the initial snapshot reaches Bronze and holds the seeded rows (first copy).",
         "reload": "ops/g4: an insert, an update and a delete arriving within the latency budget."
       }
@@ -33,6 +36,9 @@
         "discover": "real",
         "load": "real",
         "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13 D12: the schemas hold g6_ingest; the preview of g6_ingest.orders shows id and amount with declared types."
       }
     },
     "MariaDB": {
@@ -54,70 +60,73 @@
         "discover": "real",
         "load": "real",
         "reload": "real"
+      },
+      "notes": {
+        "discover": "SRC-13 D12: the schemas hold dbo; the preview of dbo.orders shows id and amount with declared types."
       }
     },
     "Object storage": {
       "gate": "g6",
       "steps": {
         "connect": "real",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
-        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+        "discover": "SRC-13 D12: the list under the glob landing/*.csv holds landing/orders.csv with its size, and its preview shows id, customer and amount, types inferred from the first rows."
       }
     },
     "REST API": {
       "gate": "g6",
       "steps": {
         "connect": "real",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
-        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+        "discover": "SRC-13 D12: the list is the dial's endpoints and holds /items; the orchestrator's preview of the first page shows id and name, types inferred. The load names the endpoint (D3)."
       }
     },
     "Oracle": {
       "gate": "g6-oracle",
       "steps": {
         "connect": "refused",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
         "all": "SRC-9 plan task 5: ops/g6/g6_oracle_test.py in its own job (g6-oracle), against Oracle Database Free (gvenzl/oracle-free, slim-faststart) in ops/g6/docker-compose.g6-oracle.override.yml. Plaintext dial: the adapter refuses TLS without an operator-typed sslServerCertDn, so TLS to Oracle is not exercised.",
         "connect": "SRC-5: an Oracle connector cannot be tested from the console (the API has no Oracle client).",
-        "discover": "SRC-13: Oracle tables are listed by the orchestrator, not the console. The product answers supported:false (SRC-9 finding G2; it was HTTP 422)."
+        "discover": "SRC-13 D12: the orchestrator lists the schemas the login can read (G6_INGEST among them) and that schema's tables (G6_INGEST.ORDERS); the preview shows the declared columns ID and AMOUNT. The load's source object is the listed name."
       }
     },
     "MongoDB": {
       "gate": "g6",
       "steps": {
         "connect": "refused",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
         "connect": "SRC-5: a MongoDB connector cannot be tested from the console.",
-        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+        "discover": "SRC-13 D12: the orchestrator lists the collections of g6_ingest, which hold orders; its preview of up to 100 documents shows id and amount, types inferred."
       }
     },
     "Kafka": {
       "gate": "g6",
       "steps": {
         "connect": "refused",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
         "connect": "SRC-5: a Kafka connector cannot be tested from the console.",
-        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server.",
+        "discover": "SRC-13 D12: the orchestrator lists the broker's topics, which hold the one the run reads; its preview of the last messages shows id and amount, types inferred. Asked after the run, so the topic exists and holds messages.",
         "reload": "A micro-batch: the gate produces a known number of new messages before the second run and expects the table to grow by exactly the messages the consumer group had not yet committed."
       }
     },
@@ -125,14 +134,14 @@
       "gate": "g6",
       "steps": {
         "connect": "refused",
-        "discover": "refused",
+        "discover": "real",
         "load": "real",
         "reload": "real"
       },
       "notes": {
         "all": "SRC-9 plan task 4: atmoz/sftp in the g6 override, with a host key minted by the fixture so the pinned fingerprint is its own.",
         "connect": "SRC-5: an SFTP connector cannot be tested from the console.",
-        "discover": "SRC-13: discovery exists today only for PostgreSQL, MySQL, MariaDB and SQL Server."
+        "discover": "SRC-13 D12: the orchestrator lists the files under the dial's path, which hold orders.csv; its preview shows id, name and amount from the header and first rows, types inferred."
       }
     }
   }

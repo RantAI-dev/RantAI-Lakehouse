@@ -51,6 +51,51 @@ verified by reading `rust/crates/lakehouse-api/src/routes/mod.rs`'s
 - `GET /api/pipelines/{id}/runs/{runId}/steps`
   (`step_trigger_and_wait_for_real_row_materializations`) --
   `pipelines::run_steps`.
+- `GET /api/pipelines/{id}/runs`
+  (`step_a_load_of_its_own_table_triggers_the_chain`) --
+  `pipelines::runs`, the chain's run list the negative assertion polls.
+- `GET`/`PUT /api/connectors/{id}/ingest-spec` and
+  `POST /api/connectors/{id}/ingest/run` (the BLD-4 half) -- the two
+  routes `ops/g6/g6_ingest_matrix_test.py` drives its own connectors
+  with, here used on the stack's own seeded `conn-pg-lakehouse`.
+
+# BLD-4: the chain after a connector load fires only for its own table
+
+`ingest_job` (`dagster/dispar_orchestrate/ingest_factory.py`) is ONE static
+job for every connector and loads EVERY selected object of that connector
+per run, so the dependency sensor's "newest SUCCESS run of the upstream" was
+an anchor that said nothing about which table loaded. Authing a pipeline
+with `dependsOn: ["ingest_job"]` therefore re-ran it on every connector's
+load in the deployment.
+
+The fix (`build_authored_dependency_sensor`'s per-table walk,
+`_latest_record_for_ingest_table`) anchors on the newest SUCCESS run that
+MATERIALIZED the pipeline's own Bronze table -- the asset key each loaded
+object logs inside its run. This gate proves both halves on a real stack,
+which is the only place they can be proven: `dagster/dispar_orchestrate/
+test_authored_factory.py`'s unit tests carry a stub instance, and the
+`start_time`-on-the-wrong-object bug this repo already shipped once hid from
+exactly that shape.
+
+1. a one-table run of the chain's OWN source table starts the chain, and
+   the chain's Silver output holds exactly `count(DISTINCT id)` rows of the
+   Bronze table it read -- both counted through `ClickHouse`, the same
+   comparison the pre-existing step below it makes (BLD-4 review R1
+   SHOULD-FIX 7 asked for the count this section claimed to be proven);
+2. a one-table run of ANOTHER table does NOT, within two sensor intervals
+   (Dagster's default 30 s evaluation interval, verified against the pinned
+   1.13.20 and doubled in the gate's own wait).
+
+Both are read from this gate's own two Bronze tables
+(`g7_dep_orders`, `g7_dep_customers`), loaded one object at a time through
+a connector spec this gate PUTs onto the seeded `conn-pg-lakehouse` and
+restores in a `finally`. Why a second fixture table at all: a one-table run
+selects its object by NAME (`ingest_factory.run_ingest` filters
+`sourceObjects` on it), so two tables need two source objects, and
+`docker-compose.yml`'s `g3a-source-init` now creates the stack's smallest
+second table for exactly that. The seeded connector's own row is NOT edited
+to load it -- that would change every deployment's fixture, which is a
+product decision, not this gate's.
 
 The earlier version of this module doc said the opposite (that those
 three routes did not exist here and the gate could therefore not be
@@ -200,6 +245,23 @@ class G7Failure(Exception):
     pass
 
 
+class G7Fatal(G7Failure):
+    """A `G7Failure` a `_wait_for` loop must NOT retry (BLD-4 review R1
+    SHOULD-FIX 7).
+
+    `_wait_for` exists to ride out a stack that is still coming up, so it
+    swallows whatever its check raises and reports the last cause when the
+    deadline passes. For a check that only waits for data to appear that
+    is right; for a check that can also hit a SERVICE that is down it is
+    the wrong report -- the sensor-tick wait answers a 401 or a 500 for
+    its full 300 s and then says "timed out waiting for the chain's
+    dependency sensor to evaluate once", which reads like a slow sensor
+    rather than an API that is refusing the gate. A check that raises
+    this instead fails the gate at once, with the status code in the
+    message. It subclasses `G7Failure` so `main()` still reports it as
+    `[g7] FAILED: ...` and returns 1."""
+
+
 def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None:
     """Duplicated from `ops/g3a/g3a_test.py:71-82`'s `_wait_for` -- same
     shape, same reason (`ops/g4`/`ops/g6` each carry their own copy too,
@@ -212,6 +274,8 @@ def _wait_for(name: str, check, timeout_s: int, interval_s: float = 2.0) -> None
             if check():
                 print(f"[g7] ready: {name}")
                 return
+        except G7Fatal:
+            raise
         except Exception as exc:  # noqa: BLE001 - report the real cause below
             last_err = exc
         time.sleep(interval_s)
@@ -249,6 +313,67 @@ def step_login() -> None:
             raise G7Failure(f"re-login after rotation failed: {relogin.status_code} {relogin.text}")
 
     print("[g7] logged in as bootstrap admin")
+
+
+def _me_tenant_ids() -> list[str]:
+    """The tenant ids `GET /api/auth/me` reports for the logged-in account."""
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G7Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    return [t["id"] for t in me.json().get("tenants", [])]
+
+
+def step_ensure_connector_tenant() -> None:
+    """Make the logged-in account a member of the tenant that owns
+    `CONNECTOR_ID`, so the per-connector routes this gate drives are not
+    refused by `require_connector_in_tenants`.
+
+    The bootstrap admin of a fresh database is created with `tenants:
+    Vec::new()` (`lakehouse_api::bootstrap_admin`, `main.rs`), so it belongs
+    to NO tenant. Every `/api/connectors/{id}/*` route sits behind
+    `ensure_connector_in_tenants` (`routes/connectors.rs`): the connector's
+    `tenant_id` must be one of the caller's, or the route answers the SAME
+    404 an unknown id gets -- which is exactly what a first run of this
+    gate hit on `GET .../ingest-spec` (the connector is present; the caller
+    simply cannot see it). The seeded `conn-pg-lakehouse` belongs to
+    `meridian-group` (0042), so that is the tenant the account joins, via
+    `PUT /api/identity/users/{id}/tenants/{tenant_id}` (the unrestricted
+    admin may add itself to any tenant), then `/api/auth/me` is re-read to
+    confirm. Membership is read per request, so no new login. An account
+    already in it changes nothing.
+
+    Duplicated, not shared, from `ops/g6/g6_ingest_matrix_test.py`'s
+    `step_ensure_tenant`: these gate scripts share no module (the module
+    doc explains why), and this gate joins only the one tenant it needs.
+    """
+    me = API.get(f"{API_URL}/api/auth/me", timeout=10)
+    if not me.ok:
+        raise G7Failure(f"GET /api/auth/me failed: {me.status_code} {me.text[:300]}")
+    me = me.json()
+    listed = API.get(f"{API_URL}/api/identity/tenants", timeout=10)
+    if not listed.ok:
+        raise G7Failure(f"list tenants failed: {listed.status_code} {listed.text[:300]}")
+    tenant = next((t for t in listed.json() if t["slug"] == GATE_TENANT_SLUG), None)
+    if tenant is None:
+        raise G7Failure(
+            f"tenant {GATE_TENANT_SLUG!r} does not exist: it owns the seeded connector "
+            f"{CONNECTOR_ID!r} (0042_tenant_provisioning.sql) this gate runs"
+        )
+    if tenant["id"] not in _me_tenant_ids():
+        added = API.put(
+            f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}",
+            timeout=10,
+        )
+        if not added.ok:
+            raise G7Failure(
+                f"add the account to tenant {GATE_TENANT_SLUG!r} failed: "
+                f"{added.status_code} {added.text[:300]}"
+            )
+        if tenant["id"] not in _me_tenant_ids():
+            raise G7Failure(
+                f"the account was added to tenant {GATE_TENANT_SLUG!r} but /api/auth/me does not list it"
+            )
+        print(f"[g7] added the account to tenant {GATE_TENANT_SLUG!r}")
 
 
 def step_create_and_activate_authored_pipeline() -> str:
@@ -439,13 +564,7 @@ def step_verify_the_silver_rows_match_the_bronze_source() -> None:
     names beside `bronze.` -- the same reword-the-comment boundary the
     guard's own docstring documents.
     """
-    ch_query(
-        f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
-        f"ENGINE = DataLakeCatalog('{LAKEKEEPER_CATALOG_URI}') "
-        f"SETTINGS catalog_type = 'rest', warehouse = '{LAKEKEEPER_WAREHOUSE}', "
-        f"storage_endpoint = '{CH_RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
-        "SETTINGS allow_database_iceberg = 1"
-    )
+    _ensure_catalog_database()
     bronze_rows = int(
         ch_query(
             f"SELECT count(DISTINCT id) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` "
@@ -468,6 +587,399 @@ def step_verify_the_silver_rows_match_the_bronze_source() -> None:
             f"expected {bronze_rows} (one per distinct id of bronze.{BRONZE_TABLE_NAME})"
         )
     print(f"[g7] silver.{SILVER_TABLE_NAME} holds {silver_rows} rows = the {bronze_rows} distinct ids of bronze.{BRONZE_TABLE_NAME}")
+
+
+# ── BLD-4: a chain after `ingest_job` fires only for its own table ──────
+
+# The one upstream this half proves: `dagster/dispar_orchestrate/
+# ingest_factory.py`'s ONE static job for every connector, launched by
+# `POST /api/connectors/{id}/ingest/run`
+# (`rust/crates/lakehouse-api/src/routes/connectors.rs`). Before BLD-4 the
+# dependency sensor took its newest SUCCESS run as the freshness anchor, so
+# every connector's load fired every pipeline that named it.
+UPSTREAM_JOB_NAME = "ingest_job"
+
+# The stack's own ingestible connector (`docker-compose.yml` +
+# `rust/migrations/0034_seed_connector_ingest_spec.sql` seeds
+# `conn-pg-lakehouse` on `ingest_demo.orders`). It is driven through the
+# SAME `PUT .../ingest-spec` / `POST .../ingest/run` pair
+# `ops/g6/g6_ingest_matrix_test.py` uses for its own connectors; the only
+# thing this gate changes on it is the `sourceObjects` list, and that is
+# restored before the gate exits. `0034`'s seeded row is NOT edited: adding
+# a second table to every deployment's seeded connector is a product
+# decision, not a gate fixture.
+CONNECTOR_ID = os.environ.get("G7_INGEST_CONNECTOR_ID", "conn-pg-lakehouse")
+# The tenant that owns `CONNECTOR_ID`: `0042_tenant_provisioning.sql`
+# backfills the seeded `conn-pg-lakehouse` to the seed tenant
+# `meridian-group` (`0002_seed_identity.sql`). Every `/api/connectors/{id}/*`
+# route sits behind `require_connector_in_tenants`, so the calling account
+# must be a member of THIS tenant or those routes answer the same 404 an
+# unknown id gets -- see `step_ensure_connector_tenant`.
+GATE_TENANT_SLUG = os.environ.get("G7_INGEST_TENANT_SLUG", "meridian-group")
+SOURCE_OBJECT_A = os.environ.get("G7_INGEST_OBJECT_A", "ingest_demo.orders")
+BRONZE_TABLE_A = os.environ.get("G7_INGEST_BRONZE_TABLE_A", "g7_dep_orders")
+SOURCE_OBJECT_B = os.environ.get("G7_INGEST_OBJECT_B", "ingest_demo.customers")
+BRONZE_TABLE_B = os.environ.get("G7_INGEST_BRONZE_TABLE_B", "g7_dep_customers")
+CHAIN_SILVER_TABLE = os.environ.get("G7_CHAIN_SILVER_TABLE", "g7_dep_ingest_chain_out")
+
+# Two Bronze tables that no earlier step of this gate (and no earlier gate
+# in the g3a-dagster CI job) has ever loaded, so the chain under test cannot
+# have a qualifying anchor before the load this gate runs on purpose: a
+# chain that fires before table A is loaded would pass a "fires after A"
+# assertion for the wrong reason.
+# Both are loaded by ONE-TABLE runs (`{object, action}`, SRC-10 decision 5),
+# never by a full run of the connector, so each run materializes exactly
+# one of the two.
+ONE_TABLE_ACTION = "refresh_remove"
+
+# Dagster's own default evaluation interval, verified against the pinned
+# `dagster==1.13.20`
+# (`dagster._core.definitions.sensor_definition.DEFAULT_SENSOR_DAEMON_INTERVAL
+# == 30`). The plan's window is TWO sensor intervals, and the loop below
+# polls through it twice over, so a chain that fires late (on the second or
+# third interval) still fails the gate rather than racing it.
+SENSOR_INTERVAL_S = 30
+OTHER_TABLE_MUST_NOT_TRIGGER_S = 2 * SENSOR_INTERVAL_S * 2
+
+# How long the wait for a run to appear (a chain launch, or the ingest run
+# this gate starts itself) is allowed to be. An ingest run of one table
+# measures seconds locally; the chain run adds the sensor's next tick.
+RUN_APPEARED_TIMEOUT_S = 180
+
+
+def _read_connector_spec() -> dict:
+    """`GET /api/connectors/{id}/ingest-spec`, the spec this gate will put
+    back when it is done (`IngestSpec` in
+    `rust/crates/lakehouse-store/src/connectors.rs`: `adapter`,
+    `ingestMode`, `dial`, `sourceObjects` in camelCase)."""
+    resp = API.get(f"{API_URL}/api/connectors/{CONNECTOR_ID}/ingest-spec", timeout=30)
+    if not resp.ok:
+        raise G7Failure(f"GET .../ingest-spec for {CONNECTOR_ID!r} failed: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def _put_connector_spec(spec: dict) -> None:
+    """`PUT /api/connectors/{id}/ingest-spec`, keeping the connector's own
+    `adapter`/`ingestMode`/`dial` and replacing only its `sourceObjects`.
+    No credential is sent: the stored `secretRef` is untouched, which is
+    what lets the gate re-save the spec of a connector it did not create
+    (ADR 0002 Addendum 3, `SEC-14`'s rule)."""
+    resp = API.put(
+        f"{API_URL}/api/connectors/{CONNECTOR_ID}/ingest-spec",
+        json={
+            "adapter": spec["adapter"],
+            "ingestMode": spec["ingestMode"],
+            "dial": spec.get("dial") or {},
+            "sourceObjects": spec["sourceObjects"],
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise G7Failure(
+            f"PUT .../ingest-spec for {CONNECTOR_ID!r} failed: {resp.status_code} {resp.text}"
+        )
+
+
+def _run_ingest_one_table(object_name: str) -> str:
+    """`POST /api/connectors/{id}/ingest/run` with `{object, action}` -- the
+    SRC-10 decision 5 run of ONE table, retried only while the orchestrator
+    answers that the code location is not loaded yet (the same race
+    `ops/g6/g6_ingest_matrix_test.py::_post_ingest_run` documents). Returns
+    the launched run id."""
+    url = f"{API_URL}/api/connectors/{CONNECTOR_ID}/ingest/run"
+    resp = API.post(url, json={"object": object_name, "action": ONE_TABLE_ACTION}, timeout=30)
+    for attempt in range(1, 4):
+        if resp.ok:
+            break
+        if not _job_not_loaded(resp):
+            break
+        print(f"[g7] ingest/run hit the code-location window; waiting for {UPSTREAM_JOB_NAME}")
+        _wait_for(
+            f"{UPSTREAM_JOB_NAME} loaded", lambda: _dagster_job_is_loaded(UPSTREAM_JOB_NAME), 120
+        )
+        resp = API.post(url, json={"object": object_name, "action": ONE_TABLE_ACTION}, timeout=30)
+    if not resp.ok:
+        raise G7Failure(
+            f"POST .../ingest/run for {CONNECTOR_ID!r} object {object_name!r} failed: "
+            f"{resp.status_code} {resp.text}"
+        )
+    body = resp.json()
+    run_id = body.get("runId") or body.get("id")
+    if not run_id:
+        raise G7Failure(f"ingest/run response had no run id: {body}")
+    return run_id
+
+
+def _dagster_run_status(run_id: str) -> str | None:
+    """A run's Dagster status, straight from the webserver's GraphQL
+    (`ops/g6/g6_ingest_matrix_test.py`'s own query, same reason)."""
+    query = (
+        "query($rid:ID!){ pipelineRunOrError(runId:$rid)"
+        "{ __typename ... on Run { status } } }"
+    )
+    # BLD-4 review R1 SHOULD-FIX 7: turn HTTPError into G7Failure
+    try:
+        resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise G7Failure(f"GraphQL run status query failed: {exc}") from exc
+    block = (resp.json().get("data") or {}).get("pipelineRunOrError") or {}
+    return block.get("status")
+
+
+def _wait_for_run_terminal(run_id: str, what: str) -> None:
+    """Wait until `run_id` reaches SUCCESS/FAILURE/CANCELED, and fail the
+    gate on anything but SUCCESS: a FAILED chain run is the feature being
+    broken, not a missing one."""
+    def terminal() -> bool:
+        return _dagster_run_status(run_id) in ("SUCCESS", "FAILURE", "CANCELED")
+
+    _wait_for(f"{what} {run_id} terminal", terminal, timeout_s=RUN_TERMINAL_TIMEOUT_S, interval_s=3.0)
+    status = _dagster_run_status(run_id)
+    if status != "SUCCESS":
+        raise G7Failure(f"{what} {run_id} ended {status}, expected SUCCESS")
+
+
+def _chain_run_ids(pipeline_id: str) -> list[str]:
+    """The ids of the chain's runs, from `GET /api/pipelines/{id}/runs`
+    (`pipelines::runs`, which lists the `authored__<id>` job's runs). An
+    `unavailable` payload (Dagster unreachable) is a gate failure, not an
+    empty chain: the route says so instead of answering `[]`."""
+    # BLD-4 review R1 SHOULD-FIX 7: turn HTTPError into G7Failure
+    try:
+        resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise G7Failure(f"GET /api/pipelines/{pipeline_id}/runs failed: {exc}") from exc
+    body = resp.json()
+    if body.get("unavailable"):
+        raise G7Failure(f"GET .../runs reported the orchestrator unavailable: {body['unavailable']}")
+    return [run["id"] for run in body.get("runs", [])]
+
+
+def _dependency_sensor_has_ticked(pipeline_id: str) -> bool:
+    """Whether the chain's dependency sensor has evaluated at least once.
+
+    A `run_status_sensor`'s FIRST evaluation sets its cursor to the newest
+    run-status event and SKIPS -- `dagster==1.13.20`'s
+    `RunStatusSensorDefinition._wrapped_fn` (`.../
+    run_status_sensor_definition.py`, the `if context.cursor is None ...`
+    branch) yields `"Initiating <name>. Set cursor to <cursor>"` and
+    returns; events that happened before that tick are never replayed.
+
+    So creating the chain and then loading table A in the same breath
+    races the sensor's first tick: if the load's SUCCESS event lands
+    first, the sensor skips it and the chain never runs -- a false
+    negative the gate would report as a feature failure. Waiting for the
+    first tick before the load removes the race, because the load's event
+    then has a storage id strictly greater than the cursor.
+
+    The tick is read from `GET /api/pipelines/{id}/schedule-ticks`, which
+    merges the `authored__<id>_after` sensor's ticks in tagged
+    `kind:"sensor"` (`routes::authored_pipelines::schedule_ticks`); a
+    `pl-` id's manual schedule has no ticks of its own, so any `sensor`
+    tick is the cursor-initialising one.
+    """
+    resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/schedule-ticks", timeout=30)
+    # BLD-4 review R1 SHOULD-FIX 7: an API that refuses or errors fails the
+    # gate now, not after this check's 300 s wait expired and the timeout
+    # blamed a sensor that was never asked. A 404 is the one non-ok answer
+    # that IS a real answer (the chain has no sensor tick yet), so it stays
+    # a `False`.
+    if resp.status_code == 401 or resp.status_code >= 500:
+        raise G7Fatal(
+            f"GET /api/pipelines/{pipeline_id}/schedule-ticks answered "
+            f"{resp.status_code} {resp.text}; the gate cannot tell whether the "
+            "sensor has ticked"
+        )
+    if not resp.ok:
+        return False
+    return any(t.get("kind") == "sensor" for t in resp.json().get("ticks", []))
+
+
+def _ensure_catalog_database() -> None:
+    """This gate's own `DataLakeCatalog` database, idempotent (the same
+    statement `step_verify_the_silver_rows_match_the_bronze_source` sends,
+    extracted because the BLD-4 half reads Bronze BEFORE that step runs and
+    so needs the database to exist already). Each reader owns its own --
+    `ops/g3a` creates `icecat_g3a`, the authored job creates
+    `icecat_authored` -- so no gate depends on another's runs."""
+    ch_query(
+        f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
+        f"ENGINE = DataLakeCatalog('{LAKEKEEPER_CATALOG_URI}') "
+        f"SETTINGS catalog_type = 'rest', warehouse = '{LAKEKEEPER_WAREHOUSE}', "
+        f"storage_endpoint = '{CH_RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
+        "SETTINGS allow_database_iceberg = 1"
+    )
+
+
+def _bronze_rows(table: str) -> int:
+    """How many DISTINCT `id`s a Bronze Iceberg table holds, read through
+    this gate's own `DataLakeCatalog` database -- the same read
+    `step_verify_the_silver_rows_match_the_bronze_source` does, WITH a
+    `WHERE 1` so the aggregate walks the rows rather than the snapshot's
+    metadata (R11, `ops/lint/check_bare_iceberg_count.py`; the docstring on
+    the step above explains why its prose spells the aggregate out too).
+    Distinct ids, not rows, because both of this gate's row-count
+    assertions compare the Bronze side against a Silver side that runs
+    `dedupe(id)` first: the comparable quantity is one row per id.
+
+    The catalog database is ensured here and not by the caller: the BLD-4
+    half reads Bronze before any other step of this gate has created it, and
+    the statement is idempotent."""
+    _ensure_catalog_database()
+    return int(
+        ch_query(
+            f"SELECT count(DISTINCT id) FROM {CATALOG_DB}.`bronze.{table}` "
+            "WHERE 1 SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+        ).strip()
+    )
+
+
+def _create_the_ingest_chained_pipeline() -> str:
+    """`POST /api/pipelines` + `POST /api/pipelines/{id}/status` -- the
+    console's own "create, then Activate" pair
+    (`step_create_and_activate_authored_pipeline` is the same two calls) --
+    for a pipeline whose SOURCE is `bronze.<BRONZE_TABLE_A>` and whose
+    `dependsOn` is `["ingest_job"]`: the shape that used to fire on every
+    connector's load.
+
+    The transforms name the same fixture columns the existing step's do
+    (`ingest_demo.orders` is that table's source), with `dedupe(id)` first
+    for the same reason that step has it: the row-count assertion below
+    compares the chain's Silver rows against `count(DISTINCT id)` of the
+    Bronze table (R11 forbids an unqualified aggregate there), so the
+    output has to be one row per distinct `id` for the two counts to be
+    comparable at all -- with only `select`, a Bronze table carrying a
+    repeated id would make the assertion fail for a shape the gate never
+    claimed to prove. The only thing this pipeline proves is the trigger,
+    not a new read path.
+    """
+    create = API.post(
+        f"{API_URL}/api/pipelines",
+        json={
+            "name": "g7_dep_ingest_chain", "kind": "batch",
+            "sourceZone": "bronze", "sourceTable": BRONZE_TABLE_A,
+            "transforms": ["dedupe(id)", "select(id,customer)"],
+            "targetZone": "silver", "targetTable": CHAIN_SILVER_TABLE,
+            "schedule": "manual",
+            "dependsOn": [UPSTREAM_JOB_NAME],
+        },
+        timeout=30,
+    )
+    if not create.ok:
+        raise G7Failure(
+            f"POST /api/pipelines (dependsOn=[{UPSTREAM_JOB_NAME!r}]) failed: "
+            f"{create.status_code} {create.text}"
+        )
+    pipeline_id = create.json()["id"]
+    activate = API.post(
+        f"{API_URL}/api/pipelines/{pipeline_id}/status", json={"status": "ready"}, timeout=30
+    )
+    if not activate.ok:
+        raise G7Failure(f"POST .../status failed: {activate.status_code} {activate.text}")
+    print(
+        f"[g7] authored pipeline {pipeline_id!r} (bronze.{BRONZE_TABLE_A} -> "
+        f"silver.{CHAIN_SILVER_TABLE}, depends_on=[{UPSTREAM_JOB_NAME!r}]) created and activated"
+    )
+    return pipeline_id
+
+
+def step_a_load_of_its_own_table_triggers_the_chain(pipeline_id: str) -> None:
+    """BLD-4 / D1, the positive half: a one-table run of the chain's OWN
+    source table is the only kind of `ingest_job` run that may start it, so
+    it must start -- and the run it starts must produce the Silver rows,
+    counted through ClickHouse rather than taken from the run's own report
+    (the same discipline `step_verify_the_silver_rows_match_the_bronze_
+    source` follows)."""
+    run_id = _run_ingest_one_table(SOURCE_OBJECT_A)
+    print(f"[g7] ran one-table ingest of {SOURCE_OBJECT_A!r}: run {run_id}")
+    _wait_for_run_terminal(run_id, "ingest run")
+    _wait_for(
+        f"bronze.{BRONZE_TABLE_A} readable with rows",
+        lambda: _bronze_rows(BRONZE_TABLE_A) > 0,
+        60,
+    )
+    loaded = _bronze_rows(BRONZE_TABLE_A)
+    print(f"[g7] bronze.{BRONZE_TABLE_A} holds {loaded} distinct ids, so the anchor this chain needs exists")
+
+    def appeared() -> bool:
+        return bool(_chain_run_ids(pipeline_id))
+
+    _wait_for("the chain to run", appeared, timeout_s=RUN_APPEARED_TIMEOUT_S, interval_s=2.0)
+    chain_runs = _chain_run_ids(pipeline_id)
+    if len(chain_runs) != 1:
+        raise G7Failure(
+            f"the chain produced {len(chain_runs)} runs after one load of "
+            f"{SOURCE_OBJECT_A!r}, expected exactly 1: {chain_runs}"
+        )
+    _wait_for_run_terminal(chain_runs[0], "chain run")
+    silver_rows = int(
+        ch_query(f"SELECT count() FROM silver.`{CHAIN_SILVER_TABLE}` FORMAT TabSeparated").strip()
+    )
+    # BLD-4 review R1 SHOULD-FIX 7: the module doc and the CHANGELOG entry
+    # claim the chain's output CARRIES the rows, so the gate asserts them:
+    # one Silver row per distinct Bronze id, counted on both sides through
+    # ClickHouse rather than read out of the run's own report (the same
+    # discipline `step_verify_the_silver_rows_match_the_bronze_source`
+    # follows, and the reason that step's pipeline carries `dedupe(id)`).
+    if silver_rows != loaded or silver_rows <= 0:
+        raise G7Failure(
+            f"silver.{CHAIN_SILVER_TABLE} holds {silver_rows} rows, expected "
+            f"{loaded} (one per distinct id of bronze.{BRONZE_TABLE_A}); the "
+            "chain ran but its output does not carry the loaded rows"
+        )
+    print(
+        f"[g7] the chain ran ({chain_runs[0]}) and wrote {silver_rows} rows to "
+        f"silver.{CHAIN_SILVER_TABLE}"
+    )
+
+
+def step_a_load_of_another_table_does_not_trigger_the_chain(pipeline_id: str) -> None:
+    """BLD-4 / D1, the negative half, and the reason the feature exists.
+
+    A one-table run of a DIFFERENT table is a SUCCESS run of the same
+    `ingest_job` -- the unfiltered rule ("newest SUCCESS run of the job")
+    answered exactly this, which is how every connector's load came to fire
+    every chain in a deployment. Here the chain has already run once (so the
+    sensor is demonstrably alive and ticking: the assertion below is not
+    satisfied by a sensor that never loads), and the new run keys a DIFFERENT
+    set of upstream run ids, so Dagster's own `run_key` dedup cannot hide it
+    either.
+
+    The wait is two sensor intervals, doubled, and the run ids are compared
+    rather than counted: a chain that starts here fails with its run id in
+    the message."""
+    before = _chain_run_ids(pipeline_id)
+    run_id = _run_ingest_one_table(SOURCE_OBJECT_B)
+    print(f"[g7] ran one-table ingest of {SOURCE_OBJECT_B!r}: run {run_id}")
+    _wait_for_run_terminal(run_id, "ingest run")
+    _wait_for(
+        f"bronze.{BRONZE_TABLE_B} readable with rows",
+        lambda: _bronze_rows(BRONZE_TABLE_B) > 0,
+        60,
+    )
+    print(
+        f"[g7] bronze.{BRONZE_TABLE_B} holds {_bronze_rows(BRONZE_TABLE_B)} distinct ids; "
+        "the chain must not run"
+    )
+
+    deadline = time.time() + OTHER_TABLE_MUST_NOT_TRIGGER_S
+    while time.time() < deadline:
+        time.sleep(2.0)
+        current = _chain_run_ids(pipeline_id)
+        new = [r for r in current if r not in before]
+        if new:
+            raise G7Failure(
+                f"a load of {SOURCE_OBJECT_B!r} (bronze.{BRONZE_TABLE_B}) started the "
+                f"chain anyway: new run(s) {new}; only a load of {SOURCE_OBJECT_A!r} "
+                f"(bronze.{BRONZE_TABLE_A}) may start it"
+            )
+    print(
+        f"[g7] {OTHER_TABLE_MUST_NOT_TRIGGER_S}s later (two sensor intervals, doubled) "
+        f"the chain still has its {len(before)} run(s): a load of another table "
+        "did not trigger it"
+    )
 
 
 def step_verify_graph_and_source() -> None:
@@ -541,6 +1053,7 @@ def _assert_source_refused(op: dict) -> None:
 
 
 def main() -> int:
+    seeded_spec: dict | None = None
     try:
         # Fail closed on an unrecognised mode rather than defaulting it to
         # `required`: a typo in a CI `.env` must be loud, not a quiet
@@ -551,6 +1064,46 @@ def main() -> int:
                 f"{list(SOURCE_PROVENANCE_MODES)}"
             )
         step_login()
+        # The bootstrap admin belongs to no tenant; the seeded connector this
+        # gate drives belongs to `meridian-group`. Join it before any
+        # `/api/connectors/{id}/*` call, or every one answers 404.
+        step_ensure_connector_tenant()
+        # BLD-4: the chain's two source objects on the stack's own
+        # connector, and the chain itself, BEFORE either ingest run -- a
+        # chain created after its anchor already exists would pass the
+        # positive assertion for the wrong reason.
+        #
+        # `ingest_job` must be loaded BEFORE the chain is created: the
+        # create route validates `depends_on` against the live Dagster job
+        # list and refuses a Dagster-native upstream it cannot see
+        # (`routes::authored_pipelines::validate_depends_on`), and a fresh
+        # stack's code location may not have registered yet.
+        _wait_for(
+            f"{UPSTREAM_JOB_NAME} loaded",
+            lambda: _dagster_job_is_loaded(UPSTREAM_JOB_NAME),
+            180,
+        )
+        seeded_spec = _read_connector_spec()
+        _put_connector_spec({**seeded_spec, "sourceObjects": [
+            {"name": SOURCE_OBJECT_A, "incrementalKey": "created_at", "target": BRONZE_TABLE_A},
+            {"name": SOURCE_OBJECT_B, "target": BRONZE_TABLE_B},
+        ]})
+        print(
+            f"[g7] {CONNECTOR_ID!r} now loads {SOURCE_OBJECT_A!r} -> bronze.{BRONZE_TABLE_A} "
+            f"and {SOURCE_OBJECT_B!r} -> bronze.{BRONZE_TABLE_B} (one object per run)"
+        )
+        chain_pipeline_id = _create_the_ingest_chained_pipeline()
+        # The chain's sensor must have ticked once (its cursor is set and
+        # skips everything before it) BEFORE the load of table A, or the
+        # load's SUCCESS event races the cursor and the chain never runs --
+        # see `_dependency_sensor_has_ticked`.
+        _wait_for(
+            "the chain's dependency sensor to evaluate once (cursor initialised)",
+            lambda: _dependency_sensor_has_ticked(chain_pipeline_id),
+            300,
+        )
+        step_a_load_of_its_own_table_triggers_the_chain(chain_pipeline_id)
+        step_a_load_of_another_table_does_not_trigger_the_chain(chain_pipeline_id)
         pipeline_id = step_create_and_activate_authored_pipeline()
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
         step_verify_the_silver_rows_match_the_bronze_source()
@@ -558,6 +1111,16 @@ def main() -> int:
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # Leave the stack as this gate found it: the seeded connector's own
+        # spec, so a later gate in the same stack (or a developer's next
+        # `ops/g6` run) does not inherit this gate's two fixtures.
+        if seeded_spec is not None:
+            try:
+                _put_connector_spec(seeded_spec)
+                print(f"[g7] restored {CONNECTOR_ID!r}'s seeded ingest-spec")
+            except G7Failure as exc:
+                print(f"[g7] WARNING: could not restore the seeded spec: {exc}", file=sys.stderr)
     print("[g7] PASS")
     return 0
 

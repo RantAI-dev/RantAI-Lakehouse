@@ -188,8 +188,18 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "connectors.rs",
-        "SecretStoreError::Io(_) => ApiError::Unavailable(err.to_string())",
-        "SecretStoreError messages are value-free by definition",
+        "ApiError::Unavailable(err.to_string()) // SEC-11 allowlisted",
+        "SRC-12 A1, `secret_store_error`'s Io and Key arms: SecretStoreError::Io prints only the std::io::ErrorKind variant name (`{0:?}` of an enum, not the OS message) in a sentence written in this repository, and SecretStoreError::Key prints a CryptoError, whose every variant is a fixed sentence naming the setting (secret_crypto.rs), never a key",
+    ),
+    (
+        "connectors.rs",
+        "ApiError::BadRequest(err.to_string()) // SEC-11 allowlisted",
+        "SRC-11 D9-D11, `InvalidExcludedColumns::BadList`: a fixed sentence (ingest_spec.rs) that names only the source object the request itself sent",
+    ),
+    (
+        "connectors.rs",
+        "_ => ApiError::Unprocessable(err.to_string()), // SEC-11 allowlisted",
+        "SRC-11 D9-D11, the other InvalidExcludedColumns variants: fixed sentences (ingest_spec.rs) that name only the object and column the request itself sent",
     ),
     (
         "connectors.rs",
@@ -279,6 +289,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/gold.rs",
         ".map_err(|err| json!({ \"error\": err.to_string() }))?;",
         "read_catalog_token's ApiError text, written in this repository",
+    ),
+    // The tool's own decode of the model's arguments: serde reporting a
+    // shape it cannot parse out of `filters`, which the caller supplied.
+    // Same class as the `invalid JSON: {err}` entries above -- our own
+    // schema describing the caller's input, never an upstream payload.
+    (
+        "ai/tools/boards.rs",
+        "format!(\"filters: {err}\")",
+        "serde error over the caller's own tool arguments",
     ),
 ];
 

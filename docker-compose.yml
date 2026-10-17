@@ -1,3 +1,12 @@
+# SEC-18 -- no default credentials. These variables have NO fallback and
+# compose refuses to start without them (`${X:?}`): POSTGRES_PASSWORD,
+# RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, LAKEKEEPER_ENCRYPTION_KEY.
+# `CONNECTOR_PG_PASSWORD` / `CONNECTOR_S3_*` fall back to those, never to a
+# literal. `ops/init-env.sh` writes a local `.env` with generated values;
+# docs/OPERATIONS.md has the upgrade note. Compose interpolates the whole
+# file whatever profiles are active, so a variable used only by an optional
+# profile (SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY) defaults to empty
+# and `seaweedfs-iam-init` refuses to run while it is empty.
 services:
   # Phase 2 OLTP store (mutation state that ClickHouse — analytics-only, no
   # transactions — is a poor fit for). ClickHouse remains the analytics
@@ -28,7 +37,7 @@ services:
       ]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     ports:
       - "${POSTGRES_HOST_PORT:-5432}:5432"
@@ -201,6 +210,13 @@ services:
       # `true`, empty or unset leaves it on; any other value stops the API
       # at start (see config.rs).
       AI_RELEVANT_TABLES: ${AI_RELEVANT_TABLES:-}
+      # SEC-17: uploads in progress at once, per user and in the whole
+      # installation (files being received and loads running, each counted
+      # against both). Empty or unset keeps the defaults, 4 and 16; a value
+      # that is not a whole number of 1 or more stops the API at start (see
+      # config.rs).
+      UPLOAD_MAX_CONCURRENT_PER_USER: ${UPLOAD_MAX_CONCURRENT_PER_USER:-}
+      UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_SECURE: ${SMTP_SECURE:-false}
@@ -310,7 +326,7 @@ services:
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${POSTGRES_DB:-lakehouse}}
       # ── secretRef-resolvable credentials for `connector_probe`'s real
       #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
       #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
@@ -325,13 +341,14 @@ services:
       # `connector:manage` principal creating a connector that names
       # `env:POSTGRES_PASSWORD` (the console's own database password) with a
       # caller-chosen external host and having the API authenticate to it.
-      # They default to the same values so the local stack still works —
+      # They fall back to the must-set values above (SEC-18: never to a
+      # literal) so the local stack still works —
       # separate NAMES, not necessarily separate values. Point them at
       # least-privilege credentials in any deployment that accepts connector
       # definitions from callers you do not fully trust.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
-      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
-      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # The connector connection test, table discovery and the clean-up of
       # a deleted change-capture connector block private/internal address
       # ranges (SSRF guard — otherwise a `connector:manage` principal gets an
@@ -349,6 +366,71 @@ services:
       # effect when the flag above is not `true`. Never opens loopback,
       # link-local, multicast or `0/8` (`lakehouse-api::internal_hosts`).
       CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
+      # SRC-11 D3: this many failed runs in a row pause a connector and raise
+      # `connector_disabled` once. Unset or empty keeps the code's default,
+      # 30 (the spec's number); zero, negative or garbage does too. A
+      # gate sets a small number so it need not run 30 failures
+      # (`ops/g6/src11_connector_operations_test.py`). Not a credential.
+      CONNECTOR_AUTO_DISABLE_AFTER: ${CONNECTOR_AUTO_DISABLE_AFTER:-}
+      # SRC-12 decision 4 (ADR 0002 addendum 5): the key managed connector
+      # credentials are sealed with (AES-256-GCM). Required, no default
+      # anywhere: compose refuses to start without it, and so does the API.
+      # Losing it loses every stored credential; back it up apart from the
+      # `lakehouse_connector_secrets` volume. `CONNECTOR_SECRETS_KEY_PREVIOUS`
+      # is set only during a key change (decision 5, `lakehouse-api
+      # rotate-secrets-key`): it opens files, it never seals.
+      CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
+      CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
+      # SRC-12 part B (decisions 1 and 2): the installation's ONE secret
+      # manager, if any. Unset (empty) means none, and then a connector's
+      # credential is a typed value or an operator's env/file. The sign-in to
+      # the manager is the operator's, here, never set in the console: it is
+      # itself a secret. The same block is on `dagster-code-location`, which
+      # reads the secrets itself at the start of every run. Empty values are
+      # ignored by both services (no default token anywhere, rule 5).
+      #   vault:  VAULT_ADDR, then VAULT_TOKEN or VAULT_ROLE_ID + VAULT_SECRET_ID
+      #   aws:    AWS_REGION and a role or access keys (the AWS_* below)
+      #   gcp:    GOOGLE_APPLICATION_CREDENTIALS (a service-account file the
+      #           operator mounts into BOTH services), or the platform identity
+      #   azure:  AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET, or a
+      #           managed identity
+      # SECRET_MANAGER_ALLOWED_PREFIXES (SRC-12 review B1 BLOCKER 1): the
+      # reference prefixes connectors may use, comma-separated, `{tenant}` =
+      # the connector's tenant id. Empty with a manager set: NO reference is
+      # accepted (a user must not make the product read every secret its
+      # identity can read).
+      SECRET_MANAGER: ${SECRET_MANAGER:-}
+      SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_SECRETS_MANAGER: ${AWS_ENDPOINT_URL_SECRETS_MANAGER:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      # SRC-12 decision 2: `false` turns typing a credential value off, so
+      # connectors can only reference a secret in the secret manager. Anything
+      # else keeps typing possible. Read by `lakehouse-api` only.
+      CONNECTOR_TYPED_CREDENTIALS: ${CONNECTOR_TYPED_CREDENTIALS:-}
+      # SRC-12 part C: the address the OAuth provider sends the person's
+      # browser back to (this product's own callback, `/api/connectors/oauth/
+      # callback` on the console's address). Operator-set and never taken from
+      # a request; empty refuses OAuth sign-in with a message naming this
+      # setting. Read by `lakehouse-api` only.
+      CONNECTOR_OAUTH_REDIRECT_URI: ${CONNECTOR_OAUTH_REDIRECT_URI:-}
+      # SRC-12 part C, GATE ONLY: `true` admits an `http://` OAuth token,
+      # revocation and sign-in address (the acceptance gate runs its own
+      # provider without a certificate). Empty (off) is the only value a real
+      # installation uses: those addresses carry a client secret or a refresh
+      # token. The private-address refusal applies either way.
+      CONNECTOR_OAUTH_ALLOW_HTTP: ${CONNECTOR_OAUTH_ALLOW_HTTP:-}
+
       # SEC-10: alert and digest webhooks refuse the same private/internal
       # addresses as the connector tests above, never follow a redirect, and
       # connect to the address that was checked. This lists the internal
@@ -555,8 +637,8 @@ services:
       RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
       # SECURITY: these defaults are public and well-known — override
       # before exposing this listener beyond localhost.
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       RUSTFS_OBS_LOGGER_LEVEL: info
     ports:
       - "${RUSTFS_HOST_PORT:-9010}:9000"
@@ -580,8 +662,8 @@ services:
       rustfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
@@ -627,7 +709,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
     entrypoint: ["/bin/sh", "-c"]
@@ -658,9 +740,9 @@ services:
       openfga-ready:
         condition: service_completed_successfully
     environment:
-      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
-      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
-      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?LAKEKEEPER_ENCRYPTION_KEY is required (catalog encryption key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__AUTHZ_BACKEND: openfga
       LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
       LAKEKEEPER__OPENFGA__STORE_NAME: ${LAKEKEEPER_OPENFGA_STORE_NAME:-lakekeeper}
@@ -679,7 +761,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
     entrypoint: ["/bin/sh", "-c"]
@@ -711,7 +793,7 @@ services:
     command:
       - migrate
       - --datastore-engine=postgres
-      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
     restart: "no"
 
   # R1 — OpenFGA: Lakekeeper's native authorization backend (the
@@ -735,7 +817,7 @@ services:
     command:
       - run
       - --datastore-engine=postgres
-      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
       - --http-addr=0.0.0.0:8080
       - --grpc-addr=0.0.0.0:8081
       - --playground-enabled=false
@@ -851,9 +933,9 @@ services:
       oidc-mock:
         condition: service_healthy
     environment:
-      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
-      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
-      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:?LAKEKEEPER_ENCRYPTION_KEY is required (catalog encryption key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       # R1 — authorization: OpenFGA backend, OIDC-identified principals.
       # `LAKEKEEPER__INSTANCE_ADMINS` bootstraps a full-access identity
@@ -921,8 +1003,8 @@ services:
       LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — this job
       # only ever needs `admin.jwt`.
@@ -1324,7 +1406,7 @@ services:
   #   docker compose -p <project> up -d --build lakehouse-api
   #   docker compose -p <project> --profile test run --rm gold-export-test-runner
   gold-export-test-runner:
-    profiles: ["test"]
+    profiles: ["dagster"]
     image: python:3.12-slim
     working_dir: /work
     volumes:
@@ -1346,6 +1428,8 @@ services:
     depends_on:
       lakehouse-api:
         condition: service_started
+      dagster-webserver:
+        condition: service_healthy
       lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
@@ -1353,6 +1437,12 @@ services:
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: ${DAGSTER_URL:-http://dagster-webserver:3000/graphql}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # DATA-2 review BLOCKER 2: no default credentials in compose (AGENTS rule 5)
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       LAKEKEEPER_BASE_URI: http://lakekeeper:8181
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEKEEPER_TOKENS_DIR: /tokens
@@ -1360,9 +1450,11 @@ services:
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
       GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "pip install -q requests && python gold_export_test.py"
+      - "pip install -q requests boto3 && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -1396,8 +1488,16 @@ services:
     profiles: ["seaweedfs"]
     image: alpine:3.20
     environment:
-      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      # SEC-18: no repository-written default. Compose interpolates the
+      # whole file whatever profiles are active, so `${VAR:?}` here would
+      # stop a default `up` that never starts SeaweedFS. They default to
+      # empty instead and the script below refuses to render when either
+      # is empty; `seaweedfs` waits for this job to complete and every
+      # other `seaweedfs` profile service waits for `seaweedfs`, so an
+      # empty key stops the whole profile (fail closed) rather than
+      # starting an S3 gateway with no or a known key.
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-}
       # CHANGE ME (or leave unset) BEFORE ANY DEPLOYMENT: see docs comment
       # above — unset is safe (a random key is generated per deployment),
       # a shared/known value here is not.
@@ -1409,6 +1509,10 @@ services:
     command:
       - |
         set -eu
+        if [ -z "$$SEAWEEDFS_ACCESS_KEY" ] || [ -z "$$SEAWEEDFS_SECRET_KEY" ]; then
+          echo "seaweedfs-iam-init: SEAWEEDFS_ACCESS_KEY and SEAWEEDFS_SECRET_KEY are required for the seaweedfs profile (SEC-18; run ops/init-env.sh or see docs/OPERATIONS.md)." >&2
+          exit 1
+        fi
         signing_key="$$SEAWEEDFS_STS_SIGNING_KEY"
         if [ -z "$$signing_key" ] && [ -f /rendered/iam.json ]; then
           signing_key="$$(sed -n 's/.*"signingKey": *"\([^"]*\)".*/\1/p' /rendered/iam.json | head -n1)"
@@ -1429,7 +1533,7 @@ services:
   #
   # SECURITY (credential-hygiene review): this used to bind-mount a
   # COMMITTED `ops/seaweedfs/iam.json` straight off the repo tree, which
-  # hard-coded `seaweedfsadmin`/`seaweedfsadmin` *and* a working STS
+  # hard-coded default admin credentials *and* a working STS
   # signing key (base64 of a self-describing placeholder string) into
   # every checkout. That file's own comment said "local/CI only", but
   # this compose file doubles as the deployment template — so a real
@@ -1482,8 +1586,8 @@ services:
       seaweedfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-}
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
@@ -1547,8 +1651,8 @@ services:
     environment:
       LAKEKEEPER_WAREHOUSE: seaweedfs
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
-      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
-      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — `admin.jwt`
       # only.
@@ -1680,7 +1784,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     entrypoint: ["/bin/sh", "-c"]
@@ -1709,7 +1813,8 @@ services:
     # .github/workflows/ci.yml builds it once and sets LAKEHOUSE_DAGSTER_IMAGE
     # to `rantai-lakehouse-dagster:ci`; the default is what a local
     # `up --build` tags. The two gate runners that `ops/g6/*.override.yml`
-    # define (`g6-oracle-test-runner`, `g6-alerts-test-runner`) share it too.
+    # define (`g6-oracle-test-runner`, `g6-alerts-test-runner`,
+    # `g6-ops-test-runner`) share it too.
     # All the `build:` blocks MUST stay identical (same
     # `args:`): with one shared name, a build of any of them retags the image
     # for all of them, so a block without `GIT_SHA` would bake `unknown`
@@ -1731,6 +1836,7 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
+      # DATA-2 review BLOCKER 3: no source bind-mount in deployment template (image carries code)
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
       - type: volume
@@ -1746,6 +1852,13 @@ services:
       - type: volume
         source: lakehouse_connector_secrets
         target: /run/secrets
+        read_only: true
+      # DATA-2 (D2): read-only subpath mount for the gold-export principal token
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
         read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
@@ -1766,10 +1879,44 @@ services:
       # this compose network and the host stay refused. Empty by default
       # (`ssrf_guard.py`'s module docstring).
       INGEST_ALLOWED_CIDRS: ${INGEST_ALLOWED_CIDRS:-}
+      # SRC-11 D1: the wait before each retry of a failing table, in seconds,
+      # one to three whole numbers. Unset or empty keeps the code's default,
+      # `60,300,900` (1, 5 and 15 minutes, the spec's); a malformed value
+      # does too (`ingest_errors.RetrySettings.from_env`). Read by the run
+      # process, which this service launches, so the daemon needs none. A
+      # gate shortens it (`ops/g6/src11_connector_operations_test.py`).
+      INGEST_RETRY_DELAYS_SECONDS: ${INGEST_RETRY_DELAYS_SECONDS:-}
+      # SRC-12 decision 4: opens the sealed `connector_managed_*` files on the
+      # read-only volume above (`secret_resolver.open_managed_credential`).
+      # Same required key as `lakehouse-api`, same single value, no default;
+      # the previous key only during a key change.
+      CONNECTOR_SECRETS_KEY: ${CONNECTOR_SECRETS_KEY:?CONNECTOR_SECRETS_KEY is required - generate one with "openssl rand -base64 32" and set it in .env}
+      CONNECTOR_SECRETS_KEY_PREVIOUS: ${CONNECTOR_SECRETS_KEY_PREVIOUS:-}
+      # SRC-12 part B: the same secret manager settings as `lakehouse-api`
+      # (see the block there), read by `secret_manager.py` when a run starts.
+      SECRET_MANAGER: ${SECRET_MANAGER:-}
+      SECRET_MANAGER_ALLOWED_PREFIXES: ${SECRET_MANAGER_ALLOWED_PREFIXES:-}
+      # SRC-12 part C, GATE ONLY: the same switch as `lakehouse-api`'s, read by
+      # `adapters/rest.py` before a token request. Empty (off) on a real
+      # installation: a client secret and a refresh token go to that address.
+      CONNECTOR_OAUTH_ALLOW_HTTP: ${CONNECTOR_OAUTH_ALLOW_HTTP:-}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_ENDPOINT_URL_SECRETS_MANAGER: ${AWS_ENDPOINT_URL_SECRETS_MANAGER:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
       # CREDENTIAL HYGIENE (review finding): this used to be a single
       # `BRONZE_SOURCE_DATABASE_URL` env var carrying a full
@@ -1792,7 +1939,7 @@ services:
       BRONZE_SOURCE_DB_HOST: postgres
       BRONZE_SOURCE_DB_PORT: "5432"
       BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
-      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
       # only ever fed the g3a demo pipeline's OWN hardcoded credential
       # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
@@ -1807,7 +1954,7 @@ services:
       # deployment of this compose file, not just the gate. Exported here
       # under its own name, same value as above, so both readers resolve
       # it.
-      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -1821,6 +1968,8 @@ services:
       # so there is no step to interpolate a file into an env var before
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
+      # DATA-2 (D2): the gold-export principal pre-minted token path
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
       # static-credential fallback path, used because dlt writes Parquet
@@ -1839,8 +1988,8 @@ services:
       # see .env.example's note by these vars). A deployment that can
       # mint a scoped RustFS/S3 identity should set these two to it
       # without touching `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` at all.
-      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
-      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -1864,6 +2013,10 @@ services:
       LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
       GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # DATA-2 (D4): number of Gold export copies to keep per mart (default 7)
+      GOLD_KEEP_COPIES: ${GOLD_KEEP_COPIES:-7}
+      # DATA-2 review BLOCKER 1: minimum orphan age in seconds before removal (default 3600)
+      GOLD_ORPHAN_MIN_AGE_SECONDS: ${GOLD_ORPHAN_MIN_AGE_SECONDS:-3600}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the
@@ -1919,6 +2072,15 @@ services:
       # ever became a job. Unset: no identity is seeded and the factory
       # loads zero authored jobs, saying so in its log.
       PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
+      # BLD-1 / D5: the API's own `DataLakeCatalog` database, which a
+      # Bronze-sourced authored pipeline reads its table through -- named
+      # here because the API's policy rewriter only recognises a governed
+      # table under THIS database, so a pipeline reading Bronze anywhere
+      # else is never masked. The same single-`.env`-value reasoning as
+      # `ICEBERG_QUERY_DB` on `lakehouse-api` and `clickhouse-iceberg-init`
+      # (which creates it); an internal name, not a credential, so a
+      # default is allowed (`${X:-}`).
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
@@ -1981,6 +2143,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       # Not a credential -- a retention window -- so a dev default is fine
       # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
@@ -1988,11 +2152,17 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # OPS-7 E6: warehouse source endpoint/bucket and ClickHouse connection (non-secret).
+      BACKUP_WAREHOUSE_ENDPOINT: ${BACKUP_WAREHOUSE_ENDPOINT:-${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}}
+      BACKUP_WAREHOUSE_BUCKET: ${BACKUP_WAREHOUSE_BUCKET:-${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
     command: ["python", "-m", "dispar_orchestrate.backup_job"]
     restart: "no"
 
@@ -2023,7 +2193,7 @@ services:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
     ports:
@@ -2064,7 +2234,7 @@ services:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
-      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
     command: ["dagster-daemon", "run", "-w", "/opt/dagster/app/workspace.yaml"]
     restart: unless-stopped
@@ -2098,8 +2268,16 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    # BLD-4 (`ops/g7/g7_pipeline_test.py`): the second SMALLEST table a
+    # connector-shaped gate needs to load one table and NOT another (a
+    # `ingest_job` run of one table) and so prove that a chain after
+    # `ingest_job` fires only for the table it reads. It is a fixture, not a
+    # product schema: the seeded `conn-pg-lakehouse` row is NOT edited to
+    # load it (0034's seed is applied, never edited) and the only code path
+    # that loads it is that gate's own ingest-spec PUT, against this stack's
+    # own instance.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2115,6 +2293,16 @@ services:
         SELECT 'customer_' || (g % 500), (g % 1000)::numeric + 0.5
         FROM generate_series(1, 2000) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.orders);
+        CREATE TABLE IF NOT EXISTS ingest_demo.customers (
+          id bigserial PRIMARY KEY,
+          name text NOT NULL,
+          email text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        );
+        INSERT INTO ingest_demo.customers (name, email)
+        SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
+        FROM generate_series(1, 20) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
         "
     restart: "no"
 
@@ -2206,6 +2394,8 @@ services:
         condition: service_healthy
       g3a-source-init:
         condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
@@ -2224,6 +2414,20 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # BLD-4: the two Bronze tables the dependency-chain half proves
+      # itself against, each loaded by a run of ONE table on the stack's
+      # own `conn-pg-lakehouse` connector. `orders` (the G3a fixture's
+      # source table) is the chain's OWN table; `customers` is the
+      # smallest second table `g3a-source-init` creates for this. Both
+      # Bronze names are fresh on purpose: a chain that already had a
+      # qualifying anchor would pass the "fires after its own table"
+      # assertion without this job loading anything.
+      G7_INGEST_CONNECTOR_ID: ${G7_INGEST_CONNECTOR_ID:-conn-pg-lakehouse}
+      G7_INGEST_OBJECT_A: ${G7_INGEST_OBJECT_A:-ingest_demo.orders}
+      G7_INGEST_BRONZE_TABLE_A: ${G7_INGEST_BRONZE_TABLE_A:-g7_dep_orders}
+      G7_INGEST_OBJECT_B: ${G7_INGEST_OBJECT_B:-ingest_demo.customers}
+      G7_INGEST_BRONZE_TABLE_B: ${G7_INGEST_BRONZE_TABLE_B:-g7_dep_customers}
+      G7_CHAIN_SILVER_TABLE: ${G7_CHAIN_SILVER_TABLE:-g7_dep_ingest_chain_out}
       # What the source step asserts (BLD-3 review BLOCKER 1): `required`
       # (the default, and what a real deployment wants) makes the gate
       # demand the op's real source text, which needs images carrying a
@@ -2244,6 +2448,61 @@ services:
       - "pip install -q requests && python g7_pipeline_test.py"
     restart: "no"
 
+  # BLD-1 acceptance — `ops/g7/bld1_pipeline_author_test.py`: an authored
+  # pipeline reads as its author, proven on the ROWS it writes. Its own
+  # service rather than a second command on `g7-test-runner`, because that
+  # one's `command` is fixed to the G7 script and `docker compose run`
+  # REPLACES a command -- running this through it would drop the
+  # `pip install requests` its `entrypoint` relies on, and the script would
+  # exit on `import requests` having proved nothing. Same image, same
+  # read-only `./ops/g7` mount, same bootstrap-admin credential from the
+  # operator's `.env`.
+  #
+  # `BLD1_NO_AUTHOR_PIPELINE_ID` is the third case's fixture (a pipeline
+  # whose `run_as` was cleared, which is what a service identity's create
+  # and the migration's backfill both leave). Unset in a normal run, and
+  # the script then prints an explicit SKIP line naming where that case is
+  # covered; CI sets it — see `ci.yml`'s `g3a-dagster` job for the `psql`
+  # step that clears the column.
+  #
+  # Usage (from the clean stack G3a leaves behind):
+  #   docker compose -p <project> --profile dagster run --rm bld1-test-runner
+  bld1-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g7:/work:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+      clickhouse-iceberg-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      # The Silver-side assertions read the pipeline's output through
+      # ClickHouse, the same client `g7-test-runner` uses.
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      BLD1_NO_AUTHOR_PIPELINE_ID: ${BLD1_NO_AUTHOR_PIPELINE_ID:-}
+      BLD1_NO_AUTHOR_FIXTURE: ${BLD1_NO_AUTHOR_FIXTURE:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python bld1_pipeline_author_test.py"
+    restart: "no"
+
   # DATA-9 (G9) — the file-upload acceptance test (`ops/g9/upload_test.py`):
   # upload, preview, load with `replace` and `append`, delete, an Excel
   # workbook and a Parquet file, end to end through the API, `file_ingest_job`
@@ -2258,6 +2517,13 @@ services:
   # `UPLOAD_S3_SECRET_KEY`, which have no default: unset, every upload answers
   # 503 "Upload storage is not configured."). The CI job writes both into its
   # `.env`; see `.github/workflows/ci.yml`'s `g9-upload`.
+  #
+  # `PIPELINE_RUN_TOKEN` too, for the same reason the g6 gates set it: the
+  # gate's step 10 (DATA-19) authors a pipeline over the table it uploaded,
+  # so `dagster-code-location` has to build an authored job and its chain
+  # sensor. Unset, `authored_factory` loads zero of both and the gate fails
+  # at "the orchestrator built authored__<id>", which is the honest answer
+  # for such a stack rather than a gate that cannot prove anything.
   #
   # The gate reads its fixtures from `ops/fixtures/` beside `ops/g9/`, so the
   # two directories are mounted side by side under /work, read-only: the
@@ -2433,8 +2699,8 @@ services:
       # Trino's own file I/O, and reusing them would blur that boundary
       # rather than reduce actual risk (both ultimately default to the same
       # `RUSTFS_*` value anyway).
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
     volumes:
       # PR #33 review, should-fix: single-file subpath mount — this
       # service only reads `trino.jwt` (interpolated into
@@ -2673,7 +2939,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -2764,10 +3030,10 @@ services:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     volumes:
       - lakehouse_debezium_data:/debezium/data
@@ -2911,7 +3177,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       # WS5 item C3 -- g4_test.py's own env var names (duplicated from
       # ops/g3a/g3a_test.py per its module comment, but NOT identically
@@ -3040,7 +3306,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -3089,7 +3355,7 @@ services:
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
       # `./ops/g8` is bound read-write as root (see `g3a-test-runner`):
       # keep a root-owned `__pycache__/` from ever landing in the checkout.
@@ -3389,8 +3655,8 @@ services:
       # `g6-files` connector's derived `file:` credential (ADR 0002
       # Addendum 3) with the value that actually unlocks this stack's
       # RustFS.
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required (object store access key; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required (object store secret key; run ops/init-env.sh or see docs/OPERATIONS.md)}
       # MYSQL_ROOT_PASSWORD, MSSQL_SA_PASSWORD, MONGO_G6_ROOT_PASSWORD:
       # gate-only, set in ops/g6/docker-compose.g6.override.yml -- see
       # the comment above mysql-g6/mssql-g6 in this file (WS3 item 37).

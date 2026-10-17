@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `DATA-10` (so a trim is not undone by copies made for no change) |
+| Blocked by | Nothing open (was: DATA-10, shipped) |
 
 ## Why
 

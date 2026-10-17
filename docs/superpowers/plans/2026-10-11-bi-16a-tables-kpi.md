@@ -248,3 +248,14 @@ Verify, not assume: how Query Studio's download streams and caps, and reuse it; 
 - PR #104 CI fix (`37739f6`): CI on that commit is green, 23 checks, except `gitleaks (full git history)`, red on `main` too (`SEC-1`).
 - The reviewer did not re-run the suites (owner's instruction); the developer ran the `lakehouse-api` unit tests and the integration files for the routes touched, each alone (counts in section 6). One file (`route_auth`) failed at database set-up on a first run and passed alone: watch it in CI.
 - Owed, each needs a backlog item: the older per-tile CSV export (`lib/csv.ts`, `table-csv.ts`) does not neutralise spreadsheet formulas and writes no byte-order mark; the estimate route now answers 422 where it answered 200 with an `error` field, and the console's estimate panel has not been looked at for that case; a refusal that only the full rewrite makes is not tested through the assistant.
+
+### AI team review of the assistant parts (recorded by the planner, 2026-10-15)
+
+PR #104 review BLOCKER 3. The product owner confirmed on 2026-10-15 that
+the AI team has reviewed this plan's assistant changes (`registry.rs`,
+`tests/fixtures/tool_schemas.json`, `capabilities.ts`) and takes the
+follow-ups into its own plans. Their notes are not copied here; open
+follow-ups the planner found are backlog `AI-20` (the grain override is not
+in the dashboard's page context) and `AI-15` (the standard request set does
+not exist yet, so `AI-3-AC1` and `AI-4-AC1` were checked by hand and
+`AI-5-AC1` not at all).

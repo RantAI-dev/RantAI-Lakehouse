@@ -22,6 +22,35 @@ describe("MiniMarkdown citation rendering (WS7 item F6)", () => {
     expect(marked.getAttribute("data-unverified")).toBe("true")
   })
 
+  it("renders an unverified number inside bold as a marker, not as literal tag text", () => {
+    const { container } = render(
+      <MiniMarkdown text='**Total: <span data-unverified="true">13</span>**' />,
+    )
+    const strong = container.querySelector("strong")
+    expect(strong).not.toBeNull()
+    const marked = within(strong as HTMLElement).getByText("13")
+    expect(marked.getAttribute("data-unverified")).toBe("true")
+    expect(container.textContent).not.toContain("<span")
+  })
+
+  it("renders an unverified number inside italic as a marker, not as literal tag text", () => {
+    const { container } = render(
+      <MiniMarkdown text='*Total: <span data-unverified="true">13</span>*' />,
+    )
+    const em = container.querySelector("em")
+    expect(em).not.toBeNull()
+    const marked = within(em as HTMLElement).getByText("13")
+    expect(marked.getAttribute("data-unverified")).toBe("true")
+    expect(container.textContent).not.toContain("<span")
+  })
+
+  it("renders bold without a marker as plain strong text, unchanged", () => {
+    const { container } = render(<MiniMarkdown text="**Rows: 42**" />)
+    const strong = container.querySelector("strong")
+    expect(strong?.textContent).toBe("Rows: 42")
+    expect(strong?.children.length).toBe(0)
+  })
+
   it("leaves a verified number as plain text with no marker at all", () => {
     const { container } = render(<MiniMarkdown text="Ada 42 baris." />)
     expect(within(container).getByText("Ada 42 baris.")).toBeDefined()

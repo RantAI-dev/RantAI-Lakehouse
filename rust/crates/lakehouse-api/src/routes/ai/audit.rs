@@ -119,10 +119,23 @@ pub fn resource_for(
             .map(str::to_owned)
     };
     match tool_name {
-        "create_chart" | "update_chart" | "delete_chart" => (Some("chart"), str_field("id")),
-        "create_board" => (Some("board"), str_field("id")),
+        "create_chart" | "update_chart" | "delete_chart" | "move_chart" => {
+            (Some("chart"), str_field("id"))
+        }
+        // AI-1 / AI-2 / AI-20 (plan 20): the rest target a board,
+        // recorded under the board the tool actually changed. The arg
+        // key is split per tool rather than "prefer `id`, fall back to
+        // `board`" because the tool reads exactly one of them: a model
+        // that sent both keys would otherwise have the tool change
+        // `board` while this row recorded `id`, putting a false board
+        // in the trail for a real write. `str_field` looks at the
+        // result first, so an id the handler returned still wins.
+        "create_board" | "rename_board" | "delete_board" => (Some("board"), str_field("id")),
         // The tab tools change a board: the audit names the board, not the tab.
         "create_tab" | "rename_tab" | "move_charts_to_tab" | "move_tab" | "delete_tab" => {
+            (Some("board"), str_field("board"))
+        }
+        "arrange_board" | "save_board_filters" | "set_board_view_filters" => {
             (Some("board"), str_field("board"))
         }
         "create_calculated_field" | "update_calculated_field" | "delete_calculated_field" => {
@@ -352,6 +365,73 @@ mod tests {
             resource_for("update_chart", &args, &json!({})),
             (Some("chart"), Some("from-args".to_owned()))
         );
+    }
+
+    /// AI-1 / AI-2 / AI-20 (plan 20): board tools record under the board
+    /// they actually changed, under the arg key each tool really reads:
+    /// `id` for rename / delete, `board` for arrange / save-filters /
+    /// set-view-filters. `move_chart` records the chart it moves,
+    /// exactly like `update_chart`.
+    #[test]
+    fn resource_for_records_the_board_the_tool_actually_changed() {
+        let mut id_args = Map::new();
+        id_args.insert("id".to_owned(), json!("b-1"));
+        assert_eq!(
+            resource_for("create_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+        assert_eq!(
+            resource_for("rename_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+        assert_eq!(
+            resource_for("delete_board", &id_args, &json!({})),
+            (Some("board"), Some("b-1".to_owned()))
+        );
+
+        let mut board_args = Map::new();
+        board_args.insert("board".to_owned(), json!("b-2"));
+        for tool in [
+            "arrange_board",
+            "save_board_filters",
+            "set_board_view_filters",
+        ] {
+            assert_eq!(
+                resource_for(tool, &board_args, &json!({})),
+                (Some("board"), Some("b-2".to_owned())),
+                "{tool} records the board it changed"
+            );
+        }
+
+        let mut move_args = Map::new();
+        move_args.insert("id".to_owned(), json!("c-1"));
+        move_args.insert("board".to_owned(), json!("b-2"));
+        assert_eq!(
+            resource_for("move_chart", &move_args, &json!({})),
+            (Some("chart"), Some("c-1".to_owned()))
+        );
+    }
+
+    /// The board-keyed tools read `board` and nothing else, so a model that
+    /// sent both keys must still leave the board it really changed in the
+    /// trail. Recording `id` here would file a real write under a board
+    /// nobody wrote to.
+    #[test]
+    fn resource_for_board_keyed_tools_ignore_a_stray_id_arg() {
+        let mut both = Map::new();
+        both.insert("id".to_owned(), json!("b-not-touched"));
+        both.insert("board".to_owned(), json!("b-2"));
+        for tool in [
+            "arrange_board",
+            "save_board_filters",
+            "set_board_view_filters",
+        ] {
+            assert_eq!(
+                resource_for(tool, &both, &json!({})),
+                (Some("board"), Some("b-2".to_owned())),
+                "{tool} must not file the write under the stray id"
+            );
+        }
     }
 
     #[test]

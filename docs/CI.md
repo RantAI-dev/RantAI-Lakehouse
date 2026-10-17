@@ -1,6 +1,6 @@
 # CI/CD
 
-This repo's CI is split into four workflows under `.github/workflows/`:
+This repo's CI is split into workflows under `.github/workflows/`:
 
 - **`ci.yml`** — change-scoped fast feedback and acceptance testing. Begins with
   a change scope detector (`changes`) and unconditional repo lints (`repo-lints`),
@@ -22,6 +22,10 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   for Phase 6's release attachment). Runs on `push` to `main` and manual dispatch
   only to avoid spending ~30 runner minutes per PR run when no PR checks consume
   the artifact.
+- **`security-all-branches.yml`** — daily scheduled (`cron: '17 3 * * *'`) and manual
+  dispatch scan of all git branches using `gitleaks` (`--log-opts="--all"`).
+  Deliberately separate from pull-request checks so findings on one branch do
+  not block unrelated PRs (SEC-36, D2).
 
 ## Change Scopes and the Single Gate (`ci-required`)
 
@@ -44,8 +48,12 @@ Downstream jobs execute according to scope:
 - **`verify`**: Runs if `frontend` or `all` is true.
 - **`dagster-unit-tests`**: Runs if `dagster` or `all` is true. Runs the tests not marked `loader` (`-m "not loader"`).
 - **`dagster-loader-tests`**: Same condition. Runs the tests marked `loader` (`-m loader`): a real `dlt` pipeline against a local Iceberg table. Split from the job above because together they took 13m52s of a 15-minute limit (PR #115).
+- **`g6-credentials`** (`SRC-12` part A, `ops/g6/src12_credentials_test.py`): checks that `docker compose config` refuses an empty `CONNECTOR_SECRETS_KEY` and names it; starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume the other g6 gates replace); types a MySQL credential through the API and checks the stored file is a seal (version byte, not the plain value, owner-only) and that the connector tests and loads; runs `lakehouse-api rotate-secrets-key` with a new key (old key as `CONNECTOR_SECRETS_KEY_PREVIOUS`), drops the old key, recreates the API and the code location, and checks the file changed and the connector still tests and loads. Its own job so the slowest connector gate stays under 20 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
+- **`g6-secret-managers`** (`SRC-12` part B, `ops/g6/src12_managers_test.py`): starts the `g6-ops` stack with `ops/g6/docker-compose.src12.override.yml` and `ops/g6/docker-compose.src12-managers.override.yml`, which adds Vault's official development server (`vault-g6`) and a `moto` server (`moto-g6`), both pinned and CI-only. The gate runs twice, once per manager, because an installation has one: with `SECRET_MANAGER=vault`, then (after `.env` is switched and the API and the code location recreated) with `SECRET_MANAGER=aws`. Each run stores a MySQL source password in the manager, refuses a reference to nothing (422, fixed words, none of the manager's) and another manager's scheme (400), saves a reference through `PUT .../credential` (read once, connection tested), checks the credentials volume holds no file and no copy, tests and loads through the reference, changes the secret in the manager to a wrong value (the next test and run fail), restores it (the next run succeeds, appends). Google Secret Manager and Azure Key Vault have no local stand-in: they are covered by unit tests against recorded responses (`secret_manager/gcp.rs`, `azure.rs`, `test_secret_manager_gcp.py`, `..._azure.py`) and were not run against the real services. Its own job: the bring-up of `g6-credentials` is 12 to 14 minutes and the two together would pass its 25; the first CI runs are its measurement. Not run against a real stack before it reached CI; the image tags (`hashicorp/vault:1.18.5`, `motoserver/moto:5.0.9`) were not pulled where this was written.
+- **`g6-oauth`** (`SRC-12` part C, `ops/g6/src12_oauth_test.py`): starts the same stack as `g6-ops` with `ops/g6/docker-compose.src12.override.yml` (the writable credentials volume and the runner's read-only view of it), and the CI-only `.env` sets the gate-only `CONNECTOR_OAUTH_ALLOW_HTTP=true` and `CONNECTOR_OAUTH_REDIRECT_URI=http://lakehouse-api:8080/api/connectors/oauth/callback`. The provider is a thread of the gate's runner: an authorize endpoint that approves at once and redirects with a code, a token endpoint that checks the PKCE verifier, issues 5-second access tokens and rotates the refresh token (honouring only the latest), a revocation endpoint, and a REST API whose pages answer 2 seconds late and require the bearer token. Steps: the client secret is saved before any sign-in (unverified, sealed); the gate signs in as a browser would (S256, random state, redirect to the product's callback with its own session); a load of 5 rows outlives one access token (at least two refresh grants are counted at the provider); the rotated refresh token is sealed in place (the file changed, still no clear text) and a second load after the first access token expired succeeds (the run record says so, the provider counted a refresh-token grant for it, the sealed token changed again; the table is loaded by `replace`, so rows are not the proof); the connection test refreshes and passes twice; a wrong and a replayed `state` are refused with the fixed page and never reach the provider; a refresh token the provider no longer honours fails one attempt as `sign_in_refused` with none of the provider's words in the log, and signing in again restores loading; signing out and deleting the connector each call the revocation address with the stored token and remove the files. Its own job, 25 minutes; the first CI runs are its measurement. Not run against a real stack before it reached CI.
+- **`g6-discovery-scale`** (`SRC-13` decisions D9 and D12, `ops/g6/src13_discovery_scale_test.py`): creates a PostgreSQL schema of 10,000 tables in the stack's own database, lists it through `POST /api/connectors/conn-pg-lakehouse/discovery/list`, searches one table by part of its name, previews it, and prints each call's seconds on `[src13]` lines that are copied to the job summary. **Fails if the listing takes more than 120 seconds** (the feature page's "10,000 tables in 2 minutes", D9) or does not return exactly the 10,000 names. The stack is the API and its PostgreSQL only (with ClickHouse and `oidc-mock`, which the API depends on): no Dagster, because the API lists PostgreSQL itself. Its own job, so no existing connector gate grows past its 20 minutes (the type-by-type `discover` steps of `g6-ingest`, `g6-ingest-other`, `g4-cdc` and `g6-oracle` are quick calls, and the ones the orchestrator answers run after the loads). Estimated 8 to 12 minutes; the first CI runs are its measurement. The measured seconds are for a CI runner against a local PostgreSQL, not a customer's database. Not run against a real stack before it reached CI.
 - **Rust fmt / clippy / build / test / msrv**: Runs if `rust` or `all` is true.
-- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
+- **Acceptance jobs (`g1-rustfs`, `g2-seaweedfs`, `g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`, `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `gold-export`, `g8-governance`, `g8-time-travel`)**: Run if `rust`, `dagster`, `stack`, or `all` is true.
 - **`images` and `image-smoke`**: Same condition as the acceptance jobs; see "Images: built once per run" below.
 
 `ci.yml` runs with `permissions: contents: read` for the whole workflow, which is the
@@ -66,7 +74,7 @@ jobs built the Dagster image as well. Now:
   `outputs: type=docker`, compressed with `zstd`, one-day retention, no second
   compression by the artifact service. It prints each archive's size in the log.
 - Each consumer (`g3a-dagster`, `g3-maintenance`, `g4-cdc`, `g6-ingest`, `g6-ingest-other`,
-  `g6-oracle`, `g9-upload`, `g6-alerts`, `gold-export`, `g8-governance`, `g8-time-travel`,
+  `g6-oracle`, `g9-upload`, `g6-alerts`, `g6-ops`, `g6-credentials`, `g6-secret-managers`, `g6-oauth`, `g6-discovery-scale`, `gold-export`, `g8-governance`, `g8-time-travel`,
   `image-smoke`) `needs: [changes, images]`, downloads the artifact(s) it
   uses, `docker load`s them, and starts the stack with `up -d --no-build`. `gold-export`,
   `g8-governance` and `image-smoke` only use the API image and download only that one.
@@ -77,7 +85,7 @@ jobs built the Dagster image as well. Now:
   `./dagster` is `${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}`. CI sets both
   variables to `…:ci` tags in the job `env:`. The `build:` blocks stay, so local
   `docker compose up --build` is unchanged. The Dagster-built services (the five in
-  `docker-compose.yml` plus `g6-oracle-test-runner` and `g6-alerts-test-runner` in the
+  `docker-compose.yml` plus `g6-oracle-test-runner`, `g6-alerts-test-runner`, `g6-ops-test-runner` and `src13-scale-test-runner` in the
   `ops/g6` overrides) must keep identical `build:` blocks (same `args:`), because a build of
   any one retags the image they all use. A new service built from `./dagster` needs the same
   `image:` key, or `docker compose run` builds the whole Dagster image again.
@@ -178,13 +186,21 @@ fingerprint (commit, file, rule, line):
 | `llm.ts:9` in `8ac6ee2` | Internal LLM node key | Rotated |
 | 5 `rantai-internal-lan-host` hits in `8ac6ee2`, `c5954ca`, `7075682` (2), `27d1e2b`, and the same 4 files in the root commit `6c3a7ff` (an ancestor of `main`) | Private LAN addresses in old commits | Not secrets; none of those files holds them today |
 | `test_schema_observer.py:26` in `31ec837` | Test token literal | False positive; the literal is gone since #129 |
-| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant. The history scan reads every branch |
+| `src11_connector_operations_test.py:576` in `4ae1bcd` | `password=matrix.CONNECTOR_MYSQL_PASSWORD` on `feat/phase-1-rest` (#144) | False positive: a reference to a CI fixture constant (surfaced when scanning all branches) |
 
 Because the entries are full fingerprints, they match nothing else: the same
 secret in a new commit, or any new secret, is **not** baselined and turns
 `history-scan` red. A red run is therefore a new finding. Rotate the secret
 first; only then decide whether it may be added to `.gitleaksignore` (with a
 comment saying why, the date, and the item ID).
+
+`.gitleaks.toml` also allowlists, by exact literal, the three non-secret
+`CONNECTOR_SECRETS_KEY` values `SRC-12` needs: the CI `.env` key (base64 of the
+32 characters `ci-connector-key-not-real-000000`), the shared test vector's
+key and the API integration tests' key. Every CI job that starts the stack
+writes that CI key into its `.env`, because `docker-compose.yml` refuses to be
+read without `CONNECTOR_SECRETS_KEY`; a new job that runs `docker compose`
+needs the same line.
 
 `.gitleaksignore` is read from `--source` (and the working directory);
 blank lines and full-line `#` comments are skipped (gitleaks v8.30.1,
@@ -215,6 +231,40 @@ deliberately not undertaken as a side effect of a CI-hardening pass — it
 needs a human to explicitly decide to take it on and coordinate with anyone
 holding a local clone. The baseline makes it unnecessary for keeping the
 scan useful.
+
+### Scan scope on PRs and `main` vs. the daily all-branch scan (`SEC-36`)
+
+Historically, `history-scan` fetched all remote branches and invoked `gitleaks`
+with no `--log-opts`, causing `gitleaks` to pass `--all` to `git log` and
+scan every ref in the repository. A test value or secret pushed on an
+unrelated feature branch (such as #144) turned the check red on `main` and
+on every open PR.
+
+Under `SEC-36` (decisions D1–D2):
+
+- **In `security.yml` (`history-scan`)**: on pushes to `main` and on pull
+  requests, `gitleaks detect` runs with `--log-opts="HEAD"` (D1). On a push
+  to `main`, this scans `main`'s history; on a pull request, `actions/checkout`
+  checks out `refs/pull/<n>/merge`, so it scans `main` plus the pull request's
+  commits. It does not scan unrelated branches, making the scan independent
+  of what other refs exist or are fetched.
+- **In `security-all-branches.yml`**: a dedicated daily workflow (`cron: '17 3 * * *'`
+  and `workflow_dispatch`) fetches all remote branches and runs
+  `gitleaks detect --log-opts="--all"` (D2). This runs as a scheduled job,
+  deliberately not as a pull-request check, so a finding on one branch
+  never blocks an unrelated PR.
+- **When the daily all-branch run turns red**: it means at least one branch
+  in the repository carries an un-baselined finding. The owner of that branch
+  must fix it: by rotating the secret, replacing the literal with a synthetic
+  value that does not match the rule, or baselining it in `.gitleaksignore`
+  with an exact fingerprint and justification.
+
+Note on merge commits: `gitleaks` uses `git log -p -U0` under the hood. Git
+by default skips diffs for merge commits in `git log -p` unless `-c`, `--cc`,
+or `-m` is specified. Consequently, conflict resolutions introduced in merge
+commits are not diffed by `gitleaks` (this was true before `SEC-36` and
+remains true).
+
 
 ## Docker
 

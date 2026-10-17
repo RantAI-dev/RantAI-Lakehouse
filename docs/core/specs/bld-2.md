@@ -6,7 +6,7 @@
 | Module | Build |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Waits for | `BLD-3` (Bronze inputs) and `DATA-10` (the content fingerprint used to tell a real change) |
+| Blocked by | Nothing open (was: BLD-3, DATA-10, shipped) |
 
 ## Why
 

@@ -119,13 +119,18 @@ proving a `gold.*` table is excluded.
 # Per-table policy + Trino verbs
 
 The verbs above are the job's fixed, unconditional behavior. Operators
-who want to actually reclaim expired snapshots or bin-pack small files
-need `table_maintenance_policy` (`rust/migrations/0030`), read once per
-run from `GET /api/lakehouse/maintenance-policies` and routed through
-Trino's Iceberg connector — which does not carry ClickHouse's
-"transactional catalog" restriction on `expire_snapshots`, and whose
-`optimize` genuinely bin-packs (ClickHouse's does not — see the table
-above).
+who want to bin-pack small files need `table_maintenance_policy`
+(`rust/migrations/0030`), read once per run from
+`GET /api/lakehouse/maintenance-policies` and routed through Trino's
+Iceberg connector — which does not carry ClickHouse's "transactional catalog"
+restriction on `expire_snapshots`, and whose `optimize` genuinely
+bin-packs (ClickHouse's does not — see the table above).
+
+Snapshot expiry (`expire_snapshots`) runs by default for every Bronze
+table with a 7-day retention threshold (Trino's own floor, OPS-1 Decision
+D1). Operators who want to retain fewer or more snapshots configure
+`snapshotsToKeep` in `table_maintenance_policy`, which overrides the
+default (D2).
 
 * **`snapshotsToKeep`.** Trino 483's `expire_snapshots` procedure takes
   only a `retention_threshold` age, not a keep-count, so keeping the N
@@ -272,19 +277,24 @@ def _ch_query(cfg: MaintenanceConfig, sql: str) -> str:
     return resp.text
 
 
-def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
-    """A dedicated `DataLakeCatalog` database for maintenance, separate
+def ensure_catalog_database(cfg: Any, db_name: str = CATALOG_DB) -> None:
+    """A dedicated `DataLakeCatalog` database for maintenance/export jobs, separate
     from any per-test catalog database (`icecat`/`icecat_g3a` in
-    `ops/g3a/g3a_test.py`) so a maintenance run never depends on test
+    `ops/g3a/g3a_test.py`) so a run never depends on test
     fixtures having created one first."""
+    auth = cfg.ch_auth_settings() if hasattr(cfg, "ch_auth_settings") else ""
     _ch_query(
         cfg,
-        f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
+        f"CREATE DATABASE IF NOT EXISTS {db_name} "
         f"ENGINE = DataLakeCatalog('{cfg.lakekeeper_catalog_uri}') "
         f"SETTINGS catalog_type = 'rest', warehouse = '{cfg.lakekeeper_warehouse}', "
-        f"storage_endpoint = '{cfg.rustfs_endpoint}'{cfg.ch_auth_settings()} "
+        f"storage_endpoint = '{cfg.rustfs_endpoint}'{auth} "
         "SETTINGS allow_database_iceberg = 1",
     )
+
+
+def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
+    ensure_catalog_database(cfg, CATALOG_DB)
 
 
 def discover_bronze_tables(cfg: MaintenanceConfig) -> list[str]:
@@ -356,19 +366,25 @@ def _parse_tsv_kv(text: str) -> dict[str, int]:
 
 
 def run_remove_orphan_files(
-    cfg: MaintenanceConfig, table_name: str, *, dry_run: bool
+    cfg: Any,
+    table_name: str,
+    *,
+    dry_run: bool,
+    catalog_db: str = CATALOG_DB,
+    older_than_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Run (or dry-run) `remove_orphan_files` against one catalog-registered
-    Bronze table — the working verb on ClickHouse 26.8 (did not exist on
+    Iceberg table — the working verb on ClickHouse 26.8 (did not exist on
     26.3). `table_name` is the catalog's own two-part name, e.g.
-    `bronze.g3a_orders` (already backtick-safe: no user input reaches this,
-    only names `discover_bronze_tables` returned, which is itself filtered
-    to the `bronze.` prefix)."""
+    `bronze.g3a_orders` or `gold.mart_name`."""
     dry_run_arg = "dry_run=1" if dry_run else "dry_run=0"
+    settings = _REMOVE_ORPHAN_FILES_SETTINGS
+    if older_than_seconds is not None:
+        settings = f"{settings}, iceberg_orphan_files_older_than_seconds={int(older_than_seconds)}"
     sql = (
-        f"ALTER TABLE {CATALOG_DB}.`{table_name}` "
+        f"ALTER TABLE {catalog_db}.`{table_name}` "
         f"EXECUTE remove_orphan_files({dry_run_arg}) "
-        f"SETTINGS {_REMOVE_ORPHAN_FILES_SETTINGS} FORMAT TabSeparated"
+        f"SETTINGS {settings} FORMAT TabSeparated"
     )
     text = _ch_query(cfg, sql)
     counts = _parse_tsv_kv(text)
@@ -574,9 +590,13 @@ def _run_maintenance_for_table(
             )
         last_run_at = _parse_run_at(latest_maintenance_run_at(cfg.ch, table_name))
 
-    expire_skip, expire_verb_run = _expire_snapshots_result(
-        cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
-    )
+    if policy_fetch_error is not None:
+        expire_skip = f"expire_snapshots (policy fetch failed: {policy_fetch_error})"
+        expire_verb_run = None
+    else:
+        expire_skip, expire_verb_run = _expire_snapshots_result(
+            cfg, namespace, name, policy, expire_skip_reason, now, last_run_at
+        )
     if expire_skip is not None and expire_skip not in skipped_verbs:
         skipped_verbs.append(expire_skip)
     if expire_verb_run is not None:
@@ -827,6 +847,12 @@ def _compute_retention_threshold(
 
 _TRINO_UNREACHABLE_SKIP = "expire_snapshots/optimize skipped: trino unreachable"
 
+# OPS-1 (Decision D1): Tables without a policy, or a policy with no
+# `snapshotsToKeep`, keep 7 days of snapshots. Trino 483's Iceberg
+# connector enforces `iceberg.expire-snapshots.min-retention` (7 days by
+# default), so 7d is both the product floor and Trino's system floor.
+DEFAULT_SNAPSHOT_RETENTION = "7d"
+
 
 def _expire_snapshots_result(
     cfg: MaintenanceConfig,
@@ -837,20 +863,54 @@ def _expire_snapshots_result(
     now: datetime,
     last_run_at: datetime | None,
 ) -> tuple[str | None, dict[str, str] | None]:
-    """Decides and (if requested) executes this table's `expire_snapshots`
-    verb via Trino. Returns `(skipped_verbs_entry, verb_run_record)`:
+    """Decides and executes this table's `expire_snapshots` verb via
+    Trino. Returns `(skipped_verbs_entry, verb_run_record)`:
     `skipped_verbs_entry` is `None` exactly when the verb genuinely ran
     (it must not also be recorded as skipped); `verb_run_record` is
-    `None` only when no policy requested this verb at all (nothing to
-    record in `bronze_meta.maintenance_verb_run` either).
+    `None` only when no verb ran or was skipped with a recorded run.
 
-    With no policy, or a policy that does not set `snapshotsToKeep`,
-    this keeps today's exact behavior: the real, freshly-observed
-    ClickHouse probe failure (`expire_skip_reason`) is the recorded skip
-    reason, and no Trino call is made."""
+    When `snapshotsToKeep` is specified in `policy`, computes the retention
+    threshold to preserve that many snapshots. When no policy is set or
+    `snapshotsToKeep` is None, applies `DEFAULT_SNAPSHOT_RETENTION` ('7d')
+    unconditionally on the daily schedule (OPS-1 Decision D1)."""
     keep = None if policy is None else policy.get("snapshotsToKeep")
     if keep is None:
-        return f"expire_snapshots ({expire_skip_reason})", None
+        sql = (
+            f'ALTER TABLE iceberg.{namespace}."{name}" '
+            f"EXECUTE expire_snapshots(retention_threshold => '{DEFAULT_SNAPSHOT_RETENTION}')"
+        )
+        try:
+            _trino_execute(cfg, sql)
+        except TrinoUnavailableError:
+            return (
+                _TRINO_UNREACHABLE_SKIP,
+                {
+                    "verb": "expire_snapshots",
+                    "engine": "trino",
+                    "outcome": "skipped",
+                    "detail": "trino unreachable",
+                },
+            )
+        except TrinoQueryError as exc:
+            detail = str(exc)
+            return (
+                f"expire_snapshots refused: {detail}",
+                {
+                    "verb": "expire_snapshots",
+                    "engine": "trino",
+                    "outcome": "refused",
+                    "detail": detail,
+                },
+            )
+        return (
+            None,
+            {
+                "verb": "expire_snapshots",
+                "engine": "trino",
+                "outcome": "applied",
+                "detail": f"default retention {DEFAULT_SNAPSHOT_RETENTION} (no snapshotsToKeep policy)",
+            },
+        )
 
     cadence_ok, cadence_reason = _cadence_allows(policy.get("schedule"), now, last_run_at)
     if not cadence_ok:

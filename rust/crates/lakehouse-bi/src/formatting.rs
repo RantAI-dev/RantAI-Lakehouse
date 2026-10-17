@@ -4,7 +4,7 @@
 //!
 //! Why here and not in the API: the settings route, the dashboard theme
 //! (`Board.font`) and the chart style validation all need the same lists, and
-//! a list kept in three places drifts. Migration `0072` repeats the lists in
+//! a list kept in three places drifts. Migration `0085` repeats the lists in
 //! its `CHECK`s as the backstop for shape; the settings route test saves every
 //! value of these lists through the table, so a drift fails there.
 

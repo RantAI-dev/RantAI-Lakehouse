@@ -17,6 +17,9 @@ mod catalog_profile;
 mod catalog_query;
 mod catalog_search;
 mod catalog_source;
+mod connector_discovery;
+mod connector_oauth;
+mod connector_runs;
 mod connectors;
 mod dashboard;
 mod dashboard_folders;
@@ -144,8 +147,25 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
+        other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// `/api/connectors/{id}/discovery/{kind}`'s timeout (`SRC-13` decision D9): the
+/// listing call's own limit is 120 seconds (`connector_listing::LIST_TIMEOUT`), so
+/// the request that carries it may take a few seconds more to answer. The route
+/// does a bounded amount of work (one connection, one or two queries, a bounded
+/// bucket scan), so the longer deadline is not an open door.
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Whether `path` is `/api/connectors/{id}/discovery/list` or `.../preview`.
+fn is_discovery_path(path: &str) -> bool {
+    path.strip_prefix("/api/connectors/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, tail)| {
+            !id.is_empty() && matches!(tail, "discovery/list" | "discovery/preview")
+        })
 }
 
 /// `/api/ai/chat`'s timeout: `AI_CHAT_TIMEOUT_SECS` when set, else 120s.
@@ -185,6 +205,32 @@ fn chat_timeout_from(raw: Option<&str>) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
+/// `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3), the rewrite
+/// the orchestrator asks for before it runs a pipeline's `SELECT`.
+///
+/// Its own function for the same reason [`pipelines_router`] is: so the
+/// route can be added without pushing that function over
+/// `clippy::too_many_lines`. It merges straight back in, through
+/// [`authored_pipelines_router`], and carries no middleware or state of
+/// its own.
+fn pipeline_enforce_router() -> Router<AppState> {
+    Router::new().route(
+        "/api/pipelines/runnable/{id}/enforce",
+        axum::routing::post(authored_pipelines::enforce_pipeline_sql),
+    )
+}
+
+/// The authored-pipeline (orchestrator-only) routes: the definitions the
+/// job factory loads, and the rewrite it asks for before it runs one.
+///
+/// `pipelines_router` merges this rather than growing another four lines:
+/// every route here is orchestrator-only in the handler as well as in
+/// [`crate::policy`], and keeping them together makes that pairing the
+/// thing a reader sees first.
+fn authored_pipelines_router() -> Router<AppState> {
+    pipeline_enforce_router().route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+}
+
 /// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
 /// purely to keep that function under `clippy::too_many_lines` — it merges
 /// straight back in, with no separate middleware/state of its own.
@@ -199,7 +245,7 @@ fn pipelines_router() -> Router<AppState> {
             axum::routing::post(pipelines::generate),
         )
         // Static, so it is matched ahead of `/api/pipelines/{id}`.
-        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .merge(authored_pipelines_router())
         .route(
             "/api/pipelines/{id}",
             get(pipelines::detail)
@@ -287,6 +333,13 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
+        )
+        // BLD-1 / D2: assign the user a pipeline reads as. A distinct
+        // route for the same reason as `/tenant` — who a row reads as is a
+        // governance decision, not a field on an unrelated update body.
+        .route(
+            "/api/pipelines/{id}/run-as",
+            axum::routing::put(pipelines::assign_pipeline_run_as),
         )
         // Dagster `run_failure_sensor` posts here once per failed run;
         // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
@@ -460,16 +513,11 @@ fn overview_alerts_router() -> Router<AppState> {
         )
 }
 
-/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
-/// `clippy::too_many_lines` reason as [`pipelines_router`].
-///
-/// Every `/api/connectors/{id}/*` route sits behind
-/// [`connectors::require_connector_in_tenants`]: the caller must belong to
-/// the connector's tenant. `PUT .../tenant` stays outside it — it is
-/// identity administration (`identity:write`), and the only way a
-/// connector with no tenant gets one.
-fn connectors_router(state: &AppState) -> Router<AppState> {
-    let per_connector = Router::new()
+/// The tenant-gated half of [`connectors_router`], split out of it for
+/// `clippy::too_many_lines` (`SRC-11` review 1 BLOCKER 1), the same way
+/// [`pipelines_router`] is split from its parent.
+fn per_connector_router(state: &AppState) -> Router<AppState> {
+    Router::new()
         .route(
             "/api/connectors/{id}",
             get(connectors::detail)
@@ -492,9 +540,12 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/credential",
             axum::routing::put(connectors::set_credential),
         )
+        // `SRC-13`: list and preview what a connector's source holds, for a
+        // person with `connector:manage` on a connector of their own tenant (D11).
+        // `{kind}` is `list` or `preview`; POST asks, GET reads the latest answer.
         .route(
-            "/api/connectors/{id}/discover",
-            axum::routing::post(connectors::discover),
+            "/api/connectors/{id}/discovery/{kind}",
+            axum::routing::post(connector_discovery::start).get(connector_discovery::poll),
         )
         .route(
             "/api/connectors/{id}/debezium-properties",
@@ -508,9 +559,28 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run_request),
         )
+        // `SRC-11` decisions D4, D5, D7, D8: the run history, a run's log and
+        // Resume, for a person with `connector:manage` on a connector of their
+        // own tenant.
+        .route("/api/connectors/{id}/runs", get(connector_runs::list))
         .route(
-            "/api/connectors/{id}/ingest/runs",
-            get(connectors::ingest_run_history),
+            "/api/connectors/{id}/runs/{runId}/log",
+            get(connector_runs::log),
+        )
+        .route(
+            "/api/connectors/{id}/resume",
+            axum::routing::post(connector_runs::resume),
+        )
+        // `SRC-12` part C: signing a REST connector in with `OAuth2`, for a
+        // person with `connector:manage` on a connector of their own tenant.
+        .route("/api/connectors/{id}/oauth", get(connector_oauth::status))
+        .route(
+            "/api/connectors/{id}/oauth/start",
+            axum::routing::post(connector_oauth::start),
+        )
+        .route(
+            "/api/connectors/{id}/oauth/sign-out",
+            axum::routing::post(connector_oauth::sign_out),
         )
         // `SRC-8` decision D6: a person with `connector:manage` on a
         // connector of their own tenant reads and approves schema changes.
@@ -525,7 +595,19 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route_layer(from_fn_with_state(
             state.clone(),
             connectors::require_connector_in_tenants,
-        ));
+        ))
+}
+
+/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+///
+/// Every `/api/connectors/{id}/*` route sits behind
+/// [`connectors::require_connector_in_tenants`]: the caller must belong to
+/// the connector's tenant. `PUT .../tenant` stays outside it — it is
+/// identity administration (`identity:write`), and the only way a
+/// connector with no tenant gets one.
+fn connectors_router(state: &AppState) -> Router<AppState> {
+    let per_connector = per_connector_router(state);
     Router::new()
         .route(
             "/api/connectors",
@@ -551,6 +633,12 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
             "/api/connectors/types",
             get(connectors::list_types),
         )
+        .route(
+            // `SRC-12` part B: static, so matched ahead of
+            // `/api/connectors/{id}` like `/types`.
+            "/api/connectors/credential-settings",
+            get(connectors::credential_settings),
+        )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
@@ -567,6 +655,51 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .route(
             "/api/connectors/{id}/schema-observations/tables",
             axum::routing::post(schema_changes::new_tables),
+        )
+        // `SRC-11`: the orchestrator's run reports. Outside the tenant gate for
+        // the same reason (its caller is a service identity); each handler
+        // checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/run-reports",
+            axum::routing::post(connector_runs::report_start),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/attempts",
+            axum::routing::post(connector_runs::report_attempt),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/log",
+            axum::routing::post(connector_runs::report_log),
+        )
+        .route(
+            "/api/connectors/{id}/run-reports/{runId}/end",
+            axum::routing::post(connector_runs::report_end),
+        )
+        // `SRC-12` part C: the provider sends the person's browser back here. It
+        // has no connector in its path, so it sits outside the tenant gate; the
+        // handler checks the user, the tenant and `connector:manage` itself.
+        // Static, so matched ahead of `/api/connectors/{id}` like `/types`.
+        .route(
+            "/api/connectors/oauth/callback",
+            get(connector_oauth::callback),
+        )
+        // `SRC-12` part C: the orchestrator reports a refresh token the provider
+        // rotated. Outside the tenant gate (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`.
+        .route(
+            "/api/connectors/{id}/oauth/refresh-token",
+            axum::routing::post(connector_oauth::update_refresh_token),
+        )
+        // `SRC-13`: the orchestrator's answer to a discovery request. Outside the
+        // tenant gate for the same reason (a service identity belongs to no
+        // tenant); the handler checks `schema_changes::require_orchestrator`. The
+        // body may carry a listing of up to 3 MiB, so this route, and only this
+        // one, takes the larger body limit.
+        .route(
+            "/api/connectors/{id}/discovery-results",
+            axum::routing::post(connector_discovery::report_result).layer(DefaultBodyLimit::max(
+                connector_discovery::MAX_RESULT_BODY_BYTES,
+            )),
         )
         .merge(per_connector)
 }
@@ -1072,6 +1205,28 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// `SRC-13` decision D9: the discovery routes carry a listing call of up to
+    /// 120 s, so they get 130 s, and only they do.
+    #[test]
+    fn the_discovery_routes_take_130_seconds_and_nothing_else_under_connectors_does() {
+        for path in [
+            "/api/connectors/conn-1/discovery/list",
+            "/api/connectors/conn-1/discovery/preview",
+        ] {
+            assert_eq!(route_timeout(path), Duration::from_secs(130), "{path}");
+        }
+        for path in [
+            "/api/connectors/conn-1",
+            "/api/connectors/conn-1/test",
+            "/api/connectors/conn-1/discovery/other",
+            "/api/connectors//discovery/list",
+            "/api/connectors/discovery/list",
+            "/api/other/conn-1/discovery/list",
+        ] {
+            assert_eq!(route_timeout(path), DEFAULT_REQUEST_TIMEOUT, "{path}");
+        }
     }
 
     /// `POST /api/uploads` receives up to 50 MB: it gets the longer bound

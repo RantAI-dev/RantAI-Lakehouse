@@ -29,11 +29,17 @@
 #   G3A_DAGSTER_RESULT    result of `g3a-dagster` job
 #   G3_MAINTENANCE_RESULT result of `g3-maintenance` job
 #   G4_CDC_RESULT         result of `g4-cdc` job
+#   G10_SSO_RESULT        result of `g10-sso` job (SEC-3 Keycloak sign-in)
 #   G6_INGEST_RESULT      result of `g6-ingest` job
 #   G6_INGEST_OTHER_RESULT result of `g6-ingest-other` job
 #   G6_ORACLE_RESULT      result of `g6-oracle` job
 #   G9_UPLOAD_RESULT      result of `g9-upload` job
 #   G6_ALERTS_RESULT      result of `g6-alerts` job (SRC-17 alert delivery)
+#   G6_OPS_RESULT         result of `g6-ops` job (SRC-11 connector operations)
+#   G6_CREDENTIALS_RESULT result of `g6-credentials` job (SRC-12 credentials at rest)
+#   G6_SECRET_MANAGERS_RESULT result of `g6-secret-managers` job (SRC-12 part B, Vault and AWS)
+#   G6_OAUTH_RESULT       result of `g6-oauth` job (SRC-12 part C, OAuth sign-in against the gate's own provider)
+#   G6_DISCOVERY_SCALE_RESULT result of `g6-discovery-scale` job (SRC-13, 10,000 tables listed and searched)
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
 #   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
@@ -139,11 +145,17 @@ run_gate() {
   check_job "g3a-dagster" "${G3A_DAGSTER_RESULT:-skipped}" "$req_acceptance"
   check_job "g3-maintenance" "${G3_MAINTENANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g4-cdc" "${G4_CDC_RESULT:-skipped}" "$req_acceptance"
+  check_job "g10-sso" "${G10_SSO_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest" "${G6_INGEST_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-ingest-other" "${G6_INGEST_OTHER_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-oracle" "${G6_ORACLE_RESULT:-skipped}" "$req_acceptance"
   check_job "g9-upload" "${G9_UPLOAD_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-alerts" "${G6_ALERTS_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-ops" "${G6_OPS_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-credentials" "${G6_CREDENTIALS_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"

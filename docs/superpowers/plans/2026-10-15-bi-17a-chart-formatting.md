@@ -366,3 +366,13 @@ Not verified by anyone yet: every visual result (owner QA), `bun run build`
 under Turbopack in this worktree (the `node_modules` symlink; webpack build
 passes; CI builds from a real install), the full workspace run (CI). The
 reviewer's own re-run was skipped at the owner's request.
+
+### Migration renumbered at the merge of main (planner, 2026-10-17)
+
+`main` took `0072` and `0073` (connector run record, `SRC-11`), so this
+branch's `0072_reporting_formatting.sql` is now `0085_reporting_formatting.sql`
+and BI-16 B's `0073_reporting_content_sites.sql` is
+`0086_reporting_content_sites.sql` (`0078` to `0084` are used on other
+branches and `0090` to `0094` are reserved by Data phase 3). The file
+contents did not change. A database that applied them as 72 and 73 (only
+the dev stack) needs its two `_sqlx_migrations` rows fixed by hand.

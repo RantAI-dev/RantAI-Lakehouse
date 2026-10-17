@@ -808,6 +808,124 @@ fn delete_calculated_field_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── AI-1 / AI-2 / AI-20: dashboard-board tools (plan 20) ────────────────
+
+/// The `FilterDef` JSON schema shared by `set_board_view_filters` and
+/// `save_board_filters`. The enum values MIRROR
+/// `lakehouse_bi::filters::{FilterOp, RelativeUnit, RelativeAnchor}` —
+/// the schema is a hand-written `json!` literal, so a variant added to
+/// one of those enums is not picked up here automatically. The shape and
+/// the per-op requirements mirror `validate_filters` /
+/// `FilterDef::validate`.
+fn filter_def_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "column": { "type": "string" },
+            "values": { "type": "array", "items": { "type": "string" } },
+            "op": {
+                "type": "string",
+                "enum": ["in", "not_in", "between", "relative", "contains", "starts_with", "ends_with", "not_contains"],
+                "description": "How the column is compared; absent means in."
+            },
+            "min": { "type": "string", "description": "between only: a number or an ISO date YYYY-MM-DD" },
+            "max": { "type": "string", "description": "between only: a number or an ISO date YYYY-MM-DD" },
+            "minExclusive": { "type": "boolean", "description": "between only: true leaves min out (after, not from)" },
+            "maxExclusive": { "type": "boolean", "description": "between only: true leaves max out (before, not to)" },
+            "unit": {
+                "type": "string",
+                "enum": ["day", "week", "month", "quarter", "year"],
+                "description": "relative only: the unit of the period"
+            },
+            "n": { "type": "integer", "minimum": 1, "maximum": 3650, "description": "relative only with anchor last: how many units back from today" },
+            "anchor": {
+                "type": "string",
+                "enum": ["last", "this", "previous", "next"],
+                "description": "relative only: which period"
+            },
+            "text": { "type": "string", "description": "contains / starts_with / ends_with / not_contains only: the needle" },
+            "required": { "type": "boolean", "description": "saved-default only: the console may not remove this filter" }
+        },
+        "required": ["column"]
+    })
+}
+
+/// The `filters` array property shared by `set_board_view_filters` and
+/// `save_board_filters`. `MAX_FILTERS` is the `lakehouse_bi` limit.
+fn filters_array_property() -> Value {
+    json!({
+        "type": "array",
+        "items": filter_def_schema(),
+        "maxItems": 20,
+        "description": "Filters to apply; up to 20. Each filter is a column plus how to compare it."
+    })
+}
+
+fn rename_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "rename_board",
+        "description": "Rename a board (by id). The built-in Main board refuses any name change. The same check the console runs applies.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" } },
+            "required": ["id", "name"] } } })
+}
+
+fn delete_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_board",
+        "description": "Delete a board (by id) and every chart on it. The built-in Main board refuses. Needs human approval before it runs; the approval message names the board and says its charts are deleted with it.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn arrange_board_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "arrange_board",
+        "description": "Place chart tiles on a board's 12-column grid. Send only the tiles that change; the rest keep their boxes. Refuses a chart that is not on the board, a box that does not fit the 12-column grid, and a width or height below 1. The board's saved layout is replaced whole; last write wins.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "tiles": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer", "minimum": 0, "maximum": 11 },
+                        "y": { "type": "integer", "minimum": 0 },
+                        "w": { "type": "integer", "minimum": 1, "maximum": 12 },
+                        "h": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["x", "y", "w", "h"]
+                },
+                "description": "Map of chart id to its new box on the 12-column grid. Each box is {x, y, w, h}; the tool refuses a chart not on this board, a box that does not fit the grid, or w or h below 1."
+            } },
+            "required": ["board", "tiles"] } } })
+}
+
+fn move_chart_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "move_chart",
+        "description": "Move a saved chart (by id) to another board. The chart's other fields stay the same; its tile is removed from the old board's layout.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "board": { "type": "string" } },
+            "required": ["id", "board"] } } })
+}
+
+fn set_board_view_filters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_board_view_filters",
+        "description": "Change the filters visible to the person on this page, this time only. Nothing is saved; the board's default and every other viewer's view are unchanged. Empty filters clear the view. Available in every chat mode, including Ask.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "filters": filters_array_property() },
+            "required": ["board", "filters"] } } })
+}
+
+fn save_board_filters_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "save_board_filters",
+        "description": "Save a board's default filters, so the next person to open the board sees them. Use only when the person asks to save for everyone. The built-in Main board refuses.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string" },
+            "filters": filters_array_property() },
+            "required": ["board", "filters"] } } })
+}
+
 // ── BI-10 value groups and hierarchies (with AI-6) ───────────────────────
 
 fn create_value_group_schema() -> Value {
@@ -1265,7 +1383,7 @@ fn get_ingest_spec_schema() -> Value {
 
 fn set_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "set_ingest_spec",
-        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode and primaryKey exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
             "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
@@ -1279,6 +1397,8 @@ fn set_ingest_spec_schema() -> Value {
                     "description": "how each run writes the table; omitted means replace" },
                 "primaryKey": { "type": "array", "items": { "type": "string" },
                     "description": "columns that identify one row; needed by replace_dedup, incremental_dedup and history" },
+                "excludedColumns": { "type": "array", "items": { "type": "string" },
+                    "description": "columns of this table left out of the load, by name; only for PostgreSQL, MySQL, MariaDB and SQL Server sources; never a primaryKey or incrementalKey column; keep the list exactly as get_ingest_spec returned it when you send the object again" },
                 "target": { "type": "string", "description": "Bronze table name it lands in" } },
                 "required": ["name", "target"] } },
             "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
@@ -1606,6 +1726,47 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "delete_calculated_field",
         schema: delete_calculated_field_schema,
         risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    // AI-1 / AI-2 / AI-20 (plan 20): dashboard-board tools. The
+    // permission mirrors the console route each tool stands in for
+    // (see POLICY_TABLE in `src/policy.rs`): every write takes
+    // `dashboard:write`; `set_board_view_filters` is a viewer-side
+    // no-op and takes `dashboard:read`, so Ask mode can offer it.
+    ToolSpec {
+        name: "rename_board",
+        schema: rename_board_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "delete_board",
+        schema: delete_board_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "arrange_board",
+        schema: arrange_board_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "move_chart",
+        schema: move_chart_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:write",
+    },
+    ToolSpec {
+        name: "set_board_view_filters",
+        schema: set_board_view_filters_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "save_board_filters",
+        schema: save_board_filters_schema,
+        risk: Risk::WriteLow,
         permission: "dashboard:write",
     },
     // BI-2 / AI-7: reusable metrics. Reading, describing and querying need
@@ -2082,7 +2243,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_eighty_five_entries() {
+    fn tool_schemas_has_ninety_two_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -2096,8 +2257,12 @@ mod tests {
         // + `list_metrics`, `describe_metric`, `query_metric`, `create_metric`,
         // `update_metric` and `delete_metric` (`BI-2`, `AI-7`) + `propose_sql`
         // (`AI-12`, plan 15; merged from main) + `create_tab`, `rename_tab`,
-        // `move_charts_to_tab`, `move_tab` and `delete_tab` (`BI-18` part C, `AI-9`).
-        assert_eq!(tool_schemas().len(), 93);
+        // `move_charts_to_tab`, `move_tab` and `delete_tab` (`BI-18` part C, `AI-9`)
+        // + `format_chart` and `set_dashboard_theme` (`BI-17` part A, `AI-8`)
+        // + the 6 dashboard-board tools from main (plan 20: `rename_board`,
+        // `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`,
+        // `save_board_filters`).
+        assert_eq!(tool_schemas().len(), 99);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
@@ -2432,6 +2597,23 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(description.contains("never carries a credential"));
+    }
+
+    /// `SRC-11 review 2 SHOULD-FIX 2`: a model that re-sends a connector's
+    /// tables must be told to keep `excludedColumns`, or the user's column
+    /// choices are dropped silently (the tool forwards `sourceObjects`
+    /// verbatim, and a save without the key loads every column again).
+    #[test]
+    fn set_ingest_spec_lists_excluded_columns_and_says_to_keep_them() {
+        let schema = (find("set_ingest_spec").expect("registered tool").schema)();
+        let object =
+            &schema["function"]["parameters"]["properties"]["sourceObjects"]["items"]["properties"];
+        assert_eq!(object["excludedColumns"]["type"], "array");
+        assert_eq!(object["excludedColumns"]["items"]["type"], "string");
+        let description = schema["function"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(description.contains("excludedColumns exactly as get_ingest_spec returned"));
     }
 
     #[test]
