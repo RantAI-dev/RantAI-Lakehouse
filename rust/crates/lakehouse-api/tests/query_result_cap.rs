@@ -189,3 +189,66 @@ async fn a_result_of_exactly_the_cap_is_not_reported_as_truncated() {
     assert_eq!(body["rows"].as_array().expect("rows").len(), ROWS_KEPT);
     assert_eq!(body["truncated"], json!(true), "{body}");
 }
+
+/// The refusal `routes::query::refuse_unlisted_settings` gives.
+const SETTINGS_REFUSAL: &str =
+    "Query Studio accepts only iceberg_snapshot_id in SETTINGS; the server sets the others.";
+
+/// How many statements the engine logged whose text contains `needle`,
+/// not counting the lookup itself. `system.query_log` is written in the
+/// background, so it is flushed first.
+async fn logged_statements_containing(ch: &ChClient, needle: &str) -> u64 {
+    ch.exec("SYSTEM FLUSH LOGS", None)
+        .await
+        .expect("flush the query log");
+    let result = ch
+        .query(
+            &format!(
+                "SELECT count() AS c FROM system.query_log \
+                 WHERE query LIKE '%{needle}%' AND query NOT LIKE '%system.query_log%'"
+            ),
+            None,
+        )
+        .await
+        .expect("read the query log");
+    let count = &result.data[0]["c"];
+    // 64-bit integers come back as strings in `FORMAT JSON`.
+    count
+        .as_u64()
+        .or_else(|| count.as_str().and_then(|s| s.parse().ok()))
+        .expect("count() is a number")
+}
+
+#[tokio::test]
+async fn a_statement_cannot_lift_the_cap_with_its_own_settings() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    // `max_result_rows = 0` in the statement overrides the cap the run sends
+    // with the request: measured on `ClickHouse` 26.8, 500,000 of 500,000
+    // rows arrived. The rule refuses it before the engine sees it.
+    let statement = format!("{HUGE_SELECT} LIMIT 500000 SETTINGS max_result_rows = 0");
+
+    let (status, body) = run_as_reader(&app, &statement).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"], SETTINGS_REFUSAL, "{body}");
+    assert_eq!(
+        logged_statements_containing(&ch, "LIMIT 500000 SETTINGS max_result_rows = 0").await,
+        0,
+        "the engine ran no statement that carries the setting"
+    );
+}
+
+#[tokio::test]
+async fn a_statement_with_the_pickers_setting_is_still_capped_and_runs() {
+    let (app, _ch) = spin_up_with_clickhouse().await;
+    // `iceberg_snapshot_id` names no Iceberg table here, so it changes
+    // nothing; this shows the rule lets the picker's statement through to a
+    // real engine, which accepts the setting by name.
+    let statement = format!("{HUGE_SELECT}\nSETTINGS iceberg_snapshot_id = 1");
+
+    let (status, body) = run_as_reader(&app, &statement).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().expect("rows").len(), ROWS_KEPT);
+    assert_eq!(body["truncated"], json!(true), "{body}");
+}
