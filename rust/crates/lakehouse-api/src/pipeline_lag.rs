@@ -1154,9 +1154,16 @@ async fn evaluate_upstream_chain(
                 lag_seconds: Some(lag_seconds),
                 target_seconds,
                 behind_streak,
+                // BLD-2 review R4 BLOCKER 1 (b) / decision R16: an
+                // exhausted U is a different state from an outstanding
+                // one, so it gets its own words — the same sentence
+                // `lag_json` renders for the pages, with the count
+                // derived from U's own `max_retries`.
                 reason: Some(format!(
-                    "waiting for upstream pipeline {} to finish",
-                    u_pipe.id
+                    "upstream pipeline {}'s last {} runs for this change failed; \
+                     the next input change starts again",
+                    u_pipe.id,
+                    i32::from(u_pipe.max_retries) + 1
                 )),
             }));
         }
@@ -1455,10 +1462,14 @@ pub async fn downstream_without_readers(
 /// while the check scheduled U — the two answers must come from one store
 /// walk, the same shape as [`downstream_without_readers`].
 pub struct ExhaustedUpstream {
-    /// The id of the upstream pipeline whose retries are exhausted. The
-    /// reason text a page consumer reads is built from `$1`'s state rows,
-    /// so the id is what must reach it — not a pre-rendered decision.
+    /// The id of the upstream pipeline whose retries are exhausted.
     pub pipeline_id: String,
+    /// `u.max_retries + 1`: how many runs of U for this input change were
+    /// attempted and failed — the count the reason text names. The state
+    /// row's `request_attempt` is the checker's attempt bookkeeping; the
+    /// reason claims `u.max_retries + 1` from U's OWN definition, so a
+    /// page and the check cannot quote different numbers for one state.
+    pub failed_runs: i32,
 }
 
 /// The three-part condition every retry-exhausted consumer derives from U's
@@ -1504,6 +1515,7 @@ pub async fn exhausted_upstream_of(
         if upstream_retries_exhausted(&u_state, i32::from(u.max_retries)) {
             return Ok(Some(ExhaustedUpstream {
                 pipeline_id: u.id.clone(),
+                failed_runs: i32::from(u.max_retries) + 1,
             }));
         }
     }
@@ -1520,6 +1532,9 @@ pub async fn exhausted_upstream_of(
 /// the lag, so a stale row means the orchestrator stopped asking and
 /// nothing is known (`BLD-2-AC5`), which is never reported as `met`.
 // BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives exhausted retries and upstream wait from state
+// BLD-2 review R4 BLOCKER 1 (b): an exhausted U gets its own reason — the
+// outstanding one ("waiting for upstream pipeline U to finish") must not
+// describe a state where the next check will never unblock P on its own.
 #[must_use]
 pub fn lag_json(
     target_lag: Option<TargetLag>,
@@ -1527,7 +1542,7 @@ pub fn lag_json(
     now: OffsetDateTime,
     downstream_no_readers: bool,
     max_retries: i32,
-    upstream_exhausted: Option<&str>,
+    upstream_exhausted: Option<&ExhaustedUpstream>,
 ) -> serde_json::Value {
     if target_lag.is_none() {
         return serde_json::Value::Null;
@@ -1585,9 +1600,16 @@ pub fn lag_json(
     // `lag_json` cannot disagree about what "exhausted" means.
     let retries_exhausted = upstream_retries_exhausted(st, max_retries);
 
-    let reason = if let Some(u_id) = upstream_exhausted {
+    let reason = if let Some(u) = upstream_exhausted {
         status = LagStatus::Behind;
-        format!("waiting for upstream pipeline {u_id} to finish")
+        // BLD-2 review R4 BLOCKER 1 (b) / decision R16: the same words the
+        // check's exhausted branch orders for P, with the count derived
+        // from U's own `max_retries` in [`ExhaustedUpstream::failed_runs`].
+        format!(
+            "upstream pipeline {}'s last {} runs for this change failed; \
+             the next input change starts again",
+            u.pipeline_id, u.failed_runs
+        )
     } else if retries_exhausted {
         status = LagStatus::Behind;
         let n = max_retries + 1;
@@ -2906,8 +2928,11 @@ mod tests {
     }
 
     // BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives waiting on exhausted upstream
+    // BLD-2 review R4 BLOCKER 1 (b): the exhausted-U reason is its own
+    // sentence, naming the count from U's own `max_retries` — saying
+    // "waiting ... to finish" would claim a check can still unblock it.
     #[test]
-    fn lag_json_reports_waiting_for_upstream_when_upstream_retries_exhausted() {
+    fn lag_json_reports_the_exhausted_upstream_whose_runs_failed_when_upstream_retries_exhausted() {
         let now = at(1_000);
         let mut state = lag_state(Some(now - time::Duration::seconds(10)), "behind");
         state.pending_since = Some(now - time::Duration::seconds(30));
@@ -2919,13 +2944,17 @@ mod tests {
             now,
             false,
             1,
-            Some("pl-upstream-orders"),
+            Some(&ExhaustedUpstream {
+                pipeline_id: "pl-upstream-orders".to_owned(),
+                failed_runs: 2,
+            }),
         );
         assert_eq!(res["status"], "behind");
         assert_eq!(res["lagSeconds"], 30);
         assert_eq!(
             res["reason"],
-            "waiting for upstream pipeline pl-upstream-orders to finish"
+            "upstream pipeline pl-upstream-orders's last 2 runs for this change failed; \
+             the next input change starts again"
         );
     }
 
@@ -3494,7 +3523,11 @@ mod tests {
         );
         assert_eq!(
             outcome.reason.as_deref(),
-            Some("waiting for upstream pipeline pl-u-exh to finish")
+            Some(
+                "upstream pipeline pl-u-exh's last 2 runs for this change failed; \
+                 the next input change starts again"
+            ),
+            "the check's exhausted-U reason names U and the count, R4 BLOCKER 1 (b)"
         );
 
         // Page payload for P
@@ -3505,12 +3538,17 @@ mod tests {
             t0,
             false,
             i32::from(p.max_retries),
-            Some("pl-u-exh"),
+            Some(&ExhaustedUpstream {
+                pipeline_id: "pl-u-exh".to_owned(),
+                failed_runs: 2,
+            }),
         );
         assert_eq!(page["status"], "behind");
         assert_eq!(
             page["reason"],
-            "waiting for upstream pipeline pl-u-exh to finish"
+            "upstream pipeline pl-u-exh's last 2 runs for this change failed; \
+             the next input change starts again",
+            "the page says the same words the check said"
         );
     }
 

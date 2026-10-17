@@ -236,7 +236,7 @@ async fn list_body(
                             now,
                             no_readers.contains(&p.id),
                             i32::from(p.max_retries),
-                            upstream_exhausted.as_ref().map(|e| e.pipeline_id.as_str()),
+                            upstream_exhausted.as_ref(),
                         ),
                     );
                 }
@@ -1087,7 +1087,7 @@ async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Val
         time::OffsetDateTime::now_utc(),
         no_readers.contains(&pipeline.id),
         i32::from(pipeline.max_retries),
-        upstream_exhausted.as_ref().map(|e| e.pipeline_id.as_str()),
+        upstream_exhausted.as_ref(),
     ))
 }
 

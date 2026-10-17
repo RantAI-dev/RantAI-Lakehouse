@@ -274,9 +274,14 @@ async fn a_lag_pipeline_reading_its_upstream_only_through_the_source_table_names
         row["lag"]["status"], "behind",
         "a P blocked by an exhausted U is behind, not unmeasured"
     );
+    // BLD-2 review R4 BLOCKER 1 (b): the exhausted-Upstream reason is its
+    // own sentence; U was seeded with max_retries 0, so one run failed.
     assert_eq!(
         row["lag"]["reason"],
-        format!("waiting for upstream pipeline {u_id} to finish"),
+        format!(
+            "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+             the next input change starts again"
+        ),
         "the page's reason names U, through the chain the check walks"
     );
 
@@ -289,7 +294,10 @@ async fn a_lag_pipeline_reading_its_upstream_only_through_the_source_table_names
     );
     assert_eq!(
         detail_body["lag"]["reason"],
-        format!("waiting for upstream pipeline {u_id} to finish"),
+        format!(
+            "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+             the next input change starts again"
+        ),
         "the detail page's reason names U through the chain, not through dependsOn"
     );
 }
