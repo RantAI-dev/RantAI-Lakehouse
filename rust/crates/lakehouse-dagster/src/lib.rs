@@ -1150,9 +1150,9 @@ impl DgClient {
             )
             .await?;
         Ok(data.runs_or_error.results.and_then(|mut runs| {
-            // Most recent first, so a re-used key (which Dagster forbids
-            // within one run's history anyway) still answers with the run
-            // that matters.
+            // Most recent first, so if more than one run carries the key the
+            // answer is the run created last (BLD-2 review R3 SHOULD-FIX 4:
+            // not a claim about what Dagster allows).
             // BLD-2 review R1 SHOULD-FIX 11: order by creationTime, not startTime
             runs.sort_by(|a, b| {
                 b.creation_time
@@ -3961,8 +3961,10 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
+                    // BLD-2 review R3 SHOULD-FIX 4: the older-created run STARTS
+                    // after the newer one, so sorting by startTime would pick it.
                     { "runId": "old", "jobName": "authored__pl-x", "status": "SUCCESS",
-                      "startTime": 120.0, "endTime": 160.0, "creationTime": 100.0 },
+                      "startTime": 1000.0, "endTime": 1040.0, "creationTime": 100.0 },
                     { "runId": "new", "jobName": "authored__pl-x", "status": "STARTED",
                       "startTime": 950.0, "creationTime": 900.0 }
                 ] } }

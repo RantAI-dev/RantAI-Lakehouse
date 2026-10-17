@@ -2127,13 +2127,8 @@ pub async fn set_target_lag(
     Ok(Some(Pipeline::from(row)))
 }
 
-/// BLD-2 plan D7: every pipeline with a target lag that reads one of
-/// `targets` (directly as its source, or through a `depends_on` pipeline's
-/// target) — the "downstream" of a table.
-///
-/// A pipeline whose kind is `downstream` is refreshed by the pipeline that
-/// reads it, so this is the list such a pipeline's own check has to walk
-/// to find out whether anybody needs it at all.
+// BLD-2 review R3 SHOULD-FIX 5: an orphaned `lag_pipelines_reading` paragraph
+// (the function it described no longer exists) was glued onto this doc.
 /// How many pipelines with a target lag read `target` (other than `pipeline_id`
 /// itself) — plan D7's honest note ("Downstream: no pipeline with a target lag
 /// reads this table") needs this number, and the page must not have to infer it.

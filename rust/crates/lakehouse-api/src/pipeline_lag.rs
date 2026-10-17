@@ -426,12 +426,14 @@ pub async fn inputs_of(
     inputs_of_conn(&mut conn, pipeline).await
 }
 
-/// `lag:<pipeline id>:<hash>` — the run key a requested run carries, so the
-/// next check can find it (plan D5 step 6). The hash is over the canonical
-/// token map, so the SAME change always produces the same key (a retry
-/// cannot fan out into two runs) and a DIFFERENT change produces a
-/// different one (a genuinely new run is not mistaken for the old
-/// request's).
+/// `lag:<pipeline id>:<hash>:<attempt>` — the run key a requested run
+/// carries, so the next check can find it (plan D5 step 6). The hash is over
+/// the canonical token map, so the same change at the same attempt always
+/// produces the same key (a repeated tick cannot fan out into two runs) and
+/// a different change produces a different one (a genuinely new run is not
+/// mistaken for the old request's). The attempt is part of the key because
+/// the orchestrator de-duplicates by key: a retry of the same change after a
+/// FAILURE must carry a new one (BLD-2 review R3 SHOULD-FIX 5).
 // BLD-2 review R1 decision R2 / BLOCKER 4: run key carries attempt number
 fn run_key_for(pipeline_id: &str, tokens: &TokenMap, attempt: i32) -> String {
     let mut hasher = Sha256::new();
@@ -576,10 +578,11 @@ impl CheckState {
 ///
 /// * `SUCCESS` → the tokens it consumed become `consumed_tokens`, so the
 ///   next check compares against them and finds nothing to do.
-/// * `FAILURE`/`CANCELED` → the request is cleared and nothing is
-///   consumed: the next check sees the same difference and may ask again.
-///   (The pipeline's own failure alert and `maxRetries` are what cover a
-///   run that keeps failing; this loop must not spin.)
+/// * `FAILURE`/`CANCELED`/`CANCELING` → the request is cleared, nothing is
+///   consumed and `request_attempt` goes up by one: the next check asks
+///   again under a new run key until `request_attempt` passes the pipeline's
+///   `max_retries` (BLD-2 review R3 SHOULD-FIX 5; the retry limit is handled
+///   here, so this loop cannot spin).
 /// * still running, or not created yet → `true`, and the caller waits.
 /// * not found after 2 minutes ([`LOST_REQUEST_SECONDS`]) → request is cleared
 ///   as lost to decide again without incrementing `request_attempt` (R1/R9).
