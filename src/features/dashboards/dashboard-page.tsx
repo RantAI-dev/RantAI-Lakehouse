@@ -27,7 +27,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -624,6 +624,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const tabs = data?.tabs ?? NO_TABS;
   const selTab = selectedTab(tabs, searchParams.get(TAB_PARAM));
   const chartIds = React.useMemo(() => charts.map((c) => c.id), [charts]);
+  // BI-18 part C review fix (BLOCKER) R13: the layout AS SHOWN, every tile with a
+  // box. Tab operations (move, delete a tab, add a block) work from this, never
+  // from the stored map alone, which lacks a chart that was never placed.
+  const shownLayout = React.useMemo(
+    () => placeUnboxed(charts.map((c) => ({ id: c.id, span: c.span, kind: c.kind })), layout, tabs),
+    [charts, layout, tabs],
+  );
   const canWrite = hasPermission("dashboard:write");
   const selectTab = React.useCallback((id: string) => {
     const qs = withTabParam(window.location.search, tabs, id);
@@ -653,7 +660,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  const currentEdit = (): TabEdit => ({ tabs, layout, filters: defaultFilters });
+  const currentEdit = (): TabEdit => ({ tabs, layout: shownLayout, filters: defaultFilters });
   const tabEditing = canWrite && !isDefault && edit
     ? {
         onAdd: (title: string) => {
@@ -669,7 +676,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           if (selTab === id && next.tabs.length > 0) selectTab(next.tabs[0].id);
           void saveTabEdit(next);
         },
-        tileCount: (id: string) => tilesOnTab(tabs, layout, chartIds, id).length,
+        tileCount: (id: string) => tilesOnTab(tabs, shownLayout, chartIds, id).length,
       }
     : undefined;
   // The phone layout: this tab's tiles replace their entries, other tabs' entries stay.
@@ -696,10 +703,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       });
       const j = (await res.json().catch(() => null)) as { chart?: { id: string }; error?: string } | null;
       if (!res.ok || !j?.chart) throw new Error(j?.error ?? "Could not add the tile");
-      const onTab = tabs.length ? tilesOnTab(tabs, layout, chartIds, selTab ?? "") : chartIds;
-      const y = onTab.reduce((m, id) => Math.max(m, (layout[id]?.y ?? 0) + (layout[id]?.h ?? 0)), 0);
+      // BI-18 part C review fix (SHOULD-FIX) R15: at the bottom of the tab as shown,
+      // where the charts with no stored box are drawn too, like a new chart.
+      const y = bottomOfTab(tabs, shownLayout, chartIds, selTab);
       const box = { x: 0, y, w: 12, h: defaultTileHeight(kind), ...(selTab ? { tab: selTab } : {}) };
-      await putBoard({ layout: { ...layout, [j.chart.id]: box } });
+      await putBoard({ layout: { ...shownLayout, [j.chart.id]: box } });
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -895,7 +903,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const here = tabOf(tabs, layout, id);
     return tabs.filter((t) => t.id !== here).map((t, i) => ({
       label: `Move to ${t.title}`, icon: <ArrowRightLeft />, separatorBefore: i === 0,
-      onSelect: () => persistLayout(moveTileToTab(tabs, layout, chartIds, id, t.id)),
+      onSelect: () => persistLayout(moveTileToTab(tabs, shownLayout, chartIds, id, t.id)),
     }));
   };
   const items: GridItem[] = charts.map((spec) => {
@@ -1190,7 +1198,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           ) : null}
           <TabBar tabs={tabs} selected={selTab} onSelect={selectTab} editing={tabEditing} />
           <DashboardGrid
-            items={items} layout={layout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
+            items={items} layout={shownLayout} editable={edit && !phoneEdit} onLayoutChange={persistLayout}
             tabs={tabs} tab={selTab} phone={phone} phoneEdit={edit && phoneEdit} onPhoneChange={persistPhone}
             foldKey={board}
           />

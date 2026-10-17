@@ -4,7 +4,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { settleLayout } from "@/lib/grid-layout";
 import {
-  PHONE_MAX_WIDTH, collapseLayout, defaultTileHeight, foldedTiles, phoneOrder, tabOf,
+  PHONE_MAX_WIDTH, collapseLayout, foldedTiles, phoneOrder, placeUnboxed, tabOf,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services/clients/bi-store";
 import { PhoneStack } from "./phone-stack";
@@ -40,30 +40,16 @@ export type GridItem = {
 const COLS = 12;
 const MARGIN = 12;
 const ROW_H = 44;
-const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
 /**
- * Ensure every item has a box; items without one get placed below, half
- * width (2 per row) or full width for `span: 2`. A stored layout that
- * already overlaps gets tidied up too.
+ * Ensure every item has a box; items without one get placed below by the one
+ * rule the server shares (`placeUnboxed`, BI-18 part C review fix (BLOCKER)
+ * R13: a row wraps by its tallest tile). A stored layout that already overlaps
+ * gets tidied up too. The page hands the grid the layout as shown, so on a
+ * board that was saved after R13 this only tidies.
  */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
-  const out: LayoutMap = {};
-  const ids = new Set(items.map((i) => i.id));
-  for (const [id, box] of Object.entries(layout)) if (ids.has(id)) out[id] = box;
-  let maxY = 0;
-  for (const b of Object.values(out)) maxY = Math.max(maxY, b.y + b.h);
-  let col = 0;
-  for (const it of items) {
-    if (out[it.id]) continue;
-    const w = it.span === 2 ? COLS : DEFAULT.w;
-    if (col + w > COLS) { col = 0; maxY += defaultTileHeight(it.kind, DEFAULT.h); }
-    const h = defaultTileHeight(it.kind, DEFAULT.h);
-    out[it.id] = { x: col, y: maxY, w, h };
-    col += w;
-    if (col >= COLS) { col = 0; maxY += h; }
-  }
-  return settleLayout(out);
+  return settleLayout(placeUnboxed(items, layout, []));
 }
 
 type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: TileBox };
