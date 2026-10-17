@@ -179,4 +179,135 @@ planner (section 5).
 
 ## 6. Handoff
 
+### Slice B — developer (OpenCode MiniMax M3.1), 2026-10-15
+
+Branch `fix/pr105-orchestrator-class`, base `e17a8281`:
+
+- `66fc42f3` — `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` (B1; 5 files, +237/−34)
+- `ba8d63a2` — `docs(proxy): say why the embed frame check uses fetch (PR #105 review SHOULD-FIX 2)` (B2; `src/proxy.ts` only, +8)
+- `29f31e98` — `docs(dagster): name Status in launch_run_with_config's Errors` (doc only, part of B1)
+- `89231890`, `1f4766fc`, `3e2eee8d` — the three commits carrying this section; the first was pushed by an interrupted run of this slice and the other two consolidate it into the single section below.
+
+**Plan vs code.** No scope mismatch. The anchors held at `e17a8281`
+(`DgError` 157, `Server(format!("Dagster HTTP …"))` 1157,
+`orchestrator_unreachable` 181), and the file's two further non-2xx sites
+(2323, 2393) fall under the plan's "any other non-2xx site in that file".
+Two things the plan did not spell out, both recorded below: the new
+`ApiError::BadGateway` variant (accepted by the planner) and the
+`routes/connectors.rs` doc comment that named the old class.
+
+**B1, what changed.** `lakehouse-dagster` gains `DgError::Status(u16)`
+(`Display` unchanged, `"Dagster HTTP {n}"`), built at all three non-2xx
+sites, so a caller can tell a `5xx` from a `4xx` without parsing text.
+`upstream_error::orchestrator_unreachable` keeps `Transport` and
+`Status(s) if s >= 500` on `503` + `code: orchestrator_unreachable` +
+`Retry-After`, and sends `Status(4xx)` and `Server(..)` to a `502` with the
+context's `failed` sentence, no `code`, no `Retry-After`, raw text to the log
+only. `UpstreamFailure::into_bad_gateway` sits beside `into_not_ready`.
+`routes/connectors.rs`'s `ingest_run_request` doc is updated to state the
+split (it still called a protocol failure "unreachable").
+
+**One file the plan does not name: `lakehouse-core`.** No `502` existed
+anywhere in the workspace (`ApiError::status()` covered
+400/401/403/404/409/422/429/500/503) and D2 asks for one, so
+`ApiError::BadGateway(String)` is added beside `Self::Unavailable` with the
+unreachable/unusable split documented at the variant, plus its `status()` →
+502 arm and a test. `ApiError::status()` is the only exhaustive `match` on
+the enum in the workspace (grep over `rust/crates`); the renderer
+`lakehouse-api/src/error.rs` picks `code` with an `if let` + `_ =>`, so no
+route status table moves. Accepted by the planner.
+
+**Tests added.** Four in `upstream_error.rs` (Transport → 503 + code + a
+`WARN` log line, `Status(502)` → 503 + code, `Status(400)` → 502 without a
+code, a GraphQL `Server(..)` → 502 whose planted marker is in the log and
+not in the body), one in `lakehouse-dagster` (a `503` answer is
+`DgError::Status(503)` with the same `Display`), one in `lakehouse-core`
+(`BadGateway` → 502).
+
+**Commands run, with the counts they printed.** Rust, from `rust/`:
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo clippy -p lakehouse-dagster -p lakehouse-api --all-targets -- -D warnings` | exit 0, no warnings |
+| `cargo test -p lakehouse-dagster` | `69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-api --lib upstream_error` | `21 passed; 0 failed; 0 ignored; 0 measured; 1677 filtered out` (17 pre-existing + the 4 above) |
+| `cargo test -p lakehouse-api --lib connectors` | `75 passed; 0 failed; 0 ignored; 0 measured; 1623 filtered out` |
+| `cargo test -p lakehouse-api --lib pipelines` | `157 passed; 0 failed; 0 ignored; 0 measured; 1541 filtered out` |
+| `cargo test -p lakehouse-api --test sec11_guard` | `4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-core` (extra: the crate B1 edits) | `48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-api --test ingest_run -- --test-threads=2` (extra) | `22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` — includes `ingest_run_with_dagster_down_is_a_503_with_an_unreachable_code`, the end-to-end proof the `Transport` → 503 + code arm is unmoved |
+| `cargo test -p lakehouse-api --test upstream_errors -- --test-threads=2` (extra) | `6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+
+Without `--test-threads`, `ingest_run` fails all 22 on this 11 GB machine
+(each test starts a Postgres container); that is a resource limit of the
+box, not a code failure — one test alone passes.
+
+TypeScript, from the worktree root: `bun run typecheck` exit 0;
+`bun run lint` exit 0 — `✖ 6 problems (0 errors, 6 warnings)`, all
+pre-existing and in files this slice does not touch.
+
+**Deviation: the toolchain.** The shell this slice ran in had no Rust
+toolchain at all (`cargo: command not found`, no `~/.cargo`, no `~/.rustup`),
+so the pinned toolchain of `rust/rust-toolchain.toml` (1.96.1 + rustfmt +
+clippy, minimal profile) was installed with rustup before anything could be
+run. That is a change to the machine, not to the repository.
+
+**Deviation: `CARGO_TARGET_DIR`.** The plan's shared
+`/home/uaa/rantai/.cargo-target` is not safe while two worktrees build the
+same crates, and this slice hit exactly that. Against the shared dir,
+`cargo test -p lakehouse-api --lib upstream_error` first failed to compile
+B1's own tests against the other worktree's crates (`E0599: no variant ...
+named Status` / `... named BadGateway`), and the next run of the same
+command reported `17 passed` — 17 is the pre-change count and the four new
+tests were absent from the binary it ran; that binary's dep-info names
+`/home/uaa/rantai/wt-pr105-embed/rust/migrations/...`, i.e. the slice-A
+worktree. A unit's `-C metadata` and extra-filename are identical across
+the two worktrees, so their builds overwrite each other's artifacts and
+cargo's mtime freshness check can accept the wrong one: a false green of
+exactly the kind rule 7 exists to catch. Every number above therefore comes
+from a private target dir, `CARGO_TARGET_DIR=/home/uaa/rantai/.cargo-target-orch-pr105`,
+built from this worktree only. Nothing in the shared directory was deleted
+and `cargo clean` was never run, so the other developer's cache is
+untouched. The reviewer should re-run its own verification somewhere other
+than the shared dir while two worktrees are live; a per-branch target dir
+(or a note in `AGENTS.md`) may be worth the planner's attention.
+
+**Re-verified on the final tree** (code identical to `29f31e98`, after that
+commit): every command in the table above was run once more against the
+plan's *shared* `/home/uaa/rantai/.cargo-target` and printed the same counts
+— `69`, `21`, `75`, `157`, `4`, `cargo fmt --check` clean, `bun run typecheck`
+exit 0, `bun run lint` 0 errors/6 warnings. `--lib upstream_error` is the
+discriminating one: `21` (17 pre-existing + this slice's 4) is this branch's
+binary, where the slice-A worktree's prints `17`. In that same shared dir
+the first clippy run failed `E0599` on code that had passed there minutes
+earlier and the immediate re-run was clean — the overwrite described above,
+seen from the other side, and the reason the shared dir is not a place to
+take a green from.
+
+**Consequences worth a look.** A `Dagster` answer that is neither a
+transport failure nor a `5xx` is now a `502`, and
+`ops/g6/g6_ingest_matrix_test.py` raises at once on anything that is not
+`503` + one of `RETRYABLE_ORCHESTRATOR_CODES` — that is the gate's own rule
+and D2's point, but such an answer no longer consumes the gate's 120 s wait
+window. The transient in `docs/superpowers/plans/2026-10-14-ci-green.md`
+(F3: a launch answering `Dagster HTTP 500` while the code location reloads)
+is a `5xx`, so it keeps the retry code. No gate needed a change.
+
+**Not verified, and why.**
+
+- `cargo test --workspace` and `cargo clippy --workspace`: the plan forbids
+  them on this 11 GB machine while two developers build; CI runs them.
+- `bun run test`, the `ops/g*` gates and `docker compose config`: not run —
+  this slice changes no TypeScript behaviour and no compose, and the gates
+  need the whole stack up.
+- The `502` is proven by unit tests over constructed `DgError` values, not
+  against a live `Dagster` answering a `4xx` or a GraphQL error; no Dagster
+  or ClickHouse was run here.
+- Slice A (embed events) is not in this branch.
+- The doc pages in section 5, and
+  `docs/core/features/no-raw-upstream-errors.md:52` (which still presents
+  `orchestrator_unreachable` as the answer for every orchestrator failure),
+  are the planner's and were left untouched.
+
 ## 7. Review
