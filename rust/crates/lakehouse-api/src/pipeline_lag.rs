@@ -2113,8 +2113,8 @@ mod tests {
     /// guess, and `not_measured` rather than `met` (plan D4).
     #[sqlx::test(migrations = "../../migrations")]
     async fn an_unreadable_input_is_not_measured_and_requests_nothing(pool: PgPool) {
-        // BLD-2 review round 1 / D11: the floor is 2 minutes (measured), so
-        // no fixture may ask for 1 — the column CHECK refuses it.
+        // BLD-2 review R3 BLOCKER 3: the floor is 1 minute (measured, R8), so
+        // fixtures may use 1; this one uses 2 only because its numbers do not depend on it.
         let pipeline = seed_pipeline(&pool, "pl-x", 2).await;
         let now = at(1_000);
         let reader = FakeTokens::new().unreadable("bronze.orders");

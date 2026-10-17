@@ -2747,7 +2747,9 @@ async fn lock_lag_states_ordered_locks_rows_and_inserts_missing_without_deadlock
         let mut inp = input();
         inp.id = Some(id.to_owned());
         inp.name = id.to_owned();
-        pipelines::create_pipeline(&pool, &inp, None).await.expect("create pipeline");
+        pipelines::create_pipeline(&pool, &inp, None)
+            .await
+            .expect("create pipeline");
     }
 
     let mut conn = pool.acquire().await?;

@@ -180,7 +180,7 @@ impl TargetLag {
         match self {
             Self::Lag { minutes } => {
                 // `saturating_mul` on an `i64` copy keeps a caller that
-                // skipped the route's 2..=10080 validation from wrapping
+                // skipped the route's 1..=10080 validation from wrapping
                 // into a value the column CHECK would reject for the wrong
                 // reason; the CHECK is still the real boundary.
                 let seconds = i64::from(minutes).saturating_mul(60);
@@ -204,7 +204,7 @@ impl TargetLag {
         if downstream {
             return (seconds.is_none()).then_some(Self::Downstream);
         }
-        // The CHECK bounds `target_lag_seconds` to 120..604800, so the
+        // The CHECK bounds `target_lag_seconds` to 60..604800, so the
         // division is exact whole minutes and stays inside `i32`.
         seconds.map(|seconds| Self::Lag {
             minutes: seconds / 60,
@@ -945,7 +945,7 @@ pub struct CreatePipelineInput {
     pub id: Option<String>,
     /// BLD-2 (migration `0084`): the target lag this pipeline is created
     /// with, or `None` for none. The route layer validates the range
-    /// (`2..=10080` minutes) before calling, and the column CHECK is the
+    /// (`1..=10080` minutes) before calling, and the column CHECK is the
     /// database-level backstop.
     pub target_lag: Option<TargetLag>,
     /// BLD-1 / D1: the `app_user` the pipeline reads as (migration
@@ -2092,7 +2092,7 @@ pub async fn get_lag_state_for_update(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] on any failure, including the CHECK
-/// constraint rejecting a lag outside `2..=10080` minutes when a caller
+/// constraint rejecting a lag outside `1..=10080` minutes when a caller
 /// bypassed the route's own validation.
 pub async fn set_target_lag(
     pool: &PgPool,

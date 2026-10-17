@@ -1182,13 +1182,15 @@ pub struct SetTargetLagBody {
     pub target_lag: Option<pipelines::TargetLag>,
 }
 
+// BLD-2 review R3 BLOCKER 3: 1 minute floor citing R8 logs and R6/R6a history
 /// The smallest target lag a pipeline may be given, in whole minutes.
 ///
-/// BLD-2 review round 1 R6b / round 2 R8, plan D11: the spec's floor is 1 minute,
-/// but gate measurements on this stack supported 2 minutes (R6b run on `47fcf9ad4618`,
-/// samples [77.2, 95.13, 68.9, 71.11, 89.1] s all <= 120 s in `bld2-gate-r6.log`).
+/// BLD-2 review round 1 R6b / round 2 R8, plan D11: the spec's floor is 1 minute (60 seconds).
+/// Under R6b it was temporarily set to 2 minutes, but with R6a (request-to-land budget),
+/// the R8 gate measurements on the compose stack (`bld2-gate-r8-1min.log` and
+/// `bld2-gate-r8-final.log`) confirmed that 1 minute passes all 5 samples (worst 32.70 s).
 /// It is a measured floor, not a preference: change it only with a new measurement
-/// behind it (R8), and change `0084_pipeline_target_lag.sql`'s CHECK in the same PR
+/// behind it, and change `0084_pipeline_target_lag.sql`'s CHECK in the same PR
 /// so the route and the column cannot disagree.
 pub const MIN_TARGET_LAG_MINUTES: i32 = 1;
 
@@ -1256,7 +1258,7 @@ pub async fn apply_set_target_lag(
 /// # Errors
 ///
 /// Returns 404 for an unknown or non-authored id or an id outside the caller's tenant;
-/// 400 for minutes outside `2..=10080` or if the lag would create a cycle;
+/// 400 for minutes outside `1..=10080` or if the lag would create a cycle;
 /// 503 if the store is unavailable.
 pub async fn set_target_lag(
     State(state): State<AppState>,

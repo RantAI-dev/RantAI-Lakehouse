@@ -30,7 +30,7 @@ all tenants) and builds, per pipeline:
   replaces both the cron schedule and the dependency `_after` sensor while set (D3).
   The sensor evaluates `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds
   (`minimum_interval_seconds=30`), balancing responsive freshness for pipelines with short
-  targets (down to 2 minutes) against the database cost of querying input snapshot tokens
+  targets (down to 1 minute; BLD-2 review R3 BLOCKER 3) against the database cost of querying input snapshot tokens
   and ClickHouse content fingerprints across authored pipelines (D6).
 
    Two upstreams are per-table rather than per-job: `file_ingest_job` loads

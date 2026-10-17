@@ -106,8 +106,8 @@ true now; SRC-20 runs this gate for real, after G3a, in the
 In addition to graph, source, and row materializations, this gate includes
 the BLD-2 D11 target lag verification step (`step_verify_target_lag_bronze_to_silver`):
 measures Bronze-to-Silver lag across 5 append iterations against the
-measured floor (2 minutes; a 1-minute target was measured at a worst sample
-of 68.94 s and refused -- plan D11), then verifies 5 checks with unchanged
+measured floor (1 minute; BLD-2 review R3 BLOCKER 3: R8 gate runs met it, worst
+sample 32.70 s -- plan D11), then verifies 5 checks with unchanged
 inputs launch no unneeded runs.
 Because of settling intervals and up to 5 runs, this step can take up to
 ~20 minutes in worst-case conditions inside the job timeout.
@@ -1153,10 +1153,11 @@ def trigger_bronze_ingest() -> str:
 
 
 # The target this gate measures against, in minutes, and the same number in
-# seconds for the assertion. 2 minutes is the MEASURED floor (plan D11):
-# a 1-minute target was measured at a worst sample of 68.94 s on this stack
-# and refused, so the API's minimum, the migration's CHECK and this gate's
-# target all sit at 2. They move together, and only with a measurement.
+# seconds for the assertion. 1 minute is the MEASURED floor (plan D11): before
+# R6a a 1-minute target missed (pre-R6a gate runs), and with R6a's
+# request-to-land budget the R8 runs met it (worst sample 32.70 s). The API's
+# minimum, the migration's CHECK and this gate's target all sit at 1 (BLD-2
+# review R3 BLOCKER 3). They move together, and only with a measurement.
 TARGET_LAG_MINUTES = 1
 TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
 

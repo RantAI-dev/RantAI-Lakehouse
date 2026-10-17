@@ -21,18 +21,19 @@
 -- # The floor is the MEASURED one, not the spec's
 --
 -- The spec's signed range starts at 60 seconds (1 minute); the floor here
--- is 120 (2 minutes), and the difference is a measurement, not a
--- preference. Plan D11 says the gate measures the lag on the compose stack
--- and that a minimum which the measurement does not support is raised in
--- the same PR rather than claimed. Under review round 1 R6b (`47fcf9ad4618` in
--- `bld2-gate-r6.log`), a 2-minute target passed all 5 samples [77.2, 95.13, 68.9,
--- 71.11, 89.1] s (avg 80.29 s <= 120 s), whereas pre-R6a runs exceeded 120 s
--- (worst sample 129.77 s in `bld2-gate-r1.log`). The floor is confirmed or updated
--- by the R8 gate runs (`docs/plans/BLD-2-TARGET-LAG-RESULT.md`). The route's own bound
+-- is 60 (1 minute), backed by gate measurements on the compose stack (plan D11).
+-- Under review round 1 R6b (`47fcf9ad4618` in `bld2-gate-r6.log`), a 2-minute
+-- target was used while pre-R6a runs exceeded 120 s (worst sample 129.77 s
+-- in `bld2-gate-r1.log`). With R6a (request-to-land budget), the R8 gate runs
+-- (`bld2-gate-r8-1min.log` and `bld2-gate-r8-final.log`) confirmed that a
+-- 1-minute target passed all 5 samples (worst sample 32.70 s <= 60 s,
+-- avg 25.64 s in `bld2-gate-r8-final.log`; worst sample 26.35 s <= 60 s,
+-- avg 20.75 s in `bld2-gate-r8-1min.log`). The floor is confirmed at 1 minute
+-- (`docs/plans/BLD-2-TARGET-LAG-RESULT.md`). The route's own bound
 -- (`routes::authored_pipelines::validate_target_lag`) carries the same
 -- number, and the two move together.
 --
--- 120..604800 seconds is 2 minutes to 7 days. `% 60 = 0` because the wire
+-- 60..604800 seconds is 1 minute to 7 days. `% 60 = 0` because the wire
 -- format is whole MINUTES (plan D2): storing a 90-second target would be a
 -- value no client can ask for and no page can display. The route layer
 -- refuses out-of-range bodies with 400 so the client never sees a
@@ -47,7 +48,7 @@ ALTER TABLE pipeline_definition
         CHECK (NOT (target_lag_downstream AND target_lag_seconds IS NOT NULL));
 
 COMMENT ON COLUMN pipeline_definition.target_lag_seconds IS
-    'Target lag in WHOLE MINUTES × 60: 120..604800 (the floor is the '
+    'Target lag in WHOLE MINUTES × 60: 60..604800 (the floor is the '
     'measured one, plan D11), NULL when the pipeline has no target lag or '
     'is "downstream" (see target_lag_downstream).';
 COMMENT ON COLUMN pipeline_definition.target_lag_downstream IS

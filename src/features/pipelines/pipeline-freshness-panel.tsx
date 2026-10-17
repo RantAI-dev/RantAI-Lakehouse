@@ -129,8 +129,8 @@ export function PipelineFreshnessPanel({
     let payload: TargetLag | null = null
     if (mode === "lag") {
       const parsedMinutes = Number(minutes)
-      // BLD-2 review round 1 / D11: the floor is the measured one (the gate
-      // did not meet 1 minute on this stack), not the spec's 1.
+      // BLD-2 review R3 BLOCKER 3 / D11: the floor is the measured one, and
+      // the R8 gate runs met 1 minute, so it equals the spec's.
       if (isNaN(parsedMinutes) || parsedMinutes < MIN_MINUTES || parsedMinutes > MAX_MINUTES) {
         setLocalError(`Minutes must be between ${MIN_MINUTES} and ${MAX_MINUTES}`)
         return
