@@ -163,6 +163,88 @@ Since `rust/Cargo.toml` enables `clippy::all` (deny) and `clippy::pedantic` (war
    - Affects `rust/Cargo.toml` and crate manifests (`future-incompatible` -> `future_incompatible`). Fixed in T2/T3.
 
 
+### Handoff (2026-10-17, round 1)
+
+#### 1. Commits on branch chore/rel-9-rust-1-99
+- `da8984e332d6` docs(plan): add REL-9 plan
+- `1b571ca5d97c` docs(plan): T1 release-notes audit (REL-9)
+- `aa87a92372c7` chore(rust): bump toolchain and minimum to 1.99.1 / 1.99 (REL-9)
+- `b870f9a0c79f` fix(rust): address 1.99 warnings and lints (REL-9)
+- `f6a163b88931` docs(rust): update toolchain docs and changelog for 1.99.1 (REL-9)
+
+#### 2. Exact Verification Commands and Results
+- `cd rust && cargo fmt --check`: PASSED (exit code 0; 0 formatting diffs).
+- `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings`: PASSED (exit code 0; 0 warnings, 0 errors).
+- `cargo deny check licenses`: PASSED (exit code 0; all licenses permitted).
+- `cargo deny check advisories`: FAILED (exit code 1; 3 pre-existing advisories RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 on `zip 8.6.0` via `calamine 0.36.1`; identical to main, out-of-scope for REL-9).
+- `rustup run 1.99.0 cargo check -j 4 --workspace --locked`: PASSED (exit code 0; completed in 7m 33s; 0 errors).
+- `docker build -f rust/Dockerfile --build-context pipeline_src=dagster/dispar_orchestrate -t lakehouse-api:rel9 rust`: PASSED (exit code 0; built image `lakehouse-api:rel9` sha256:bfb83c5023fa).
+- `docker run -d --name lakehouse-rel9 -p 18080:8080 -e CONNECTOR_SECRETS_KEY=... lakehouse-api:rel9 && curl -v http://127.0.0.1:18080/health`: PASSED (HTTP/1.1 200 OK, body: `ok`).
+- `docker compose --profile '*' config --quiet`: PASSED (exit code 0; clean config validation).
+- `RUST_TEST_THREADS=2 cargo test -j 4 --workspace --no-fail-fast`: *stopped at 40 GB disk threshold / not verified*. The test compilation successfully compiled all workspace crates. During link step of the 50 integration test binaries (each ~1 GB debuginfo), root disk available dropped to 39,964 MB, hitting the mandatory 40 GB floor. In accordance with plan instructions, the job was stopped and `cargo-target/debug/incremental` was cleaned (recovering 6.3 GB to 44.5 GB free).
+
+#### 3. Release Notes Compatibility Audit (T1 Table)
+See the full audit table in §8 above, covering all compatibility notes from Rust 1.97.0, 1.98.0, 1.99.0, and 1.99.1 with grep evidence.
+
+#### 4. Lint Allow Attributes Added and Rationale
+1. `#[allow(clippy::result_large_err)]`:
+   - `crates/lakehouse-api/src/routes/ai/mod.rs:432` (`chat_completion`)
+   - `crates/lakehouse-api/src/routes/pipelines.rs:2815` (`create_pipeline`)
+   - `crates/lakehouse-api/src/routes/pipelines.rs:3717` (`update_pipeline`)
+   - *Rationale:* Err variant is Axum's `Response` (>128 bytes). Standard pattern in Axum HTTP handlers; boxing would change public handler signatures and increase boilerplate.
+2. `#[allow(clippy::unused_async_trait_impl)]`:
+   - `crates/lakehouse-api/src/rustfs_client.rs:214` (`RustfsClient::upload_stream`)
+   - *Rationale:* Trait contract specifies an `async fn` across remote backends (S3, GCS), but the local/mock in-memory implementation does not need internal `.await` calls.
+3. `#[allow(clippy::assert_is_empty)]`:
+   - `crates/lakehouse-api/tests/common/mod.rs`
+   - `crates/lakehouse-dagster/src/client.rs:651`
+   - `crates/lakehouse-clickhouse/src/client.rs:1705`
+   - `crates/lakehouse-store/src/lib.rs:135`
+   - *Rationale:* Standard test assertions checking `assert!(x.is_empty())` across existing tests; clearer and idiomatic in this test suite than pedantic assertion rewrites.
+
+#### 5. Acceptance Checks Evidence
+- **REL-9-AC1 (No 1.96 / 1.88 mentions):**
+```
+$ git grep -n -E '1\.(96|88)' -- ':!public/geo*'
+CHANGELOG.md:624:  builder's OS; built from a pinned Rust 1.96.1 `Dockerfile`.
+design-system/tokens/colors.css:47:  --chart-3: oklch(0.588 0.158 241.966);
+design-system/tokens/colors.css:54:  --sidebar-primary:           oklch(0.588 0.158 241.966);
+design-system/tokens/colors.css:108:  --chart-3: oklch(0.588 0.158 241.966);
+docs/CI.md:144:advancing from the historical 1.88 floor while exceeding `SEC-41` requirements).
+docs/OPERATIONS.md:19:>= 1.88; bumped to `1.99.1` under `REL-9` — see the `rust-toolchain.toml`
+docs/adr/0001-dockerfile-convergence-and-tenant-module.md:28:`.api` variant was strictly better on three counts: it pins `rust:1.96.1-slim`
+docs/adr/0002-secretref-resolution.md:67:  `async fn`-in-trait is not object-safe; this workspace's MSRV, 1.88,
+docs/plans/CI-SPEED-PLAN.md:66:| Rust · test (1.88.0) | 794s | same as stable | about 750s |
+docs/plans/CI-SPEED-PLAN.md:94:   1.88.0 MSRV toolchain, and once more under `cargo llvm-cov`.
+docs/plans/CI-SPEED-PLAN.md:226:5. **Turn the MSRV job into a compile check.** Replace the 1.88.0 matrix
+docs/plans/CI-SPEED-PLAN.md:228:   `cargo check --workspace --all-targets --locked` on 1.88.0.
+docs/plans/CI-SPEED-PLAN.md:310:- The 1.88.0 job runs `cargo check --workspace --all-targets --locked`
+docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md:68:README's MSRV note (says 1.85; `Cargo.toml` says 1.88).
+docs/superpowers/plans/2026-10-02-upload-file.md:1953:  workspace's 1.96.1; no cargo), and run over 597,878 strings (every string up
+docs/superpowers/plans/2026-10-09-ci-pr2-images-once.md:43:   never built the API image (`g1-test-runner` is `rust:1.96.1-slim`,
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:29:| Toolchain pin | `rust/rust-toolchain.toml:8` (`channel = "1.96.1"`), comment lines 1–7 |
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:30:| Declared minimum | `rust/Cargo.toml:12` (`rust-version = "1.88"`), comment lines 9–11 |
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:31:| API image | `rust/Dockerfile:23` (`FROM rust:1.96.1-slim AS tools`), comments ~10–12 and ~97 |
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:32:| G1 test runner image | `docker-compose.yml:1341` (`image: rust:1.96.1-slim`) |
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:33:| MSRV job | `.github/workflows/ci.yml:347–375` (name, `toolchain: "1.88.0"`, cache key `msrv-1.88.0`) |
+docs/superpowers/plans/2026-10-17-rel-9-rust-latest.md:58:numbers. The old comments explained why the minimum was 1.88. The new
+```
+- **REL-9-AC2 (Compatibility notes audit):** §8 table includes every note from 1.97.0, 1.98.0, 1.99.0, 1.99.1 with assessment and grep proof.
+- **REL-9-AC3 (Rust verification passes):** fmt, clippy, MSRV cargo check, compose validation all pass on 1.99.1.
+- **REL-9-AC4 (API image builds and passes /health on rust:1.99.1-slim):**
+```
+$ curl -v http://127.0.0.1:18080/health
+* Established connection to 127.0.0.1 (127.0.0.1 port 18080)
+> GET /health HTTP/1.1
+> Host: 127.0.0.1:18080
+< HTTP/1.1 200 OK
+< content-type: text/plain; charset=utf-8
+< content-length: 2
+< date: Sat, 17 Oct 2026 15:29:58 GMT
+ok
+```
+
+
 ## 9. Review
 
 (planner)
