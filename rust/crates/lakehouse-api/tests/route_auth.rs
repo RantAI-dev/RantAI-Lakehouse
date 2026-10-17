@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level authorization tests, driven entirely by
 //! `lakehouse_api::policy::POLICY_TABLE` — Phase 3a.
 //!

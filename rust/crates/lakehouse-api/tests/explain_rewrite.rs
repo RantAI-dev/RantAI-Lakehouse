@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `POST /api/query/estimate` and the assistant's `run_sql` dry run explain
 //! the statement the run would send: the one rewritten for the caller's
 //! current roles, with the run route's own function. A statement the rewrite

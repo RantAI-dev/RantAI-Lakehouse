@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! WS3 item 29/30: `POST /api/connectors/{id}/ingest/run` at the ROUTE
 //! level — a real seeded connector row, a real authenticated session, and
 //! (for the launch-success case) a real `wiremock`-mocked `Dagster`

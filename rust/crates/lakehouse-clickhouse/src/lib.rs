@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assert_is_empty,
+        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+    )
+)]
 //! HTTP client for `ClickHouse`'s plain HTTP interface.
 //!
 //! Ports `src/services/clients/clickhouse.ts` — the client every

@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assert_is_empty,
+        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+    )
+)]
 //! Threshold alerts & scheduled digests over `serving.*` marts, persisted in
 //! `console.alert_rule`, delivered via webhook/email (see
 //! [`lakehouse_notify`]).

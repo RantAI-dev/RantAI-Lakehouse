@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for `POST /api/ai/tool` (T0.4 of the
 //! copilot-operations-handover plan) and its audit trail (T0.3's leftover
 //! half): the SAME `gate::decide` path the chat loop runs, exercised

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Integration tests for `lakehouse_auth::throttle` against a real Postgres,
 //! using the shared `lakehouse-test-support` harness.
 //!

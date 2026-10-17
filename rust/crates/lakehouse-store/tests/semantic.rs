@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Integration tests for `semantic.rs` (migration `0059`): the store half of
 //! the semantic layer, one description per table and column that the chat
 //! reads and a person can correct.

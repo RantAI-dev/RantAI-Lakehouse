@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Route-level tests for the semantic layer's API (`GET /api/semantic`,
 //! `GET`/`PUT /api/semantic/{asset}`, AI-16).
 //!

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `SEC-12`: signed embed tokens always expire, can be withdrawn, are signed
 //! with a configured secret, and the embed pages say who may frame them.
 //!

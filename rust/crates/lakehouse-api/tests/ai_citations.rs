@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! End-to-end proof (WS7 item F3, Hard Requirement 2 of the phase brief):
 //! a `POST /api/ai/chat` turn where the mocked LLM's final answer
 //! contains a Markdown table with NO backing tool call gets that table

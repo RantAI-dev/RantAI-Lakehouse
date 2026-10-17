@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Tests for `lakehouse_auth::oidc` against a locally generated key and a
 //! `wiremock` JWKS server — never a real identity provider.
 //!

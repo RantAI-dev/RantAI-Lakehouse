@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `GET`/`PUT /api/settings/reporting` over the real router (`BI-9`, T1):
 //! who may read and write, what is refused with a fixed message, that the
 //! engine's zone list decides, and that an upstream failure never puts its

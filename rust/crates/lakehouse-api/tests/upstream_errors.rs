@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! SEC-11: no response body carries text that came from an upstream.
 //!
 //! A `wiremock` stand-in for `ClickHouse` answers every request with a 500

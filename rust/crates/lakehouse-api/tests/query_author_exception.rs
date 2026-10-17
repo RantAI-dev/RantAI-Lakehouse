@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! SEC-11, the query-author exception (product owner decision, 2026-10-10).
 //!
 //! Query Studio (`POST /api/query/run`, `POST /api/query/estimate`) shows the

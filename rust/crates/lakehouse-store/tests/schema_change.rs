@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Integration tests for `lakehouse_store::schema_change` against a real
 //! Postgres (`SRC-8` task 3): the baseline, the identity of a pending
 //! change, approval, the connector pause and the cascade.

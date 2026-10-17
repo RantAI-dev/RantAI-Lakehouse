@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Integration tests for `pipelines.rs` against a real Postgres — WS4 item
 //! D3: `CreatePipelineBody`'s `incremental_column`/`transforms`/
 //! `fbic_enabled` used to be accepted and dropped on the floor

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `SEC-14`: changing where a connector points never sends its stored
 //! credential to the new place.
 //!

@@ -1055,9 +1055,7 @@ mod export_batch_sql_enforcement {
     /// all — the batch loop built `batch_sql` inline and executed it with
     /// no obligations check of any kind (`gold_export.rs`'s pre-D2
     /// `export_mart`, `LIMIT`/`OFFSET` loop). Quoted failure text
-    /// (`cargo test -p lakehouse-api gold_export::export_batch_sql 2>&1 |
-    /// tail -40` against the pre-D2 module): `error[E0425]: cannot find
-    /// function \`export_batch_sql\` in this scope`.
+    /// (`cargo test -p lakehouse-api gold_export::export_batch_sql 2>&1 | tail -40` against the pre-D2 module): `error[E0425]: cannot find function export_batch_sql in this scope`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn export_mart_rewrites_each_batch_query_for_the_triggering_principals_roles(
         pool: PgPool,

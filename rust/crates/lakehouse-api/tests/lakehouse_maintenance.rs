@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for `POST /api/lakehouse/tables/{ns}/{table}/maintenance`
 //! and `GET /api/lakehouse/maintenance-policies` (WS2 §4, WS2 plan review W8).
 //!

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for the T2.5 governance draft tools
 //! (`draft_policy`, `draft_classification_rule`, `draft_quality_rule`):
 //! every one of them must create a record that is never "active" —

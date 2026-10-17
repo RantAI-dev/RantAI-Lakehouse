@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assert_is_empty,
+        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+    )
+)]
 //! Task 3.1: the authentication core.
 //!
 //! # Why this crate exists

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Tests for `lakehouse_auth::openfga::LakekeeperAdminClient` against a
 //! `wiremock` server standing in for `Lakekeeper`'s management API —
 //! never a real `Lakekeeper` instance. See `openfga.rs`'s module doc

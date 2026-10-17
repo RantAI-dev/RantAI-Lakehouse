@@ -2811,6 +2811,10 @@ pub async fn run_finished_event(
 /// not loaded (marked ready while it was down, say) gets one reload; if
 /// the job is still missing, 409 says so rather than a launch error that
 /// reads like a bad job name.
+#[allow(
+    clippy::result_large_err,
+    reason = "axum::response::Response is returned directly as early error responses"
+)]
 async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
     let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
     let pipeline = pipelines::get_pipeline(pool, id)
@@ -3707,6 +3711,10 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
 /// `{"error": "orchestrator error"}` and the detail only to `tracing`
 /// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+#[allow(
+    clippy::result_large_err,
+    reason = "axum::response::Response is returned directly as early error responses"
+)]
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,

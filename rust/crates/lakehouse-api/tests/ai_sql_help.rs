@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Query Studio's SQL help (plan 15): the `propose_sql` tool, its rules, and
 //! the switch `AI_SQL_HELP`.
 //!

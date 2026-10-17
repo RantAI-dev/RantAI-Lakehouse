@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for `POST /api/agents/employees/{id}/run`
 //! (T3.2 of the copilot-operations-handover plan): running a digital
 //! employee headlessly — the same copilot tool-calling loop interactive

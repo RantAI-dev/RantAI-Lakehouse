@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `POST /api/pipelines/runnable/{id}/enforce` (BLD-1 / D3): the rewrite a
 //! pipeline's AUTHOR is allowed to run, which is the only SQL the
 //! orchestrator runs (`dagster/dispar_orchestrate/authored_factory.py`).

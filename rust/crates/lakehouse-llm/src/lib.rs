@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assert_is_empty,
+        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+    )
+)]
 //! `OpenAI`-compatible chat completions client, porting
 //! `src/services/clients/llm.ts`.
 //!

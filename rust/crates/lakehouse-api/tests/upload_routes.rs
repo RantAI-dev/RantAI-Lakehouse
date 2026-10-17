@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `/api/uploads/*` at the route level (T6 of
 //! `docs/superpowers/plans/2026-10-02-upload-file.md`, ADR 0014): the real
 //! router over a real migrated Postgres, real authenticated sessions, and

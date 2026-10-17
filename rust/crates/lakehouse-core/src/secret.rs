@@ -287,6 +287,10 @@ impl EnvSecretResolver {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "SecretResolver trait defines async fn; implementation is synchronous"
+)]
 impl SecretResolver for EnvSecretResolver {
     async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
         let Some(var_name) = secret_ref.strip_prefix(ENV_SECRET_REF_PREFIX) else {
@@ -516,6 +520,10 @@ impl FileSecretResolver {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "SecretResolver trait defines async fn; implementation is synchronous"
+)]
 impl SecretResolver for FileSecretResolver {
     async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
         let bytes = self.read_confined(secret_ref)?;

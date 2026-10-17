@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `SEC-11-AC1`: no route builds a response from an upstream error's text.
 //!
 //! # What this checks

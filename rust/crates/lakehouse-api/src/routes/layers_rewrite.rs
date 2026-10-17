@@ -623,6 +623,10 @@ impl Stub {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "LayerRunner trait defines async fn; test stub is synchronous"
+)]
 impl LayerRunner for Stub {
     async fn run(&self, sql: &str) -> Result<Value, SpecRunFailure> {
         self.asked.lock().unwrap().push(sql.to_owned());

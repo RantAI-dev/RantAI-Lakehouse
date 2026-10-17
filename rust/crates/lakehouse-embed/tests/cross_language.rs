@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Cross-language compatibility: a token signed by the real TypeScript
 //! `signEmbed` still has a signature the Rust port verifies. Since `SEC-12`
 //! its claims (no `exp`, no `iat`) are refused, by design.

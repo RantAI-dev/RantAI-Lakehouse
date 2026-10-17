@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `DELETE /api/connectors/{id}` — CDC deprovision-before-delete
 //! (`routes::connectors::delete`'s doc comment: the fix for a deleted
 //! `PostgreSQL` connector orphaning its replication slot/publication).

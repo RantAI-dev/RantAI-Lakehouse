@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for the Tier 2 `WriteHigh` tools:
 //! `run_bronze_maintenance` (C2: applies real Bronze maintenance) and
 //! `kill_query` (a real `KILL QUERY`). Each must create a pending

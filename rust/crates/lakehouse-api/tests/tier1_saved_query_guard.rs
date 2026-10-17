@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Proves T1.4's `run_saved_query` really goes through the SAME read-only
 //! SQL guard `POST /api/query/run` uses (`routes/query.rs`'s `is_read_only`)
 //! rather than a second, possibly-weaker copy: a saved query whose SQL is

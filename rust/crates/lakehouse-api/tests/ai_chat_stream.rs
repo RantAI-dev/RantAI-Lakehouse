@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `POST /api/ai/chat` with `stream: true` sends the answer text as
 //! `{"type":"delta"}` NDJSON lines while the model writes it, and still
 //! ends with the citation-checked `done` body — streaming changes when the

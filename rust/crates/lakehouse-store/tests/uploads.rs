@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Integration tests for `lakehouse_store::uploads` and the `file_upload`
 //! table (`0057_upload.sql`, `0058_upload_tenant_mode.sql`) against a real
 //! Postgres.

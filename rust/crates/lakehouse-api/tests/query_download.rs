@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `GET /api/query/run/{id}/download` — owner-scoped re-run download
 //! (WS2 §13, WS2 plan review W9).
 //!

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! HTTP-level integration tests for `POST /api/identity/tenants`'
 //! provisioning behaviour: a resumable state machine over `tenant.
 //! provisioning_status` (see `0042_tenant_provisioning.sql`) so a crash or

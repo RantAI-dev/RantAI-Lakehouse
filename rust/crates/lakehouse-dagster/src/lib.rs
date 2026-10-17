@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assert_is_empty,
+        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+    )
+)]
 //! `Dagster` GraphQL client, porting `src/services/clients/dagster.ts`.
 //!
 //! Talks to `Dagster`'s GraphQL endpoint directly over HTTP, matching the

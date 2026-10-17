@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! Named regression tests for specific security properties — Phase 3a,
 //! task 3: "explicit, named tests for the four issues that were fixed...
 //! these must fail loudly if anyone regresses them."

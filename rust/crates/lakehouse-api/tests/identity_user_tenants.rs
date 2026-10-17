@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `PUT /api/identity/users/{id}/tenants/{tenant_id}` — giving an existing
 //! user a tenant.
 //!

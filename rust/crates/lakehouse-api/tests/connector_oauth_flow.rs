@@ -1,3 +1,7 @@
+#![allow(
+    clippy::assert_is_empty,
+    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
+)]
 //! `SRC-12` part C (decisions 6 to 8, 11, 12): a REST connector signs in with
 //! OAuth authorization code and PKCE, keeps a refresh token sealed, survives
 //! its rotation, and signs out.
