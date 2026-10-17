@@ -442,9 +442,14 @@ def fill_value(value: Any, names: dict[str, str]) -> Any:
 
 
 def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
-    """An `expect_state` with its `{name}` values replaced by the run's ids."""
+    """An `expect_state` with its `{name}` keys and values replaced by the run's ids."""
     filled = dict(check)
-    filled["where"] = fill_value(check.get("where", {}), names)
+    # The keys are filled too: a board's layout is keyed by chart id, so a
+    # `where` key such as `layout.{chart}.w` names a chart this run created.
+    filled["where"] = {
+        fill_names(key, names): fill_value(value, names)
+        for key, value in check.get("where", {}).items()
+    }
     filled["path"] = fill_names(check["path"], names)
     return filled
 

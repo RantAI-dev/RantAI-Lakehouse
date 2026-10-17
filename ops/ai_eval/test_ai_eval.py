@@ -478,6 +478,13 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(filled["where"], {"id": "c-1"})
         self.assertEqual(m.expect_state_problems(cfg, session, filled, own_ids={"c-1"}), [])
 
+    def test_an_expect_state_where_key_can_use_a_saved_name(self) -> None:
+        # A board's layout is keyed by chart id, so the id is part of the key.
+        check = {"path": "/api/dashboard/boards", "list": "boards",
+                 "where": {"id": "{board}", "layout.{chart}.w": 6}, "count": 1}
+        filled = m.fill_check(check, {"board": "b-7", "chart": "c-1"})
+        self.assertEqual(filled["where"], {"id": "b-7", "layout.c-1.w": 6})
+
     def test_a_failed_setup_call_raises_so_the_run_is_a_setup_error(self) -> None:
         cfg = make_cfg()
         session = FakeSession({("POST", "/api/dashboard/specs"): FakeResponse(400, {"error": "bad"})})
@@ -1046,6 +1053,31 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertTrue(m.where_matches(pivot, where))
         grouped = {"id": "g", "kind": "table", "mart": "mart_wisman", "def": {"kind": "table"}}
         self.assertFalse(m.where_matches(grouped, where))
+
+    def test_arrange_case_is_true_only_for_a_board_whose_tiles_are_half_width(self) -> None:
+        # `GET /api/dashboard/boards` returns each board's `layout` as
+        # {chartId: {x, y, w, h}}. A board with its charts but no saved layout
+        # (the state before the write) must fail the check; the arranged one passes.
+        cfg = make_cfg()
+        check = self.cases()["board_arrange_half_width"]["expect_state"][0]
+        names = {"board": "b-7", "chart_a": "c-a", "chart_b": "c-b"}
+        filled = m.fill_check(check, names)
+
+        def problems(layout: dict[str, Any]) -> list[str]:
+            session = FakeSession({("GET", "/api/dashboard/boards"): {"boards": [
+                {"id": "b-7", "name": "T", "layout": layout, "chartCount": 2, "builtin": False},
+            ]}})
+            return m.expect_state_problems(cfg, session, filled, own_ids={"b-7"})
+
+        self.assertTrue(problems({}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 0, "y": 4, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}}))
+        self.assertEqual(
+            problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}), []
+        )
+        self.assertEqual(
+            problems({"c-a": {"x": 6, "y": 0, "w": 6, "h": 2}, "c-b": {"x": 0, "y": 0, "w": 6, "h": 2}}), []
+        )
 
     def test_chart_on_new_board_links_the_chart_to_the_board_it_created(self) -> None:
         # row 14: the chart's `board` is the id of the board this run created.
