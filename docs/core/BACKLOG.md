@@ -168,7 +168,7 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | In Acceptance | #165 | `reference/competitive-comparison.md` (Data matrix) |
 | `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. **Blocked by `SEC-21` (full-result download)** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. **Blocked by `BI-18` (the dashboard date filter)** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
@@ -186,9 +186,9 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-17` | Task | Upload hardening: a column cap, a limit on concurrent uploads, CSV exports that neutralise formula cells | Administration & Security | P2 | Done | #86 | Data module code audit |
 | `SEC-18` | Task | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Administration & Security | P2 | Done | #83 | `docker-compose.yml` |
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Todo |  | PR #83 review |
-| `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Todo |  | `routes/query.rs` |
-| `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105 | `lakehouse-embed` |
 | `SEC-25` | Task | Connector security follow-ups: a connector that signs in with no credential (Kafka, auth `none`) can never be re-pointed (409 without a credential, 400 with one); the PATCH-`host` rule and its doc for `files` connectors are stale since `SRC-6`; the `SEC-15` refusal message has runs of spaces | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 | `SEC-26` | Task | About thirty assistant tool results carry raw upstream error text (`err.to_string()`) into the chat response's `toolTrace`. Same rule as `SEC-6`. Closed by `SEC-11`'s change: `tests/sec11_guard.rs` scans `routes/ai/tools`, and each remaining line there is our own text with an allowlist reason. | Administration & Security | P2 | Done | #105 | `superpowers/plans/2026-10-12-delivery-review.md` |
@@ -204,8 +204,9 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-24` | Task | Catalog search follow-ups: measure the 500 ms target on 10,000 tables (`DATA-11-RESULT.md`); keep the Owner and Tags filters reachable on a laptop-width window; read column rows with `FINAL`; run acceptance rows 10, 11 and 13 | Data | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` (`DATA-11`) |
 | `AI-19` | Task | The AI team's plans for `AI-16` and `AI-17` in `docs/superpowers/plans/` (`AI-16-AC1`, `AGENTS.md` step 1); the feature pages say plans are not kept in the repository | AI Copilot | P2 | Todo |  | `superpowers/plans/2026-10-12-delivery-review.md` |
 | `SEC-31` | Task | The policy rewrite wrote a string literal back with `sqlparser`'s `Display`, which does not re-encode backslash escapes for `ClickHouse`, so a literal could reach the database with another value than the caller wrote. Fixed in `f8104c8`; ticketed so it is reviewed on its own | Administration & Security | P1 | Done | #104 | PR #104 review |
-| `SEC-32` | Task | Admin-written mask and row-filter expressions are not re-encoded by the `SEC-31` fix; check whether they need it | Administration & Security | P2 | Todo |  | `superpowers/plans/2026-10-07-dashboard-filters.md` follow-up, PR #104 review |
-| `SEC-33` | Task | A Query Studio download rewrites the history's statement, which was stored already rewritten, so an old mask or row filter stays inside and the current one applies on top. Fails closed, but the doc says today's policy governs the file; store the original statement or test the stored shape and correct the doc (`query.rs`, `tests/query_download.rs` seeds raw SQL) | Administration & Security | P2 | Todo |  | PR #104 review SHOULD-FIX 1 |
+| `SEC-32` | Task | Admin-written mask and row-filter expressions are not re-encoded by the `SEC-31` fix; check whether they need it. The validator now refuses a backslash in a text value and every text form but a plain quoted string, so the generic-dialect check and ClickHouse agree | Administration & Security | P2 | Done | #203 | `superpowers/plans/2026-10-07-dashboard-filters.md` follow-up, PR #104 review |
+| `SEC-33` | Task | A Query Studio download rewrites the history's statement, which was stored already rewritten, so an old mask or row filter stays inside and the current one applies on top. Fails closed, but the doc says today's policy governs the file; store the original statement or test the stored shape and correct the doc (`query.rs`, `tests/query_download.rs` seeds raw SQL) | Administration & Security | P2 | Done | #203 | PR #104 review SHOULD-FIX 1 |
+| `SEC-43` | Task | The row-filter validator checked only a function's arguments, an operator's sides and a column's last name part; every other part of a call, any operator and any qualifier now must match a fixed shape | Administration & Security | P2 | Done | #205 | `SEC-32` follow-up, batch review 2026-10-17 |
 | `SEC-34` | Task | Calculated-field names read back from storage enter the SQL as a plain alias, not re-validated (`fields.rs` `row_to_field`, `builder.rs`). Not reachable through the API; wrap the name in `Ident` on read | Administration & Security | P2 | Todo |  | PR #104 review SHOULD-FIX 2 |
 | `BI-27` | Task | Whole-result export holds up to three copies of 100,001 rows and mart exports have no time or byte limit (`dashboard.rs`). Take the rows instead of cloning, add a byte cap and a timeout, or stream | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 3 |
 | `BI-28` | Task | Export honesty: negative `Int64` values are written `'-5` (decide number columns from `result.meta`); a file can include rows a tile skipped with nothing saying so (`RecordsSql.skipped` dropped); a raw table with a calculated column cannot be exported (400) | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 4 |
@@ -280,7 +281,6 @@ parity), built after it.
 | `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
 | `SEC-20` | Todo | — | `QS-3` |
-| `SEC-21` | Todo | — | `QS-2` (full-result download) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
 | `AI-12` | Building | `QS-5` (variables part) | — |
@@ -290,7 +290,6 @@ parity), built after it.
 | `AI-8` | Planned | `BI-17` | — |
 | `AI-9` | Planned | `BI-18` (layout part) | — |
 | `DATA-3` | Planned | `DATA-4` | — |
-| `QS-2` | Planned | `SEC-21` (full-result download) | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1`, `BLD-2` | — |
 | `SRC-3` | Planned | `DEC-9` | — |
@@ -298,7 +297,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-19`, `AI-20`, `AI-21`, `BI-1`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-19`, `SEC-20`, `SEC-21`, `SEC-22`, `SEC-24`, `SEC-25`, `SEC-26`, `SEC-32`, `SEC-33`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-19`, `AI-20`, `AI-21`, `BI-1`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -342,6 +341,11 @@ set by the product owner and are left empty until they are.
 | `SEC-41` | 2026-10-17 | | |
 | `SEC-42` | 2026-10-17 | 2026-10-17 | |
 | `OPS-7` | 2026-10-15 | 2026-10-16 | |
+| `SEC-19` | | 2026-10-17 | |
+| `SEC-21` | | 2026-10-17 | |
+| `SEC-33` | | 2026-10-17 | |
+| `SEC-32` | | 2026-10-17 | |
+| `SEC-43` | 2026-10-17 | 2026-10-17 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
