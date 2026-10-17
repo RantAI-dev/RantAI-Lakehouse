@@ -324,4 +324,27 @@ is a `5xx`, so it keeps the retry code. No gate needed a change.
 - Not verified:
   - `cargo test --workspace` or workspace-wide clippy (skipped per rule to conserve memory on 11 GB host; CI runs workspace checks).
 
+### Slice A on the current base — developer (Claude Sonnet), 2026-10-17
+
+Merge of `origin/fix/pr105-embed-events` into this branch (base `48f3295b`),
+conflicts in `store.rs` and this file resolved by hand (see the merge commit).
+
+- Checks run, in the foreground, `CARGO_TARGET_DIR` shared, jobs 2:
+  - `cargo fmt --check`: clean
+  - `cargo clippy -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster -p lakehouse-core --all-targets -- -D warnings`: clean
+  - `cargo test -p lakehouse-bi`: 427 passed, 3 ignored; doc-test 1 passed
+  - `cargo test -p lakehouse-api --lib -- embed dashboard upstream_error connectors`: 223 passed
+  - `--test embed_tokens`: 21 passed; `--test sec11_guard`: 4 passed; `--test upstream_errors`: 6 passed
+  - `bun run typecheck`: no errors
+- **Plan assumption falsified.** D1 says the embed columns "never reached
+  `main`, so no data moves". They did: `5d8f61e1` (SEC-12) is on `main` and
+  creates `embed_revoked_before`, `embed_revoked_jti_json`,
+  `embed_origins_json`. A deployment that ran it holds withdrawals there;
+  after this change they are no longer read, so a withdrawn token would be
+  accepted again. A one-time backfill of those columns into the event table
+  (guarded by `system.columns`) is needed before this ships if `main` has
+  been deployed. Not built: it is a scope decision for the planner.
+- Not verified: `route_auth`, the full workspace test run, `bun run lint`
+  and `bun run test`, anything against a live ClickHouse.
+
 ## 7. Review
