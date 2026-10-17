@@ -223,9 +223,13 @@ async fn execute_query_against_engine(
         // text is logged under the reference. An unreachable engine or a
         // non-query failure stays the fixed message. See
         // `upstream_error::ch_error_for_author`.
+        //
+        // SEC-21: the engine stops producing rows past the cap, so a huge
+        // result never reaches this process. One row more than the route
+        // keeps is asked for, so `truncated` stays honest.
         let result = state
             .clickhouse
-            .query(sql, None)
+            .query_limited(sql, MAX_RESULT_ROWS + 1, None)
             .await
             .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
 
@@ -311,10 +315,15 @@ pub(crate) async fn check_statement_would_run(
 /// The most rows one run hands back to the browser.
 ///
 /// The console renders every row it receives, so an unbounded `SELECT *`
-/// used to be enough to freeze the tab. `ClickHouse`/`Trino` still compute
-/// the whole result — this caps what crosses the wire, and the response
-/// says when it did (`truncated`), so nobody reads a partial answer as the
-/// whole one.
+/// used to be enough to freeze the tab. The response says when the cap
+/// applied (`truncated`), so nobody reads a partial answer as the whole one.
+///
+/// `ClickHouse` is asked to stop at the cap (`ChClient::query_limited`), so
+/// a huge result does not fill this process's memory before `truncate`
+/// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
+/// boundary, so up to one block (`max_block_size`, about 65,000 rows by
+/// default) beyond the cap can still arrive; the route keeps
+/// `MAX_RESULT_ROWS` of them. `Trino`'s client bounds its own result.
 const MAX_RESULT_ROWS: usize = 2_000;
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
@@ -410,8 +419,9 @@ pub async fn run(
 
     // The console renders every row it receives, so an unbounded `SELECT *`
     // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
-    // comment. `ClickHouse`/`Trino` still compute the whole result; only
-    // what crosses the wire is capped, and the response says when it did.
+    // comment. The engines stop at the cap (`ClickHouse` inside the engine,
+    // `Trino` in its client); this keeps exactly `MAX_RESULT_ROWS` of what
+    // arrived, and the response says when it did.
     let total_rows = rows.len();
     let truncated = total_rows > MAX_RESULT_ROWS;
     rows.truncate(MAX_RESULT_ROWS);
