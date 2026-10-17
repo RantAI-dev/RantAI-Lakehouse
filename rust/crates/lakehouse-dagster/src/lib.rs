@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! `Dagster` GraphQL client, porting `src/services/clients/dagster.ts`.
 //!
 //! Talks to `Dagster`'s GraphQL endpoint directly over HTTP, matching the
@@ -4090,7 +4083,10 @@ mod tests {
             "error text must not be carried"
         );
         // A schedule that does not exist has no ticks, not an error.
-        assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
+        assert_eq!(
+            schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     /// R3 plan 2a BLOCKER regression: `sensor_ticks` selects
@@ -4126,7 +4122,10 @@ mod tests {
             "Dagster error text must not be carried in the response"
         );
         // A sensor that does not exist has no ticks, not an error.
-        assert!(sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })).is_empty());
+        assert_eq!(
+            sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })),
+            [] as [ScheduleTick; 0]
+        );
     }
 
     #[tokio::test]
@@ -4718,7 +4717,8 @@ mod tests {
         assert_eq!(op.sql, None);
         // The captured fixture predates `reads`/`writes`: absent entries
         // read as empty lists, never as a fabricated phrase.
-        assert!(op.reads.is_empty() && op.writes.is_empty());
+        assert_eq!(op.reads, [] as [String; 0]);
+        assert_eq!(op.writes, [] as [String; 0]);
     }
 
     #[test]
@@ -4734,7 +4734,10 @@ mod tests {
                 "ClickHouse lake.y".to_owned()
             ]
         );
-        assert!(metadata_lines(&entries, "reads").is_empty());
+        assert_eq!(
+            metadata_lines(&entries, "reads"),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// An op reporting metadata with none of the three recognized labels
