@@ -2013,7 +2013,9 @@ pub async fn lock_lag_states_ordered(
     tenant_id: Option<Uuid>,
 ) -> Result<std::collections::BTreeMap<String, Option<PipelineLagState>>, StoreError> {
     let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
-    ordered.sort();
+    // `sort_unstable`: a `&str` slice needs no stable order for this use
+    // (inserts then reads, all against one key set); caught mid-round, R4.
+    ordered.sort_unstable();
     ordered.dedup();
     if ordered.is_empty() {
         return Ok(std::collections::BTreeMap::new());

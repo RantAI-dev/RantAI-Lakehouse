@@ -2806,7 +2806,7 @@ async fn lock_lag_states_ordered_returns_states_keyed_in_sorted_order_from_unsor
     // The three rows were missing-INSERTed and never checked: the locked
     // snapshot reports them as "no state yet", not as something measured.
     assert!(
-        locked.values().all(|state| state.is_none()),
+        locked.values().all(std::option::Option::is_none),
         "never-checked rows map to None"
     );
     Ok(())
