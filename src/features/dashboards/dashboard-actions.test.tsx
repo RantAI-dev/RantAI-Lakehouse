@@ -46,3 +46,44 @@ describe("DashboardActionsMenu auto-refresh", () => {
     expect(onAutoSec).toHaveBeenCalledWith("600")
   })
 })
+
+describe("DashboardActionsMenu theme and font", () => {
+  it("offers Theme and font on a user dashboard and not on the built-in one", async () => {
+    const onTheme = mock(() => {})
+    renderMenu({ onTheme })
+    fireEvent.click(await screen.findByText("Theme and font…"))
+    expect(onTheme).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ isDefault: true, onTheme })
+    await screen.findByText("Manual")
+    expect(screen.queryByText("Theme and font…")).toBeNull()
+  })
+})
+
+describe("DashboardActionsMenu history and personal space", () => {
+  it("offers the version history on a user dashboard and not on the built-in one", async () => {
+    const onHistory = mock(() => {})
+    renderMenu({ onHistory })
+    fireEvent.click(await screen.findByText("Version history…"))
+    expect(onHistory).toHaveBeenCalledTimes(1)
+    cleanup()
+    renderMenu({ isDefault: true, onHistory })
+    await screen.findByText("Manual")
+    expect(screen.queryByText("Version history…")).toBeNull()
+  })
+
+  it("disables Share on a private dashboard and says why", async () => {
+    const onShare = mock(() => {})
+    renderMenu({ isPrivate: true, onShare })
+    const share = await screen.findByText("Share…")
+    fireEvent.click(share)
+    expect(onShare).not.toHaveBeenCalled()
+  })
+
+  it("keeps Share working on a shared dashboard", async () => {
+    const onShare = mock(() => {})
+    renderMenu({ isPrivate: false, onShare })
+    fireEvent.click(await screen.findByText("Share…"))
+    expect(onShare).toHaveBeenCalledTimes(1)
+  })
+})

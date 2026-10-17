@@ -9,8 +9,12 @@
 
 /* ─────────────────────────────────────────────
    Light Mode (default)
+   `.theme-light` re-applies these tokens to one subtree inside a dark page
+   (a dashboard fixed to light, BI-17 part A); it is not part of the shared
+   design system upstream.
 ───────────────────────────────────────────── */
-:root {
+:root,
+.theme-light {
   /* Surfaces */
   --background:         oklch(1 0 0);
   --foreground:         oklch(0.148 0.004 228.8);

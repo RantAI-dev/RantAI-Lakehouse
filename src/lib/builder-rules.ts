@@ -3,6 +3,7 @@ import { takesBin, takesOther, takesSteps } from "./chart-shape"
 import { takesLayers } from "./chart-layers"
 import { kindHasClickValue } from "./chart-click"
 import type { ChartKind } from "./dashboard-specs"
+import { isStaticKind } from "./dashboard-tabs"
 
 /**
  * Which sections and controls of the chart builder apply to the chosen kind
@@ -33,12 +34,14 @@ export type BuilderState = {
   limitHasEffect: boolean
   /** A data source is chosen (or a new SQL source is being written). */
   hasSource: boolean
+  /** A category column is chosen: a bullet graph then has one bullet per category and a limit (BI-16 part B). */
+  hasDimension?: boolean
 }
 
 export type SortControl = "choice" | "by-date" | "by-category" | "none"
 
 export type BuilderRules = {
-  /** The four sections; a text note has none of them (title and content only). */
+  /** The four sections; a static kind (text note, heading, divider, section) has none of them (title and content only). */
   sections: { data: boolean; show: boolean; sortAndFilter: boolean; moreOptions: boolean }
   sort: SortControl
   limit: boolean
@@ -57,14 +60,17 @@ export type BuilderRules = {
 }
 
 const LINE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
-const SINGLE_KINDS = ["kpi", "gauge"]
+// BI-16 part B: a progress bar is one row like a KPI; a histogram counts per range in range order, so neither sorts nor limits.
+const SINGLE_KINDS = ["kpi", "gauge", "progress", "histogram"]
 const POINT_KINDS = ["pointmap", "geoheat"]
 
 export function builderRules(s: BuilderState): BuilderRules {
-  const text = s.kind === "text"
+  // BI-18 part C: heading, divider and section are static like a text note (title and content only, no data).
+  const text = isStaticKind(s.kind)
   const ownColumns = s.kind === "pivot" || (s.kind === "table" && s.rowsMode)
   const noSortOrLimit = text || SINGLE_KINDS.includes(s.kind) || POINT_KINDS.includes(s.kind) || ownColumns
-  const sort: SortControl = noSortOrLimit ? "none" : s.kind === "boxplot" ? "by-category" : s.kind === "calendar" ? "by-date" : "choice"
+  // A bullet graph keeps its default order (the largest values first); only its limit is the person's.
+  const sort: SortControl = noSortOrLimit || s.kind === "bullet" ? "none" : s.kind === "boxplot" ? "by-category" : s.kind === "calendar" ? "by-date" : "choice"
   const otherApplies = takesOther(s.kind, s.rowsMode) && !s.grained && !s.multiGrouped && s.limitHasEffect
   const stepsApply = takesSteps(s.kind, s.rowsMode)
   const layersApply = takesLayers(s.kind) && !s.rowsMode
@@ -77,7 +83,7 @@ export function builderRules(s: BuilderState): BuilderRules {
   return {
     sections: { data: !text, show: !text, sortAndFilter: !text, moreOptions: !text },
     sort,
-    limit: !noSortOrLimit && s.limitHasEffect,
+    limit: !noSortOrLimit && s.limitHasEffect && (s.kind !== "bullet" || !!s.hasDimension),
     filters: !text,
     other: { shown: !text && otherApplies, disabled: otherBlocked, hint },
     steps: stepsApply && !s.grained && !s.breakdown && !s.other && s.layers === 0,
@@ -95,7 +101,6 @@ export function builderRules(s: BuilderState): BuilderRules {
 export type MoreOptionsUse = {
   steps: number
   layers: number
-  referenceLines: number
   /** A click that replaces the drill menu. */
   click: boolean
   /** Column formats of a grouped table. */
@@ -105,7 +110,7 @@ export type MoreOptionsUse = {
 }
 
 export function moreOptionsUsed(u: MoreOptionsUse): boolean {
-  return u.steps > 0 || u.layers > 0 || u.referenceLines > 0 || u.click || u.columnSettings > 0 || u.compare
+  return u.steps > 0 || u.layers > 0 || u.click || u.columnSettings > 0 || u.compare
 }
 
 /**

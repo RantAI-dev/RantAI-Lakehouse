@@ -60,7 +60,11 @@ export function dropInertFilters(filters: FilterDef[]): FilterDef[] {
 function canonical(f: FilterDef): FilterDef {
   const op = opOf(f)
   const base = { column: f.column, values: [] as string[] }
-  const required = f.required ? { required: true } : {}
+  // BI-18 part C: the tie to tabs travels with the filter (address and saved default).
+  const required = {
+    ...(f.required ? { required: true } : {}),
+    ...(f.tabs?.length ? { tabs: [...f.tabs].sort() } : {}),
+  }
   switch (op) {
     case "in":
       return { ...base, values: [...f.values].sort(), ...required }
@@ -134,6 +138,10 @@ function asFilter(raw: unknown): FilterDef | null {
   if (r.maxExclusive === true) f.maxExclusive = true
   if (r.required === true) f.required = true
   if (str(r.text) !== undefined) f.text = str(r.text)
+  if (Array.isArray(r.tabs)) {
+    const ties = r.tabs.filter((t): t is string => typeof t === "string")
+    if (ties.length) f.tabs = ties
+  }
   return f
 }
 

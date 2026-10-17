@@ -174,6 +174,7 @@ async fn run() -> anyhow::Result<()> {
     // hour). Without a Postgres pool it logs once and spawns nothing —
     // cleanup depends on the database being reachable.
     spawn_auth_cleanup(&state);
+    spawn_trash_sweep(&state);
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
@@ -870,6 +871,42 @@ fn spawn_auth_cleanup(state: &AppState) {
         loop {
             interval.tick().await;
             run().await;
+        }
+    });
+}
+
+/// Spawn the background task that removes dashboards and charts that have been
+/// in the trash for more than 30 days (`BI-18` part C, part 2). Runs once at
+/// start and then every hour, like [`spawn_auth_cleanup`] (missed ticks
+/// skipped), on the API's own runtime: the dashboards live in `ClickHouse`, so
+/// no Postgres pool is needed and every replica may run it (the removal is
+/// idempotent).
+///
+/// Fail closed: `lakehouse_bi::trash::purge_expired` reads the expired ids
+/// before it writes anything, so a sweep that cannot read deletes nothing; the
+/// error is logged under a reference and the next tick tries again. An error
+/// never takes the process down.
+fn spawn_trash_sweep(state: &AppState) {
+    let ch = state.clickhouse.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match lakehouse_bi::trash::purge_expired(&ch).await {
+                Ok(purged) if purged.boards + purged.charts > 0 => {
+                    tracing::info!(
+                        boards = purged.boards,
+                        charts = purged.charts,
+                        "dashboard trash sweep removed expired items",
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+                    tracing::warn!("dashboard trash sweep could not run; nothing was deleted");
+                }
+            }
         }
     });
 }

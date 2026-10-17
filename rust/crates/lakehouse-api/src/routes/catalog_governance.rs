@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
 
 use crate::policy_engine::PolicyCondition;
+use crate::routes::dashboard_organise::viewer_of;
 use crate::routes::governance::observed_quality;
 use crate::routes::quality::{LatestRun, latest_runs, threshold_hint};
 use crate::state::AppState;
@@ -213,14 +214,20 @@ pub(crate) async fn dependents(
         }
     }
     if principal.has("dashboard:read") {
-        out.extend(dashboard_dependents(state, tables).await);
+        out.extend(dashboard_dependents(state, tables, &viewer_of(principal)).await);
     }
     out
 }
 
-async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value> {
+async fn dashboard_dependents(
+    state: &AppState,
+    tables: &[String],
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Vec<Value> {
     let ch = &state.clickhouse;
-    let charts = match lakehouse_bi::store::list_stored_charts(ch).await {
+    // BI-18 part C, part 2: a dashboard in somebody's personal space is not
+    // listed as reading the table.
+    let charts = match lakehouse_bi::store::list_stored_charts(ch, viewer).await {
         Ok(charts) => charts,
         Err(err) => {
             tracing::warn!(?err, "catalog detail: dashboard charts unavailable");
@@ -251,7 +258,7 @@ async fn dashboard_dependents(state: &AppState, tables: &[String]) -> Vec<Value>
     if boards.is_empty() {
         return Vec::new();
     }
-    let names: HashMap<String, String> = match lakehouse_bi::store::list_boards(ch).await {
+    let names: HashMap<String, String> = match lakehouse_bi::store::list_boards(ch, viewer).await {
         Ok(list) => list.into_iter().map(|b| (b.id, b.name)).collect(),
         Err(err) => {
             tracing::warn!(?err, "catalog detail: dashboard names unavailable");

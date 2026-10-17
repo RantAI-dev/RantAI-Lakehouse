@@ -430,6 +430,10 @@ struct EntryBody {
     /// it where it would show the identifier. Empty when the metric has none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     label: String,
+    /// `BI-17` (D4): the metric's format hint, so a tile can use it as the
+    /// default format of the value. Empty when the metric has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    format: String,
     /// The date column and default grain of the metric's comparisons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_column: Option<String>,
@@ -459,6 +463,7 @@ pub fn entry_of_metric(def: &MetricDef, expanded: Result<Vec<FilterDef>, String>
             filters,
             error,
             label: def.label.trim().to_owned(),
+            format: def.format.clone().unwrap_or_default(),
             time_column: def.time_column.clone(),
             grain: def.grain.clone(),
         }),
@@ -467,6 +472,19 @@ pub fn entry_of_metric(def: &MetricDef, expanded: Result<Vec<FilterDef>, String>
         created_by: def.created_by.clone(),
         updated_at: def.updated_at.clone(),
     }
+}
+
+/// The format hint a metric's catalog entry carries; `None` when it has none
+/// or is not a metric entry.
+#[must_use]
+pub fn entry_format(entry: &FieldDef) -> Option<String> {
+    if !entry.is_metric() {
+        return None;
+    }
+    serde_json::from_str::<EntryBody>(&entry.formula)
+        .ok()
+        .map(|b| b.format)
+        .filter(|f| !f.is_empty())
 }
 
 /// The label a metric's catalog entry carries; `None` when it has none or is
@@ -702,6 +720,8 @@ pub fn value_chart(q: &ValueQuery<'_>) -> crate::store::StoredChartSpec {
             layer_query: true,
             ..crate::shape::ShapeFields::default()
         },
+        style: crate::style::StyleFields::default(),
+        types: Box::default(),
     };
     StoredChartSpec {
         spec: ChartSpec {
@@ -1168,6 +1188,20 @@ mod tests {
         let healed = catalog.metric_labels(&bare.def, Some(&c));
         assert_eq!(healed.len(), 1, "{healed:?}");
         assert_eq!(healed["total"], "Total visitors");
+    }
+
+    /// `BI-17` (D4): the tile carries each metric's format hint, and a metric
+    /// with none is left out.
+    #[test]
+    fn the_tile_carries_the_format_hint_of_each_metric_that_has_one() {
+        let mut shaped = metric("total", "Sum(v)", vec![]);
+        shaped.format = Some("percent".to_owned());
+        let plain = metric("w_sum", "Sum(w)", vec![]);
+        let catalog = FieldCatalog::from_fields(catalog_entries(&[shaped, plain], &[]));
+        let marked = chart_of_metrics(json!([{ "metric": "total" }, { "metric": "w_sum" }, "v"]));
+        let formats = catalog.metric_formats(&marked.def, None);
+        assert_eq!(formats.len(), 1, "{formats:?}");
+        assert_eq!(formats["total"], "percent");
     }
 
     #[test]

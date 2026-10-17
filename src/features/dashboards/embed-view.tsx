@@ -1,24 +1,32 @@
 "use client";
 
+import type { ReportingContext } from "@/lib/time-grain";
 import * as React from "react";
 import { useTheme } from "next-themes";
+import { cn } from "@/lib/utils";
+import { dashboardLook } from "@/lib/dashboard-look";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { ReportingProvider } from "./reporting-context";
 import { TileBody } from "./tile-body";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import { selectedTab } from "@/lib/dashboard-tabs";
+import type { BoardTab, LayoutMap, PhoneTile } from "@/services/clients/bi-store";
+import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
-  board: { id: string; name: string };
+  board: { id: string; name: string; theme?: string; font?: string };
   layout: LayoutMap;
+  /** BI-18 part C: only when the board has them. */
+  tabs?: BoardTab[];
+  phoneLayout?: PhoneTile[];
   charts: (ChartRenderSpec & { text?: string; caption?: string })[];
   results: Record<string, Cell>;
-  /** The zone and first weekday the buckets were cut with (BI-9). */
-  reporting?: { timeZone: string; weekStart: string };
+  /** The zone and first weekday the buckets were cut with (BI-9), and the formatting settings (BI-17). */
+  reporting?: ReportingContext;
 };
 
 /**
@@ -30,8 +38,12 @@ type Payload = {
  */
 export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: string; chartId?: string }) {
   const { resolvedTheme } = useTheme();
-  const dark = resolvedTheme === "dark";
+  const appDark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
+  // BI-17 part A (D13): the dashboard's own theme and font apply in an embed too.
+  const look = dashboardLook(data?.board, appDark, data?.reporting?.fonts);
+  const dark = look.dark;
+  const [tabId, setTabId] = React.useState<string | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
   // SEC-12: what a refused signed token reads. The public link keeps the
   // plain line.
@@ -78,6 +90,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   }
 
   const charts = data?.charts ?? [];
+  const tab = selectedTab(data?.tabs ?? [], tabId);
 
   // ── Mode: a single chart fills the iframe ──────────────────────────────────
   if (chartId) {
@@ -87,7 +100,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     }
     return (
       <ReportingProvider reporting={data?.reporting}>
-      <div className="flex h-screen flex-col overflow-hidden bg-transparent p-2">
+      <div className={cn("flex h-screen flex-col overflow-hidden bg-transparent p-2", look.className)} style={look.style}>
         <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card">
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
             <p className="min-w-0 flex-1 truncate text-sm font-semibold">{spec?.title ?? "…"}</p>
@@ -110,6 +123,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   // ── Mode: the whole dashboard ──────────────────────────────────────────────
   const items: GridItem[] = charts.map((spec) => ({
     id: spec.id,
+    kind: spec.kind,
     title: spec.title,
     badge: <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{spec.kind}</span>,
     // BI-6: the chart's own filters, listed (the viewer cannot change them).
@@ -119,7 +133,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
 
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className="min-h-screen bg-transparent p-2">
+    <div className={cn("min-h-screen bg-transparent p-2", look.className)} style={look.style}>
       {state === "loading" ? (
         <div className="grid gap-3 sm:grid-cols-2">
           {[0, 1, 2, 3].map((i) => <div key={i} className="h-40 animate-pulse rounded-xl bg-muted/50" />)}
@@ -127,7 +141,11 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
       ) : items.length === 0 ? (
         <div className="grid h-40 place-content-center text-sm text-muted-foreground">No charts.</div>
       ) : (
-        <DashboardGrid items={items} layout={data?.layout ?? {}} editable={false} onLayoutChange={() => {}} />
+        <>
+          <TabBar tabs={data?.tabs ?? []} selected={tab} onSelect={setTabId} />
+          <DashboardGrid items={items} layout={data?.layout ?? {}} editable={false} onLayoutChange={() => {}}
+            tabs={data?.tabs} tab={tab} phone={data?.phoneLayout} foldKey={data?.board.id} />
+        </>
       )}
     </div>
     </ReportingProvider>

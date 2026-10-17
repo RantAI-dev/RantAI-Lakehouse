@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
-  columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload,
+  columnSwitchParams, limitParam, normalizeDef, paramsDiffer, paramsQuery, readParamsParam, refLinesFromDef, refLinesPayload, isComputedLine,
   savedParamsBody, slotParam, slotText, withParamsParam, withValue, type ParamControl, type ParamDef,
 } from "./params"
 
@@ -71,4 +71,19 @@ test("reference lines round trip, and a row with neither a number nor a paramete
   assert.deepEqual(refLinesPayload([{ value: "", param: "", label: "x" }, { value: "abc", param: "", label: "" }]), [])
   const six = Array.from({ length: 6 }, (_, i) => ({ value: String(i), param: "", label: "" }))
   assert.equal(refLinesPayload(six).length, 5)
+})
+
+test("computed lines and bands round trip, and a computed line carries no value", () => {
+  const lines = [
+    { kind: "average", color: "#112233" },
+    { kind: "trend", measure: "visitors", label: "Trend" },
+    { kind: "band", value: 1, to: { param: "hi" }, label: "Normal" },
+    { value: 5 },
+  ]
+  assert.deepEqual(refLinesPayload(refLinesFromDef(lines)), lines)
+  // A band with one edge missing, and an old line without a kind, behave.
+  assert.deepEqual(refLinesPayload([{ value: "1", param: "", label: "", kind: "band", to: "" }]), [])
+  assert.deepEqual(refLinesPayload([{ value: "2", param: "", label: "" }]), [{ value: 2 }])
+  assert.equal(isComputedLine("median"), true)
+  assert.equal(isComputedLine("band"), false)
 })

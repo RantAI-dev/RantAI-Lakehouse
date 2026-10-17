@@ -4,10 +4,16 @@ import type {
   DashboardFolder,
   DashboardService,
   JoinSuggestions,
+  RestoredItem,
+  RevertResult,
   SaveSqlSourceInput,
+  ShortcutItem,
+  Shortcuts,
   SqlSource,
   SqlSourcePreview,
+  TrashList,
   UpdateBoardInput,
+  VersionHistory,
 } from "../contracts/dashboards"
 import type { EmbedInfo } from "../contracts/dashboards"
 import { apiFetch } from "../http"
@@ -258,5 +264,75 @@ export const clickhouseDashboardService: DashboardService = {
       "The token could not be withdrawn"
     )
     return json.withdrawn ?? ""
+  },
+
+  // BI-18 part C, part 2. The server's sentences are fixed and ours (a revert
+  // that cannot be done says which chart and why), so they are shown as they come.
+  async listVersions(board, signal) {
+    return request<VersionHistory>(
+      `/api/dashboard/versions?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "Version history could not be loaded"
+    )
+  },
+  async revertToVersion(board, version, signal) {
+    return request<RevertResult>(
+      "/api/dashboard/versions/revert",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ board, version }), signal },
+      "That version could not be restored"
+    )
+  },
+  async listTrash(signal) {
+    return request<TrashList>(
+      "/api/dashboard/trash",
+      { cache: "no-store", signal },
+      "The trash could not be loaded"
+    )
+  },
+  async restoreFromTrash(kind, id, signal) {
+    const json = await request<{ restored: RestoredItem }>(
+      "/api/dashboard/trash/restore",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "It could not be restored"
+    )
+    return json.restored
+  },
+  async ensurePersonalSpace(signal) {
+    const json = await request<{ folder: DashboardFolder }>(
+      "/api/dashboard/personal",
+      { method: "POST", signal },
+      "The personal space could not be opened"
+    )
+    return json.folder
+  },
+  async shortcuts(signal) {
+    const json = await request<Partial<Shortcuts>>(
+      "/api/dashboard/shortcuts",
+      { cache: "no-store", signal },
+      "Favourites could not be loaded"
+    )
+    return { favourites: json.favourites ?? [], recent: json.recent ?? [] }
+  },
+  async setFavourite(kind, id, on, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/favourites",
+      { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ kind, id, on }), signal },
+      "The favourite could not be saved"
+    )
+  },
+  async touchRecent(kind, id, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/recent",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "Recent items could not be saved"
+    )
+  },
+  async searchItems(text, signal): Promise<ShortcutItem[]> {
+    const json = await request<{ hits?: ShortcutItem[] }>(
+      `/api/dashboard/search?q=${encodeURIComponent(text)}`,
+      { cache: "no-store", signal },
+      "Search is unavailable"
+    )
+    return json.hits ?? []
   },
 }

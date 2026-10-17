@@ -476,6 +476,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    // BI-18 part C, part 2: the personal space is created on first use (writing
+    // is what makes a dashboard to put in it); history and the trash are read
+    // with the dashboard, and going back or restoring edit it, so they need the
+    // permission that edits and deletes. Favourites and recent items are the
+    // caller's own preferences, never an edit of a dashboard: `dashboard:read`.
+    ("POST",   "/api/dashboard/personal",        Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/versions",        Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/versions/revert", Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/trash",           Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/trash/restore",   Policy::RequiresPermission("dashboard:write")),
+    ("GET",    "/api/dashboard/shortcuts",       Policy::RequiresPermission("dashboard:read")),
+    ("PUT",    "/api/dashboard/favourites",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/recent",          Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/dashboard/search",          Policy::RequiresPermission("dashboard:read")),
     // Dashboard SQL sources: listing is a read; authoring and previewing
     // arbitrary SQL is its own permission, separate from dashboard:write
     // (plan §1, the Metabase "native query" split).

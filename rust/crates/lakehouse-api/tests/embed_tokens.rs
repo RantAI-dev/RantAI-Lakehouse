@@ -87,7 +87,9 @@ impl FakeCh {
     fn inserts_into_board(&self) -> Vec<String> {
         self.statements()
             .into_iter()
-            .filter(|s| s.starts_with("INSERT INTO console.bi_board"))
+            // The board table only: a content edit also writes a row of
+            // `bi_board_version` (BI-18 part C, part 2), whose name starts the same.
+            .filter(|s| s.starts_with("INSERT INTO console.bi_board ("))
             .collect()
     }
 
@@ -109,7 +111,25 @@ impl Respond for FakeCh {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
-        if sql.contains("FROM console.bi_board") {
+        // The state lookup every board edit makes first (BI-18 part C, part 2):
+        // live, and nobody's personal board.
+        if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
+            let found: Vec<Value> = self
+                .boards
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| {
+                    let id = b["id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("WHERE id = '{id}'"))
+                })
+                .map(|b| json!({ "is_deleted": 0, "owner_id": b["owner_id"].as_str().unwrap_or("") }))
+                .collect();
+            return rows(found);
+        }
+        // A chart read names the boards table too (its sub-selects), so it is
+        // not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             let found: Vec<Value> = self
                 .boards
                 .lock()

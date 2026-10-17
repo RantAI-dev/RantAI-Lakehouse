@@ -1,5 +1,6 @@
 "use client";
 
+import { isStaticKind } from "@/lib/dashboard-tabs";
 import * as React from "react";
 import Link from "next/link";
 import { useTheme } from "next-themes";
@@ -64,7 +65,7 @@ export function DashboardPreview({
       return box ? box.y * 100 + box.x : Number.MAX_SAFE_INTEGER;
     };
     const candidates = [...(state.data?.charts ?? [])]
-      .filter((c) => c.kind !== "text")
+      .filter((c) => !isStaticKind(c.kind))
       .sort((a, b) => order(a.id) - order(b.id));
     const visual = candidates.filter((c) => c.kind !== "table");
     return (visual.length > 0 ? visual : candidates).slice(0, limit);

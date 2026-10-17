@@ -33,7 +33,7 @@ use crate::sql_rewrite::{
 const VISITS: &str = "serving.mart_demo_map_points";
 const NAME: &str = "mart_demo_map_points";
 
-struct Governed {
+pub(super) struct Governed {
     label: &'static str,
     mask: &'static [&'static str],
     row_filter: &'static str,
@@ -65,7 +65,7 @@ impl ObligationsSource for Governed {
     }
 }
 
-fn only_jakarta() -> Governed {
+pub(super) fn only_jakarta() -> Governed {
     Governed {
         label: "row-filter",
         mask: &["place"],
@@ -73,7 +73,7 @@ fn only_jakarta() -> Governed {
     }
 }
 
-fn masks_the_binned_column() -> Governed {
+pub(super) fn masks_the_binned_column() -> Governed {
     Governed {
         label: "mask-visitors",
         mask: &["visitors"],
@@ -100,7 +100,7 @@ fn columns() -> HashMap<String, RelationColumns> {
 
 /// A stored chart on the demo visits table: `extra` laid over a bar chart that
 /// counts rows by the binned `visitors`.
-fn chart(extra: &serde_json::Value) -> StoredChartSpec {
+pub(super) fn chart(extra: &serde_json::Value) -> StoredChartSpec {
     let mut def = serde_json::json!({
         "title": "t", "kind": "bar", "mart": NAME,
         "dimension": "visitors", "measures": ["lat"], "aggregate": "count",
@@ -151,12 +151,12 @@ fn reads_of(sql: &str) -> usize {
         .count()
 }
 
-fn built(chart: &StoredChartSpec, dashboard: &[FilterDef]) -> FilteredSql {
+pub(super) fn built(chart: &StoredChartSpec, dashboard: &[FilterDef]) -> FilteredSql {
     let time = TimeContext::default();
     sql_with_filters_report(chart, &[], dashboard, &columns(), &ReadContext::new(&time))
 }
 
-fn rewrite(label: &str, sql: &str, policy: &Governed) -> String {
+pub(super) fn rewrite(label: &str, sql: &str, policy: &Governed) -> String {
     let label = format!("{label} [{}]", policy.label);
     append("BIN_STATEMENTS_OUT", &label, sql);
     let out = enforce(
@@ -191,7 +191,12 @@ fn rewrite(label: &str, sql: &str, policy: &Governed) -> String {
 }
 
 /// The tile statement and every width statement of `chart`, rewritten.
-fn governed(label: &str, chart: &StoredChartSpec, dashboard: &[FilterDef], policy: &Governed) {
+pub(super) fn governed(
+    label: &str,
+    chart: &StoredChartSpec,
+    dashboard: &[FilterDef],
+    policy: &Governed,
+) {
     let got = built(chart, dashboard);
     rewrite(label, &got.sql, policy);
     for (i, read) in got.bins.iter().enumerate() {
@@ -290,7 +295,7 @@ fn a_drilled_level_is_an_ordinary_governed_statement_and_keeps_the_saved_filters
     assert!(out.contains("provinsi IN ('Jawa Barat')"), "{out}");
 }
 
-fn dashboard_filter(json: &str) -> FilterDef {
+pub(super) fn dashboard_filter(json: &str) -> FilterDef {
     serde_json::from_str(json).unwrap()
 }
 
@@ -337,7 +342,7 @@ fn the_dashboards_filters_and_the_charts_own_filters_stay_under_the_bin_and_gove
 /// not, by where `recursive`'s stack checks happen to fall. A release build needs
 /// about 0.5 MiB. The test now runs where production runs, so it fails if the
 /// runtime's stack ever shrinks below what these statements need.
-fn on_worker_stack(body: impl FnOnce() + Send + 'static) {
+pub(super) fn on_worker_stack(body: impl FnOnce() + Send + 'static) {
     let handle = std::thread::Builder::new()
         .name("worker-stack".to_owned())
         .stack_size(crate::config::WORKER_STACK_BYTES)

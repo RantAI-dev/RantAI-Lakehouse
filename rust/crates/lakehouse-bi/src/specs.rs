@@ -67,12 +67,50 @@ pub enum ChartKind {
     Kpi,
     /// Single-number gauge tile.
     Gauge,
+    /// A value against a goal as a bar with the percentage reached
+    /// (`BI-16` part B).
+    Progress,
+    /// How many rows fall in each range of one number column
+    /// (`BI-16` part B).
+    Histogram,
+    /// A value, a target marker and up to three bands, for one value or one
+    /// per category (`BI-16` part B).
+    Bullet,
+    /// A picture from an allowed site (`BI-16` part B; no SQL).
+    Image,
+    /// A web page from an allowed site in a sandboxed frame (`BI-16` part B;
+    /// no SQL).
+    Web,
     /// Data table: the grouped summary, or (`tableMode: "rows"`) raw rows.
     Table,
     /// Pivot table: row and column fields, values, totals (`BI-16` part A).
     Pivot,
     /// Free-text markdown tile (no SQL).
     Text,
+    /// A one-line heading between tiles (`BI-18` part C; no SQL).
+    Heading,
+    /// A rule between tiles (`BI-18` part C; no SQL, no text).
+    Divider,
+    /// A heading that folds the tiles below it, up to the next section
+    /// header on the same tab (`BI-18` part C; no SQL).
+    Section,
+}
+
+impl ChartKind {
+    /// Whether the tile carries no data: it never has a statement, reads no
+    /// relation and takes no filter, so every path that builds or runs one
+    /// skips it. `text` was the only such kind before `BI-18` part C; the
+    /// section kinds (`heading`, `divider`, `section`) and the `image` and `web`
+    /// cards of `BI-16` part B join it, and a check
+    /// on this method replaces the old `== ChartKind::Text` so a new static
+    /// kind cannot reach a statement builder by being left out of one.
+    #[must_use]
+    pub fn is_static(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Heading | Self::Divider | Self::Section | Self::Image | Self::Web
+        )
+    }
 }
 
 /// Numeric display format for a chart or KPI value.

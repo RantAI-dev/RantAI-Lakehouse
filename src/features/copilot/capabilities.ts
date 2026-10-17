@@ -34,6 +34,10 @@ export const CAPABILITIES: Capability[] = [
     icon: BarChart3,
     write: true,
     tools: ["describe_mart", "suggest_join", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board",
+      // BI-17 part A / AI-8: formatting a chart and a dashboard's theme (named here or they never reach the model).
+      "format_chart", "set_dashboard_theme",
+      // BI-18 part C / AI-9: tabs (the composer sends this list as the allowlist, so a tool missing here never reaches the model).
+      "create_tab", "rename_tab", "move_charts_to_tab", "move_tab", "delete_tab",
       // BI-8 review fix (BLOCKER) R1: the composer sends this list as the allowlist of tools for the turn, so a tool missing here never reaches the model.
       "list_formula_functions", "list_calculated_fields", "validate_formula", "create_calculated_field", "update_calculated_field", "delete_calculated_field",
       // BI-10: value groups and hierarchies.

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  Check, Copy, Download, FileDown, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Save, Share2, Trash2,
+  Check, Copy, Download, FileDown, History, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,10 +19,16 @@ import { REFRESH_OPTIONS } from "@/lib/dashboard-refresh";
 
 /** The dashboard's ⋯ menu: refresh, view, auto-refresh, and board actions. */
 export function DashboardActionsMenu({
-  isDefault, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
+  isDefault, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
 }: {
   readonly isDefault: boolean;
+  /** In somebody's personal space: it cannot be shared until it is moved to a folder. */
+  readonly isPrivate?: boolean;
+  /** Opens the version history; the item is left out when absent. */
+  readonly onHistory?: () => void;
+  /** Opens "Theme and font…" (`BI-17`); the item is left out when absent. */
+  readonly onTheme?: () => void;
   readonly loading: boolean;
   readonly fullscreen: boolean;
   /** The interval in force, in seconds ("0" = manual). */
@@ -106,9 +112,31 @@ export function DashboardActionsMenu({
                 <Pencil className="size-4" /> Rename
               </DropdownMenuItem>
             )}
-            {!isDefault ? (
+            {!isDefault && isPrivate ? (
+              <Tooltip>
+                <TooltipTrigger render={<span className="block" />}>
+                  <DropdownMenuItem disabled>
+                    <Share2 className="size-4" /> Share…
+                  </DropdownMenuItem>
+                </TooltipTrigger>
+                <TooltipContent side="left" className="max-w-56">
+                  A dashboard in your personal space cannot be shared. Move it to a folder first.
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
+            {!isDefault && !isPrivate ? (
               <DropdownMenuItem onClick={onShare}>
                 <Share2 className="size-4" /> Share…
+              </DropdownMenuItem>
+            ) : null}
+            {!isDefault && onHistory ? (
+              <DropdownMenuItem onClick={onHistory}>
+                <History className="size-4" /> Version history…
+              </DropdownMenuItem>
+            ) : null}
+            {!isDefault && onTheme ? (
+              <DropdownMenuItem onClick={onTheme}>
+                <Palette className="size-4" /> Theme and font…
               </DropdownMenuItem>
             ) : null}
             <DropdownMenuItem onClick={onExportPdf}>

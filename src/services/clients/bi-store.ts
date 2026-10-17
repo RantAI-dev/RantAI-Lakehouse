@@ -1,5 +1,7 @@
 import type { ChartKind, ChartSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { TableDefFields } from "@/lib/table-types";
+import type { StyleFields } from "@/lib/chart-style";
+import type { TypeDefFields } from "@/lib/type-b";
 
 /**
  * Shared BI/dashboard types.
@@ -40,10 +42,20 @@ export type ChartInput = {
   text?: string; // markdown content (kind="text")
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
-} & TableDefFields; // raw tables, pivots and KPI comparisons (BI-16 part A)
+} & TableDefFields // raw tables, pivots and KPI comparisons (BI-16 part A)
+  & StyleFields // number formats, colours, axes, notes, conditional colours (BI-17 part A)
+  & TypeDefFields; // goal, bands, histogram ranges, address of an image or web card (BI-16 part B)
 
 /** Tile position on the grid canvas (12 columns). Key = chartId. */
-export type TileBox = { x: number; y: number; w: number; h: number };
+export type TileBox = {
+  x: number; y: number; w: number; h: number;
+  /** The tab this tile sits on (BI-18 part C). Absent: the first tab, or no tabs. */
+  tab?: string;
+};
+/** A tab of a dashboard (BI-18 part C); `id` is stable across renames. Mirrors `lakehouse_bi::layout::Tab`. */
+export type BoardTab = { id: string; title: string };
+/** A tile in the phone layout: its place in the one column and its height in rows. */
+export type PhoneTile = { id: string; h: number };
 export type LayoutMap = Record<string, TileBox>;
 /** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
 export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
@@ -77,6 +89,8 @@ export type FilterDef = {
   required?: boolean;
   /** BI-2: a reference to a saved segment of the chart's table, `{ column: "", values: [], segment }`; it stands for the segment's filters. */
   segment?: string;
+  /** BI-18 part C: the ids of the tabs this filter applies to. Absent or empty: every tab. */
+  tabs?: string[];
 };
 /** A column a filter can target, with how many tiles of the board have it. */
 export type FilterField = { column: string; kind: FilterKind | string; tiles: number };
@@ -103,13 +117,22 @@ export type Board = {
   createdBy?: string;
   /** Folder this board is filed in; empty or null = no folder. */
   folderId?: string | null;
+  /** The principal whose personal space holds this board (BI-18 part C, part 2); absent when it is shared. */
+  ownerId?: string;
   layout?: LayoutMap;
   filters?: FilterDef[];
+  /** BI-18 part C: absent when the dashboard has no tabs. */
+  tabs?: BoardTab[];
+  /** BI-18 part C: the order and heights of the tiles below 640 px, when an editor saved them. */
+  phoneLayout?: PhoneTile[];
   /**
    * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
    * 1800, 3600). Absent when none was saved; BI-18·B.
    */
   refreshSeconds?: number;
+  /** BI-17 part A: the dashboard's own theme (`light` or `dark`) and font id; absent follows the console. */
+  theme?: string;
+  font?: string;
   createdAt?: string;
   /**
    * Kapan board terakhir ditulis.

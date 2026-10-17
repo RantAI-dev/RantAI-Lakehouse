@@ -6,11 +6,13 @@ import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ErrorWithReference } from "@/components/error-reference";
 import { useService } from "@/hooks/use-service";
+import type { StyleFields } from "@/lib/chart-style";
+import { domainsOf } from "@/lib/conditional-format";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import { cn } from "@/lib/utils";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
-import { cellClass, CellValue, columnStyle } from "./table-cell";
+import { cellClass, CellValue, columnStyle, conditionalCss } from "./table-cell";
 import type { Rows } from "./tile-dialogs";
 import { fetchRecordsPage, hasNextPage, pageRange, splitReference, type RecordsPage, type RecordsRequest } from "./records";
 
@@ -21,7 +23,7 @@ type Sort = { column: string; dir: "asc" | "desc" };
  * `chart`: the tile's id when it has filters of its own (BI-6) or joined tables (BI-7), so a later page
  * or another sort lists the same relation the first page came from.
  */
-export type RawTableSpec = { mart: string; sqlSource?: string; title: string; def?: TableDefFields; chart?: string };
+export type RawTableSpec = { mart: string; sqlSource?: string; title: string; def?: TableDefFields & StyleFields; chart?: string };
 
 /** The sort the viewer chose, else the saved one. */
 function effectiveSort(chosen: Sort | null, def: TableDefFields | undefined): Sort | null {
@@ -66,7 +68,10 @@ export function RawTable({
   );
 
   const fetched = needsFetch ? state.data : null;
-  const rows = needsFetch ? fetched?.rows ?? [] : cell.rows;
+  const fetchedRows = fetched?.rows;
+  const rows = React.useMemo(() => (needsFetch ? fetchedRows ?? [] : cell.rows), [needsFetch, fetchedRows, cell.rows]);
+  // A colour range reads the minimum and maximum of the page on screen (decision 7).
+  const domains = React.useMemo(() => domainsOf(def?.conditional, rows), [def?.conditional, rows]);
   const total = fetched?.total ?? cell.total;
   const page: Pick<RecordsPage, "rows" | "total" | "offset"> | null =
     typeof total === "number" ? { rows, total, offset: needsFetch ? fetched?.offset ?? offset : 0 } : null;
@@ -112,7 +117,7 @@ export function RawTable({
             ) : rows.map((r, i) => (
               <tr key={i} className="border-b border-border/40 last:border-0">
                 {shown.map((c) => (
-                  <td key={c} style={columnStyle(settings[c])} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} /></td>
+                  <td key={c} style={{ ...columnStyle(settings[c]), ...conditionalCss(def?.conditional, c, r[c], domains) }} className={cellClass(settings[c])}><CellValue value={r[c]} setting={settings[c]} format={def?.valueFormats?.[c] ?? def?.format} /></td>
                 ))}
               </tr>
             ))}

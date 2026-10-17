@@ -48,6 +48,24 @@ describe("the dashboard capability against the server's tool list", () => {
     for (const name of wanted) expect(offered).toContain(name)
   })
 
+  // BI-18 part C / AI-9: the tab tools, named here or they never reach the model.
+  it("lists every tab tool the server has", () => {
+    const wanted = serverTools.filter((n) => /_tabs?(_|$)|_to_tab$/.test(n))
+    expect(wanted.sort()).toEqual(["create_tab", "delete_tab", "move_charts_to_tab", "move_tab", "rename_tab"])
+    const offered = toolsFromCaps(new Set(["dashboard"]), "build")
+    for (const name of wanted) expect(offered).toContain(name)
+    for (const name of wanted) expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(name)
+  })
+
+  // BI-17 part A / AI-8: the formatting tools.
+  it("lists the formatting tools the server has, to build mode only", () => {
+    const wanted = serverTools.filter((n) => n === "format_chart" || n === "set_dashboard_theme")
+    expect(wanted.sort()).toEqual(["format_chart", "set_dashboard_theme"])
+    const offered = toolsFromCaps(new Set(["dashboard"]), "build")
+    for (const name of wanted) expect(offered).toContain(name)
+    for (const name of wanted) expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(name)
+  })
+
   it("names no tool the server does not have", () => {
     for (const name of toolsFromCaps(new Set(["dashboard"]), "build")) expect(serverTools).toContain(name)
   })

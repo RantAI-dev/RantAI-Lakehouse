@@ -1,20 +1,15 @@
 "use client";
 
 import * as React from "react";
-import { GripVertical, MoreHorizontal } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuGroupLabel,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { settleLayout } from "@/lib/grid-layout";
 import { cn } from "@/lib/utils";
-import type { LayoutMap, TileBox } from "@/services/clients/bi-store";
+import { settleLayout } from "@/lib/grid-layout";
+import {
+  PHONE_MAX_WIDTH, collapseLayout, foldedTiles, phoneOrder, placeUnboxed, tabOf,
+} from "@/lib/dashboard-tabs";
+import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services/clients/bi-store";
+import { PhoneStack } from "./phone-stack";
+import { SectionTile, TileCard, isSectionKind } from "./tile-card";
+import { useFolded } from "./use-folded";
 
 export type TileMenuItem = {
   label: string;
@@ -29,6 +24,8 @@ export type GridItem = {
   id: string;
   /** Chart width chosen in the builder; `2` = full width. Only sizes a tile with no stored box yet. */
   span?: 1 | 2;
+  /** `heading`, `divider` and `section` are drawn without a card and fold (BI-18 part C); any other is a card. */
+  kind?: string;
   title: string;
   subtitle?: string;
   badge?: React.ReactNode;
@@ -43,29 +40,16 @@ export type GridItem = {
 const COLS = 12;
 const MARGIN = 12;
 const ROW_H = 44;
-const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
 /**
- * Ensure every item has a box; items without one get placed below, half
- * width (2 per row) or full width for `span: 2`. A stored layout that
- * already overlaps gets tidied up too.
+ * Ensure every item has a box; items without one get placed below by the one
+ * rule the server shares (`placeUnboxed`, BI-18 part C review fix (BLOCKER)
+ * R13: a row wraps by its tallest tile). A stored layout that already overlaps
+ * gets tidied up too. The page hands the grid the layout as shown, so on a
+ * board that was saved after R13 this only tidies.
  */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
-  const out: LayoutMap = {};
-  const ids = new Set(items.map((i) => i.id));
-  for (const [id, box] of Object.entries(layout)) if (ids.has(id)) out[id] = box;
-  let maxY = 0;
-  for (const b of Object.values(out)) maxY = Math.max(maxY, b.y + b.h);
-  let col = 0;
-  for (const it of items) {
-    if (out[it.id]) continue;
-    const w = it.span === 2 ? COLS : DEFAULT.w;
-    if (col + w > COLS) { col = 0; maxY += DEFAULT.h; }
-    out[it.id] = { x: col, y: maxY, w, h: DEFAULT.h };
-    col += w;
-    if (col >= COLS) { col = 0; maxY += DEFAULT.h; }
-  }
-  return settleLayout(out);
+  return settleLayout(placeUnboxed(items, layout, []));
 }
 
 type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: TileBox };
@@ -75,19 +59,32 @@ type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: 
  * Tableau-style. Custom-built (pointer events) — safe for React 19. In
  * `editable` mode, tiles can be moved and resized; changes are sent via
  * onLayoutChange.
+ *
+ * BI-18 part C: with `tabs` only the tiles of `tab` are drawn (a layout change
+ * is sent back whole, the other tabs' tiles untouched); a `section` tile folds
+ * the tiles below it (the viewer's own state, `foldKey`); and a canvas narrower
+ * than 640 px, or one in `phoneEdit`, is drawn as one full-width column
+ * (`PhoneStack`) in the order of the phone layout, else the reading order.
  */
 export function DashboardGrid({
-  items, layout, editable, onLayoutChange,
+  items, layout, editable, onLayoutChange, tabs, tab, phone, phoneEdit, onPhoneChange, foldKey,
 }: {
   items: GridItem[];
   layout: LayoutMap;
   editable: boolean;
   onLayoutChange: (next: LayoutMap) => void;
+  tabs?: BoardTab[];
+  tab?: string;
+  phone?: PhoneTile[];
+  phoneEdit?: boolean;
+  onPhoneChange?: (next: PhoneTile[]) => void;
+  foldKey?: string;
 }) {
   const ref = React.useRef<HTMLDivElement>(null);
   const [width, setWidth] = React.useState(0);
   const [drag, setDrag] = React.useState<Drag | null>(null);
   const [preview, setPreview] = React.useState<LayoutMap | null>(null);
+  const [folded, toggleFold] = useFolded(foldKey);
 
   // Measure width IMMEDIATELY (useLayoutEffect) so tiles don't collapse on the
   // first render, plus a ResizeObserver for width changes.
@@ -101,8 +98,29 @@ export function DashboardGrid({
     return () => ro.disconnect();
   }, []);
 
-  const base = React.useMemo(() => resolve(items, layout), [items, layout]);
+  const tabbed = Boolean(tabs?.length && tab);
+  const shown = React.useMemo(
+    () => (tabbed ? items.filter((it) => tabOf(tabs ?? [], layout, it.id) === tab) : items),
+    [tabbed, items, tabs, layout, tab],
+  );
+  const base = React.useMemo(() => resolve(shown, layout), [shown, layout]);
   const view = preview ?? base;
+
+  // A layout change goes up whole: this tab's tiles stamped with the tab, and
+  // every other tab's tiles as they were.
+  const emit = (next: LayoutMap) => {
+    if (!tabbed) { onLayoutChange(next); return; }
+    const mine = new Set(shown.map((i) => i.id));
+    const out: LayoutMap = {};
+    for (const [id, box] of Object.entries(layout)) if (!mine.has(id)) out[id] = box;
+    for (const [id, box] of Object.entries(next)) out[id] = { ...box, tab };
+    onLayoutChange(out);
+  };
+
+  const stacked = phoneEdit || (width > 0 && width < PHONE_MAX_WIDTH);
+  const kinds = React.useMemo(() => shown.map((i) => ({ id: i.id, kind: i.kind ?? "" })), [shown]);
+  // Edit mode shows everything; folding is for reading.
+  const folding = !editable && !phoneEdit;
 
   // Margin hanya menjadi gap ANTAR kolom/baris. Kanvas tidak menambahkan
   // inset luar agar tepi tile sejajar dengan KPI dan konten dashboard lain.
@@ -117,7 +135,30 @@ export function DashboardGrid({
     height: b.h * ROW_H + (b.h - 1) * MARGIN,
   });
 
-  const maxY = Math.max(0, ...Object.values(view).map((b) => b.y + b.h));
+  if (stacked) {
+    const ordered = phoneOrder(shown.map((i) => i.id), base, phone);
+    // Folding follows the column's own order: a section folds what comes after it there.
+    const column: LayoutMap = {};
+    ordered.forEach((p, i) => { column[p.id] = { x: 0, y: i, w: 12, h: 1 }; });
+    const hidden = folding ? foldedTiles(kinds, column, folded) : new Set<string>();
+    return (
+      <div ref={ref} className="w-full">
+        <PhoneStack
+          items={shown}
+          order={ordered.filter((p) => !hidden.has(p.id))}
+          editing={Boolean(phoneEdit)}
+          folded={folded}
+          onToggleFold={toggleFold}
+          onChange={onPhoneChange}
+        />
+      </div>
+    );
+  }
+
+  const hiddenIds = folding ? foldedTiles(kinds, view, folded) : new Set<string>();
+  const drawn = hiddenIds.size ? collapseLayout(view, kinds, hiddenIds) : view;
+
+  const maxY = Math.max(0, ...Object.values(drawn).map((b) => b.y + b.h));
   const canvasH = maxY > 0
     ? maxY * ROW_H + (maxY - 1) * MARGIN + (editable ? unitY : 0)
     : 0;
@@ -129,6 +170,7 @@ export function DashboardGrid({
     e.preventDefault();
     const startBox = base[id];
     if (!startBox) return;
+    const minH = isSectionKind(shown.find((i) => i.id === id)?.kind) ? 1 : 3;
     const px = e.clientX, py = e.clientY;
     setDrag({ id, mode, px, py, box: startBox });
     let last: LayoutMap = base;
@@ -137,8 +179,8 @@ export function DashboardGrid({
       const dRows = Math.round((ev.clientY - py) / unitY);
       const b = startBox;
       const nb: TileBox = mode === "move"
-        ? { x: Math.min(Math.max(0, b.x + dCols), COLS - b.w), y: Math.max(0, b.y + dRows), w: b.w, h: b.h }
-        : { x: b.x, y: b.y, w: Math.min(Math.max(2, b.w + dCols), COLS - b.x), h: Math.max(3, b.h + dRows) };
+        ? { ...b, x: Math.min(Math.max(0, b.x + dCols), COLS - b.w), y: Math.max(0, b.y + dRows) }
+        : { ...b, w: Math.min(Math.max(2, b.w + dCols), COLS - b.x), h: Math.max(minH, b.h + dRows) };
       // Tile yang ditabrak turun ke bawah, jadi tidak ada yang tertimpa.
       last = settleLayout({ ...base, [id]: nb }, id);
       setPreview(last);
@@ -148,7 +190,7 @@ export function DashboardGrid({
       window.removeEventListener("pointerup", up);
       setPreview(null);
       setDrag(null);
-      onLayoutChange(last);
+      emit(last);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -167,66 +209,18 @@ export function DashboardGrid({
           }}
         />
       ) : null}
-      {items.map((it) => {
-        const b = view[it.id];
+      {shown.map((it) => {
+        const b = drawn[it.id];
         if (!b) return null;
         const dragging = drag?.id === it.id;
+        const onMove = editable ? (e: React.PointerEvent) => startDrag(e, it.id, "move") : undefined;
         return (
           <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
-            <div className={cn("flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", dragging && "ring-2 ring-primary/40")}>
-              {/* Header / drag handle */}
-              <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", editable && "cursor-move select-none bg-muted/40")}
-                   style={editable ? { touchAction: "none" } : undefined}
-                   onPointerDown={editable ? (e) => startDrag(e, it.id, "move") : undefined}>
-                {editable ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
-                <div className="min-w-0 flex-1">
-                  <p className="flex items-center gap-1.5 truncate text-sm font-semibold leading-tight">
-                    <span className="truncate">{it.title}</span>
-                    {it.hint}
-                  </p>
-                  {it.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{it.subtitle}</p> : null}
-                </div>
-                {it.badge}
-                {it.menu?.length ? (
-                  <div className="print:hidden" onPointerDown={(e) => e.stopPropagation()}>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger
-                        render={
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-7 text-muted-foreground hover:text-foreground"
-                            aria-label={`Actions for ${it.title}`}
-                          />
-                        }
-                      >
-                        <MoreHorizontal className="size-4" />
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-48">
-                        {it.menuLabel ? (
-                          <DropdownMenuGroup>
-                            <DropdownMenuGroupLabel className="truncate font-mono text-[11px] font-normal">
-                              {it.menuLabel}
-                            </DropdownMenuGroupLabel>
-                          </DropdownMenuGroup>
-                        ) : null}
-                        {it.menu.map((m, i) => (
-                          <React.Fragment key={m.label}>
-                            {m.separatorBefore && i > 0 ? <DropdownMenuSeparator /> : null}
-                            <DropdownMenuItem variant={m.destructive ? "destructive" : "default"} onClick={m.onSelect}>
-                              {m.icon}
-                              {m.label}
-                            </DropdownMenuItem>
-                          </React.Fragment>
-                        ))}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                ) : null}
-              </div>
-              {/* Body */}
-              <div className="min-h-0 flex-1 p-2">{it.body}</div>
-            </div>
+            {isSectionKind(it.kind) ? (
+              <SectionTile item={it} editable={editable} folded={folded.has(it.id)} onToggle={() => toggleFold(it.id)} onHeaderPointerDown={onMove} />
+            ) : (
+              <TileCard item={it} editable={editable} dragging={dragging} onHeaderPointerDown={onMove} />
+            )}
             {/* Resize handle (bottom-right corner, visible) */}
             {editable ? (
               <div

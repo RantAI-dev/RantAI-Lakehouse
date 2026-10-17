@@ -43,6 +43,18 @@ pub struct BinRead {
 /// longer checks out (data corruption only; the caller reports the chart).
 #[must_use]
 pub fn chart_layers(def: &ChartInput) -> Option<Vec<Layer>> {
+    // BI-16 part B: a histogram is its dimension cut into ranges, with the
+    // mode its own field chose (about 20 ranges when none was chosen).
+    if def.kind == crate::specs::ChartKind::Histogram {
+        let mode = match &def.types.histogram {
+            Some(bins) => bins.mode().ok()?,
+            None => BinMode::Count(crate::types_b::AUTO_HISTOGRAM_BINS),
+        };
+        return Some(vec![Layer {
+            column: Ident::new(def.dimension.clone()).ok()?,
+            mode,
+        }]);
+    }
     let mut out = Vec::new();
     for (spec, column) in [
         (def.shape.bin.as_ref(), Some(def.dimension.as_str())),

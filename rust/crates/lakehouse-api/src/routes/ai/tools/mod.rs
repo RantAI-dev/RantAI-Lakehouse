@@ -7,9 +7,11 @@
 //!   buttons.
 //! - [`propose`] — `propose_sql`, a corrected statement checked for the
 //!   caller and shown to the person, never run.
+//! - [`look`] — `format_chart`, `set_dashboard_theme` (`BI-17` part A).
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
 //!   `suggest_dashboard`.
+//! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
@@ -37,11 +39,15 @@ mod gold;
 mod governance;
 mod ingest;
 mod lakehouse;
+mod look;
+#[cfg(test)]
+pub(super) use look::FORMAT_FIELDS;
 mod metrics;
 mod ops;
 mod pipelines;
 mod propose;
 mod queries;
+mod tabs;
 
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
@@ -153,17 +159,18 @@ pub(in crate::routes) async fn run_tool(
                 return json!({ "error": "The reporting settings could not be read." });
             };
             if name == "create_chart" {
-                dashboards::create_chart(ch, args, None, &time).await
+                dashboards::create_chart(ch, principal, args, None, &time).await
             } else {
-                dashboards::update_chart(ch, args, &time).await
+                dashboards::update_chart(ch, principal, args, &time).await
             }
         }
-        "create_board" => dashboards::create_board(ch, args).await,
-        "list_boards" => dashboards::list_boards(ch).await,
+        "create_board" => dashboards::create_board(ch, principal, args).await,
+        "list_boards" => dashboards::list_boards(ch, principal).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
-        "list_charts" => dashboards::list_charts(ch).await,
+        "list_charts" => dashboards::list_charts(ch, principal).await,
         "list_sql_sources" | "suggest_join" => dashboards::chart_sources(ch, name, args).await,
-        "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
+        n if look::handles(n) => look::run(state, principal, name, args).await,
         "rename_board"
         | "delete_board"
         | "arrange_board"
