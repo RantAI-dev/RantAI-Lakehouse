@@ -189,6 +189,17 @@ pub async fn get(
     {
         Ok(mut body) => {
             crate::routes::settings::add_formatting(&mut body, &format);
+            // BI-1 D7: the console hides the download items for a person
+            // whose every role is switched off; the routes refuse anyway.
+            if let Some(map) = body.as_object_mut() {
+                map.insert(
+                    "canDownload".to_owned(),
+                    Value::Bool(crate::routes::settings::may_download(
+                        &principal,
+                        &format.download_denied_roles,
+                    )),
+                );
+            }
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(BodyError::Params(err)) => crate::error::ApiRejection(err).into_response(),
@@ -2913,13 +2924,15 @@ fn export_statement(
 /// # Errors
 ///
 /// 400 for a missing or non-raw-table `chart`, bad filters or sort; 404 for an
-/// unknown tile; 422 when the role rewrite refuses or the engine rejects the
+/// unknown tile; 403 when every role of the person is switched off from
+/// downloading (`BI-1` D7); 422 when the role rewrite refuses or the engine rejects the
 /// statement; 503 when the engine or the audit store is unavailable.
 pub async fn table_export(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Query(q): Query<TableExportQuery>,
 ) -> ApiResult<Response> {
+    crate::routes::settings::require_download(&state, &principal).await?;
     let ch = &state.clickhouse;
     let chart_id = q
         .chart
@@ -2999,20 +3012,32 @@ pub async fn table_export(
 
     record_export_audit(&state, &principal, chart, (rows.len(), cut, cap)).await?;
 
-    Ok((
+    Ok(export_response(
+        body,
+        &export_file_name(&chart.spec.title),
+        (rows.len(), cut, cap),
+    ))
+}
+
+/// The CSV response of an export: the file, its name, and the counts the
+/// console tells the person (`X-Export-Rows`, `X-Export-Cut`, `X-Export-Cap`).
+/// The raw-bytes response bypasses `ApiJson` because the body is a file.
+fn export_response(
+    body: String,
+    file_name: &str,
+    (rows, cut, cap): (usize, bool, u32),
+) -> Response {
+    (
         [
             (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
             (
                 header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"{}\"",
-                    export_file_name(&chart.spec.title)
-                ),
+                format!("attachment; filename=\"{file_name}\""),
             ),
             (header::CACHE_CONTROL, "no-store".to_owned()),
             (
                 header::HeaderName::from_static("x-export-rows"),
-                rows.len().to_string(),
+                rows.to_string(),
             ),
             (
                 header::HeaderName::from_static("x-export-cut"),
@@ -3025,7 +3050,7 @@ pub async fn table_export(
         ],
         body,
     )
-        .into_response())
+        .into_response()
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────

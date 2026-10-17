@@ -89,6 +89,8 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** False when every role of the viewer is switched off from downloading (BI-1); the download items are hidden. Absent from an older server: allowed. */
+  canDownload?: boolean;
   /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
   theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */

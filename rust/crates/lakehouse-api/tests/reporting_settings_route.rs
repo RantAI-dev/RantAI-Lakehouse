@@ -24,7 +24,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...]}";
 
 /// What a deployment that never saved formatting reads back.
 fn formatting_defaults(mut body: Value) -> Value {
@@ -38,6 +38,7 @@ fn formatting_defaults(mut body: Value) -> Value {
         "system"
     ]);
     body["contentSites"] = json!([]);
+    body["downloadDeniedRoles"] = json!([]);
     body
 }
 
@@ -324,6 +325,73 @@ async fn content_sites_are_saved_normalised_kept_by_a_later_save_and_refused_whe
     )
     .await;
     assert_eq!(cleared["contentSites"], json!([]));
+}
+
+/// `BI-1` T1 (D7): the list of roles that may not download is saved by name,
+/// kept by a save that omits it, refused when a name is not a role, and needs
+/// `settings:write`.
+#[tokio::test]
+async fn download_denied_roles_are_saved_kept_and_refused_when_not_a_role() {
+    let (TestApp { router, pool }, _server) = app_with_engine(1).await;
+    let writer = create_principal_with_permissions(&pool, "settings:write").await;
+    let cookie = session_cookie_for_user(&pool, writer).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","downloadDeniedRoles":["Analyst","Analyst"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["downloadDeniedRoles"], json!(["Analyst"]));
+    // A save without the field keeps the list.
+    let (_, again) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"sunday"}"#,
+    )
+    .await;
+    assert_eq!(again["downloadDeniedRoles"], json!(["Analyst"]));
+
+    let (status, err) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","downloadDeniedRoles":["No Such Role"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(
+        err["error"].as_str(),
+        Some("downloadDeniedRoles must name roles that exist.")
+    );
+    let (_, after) = call(&router, "GET", &cookie, "").await;
+    assert_eq!(
+        after["downloadDeniedRoles"],
+        json!(["Analyst"]),
+        "a refused save changes nothing"
+    );
+
+    let (_, cleared) = call(
+        &router,
+        "PUT",
+        &cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","downloadDeniedRoles":[]}"#,
+    )
+    .await;
+    assert_eq!(cleared["downloadDeniedRoles"], json!([]));
+
+    let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let (status, _) = call(
+        &router,
+        "PUT",
+        &reader_cookie,
+        r#"{"timeZone":"UTC","weekStart":"monday","downloadDeniedRoles":["Analyst"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 async fn post_chart(

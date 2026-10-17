@@ -561,3 +561,60 @@ async fn an_unauthenticated_request_is_401() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `BI-1` T1 (D7): a person whose every role is switched off cannot download,
+/// is told so in a sentence, and nothing is read from the engine for them; a
+/// person who holds another role still can.
+#[tokio::test]
+async fn a_person_whose_every_role_is_switched_off_cannot_export() {
+    let ch = MockServer::start().await;
+    mount(&ch, vec![json!({"email": "a", "region": "north"})]).await;
+    let (router, pool, cookie) = app(&ch).await;
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, download_denied_roles) \
+         VALUES (TRUE, 'UTC', 'monday', ARRAY['Exporter'])",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = ch.received_requests().await.unwrap().len();
+    let resp = get(&router, "/api/dashboard/table-export?chart=c_rows", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Downloads are switched off for your role.")),
+        "{body}"
+    );
+    assert_eq!(
+        ch.received_requests().await.unwrap().len(),
+        before,
+        "a refused download reads nothing"
+    );
+
+    // The same person with a second role that is not switched off may.
+    let extra = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, 'Second', '', 'test')",
+    )
+    .bind(extra)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) SELECT user_id, $1 FROM app_user_role ur JOIN role r ON r.id = ur.role_id WHERE r.name = 'Exporter'")
+        .bind(extra)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (user,): (Uuid,) = sqlx::query_as(
+        "SELECT ur.user_id FROM app_user_role ur JOIN role r ON r.id = ur.role_id WHERE r.name = 'Second'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cookie = session_cookie_for_user(&pool, user).await;
+    let resp = get(&router, "/api/dashboard/table-export?chart=c_rows", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
