@@ -1137,6 +1137,7 @@ pub async fn lag_check(
                 Box::new(crate::routes::alerts::ApiSilenceSource { pg })
                     as Box<dyn lakehouse_alerts::SilenceSource>
             });
+        // BLD-2 review R3 BLOCKER 1 / decision R14: pass check's reason to alert
         if let Err(err) = lakehouse_alerts::evaluate_pipeline_behind_target(
             &state.clickhouse,
             &http,
@@ -1144,6 +1145,7 @@ pub async fn lag_check(
             &id,
             outcome.lag_seconds,
             outcome.target_seconds,
+            outcome.reason.as_deref(),
             silence_source.as_deref(),
         )
         .await

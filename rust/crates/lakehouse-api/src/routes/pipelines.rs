@@ -216,6 +216,20 @@ async fn list_body(
         for p in &authored {
             if let Ok(mut val) = serde_json::to_value(p) {
                 if let Value::Object(obj) = &mut val {
+                    // BLD-2 review R3 BLOCKER 1 / decision R14: check if an upstream U has exhausted retries
+                    let upstream_exhausted = p.depends_on.iter().find_map(|u_id| {
+                        let u_state = lag_states.get(u_id)?;
+                        let u_pipe = authored.iter().find(|cand| &cand.id == u_id)?;
+                        let u_max = i32::from(u_pipe.max_retries);
+                        if u_state.request_attempt > u_max
+                            && u_state.requested_tokens.is_some()
+                            && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
+                        {
+                            Some(u_id.as_str())
+                        } else {
+                            None
+                        }
+                    });
                     obj.insert(
                         "lag".to_owned(),
                         crate::pipeline_lag::lag_json(
@@ -223,6 +237,8 @@ async fn list_body(
                             lag_states.get(&p.id),
                             now,
                             no_readers.contains(&p.id),
+                            i32::from(p.max_retries),
+                            upstream_exhausted,
                         ),
                     );
                 }
@@ -1052,17 +1068,37 @@ async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Val
             None,
             time::OffsetDateTime::now_utc(),
             false,
+            0,
+            None,
         ));
     }
     let state = pipelines::get_lag_state(pool, &pipeline.id).await?;
     let no_readers =
         crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
             .await?;
+    // BLD-2 review R3 BLOCKER 1 / decision R14: check if an upstream U has exhausted retries
+    let mut upstream_exhausted: Option<String> = None;
+    for u_id in &pipeline.depends_on {
+        if let Ok(Some(u_pipe)) = pipelines::get_pipeline(pool, u_id).await
+            && let Ok(Some(u_state)) = pipelines::get_lag_state(pool, u_id).await
+        {
+            let u_max = i32::from(u_pipe.max_retries);
+            if u_state.request_attempt > u_max
+                && u_state.requested_tokens.is_some()
+                && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
+            {
+                upstream_exhausted = Some(u_id.clone());
+                break;
+            }
+        }
+    }
     Ok(crate::pipeline_lag::lag_json(
         pipeline.target_lag,
         state.as_ref(),
         time::OffsetDateTime::now_utc(),
         no_readers.contains(&pipeline.id),
+        i32::from(pipeline.max_retries),
+        upstream_exhausted.as_deref(),
     ))
 }
 

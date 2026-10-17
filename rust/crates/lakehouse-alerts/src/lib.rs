@@ -1828,6 +1828,7 @@ pub async fn evaluate_pipeline_volume_drop(
 /// # Errors
 ///
 /// Returns [`ChError`] only if [`list_rules`] itself fails (e.g. `ClickHouse` unreachable).
+// BLD-2 review R3 BLOCKER 1 / decision R14: alert includes reason when provided
 pub async fn evaluate_pipeline_behind_target(
     ch: &ChClient,
     http: &WebhookSender,
@@ -1835,13 +1836,15 @@ pub async fn evaluate_pipeline_behind_target(
     pipeline_id: &str,
     lag_seconds: Option<i64>,
     target_seconds: Option<i32>,
+    reason: Option<&str>,
     silence: Option<&dyn SilenceSource>,
 ) -> Result<usize, ChError> {
     let console_link = format!("/pipelines/{pipeline_id}");
     let lag_str = lag_seconds.map_or_else(|| "unknown".to_owned(), |s| format!("{s}s"));
     let target_str = target_seconds.map_or_else(|| "unknown".to_owned(), |s| format!("{s}s"));
+    let reason_clause = reason.map_or_else(String::new, |r| format!(", reason: {r}"));
     let text = format!(
-        "Pipeline {pipeline_id} is behind its target lag (lag: {lag_str}, target: {target_str}). View: {console_link}"
+        "Pipeline {pipeline_id} is behind its target lag (lag: {lag_str}, target: {target_str}{reason_clause}). View: {console_link}"
     );
     let title_prefix = "⚠️ Pipeline behind target";
     deliver_one_kind(
@@ -4727,6 +4730,69 @@ mod tests {
     }
 
     // ── AlertKind::PipelineBehindTarget (BLD-2 plan D9) ──────────────────
+    // BLD-2 review R3 BLOCKER 1 / decision R14: alert includes reason when provided
+    #[tokio::test]
+    async fn evaluate_pipeline_behind_target_delivers_a_message_naming_reason_when_provided() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/behind-reason", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/behind-reason"))
+            .and(body_string_contains(
+                "Pipeline pl-orders is behind its target lag (lag: 30s, target: 600s, reason: the last 2 runs for this change failed; the next input change starts again)",
+            ))
+            .and(body_string_contains("View: /pipelines/pl-orders"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let rule_json = serde_json::json!({
+            "meta": [],
+            "data": [{
+                "id": "al_pbt_r",
+                "name": "Orders lag alert with reason",
+                "type": "pipeline_behind_target",
+                "mart": "",
+                "measure": "",
+                "agg": "",
+                "op": "",
+                "threshold": "0",
+                "board": "",
+                "channel": "webhook",
+                "target": webhook,
+                "enabled": "1",
+                "created_at": "",
+                "severity": "",
+                "pipeline": "pl-orders",
+                "connector": ""
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rule_json))
+            .mount(&server)
+            .await;
+
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let http = test_webhook_sender();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_behind_target(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(30),
+            Some(600),
+            Some("the last 2 runs for this change failed; the next input change starts again"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
+    }
 
     #[test]
     fn pipeline_behind_target_kind_as_str_round_trips() {
@@ -4867,6 +4933,7 @@ mod tests {
             Some(300),
             Some(120),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4924,6 +4991,7 @@ mod tests {
             "pl-orders",
             Some(300),
             Some(120),
+            None,
             Some(&AlwaysSilenced),
         )
         .await

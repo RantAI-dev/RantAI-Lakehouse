@@ -979,16 +979,10 @@ async fn evaluate_upstream_chain(
             let pending_since = state.pending_since.unwrap_or(now);
             state.pending_since = Some(pending_since);
             let lag_seconds = (now - pending_since).whole_seconds();
-            let target = target_seconds.map_or(i64::MAX, i64::from);
-            let status = if state.consumed_tokens.is_none() || lag_seconds > target {
-                LagStatus::Behind
-            } else {
-                LagStatus::Met
-            };
-            let behind_streak = match status {
-                LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
-                LagStatus::Met | LagStatus::NotMeasured => 0,
-            };
+            // BLD-2 review R3 BLOCKER 1 / decision R14: For a P waiting on an exhausted U,
+            // P is behind with a reason naming U whatever the lag.
+            let status = LagStatus::Behind;
+            let behind_streak = stored.map_or(1, |row| row.behind_streak + 1);
             // BLD-2 review R1 BLOCKER 5: keep P request
             let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
             pipelines::upsert_lag_state_conn(tx, &p_update)
@@ -1099,16 +1093,10 @@ async fn evaluate_upstream_chain(
             let pending_since = state.pending_since.unwrap_or(now);
             state.pending_since = Some(pending_since);
             let lag_seconds = (now - pending_since).whole_seconds();
-            let target = target_seconds.map_or(i64::MAX, i64::from);
-            let status = if state.consumed_tokens.is_none() || lag_seconds > target {
-                LagStatus::Behind
-            } else {
-                LagStatus::Met
-            };
-            let behind_streak = match status {
-                LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
-                LagStatus::Met | LagStatus::NotMeasured => 0,
-            };
+            // BLD-2 review R3 BLOCKER 1 / decision R14: For a P waiting on an exhausted U,
+            // P is behind with a reason naming U whatever the lag.
+            let status = LagStatus::Behind;
+            let behind_streak = stored.map_or(1, |row| row.behind_streak + 1);
             let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
             pipelines::upsert_lag_state_conn(tx, &p_update)
                 .await
@@ -1452,12 +1440,15 @@ pub async fn downstream_without_readers(
 /// the last three check intervals (90 s) — the orchestrator is what checks
 /// the lag, so a stale row means the orchestrator stopped asking and
 /// nothing is known (`BLD-2-AC5`), which is never reported as `met`.
+// BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives exhausted retries and upstream wait from state
 #[must_use]
 pub fn lag_json(
     target_lag: Option<TargetLag>,
     state: Option<&pipelines::PipelineLagState>,
     now: OffsetDateTime,
     downstream_no_readers: bool,
+    max_retries: i32,
+    upstream_exhausted: Option<&str>,
 ) -> serde_json::Value {
     if target_lag.is_none() {
         return serde_json::Value::Null;
@@ -1496,7 +1487,7 @@ pub fn lag_json(
     if target_lag == Some(TargetLag::Downstream) && downstream_no_readers {
         return stale_read("Downstream: no pipeline with a target lag reads this table".to_owned());
     }
-    let status = match st.last_status.as_deref() {
+    let mut status = match st.last_status.as_deref() {
         Some("met") => LagStatus::Met,
         Some("behind") => LagStatus::Behind,
         // The three words are a CHECK constraint on the column, so this arm
@@ -1508,7 +1499,25 @@ pub fn lag_json(
     } else {
         st.pending_since.map(|ps| (now - ps).whole_seconds().max(0))
     };
-    let reason = reason_for(status, st.consumed_tokens.is_none());
+
+    // BLD-2 review R3 BLOCKER 1 / decision R14:
+    // Derives "the last N runs for this change failed; the next input change starts again"
+    // from the state row (request_attempt over max_retries, tokens not consumed).
+    let retries_exhausted = st.request_attempt > max_retries
+        && st.requested_tokens.is_some()
+        && st.consumed_tokens.as_ref() != st.requested_tokens.as_ref();
+
+    let reason = if let Some(u_id) = upstream_exhausted {
+        status = LagStatus::Behind;
+        format!("waiting for upstream pipeline {u_id} to finish")
+    } else if retries_exhausted {
+        status = LagStatus::Behind;
+        let n = max_retries + 1;
+        format!("the last {n} runs for this change failed; the next input change starts again")
+    } else {
+        reason_for(status, st.consumed_tokens.is_none()).to_owned()
+    };
+
     serde_json::json!({
         "status": status.as_str(),
         "lagSeconds": lag_seconds,
@@ -2626,7 +2635,10 @@ mod tests {
     #[test]
     fn lag_json_is_null_when_the_pipeline_has_no_target_lag() {
         let now = at(1_000);
-        assert_eq!(lag_json(None, None, now, false), serde_json::Value::Null);
+        assert_eq!(
+            lag_json(None, None, now, false, 0, None),
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -2638,6 +2650,8 @@ mod tests {
                 state.as_ref(),
                 now,
                 false,
+                0,
+                None,
             );
             assert_eq!(res["status"], "not_measured");
             assert_eq!(res["lagSeconds"], serde_json::Value::Null);
@@ -2661,7 +2675,9 @@ mod tests {
                 Some(TargetLag::Lag { minutes: 5 }),
                 Some(&fresh),
                 now,
-                false
+                false,
+                0,
+                None,
             )["status"],
             "met",
             "a check exactly three intervals old is still believed"
@@ -2675,6 +2691,8 @@ mod tests {
             Some(&stale),
             now,
             false,
+            0,
+            None,
         );
         assert_eq!(res["status"], "not_measured");
         assert_eq!(
@@ -2700,6 +2718,8 @@ mod tests {
             Some(&state),
             now,
             false,
+            0,
+            None,
         );
         assert_eq!(res["status"], "behind");
         assert_eq!(res["lagSeconds"], 125);
@@ -2711,6 +2731,8 @@ mod tests {
             Some(&state),
             now,
             false,
+            0,
+            None,
         );
         assert_eq!(unmeasured["status"], "not_measured");
         assert_eq!(unmeasured["lagSeconds"], serde_json::Value::Null);
@@ -2728,6 +2750,8 @@ mod tests {
             Some(&state),
             now,
             false,
+            0,
+            None,
         );
         assert_eq!(
             res["reason"],
@@ -2741,7 +2765,14 @@ mod tests {
     fn lag_json_reports_the_downstream_note_for_a_pipeline_with_no_readers() {
         let now = at(1_000);
         let state = lag_state(Some(now - time::Duration::seconds(10)), "met");
-        let res = lag_json(Some(TargetLag::Downstream), Some(&state), now, true);
+        let res = lag_json(
+            Some(TargetLag::Downstream),
+            Some(&state),
+            now,
+            true,
+            0,
+            None,
+        );
         assert_eq!(res["status"], "not_measured");
         assert_eq!(
             res["reason"],
@@ -2749,7 +2780,14 @@ mod tests {
         );
         assert_eq!(res["lagSeconds"], serde_json::Value::Null);
 
-        let read = lag_json(Some(TargetLag::Downstream), Some(&state), now, false);
+        let read = lag_json(
+            Some(TargetLag::Downstream),
+            Some(&state),
+            now,
+            false,
+            0,
+            None,
+        );
         assert_eq!(
             read["status"], "met",
             "a downstream pipeline somebody reads reports what its own check measured"
@@ -2758,6 +2796,61 @@ mod tests {
 
     /// Plan D9: the alert fires on the check that completes the streak, so
     /// once per streak and never twice for it.
+    // BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives retries exhausted
+    #[test]
+    fn lag_json_reports_retries_exhausted_when_attempts_exceed_max_retries_even_with_low_lag() {
+        let now = at(1_000);
+        let mut state = lag_state(Some(now - time::Duration::seconds(10)), "behind");
+        state.pending_since = Some(now - time::Duration::seconds(30));
+        state.request_attempt = 2;
+        state.consumed_tokens = Some(tokens_to_json(&tokens_of(&[(
+            "bronze.orders",
+            "iceberg:7",
+        )])));
+        state.requested_tokens = Some(tokens_to_json(&tokens_of(&[(
+            "bronze.orders",
+            "iceberg:8",
+        )])));
+        let res = lag_json(
+            Some(TargetLag::Lag { minutes: 10 }),
+            Some(&state),
+            now,
+            false,
+            1, // max_retries
+            None,
+        );
+        assert_eq!(res["status"], "behind");
+        assert_eq!(res["lagSeconds"], 30);
+        assert_eq!(
+            res["reason"],
+            "the last 2 runs for this change failed; the next input change starts again"
+        );
+    }
+
+    // BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives waiting on exhausted upstream
+    #[test]
+    fn lag_json_reports_waiting_for_upstream_when_upstream_retries_exhausted() {
+        let now = at(1_000);
+        let mut state = lag_state(Some(now - time::Duration::seconds(10)), "behind");
+        state.pending_since = Some(now - time::Duration::seconds(30));
+        state.request_attempt = 0;
+        state.consumed_tokens = Some(tokens_to_json(&tokens_of(&[("silver.clean", "iceberg:1")])));
+        let res = lag_json(
+            Some(TargetLag::Lag { minutes: 10 }),
+            Some(&state),
+            now,
+            false,
+            1,
+            Some("pl-upstream-orders"),
+        );
+        assert_eq!(res["status"], "behind");
+        assert_eq!(res["lagSeconds"], 30);
+        assert_eq!(
+            res["reason"],
+            "waiting for upstream pipeline pl-upstream-orders to finish"
+        );
+    }
+
     #[test]
     fn the_behind_target_alert_fires_exactly_at_the_third_check() {
         for streak in 0..=2 {
@@ -3182,6 +3275,164 @@ mod tests {
         assert_eq!(
             c_consumed.reason.as_deref(),
             Some("the last 2 runs for this change failed; the next input change starts again")
+        );
+
+        // BLD-2 review R3 BLOCKER 1 / decision R14: test the page payload for the case the R10 test uses
+        let state_consumed = pipelines::get_lag_state(&pool, &pipe_consumed.id)
+            .await
+            .unwrap();
+        let page = lag_json(
+            pipe_consumed.target_lag,
+            state_consumed.as_ref(),
+            t0,
+            false,
+            i32::from(pipe_consumed.max_retries),
+            None,
+        );
+        assert_eq!(page["status"], "behind");
+        assert_eq!(page["lagSeconds"], 30);
+        assert_eq!(
+            page["reason"],
+            "the last 2 runs for this change failed; the next input change starts again"
+        );
+    }
+
+    /// BLD-2 review R3 BLOCKER 1 / decision R14: For a P waiting on an exhausted U,
+    /// P is behind with a reason naming U in both check outcome and page payload.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn downstream_waiting_on_exhausted_upstream_reads_behind_with_reason_naming_u(
+        pool: PgPool,
+    ) {
+        let tenant_id = seed_tenant(&pool).await;
+        let u = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "u_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "u_clean".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-u-exh".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create u");
+
+        let p = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "p_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "u_clean".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "p_mart".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: Some(tenant_id),
+                depends_on: vec!["pl-u-exh".to_owned()],
+                connector_id: None,
+                id: Some("pl-p-exh".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create p");
+
+        let t0 = at(1_000);
+        let t_past = t0 - time::Duration::seconds(30);
+        let u_old = tokens_of(&[("bronze.orders", "iceberg:1")]);
+        let u_new = tokens_of(&[("bronze.orders", "iceberg:2")]);
+        // Set U to exhausted: request_attempt = 2 > max_retries(1), requested != consumed
+        let update_u = LagStateUpdate {
+            pipeline_id: u.id.clone(),
+            tenant_id: u.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&u_old)),
+            consumed_at: Some(t_past),
+            pending_since: Some(t_past),
+            requested_run_key: None,
+            requested_tokens: Some(tokens_to_json(&u_new)),
+            requested_at: None,
+            request_attempt: 2,
+            last_check_at: t0,
+            last_status: "not_measured".to_owned(),
+            behind_streak: 0,
+        };
+        pipelines::upsert_lag_state(&pool, &update_u).await.unwrap();
+
+        // P has consumed silver.u_clean before, lag is 30s <= target 600s
+        let p_tokens = tokens_of(&[("silver.u_clean", "fp:1")]);
+        let update_p = LagStateUpdate {
+            pipeline_id: p.id.clone(),
+            tenant_id: p.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&p_tokens)),
+            consumed_at: Some(t_past),
+            pending_since: Some(t_past),
+            requested_run_key: None,
+            requested_tokens: None,
+            requested_at: None,
+            request_attempt: 0,
+            last_check_at: t0,
+            last_status: "met".to_owned(),
+            behind_streak: 0,
+        };
+        pipelines::upsert_lag_state(&pool, &update_p).await.unwrap();
+
+        let reader = FakeTokens::new()
+            .with("bronze.orders", "iceberg:2")
+            .with("silver.u_clean", "fp:1");
+        let (dagster, _s) = dagster_with(&job_name(&p.id), None, &[]).await;
+        let p_inputs = inputs_of(&pool, &p).await.unwrap().unwrap();
+        let outcome = run_lag_check(&pool, &dagster, &reader, &p, &p_inputs, t0)
+            .await
+            .expect("run check");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(
+            outcome.status,
+            LagStatus::Behind,
+            "P waiting on exhausted U must be behind"
+        );
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting for upstream pipeline pl-u-exh to finish")
+        );
+
+        // Page payload for P
+        let p_state = pipelines::get_lag_state(&pool, &p.id).await.unwrap();
+        let page = lag_json(
+            p.target_lag,
+            p_state.as_ref(),
+            t0,
+            false,
+            i32::from(p.max_retries),
+            Some("pl-u-exh"),
+        );
+        assert_eq!(page["status"], "behind");
+        assert_eq!(
+            page["reason"],
+            "waiting for upstream pipeline pl-u-exh to finish"
         );
     }
 
