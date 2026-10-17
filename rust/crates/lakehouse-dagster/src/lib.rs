@@ -208,6 +208,16 @@ struct GqlResponse<T> {
     errors: Option<Value>,
 }
 
+/// BLD-2: `pipelineRunsOrError(filter: {runKeys: …})`. Separate from
+/// [`RunsOrErrorData`] because the field name (`pipelineRunsOrError` vs
+/// `runsOrError`) is what distinguishes the run-key lookup from the
+/// name-filtered list.
+#[derive(Debug, Deserialize)]
+struct PipelineRunsOrErrorData {
+    #[serde(rename = "pipelineRunsOrError")]
+    runs_or_error: RunsOrError,
+}
+
 #[derive(Debug, Deserialize)]
 struct RunsOrErrorData {
     #[serde(rename = "runsOrError")]
@@ -1100,6 +1110,57 @@ impl DgClient {
             .execute(query, Some(json!({ "job": job_name, "limit": limit })))
             .await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
+    }
+
+    /// The most recent run carrying `run_key` as its `dagster/run_key` tag.
+    ///
+    /// BLD-2's lag check stores the run key it asked Dagster to use and
+    /// asks this on the next check to learn whether that run has landed
+    /// (plan D5). Filtering on `dagster/run_key` in `PipelineRunsFilter.tags`
+    /// — a server-side tag filter — rather than paging recent runs and
+    /// scanning their tags client-side: the run being looked for may be older
+    /// than any page limit the route would be willing to fetch, and the answer is
+    /// "this exact run key", not "the newest run whose tags happen to
+    /// match".
+    ///
+    /// `Ok(None)` when no run carries that key — including the case where
+    /// the orchestrator has not created it yet, which the caller treats as
+    /// "the request is still outstanding" rather than as a failure (fail
+    /// closed: a second run for the same change is worse than waiting one
+    /// tick).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON` or
+    /// carries a GraphQL `errors` array.
+    pub async fn find_run_by_run_key(&self, run_key: &str) -> Result<Option<DgRun>, DgError> {
+        let query = "query($filter: RunsFilter) { pipelineRunsOrError(\
+                      filter: $filter) { __typename \
+                      ... on Runs { results { runId jobName status startTime endTime \
+                      creationTime parentRunId rootRunId tags { key value } } } } }";
+        let data: PipelineRunsOrErrorData = self
+            .execute(
+                query,
+                Some(json!({
+                    "filter": {
+                        "tags": [{ "key": "dagster/run_key", "value": run_key }]
+                    }
+                })),
+            )
+            .await?;
+        Ok(data.runs_or_error.results.and_then(|mut runs| {
+            // Most recent first, so if more than one run carries the key the
+            // answer is the run created last (BLD-2 review R3 SHOULD-FIX 4:
+            // not a claim about what Dagster allows).
+            // BLD-2 review R1 SHOULD-FIX 11: order by creationTime, not startTime
+            runs.sort_by(|a, b| {
+                b.creation_time
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.creation_time.unwrap_or(0.0))
+            });
+            runs.into_iter().next()
+        }))
     }
 
     /// [`DgClient::list_runs_for_job`], with each run's config — see
@@ -3884,6 +3945,66 @@ mod tests {
         assert_eq!(refresh.schedules[0].schedule_state.status, "RUNNING");
         let other = jobs.iter().find(|j| j.name == "other_job").unwrap();
         assert!(other.schedules.is_empty());
+    }
+
+    /// BLD-2: the lag check looks a requested run up by its `runKey`.
+    /// BLD-2 review R1 SHOULD-FIX 11 / R2 SHOULD-FIX 5: tags filter and ordered by creationTime
+    /// (differing creationTime and startTime prove ordering is by creationTime, not startTime).
+    #[tokio::test]
+    async fn find_run_by_run_key_sends_the_key_as_a_variable_and_returns_the_newest() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_partial_json(
+                json!({ "variables": { "filter": { "tags": [{ "key": "dagster/run_key", "value": "lag:pl-x:abc" }] } } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [
+                    // BLD-2 review R3 SHOULD-FIX 4: the older-created run STARTS
+                    // after the newer one, so sorting by startTime would pick it.
+                    { "runId": "old", "jobName": "authored__pl-x", "status": "SUCCESS",
+                      "startTime": 1000.0, "endTime": 1040.0, "creationTime": 100.0 },
+                    { "runId": "new", "jobName": "authored__pl-x", "status": "STARTED",
+                      "startTime": 950.0, "creationTime": 900.0 }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let run = client
+            .find_run_by_run_key("lag:pl-x:abc")
+            .await
+            .unwrap()
+            .expect("a run carries that key");
+        assert_eq!(run.run_id, "new");
+        assert_eq!(run.status, "STARTED");
+        assert_eq!(run.start_time, Some(950.0));
+    }
+
+    /// No run with that key is the orchestrator's normal "not created
+    /// yet" answer, and the caller treats it as "still outstanding" rather
+    /// than as an error (see [`DgClient::find_run_by_run_key`]).
+    #[tokio::test]
+    async fn find_run_by_run_key_is_none_when_no_run_carries_the_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunsOrError": { "__typename": "Runs", "results": [] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        assert!(
+            client
+                .find_run_by_run_key("lag:pl-x:abc")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

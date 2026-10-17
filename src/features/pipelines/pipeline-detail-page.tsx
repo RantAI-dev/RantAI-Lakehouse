@@ -43,6 +43,7 @@ import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { authorChoices, readsAs } from "./pipeline-reads-as"
 import { RunInspector } from "./run-inspector"
 import { ScheduleHistory } from "./schedule-history"
+import { PipelineFreshnessPanel } from "./pipeline-freshness-panel"
 
 /** Poll cadence: fast while a run is live or one was just launched, slow otherwise. */
 const LIVE_POLL_MS = 4000
@@ -468,6 +469,8 @@ export function PipelineDetailPage() {
           now={now}
         />
       ) : null}
+
+      <PipelineFreshnessPanel pipeline={p} onUpdated={state.reload} />
 
       <Tabs value={tab} onValueChange={(v) => setParam("tab", String(v))}>
         <TabsList variant="line" className="gap-4 border-b border-border pb-1">

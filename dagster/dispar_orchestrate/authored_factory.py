@@ -24,7 +24,14 @@ all tenants) and builds, per pipeline:
   keeps the sensor's RUNNING/STOPPED state across a code-location
   reload, so the `paused` branch has to skip the sensor AND the API
   `authored_status` route has to stop the stored sensor next to the
-  schedule (F1.2).
+  schedule (F1.2);
+* an `authored__<id>_lag` sensor when the pipeline has a time-based target lag
+  (`targetLag.kind == 'lag'`) AND its status is `ready` (BLD-2 D3/D6). A target lag
+  replaces both the cron schedule and the dependency `_after` sensor while set (D3).
+  The sensor evaluates `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds
+  (`minimum_interval_seconds=30`), balancing responsive freshness for pipelines with short
+  targets (down to 1 minute; BLD-2 review R3 BLOCKER 3) against the database cost of querying input snapshot tokens
+  and ClickHouse content fingerprints across authored pipelines (D6).
 
    Two upstreams are per-table rather than per-job: `file_ingest_job` loads
    ONE uploaded file into ONE Bronze table per run, and `ingest_job` loads
@@ -117,6 +124,7 @@ from dagster import (
     job,
     op,
     run_status_sensor,
+    sensor,
 )
 
 from dispar_orchestrate import authored_transforms, op_metadata
@@ -785,6 +793,10 @@ def build_authored_schedule(pipeline: dict[str, Any], authored_job: Any) -> Sche
     `"On demand"`, ...) or its cron is one Dagster refuses. A refused cron
     is logged and skipped rather than raised: one bad row must not take
     down every job in this code location."""
+    # BLD-2 D3: A target lag (either kind) replaces the cron schedule while it is set.
+    # The schedule string stays stored, so clearing the target lag restores the schedule (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     cron = pipeline.get("schedule")
     if not _is_five_field_cron(cron):
         return None
@@ -1137,23 +1149,27 @@ def build_authored_dependency_sensor(
     sorted key, so Dagster's own dedup drops the second and the
     downstream launches once (R3 plan 2a).
 
-`monitored_jobs` accepts `JobSelector`s (for cross-location
-upstreams like `ingest_job`); `request_job` must be the
-`JobDefinition` this code location built -- Dagster 1.13.20's
-`SensorDefinition.__init__` coerces `request_job` through
-`AutomationTarget.from_coercible`, which only handles
-`JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
-Verified against dagster 1.13.20's `run_status_sensor` signature.
+    `monitored_jobs` accepts `JobSelector`s (for cross-location
+    upstreams like `ingest_job`); `request_job` must be the
+    `JobDefinition` this code location built -- Dagster 1.13.20's
+    `SensorDefinition.__init__` coerces `request_job` through
+    `AutomationTarget.from_coercible`, which only handles
+    `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
+    Verified against dagster 1.13.20's `run_status_sensor` signature.
 
-TWO upstreams are per-table, so the freshness walk filters them
-(`DATA-19` / D1 and `BLD-4` / D1): a pipeline counts only the SUCCESS
-runs that loaded ITS source table, and a load of any other table never
-triggers it. `file_ingest_job` writes ONE table per run and reads it from
-the run's config; `ingest_job` writes EVERY selected object of ONE
-connector per run and reads it from the materialization that run logged
-(`_latest_record_for_ingest_table`). Everything else keeps the
-unfiltered rule above, byte for byte.
-"""
+    TWO upstreams are per-table, so the freshness walk filters them
+    (`DATA-19` / D1 and `BLD-4` / D1): a pipeline counts only the SUCCESS
+    runs that loaded ITS source table, and a load of any other table never
+    triggers it. `file_ingest_job` writes ONE table per run and reads it from
+    the run's config; `ingest_job` writes EVERY selected object of ONE
+    connector per run and reads it from the materialization that run logged
+    (`_latest_record_for_ingest_table`). Everything else keeps the
+    unfiltered rule above, byte for byte.
+    """
+    # BLD-2 D3: A target lag (either kind) replaces the dependency (_after) sensor while it is set.
+    # The dependsOn list stays stored, so clearing the target lag restores the chain sensor (AC8).
+    if pipeline.get("targetLag") is not None:
+        return None
     depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
         return None
@@ -1346,9 +1362,222 @@ unfiltered rule above, byte for byte.
     return _dependency_sensor
 
 
+def lag_sensor_name(pipeline_id: str) -> str:
+    """BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory."""
+    safe_id = _dagster_safe_name(pipeline_id)
+    return f"authored__{safe_id}_lag"
+
+
+def build_authored_lag_sensor(
+    pipeline: dict[str, Any],
+    authored_job: Any,
+    allowed_jobs: list[Any] | None = None,
+    cfg: AuthoredPipelineConfig | None = None,
+) -> Any | None:
+    """BLD-2 D6: one sensor per authored pipeline with a time-based target lag
+    (`targetLag.kind == 'lag'`). Downstream lag pipelines (`targetLag.kind == 'downstream'`)
+    do not poll: their refresh is requested when an upstream pipeline's check runs.
+
+    A `paused` pipeline gets no sensor at all (as with the dependency sensor, F1.2 #57):
+    the orchestrator preserves a sensor's RUNNING state across reloads, so a paused
+    pipeline must not continue checking lag in the background.
+
+    `minimum_interval_seconds=30`: checks run at most every 30 seconds to balance
+    freshness responsiveness for short lag targets against the query cost of input tokens
+    and ClickHouse content fingerprints across authored pipelines.
+    """
+    target_lag = pipeline.get("targetLag")
+    if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+        return None
+
+    if pipeline.get("status") == "paused":
+        return None
+
+    pipeline_id = pipeline.get("id", "")
+    sensor_name = lag_sensor_name(pipeline_id)
+
+    # BLD-2 review R1 BLOCKER 2: give the sensor every job it may name
+    jobs_to_attach = list(allowed_jobs) if allowed_jobs else [authored_job]
+    if authored_job not in jobs_to_attach:
+        jobs_to_attach.insert(0, authored_job)
+    allowed_job_names = {j.name for j in jobs_to_attach}
+
+    @sensor(
+        name=sensor_name,
+        jobs=jobs_to_attach,
+        minimum_interval_seconds=30,
+        default_status=DefaultSensorStatus.RUNNING,
+    )
+    def _lag_sensor(context: Any) -> Any:
+        cfg_ = cfg or AuthoredPipelineConfig.from_env()
+        if not cfg_.run_token:
+            # BLD-2 review R2 SHOULD-FIX 12: log once why no checks happen when run token unset
+            cursor = getattr(context, "cursor", None)
+            if cursor != "token_unset_warned":
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r}: DISPAR_RUN_TOKEN is unset; no lag checks will run"
+                )
+                if hasattr(context, "update_cursor"):
+                    context.update_cursor("token_unset_warned")
+            return None
+
+        url = f"{cfg_.api_url}/api/pipelines/runnable/{pipeline_id}/lag-check"
+        try:
+            resp = requests.post(
+                url,
+                headers=_headers(cfg_),
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            # D6: transport error is skipped for this tick (next tick asks again); never raises.
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} transport failure ({exc}); skipping tick"
+            )
+            return None
+
+        if 400 <= resp.status_code < 500:
+            # D6: 4xx is logged and skipped
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned {resp.status_code} ({resp.text}); skipping tick"
+            )
+            return None
+
+        if resp.status_code >= 500:
+            # D6: 5xx is skipped for this tick
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned server error {resp.status_code}; skipping tick"
+            )
+            return None
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            context.log.warning(
+                f"Target lag check for pipeline {pipeline_id!r} returned non-JSON response ({exc}); skipping tick"
+            )
+            return None
+
+        decision = body.get("decision")
+        if decision == "run":
+            # BLD-2 review R1 BLOCKER 2: use body['jobName'] and validate against allowed jobs
+            run_key = body.get("runKey")
+            target_job_name = body.get("jobName")
+            if not run_key:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned decision 'run' without runKey; skipping tick"
+                )
+                return None
+            if not target_job_name or target_job_name not in allowed_job_names:
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r} returned unexpected jobName {target_job_name!r} "
+                    f"(allowed: {sorted(allowed_job_names)}); skipping tick"
+                )
+                return None
+            yield RunRequest(run_key=run_key, job_name=target_job_name)
+
+    return _lag_sensor
+
+
+def _pipeline_target(p: dict[str, Any]) -> str:
+    if p.get("target"):
+        return str(p["target"])
+    defn = p.get("definition") or {}
+    zone = defn.get("targetZone") or p.get("targetZone") or p.get("target_zone") or ""
+    table = defn.get("targetTable") or p.get("targetTable") or p.get("target_table") or ""
+    if zone and table:
+        return f"{zone}.{table}"
+    return ""
+
+
+def _pipeline_source(p: dict[str, Any]) -> str:
+    if p.get("source"):
+        return str(p["source"])
+    defn = p.get("definition") or {}
+    zone = defn.get("sourceZone") or p.get("sourceZone") or p.get("source_zone") or ""
+    table = defn.get("sourceTable") or p.get("sourceTable") or p.get("source_table") or ""
+    if zone and table:
+        return f"{zone}.{table}"
+    return ""
+
+
+def _pipeline_tenant(p: dict[str, Any]) -> str | None:
+    t = p.get("tenantId") or p.get("tenant_id")
+    return str(t) if t is not None else None
+
+
+def _pipeline_depends_on(p: dict[str, Any]) -> list[str]:
+    deps = p.get("dependsOn") or p.get("depends_on") or []
+    return [str(d) for d in deps]
+
+
+def build_authored_lag_sensors(
+    pipeline_jobs: list[tuple[dict[str, Any], Any]],
+    cfg: AuthoredPipelineConfig | None = None,
+) -> list[Any]:
+    """One lag sensor per authored pipeline with a time-based target lag.
+    BLD-2 review R2 SHOULD-FIX 7: attach only jobs of downstream pipelines this pipeline actually reads
+    (direct source/dependsOn or recursive chain in the same tenant).
+
+    BLD-2 review R3 SHOULD-FIX 8: the tenant comes from the runnable payload's
+    `tenantId` (`RunnablePipeline.tenant_id`). BLD-2 review R4 SHOULD-FIX 2
+    sharpens it to the R3 decision: an unassigned pipeline's tenant is None
+    and NULL links nothing, so a reading pipeline with no tenant matches no
+    downstream at all — two unassigned pipelines are not a same-tenant
+    pair, they are two pipelines without a sharing rule.
+
+    Not attached: a downstream pipeline that P reads ONLY through the target
+    table of a pipeline in P's `dependsOn` (an edge the API's chain walk
+    follows, this one does not). If the API ever answers with such a U, the
+    sensor fails closed with an "unexpected jobName" skip rather than running
+    a job outside its allowed list.
+    """
+    sensors: list[Any] = []
+    for pipeline, authored_job in pipeline_jobs:
+        target_lag = pipeline.get("targetLag")
+        if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+            continue
+
+        # Find downstream pipelines read by this pipeline (direct or transitive in same tenant)
+        visited_ids: set[str] = set()
+        queue = [pipeline]
+        while queue:
+            curr = queue.pop(0)
+            curr_tenant = _pipeline_tenant(curr)
+            # BLD-2 review R4 SHOULD-FIX 2: a tenant-less reading pipeline
+            # links nothing — per R3, NULL tenant matches no membership, so
+            # two unassigned pipelines never share a lag sensor.
+            if curr_tenant is None:
+                continue
+            curr_source = _pipeline_source(curr)
+            curr_deps = set(_pipeline_depends_on(curr))
+            for other_p, other_j in pipeline_jobs:
+                other_id = other_p.get("id", "")
+                if not other_id or other_id in visited_ids or other_id == pipeline.get("id"):
+                    continue
+                other_lag = other_p.get("targetLag")
+                if not isinstance(other_lag, dict) or other_lag.get("kind") != "downstream":
+                    continue
+                if _pipeline_tenant(other_p) != curr_tenant:
+                    continue
+                other_target = _pipeline_target(other_p)
+                if (other_target and other_target == curr_source) or (other_id in curr_deps):
+                    visited_ids.add(other_id)
+                    queue.append(other_p)
+
+        allowed = [authored_job] + [
+            j for other_p, j in pipeline_jobs
+            if other_p.get("id") in visited_ids and j.name != authored_job.name
+        ]
+        sensor_ = build_authored_lag_sensor(pipeline, authored_job, allowed_jobs=allowed, cfg=cfg)
+        if sensor_ is not None:
+            sensors.append(sensor_)
+    return sensors
+
+
 # Built at Dagster code-load time, same pattern `agent_run_schedules`
 # (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
 # for every way this degrades to empty lists without raising.
+#
 # Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
 # names statically) sees all four names `definitions.py` imports.
@@ -1357,3 +1586,4 @@ authored_jobs = _authored_jobs_and_schedules_and_deps[0]
 authored_schedules = _authored_jobs_and_schedules_and_deps[1]
 _authored_pipeline_jobs = _authored_jobs_and_schedules_and_deps[2]
 authored_dependency_sensors = build_authored_dependency_sensors(_authored_pipeline_jobs)
+authored_lag_sensors = build_authored_lag_sensors(_authored_pipeline_jobs)

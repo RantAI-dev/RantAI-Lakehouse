@@ -379,12 +379,21 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
+    ("PUT",  "/api/pipelines/{id}/target-lag",         Policy::RequiresPermission("pipeline:write")),
     ("DELETE", "/api/pipelines/{id}",                  Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}/schedule-ticks",     Policy::RequiresPermission("pipeline:read")),
     // Every tenant's authored definitions, for the orchestrator's job
     // factory. `pipeline:read` is the floor; the handler also refuses
     // anyone but a service identity (routes::authored_pipelines).
     ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
+    // BLD-2: the target-lag sensor's one decision-maker (plan D5). Same
+    // floor as `runnable`, and the same handler-side refusal: only the
+    // orchestrator's service identity (or a Platform Admin) may ask
+    // whether a pipeline is behind its target. `pipeline:read` rather
+    // than `pipeline:write` because a check READS state and asks for a
+    // run the orchestrator launches itself — it does not mutate the
+    // pipeline, which is what the `pipeline:write` routes are for.
+    ("POST", "/api/pipelines/runnable/{id}/lag-check", Policy::RequiresPermission("pipeline:read")),
     // BLD-1 / D3: the orchestrator posts a pipeline's `SELECT` here and
     // gets back the rewrite that pipeline's AUTHOR is allowed to run.
     // Same floor as `runnable` above (`pipeline:read`), and the same

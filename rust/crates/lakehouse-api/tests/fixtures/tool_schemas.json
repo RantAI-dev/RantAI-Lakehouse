@@ -4926,6 +4926,67 @@
   {
     "type": "function",
     "function": {
+      "name": "set_pipeline_target_lag",
+      "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (minimum 1 minute, up to 10080 minutes / 7 days), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pipeline": {
+            "type": "string",
+            "description": "pipeline id (pl-…) or pipeline name"
+          },
+          "targetLag": {
+            "description": "target lag configuration: { kind: \"lag\", minutes } | { kind: \"downstream\" } | null to clear",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "lag"
+                    ]
+                  },
+                  "minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080
+                  }
+                },
+                "required": [
+                  "kind",
+                  "minutes"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "downstream"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              }
+            ]
+          }
+        },
+        "required": [
+          "pipeline"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_iceberg_tables",
       "description": "The Iceberg tables in the lakehouse warehouse (Lakekeeper): with namespace, that namespace's tables; without, every namespace with its tables, including Bronze and exported Gold. Each table has its format version, current snapshot, last update, files, records and size.",
       "parameters": {

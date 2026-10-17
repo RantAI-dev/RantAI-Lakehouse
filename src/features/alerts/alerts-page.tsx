@@ -154,6 +154,7 @@ export function alertRuleFormFields(
 } {
   const none = { connector: false, allConnectors: false, note: null }
   if (type === "freshness") return { martMeasure: false, board: false, freshnessTarget: true, ...none };
+  if (type === "pipeline_behind_target") return { martMeasure: false, board: false, freshnessTarget: false, ...none };
   if (type === "alert") return { martMeasure: true, board: false, freshnessTarget: false, ...none };
   if (isLoadAlertKind(type)) {
     const picksConnector = type !== "upload_failure"
@@ -176,6 +177,17 @@ export function alertRuleFormFields(
  * kind sends the form as it always did.
  */
 export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
+  if (f.type === "pipeline_behind_target") {
+    return {
+      name: f.name.trim(),
+      type: f.type,
+      channel: f.channel,
+      target: f.target.trim(),
+      enabled: f.enabled,
+      pipeline: f.pipeline?.trim() || "*",
+      ...(f.severity ? { severity: f.severity } : {}),
+    }
+  }
   if (!isLoadAlertKind(f.type)) return f
   return {
     name: f.name.trim(),
@@ -509,6 +521,7 @@ function RuleEditDialog({
                   <SelectItem value="alert">Threshold alert</SelectItem>
                   <SelectItem value="digest">Dashboard digest</SelectItem>
                   <SelectItem value="freshness">Dataset freshness</SelectItem>
+                  <SelectItem value="pipeline_behind_target">Pipeline behind target lag</SelectItem>
                   {LOAD_ALERT_KINDS.map((kind) => (
                     <SelectItem key={kind} value={kind}>
                       {ruleKindLabel(kind)}

@@ -131,6 +131,9 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>, tenant_id: Option<Uu
             connector_id: None,
             id: None,
             run_as,
+            // BLD-2: this fixture is about the enforce rewrite, not about a
+            // target lag.
+            target_lag: None,
         },
         run_as,
     )

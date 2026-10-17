@@ -1326,5 +1326,95 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertEqual(len(case["expect_state"]), 2, case_id)
 
 
+class ToolArgsMatchTest(unittest.TestCase):
+    """BLD-2 review R4 BLOCKER 2 / decision R15: a wanted NUMBER matches only
+    a number equal to it (`minutes: 10` never matches `100`), a wanted
+    STRING matches case-insensitively as a substring of a string value AND
+    of the JSON text of a list or object value (a filters array of objects,
+    a qualified table name)."""
+
+    def test_a_number_that_merely_contains_the_wanted_number_does_not_match(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 100}}
+        self.assertFalse(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_an_equal_number_matches_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_a_wanted_number_matches_an_equal_member_of_a_list(self) -> None:
+        self.assertTrue(m.tool_args_match({"minutes": [10, 100]}, {"minutes": 10}))
+        self.assertFalse(m.tool_args_match({"minutes": [100]}, {"minutes": 10}))
+
+    def test_an_equal_string_matches_case_insensitively_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "Orders_Clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(
+            m.tool_args_match(
+                args,
+                {"pipeline": "orders_clean", "targetLag.kind": "lag", "targetLag.minutes": 10},
+            )
+        )
+
+    def test_a_wanted_string_matches_inside_a_qualified_table_name(self) -> None:
+        self.assertTrue(
+            m.tool_args_match({"pipeline": "silver.orders_clean"}, {"pipeline": "orders_clean"})
+        )
+        self.assertFalse(
+            m.tool_args_match({"pipeline": "silver.orders_cleaned"}, {"pipeline": "orders_clean."})
+        )
+
+    def test_a_wanted_string_matches_the_json_text_of_one_filters_shaped_list(self) -> None:
+        filters = [
+            {"column": "created_year", "first": {"op": "eq", "value": "2026"}},
+            {"column": "region", "first": {"op": "in", "value": ["Asia", "Europe"]}},
+        ]
+        self.assertTrue(m.tool_args_match({"filters": filters}, {"filters": "created_year"}))
+        self.assertFalse(m.tool_args_match({"filters": filters}, {"filters": "wilayah"}))
+
+    def test_a_wanted_string_matches_the_json_text_of_a_list_but_never_a_number(self) -> None:
+        self.assertTrue(m.tool_args_match({"measures": ["a", "b"]}, {"measures": "b"}))
+        self.assertTrue(m.tool_args_match({"measures": ["ab"]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"measures": [1, 2]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"minutes": 100}, {"minutes": "only-a-string"}))
+
+    def test_an_absent_key_never_matches(self) -> None:
+        self.assertFalse(m.tool_args_match({"mart": "x"}, {"grain": ""}))
+
+    def test_a_wanted_bool_matches_only_a_bool_of_the_same_value(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: Python says `1 == True` and
+        `1.0 == True`, so a wanted `True` used to score a call that sent the
+        number 1 -- a case asking for a flag could pass on a numeric one."""
+        self.assertTrue(m.tool_args_match({"enabled": True}, {"enabled": True}))
+        self.assertTrue(m.tool_args_match({"enabled": False}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": 1}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 1.0}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 0}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": "true"}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": True}, {"enabled": False}))
+        self.assertTrue(
+            m.tool_args_match(
+                {"spec": {"ifChanged": True, "ttlDays": 30}}, {"spec.ifChanged": True}
+            )
+        )
+        self.assertFalse(
+            m.tool_args_match({"spec": {"ifChanged": 1, "ttlDays": 30}}, {"spec.ifChanged": True}),
+            "a dotted key reads the same values and is held to the same rule",
+        )
+
+    def test_a_wanted_string_matches_a_non_ascii_member_of_a_list(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: `json.dumps` escapes non-ASCII by
+        default, so a wanted string carrying an accented or CJK character
+        was looked for as `\\uXXXX` and could never be found inside a list
+        or object value. The wanted string has to carry the character itself
+        for this to differ -- a wanted ASCII substring of a non-ASCII value
+        matched either way."""
+        members = ["São Paulo", "Berlin"]
+        self.assertTrue(m.tool_args_match({"regions": members}, {"regions": "são paulo"}))
+        self.assertTrue(m.tool_args_match({"region": "São Paulo"}, {"region": "São Paulo"}))
+        self.assertTrue(
+            m.tool_args_match({"filters": [{"region": "São Paulo"}]}, {"filters": "São Paulo"})
+        )
+        self.assertFalse(m.tool_args_match({"regions": ["Berlin"]}, {"regions": "São Paulo"}))
+
+
 if __name__ == "__main__":
     unittest.main()
