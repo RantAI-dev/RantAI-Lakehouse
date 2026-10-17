@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! Signed embedding (Metabase-style), porting
 //! `src/services/clients/embed-jwt.ts`.
 //!
