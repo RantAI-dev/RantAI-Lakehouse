@@ -386,8 +386,9 @@ pub(crate) fn target_of(pipeline: &Pipeline) -> (Option<i32>, bool) {
 /// Returns [`StoreError`] if the dependency query fails.
 // BLD-2 review R1 SHOULD-FIX 13: return Ok(None) on unparseable source
 // BLD-2 review R1 decision R3 / SHOULD-FIX 9: tenant-scoped
-pub async fn inputs_of(
-    pool: &PgPool,
+/// BLD-2 review R3 BLOCKER 2 / decision R13: read inputs on existing connection
+pub async fn inputs_of_conn(
+    conn: &mut sqlx::PgConnection,
     pipeline: &Pipeline,
 ) -> Result<Option<Vec<InputTable>>, StoreError> {
     let mut inputs = Vec::new();
@@ -396,21 +397,33 @@ pub async fn inputs_of(
     };
     inputs.push(source);
     for (id, target) in
-        pipelines::targets_for(pool, pipeline.tenant_id, &pipeline.depends_on).await?
+        pipelines::targets_for_conn(conn, pipeline.tenant_id, &pipeline.depends_on).await?
     {
         if let Some(input) = InputTable::parse(&target) {
             inputs.push(input);
         } else {
             tracing::warn!(
                 pipeline = %id,
-                "target lag: an upstream pipeline's stored target is not a <zone>.<table> location; \
-                 it is not watched as an input"
+                "target lag: an upstream pipeline's stored target is not a <zone>.<table> location;                  it is not watched as an input"
             );
         }
     }
     inputs.sort();
     inputs.dedup();
     Ok(Some(inputs))
+}
+
+/// Read input tables for `pipeline`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if acquiring a connection or querying fails.
+pub async fn inputs_of(
+    pool: &PgPool,
+    pipeline: &Pipeline,
+) -> Result<Option<Vec<InputTable>>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    inputs_of_conn(&mut conn, pipeline).await
 }
 
 /// `lag:<pipeline id>:<hash>` — the run key a requested run carries, so the
@@ -798,124 +811,158 @@ pub async fn run_lag_check(
         });
     }
 
-    // BLD-2 review R1 decision R5 / SHOULD-FIX 7: concurrency: read with SELECT FOR UPDATE in tx
+    // BLD-2 review R3 BLOCKER 2 / decisions R12 & R13:
+    // Open transaction, configure timeouts, and bound network calls under 8s timeout.
     let mut tx = pool
         .begin()
         .await
         .map_err(|err| store_err(&pipeline.id, "transaction begin failed", err))?;
 
-    let stored = pipelines::get_lag_state_for_update(&mut tx, &pipeline.id, pipeline.tenant_id)
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
         .await
-        .map_err(|err| store_err(&pipeline.id, "state row unreadable", err))?;
-    let mut state = stored.as_ref().map_or_else(
-        || CheckState {
-            consumed_tokens: None,
-            consumed_at: None,
-            pending_since: None,
-            requested_run_key: None,
-            requested_tokens: None,
-            requested_at: None,
-            request_attempt: 0,
-        },
-        CheckState::from_row,
-    );
+        .map_err(|err| store_err(&pipeline.id, "set lock_timeout failed", err))?;
 
-    let outstanding = settle_request(dagster, &mut state, &job_name, now)
+    sqlx::query("SET LOCAL statement_timeout = '8s'")
+        .execute(&mut *tx)
         .await
-        .map_err(|err| {
-            tracing::warn!(%err, pipeline = %pipeline.id, "target lag: orchestrator unreachable; skipping this tick");
-            crate::upstream_error::report(
-                &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Unavailable("the orchestrator is unavailable".to_owned())
-        })?;
+        .map_err(|err| store_err(&pipeline.id, "set statement_timeout failed", err))?;
 
-    // Plan D7: walk the chain of upstream downstream pipelines, deepest first.
-    let chain = pipelines::upstream_downstream_chain(pool, pipeline)
-        .await
-        .map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: upstream chain failed");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+    let work = async {
+        // BLD-2 review R3 BLOCKER 2 / decision R13: use tx for reads inside the transaction
+        let chain = pipelines::upstream_downstream_chain_conn(&mut tx, pipeline)
+            .await
+            .map_err(|err| store_err(&pipeline.id, "upstream chain failed", err))?;
 
-    if let Some(early) = evaluate_upstream_chain(
-        pool,
-        &mut tx,
-        dagster,
-        reader,
-        pipeline,
-        &chain,
-        &mut state,
-        stored.as_ref(),
-        target_seconds,
-        &job_name,
-        now,
-    )
-    .await?
-    {
+        // BLD-2 review R3 BLOCKER 2 / decision R12: lock P and every U in ONE statement ordered by pipeline_id
+        let mut all_ids = vec![pipeline.id.clone()];
+        for u in &chain {
+            all_ids.push(u.id.clone());
+        }
+        all_ids.sort();
+        all_ids.dedup();
+
+        let mut locked_states =
+            pipelines::lock_lag_states_ordered(&mut tx, &all_ids, pipeline.tenant_id)
+                .await
+                .map_err(|err| store_err(&pipeline.id, "ordered lock failed", err))?;
+
+        let stored = locked_states.remove(&pipeline.id).flatten();
+        let mut state = stored.as_ref().map_or_else(
+            || CheckState {
+                consumed_tokens: None,
+                consumed_at: None,
+                pending_since: None,
+                requested_run_key: None,
+                requested_tokens: None,
+                requested_at: None,
+                request_attempt: 0,
+            },
+            CheckState::from_row,
+        );
+
+        let outstanding = settle_request(dagster, &mut state, &job_name, now)
+            .await
+            .map_err(|err| {
+                tracing::warn!(%err, pipeline = %pipeline.id, "target lag: orchestrator unreachable; skipping this tick");
+                crate::upstream_error::report(
+                    &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+                    crate::upstream_error::Class::Unavailable,
+                    &err.to_string(),
+                );
+                ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+            })?;
+
+        if let Some(early) = evaluate_upstream_chain(
+            &mut tx,
+            dagster,
+            reader,
+            pipeline,
+            &chain,
+            &mut state,
+            stored.as_ref(),
+            &mut locked_states,
+            target_seconds,
+            &job_name,
+            now,
+        )
+        .await?
+        {
+            tx.commit()
+                .await
+                .map_err(|err| store_err(&pipeline.id, "transaction commit failed", err))?;
+            return Ok(early);
+        }
+
+        let mut extra_budget = 0;
+        for up in &chain {
+            let up_job = crate::routes::authored_pipelines::job_name(&up.id);
+            extra_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
+                tracing::warn!(%err, "target lag: upstream run budget unreadable");
+                crate::upstream_error::report(
+                    &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+                    crate::upstream_error::Class::Unavailable,
+                    &err.to_string(),
+                );
+                ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+            })?;
+        }
+
+        let outcome = decide(
+            dagster,
+            reader,
+            pipeline,
+            &mut state,
+            inputs,
+            outstanding,
+            target_seconds,
+            extra_budget,
+            &job_name,
+            now,
+        )
+        .await?;
+
+        let behind_streak = match outcome.status {
+            LagStatus::Behind => stored.as_ref().map_or(1, |row| row.behind_streak + 1),
+            LagStatus::Met | LagStatus::NotMeasured => 0,
+        };
+        let update = make_lag_update(
+            pipeline,
+            &state,
+            now,
+            outcome.status.as_str(),
+            behind_streak,
+        );
+        pipelines::upsert_lag_state_conn(&mut tx, &update)
+            .await
+            .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
         tx.commit()
             .await
             .map_err(|err| store_err(&pipeline.id, "transaction commit failed", err))?;
-        return Ok(early);
-    }
 
-    let mut extra_budget = 0;
-    for up in &chain {
-        let up_job = crate::routes::authored_pipelines::job_name(&up.id);
-        extra_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
-            tracing::warn!(%err, "target lag: upstream run budget unreadable");
-            crate::upstream_error::report(
-                &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Unavailable("the orchestrator is unavailable".to_owned())
-        })?;
-    }
-
-    let outcome = decide(
-        dagster,
-        reader,
-        pipeline,
-        &mut state,
-        inputs,
-        outstanding,
-        target_seconds,
-        extra_budget,
-        &job_name,
-        now,
-    )
-    .await?;
-
-    let behind_streak = match outcome.status {
-        LagStatus::Behind => stored.as_ref().map_or(1, |row| row.behind_streak + 1),
-        LagStatus::Met | LagStatus::NotMeasured => 0,
+        Ok(LagCheckOutcome {
+            behind_streak,
+            ..outcome
+        })
     };
-    let update = make_lag_update(
-        pipeline,
-        &state,
-        now,
-        outcome.status.as_str(),
-        behind_streak,
-    );
-    pipelines::upsert_lag_state_conn(&mut tx, &update)
-        .await
-        .map_err(|err| store_err(&pipeline.id, "state row unwritable", err))?;
-    tx.commit()
-        .await
-        .map_err(|err| store_err(&pipeline.id, "transaction commit failed", err))?;
 
-    Ok(LagCheckOutcome {
-        behind_streak,
-        ..outcome
-    })
+    if let Ok(res) = tokio::time::timeout(std::time::Duration::from_secs(8), work).await {
+        res
+    } else {
+        // BLD-2 review R3 BLOCKER 2 / decision R13: roll back and answer classified 503
+        tracing::warn!(
+            pipeline = %pipeline.id,
+            "target lag: check timed out while holding locks; transaction rolled back"
+        );
+        crate::upstream_error::report(
+            &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+            crate::upstream_error::Class::Unavailable,
+            &"check timed out while holding locks",
+        );
+        Err(ApiError::Unavailable(
+            "the orchestrator is unavailable".to_owned(),
+        ))
+    }
 }
 
 // BLD-2 review R2 BLOCKER 2: helper for resetting attempt on token change and checking max_retries
@@ -932,7 +979,6 @@ fn check_retries_and_reset(state: &mut CheckState, tokens: &TokenMap, max_retrie
     reason = "evaluates chain of upstream downstream pipelines in one coherent loop"
 )]
 async fn evaluate_upstream_chain(
-    pool: &PgPool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     dagster: &DgClient,
     reader: &impl LagTokenReader,
@@ -940,15 +986,14 @@ async fn evaluate_upstream_chain(
     chain: &[Pipeline],
     state: &mut CheckState,
     stored: Option<&pipelines::PipelineLagState>,
+    locked_states: &mut std::collections::HashMap<String, Option<pipelines::PipelineLagState>>,
     target_seconds: Option<i32>,
     job_name: &str,
     now: OffsetDateTime,
 ) -> Result<Option<LagCheckOutcome>, ApiError> {
     for u_pipe in chain {
-        // BLD-2 review R2 BLOCKER 3: Lock U row in the same transaction as P
-        let u_stored = pipelines::get_lag_state_for_update(tx, &u_pipe.id, u_pipe.tenant_id)
-            .await
-            .map_err(|err| store_err(&u_pipe.id, "upstream state row unreadable", err))?;
+        // BLD-2 review R3 BLOCKER 2 / decision R12: U row was locked in one ordered statement with P
+        let u_stored = locked_states.remove(&u_pipe.id).flatten();
         let mut u_state = u_stored.as_ref().map_or_else(
             || CheckState {
                 consumed_tokens: None,
@@ -1007,7 +1052,8 @@ async fn evaluate_upstream_chain(
         // source cannot be parsed is not measurable, so this branch writes
         // P not_measured instead of returning without a write (the page
         // would otherwise keep showing the old status).
-        let u_inputs_maybe = inputs_of(pool, u_pipe)
+        // BLD-2 review R3 BLOCKER 2 / decision R13: read inputs on existing connection tx
+        let u_inputs_maybe = inputs_of_conn(tx, u_pipe)
             .await
             .map_err(|err| store_err(&u_pipe.id, "upstream inputs unreadable", err))?;
         let Some(u_inputs) = u_inputs_maybe else {
@@ -3433,6 +3479,76 @@ mod tests {
         assert_eq!(
             page["reason"],
             "waiting for upstream pipeline pl-u-exh to finish"
+        );
+    }
+
+    // BLD-2 review R3 BLOCKER 2 / decision R13:
+    // A fake Dagster that never answers makes the check return 503 within the budget
+    // and leaves the state row unchanged.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unanswering_dagster_times_out_within_budget_returns_503_and_leaves_row_unchanged(
+        pool: PgPool,
+    ) {
+        let pipeline = seed_pipeline(&pool, "pl-hang", 10).await;
+        let t0 = at(1_000);
+        let old_tokens = tokens_of(&[("bronze.orders", "iceberg:1")]);
+        let initial_update = LagStateUpdate {
+            pipeline_id: pipeline.id.clone(),
+            tenant_id: pipeline.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&old_tokens)),
+            consumed_at: Some(t0),
+            pending_since: None,
+            requested_run_key: Some("lag:pl-hang:abc:0".to_owned()),
+            requested_tokens: Some(tokens_to_json(&old_tokens)),
+            requested_at: Some(t0),
+            request_attempt: 0,
+            last_check_at: t0,
+            last_status: "met".to_owned(),
+            behind_streak: 0,
+        };
+        pipelines::upsert_lag_state(&pool, &initial_update)
+            .await
+            .expect("upsert initial state");
+
+        // Mock Dagster server that delays response beyond the 8s budget
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(12)))
+            .mount(&server)
+            .await;
+
+        let dagster = DgClient::new(format!("{}/graphql", server.uri()));
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:2");
+        let inputs = inputs_of(&pool, &pipeline).await.unwrap().unwrap();
+
+        let start = std::time::Instant::now();
+        let err = run_lag_check(&pool, &dagster, &reader, &pipeline, &inputs, at(1_030))
+            .await
+            .expect_err("check must time out and return 503");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_secs(8)
+                && elapsed < std::time::Duration::from_secs(10),
+            "timeout must happen at the 8s budget (elapsed: {elapsed:?})"
+        );
+        match err {
+            ApiError::Unavailable(msg) => {
+                assert_eq!(msg, "the orchestrator is unavailable");
+            }
+            other => panic!("expected 503 Unavailable, got {other:?}"),
+        }
+
+        // Verify state row is completely unchanged (rollback succeeded)
+        let state_after = pipelines::get_lag_state(&pool, &pipeline.id)
+            .await
+            .unwrap()
+            .expect("state row exists");
+        assert_eq!(state_after.last_status.as_deref(), Some("met"));
+        assert_eq!(state_after.last_check_at, Some(t0));
+        assert_eq!(
+            state_after.requested_run_key.as_deref(),
+            Some("lag:pl-hang:abc:0")
         );
     }
 

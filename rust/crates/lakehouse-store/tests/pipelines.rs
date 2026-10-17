@@ -2735,3 +2735,29 @@ async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
     );
     Ok(())
 }
+
+/// BLD-2 review R3 BLOCKER 2 / decision R12:
+/// Lock P's row and every U row the chain will touch in ONE statement,
+/// ordered by `pipeline_id`, before any read-modify-write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lock_lag_states_ordered_locks_rows_and_inserts_missing_without_deadlock(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["pl-z", "pl-a", "pl-m"] {
+        let mut inp = input();
+        inp.id = Some(id.to_owned());
+        inp.name = id.to_owned();
+        pipelines::create_pipeline(&pool, &inp, None).await.expect("create pipeline");
+    }
+
+    let mut conn = pool.acquire().await?;
+    let ids = vec!["pl-z".to_owned(), "pl-a".to_owned(), "pl-m".to_owned()];
+    let locked = pipelines::lock_lag_states_ordered(&mut conn, &ids, None)
+        .await
+        .expect("lock ordered");
+    assert_eq!(locked.len(), 3);
+    assert!(locked.contains_key("pl-a"));
+    assert!(locked.contains_key("pl-m"));
+    assert!(locked.contains_key("pl-z"));
+    Ok(())
+}

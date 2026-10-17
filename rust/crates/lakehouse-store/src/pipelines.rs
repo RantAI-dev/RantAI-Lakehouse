@@ -1844,11 +1844,15 @@ pub async fn get_lag_state(
 /// pipeline that belongs to no tenant links to nothing (fail closed, as
 /// migration 0042). One function for both callers (rule 4).
 ///
+/// Read target table names for the given pipeline IDs on an existing connection.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn targets_for(
-    pool: &PgPool,
+///
+/// BLD-2 review R3 BLOCKER 2 / decision R13: read targets on an existing connection
+pub async fn targets_for_conn(
+    conn: &mut sqlx::PgConnection,
     tenant_id: Option<Uuid>,
     ids: &[String],
 ) -> Result<std::collections::HashMap<String, String>, StoreError> {
@@ -1863,9 +1867,23 @@ pub async fn targets_for(
     )
     .bind(tenant_id)
     .bind(ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().collect())
+}
+
+/// Read target table names for the given pipeline IDs.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if acquiring a connection or querying fails.
+pub async fn targets_for(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, String>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    targets_for_conn(&mut conn, tenant_id, ids).await
 }
 
 /// Read the lag state of many pipelines in one query — the list and detail
@@ -1969,6 +1987,54 @@ pub async fn upsert_lag_state_conn(
 /// Reads the pipeline's lag state with `SELECT ... FOR UPDATE` inside `conn`'s
 /// transaction, serializing overlapping checks of the same pipeline.
 /// Inserts an initial empty row if none exists so the lock can be acquired.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the database query fails.
+/// BLD-2 review R3 BLOCKER 2 / decision R12:
+/// Lock P's row and every U row the chain will touch in ONE statement,
+/// ordered by `pipeline_id`, before any read-modify-write.
+pub async fn lock_lag_states_ordered(
+    conn: &mut sqlx::PgConnection,
+    ids: &[String],
+    tenant_id: Option<Uuid>,
+) -> Result<std::collections::HashMap<String, Option<PipelineLagState>>, StoreError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    for id in ids {
+        sqlx::query(
+            "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, $2)              ON CONFLICT (pipeline_id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    let sql = format!(
+        "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1) ORDER BY pipeline_id FOR UPDATE"
+    );
+    let rows: Vec<LagStateRow> = sqlx::query_as(&sql).bind(ids).fetch_all(&mut *conn).await?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let pid = row.pipeline_id.clone();
+        let state = if row.last_check_at.is_none() {
+            None
+        } else {
+            Some(PipelineLagState::from(row))
+        };
+        map.insert(pid, state);
+    }
+    for id in ids {
+        map.entry(id.clone()).or_insert(None);
+    }
+    Ok(map)
+}
+
+/// Fetch a pipeline's lag state with an exclusive row lock (`FOR UPDATE`).
 ///
 /// # Errors
 ///
@@ -2110,15 +2176,16 @@ pub async fn count_lag_pipelines_reading(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn upstream_downstream_pipelines(
-    pool: &PgPool,
+/// BLD-2 review R3 BLOCKER 2 / decision R13: read upstream pipelines on existing connection
+pub async fn upstream_downstream_pipelines_conn(
+    conn: &mut sqlx::PgConnection,
     pipeline: &Pipeline,
 ) -> Result<Vec<Pipeline>, StoreError> {
     let Some(tenant_id) = pipeline.tenant_id else {
         return Ok(Vec::new());
     };
     let mut input_tables = vec![pipeline.source.clone()];
-    for target in targets_for(pool, Some(tenant_id), &pipeline.depends_on)
+    for target in targets_for_conn(conn, Some(tenant_id), &pipeline.depends_on)
         .await?
         .into_values()
     {
@@ -2128,37 +2195,64 @@ pub async fn upstream_downstream_pipelines(
     input_tables.dedup();
 
     let sql = format!(
-        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
-         WHERE target_lag_downstream = true \
-           AND tenant_id = $4 \
-           AND id != $1 \
-           AND (target = ANY($2) OR id = ANY($3)) \
-         ORDER BY id"
+        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition          WHERE target_lag_downstream = true            AND tenant_id = $4            AND id != $1            AND (target = ANY($2) OR id = ANY($3))          ORDER BY id"
     );
     let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
         .bind(&pipeline.id)
         .bind(&input_tables)
         .bind(&pipeline.depends_on)
         .bind(tenant_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
     Ok(rows.into_iter().map(Pipeline::from).collect())
 }
 
-async fn visit_downstream_chain(
-    pool: &PgPool,
+async fn visit_downstream_chain_conn(
+    conn: &mut sqlx::PgConnection,
     node: &Pipeline,
     visited: &mut std::collections::HashSet<String>,
     order: &mut Vec<Pipeline>,
 ) -> Result<(), StoreError> {
-    let upstreams = upstream_downstream_pipelines(pool, node).await?;
+    let upstreams = upstream_downstream_pipelines_conn(conn, node).await?;
     for u in upstreams {
         if visited.insert(u.id.clone()) {
-            Box::pin(visit_downstream_chain(pool, &u, visited, order)).await?;
+            Box::pin(visit_downstream_chain_conn(conn, &u, visited, order)).await?;
             order.push(u);
         }
     }
     Ok(())
+}
+
+/// BLD-2 review R3 BLOCKER 2 / decision R13: discover chain on an existing connection
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if any query fails.
+pub async fn upstream_downstream_chain_conn(
+    conn: &mut sqlx::PgConnection,
+    pipeline: &Pipeline,
+) -> Result<Vec<Pipeline>, StoreError> {
+    if pipeline.tenant_id.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut order = Vec::new();
+
+    visit_downstream_chain_conn(conn, pipeline, &mut visited, &mut order).await?;
+    Ok(order)
+}
+
+/// Read immediate upstream pipelines marked `target_lag_downstream = true`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if acquiring a connection or querying fails.
+pub async fn upstream_downstream_pipelines(
+    pool: &PgPool,
+    pipeline: &Pipeline,
+) -> Result<Vec<Pipeline>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    upstream_downstream_pipelines_conn(&mut conn, pipeline).await
 }
 
 /// The chain of upstream downstream pipelines, deepest first.
@@ -2174,14 +2268,8 @@ pub async fn upstream_downstream_chain(
     pool: &PgPool,
     pipeline: &Pipeline,
 ) -> Result<Vec<Pipeline>, StoreError> {
-    if pipeline.tenant_id.is_none() {
-        return Ok(Vec::new());
-    }
-    let mut visited = std::collections::HashSet::new();
-    let mut order = Vec::new();
-
-    visit_downstream_chain(pool, pipeline, &mut visited, &mut order).await?;
-    Ok(order)
+    let mut conn = pool.acquire().await?;
+    upstream_downstream_chain_conn(&mut conn, pipeline).await
 }
 
 /// Helper DFS for cycle detection starting from `current` and looking for
