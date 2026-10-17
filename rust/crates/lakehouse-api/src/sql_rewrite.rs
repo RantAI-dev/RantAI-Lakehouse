@@ -1010,14 +1010,22 @@ fn build_masked_filtered_select(
 /// outside this narrow, explicitly allowed shape.
 ///
 /// A text value may not contain a backslash (SEC-32). This function parses
-/// with `GenericDialect`, which keeps `'\\'` as two backslashes, while
-/// `ClickHouse` reads it as one. The two parsers then disagree on where the
-/// string ends: `x = '\' OR 1=1 --'` is one comparison to the policy check
-/// and a comparison plus an injected `OR` to `ClickHouse`. Refusing the
-/// backslash keeps the validated filter and the executed filter the same
-/// text. Only numbers, booleans, `NULL` and a plain single-quoted string are
-/// literals here; `R'..'`, `N'..'`, `X'..'`, `E'..'` and `$$..$$` forms
-/// mean different things to the two engines and are refused too.
+/// with `GenericDialect`, which does not read a backslash as an escape, while
+/// `ClickHouse` reads `\'` as an escaped quote. The two parsers can then
+/// disagree on where a string ends. For `x = '\' OR 1=1 --'` the policy
+/// check sees the complete text `\`, then `OR 1=1`, then a `--` comment, so
+/// the filter is `x = '\' OR 1=1`. The validated filter is written back as
+/// `x = '\' OR 1 = 1`, and `ClickHouse` reads `\'` as an escaped quote and
+/// finds an unterminated string. Today that ends in an error, which fails
+/// closed. A crafted text could make both parsers accept the filter and read
+/// it differently, so the backslash is refused instead of relied on to fail.
+/// Only numbers, booleans, `NULL` and a plain single-quoted string are
+/// literals here. The `R'..'`, `N'..'`, `X'..'`, `E'..'` and `$$..$$` forms
+/// are refused too, because the two engines may read them differently.
+///
+/// The `ESCAPE` expression of `LIKE` and `ILIKE` is validated like any
+/// other child expression, so a backslash text, a subquery or a function off
+/// the allowlist is refused there too.
 ///
 /// # Errors
 /// [`RewriteError::InvalidRowFilter`] naming the specific problem.
@@ -1129,15 +1137,24 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
         Expr::Like {
             expr: inner,
             pattern,
+            escape_char,
             ..
         }
         | Expr::ILike {
             expr: inner,
             pattern,
+            escape_char,
             ..
         } => {
             validate_expr_shape(inner, real_columns)?;
-            validate_expr_shape(pattern, real_columns)
+            validate_expr_shape(pattern, real_columns)?;
+            // SEC-32 review fix (BLOCKER): the escape is an expression too.
+            // Unvisited, it let a backslash text, a subquery or a function
+            // off the allowlist pass.
+            if let Some(escape) = escape_char {
+                validate_expr_shape(escape, real_columns)?;
+            }
+            Ok(())
         }
         Expr::Function(f) => validate_function_call(f, real_columns),
         _ => Err(RewriteError::InvalidRowFilter {
@@ -1315,7 +1332,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         Expr::ILike {
             negated,
@@ -1328,7 +1345,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         // Every other shape (a plain identifier, a literal, an already
         // validated function call whose args contain no placeholder —
@@ -1336,6 +1353,15 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
         // else reaches here) is returned unchanged.
         _ => Ok(expr.clone()),
     }
+}
+
+fn expand_escape(
+    escape: Option<&Expr>,
+    values: &PlaceholderValues,
+) -> Result<Option<Box<Expr>>, RewriteError> {
+    escape
+        .map(|e| expand_expr(e, values).map(Box::new))
+        .transpose()
 }
 
 fn expand_expr(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, RewriteError> {
@@ -1686,9 +1712,9 @@ mod row_filter {
     }
 
     // SEC-32: the policy check parses a filter with `GenericDialect`, which
-    // keeps `'\\'` as two backslashes, while `ClickHouse` reads it as one.
-    // A text value with a backslash therefore means different things to the
-    // two parsers, so it is refused rather than re-encoded.
+    // does not read a backslash as an escape, while `ClickHouse` does. The
+    // two parsers can disagree on where a string ends, so a text value with
+    // a backslash is refused rather than re-encoded.
     #[test]
     fn validate_row_filter_expr_refuses_a_text_value_with_a_backslash() {
         let cols = vec!["x".to_owned()];
@@ -1718,6 +1744,104 @@ mod row_filter {
         for raw in ["x = R'a'", "x = N'a'", "x = X'61'", "x = E'a'", "x = $$a$$"] {
             assert_eq!(invalid_reason(raw, &cols), PLAIN_TEXT_REASON, "{raw}");
         }
+    }
+
+    // SEC-32 review fix (BLOCKER): `LIKE ... ESCAPE <expr>` carries a child
+    // expression in `escape_char`. The shape walk used to skip it, so a
+    // backslash text, a subquery or an unknown column passed in that slot.
+    #[test]
+    fn a_like_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+        assert_eq!(
+            invalid_reason(r"x NOT LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn an_ilike_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x ILIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn a_second_string_opened_after_a_backslash_escape_is_refused() {
+        // The policy check reads a `LIKE` with a one-backslash escape and a
+        // comparison against a long text. `ClickHouse` reads `\'` as an
+        // escaped quote, so the string boundaries differ. The backslash in
+        // the escape is the refusal reason.
+        let cols = vec!["x".to_owned()];
+        let raw = r"x LIKE 'a' ESCAPE '\' AND x = ' OR 1=1 OR x = '";
+        assert_eq!(invalid_reason(raw, &cols), BACKSLASH_REASON);
+        let built = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &[],
+            Some(raw),
+            &PlaceholderValues::none(),
+        );
+        assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
+    }
+
+    #[test]
+    fn a_like_escape_with_a_plain_character_still_passes_and_expands_unchanged() {
+        let cols = vec!["x".to_owned()];
+        for raw in [
+            "x LIKE 'a' ESCAPE '!'",
+            "x ILIKE 'a' ESCAPE '!'",
+            "x NOT LIKE 'a%' ESCAPE '!'",
+            "x LIKE 'a'",
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn a_like_escape_holding_a_subquery_or_an_unknown_column_is_refused() {
+        let cols = vec!["x".to_owned()];
+        let reason = invalid_reason("x LIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x ILIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x LIKE 'a' ESCAPE secret_col", &cols);
+        assert!(reason.contains("is not a real column"), "{reason}");
+        let reason = invalid_reason("x LIKE 'a' ESCAPE sleep(1)", &cols);
+        assert!(
+            reason.contains("is not allowed in a row filter"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_like_escape_placeholder_is_expanded_not_left_as_an_identifier() {
+        let cols = vec!["x".to_owned()];
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        let expr = validate_row_filter_expr("x LIKE 'a' ESCAPE __principal_id__", &cols).unwrap();
+        assert_eq!(
+            expand_placeholders(&expr, &values).unwrap(),
+            "x LIKE 'a' ESCAPE 'u-1'"
+        );
     }
 
     #[test]
