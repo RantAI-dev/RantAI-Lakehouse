@@ -111,7 +111,57 @@ One PR, opened by the planner: `chore(rust): toolchain and minimum to
 
 ## 8. Handoff
 
-(developer appends here)
+### T1 audit: Rust 1.97.0–1.99.1 release notes and lints
+
+Workspace lints in `rust/Cargo.toml`:
+- `[workspace.lints.rust]`: `future-incompatible = "warn"` (deprecated alias for `future_incompatible`), `nonstandard_style = { level = "deny", priority = -1 }`, `missing_docs = "warn"`.
+- `[workspace.lints.clippy]`: `all = { level = "deny", priority = -2 }`, `pedantic = { level = "warn", priority = -1 }`, plus specific denies for `redundant_clone`, `needless_collect`, `large_enum_variant`, `unwrap_used`, `expect_used`.
+
+#### Release notes compatibility audit table
+
+| Release | Section | Note / Change | Assessment & Grep Evidence |
+| --- | --- | --- | --- |
+| 1.97.0 | Compiler / Compatibility Notes | Symbol mangling `v0` enabled by default (`-Csymbol-mangling-version=v0`); legacy mangling restricted | Does not affect us: repo does not inspect mangled symbols or require legacy mangling. `grep -rn "symbol-mangling" rust/` -> empty. (Source: https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/) |
+| 1.97.0 | Compatibility Notes | Deref coercions disallowed in `pin!` macro | Does not affect us: `pin!` is not used anywhere in workspace. `grep -rn 'pin!' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes | Future-incompatibility warning for `{float}` inference (`f32: From<{float}>`) | Does not affect us: floating point usages are explicit (`f64`). (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes | Pattern matching & structural equality changes (disallow const pattern matching conflicting with manual PartialEq) | Does not affect us: no manual `PartialEq` impls paired with const pattern matches. `grep -rn 'impl.*PartialEq for' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes | `#[non_exhaustive]` enum discriminant reading on match | Does not affect us: no closures capture single-variant non-exhaustive enums across match arms. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes | Match ergonomics 2024 `mut ref` and `mut ref mut` in struct pattern field shorthand feature-gated | Does not affect us: no `mut ref` patterns exist. `grep -rn 'mut ref ' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes / Libraries | `derive(PartialOrd)` fast path with `Ord` | Does not affect us: no manual `Ord` impls exist in workspace. `grep -rn 'impl.*Ord for' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Compatibility Notes | `semicolon_in_expressions_from_non_local_macros` lint emitted on non-local macros | Does not affect us: macro invocations in expression position are properly structured. (Source: https://github.com/rust-lang/rust/releases/tag/1.97.0) |
+| 1.97.0 | Platform Support | `nvptx64-nvidia-cuda` dropped support for older architectures | Does not affect us: workspace builds for `x86_64-unknown-linux-gnu` / `x86_64-unknown-linux-musl`. (Source: https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/) |
+| 1.97.0 / 1.98.0 | Cargo | `lints.rust.future-incompatible` deprecated in favor of `lints.rust.future_incompatible` | Affects us at `rust/Cargo.toml:79` and all workspace crate `Cargo.toml` files; fixed in T2/T3. (Source: Cargo 1.98 manifest diagnostic) |
+| 1.98.0 | Compatibility Notes | Trait object lifetime bounds resolution when fully elided | Does not affect us: trait object lifetime bounds are explicit (`dyn ... + Send + Sync + 'static`). (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.98.0 | Compatibility Notes | Ambiguous glob imports converted to hard errors (`ambiguous_glob_imports`) | Does not affect us: glob imports are limited to test modules (`use super::*;`) without name collisions. `grep -rn 'use .*::\*;' rust/` checked. (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.98.0 | Compatibility Notes | Equality where-bounds syntax deprecation (`Type = Type`, `Type == Type` no longer permitted) | Does not affect us: no equality syntax in where-clauses. `grep -rn 'where.*==' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.98.0 | Compatibility Notes | Transmute size checking with `#[repr(...)]` | Does not affect us: `std::mem::transmute` is not used in the codebase. `grep -rn 'transmute' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.98.0 | Compatibility Notes / Libraries | Windows TLS destructors switched to Fiber Local Storage (FLS) | Does not affect us: target is Linux x86_64. (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.98.0 | Compatibility Notes / Compiler | Deny-by-default `invalid_runtime_symbol_definitions` lint | Does not affect us: workspace does not define runtime library symbols. (Source: https://github.com/rust-lang/rust/releases/tag/1.98.0) |
+| 1.99.0 | Compatibility Notes / Libraries | Recommendation against round-trip unleaking after `Box::leak` | Does not affect us: `lakehouse-test-support/src/lib.rs:69,109` leaks tokio runtime & Postgres testcontainer for process lifetime and never calls `Box::from_raw`. `grep -rn 'Box::from_raw' rust/` -> empty. (Source: https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/) |
+| 1.99.0 | Compatibility Notes | Corrected layout of `#[repr(Int)]` enums with uninhabited ZST | Does not affect us: no `#[repr(Int)]` enums in workspace. `grep -rn '#\[repr(' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.99.0) |
+| 1.99.0 | Compatibility Notes | Prevent unsize-coercing into `Pin<Foo>` where `Foo: !Deref` | Does not affect us: `Pin` unsize-coercions are not used. (Source: https://github.com/rust-lang/rust/releases/tag/1.99.0) |
+| 1.99.0 | Compatibility Notes | Fast-path for `derive(PartialOrd)` when deriving `Ord` | Does not affect us: no manual `Ord` implementations exist in workspace. `grep -rn 'impl.*Ord for' rust/` -> empty. (Source: https://github.com/rust-lang/rust/releases/tag/1.99.0) |
+| 1.99.1 | Regression / Compatibility | LLVM loop-idiom `wcslen` missing symbol on targets without standard C library | Does not affect us: targets Linux glibc/musl, and 1.99.1 includes the compiler-builtins fallback. (Source: https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) |
+| 1.99.1 | Regression / Compatibility | FFI `bool` zero-extension fix on x86_64 | Does not affect us: no custom extern "C" functions returning bool. (Source: https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) |
+| 1.99.1 | Regression / Compatibility | `rust-lld` on macOS rpath fix | Does not affect us: builds and runs on Linux x86_64. (Source: https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) |
+
+#### New default-on rustc and clippy lints affecting the workspace
+
+Since `rust/Cargo.toml` enables `clippy::all` (deny) and `clippy::pedantic` (warn), the following new lints triggered under 1.99.1:
+1. `clippy::question_mark` (`clippy::all`):
+   - Affects `crates/lakehouse-api/src/connector_probe.rs:1426:12` (block can use `?`). Fixed in T3.
+2. `clippy::result_large_err` (`clippy::all`):
+   - Affects `crates/lakehouse-api/src/routes/ai/mod.rs:431:6` (Err variant `Response` is large). Fixed in T3.
+   - Affects `crates/lakehouse-api/src/routes/pipelines.rs:2814:64` and `3715:6` (Err variant `Response` is large). Fixed in T3.
+3. `clippy::chunks_exact_to_as_chunks` (`clippy::all`):
+   - Affects `crates/lakehouse-api/src/upload_parse.rs:203:18` (constant chunk size 2). Fixed in T3.
+4. `clippy::assert_is_empty` (`clippy::pedantic`):
+   - Affects `assert!(x.is_empty())` test assertions across `crates/lakehouse-api`, `crates/lakehouse-dagster`, `crates/lakehouse-clickhouse`, `crates/lakehouse-store`. Fixed in T3.
+5. `clippy::unused_async_trait_impl` (`clippy::pedantic`):
+   - Affects `crates/lakehouse-api/src/rustfs_client.rs:213:9` (async trait fn with no `.await`). Fixed in T3.
+6. Cargo `future_incompatible` key rename warning:
+   - Affects `rust/Cargo.toml` and crate manifests (`future-incompatible` -> `future_incompatible`). Fixed in T2/T3.
+
 
 ## 9. Review
 
