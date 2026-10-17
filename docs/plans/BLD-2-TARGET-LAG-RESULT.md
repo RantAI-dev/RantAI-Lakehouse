@@ -18,6 +18,10 @@ or `/home/shiro/rantai/review/bld2-gate-r8-final.log`.
 | Full output | `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
 | Env file | `/home/shiro/rantai/bld2-gate.env` |
 
+Reconstructed (not a verbatim quote of the log, which prints only `===` section
+headers): the sequence in `/home/shiro/rantai/review/run-bld2-r8-final.sh`, with
+the four image builds and the `up` service list written on one line each.
+
 ```bash
 docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build lakehouse-api dagster-code-location oidc-mock g7-test-runner
 docker compose -p bld2r8fin --env-file /home/shiro/rantai/bld2-gate.env --profile dagster up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon g3a-source-init clickhouse-iceberg-init
@@ -69,18 +73,43 @@ Five checks, one per check interval, zero new runs, status `met` throughout.
 
 ---
 
+### Why 60 s passes now when it did not before (like-for-like)
+
+The gate measures the same thing in r1, r6 and r8: `commit_t` is taken after
+the ingest run's `SUCCESS`, one row is appended per sample, the wait is for
+Silver's distinct count to reach Bronze's, and the sensor ticks every 30 s.
+What changed between the pre-R6a 1-minute samples (40.7 to 68.94 s, quoted in
+the plan; no log on disk, see the note below) and the R8 samples (16.35 to
+32.70 s) is R6a itself. At a 60 s target the budget (the request-to-land
+median plus 60 s) exceeds the target, so the run is requested at the first
+check that sees the change, as plan note 6.3 predicted. Before R6a the
+threshold was positive and the pipeline waited one more tick before asking.
+It is not a faster machine or a different measurement.
+
 ## 2. All Runs Backed by Surviving Logs
 
 | Run | Commit (12 chars) | Date (UTC) | Project | Target | 5 samples (s) | Worst | Result | Headroom | Evidence log on disk |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Pre-R6a 2-min run | `9a59250c77ec` | `2026-10-16T20:01:03+00:00` | `bld2r1f` | 120 s | 103.50, 129.77, 115.69, 101.79, 129.69 (avg 116.09 s) | 129.77 s | FAILED (`max=129.77s`) | None (exceeded target by 9.77 s, computed) | `/home/shiro/rantai/review/bld2-gate-r1.log` |
 | Post-R6a 2-min run | `47fcf9ad4618` | `2026-10-16T20:32:16+00:00` | `bld2r6q` | 120 s | 77.20, 95.13, 68.90, 71.11, 89.10 (avg 80.29 s) | 95.13 s | PASSED (`<= 120s`) | 24.87 s (computed: `120 - 95.13`) | `/home/shiro/rantai/review/bld2-gate-r6.log` |
-| R8 initial 1-min run | `3b418d07de54` | `2026-10-17T00:59:44+00:00` | `bld2r81m` | 60 s | 16.37, 22.36, 22.32, 26.35, 16.35 (avg 20.75 s) | 26.35 s | PASSED (`<= 60s`) | 33.65 s (computed: `60 - 26.35`) | `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
+| R8 initial 1-min run (see the note under the table: `3b418d07de54` plus an uncommitted floor patch) | `3b418d07de54` | `2026-10-17T00:59:44+00:00` | `bld2r81m` | 60 s | 16.37, 22.36, 22.32, 26.35, 16.35 (avg 20.75 s) | 26.35 s | PASSED (`<= 60s`) | 33.65 s (computed: `60 - 26.35`) | `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
 | R8 final 1-min run | `29d889340b1a` | `2026-10-17T01:43:18+00:00` | `bld2r8fin` | 60 s | 18.34, 32.70, 16.37, 28.41, 32.39 (avg 25.64 s) | 32.70 s | PASSED (`<= 60s`) | 27.30 s (computed: `60 - 32.70`) | `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
+
+*Note on the R8 initial 1-min run:* the log header says commit `3b418d07de54`,
+but at that commit the API floor (`MIN_TARGET_LAG_MINUTES`), the migration CHECK
+and the gate's `TARGET_LAG_MINUTES` were 2 minutes, while the log prints
+`configuring targetLag=1 minutes`. It ran on `3b418d07de54` plus an uncommitted
+patch that set those to 1 (saved as
+`/home/shiro/rantai/review/bld2-r2-wip-0101.patch`, 3 files). The R8 final run
+on `29d889340b1a` is clean: committed code only.
 
 *Note on earlier unlogged run:* The pre-R6a 1-minute run quoted in plan Section 8 Decision R6 (`[40.70, 68.94, 56.85, 56.90, 52.82]` s, worst 68.94 s) has no surviving log file on disk.
 
-Commands executed for each logged run:
+Commands executed for each logged run (reconstructed, abbreviated with `...`;
+the logs themselves print only `===` section headers and the output of each step.
+Only the two R8 runs have a surviving script, `run-bld2-r8-1min.sh` and
+`run-bld2-r8-final.sh` in the same directory; the r1 and r6 lines are inferred
+from the project names and the log structure, not quoted):
 - `bld2-gate-r1.log`: `docker compose -p bld2r1f --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
 - `bld2-gate-r6.log`: `docker compose --env-file /home/shiro/rantai/bld2-gate.env -p bld2r6q --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
 - `bld2-gate-r8-1min.log`: `docker compose -p bld2r81m --env-file /home/shiro/rantai/bld2-gate.env --profile dagster build ... && up ... && run g3a-test-runner && run g7-test-runner`
@@ -91,7 +120,7 @@ Commands executed for each logged run:
 ## 3. What the content fingerprint costs (BLOCKER 4, SHOULD-FIX 22)
 
 The content fingerprint is computed with the 3-column query from
-`mart_content_fingerprint` in `rust/crates/lakehouse-api/src/routes/gold_export_history.rs`:
+`mart_content_fingerprint` in `rust/crates/lakehouse-api/src/gold_export_history.rs`:
 
 ```sql
 SELECT toString(count()) AS row_count,
@@ -103,6 +132,13 @@ FROM `silver`.`g7_dedupe_select_out` FORMAT JSON
 ```
 
 Measured results on `silver.g7_dedupe_select_out` (2005 rows):
+
+Label for the two `[fp]` blocks below: the log prints `clickhouse-client`'s
+JSON pretty-printed across many `[fp] ... run N:` lines. The `"elapsed": ...
+(... s)` lines are assembled from the one log line that carries
+`"elapsed": <seconds>,` plus a rounding added here, and the JSON data blocks
+are the `row_count`, `content_sum` and `schema_hash` values taken from separate
+log lines. They are not verbatim single lines of the log.
 
 ### From `/home/shiro/rantai/review/bld2-gate-r1.log` (commit `9a59250c77ec`)
 
