@@ -708,3 +708,14 @@ bbe40ee8ad06 feat(connectors): require TLS for SQL Server dials and verify CA wh
 #### 3. Scope & Plan Status
 - BLOCKER 11 fixed: `mssql-g6-cert-init` mints separate CA (`ca.crt`, `CA:TRUE`) and signed server certificate (`mssql-g6.pem`/`mssql-g6.key`, `CA:FALSE`, `serverAuth`, `SAN:DNS:mssql-g6`). `g6-ca-bundle-init` combines Postgres `ca.crt` and `mssql-g6`'s `ca.crt` into `g6_connector_ca` for `CONNECTOR_TLS_CA_FILE`. `dagster-code-location` sets `SSL_CERT_FILE` to `/etc/mssql-tls/ca.crt`. SQL Server connect, discover, and Dagster load/reload all pass.
 - BLOCKER 12 (sqlx VerifyCa to IP) remains deferred to SEC-41 (sqlx 0.9 upgrade).
+
+Round 3b, reviewed 2026-10-17 at `289019f2`: BLOCKER 11 fixed in
+`460ab242` as decided (fixture CA `CA:TRUE` with `keyCertSign`; server
+certificate `CA:FALSE`, `serverAuth`, SAN `DNS:mssql-g6`; CA key and
+serial deleted; the G6 bundle and Dagster's `SSL_CERT_FILE` hold the
+fixture CA). The developer's local G6 `g6-sql` run: SQL Server connect,
+discover, load and reload pass; PostgreSQL discover fails as expected
+(BLOCKER 12). The fixture key stays mode 0644 as before (the `mssql`
+user must read it; gate-only). BLOCKER 10's fix (`476d709e`) is reviewed
+with the full re-run after `SEC-41` merges, when this branch merges
+`main` again. Open: BLOCKER 12, Blocked by `SEC-41`.
