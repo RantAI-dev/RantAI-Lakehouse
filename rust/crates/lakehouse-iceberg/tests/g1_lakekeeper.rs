@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! G1 acceptance test — the P1 "floor" gate from
 //! `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md` §3.
 //!

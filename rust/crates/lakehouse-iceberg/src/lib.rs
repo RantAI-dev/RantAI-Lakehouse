@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! Bronze-layer Iceberg client: object storage, catalog, table create + append.
 //!
 //! # What this crate owns, and why it exists as its own crate
