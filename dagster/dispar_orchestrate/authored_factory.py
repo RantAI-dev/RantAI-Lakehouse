@@ -1201,9 +1201,6 @@ def build_authored_dependency_sensor(
     return _dependency_sensor
 
 
-# Built at Dagster code-load time, same pattern `agent_run_schedules`
-# (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
-# for every way this degrades to empty lists without raising.
 def lag_sensor_name(pipeline_id: str) -> str:
     """BLD-2 review R1 SHOULD-FIX 14: build the sensor name with the same helper as the factory."""
     safe_id = _dagster_safe_name(pipeline_id)
@@ -1253,10 +1250,14 @@ def build_authored_lag_sensor(
     def _lag_sensor(context: Any) -> Any:
         cfg_ = cfg or AuthoredPipelineConfig.from_env()
         if not cfg_.run_token:
-            # BLD-2 review R1 SHOULD-FIX 17: log once why no checks happen when run token unset
-            context.log.warning(
-                f"Target lag check for pipeline {pipeline_id!r}: DISPAR_RUN_TOKEN is unset; no lag checks will run"
-            )
+            # BLD-2 review R2 SHOULD-FIX 12: log once why no checks happen when run token unset
+            cursor = getattr(context, "cursor", None)
+            if cursor != "token_unset_warned":
+                context.log.warning(
+                    f"Target lag check for pipeline {pipeline_id!r}: DISPAR_RUN_TOKEN is unset; no lag checks will run"
+                )
+                if hasattr(context, "update_cursor"):
+                    context.update_cursor("token_unset_warned")
             return None
 
         url = f"{cfg_.api_url}/api/pipelines/runnable/{pipeline_id}/lag-check"
@@ -1316,26 +1317,88 @@ def build_authored_lag_sensor(
     return _lag_sensor
 
 
+def _pipeline_target(p: dict[str, Any]) -> str:
+    if p.get("target"):
+        return str(p["target"])
+    defn = p.get("definition") or {}
+    zone = defn.get("targetZone") or p.get("targetZone") or p.get("target_zone") or ""
+    table = defn.get("targetTable") or p.get("targetTable") or p.get("target_table") or ""
+    if zone and table:
+        return f"{zone}.{table}"
+    return ""
+
+
+def _pipeline_source(p: dict[str, Any]) -> str:
+    if p.get("source"):
+        return str(p["source"])
+    defn = p.get("definition") or {}
+    zone = defn.get("sourceZone") or p.get("sourceZone") or p.get("source_zone") or ""
+    table = defn.get("sourceTable") or p.get("sourceTable") or p.get("source_table") or ""
+    if zone and table:
+        return f"{zone}.{table}"
+    return ""
+
+
+def _pipeline_tenant(p: dict[str, Any]) -> str | None:
+    t = p.get("tenantId") or p.get("tenant_id")
+    return str(t) if t is not None else None
+
+
+def _pipeline_depends_on(p: dict[str, Any]) -> list[str]:
+    deps = p.get("dependsOn") or p.get("depends_on") or []
+    return [str(d) for d in deps]
+
+
 def build_authored_lag_sensors(
     pipeline_jobs: list[tuple[dict[str, Any], Any]],
     cfg: AuthoredPipelineConfig | None = None,
 ) -> list[Any]:
     """One lag sensor per authored pipeline with a time-based target lag.
-    BLD-2 review R1 BLOCKER 2: each sensor gets its own job plus the jobs of downstream pipelines it reads.
+    BLD-2 review R2 SHOULD-FIX 7: attach only jobs of downstream pipelines this pipeline actually reads
+    (direct source/dependsOn or recursive chain in the same tenant).
     """
-    downstream_jobs = [
-        job for p, job in pipeline_jobs
-        if isinstance(p.get("targetLag"), dict) and p.get("targetLag", {}).get("kind") == "downstream"
-    ]
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
-        allowed = [authored_job] + [j for j in downstream_jobs if j.name != authored_job.name]
+        target_lag = pipeline.get("targetLag")
+        if not isinstance(target_lag, dict) or target_lag.get("kind") != "lag":
+            continue
+
+        # Find downstream pipelines read by this pipeline (direct or transitive in same tenant)
+        visited_ids: set[str] = set()
+        queue = [pipeline]
+        while queue:
+            curr = queue.pop(0)
+            curr_tenant = _pipeline_tenant(curr)
+            curr_source = _pipeline_source(curr)
+            curr_deps = set(_pipeline_depends_on(curr))
+            for other_p, other_j in pipeline_jobs:
+                other_id = other_p.get("id", "")
+                if not other_id or other_id in visited_ids or other_id == pipeline.get("id"):
+                    continue
+                other_lag = other_p.get("targetLag")
+                if not isinstance(other_lag, dict) or other_lag.get("kind") != "downstream":
+                    continue
+                if _pipeline_tenant(other_p) != curr_tenant:
+                    continue
+                other_target = _pipeline_target(other_p)
+                if (other_target and other_target == curr_source) or (other_id in curr_deps):
+                    visited_ids.add(other_id)
+                    queue.append(other_p)
+
+        allowed = [authored_job] + [
+            j for other_p, j in pipeline_jobs
+            if other_p.get("id") in visited_ids and j.name != authored_job.name
+        ]
         sensor_ = build_authored_lag_sensor(pipeline, authored_job, allowed_jobs=allowed, cfg=cfg)
         if sensor_ is not None:
             sensors.append(sensor_)
     return sensors
 
 
+# Built at Dagster code-load time, same pattern `agent_run_schedules`
+# (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
+# for every way this degrades to empty lists without raising.
+#
 # Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
 # names statically) sees all four names `definitions.py` imports.
