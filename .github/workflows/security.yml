@@ -42,8 +42,13 @@ jobs:
       # available. See rust/deny.toml for the full justification — the
       # same exception is mirrored here since cargo-audit and cargo-deny
       # read separate ignore lists.
+      #
+      # RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369 (`zip`
+      # 8.6.0 extraction vulnerabilities) are unreachable: calamine 0.36.1
+      # never calls extract, and the workspace has no direct zip dependency.
+      # See rust/deny.toml for the full justification.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
         working-directory: rust
 
   cargo-deny:
