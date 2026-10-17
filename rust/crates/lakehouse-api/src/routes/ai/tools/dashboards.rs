@@ -26,7 +26,7 @@ fn viewer_for(principal: Option<&Principal>) -> Viewer {
 /// The tool's error for a refused dashboard or chart: the route's own
 /// sentence, or, for a store that could not be read, the fixed message with
 /// its reference id (never the database's text).
-fn refused(gate: Gate) -> Value {
+pub(super) fn refused(gate: Gate) -> Value {
     match gate {
         Gate::Missing(sentence) => json!({ "error": sentence }),
         Gate::Store(cause) => {
