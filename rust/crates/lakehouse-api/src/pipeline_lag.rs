@@ -859,13 +859,14 @@ pub async fn run_lag_check(
             .await
             .map_err(|err| store_err(&pipeline.id, "upstream chain failed", err))?;
 
-        // BLD-2 review R3 BLOCKER 2 / decision R12: lock P and every U in ONE statement ordered by pipeline_id
-        let mut all_ids = vec![pipeline.id.clone()];
-        for u in &chain {
-            all_ids.push(u.id.clone());
-        }
-        all_ids.sort();
-        all_ids.dedup();
+        // BLD-2 review R3 BLOCKER 2 / decision R12: lock P and every U in ONE statement.
+        // BLD-2 review R4 SHOULD-FIX 1: the id order is decided inside
+        // `lock_lag_states_ordered`, so no caller can lock in a
+        // different order and reintroduce a interleaving deadlock.
+        let all_ids: Vec<String> = [pipeline.id.clone()]
+            .into_iter()
+            .chain(chain.iter().map(|u| u.id.clone()))
+            .collect();
 
         let mut locked_states =
             pipelines::lock_lag_states_ordered(&mut tx, &all_ids, pipeline.tenant_id)
@@ -992,7 +993,7 @@ async fn evaluate_upstream_chain(
     chain: &[Pipeline],
     state: &mut CheckState,
     stored: Option<&pipelines::PipelineLagState>,
-    locked_states: &mut std::collections::HashMap<String, Option<pipelines::PipelineLagState>>,
+    locked_states: &mut std::collections::BTreeMap<String, Option<pipelines::PipelineLagState>>,
     target_seconds: Option<i32>,
     job_name: &str,
     now: OffsetDateTime,

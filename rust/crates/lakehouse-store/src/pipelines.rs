@@ -1992,30 +1992,37 @@ pub async fn upsert_lag_state_conn(
     Ok(PipelineLagState::from(row))
 }
 
-/// BLD-2 review R1 decision R5 / SHOULD-FIX 7: Concurrency.
+/// BLD-2 review R3 BLOCKER 2 / decision R12; BLD-2 review R4 SHOULD-FIX 1:
+/// lock P's row AND every U row of the chain in ONE statement before any
+/// read-modify-write, so two overlapping checks can never hold the same
+/// rows in different orders. The function owns the order — it sorts and
+/// dedups `ids` itself (the missing-row INSERTs then also run in sorted
+/// order) and returns a [`std::collections::BTreeMap`], so a caller
+/// observing the map observes the same sorted-key snapshot no matter how
+/// it collected the chain.
 ///
-/// Reads the pipeline's lag state with `SELECT ... FOR UPDATE` inside `conn`'s
-/// transaction, serializing overlapping checks of the same pipeline.
-/// Inserts an initial empty row if none exists so the lock can be acquired.
+/// A lag state whose row has never been checked (`last_check_at IS NULL`)
+/// maps to `None`, the same shape [`PipelineLagState`] picks from.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] if the database query fails.
-/// BLD-2 review R3 BLOCKER 2 / decision R12:
-/// Lock P's row and every U row the chain will touch in ONE statement,
-/// ordered by `pipeline_id`, before any read-modify-write.
+/// Returns [`StoreError::Database`] if a query fails.
 pub async fn lock_lag_states_ordered(
     conn: &mut sqlx::PgConnection,
     ids: &[String],
     tenant_id: Option<Uuid>,
-) -> Result<std::collections::HashMap<String, Option<PipelineLagState>>, StoreError> {
-    if ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
+) -> Result<std::collections::BTreeMap<String, Option<PipelineLagState>>, StoreError> {
+    let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
+    ordered.sort();
+    ordered.dedup();
+    if ordered.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
     }
 
-    for id in ids {
+    for id in &ordered {
         sqlx::query(
-            "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, $2)              ON CONFLICT (pipeline_id) DO NOTHING",
+            "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, $2) \
+             ON CONFLICT (pipeline_id) DO NOTHING",
         )
         .bind(id)
         .bind(tenant_id)
@@ -2024,11 +2031,14 @@ pub async fn lock_lag_states_ordered(
     }
 
     let sql = format!(
-        "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1) ORDER BY pipeline_id FOR UPDATE"
+        "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = ANY($1) \
+         ORDER BY pipeline_id FOR UPDATE"
     );
-    let rows: Vec<LagStateRow> = sqlx::query_as(&sql).bind(ids).fetch_all(&mut *conn).await?;
-
-    let mut map = std::collections::HashMap::new();
+    let rows: Vec<LagStateRow> = sqlx::query_as(&sql)
+        .bind(&ordered)
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut map = std::collections::BTreeMap::new();
     for row in rows {
         let pid = row.pipeline_id.clone();
         let state = if row.last_check_at.is_none() {
@@ -2038,45 +2048,10 @@ pub async fn lock_lag_states_ordered(
         };
         map.insert(pid, state);
     }
-    for id in ids {
-        map.entry(id.clone()).or_insert(None);
+    for id in &ordered {
+        map.entry(id.to_string()).or_insert(None);
     }
     Ok(map)
-}
-
-/// Fetch a pipeline's lag state with an exclusive row lock (`FOR UPDATE`).
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if the database query fails.
-pub async fn get_lag_state_for_update(
-    conn: &mut sqlx::PgConnection,
-    pipeline_id: &str,
-    tenant_id: Option<Uuid>,
-) -> Result<Option<PipelineLagState>, StoreError> {
-    sqlx::query(
-        "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, $2) \
-         ON CONFLICT (pipeline_id) DO NOTHING",
-    )
-    .bind(pipeline_id)
-    .bind(tenant_id)
-    .execute(&mut *conn)
-    .await?;
-
-    let sql = format!(
-        "SELECT {LAG_STATE_COLUMNS} FROM pipeline_lag_state WHERE pipeline_id = $1 FOR UPDATE"
-    );
-    let row: Option<LagStateRow> = sqlx::query_as(&sql)
-        .bind(pipeline_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-    Ok(row.and_then(|r| {
-        if r.last_check_at.is_none() {
-            None
-        } else {
-            Some(PipelineLagState::from(r))
-        }
-    }))
 }
 
 /// Set (or clear, with `None`) a pipeline's target lag — the store half of

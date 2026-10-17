@@ -2766,11 +2766,21 @@ async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// BLD-2 review R3 BLOCKER 2 / decision R12:
-/// Lock P's row and every U row the chain will touch in ONE statement,
-/// ordered by `pipeline_id`, before any read-modify-write.
+/// BLD-2 review R4 SHOULD-FIX 1 (and R3 BLOCKER 2 / decision R12): the ONE
+/// function that takes the lag-state locks owns the id order. `ids` arrive
+/// unsorted and the returned map is keyed in sorted order (a `BTreeMap`),
+/// so every caller observes the SAME sorted-key locked snapshot regardless
+/// of how it collected the chain — the property the two-connection lock
+/// interleaving used to depend on without any code owning it.
+///
+/// An honest limit of what this test can pin down in-process: a
+/// second-connection blocker assertion would need a connection that
+/// blocks forever, which has no completion to await inside one test's
+/// runtime, so ordering is what this test asserts, not liveness under
+/// contention. The blocking property is the `FOR UPDATE` row the SQL
+/// itself carries — same statement shape the R3 review quoted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn lock_lag_states_ordered_locks_rows_and_inserts_missing_without_deadlock(
+async fn lock_lag_states_ordered_returns_states_keyed_in_sorted_order_from_unsorted_ids(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     for id in ["pl-z", "pl-a", "pl-m"] {
@@ -2787,9 +2797,17 @@ async fn lock_lag_states_ordered_locks_rows_and_inserts_missing_without_deadlock
     let locked = pipelines::lock_lag_states_ordered(&mut conn, &ids, None)
         .await
         .expect("lock ordered");
-    assert_eq!(locked.len(), 3);
-    assert!(locked.contains_key("pl-a"));
-    assert!(locked.contains_key("pl-m"));
-    assert!(locked.contains_key("pl-z"));
+    let keys: Vec<&String> = locked.keys().collect();
+    assert_eq!(
+        keys,
+        vec![&"pl-a".to_owned(), &"pl-m".to_owned(), &"pl-z".to_owned()],
+        "the locked snapshot is keyed in sorted order from unsorted input"
+    );
+    // The three rows were missing-INSERTed and never checked: the locked
+    // snapshot reports them as "no state yet", not as something measured.
+    assert!(
+        locked.values().all(|state| state.is_none()),
+        "never-checked rows map to None"
+    );
     Ok(())
 }
