@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! Threshold alerts & scheduled digests over `serving.*` marts, persisted in
 //! `console.alert_rule`, delivered via webhook/email (see
 //! [`lakehouse_notify`]).
@@ -2980,8 +2973,8 @@ mod tests {
         // measure/agg/threshold/board are cleared for this kind — a
         // Freshness rule is target-only, nothing else on the row means
         // anything for it.
-        assert!(normalized.measure.is_empty());
-        assert!(normalized.board.is_empty());
+        assert_eq!(normalized.measure, "");
+        assert_eq!(normalized.board, "");
     }
 
     #[test]
