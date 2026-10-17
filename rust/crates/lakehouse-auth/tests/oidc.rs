@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Tests for `lakehouse_auth::oidc` against a locally generated key and a
 //! `wiremock` JWKS server — never a real identity provider.
 //!
@@ -665,7 +661,7 @@ async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
     // This fixture's `OidcConfig` carries no `role_map`
     // (`authenticator`'s own construction), so there is nothing to map —
     // `mapped_role_names` must be empty, not fabricated.
-    assert!(mapped_role_names.is_empty());
+    assert_eq!(mapped_role_names, [] as [std::string::String; 0]);
     Ok(())
 }
 

@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn malformed_tokens_grant_nothing() {
         let set = PermissionSet::parse("not-a-pair, :missing-resource, missing-action:, ,");
-        assert!(set.is_empty());
+        assert_eq!(set, PermissionSet::default());
         assert!(!set.has("not-a-pair:anything"));
     }
 
