@@ -2466,11 +2466,12 @@ services:
   # pipeline reads as its author, proven on the ROWS it writes. Its own
   # service rather than a second command on `g7-test-runner`, because that
   # one's `command` is fixed to the G7 script and `docker compose run`
-  # REPLACES a command -- running this through it would drop the
-  # `pip install requests` its `entrypoint` relies on, and the script would
-  # exit on `import requests` having proved nothing. Same image, same
-  # read-only `./ops/g7` mount, same bootstrap-admin credential from the
-  # operator's `.env`.
+  # REPLACES a command, and the two services no longer share an image.
+  # BLD-2 review R3 SHOULD-FIX 9: `g7-test-runner` now builds
+  # `ops/g7/Dockerfile` (its dependencies are baked in); this service stays
+  # on `python:3.12-slim` and installs `requests` in its own `command`.
+  # Same read-only `./ops/g7` mount, same bootstrap-admin credential from
+  # the operator's `.env`.
   #
   # `BLD1_NO_AUTHOR_PIPELINE_ID` is the third case's fixture (a pipeline
   # whose `run_as` was cleared, which is what a service identity's create
