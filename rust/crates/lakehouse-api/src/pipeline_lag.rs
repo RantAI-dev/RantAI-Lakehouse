@@ -3749,7 +3749,10 @@ mod tests {
         let t_past = t0 - time::Duration::seconds(30);
         let u_old = tokens_of(&[("bronze.orders", "iceberg:1")]);
         let u_new = tokens_of(&[("bronze.orders", "iceberg:2")]);
-        // Set U to exhausted: request_attempt = 2 > max_retries(1), requested != consumed
+        // Set U to outstanding: a run is requested but not yet consumed
+        // (request_attempt = 0, within max_retries(1); requested_tokens !=
+        // consumed_tokens). The exhausted case (attempt > max_retries) has
+        // its own test above — BLD-2 review R4 SHOULD-FIX 5.
         let update_u = LagStateUpdate {
             pipeline_id: u.id.clone(),
             tenant_id: u.tenant_id,
