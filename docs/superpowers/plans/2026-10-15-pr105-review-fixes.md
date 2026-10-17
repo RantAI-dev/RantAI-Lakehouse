@@ -367,6 +367,23 @@ conflicts in `store.rs` and this file resolved by hand (see the merge commit).
   emulates the idempotence); the real statements are unrun. No full
   workspace run, `bun run lint/test`.
 
+### R-A3 / R-A4 fix — developer (Claude Sonnet), 2026-10-17
+
+- Commit: `fix(bi): copy a board's legacy embed state in one INSERT and include trashed boards (PR #105 review R-A3/R-A4 SHOULD-FIX)`.
+- R-A3: one multi-row `INSERT` per board (`legacy_embed_insert`). R-A4: no
+  `is_deleted` condition in the copy's `SELECT`.
+- Tests: the one-`INSERT` assertion replaces the earlier three-`INSERT` ones;
+  new `the_legacy_embed_copy_does_not_skip_boards_in_the_trash` (checks the
+  query text; the mock does not filter).
+- Commands (foreground, shared target, jobs 2): `cargo fmt --check` clean;
+  clippy bi/api/dagster/core `--all-targets -D warnings` clean;
+  `cargo test -p lakehouse-bi` 433 passed, 3 ignored, doc-test 1;
+  `-p lakehouse-api --lib -- embed dashboard upstream_error connectors` 223;
+  `--test embed_tokens` 21; `sec11_guard` 4; `upstream_errors` 6;
+  `route_auth` (threads 2) 42.
+- Not verified: that ClickHouse writes a multi-row `INSERT` as one block
+  (the planner's premise; not run here), full workspace run, `bun run lint/test`.
+
 ## 7. Review
 
 ### Review — slice A merged onto `main`, 2026-10-17, planner
