@@ -86,6 +86,12 @@ class FakeSession:
         return self._answer("DELETE", url, None)
 
 
+def confirm_reply(tool: str, result: dict[str, Any], outcome: str = "executed", status: int = 200) -> dict[str, Any]:
+    """What `send_confirm` returns: the `POST /api/ai/tool` reply
+    `{tool, outcome, result}` with the HTTP status added as `_status`."""
+    return {"tool": tool, "outcome": outcome, "result": result, "_status": status}
+
+
 # ── pass rule and set verdict ─────────────────────────────────────────────
 
 
@@ -348,7 +354,7 @@ class CleanupPlanTests(unittest.TestCase):
     def test_created_objects_are_collected_from_setup_trace_and_confirm(self) -> None:
         setup_results = [{"kind": "board", "id": "b1"}]
         trace = [{"tool": "create_chart", "result": {"created": True, "id": "c1"}}, {"tool": "create_chart", "result": {"error": "no"}}]
-        confirms = [{"tool": "create_calculated_field", "result": {"ok": True, "id": "f1"}}]
+        confirms = [{"tool": "create_calculated_field", "result": confirm_reply("create_calculated_field", {"ok": True, "id": "f1"})}]
         found = m.collect_created(setup_results, [trace], confirms)
         # The confirmed calculated field is collected too; the failed chart is not.
         self.assertEqual(
@@ -368,8 +374,44 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertEqual(m.collect_created([], [trace], []), [])
 
     def test_a_calc_field_confirm_that_failed_is_not_collected(self) -> None:
-        confirms = [{"tool": "create_calculated_field", "result": {"error": "bad", "id": "f-theirs"}}]
+        confirms = [{"tool": "create_calculated_field", "result": confirm_reply("create_calculated_field", {"error": "bad", "id": "f-theirs"}, outcome="failed")}]
         self.assertEqual(m.collect_created([], [], confirms), [])
+
+    def test_a_confirmed_chart_and_board_are_collected_from_the_real_reply_shape(self) -> None:
+        # `POST /api/ai/tool` answers {tool, outcome, result}; the created
+        # object's id and `created` marker are in the inner `result`.
+        confirms = [
+            {"tool": "create_chart", "result": confirm_reply("create_chart", {"created": True, "id": "c77"})},
+            {"tool": "create_board", "result": confirm_reply("create_board", {"created": True, "id": "b88"})},
+        ]
+        self.assertEqual(
+            m.collect_created([], [], confirms),
+            [{"kind": "chart", "id": "c77"}, {"kind": "board", "id": "b88"}],
+        )
+
+    def test_a_confirmed_chart_reaches_the_state_check_and_the_cleanup_of_a_run(self) -> None:
+        # The seam: a case that confirms a chart. The chart the confirm made
+        # counts in `expect_state`, and the run deletes it afterwards.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/ai/chat"): {
+                "answer": "Drafted.",
+                "toolTrace": [{"tool": "create_chart", "args": {"caption": "C"},
+                               "result": {"needs_confirmation": True, "tool": "create_chart", "args": {"caption": "C"}}}],
+            },
+            ("POST", "/api/ai/tool"): confirm_reply("create_chart", {"created": True, "id": "c77"}),
+            ("GET", "/api/dashboard/specs"): {"specs": [{"id": "c77"}]},
+        })
+        case = {
+            "id": "confirmed_chart",
+            "mode": "build",
+            "confirm": True,
+            "turns": ["Draw it."],
+            "expect_state": [{"path": "/api/dashboard/specs", "list": "specs", "where": {}, "count": 1}],
+        }
+        result = m.run_case(cfg, session, case)
+        self.assertEqual(result["problems"], [])
+        self.assertIn(("DELETE", "http://api.test/api/dashboard/specs?id=c77", None), session.calls)
 
     def test_a_calc_field_created_in_a_turn_is_collected_as_a_field(self) -> None:
         # The real success: `{ok: true, field: {id}}`, with `id` lifted to the top.
@@ -435,6 +477,13 @@ class SetupTests(unittest.TestCase):
         filled = m.fill_check(check, names)
         self.assertEqual(filled["where"], {"id": "c-1"})
         self.assertEqual(m.expect_state_problems(cfg, session, filled, own_ids={"c-1"}), [])
+
+    def test_an_expect_state_where_key_can_use_a_saved_name(self) -> None:
+        # A board's layout is keyed by chart id, so the id is part of the key.
+        check = {"path": "/api/dashboard/boards", "list": "boards",
+                 "where": {"id": "{board}", "layout.{chart}.w": 6}, "count": 1}
+        filled = m.fill_check(check, {"board": "b-7", "chart": "c-1"})
+        self.assertEqual(filled["where"], {"id": "b-7", "layout.c-1.w": 6})
 
     def test_a_failed_setup_call_raises_so_the_run_is_a_setup_error(self) -> None:
         cfg = make_cfg()
@@ -677,6 +726,69 @@ class RunCaseTests(unittest.TestCase):
         self.assertEqual(modes, ["ask", "build"])
 
 
+    def test_a_run_fills_the_setup_names_in_the_expected_tool_args(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/dashboard/boards"): {"board": {"id": "b-9"}},
+            ("POST", "/api/ai/chat"): {
+                "answer": "Renamed.",
+                "toolTrace": [{"tool": "update_board", "args": {"id": "b-9", "name": "N"}, "result": {"ok": True}}],
+            },
+        })
+        case = {
+            "id": "rename",
+            "mode": "build",
+            "setup": [{"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {}, "id_at": "board.id"}],
+            "turns": ["Rename it."],
+            "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}},
+        }
+        result = m.run_case(cfg, session, case)
+        self.assertEqual(result["missing"], [])
+
+    def run_confirming_case(self, reply: Any) -> dict[str, Any]:
+        session = FakeSession({
+            ("POST", "/api/ai/chat"): {
+                "answer": "Drafted.",
+                "toolTrace": [{"tool": "create_chart", "args": {"caption": "C"},
+                               "result": {"needs_confirmation": True, "tool": "create_chart", "args": {"caption": "C"}}}],
+            },
+            ("POST", "/api/ai/tool"): reply,
+        })
+        case = {"id": "confirming", "mode": "build", "confirm": True, "turns": ["Draw it."]}
+        return m.run_case(make_cfg(), session, case)
+
+    def test_a_confirm_that_came_back_executed_adds_no_problem(self) -> None:
+        result = self.run_confirming_case(confirm_reply("create_chart", {"created": True, "id": "c1"}))
+        self.assertEqual(result["problems"], [])
+
+    def test_a_confirm_with_http_500_is_a_problem_naming_the_status(self) -> None:
+        reply = FakeResponse(500, {"error": "boom"})
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("HTTP 500", problem[0])
+
+    def test_a_confirm_with_an_error_status_is_a_problem_even_when_the_body_says_executed(self) -> None:
+        reply = FakeResponse(502, confirm_reply("create_chart", {"created": True, "id": "c1"}))
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("HTTP 502", problem[0])
+
+    def test_a_confirm_with_an_outcome_other_than_executed_is_a_problem_naming_it(self) -> None:
+        reply = confirm_reply("create_chart", {"error": "bad spec"}, outcome="failed")
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("outcome failed", problem[0])
+        self.assertIn("HTTP 200", problem[0])
+
+    def test_a_confirm_reply_with_an_error_is_a_problem(self) -> None:
+        reply = {"tool": "create_chart", "outcome": "executed", "error": "late failure", "result": {}}
+        result = self.run_confirming_case(reply)
+        self.assertTrue([p for p in result["problems"] if p.startswith("confirm create_chart")])
+
+
 # ── the existing 28 cases score as before ─────────────────────────────────
 
 
@@ -716,6 +828,58 @@ class ExistingCasesTests(unittest.TestCase):
         self.assertEqual(out["completeness"], 1.0)
         self.assertEqual(len(out["runs"]), 1)
         self.assertTrue(out["passed"])
+
+
+class ScoreCaseTests(unittest.TestCase):
+    """`score_case` on one scripted turn: no facts, so the tool check, the
+    refusal cues and the confirm problems are the only things judged."""
+
+    @staticmethod
+    def body(answer: str, trace: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return {"answer": answer, "toolTrace": trace or [], "_status": 200, "_elapsed_s": 1}
+
+    def test_a_name_in_args_contains_is_filled_before_it_is_compared(self) -> None:
+        case = {"id": "rename", "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}}}
+        trace = [{"tool": "update_board", "args": {"id": "b-42", "name": "New"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)], names={"board": "b-42"})
+        self.assertEqual(scored["missing"], [])
+
+    def test_a_name_that_is_not_the_called_id_is_still_missing(self) -> None:
+        case = {"id": "rename", "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}}}
+        trace = [{"tool": "update_board", "args": {"id": "b-other"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)], names={"board": "b-42"})
+        self.assertEqual(len(scored["missing"]), 1)
+
+    def test_names_are_optional_for_a_rescore(self) -> None:
+        # `--rescore` has no setup names: an `args_contains` without a
+        # placeholder scores as before.
+        case = {"id": "t", "expect_tool": {"name": "create_chart", "args_contains": {"kind": "bar"}}}
+        trace = [{"tool": "create_chart", "args": {"kind": "bar"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)])
+        self.assertEqual(scored["missing"], [])
+
+    def refused(self, answer: str) -> bool:
+        case = {"id": "r", "expect_refusal": True}
+        scored = m.score_case(make_cfg(), None, case, [self.body(answer)])
+        return "answered a question the data cannot answer" not in scored["problems"]
+
+    def test_a_plain_cannot_is_a_refusal(self) -> None:
+        self.assertTrue(self.refused("I can't create charts here."))
+        self.assertTrue(self.refused("Charts can't read a Silver table directly."))
+        self.assertTrue(self.refused("I cannot do that in ask mode."))
+        self.assertTrue(self.refused("I can not draw that."))
+        self.assertTrue(self.refused("I am not able to change the board."))
+
+    def test_an_indonesian_cannot_is_a_refusal(self) -> None:
+        self.assertTrue(self.refused("Saya tidak bisa membuat grafik di sini."))
+        self.assertTrue(self.refused("Itu tidak dapat dilakukan."))
+
+    def test_a_curly_apostrophe_still_counts(self) -> None:
+        self.assertTrue(self.refused("I can\u2019t create charts here."))
+        self.assertTrue(self.refused("That isn\u2019t available."))
+
+    def test_an_answer_with_no_cue_is_not_a_refusal(self) -> None:
+        self.assertFalse(self.refused("Here is the chart you asked for."))
 
 
 # ── exit codes and the output file ────────────────────────────────────────
@@ -890,6 +1054,37 @@ class DashboardRowsTests(unittest.TestCase):
         grouped = {"id": "g", "kind": "table", "mart": "mart_wisman", "def": {"kind": "table"}}
         self.assertFalse(m.where_matches(grouped, where))
 
+    def test_arrange_case_is_true_only_for_a_board_whose_tiles_are_half_width(self) -> None:
+        # `GET /api/dashboard/boards` returns each board's `layout` as
+        # {chartId: {x, y, w, h}}. A board with its charts but no saved layout
+        # (the state before the write) must fail the check; the arranged one passes.
+        cfg = make_cfg()
+        check = self.cases()["board_arrange_half_width"]["expect_state"][0]
+        names = {"board": "b-7", "chart_a": "c-a", "chart_b": "c-b"}
+        filled = m.fill_check(check, names)
+
+        def problems(layout: dict[str, Any]) -> list[str]:
+            session = FakeSession({("GET", "/api/dashboard/boards"): {"boards": [
+                {"id": "b-7", "name": "T", "layout": layout, "chartCount": 2, "builtin": False},
+            ]}})
+            return m.expect_state_problems(cfg, session, filled, own_ids={"b-7"})
+
+        self.assertTrue(problems({}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 0, "y": 4, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}}))
+        # Each of the four layout keys is guarded on its own: chart a correct,
+        # chart b wrong in exactly one of width or row.
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 0, "y": 0, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 4, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 4, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
+        self.assertEqual(
+            problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}), []
+        )
+        self.assertEqual(
+            problems({"c-a": {"x": 6, "y": 0, "w": 6, "h": 2}, "c-b": {"x": 0, "y": 0, "w": 6, "h": 2}}), []
+        )
+
     def test_chart_on_new_board_links_the_chart_to_the_board_it_created(self) -> None:
         # row 14: the chart's `board` is the id of the board this run created.
         case = self.cases()["chart_on_new_board"]
@@ -941,7 +1136,7 @@ class DashboardRowsTests(unittest.TestCase):
                   "result": {"needs_confirmation": True, "tool": "create_calculated_field",
                              "args": {"formula": "SELECT 1"}}}]
         confirms = [{"tool": "create_calculated_field",
-                     "result": {"ok": True, "field": {"formula": "SELECT 1"}}}]
+                     "result": confirm_reply("create_calculated_field", {"ok": True, "field": {"formula": "SELECT 1"}})}]
         self.assertTrue(m.formula_problems(trace, confirms, ["SELECT"]))
 
     def test_a_clean_confirmed_formula_is_not_a_problem(self) -> None:
@@ -949,7 +1144,7 @@ class DashboardRowsTests(unittest.TestCase):
                   "result": {"needs_confirmation": True, "tool": "create_calculated_field",
                              "args": {"formula": "[jumlah_event] / 2"}}}]
         confirms = [{"tool": "create_calculated_field",
-                     "result": {"ok": True, "field": {"formula": "[jumlah_event] / 2"}}}]
+                     "result": confirm_reply("create_calculated_field", {"ok": True, "field": {"formula": "[jumlah_event] / 2"}})}]
         self.assertEqual(m.formula_problems(trace, confirms, ["SELECT"]), [])
 
     def test_a_pending_confirmation_alone_is_not_a_created_formula(self) -> None:

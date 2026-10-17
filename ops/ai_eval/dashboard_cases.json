@@ -353,7 +353,7 @@
     "turns": ["Put these two charts side by side at the top, each half the width."],
     "expect_tool": {"name": "arrange_board", "args_contains": {"board": "{board}"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "chartCount": 2}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "chartCount": 2, "layout.{chart_a}.w": 6, "layout.{chart_a}.y": 0, "layout.{chart_b}.w": 6, "layout.{chart_b}.y": 0}, "count": 1}
     ]
   },
   {
