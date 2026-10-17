@@ -631,6 +631,125 @@ async fn ensure_board_state_columns(ch: &ChClient) -> Result<(), ChError> {
     Ok(())
 }
 
+/// The `Unix epoch` as an event `at`: every copied legacy event carries it, so
+/// any event written since sorts after it (`argMax` on `at`).
+const LEGACY_EMBED_EPOCH: &str = "toDateTime64(0, 6, 'UTC')";
+
+/// One-time copy of the embed state that `5d8f61e1` (`SEC-12`) stored on the
+/// `console.bi_board` row into `console.bi_board_embed_event` (PR #105 review
+/// R-A1 BLOCKER).
+///
+/// Why: the event table replaces three `bi_board` columns that already
+/// reached `main`. Nothing reads them any more, so without this copy a token
+/// withdrawn on a deployed database would be accepted again and a board's
+/// allowed origins would be lost. The legacy columns stay in place and are
+/// never written again; dropping them is a later migration, not this one.
+///
+/// Rules: it runs only when `system.columns` shows legacy columns on
+/// `console.bi_board` (a fresh database has none and nothing runs); every
+/// copied event has `at` = the epoch ([`LEGACY_EMBED_EPOCH`]), so a real event
+/// written since wins; it is idempotent because a board that already has an
+/// event at the epoch is skipped by the query itself; values are bound with
+/// [`SqlLiteral`], never formatted in.
+async fn copy_legacy_embed_state(ch: &ChClient) -> Result<(), ChError> {
+    let present = ch
+        .rows(
+            "SELECT name FROM system.columns WHERE database = 'console' AND table = 'bi_board' \
+             AND name IN ('embed_revoked_before', 'embed_revoked_jti_json', 'embed_origins_json')",
+            None,
+        )
+        .await?;
+    let has = |name: &str| present.iter().any(|r| row_str(r, "name") == name);
+    let (has_before, has_jti, has_origins) = (
+        has("embed_revoked_before"),
+        has("embed_revoked_jti_json"),
+        has("embed_origins_json"),
+    );
+    if !(has_before || has_jti || has_origins) {
+        return Ok(());
+    }
+    // A column that is not there reads as its constant default.
+    let before = if has_before {
+        "embed_revoked_before"
+    } else {
+        "0"
+    };
+    let jti = if has_jti {
+        "embed_revoked_jti_json"
+    } else {
+        "'[]'"
+    };
+    let origins = if has_origins {
+        "embed_origins_json"
+    } else {
+        "'[]'"
+    };
+    let sql = format!(
+        "SELECT id, {before} AS embed_revoked_before, {jti} AS embed_revoked_jti_json, \
+         {origins} AS embed_origins_json FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND ({before} > 0 OR {jti} NOT IN ('', '[]') \
+         OR {origins} NOT IN ('', '[]')) \
+         AND id NOT IN (SELECT board_id FROM console.bi_board_embed_event \
+         WHERE at = {LEGACY_EMBED_EPOCH})"
+    );
+    for row in ch.rows(&sql, None).await? {
+        for insert in legacy_embed_inserts(&row) {
+            ch.exec(&insert, None).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The event `INSERT`s that carry one legacy board row's embed state over.
+/// Always at least one when the row has any state, so the epoch marker that
+/// makes [`copy_legacy_embed_state`] idempotent is always written.
+fn legacy_embed_inserts(row: &serde_json::Map<String, Value>) -> Vec<String> {
+    let board = SqlLiteral::from(row_str(row, "id"));
+    let revoked_before = row_u64(row, "embed_revoked_before");
+    let jti_json = row_str(row, "embed_revoked_jti_json").trim();
+    let origins_json = row_str(row, "embed_origins_json").trim();
+    let mut out = Vec::new();
+    let mut revoke_all = |value: u64| {
+        out.push(format!(
+            "INSERT INTO console.bi_board_embed_event (board_id, kind, revoked_before, at) \
+             VALUES ({board}, 'revoke_all', {value}, {LEGACY_EMBED_EPOCH})"
+        ));
+    };
+    if revoked_before > 0 {
+        revoke_all(revoked_before);
+    }
+    let tokens: Option<Vec<WithdrawnToken>> = if jti_json.is_empty() {
+        Some(Vec::new())
+    } else {
+        serde_json::from_str(jti_json).ok()
+    };
+    let mut withdraws = Vec::new();
+    match tokens {
+        Some(list) => {
+            for t in list {
+                withdraws.push(format!(
+                    "INSERT INTO console.bi_board_embed_event (board_id, kind, jti, exp, at) \
+                     VALUES ({board}, 'withdraw', {}, {}, {LEGACY_EMBED_EPOCH})",
+                    SqlLiteral::from(t.jti.as_str()),
+                    t.exp
+                ));
+            }
+        }
+        // Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
+        // does not parse withdraws every token of the board.
+        None => revoke_all(u64::MAX),
+    }
+    out.extend(withdraws);
+    if !origins_json.is_empty() && origins_json != "[]" {
+        out.push(format!(
+            "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json, at) \
+             VALUES ({board}, 'origins', {}, {LEGACY_EMBED_EPOCH})",
+            SqlLiteral::from(origins_json)
+        ));
+    }
+    out
+}
+
 /// The tables behind saved fields and hierarchies (`BI-8`, `BI-10`). Split
 /// out of [`ensure_bi_table_uncached`] to keep it under clippy's line limit.
 async fn ensure_field_tables(ch: &ChClient) -> Result<(), ChError> {
@@ -812,6 +931,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     )
     .await?;
     ensure_field_tables(ch).await?;
+    copy_legacy_embed_state(ch).await?;
     Ok(())
 }
 
@@ -4233,10 +4353,13 @@ mod tests {
         // `console.bi_hierarchy` table. 20 = those 18 plus the BI-11
         // `bi_board.params_json` column and the `console.bi_param` table.
         // 22 = those 20 plus the BI-2 `console.bi_metric` and
-        // `console.bi_segment` tables.
+        // `console.bi_segment` tables. 23 = those 22 plus the one
+        // `system.columns` query that guards the legacy embed copy (R-A1):
+        // this mock answers it with no columns, so no copy runs; it is a
+        // read, not a DDL statement, but it is a request all the same.
         assert_eq!(
-            first_call_requests, 22,
-            "first call should issue all 22 DDL statements"
+            first_call_requests, 23,
+            "first call should issue the 22 DDL statements and the one legacy-column check"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -4739,6 +4862,173 @@ mod tests {
             !body.contains("embed_origins_json"),
             "must not contain embed_origins_json: {body}"
         );
+    }
+
+    /// A `ClickHouse` stand-in for the legacy embed copy: answers the
+    /// `system.columns` check with `columns`, serves one legacy board row
+    /// until an epoch-stamped event has been inserted (what the real query's
+    /// `NOT IN (... WHERE at = epoch)` does), and records nothing else.
+    struct LegacyEmbedCh {
+        columns: Vec<&'static str>,
+        copied: std::sync::atomic::AtomicBool,
+    }
+    impl wiremock::Respond for LegacyEmbedCh {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            use std::sync::atomic::Ordering;
+            let sql = String::from_utf8_lossy(&request.body);
+            let data = if sql.contains("FROM system.columns") {
+                self.columns
+                    .iter()
+                    .map(|n| serde_json::json!({ "name": n }))
+                    .collect::<Vec<_>>()
+            } else if sql.contains("FROM console.bi_board FINAL")
+                && !self.copied.load(Ordering::SeqCst)
+            {
+                vec![serde_json::json!({
+                    "id": "b_legacy",
+                    "embed_revoked_before": "1700000000",
+                    "embed_revoked_jti_json": r#"[{"jti":"gone-1","exp":4102444800}]"#,
+                    "embed_origins_json": r#"["https://a.example","https://b.example"]"#,
+                })]
+            } else {
+                if sql.starts_with("INSERT INTO console.bi_board_embed_event") {
+                    self.copied.store(true, Ordering::SeqCst);
+                }
+                Vec::new()
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [], "data": data, "rows": data.len()
+            }))
+        }
+    }
+
+    const ALL_LEGACY_COLUMNS: [&str; 3] = [
+        "embed_revoked_before",
+        "embed_revoked_jti_json",
+        "embed_origins_json",
+    ];
+
+    async fn run_legacy_copy(columns: Vec<&'static str>, runs: usize) -> Vec<String> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns,
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+        for _ in 0..runs {
+            copy_legacy_embed_state(&ch).await.unwrap();
+        }
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|sql| sql.starts_with("INSERT"))
+            .collect()
+    }
+
+    /// PR #105 review R-A1 BLOCKER, accept (1): a legacy database with one
+    /// withdrawn jti, a cut-off and two origins. Feeding the copied events
+    /// through the same aggregation the reads use: the jti is refused, a
+    /// token older than the cut-off is refused, a newer one is not, and the
+    /// origins are served.
+    #[tokio::test]
+    async fn the_legacy_embed_state_is_copied_and_still_refuses_what_it_refused() {
+        let inserts = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
+        assert_eq!(inserts.len(), 3, "{inserts:?}");
+        assert!(
+            inserts.iter().all(
+                |s| s.starts_with("INSERT INTO console.bi_board_embed_event")
+                    && s.contains(LEGACY_EMBED_EPOCH)
+                    && !s.contains("console.bi_board ")
+            ),
+            "{inserts:?}"
+        );
+        let rows = [
+            serde_json::json!({"kind": "revoke_all", "revoked_before": "1700000000", "jti": "", "exp": "0", "origins_json": "[]"}),
+            serde_json::json!({"kind": "withdraw", "revoked_before": "0", "jti": "gone-1", "exp": "4102444800", "origins_json": "[]"}),
+            serde_json::json!({"kind": "origins", "revoked_before": "0", "jti": "", "exp": "0", "origins_json": r#"["https://a.example","https://b.example"]"#}),
+        ];
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|v| v.as_object().unwrap().clone())
+            .collect();
+        let access = embed_access_from_aggregate_rows(&rows, 1_800_000_000, 0);
+        assert!(access.is_withdrawn(2_000_000_000.0, Some("gone-1")));
+        assert!(access.is_withdrawn(1_699_999_999.0, Some("other")));
+        assert!(!access.is_withdrawn(1_700_000_001.0, Some("other")));
+        assert_eq!(access.origins, ["https://a.example", "https://b.example"]);
+    }
+
+    /// R-A1 accept (2): a second run inserts nothing more.
+    #[tokio::test]
+    async fn a_second_run_of_the_legacy_embed_copy_inserts_nothing() {
+        let once = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 1).await;
+        let twice = run_legacy_copy(ALL_LEGACY_COLUMNS.to_vec(), 2).await;
+        assert_eq!(once.len(), 3);
+        assert_eq!(twice.len(), once.len(), "{twice:?}");
+    }
+
+    /// R-A1 accept (3): a fresh database has no legacy columns, so nothing
+    /// is selected and nothing is inserted.
+    #[tokio::test]
+    async fn a_database_without_the_legacy_columns_runs_no_embed_copy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(LegacyEmbedCh {
+                columns: Vec::new(),
+                copied: std::sync::atomic::AtomicBool::new(false),
+            })
+            .mount(&server)
+            .await;
+        copy_legacy_embed_state(&client(&server.uri()))
+            .await
+            .unwrap();
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 1, "only the column check: {bodies:?}");
+        assert!(bodies[0].contains("system.columns"));
+    }
+
+    /// R-A1 accept (4): the copied `origins` event is stamped with the
+    /// epoch and the read takes the newest `origins` event by `at`, so an
+    /// origins event written since the copy wins. The SQL itself is not run
+    /// here (no live `ClickHouse`); this pins both halves of the contract.
+    #[test]
+    fn a_real_origins_event_written_after_the_copy_wins_over_it() {
+        let row = serde_json::json!({
+            "id": "b1", "embed_revoked_before": "0",
+            "embed_revoked_jti_json": "[]",
+            "embed_origins_json": r#"["https://old.example"]"#,
+        });
+        let inserts = legacy_embed_inserts(row.as_object().unwrap());
+        assert_eq!(inserts.len(), 1);
+        assert!(inserts[0].contains("'origins'") && inserts[0].contains(LEGACY_EMBED_EPOCH));
+        // Real writers stamp `now64(6)` (column default), later than the epoch.
+        let read = include_str!("store.rs");
+        assert!(read.contains("argMax(origins_json, at) AS origins_json"));
+    }
+
+    /// Fails closed like `EmbedAccess::from_stored`: a withdrawn list that
+    /// does not parse becomes a `revoke_all` of `u64::MAX`.
+    #[test]
+    fn an_unparseable_legacy_withdrawn_list_revokes_everything() {
+        let row = serde_json::json!({
+            "id": "b1", "embed_revoked_before": "0",
+            "embed_revoked_jti_json": "not json", "embed_origins_json": "[]",
+        });
+        let inserts = legacy_embed_inserts(row.as_object().unwrap());
+        assert_eq!(inserts.len(), 1);
+        assert!(inserts[0].contains(&u64::MAX.to_string()));
     }
 
     struct MockBiCh;
