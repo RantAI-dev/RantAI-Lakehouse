@@ -1,8 +1,10 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 import type { BoardTab, FilterDef, LayoutMap } from "@/services/clients/bi-store"
 import {
-  addTab, appliesOnTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab,
+  addTab, appliesOnTab, bottomOfTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab, placeUnboxed,
   phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
 } from "./dashboard-tabs"
 import { decodeFilters, encodeFilters, normalizeFilters } from "./dashboard-filter-state"
@@ -170,4 +172,92 @@ test("a heading, a section and a divider are created one row tall and a chart ke
   assert.equal(defaultTileHeight("bar"), 6)
   assert.equal(defaultTileHeight(undefined, 4), 4)
   assert.equal(defaultTileHeight("kpi", 3), 3)
+})
+
+// ── BI-18 part C review fix (BLOCKER) R13: charts with no stored box ──────────
+
+type Case = {
+  name: string
+  tabs: string[]
+  layout: LayoutMap
+  charts: { id: string; span: 1 | 2; kind: string }[]
+  placed: LayoutMap
+}
+
+test("placeUnboxed gives the place the server gives, on the cases both sides share", () => {
+  const file = join(import.meta.dir, "..", "..", "ops", "fixtures", "place_unboxed.json")
+  const { cases } = JSON.parse(readFileSync(file, "utf8")) as { cases: Case[] }
+  assert.ok(cases.length >= 3)
+  for (const c of cases) {
+    const tabs = c.tabs.map((id) => ({ id, title: id }))
+    const out = placeUnboxed(c.charts, c.layout, tabs)
+    for (const [id, want] of Object.entries(c.placed)) assert.deepEqual(out[id], want, `${c.name}: ${id}`)
+    for (const [id, box] of Object.entries(c.layout)) assert.deepEqual(out[id], box, `${c.name}: stored ${id} moved`)
+    assert.equal(Object.keys(out).length, Object.keys(c.layout).length + Object.keys(c.placed).length, c.name)
+  }
+})
+
+// Seven charts, two with a stored box, five without: the QA board in small.
+const SHOWN_IDS = ["a", "b", "c", "d", "e", "f", "g"]
+const SHOWN_ITEMS = SHOWN_IDS.map((id) => ({ id, span: 1 as const, kind: "bar" }))
+const STORED: LayoutMap = { a: { x: 0, y: 0, w: 6, h: 6, tab: "t_a" }, b: { x: 6, y: 0, w: 6, h: 6, tab: "t_a" } }
+
+test("Move to of a chart with no stored box does not crash and the space it left is closed", () => {
+  const shown = placeUnboxed(SHOWN_ITEMS, STORED, [A, B])
+  // Drawn: a,b (y 0, stored), c,d (y 6), e,f (y 12), g (y 18). Move c, which had no box.
+  const out = moveTileToTab([A, B], shown, SHOWN_IDS, "c", "t_b")
+  assert.equal(out.c.tab, "t_b")
+  // Only the column of c closes: e and g follow it up, f (under d) and d stay.
+  assert.deepEqual([out.e.y, out.f.y, out.g.y], [6, 12, 12])
+  assert.equal(out.d.y, 6)
+  assert.equal(tabOf([A, B], out, "d"), "t_a")
+})
+
+test("Move to of a stored chart while unstored ones exist closes the space they would have filled", () => {
+  const shown = placeUnboxed(SHOWN_ITEMS, STORED, [A, B])
+  const out = moveTileToTab([A, B], shown, SHOWN_IDS, "a", "t_b")
+  // c (below a, over its columns) moves up into a's place; e under c follows c.
+  assert.equal(out.c.y, 0)
+  assert.equal(out.e.y, 6)
+  assert.equal(out.g.y, 12)
+  assert.equal(out.b.y, 0)
+})
+
+test("moveTileToTab and deleteTab never index a box that is missing", () => {
+  const partial: LayoutMap = { a: { x: 0, y: 0, w: 6, h: 6, tab: "t_a" } }
+  assert.doesNotThrow(() => moveTileToTab([A, B], partial, SHOWN_IDS, "a", "t_b"))
+  assert.doesNotThrow(() => moveTileToTab([A, B], partial, SHOWN_IDS, "c", "t_b"))
+  const out = deleteTab({ tabs: [A, B], layout: partial, filters: [] }, SHOWN_IDS, "t_a", true)
+  assert.ok(!("error" in out))
+})
+
+test("deleting a tab moves every chart on it, stored or not, to the first remaining tab", () => {
+  const shown = placeUnboxed(SHOWN_ITEMS, { ...STORED, b: { ...STORED.b, tab: "t_b" } }, [A, B])
+  const out = deleteTab({ tabs: [A, B], layout: shown, filters: [] }, SHOWN_IDS, "t_a", true)
+  assert.ok(!("error" in out))
+  if ("error" in out) return
+  for (const id of SHOWN_IDS) assert.equal(out.layout[id].tab, "t_b", id)
+  const ys = SHOWN_IDS.map((id) => `${out.layout[id].x},${out.layout[id].y}`)
+  assert.equal(new Set(ys).size, ys.length, "no two tiles share a place")
+})
+
+test("reordering the tabs leaves every chart, stored or not before, where it showed", () => {
+  const shown = placeUnboxed(SHOWN_ITEMS, STORED, [A, B])
+  // The page saves the layout as shown; the server stamps nothing more.
+  for (const id of SHOWN_IDS) assert.equal(shown[id].tab ?? "t_a", "t_a", id)
+  const reordered = moveTab([A, B], "t_b", -1)
+  const tagged = Object.fromEntries(Object.entries(shown).map(([id, box]) => [id, { ...box, tab: box.tab ?? "t_a" }]))
+  for (const id of SHOWN_IDS) assert.equal(tabOf(reordered, tagged, id), "t_a", id)
+})
+
+// ── BI-18 part C review fix (SHOULD-FIX) R15: a new block goes to the bottom as shown ──
+
+test("a new block starts below the charts drawn at the bottom of the tab, stored or not", () => {
+  const shown = placeUnboxed(SHOWN_ITEMS, STORED, [A, B])
+  // Stored bottom is 6; the unstored charts are drawn down to 24.
+  assert.equal(bottomOfTab([A, B], shown, SHOWN_IDS, "t_a"), 24)
+  assert.equal(bottomOfTab([A, B], shown, SHOWN_IDS, "t_b"), 0)
+  assert.equal(bottomOfTab([], shown, SHOWN_IDS, undefined), 24)
+  // The stored map alone would have said 6, which is what put the block in the middle.
+  assert.equal(bottomOfTab([A, B], STORED, SHOWN_IDS, "t_a"), 6)
 })

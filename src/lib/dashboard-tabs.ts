@@ -37,6 +37,58 @@ export function defaultTileHeight(kind: string | undefined, chartDefault = 6): n
   return kind === "heading" || kind === "section" || kind === "divider" ? 1 : chartDefault
 }
 
+/** Grid columns and the size of a chart tile with no box, as `COLS` and `DEFAULT` in `dashboard-grid.tsx`. */
+const GRID_COLS = 12
+const DEFAULT_TILE = { w: 6, h: 6 }
+
+/** A tile the grid has to place: its id, the width the builder chose and its kind. */
+export type PlaceItem = { id: string; span?: 1 | 2; kind?: string }
+
+/**
+ * Gives every item with no box one (BI-18 part C review fix (BLOCKER) R13), the
+ * layout AS SHOWN. The rule is the server's `layout::place_unboxed` and the
+ * two are tested on `ops/fixtures/place_unboxed.json`: below the bottom of the
+ * stored boxes of the first tab (of all of them on a board with no tabs), in
+ * the order of `items`, half width or 12 wide for `span: 2`, a heading, section
+ * header or divider one row high, two half-width tiles to a row and a row as
+ * tall as its tallest tile. On a tabbed board a new box names the first tab.
+ * Stored boxes are returned as they are; boxes of ids that are not in `items`
+ * are dropped, like the grid's `resolve()` always did.
+ */
+export function placeUnboxed(items: readonly PlaceItem[], layout: LayoutMap, tabs: readonly BoardTab[]): LayoutMap {
+  const out: LayoutMap = {}
+  const ids = new Set(items.map((i) => i.id))
+  for (const [id, box] of Object.entries(layout)) if (ids.has(id)) out[id] = box
+  const first = tabs[0]?.id
+  let y = 0
+  for (const [id, box] of Object.entries(out)) {
+    if (first === undefined || tabOf(tabs, out, id) === first) y = Math.max(y, box.y + box.h)
+  }
+  let col = 0
+  let rowH = 0
+  for (const it of items) {
+    if (out[it.id]) continue
+    const w = it.span === 2 ? GRID_COLS : DEFAULT_TILE.w
+    const h = defaultTileHeight(it.kind, DEFAULT_TILE.h)
+    if (col + w > GRID_COLS) { y += rowH; col = 0; rowH = 0 }
+    out[it.id] = { x: col, y, w, h, ...(first ? { tab: first } : {}) }
+    col += w
+    rowH = Math.max(rowH, h)
+    if (col >= GRID_COLS) { y += rowH; col = 0; rowH = 0 }
+  }
+  return out
+}
+
+/**
+ * The y a new tile starts at on `tab`, read from the layout as shown: below
+ * everything on that tab (everything, on a board with no tabs). BI-18 part C
+ * review fix (SHOULD-FIX) R15.
+ */
+export function bottomOfTab(tabs: readonly BoardTab[], shown: LayoutMap, ids: string[], tab: string | undefined): number {
+  const here = tab === undefined || tabs.length === 0 ? ids : tilesOnTab(tabs, shown, ids, tab)
+  return here.reduce((y, id) => Math.max(y, (shown[id]?.y ?? 0) + (shown[id]?.h ?? 0)), 0)
+}
+
 /** The tab a tile sits on: the one it names, else the first; `undefined` on a board with no tabs. */
 export function tabOf(tabs: readonly BoardTab[], layout: LayoutMap, id: string): string | undefined {
   if (tabs.length === 0) return undefined
@@ -157,7 +209,10 @@ export function moveTileToTab(tabs: readonly BoardTab[], layout: LayoutMap, ids:
   const box = layout[id] ?? { x: 0, y: 0, w: 6, h: 6 }
   const out: LayoutMap = { ...layout, [id]: { ...box, tab, x: 0, y: bottomOf(layout, others) } }
   if (from === undefined || from === tab || !layout[id]) return out
-  const left = tilesOnTab(tabs, layout, ids, from).filter((x) => x !== id)
+  // BI-18 part C review fix (BLOCKER) R13: only tiles that have a box can sit below
+  // one; the page passes the layout as shown, so that is every tile, but this
+  // function never indexes a box that is missing.
+  const left = tilesOnTab(tabs, layout, ids, from).filter((x) => x !== id && out[x])
   const below = left
     .filter((x) => out[x].y >= box.y + box.h && out[x].x < box.x + box.w && out[x].x + out[x].w > box.x)
     .sort((p, q) => out[p].y - out[q].y)

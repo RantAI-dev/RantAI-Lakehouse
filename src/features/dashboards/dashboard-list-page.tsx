@@ -26,7 +26,6 @@ import { Label } from "@/components/ui/label"
 import {
   Select,
   SelectContent,
-  SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
@@ -38,6 +37,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { filterDataClientSide } from "@/lib/data-table"
 import {
   folderChoices,
+  folderOptionText,
   isPersonalFolder,
   itemHref,
   labelledFolders,
@@ -64,6 +64,7 @@ import {
 } from "./dashboard-list-columns"
 import { FavouriteButton } from "./favourite-button"
 import { PRIVATE_HINT } from "./private-badge"
+import { FolderOptions } from "./folder-options"
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs"
 import { forgetLastBoard } from "./last-board"
 import { TrashDialog } from "./trash-dialog"
@@ -153,16 +154,11 @@ function BoardFormDialog({
               <Select value={folderId} onValueChange={(v) => setFolderId(v ?? NO_FOLDER)}>
                 <SelectTrigger className="w-full">
                   <SelectValue>
-                    {folderId === NO_FOLDER ? "No folder" : folderPath(folders ?? [], folderId)}
+                    {folderOptionText(folders ?? [], folderId === NO_FOLDER ? "" : folderId, "No folder")}
                   </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={NO_FOLDER}>No folder</SelectItem>
-                  {folderOptions.map(({ folder }) => (
-                    <SelectItem key={folder.id} value={folder.id}>
-                      {folderPath(folders ?? [], folder.id)}
-                    </SelectItem>
-                  ))}
+                  <FolderOptions folders={folders ?? []} noneValue={NO_FOLDER} noneLabel="No folder" />
                 </SelectContent>
               </Select>
               {isPersonalFolder(folders ?? [], folderId) ? (

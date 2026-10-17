@@ -1,5 +1,5 @@
 import { parseTimestamp } from "@/lib/format"
-import type { FolderLike } from "@/lib/folder-tree"
+import { folderPath, type FolderLike } from "@/lib/folder-tree"
 import type { ItemKind, TrashItem } from "@/services/contracts/dashboards"
 
 /**
@@ -92,4 +92,33 @@ export function itemHref(item: { kind: ItemKind; id: string; board?: string }): 
 /** Whether `id` names a personal space among `folders` (the New dashboard dialog hints that it is private). */
 export function isPersonalFolder(folders: readonly FolderLike[], id: string): boolean {
   return Boolean(folders.find((f) => f.id === id)?.ownerId)
+}
+
+/** What a folder picker calls the caller's own personal space (BI-18 part C review fix (SHOULD-FIX) R17). */
+export const PERSONAL_OPTION_LABEL = "Personal space (only you)"
+
+/**
+ * The folders of a picker in the order it shows them: the personal space (and
+ * what is filed under it) first, apart from the shared folders, which keep
+ * their tree order. The caller adds the "no folder" entry between the two.
+ */
+export function splitFolderOptions<T extends { folder: FolderLike }>(flat: readonly T[], folders: readonly FolderLike[]): { personal: T[]; shared: T[] } {
+  const inPersonal = (f: FolderLike): boolean => {
+    const seen = new Set<string>()
+    let at: FolderLike | undefined = f
+    while (at && !seen.has(at.id)) {
+      if (at.ownerId) return true
+      seen.add(at.id)
+      at = at.parentId ? folders.find((x) => x.id === at!.parentId) : undefined
+    }
+    return false
+  }
+  return { personal: flat.filter((o) => inPersonal(o.folder)), shared: flat.filter((o) => !inPersonal(o.folder)) }
+}
+
+/** The text a picker shows for the chosen value: the label of the personal space, the path of a folder, else `none`. */
+export function folderOptionText(folders: FolderLike[], id: string, none: string): string {
+  const folder = folders.find((f) => f.id === id)
+  if (!folder) return none
+  return folder.ownerId ? PERSONAL_OPTION_LABEL : folderPath(folders, id)
 }
