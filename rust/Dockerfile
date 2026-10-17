@@ -5,11 +5,9 @@
 # clean-clone build problem in a different (and better) way; the two have
 # since been converged onto this single file, and `Dockerfile.api` is gone.
 #
-# Base image pin: `rust:1.85-slim` (this file's old pin) cannot build this
-# workspace — `Cargo.lock` pulls in `time@0.3.55`, which requires rustc
-# >= 1.88. Rather than guessing the minimum that happens to satisfy today's
-# lockfile, this pins the exact toolchain the workspace already commits to
-# in `rust-toolchain.toml` (`channel = "1.96.1"`), so the Docker build and
+# Base image pin: `rust:1.99.1-slim` pins the exact toolchain the workspace
+# commits to in `rust-toolchain.toml` (`channel = "1.99.1"`), unblocking
+# SEC-41 (sqlx 0.9 requires rustc >= 1.94; REL-9 D1), so the Docker build and
 # local dev/CI builds are guaranteed to use the same compiler.
 #
 # Three build stages share one tools base, so the two `cargo install`s below
@@ -20,7 +18,7 @@
 #   planner  copies the manifests + sources, writes `recipe.json`
 #   builder  compiles the dependencies from `recipe.json` alone (`cook`),
 #            then copies the sources and compiles the workspace
-FROM rust:1.96.1-slim AS tools
+FROM rust:1.99.1-slim AS tools
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 # `sqlx-cli`, pinned to the same version as the workspace's `sqlx`
@@ -94,7 +92,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p lakehouse-api \
     && cp "$CARGO_TARGET_DIR/release/lakehouse-api" /usr/local/bin/lakehouse-api
 
-# `debian:trixie-slim`, not `bookworm-slim`: `rust:1.96.1-slim` builds on
+# `debian:trixie-slim`, not `bookworm-slim`: `rust:1.99.1-slim` builds on
 # Debian 13 (trixie), whose glibc is newer than bookworm's. A bookworm
 # runtime image fails to even exec the trixie-built `sqlx-cli` binary
 # (`GLIBC_2.39' not found`) — matching the base OS avoids a glibc skew

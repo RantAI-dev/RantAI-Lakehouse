@@ -1338,7 +1338,7 @@ services:
 
   g1-test-runner:
     profiles: ["test"]
-    image: rust:1.96.1-slim
+    image: rust:1.99.1-slim
     working_dir: /workspace
     volumes:
       - ./rust:/workspace

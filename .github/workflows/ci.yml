@@ -344,11 +344,11 @@ jobs:
         working-directory: rust
 
   # ── Rust: MSRV compile check ─────────────────────────────────────────
-  # In PR 1, the 1.88.0 MSRV test run is converted into a fast compile check
+  # In PR 1, the MSRV test run is converted into a fast compile check
   # (cargo check --workspace --all-targets --locked) so we ensure MSRV
   # compatibility without duplicating the full integration test run time.
   msrv:
-    name: Rust · MSRV check (1.88.0)
+    name: Rust · MSRV check (1.99.0)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -360,7 +360,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
 
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
@@ -368,7 +368,7 @@ jobs:
         with:
           workspaces: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: msrv-1.88.0
+          key: msrv-1.99.0
 
       - name: cargo check --workspace --all-targets --locked
         run: cargo check --workspace --all-targets --locked

@@ -21,7 +21,7 @@
 #   RUST_CLIPPY_RESULT    result of `clippy` job
 #   RUST_BUILD_RESULT     result of `build` job
 #   RUST_TEST_RESULT      result of `test` job (stable)
-#   RUST_MSRV_RESULT      result of `msrv` job (1.88.0)
+#   RUST_MSRV_RESULT      result of `msrv` job (1.99.0)
 #   DAGSTER_TESTS_RESULT  result of `dagster-unit-tests` job
 #   DAGSTER_LOADER_TESTS_RESULT result of `dagster-loader-tests` job
 #   G1_RUSTFS_RESULT      result of `g1-rustfs` job
