@@ -11,7 +11,7 @@ import { embedFramePolicy, type EmbedPageToken } from "@/lib/embed-frame"
  * asks the API (`POST /api/embed/frame`, public, answers only an origin list
  * and the same empty list for a bad token) and sets
  * `Content-Security-Policy: frame-ancestors ...`. Nothing else in the console
- * is matched or changed here.
+ * is matched or changed here (the print view's headers aside, below).
  *
  * Fails closed: an API that cannot be reached, answers slowly or answers
  * anything but a list gives `frame-ancestors 'none'`.
@@ -34,11 +34,32 @@ async function allowedOrigins(token: EmbedPageToken): Promise<unknown> {
   return ((await res.json()) as { origins?: unknown }).origins
 }
 
+/**
+ * `BI-1`: the PDF print view (`/render/dashboard/<token>`) is opened by the
+ * Gotenberg container with a 2-minute token in the address. It must not be
+ * framed, cached, indexed, or leak the token in a `Referer`; the headers say
+ * so. Nothing here asks the API: the page itself posts the token to
+ * `POST /api/render/data`.
+ */
+export function renderHeaders(): Record<string, string> {
+  return {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Robots-Tag": "noindex",
+  }
+}
+
 export async function proxy(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith("/render/")) {
+    const response = NextResponse.next()
+    for (const [name, value] of Object.entries(renderHeaders())) response.headers.set(name, value)
+    return response
+  }
   const policy = await embedFramePolicy(request.nextUrl.pathname, allowedOrigins)
   const response = NextResponse.next()
   response.headers.set("Content-Security-Policy", policy)
   return response
 }
 
-export const config = { matcher: ["/embed/:path*"] }
+export const config = { matcher: ["/embed/:path*", "/render/:path*"] }
