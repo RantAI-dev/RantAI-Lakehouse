@@ -1887,6 +1887,36 @@ async fn runnable_pipelines_carry_their_target_lag(pool: PgPool) -> sqlx::Result
     Ok(())
 }
 
+/// BLD-2 review R3 SHOULD-FIX 8: `GET /api/pipelines/runnable` carries the
+/// tenant, or the factory's same-tenant filter would never apply.
+#[sqlx::test(migrations = "../../migrations")]
+async fn runnable_pipelines_carry_their_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let tenant = create_tenant(&pool, &tenant_input("tenant-runnable"))
+        .await
+        .unwrap();
+    let tenant_id: Uuid = tenant.id.parse().unwrap();
+    let created = pipelines::create_pipeline(&pool, &named_input("pl-runnable-tenant"), None)
+        .await
+        .expect("create should succeed");
+    set_pipeline_tenant(&pool, &created.id, tenant_id).await;
+    pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .expect("mark ready")
+        .expect("row should come back");
+
+    let list = pipelines::list_runnable_pipelines(&pool)
+        .await
+        .expect("list_runnable_pipelines should succeed");
+    let row = list
+        .iter()
+        .find(|p| p.id == created.id)
+        .expect("the ready pipeline is runnable");
+    assert_eq!(row.tenant_id, Some(tenant_id));
+    let wire = serde_json::to_value(row).expect("serialize RunnablePipeline");
+    assert_eq!(wire["tenantId"], tenant_id.to_string());
+    Ok(())
+}
+
 /// BLD-1 / D1: create an `app_user` with no roles or tenants — the column
 /// under test is the user row itself, and a membership would only add a
 /// second thing that can fail.

@@ -1329,6 +1329,9 @@ struct RunnableRow {
     /// plan D3 (a target lag replaces the schedule while it is set).
     target_lag_seconds: Option<i32>,
     target_lag_downstream: bool,
+    /// BLD-2 review R3 SHOULD-FIX 8: carried so the lag sensor attaches a
+    /// downstream job only from the pipeline's own tenant.
+    tenant_id: Option<Uuid>,
 }
 
 /// One authored pipeline the orchestrator should build a job for.
@@ -1361,6 +1364,12 @@ pub struct RunnablePipeline {
     /// every pipeline written before this migration — which is exactly the
     /// "use the schedule" case the factory already implements.
     pub target_lag: Option<TargetLag>,
+    /// BLD-2 review R3 SHOULD-FIX 8: the pipeline's tenant, so
+    /// `authored_factory.build_authored_lag_sensors` can keep a `downstream`
+    /// pipeline of another tenant out of a lag sensor's allowed jobs.
+    /// Absent from the wire when unassigned, like [`Pipeline::tenant_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
 }
 
 /// Every authored pipeline in status `ready` or `paused`, across all
@@ -1375,7 +1384,7 @@ pub struct RunnablePipeline {
 pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
     let rows: Vec<RunnableRow> = sqlx::query_as(
         "SELECT id, name, status, schedule, depends_on, target_lag_seconds, \
-             target_lag_downstream FROM pipeline_definition \
+             target_lag_downstream, tenant_id FROM pipeline_definition \
              WHERE status IN ('ready', 'paused') ORDER BY created_at",
     )
     .fetch_all(pool)
@@ -1395,6 +1404,7 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
                     row.target_lag_seconds,
                     row.target_lag_downstream,
                 ),
+                tenant_id: row.tenant_id,
             });
         }
     }

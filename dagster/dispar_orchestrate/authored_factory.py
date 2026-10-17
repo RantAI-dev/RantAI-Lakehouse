@@ -1517,6 +1517,17 @@ def build_authored_lag_sensors(
     """One lag sensor per authored pipeline with a time-based target lag.
     BLD-2 review R2 SHOULD-FIX 7: attach only jobs of downstream pipelines this pipeline actually reads
     (direct source/dependsOn or recursive chain in the same tenant).
+
+    BLD-2 review R3 SHOULD-FIX 8: the tenant comes from the runnable payload's
+    `tenantId` (`RunnablePipeline.tenant_id`, absent when unassigned, in which
+    case only other unassigned pipelines match), so the same-tenant filter is
+    real in production, not only in tests.
+
+    Not attached: a downstream pipeline that P reads ONLY through the target
+    table of a pipeline in P's `dependsOn` (an edge the API's chain walk
+    follows, this one does not). If the API ever answers with such a U, the
+    sensor fails closed with an "unexpected jobName" skip rather than running
+    a job outside its allowed list.
     """
     sensors: list[Any] = []
     for pipeline, authored_job in pipeline_jobs:
