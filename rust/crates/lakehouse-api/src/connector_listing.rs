@@ -41,6 +41,7 @@
 //! cannot take exponential time; the pattern is at most [`MAX_GLOB_CHARS`]
 //! characters and a bucket scan stops at [`MAX_SCANNED`] keys.
 
+use std::path::Path;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -751,6 +752,7 @@ async fn run_sql(
     op: &SqlOp<'_>,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Result<SqlOut, ErrorClass> {
     let approved = connector_probe::resolve_checked(target.host, target.port, internal_hosts)
         .await
@@ -767,6 +769,7 @@ async fn run_sql(
                     target.user,
                     password.expose_secret(),
                     target.database,
+                    ca,
                 );
                 let pool = PgPoolOptions::new()
                     .max_connections(1)
@@ -794,7 +797,8 @@ async fn run_sql(
                 out
             }
             SqlDriver::Mssql => {
-                let mut client = connect_mssql(&approved, target, password.expose_secret()).await?;
+                let mut client =
+                    connect_mssql(&approved, target, password.expose_secret(), ca).await?;
                 run_mssql(&mut client, op).await
             }
             // Oracle is read by the orchestrator (`dispatch` never gets here).
@@ -809,14 +813,17 @@ async fn connect_mssql(
     approved: &Approved,
     target: &DialTarget<'_>,
     password: &str,
+    ca: Option<&Path>,
 ) -> Result<MssqlClient, ErrorClass> {
     let mut config = tiberius::Config::new();
     config.host(target.host);
     config.port(target.port);
     config.database(target.database);
     config.authentication(tiberius::AuthMethod::sql_server(target.user, password));
-    // The same stated TLS posture as `connector_probe::probe_mssql`.
-    config.trust_cert();
+    // `SEC-14` part B (D5/E3): the same stated TLS posture as
+    // `connector_probe::probe_mssql`, from the same helper, so a listing
+    // dial cannot accept a certificate the connection test would refuse.
+    connector_probe::apply_mssql_tls(&mut config, ca);
     // The socket goes to the approved address; `config.host` keeps the name for
     // the TDS handshake (`SEC-15`).
     let tcp = connector_probe::connect_pinned(approved)
@@ -835,6 +842,7 @@ async fn sql_answer(
     request: &Request,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Answer {
     let schema = request.schema.as_str();
     let search = request.search.as_str();
@@ -853,7 +861,7 @@ async fn sql_answer(
             SqlOp::Columns { schema, table }
         }
     };
-    match run_sql(target, &info.secret_ref, &op, resolver, internal_hosts).await {
+    match run_sql(target, &info.secret_ref, &op, resolver, internal_hosts, ca).await {
         Ok(SqlOut::Names { names, truncated }) => {
             let (object_kind, qualifier) = if schema.is_empty() {
                 (ObjectKind::Schema, "")
@@ -1085,6 +1093,7 @@ pub async fn dispatch(
     request: &Request,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Dispatch {
     let Some(adapter) = info.adapter.as_deref() else {
         // No ingest spec yet: there is no dial to read.
@@ -1102,6 +1111,7 @@ pub async fn dispatch(
                 request,
                 resolver,
                 internal_hosts,
+                ca,
             )
             .await
         }
@@ -1113,6 +1123,7 @@ pub async fn dispatch(
                 request,
                 resolver,
                 internal_hosts,
+                ca,
             )
             .await
         }
@@ -1341,6 +1352,7 @@ mod tests {
             &request,
             &PanicIfCalled,
             &InternalHosts::NONE,
+            None,
         )
         .await
         else {
@@ -1386,6 +1398,7 @@ mod tests {
                 &request,
                 &resolver,
                 &InternalHosts::NONE,
+                None,
             )
             .await;
             assert!(matches!(out, Dispatch::Orchestrator));
@@ -1403,8 +1416,15 @@ mod tests {
             search: "order".to_owned(),
             ..request.clone()
         };
-        let Dispatch::Done(answer) =
-            dispatch(Kind::List, &rest, &search, &resolver, &InternalHosts::NONE).await
+        let Dispatch::Done(answer) = dispatch(
+            Kind::List,
+            &rest,
+            &search,
+            &resolver,
+            &InternalHosts::NONE,
+            None,
+        )
+        .await
         else {
             panic!("the API lists REST endpoints itself");
         };
@@ -1423,7 +1443,8 @@ mod tests {
                 &rest,
                 &request,
                 &resolver,
-                &InternalHosts::NONE
+                &InternalHosts::NONE,
+                None,
             )
             .await,
             Dispatch::Orchestrator
@@ -1453,8 +1474,15 @@ mod tests {
                 serde_json::json!({"spreadsheetId": "abc", "ranges": ["A1:B2"]}),
             ),
         ] {
-            let Dispatch::Done(answer) =
-                dispatch(Kind::List, &info, &request, &resolver, &InternalHosts::NONE).await
+            let Dispatch::Done(answer) = dispatch(
+                Kind::List,
+                &info,
+                &request,
+                &resolver,
+                &InternalHosts::NONE,
+                None,
+            )
+            .await
             else {
                 panic!("answered by the API");
             };

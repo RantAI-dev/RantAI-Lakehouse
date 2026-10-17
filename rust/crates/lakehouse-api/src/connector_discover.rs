@@ -55,6 +55,7 @@ use lakehouse_store::connectors::ConnectorDialInfo;
 use lakehouse_store::ingest_spec::{Dial, IngestSpecError, SqlDriver};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
+use std::path::Path;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_probe::{self, DIAL_TIMEOUT, DialTarget};
@@ -490,6 +491,7 @@ async fn discover_dial(
     schema: &str,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Result<Vec<DiscoveredObject>, DiscoverError> {
     let approved = connector_probe::resolve_checked(target.host, target.port, internal_hosts)
         .await
@@ -507,6 +509,7 @@ async fn discover_dial(
                     target.user,
                     password.expose_secret(),
                     target.database,
+                    ca,
                 );
                 let pool = PgPoolOptions::new()
                     .max_connections(1)
@@ -540,9 +543,10 @@ async fn discover_dial(
                     target.user,
                     password.expose_secret(),
                 ));
-                // Same "state the TLS posture explicitly" reasoning as
-                // `connector_probe::probe_mssql`.
-                config.trust_cert();
+                // `SEC-14` part B (D5/E3): encryption required, and the CA
+                // verified when one is configured -- the same posture as
+                // `connector_probe::probe_mssql`, from one helper.
+                connector_probe::apply_mssql_tls(&mut config, ca);
                 // SEC-15: the socket goes to the approved address;
                 // `config.host` keeps the name for the TDS handshake.
                 // `TcpStream::connect`/`set_nodelay` return `std::io::Error`,
@@ -586,7 +590,9 @@ async fn discover_dial(
 /// Discover `schema`'s objects for `dial_info`, dispatching on
 /// `dial_info.adapter`. `schema` is required for the `sql`/`cdc`
 /// adapters (the caller-supplied string every driver's discovery query
-/// binds — see the module doc comment) and ignored otherwise.
+/// binds — see the module doc comment) and ignored otherwise. `ca` is the
+/// CA its Postgres and SQL Server dials verify the server against (`SEC-14`
+/// part B, D5; `None` = require TLS, trust the certificate).
 ///
 /// # Errors
 ///
@@ -598,6 +604,7 @@ pub async fn discover(
     schema: Option<&str>,
     resolver: &dyn DynSecretResolver,
     internal_hosts: &InternalHosts,
+    ca: Option<&Path>,
 ) -> Result<DiscoverResult, DiscoverError> {
     match dial_info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
@@ -639,6 +646,7 @@ pub async fn discover(
                 schema,
                 resolver,
                 internal_hosts,
+                ca,
             )
             .await?;
             Ok(DiscoverResult::ok(objects))
@@ -701,6 +709,7 @@ mod tests {
             Some("APP"),
             &PanicIfCalledResolver,
             &InternalHosts::NONE,
+            None,
         )
         .await
         .expect("an unsupported answer, not an error");
@@ -728,6 +737,7 @@ mod tests {
                 Some("APP"),
                 &PanicIfCalledResolver,
                 &InternalHosts::NONE,
+                None,
             )
             .await
             .expect("an unsupported answer, not an error");

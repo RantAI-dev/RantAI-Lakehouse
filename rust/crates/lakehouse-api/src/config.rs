@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 
 use lakehouse_core::ident::Ident;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -42,8 +44,9 @@ pub const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// variables.
 ///
 /// Only `PORT`, `CATALOG_TENANT_ID`, `AI_DEFAULT_REPLY_LANGUAGE`,
-/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK` and `AI_RELEVANT_TABLES` can fail
-/// resolution. `PORT` is load-bearing and Rust-only (the TypeScript
+/// `AI_SEMANTIC_LAYER`, `AI_ASK_BACK`, `AI_RELEVANT_TABLES`, `AI_SQL_HELP`,
+/// `CONNECTOR_TYPED_CREDENTIALS`, `EMBED_TOKEN_MAX_LIFETIME_SECONDS` and
+/// `CONNECTOR_TLS_CA_FILE` can fail resolution. `PORT` is load-bearing and Rust-only (the TypeScript
 /// backend runs under Next.js and never binds a port itself), so an
 /// unparseable value refusing to boot is the correct, Rust-specific failure
 /// mode. `SMTP_PORT` deliberately has no equivalent error variant —
@@ -155,6 +158,19 @@ pub enum ConfigError {
         "EMBED_TOKEN_MAX_LIFETIME_SECONDS must be a positive whole number of seconds (unset or empty means 86400), got {0:?}"
     )]
     InvalidEmbedTokenMaxLifetime(String),
+    /// `CONNECTOR_TLS_CA_FILE` names a path that cannot be read as a file
+    /// (`SEC-14` part B, D5). Fails config resolution rather than falling back
+    /// to Trust On First Use: an operator who set a CA meant the connector
+    /// dials to verify the server against it, and an unreadable path would
+    /// otherwise silently keep the trust-everything posture with nothing in
+    /// the logs to explain it.
+    #[error("CONNECTOR_TLS_CA_FILE must name a readable file, cannot read {0:?}")]
+    UnreadableConnectorTlsCaFile(std::path::PathBuf),
+    /// A set `CONNECTOR_TLS_CA_FILE` contains no valid PEM certificate. We refuse
+    /// start-up rather than discovering on the first connector dial that the CA
+    /// file cannot be used (SEC-14B review round 1, SHOULD-FIX 6).
+    #[error("CONNECTOR_TLS_CA_FILE must contain at least one PEM certificate, found none in {0:?}")]
+    EmptyConnectorTlsCaFile(std::path::PathBuf),
 }
 
 /// The language the copilot answers in when the user's message is too short
@@ -260,6 +276,14 @@ pub struct Config {
     /// (`CONNECTOR_SECRETS_KEY_PREVIOUS`; decision 5). It opens files, it
     /// never seals.
     pub connector_secrets_key_previous: Option<String>,
+    /// CA certificate (PEM) connector dials verify the database server
+    /// against (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5 as amended).
+    /// `None` when unset or empty: a connector dial still requires TLS but
+    /// takes the server's certificate on trust (`require`, D5). Set to a path
+    /// that cannot be read, start-up fails
+    /// ([`ConfigError::UnreadableConnectorTlsCaFile`]) — never a silent
+    /// fall-back to the trust-everything posture.
+    pub connector_tls_ca_file: Option<std::path::PathBuf>,
     /// The installation's secret manager and how to sign in to it
     /// (`SECRET_MANAGER` and its manager's variables; `SRC-12` part B). The
     /// sign-in settings are secrets: this field's `Debug` prints the manager
@@ -989,6 +1013,7 @@ impl std::fmt::Debug for Config {
                     .as_ref()
                     .map(|_| REDACTED),
             )
+            .field("connector_tls_ca_file", &self.connector_tls_ca_file)
             .field("secret_manager", &self.secret_manager)
             .field(
                 "connector_typed_credentials",
@@ -1194,6 +1219,32 @@ fn parse_embed_token_max_lifetime(env: &HashMap<String, String>) -> Result<u64, 
     }
 }
 
+/// `CONNECTOR_TLS_CA_FILE` (`SEC-14` part B, D5): unset or empty is "no CA,
+/// require TLS only"; a set path is read now so an unreadable one stops the
+/// API at start rather than on the first connector dial.
+fn parse_connector_tls_ca_file(
+    env: &HashMap<String, String>,
+) -> Result<Option<std::path::PathBuf>, ConfigError> {
+    let Some(raw) = truthy(env, "CONNECTOR_TLS_CA_FILE") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    // `read` (not `File::open`) so a directory, which opens but cannot be
+    // read as a certificate, is caught here too.
+    std::fs::read(&path).map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let certificates = CertificateDer::pem_file_iter(&path)
+        .map_err(|_| ConfigError::UnreadableConnectorTlsCaFile(path.clone()))?;
+    let mut count = 0usize;
+    for cert in certificates {
+        cert.map_err(|_| ConfigError::EmptyConnectorTlsCaFile(path.clone()))?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(ConfigError::EmptyConnectorTlsCaFile(path));
+    }
+    Ok(Some(path))
+}
+
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
 /// a lookup from external group name to local `role.name`. A malformed
 /// entry (no `=`, or an empty group/role name) is skipped rather than
@@ -1285,6 +1336,10 @@ impl Config {
                 .unwrap_or_else(|| "rantai-lake@localhost".to_owned())
         });
 
+        // `CONNECTOR_TLS_CA_FILE`: read the file now so an unreadable path
+        // stops the API at start, not on the first connector dial (T1).
+        let connector_tls_ca_file = parse_connector_tls_ca_file(env)?;
+
         Ok(Self {
             ch_url: or_default(env, "CH_URL", "http://localhost:18123"),
             ch_user: or_default(env, "CH_USER", "default"),
@@ -1344,6 +1399,7 @@ impl Config {
             ),
             connector_secrets_key: truthy(env, "CONNECTOR_SECRETS_KEY"),
             connector_secrets_key_previous: truthy(env, "CONNECTOR_SECRETS_KEY_PREVIOUS"),
+            connector_tls_ca_file,
             secret_manager: crate::secret_manager::SecretManagerSettings::from_map(env)?,
             connector_typed_credentials: parse_switch(
                 env,
@@ -1521,6 +1577,19 @@ impl Config {
         crate::connector_oauth::OAuthSettings {
             allow_http: self.connector_oauth_allow_http,
         }
+    }
+
+    /// The CA a connector dial verifies the database server against
+    /// (`CONNECTOR_TLS_CA_FILE`; `SEC-14` part B, D5/D6). `None` is D5's
+    /// `require` posture: TLS is still required, the server certificate is
+    /// trusted as-is.
+    ///
+    /// Every connector dial takes this and never reads the field directly,
+    /// so "which CA does a dial verify against" is one accessor rather than
+    /// a setting read at six call sites.
+    #[must_use]
+    pub fn connector_tls_ca(&self) -> Option<&std::path::Path> {
+        self.connector_tls_ca_file.as_deref()
     }
 
     /// The internal addresses an alert webhook may call (`SEC-10`): only the
@@ -2510,6 +2579,78 @@ mod tests {
                 ConfigError::InvalidEmbedTokenMaxLifetime(bad.to_owned())
             );
         }
+    }
+
+    /// `SEC-14` part B (D5): unset or empty means "no CA, require TLS only";
+    /// a readable file is kept as the path a dial verifies the server against.
+    #[test]
+    fn a_connector_tls_ca_file_is_absent_by_default_and_kept_when_readable() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = crate::tls_proxy::pem_certificate(certified.cert.der());
+        std::fs::write(&ca, cert).unwrap();
+        let env = env_with("CONNECTOR_TLS_CA_FILE", ca.to_str().unwrap());
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file.as_deref(), Some(ca.as_path()));
+
+        // Empty is unset, exactly like every other truthy setting.
+        let cfg = Config::from_map(&env_with("CONNECTOR_TLS_CA_FILE", "")).unwrap();
+        assert_eq!(cfg.connector_tls_ca_file, None);
+    }
+
+    /// `SEC-14` T1: a set path that cannot be read stops the API at start with
+    /// a message naming the variable, never a silent fall back to trusting
+    /// every server certificate.
+    #[test]
+    fn an_unreadable_connector_tls_ca_file_stops_the_api() {
+        for path in [
+            std::path::PathBuf::from("/nonexistent/rantai/ca.pem"),
+            // A directory: opens but is not a readable certificate file.
+            std::path::PathBuf::from("/"),
+        ] {
+            let env = env_with("CONNECTOR_TLS_CA_FILE", path.to_str().unwrap());
+            let err = Config::from_map(&env).expect_err("an unreadable path must fail start-up");
+            assert_eq!(err, ConfigError::UnreadableConnectorTlsCaFile(path));
+            assert!(
+                err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+                "the message must name the variable: {err}"
+            );
+        }
+    }
+
+    /// `SEC-14` part B, SHOULD-FIX 6: a set path that contains no PEM certificate
+    /// stops the API at start with a message naming the variable, never a silent fall
+    /// back to discovering it on the first connector dial.
+    #[test]
+    fn an_empty_connector_tls_ca_file_stops_the_api() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        // File is empty (0 bytes, no PEM certificate)
+        let env = env_with("CONNECTOR_TLS_CA_FILE", temp.path().to_str().unwrap());
+        let err = Config::from_map(&env).expect_err("an empty CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
+
+        // File has non-PEM text
+        std::fs::write(temp.path(), "this is not a pem certificate\n").unwrap();
+        let err = Config::from_map(&env).expect_err("a non-PEM CA file must fail start-up");
+        assert_eq!(
+            err,
+            ConfigError::EmptyConnectorTlsCaFile(temp.path().to_path_buf())
+        );
+        assert!(
+            err.to_string().contains("CONNECTOR_TLS_CA_FILE"),
+            "the message must name the variable: {err}"
+        );
     }
 
     #[test]
