@@ -237,6 +237,38 @@ async fn seed_unmeasured_state(pool: &PgPool, id: &str, tenant: Uuid) {
     .expect("seed the lag state");
 }
 
+/// An outstanding request that still has attempts left — U was asked for
+/// this input change and has not consumed it, but `request_attempt` is
+/// within `max_retries`, so `upstream_retries_exhausted` is false.
+///
+/// BLD-2 review R5 SHOULD-FIX 7: the two controls that need a NOT-exhausted
+/// upstream seeded their state with `seed_exhausted_state` and relied on a
+/// small `max_retries` to make it not-exhausted — so the helper named for
+/// the thing they were NOT testing built the rows under test. Same row
+/// shape, honest name.
+async fn seed_outstanding_state(pool: &PgPool, id: &str, tenant: Uuid, attempt: i32) {
+    let now = OffsetDateTime::now_utc();
+    pipelines::upsert_lag_state(
+        pool,
+        &pipelines::LagStateUpdate {
+            pipeline_id: id.to_owned(),
+            tenant_id: Some(tenant),
+            consumed_tokens: None,
+            consumed_at: None,
+            pending_since: Some(now - time::Duration::hours(18)),
+            requested_run_key: Some(format!("pl-run-key:{id}:0")),
+            requested_tokens: Some(serde_json::json!({"bronze.raw": "fp:1"})),
+            requested_at: Some(now),
+            request_attempt: attempt,
+            last_check_at: now,
+            last_status: "not_measured".to_owned(),
+            behind_streak: 0,
+        },
+    )
+    .await
+    .expect("seed the outstanding lag state");
+}
+
 /// P's source is U's target, P's `dependsOn` is empty: the exact shape a
 /// chain-scheduled read has and a `dependsOn`-mirrored read does not.
 #[tokio::test]
@@ -295,7 +327,7 @@ async fn a_lag_pipeline_reading_its_upstream_only_through_the_source_table_names
     assert_eq!(
         row["lag"]["reason"],
         format!(
-            "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+            "upstream pipeline {u_id}'s last 1 run for this change failed; \
              the next input change starts again"
         ),
         "the page's reason names U, through the chain the check walks"
@@ -311,7 +343,7 @@ async fn a_lag_pipeline_reading_its_upstream_only_through_the_source_table_names
     assert_eq!(
         detail_body["lag"]["reason"],
         format!(
-            "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+            "upstream pipeline {u_id}'s last 1 run for this change failed; \
              the next input change starts again"
         ),
         "the detail page's reason names U through the chain, not through dependsOn"
@@ -339,7 +371,7 @@ async fn an_outstanding_not_exhausted_upstream_does_not_make_the_page_read_behin
     .await;
     set_ready(&app.pool, &u_id).await;
     // attempt 1 <= max_retries 2: outstanding, not exhausted.
-    seed_exhausted_state(&app.pool, &u_id, tenant, 1).await;
+    seed_outstanding_state(&app.pool, &u_id, tenant, 1).await;
 
     let p_id = create_pipeline(
         &app.pool,
@@ -396,7 +428,7 @@ async fn the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_o
     )
     .await;
     set_ready(&app.pool, &u1_id).await;
-    seed_exhausted_state(&app.pool, &u1_id, tenant, 1).await;
+    seed_outstanding_state(&app.pool, &u1_id, tenant, 1).await;
 
     // The nearer U2: exhausted (attempt 3 > max_retries 2, three failed runs).
     let u2_id = create_pipeline(
@@ -491,7 +523,7 @@ fn assert_each_row_names_u(body: &Value, p_ids: &[String], u_id: &str) {
         assert_eq!(
             row["lag"]["reason"],
             format!(
-                "upstream pipeline {u_id}'s last 1 runs for this change failed; \
+                "upstream pipeline {u_id}'s last 1 run for this change failed; \
                  the next input change starts again"
             ),
             "every listed row names the shared U"

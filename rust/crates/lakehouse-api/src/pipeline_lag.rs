@@ -1215,10 +1215,10 @@ async fn evaluate_upstream_chain(
                 // `lag_json` renders for the pages, with the count
                 // derived from U's own `max_retries`.
                 reason: Some(format!(
-                    "upstream pipeline {}'s last {} runs for this change failed; \
+                    "upstream pipeline {}'s last {} for this change failed; \
                      the next input change starts again",
                     u_pipe.id,
-                    i32::from(u_pipe.max_retries) + 1
+                    failed_runs(i32::from(u_pipe.max_retries) + 1)
                 )),
             }));
         }
@@ -1412,7 +1412,10 @@ async fn decide(
         let n = max_retries + 1;
         (
             LagStatus::Behind,
-            format!("the last {n} runs for this change failed; the next input change starts again"),
+            format!(
+                "the last {} for this change failed; the next input change starts again",
+                failed_runs(n)
+            ),
         )
     } else {
         let st = if never_consumed || lag_seconds > target {
@@ -1441,6 +1444,18 @@ fn reason_for(status: LagStatus, never_consumed: bool) -> &'static str {
         (LagStatus::Behind, false) => "past the target lag",
         (LagStatus::Met, _) => "within the target lag",
     }
+}
+
+/// BLD-2 review R5 SHOULD-FIX 7: "last 1 run", not "last 1 runs" — one
+/// helper for all four places the count is written (the check's exhausted
+/// reason and `lag_json`'s two), because the check and the page must not
+/// even disagree about the plural: the same sentence is built twice from
+/// one number, and a page quoting "1 runs" was a number badly written.
+///
+/// `n` is 1 whenever `max_retries` is 0 — a pipeline allowed no retry fails
+/// its first run — so this is the DEFAULT page text, not an edge case.
+fn failed_runs(n: i32) -> String {
+    format!("{n} run{}", if n == 1 { "" } else { "s" })
 }
 
 /// BLD-2 plan D9: does THIS check raise the behind-target alert?
@@ -1760,15 +1775,18 @@ pub fn lag_json(
     let retries_exhausted = upstream_retries_exhausted(st, max_retries);
 
     let reason = if let Some(u) = upstream_stop {
-        if let Some(failed_runs) = u.failed_runs {
+        // BLD-2 review R5 SHOULD-FIX 7: the binding is `runs`, not
+        // `failed_runs` — the helper of that name must stay reachable.
+        if let Some(runs) = u.failed_runs {
             status = LagStatus::Behind;
             // BLD-2 review R4 BLOCKER 1 (b) / decision R16: the same words the
             // check's exhausted branch orders for P, with the count derived
             // from U's own `max_retries` in [`UpstreamStop::failed_runs`].
             format!(
-                "upstream pipeline {}'s last {failed_runs} runs for this change failed; \
+                "upstream pipeline {}'s last {} for this change failed; \
                  the next input change starts again",
-                u.pipeline_id
+                u.pipeline_id,
+                failed_runs(runs)
             )
         } else {
             // BLD-2 review R5 decision R18: the walk stopped at an
@@ -1781,7 +1799,10 @@ pub fn lag_json(
     } else if retries_exhausted {
         status = LagStatus::Behind;
         let n = max_retries + 1;
-        format!("the last {n} runs for this change failed; the next input change starts again")
+        format!(
+            "the last {} for this change failed; the next input change starts again",
+            failed_runs(n)
+        )
     } else {
         reason_for(status, st.consumed_tokens.is_none()).to_owned()
     };
@@ -3179,6 +3200,17 @@ mod tests {
             res["reason"],
             "the last 2 runs for this change failed; the next input change starts again"
         );
+    }
+
+    /// BLD-2 review R5 SHOULD-FIX 7: the count and its plural come from one
+    /// helper, so "last 1 run" is what every exhausted reason says when a
+    /// pipeline is allowed no retry at all (`max_retries: 0` → one failed
+    /// run) — the default text, not an edge case.
+    #[test]
+    fn the_failed_run_count_is_written_with_its_plural() {
+        assert_eq!(super::failed_runs(1), "1 run");
+        assert_eq!(super::failed_runs(2), "2 runs");
+        assert_eq!(super::failed_runs(3), "3 runs");
     }
 
     // BLD-2 review R3 BLOCKER 1 / decision R14: lag_json derives waiting on exhausted upstream

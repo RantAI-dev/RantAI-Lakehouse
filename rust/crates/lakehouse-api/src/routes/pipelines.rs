@@ -1079,12 +1079,12 @@ async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Val
     let no_readers =
         crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
             .await?;
-    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 refused + SHOULD-FIX 3:
+    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + SHOULD-FIX 3:
     // the answer comes from the SAME chain the check walks (not
     // `dependsOn` alone) and the read propagates with `?` — the old code
-    // walked `dependsOn` and swallowed every store error with
-    // `if let Ok(...)`, so a failing read silently answered "nothing is
-    // blocking this pipeline".
+    // refused decision R16's answer: it walked `dependsOn` and swallowed
+    // every store error with `if let Ok(...)`, so a failing read silently
+    // answered "nothing is blocking this pipeline".
     let upstream_stop = crate::pipeline_lag::upstream_stop_of(pool, pipeline).await?;
     Ok(crate::pipeline_lag::lag_json(
         pipeline.target_lag,
