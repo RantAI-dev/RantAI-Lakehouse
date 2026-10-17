@@ -46,7 +46,7 @@ use crate::upstream_error;
 // ── GET /api/dashboard ──────────────────────────────────────────────────
 
 /// Query parameters accepted by `GET /api/dashboard`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct DashboardQuery {
     #[serde(default)]
     board: Option<String>,
@@ -63,6 +63,25 @@ pub struct DashboardQuery {
     /// not named here takes the board's saved value, else its default.
     #[serde(default)]
     params: Option<String>,
+}
+
+impl DashboardQuery {
+    /// The query the PDF's print view reads a board with (`BI-1` D3): the
+    /// board and the filter, parameter and grain text the person had on screen.
+    pub(crate) fn for_render(
+        board: &str,
+        filters: Option<&str>,
+        params: Option<&str>,
+        grain: Option<&str>,
+    ) -> Self {
+        Self {
+            board: Some(board.to_owned()),
+            year: None,
+            filters: filters.map(str::to_owned),
+            grain: grain.map(str::to_owned),
+            params: params.map(str::to_owned),
+        }
+    }
 }
 
 /// Why [`get_body`] stopped: the store failed, or the request's parameter
@@ -144,6 +163,27 @@ pub async fn get(
     Extension(principal): Extension<Principal>,
     Query(q): Query<DashboardQuery>,
 ) -> Response {
+    match payload_for(&state, &principal, &q).await {
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// The payload `GET /api/dashboard` answers for `principal`: the board's
+/// tiles read as that person (masks, row filters), the formatting settings and
+/// whether the person may download. The one copy, called by the route and by
+/// the PDF's print view (`routes::render`, `BI-1` D3) so the file shows what
+/// the screen shows.
+///
+/// # Errors
+///
+/// The response to send instead: 400 for filters, grain or parameters that do
+/// not fit, a fixed sentence for a store failure.
+pub(crate) async fn payload_for(
+    state: &AppState,
+    principal: &Principal,
+    q: &DashboardQuery,
+) -> Result<Value, Response> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_tenant_ids: principal
@@ -152,33 +192,26 @@ pub async fn get(
             .map(ToString::to_string)
             .collect(),
     };
+    let reject = |err: ApiError| crate::error::ApiRejection(err).into_response();
     // BI-18: a malformed `filters` used to be ignored without a word, which
     // showed an unfiltered dashboard for a filter the caller believed was on.
-    let param_filters = match parse_filters_param(q.filters.as_deref()) {
-        Ok(f) => f,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let requested = match parse_grain_request(q.grain.as_deref()) {
-        Ok(g) => g,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let time = match crate::routes::settings::time_context(&state).await {
-        Ok(t) => t,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
+    let param_filters = parse_filters_param(q.filters.as_deref()).map_err(reject)?;
+    let requested = parse_grain_request(q.grain.as_deref()).map_err(reject)?;
+    let time = crate::routes::settings::time_context(state)
+        .await
+        .map_err(reject)?;
     // BI-17 part A: the number locale, company palette and fonts go out in the
     // payload's `reporting` object next to the zone.
-    let format = match crate::routes::settings::format_settings(&state).await {
-        Ok(f) => f,
-        Err(err) => return crate::error::ApiRejection(err).into_response(),
-    };
-    let obligations = PolicyEngineObligations::from_state(&state);
+    let format = crate::routes::settings::format_settings(state)
+        .await
+        .map_err(reject)?;
+    let obligations = PolicyEngineObligations::from_state(state);
     // BI-18 part C, part 2: a board in the trash or in somebody else's
     // personal space reads as a board that does not exist.
-    let viewer = viewer_of(&principal);
+    let viewer = viewer_of(principal);
     match get_body(
         &state.clickhouse,
-        &q,
+        q,
         param_filters,
         &principal.role_names,
         &placeholders,
@@ -195,19 +228,19 @@ pub async fn get(
                 map.insert(
                     "canDownload".to_owned(),
                     Value::Bool(crate::routes::settings::may_download(
-                        &principal,
+                        principal,
                         &format.download_denied_roles,
                     )),
                 );
             }
-            (StatusCode::OK, ApiJson(body)).into_response()
+            Ok(body)
         }
-        Err(BodyError::Params(err)) => crate::error::ApiRejection(err).into_response(),
-        Err(BodyError::Store(err)) => (
+        Err(BodyError::Params(err)) => Err(reject(err)),
+        Err(BodyError::Store(err)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 

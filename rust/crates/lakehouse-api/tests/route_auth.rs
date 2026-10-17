@@ -2054,3 +2054,18 @@ async fn parameters_are_read_with_dashboard_read_and_defined_with_dashboard_writ
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} (neither)");
     }
 }
+
+/// BI-1 (D3): the print view's data route is `Policy::Public` (the renderer has
+/// no session) and the one such route that reads as a person, so it is pinned
+/// by name; the table-driven loops above walk it with no credentials, and the
+/// route's own tests (`render_data.rs`) show a session cookie changes nothing.
+#[test]
+fn the_render_data_route_is_public_and_token_authenticated() {
+    assert_eq!(
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/api/render/data")
+            .map(|(_, _, policy)| *policy),
+        Some(Policy::Public)
+    );
+}

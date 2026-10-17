@@ -151,6 +151,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // eighth is `POST /api/embed/frame`, SEC-12.) ───────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
+    // BI-1 (D3): the PDF's print view has no session; its data route is
+    // authenticated by the signed render token in the body, and reads as the
+    // person the token names (never as the embed viewer role).
+    ("POST", "/api/render/data",                  Policy::Public),
     // SEC-12: the console's `proxy.ts` asks which sites may frame an embed
     // page, with the token the page was opened with. Public because the
     // token is the credential; it answers only an origin list, and the same
@@ -939,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_eight_public_entries_exist() {
+    fn exactly_nine_public_entries_exist() {
         // Pre-existing drift found while landing the `/api/auth/providers`
         // route: this assertion was still pinned at 4 even though the two
         // earlier OIDC public routes (`/api/auth/oidc/start`,
@@ -954,7 +958,9 @@ mod tests {
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
         // SEC-12 added `POST /api/embed/frame`: 7 -> 8.
-        assert_eq!(public_count, 8);
+        // BI-1 (D3) added `POST /api/render/data`, the PDF print view's data
+        // route, authenticated by its signed render token: 8 -> 9.
+        assert_eq!(public_count, 9);
     }
 
     /// SEC-23 (F1): adding a governance rule needs `governance:write`, the
