@@ -1014,10 +1014,11 @@ fn build_masked_filtered_select(
 /// operators and qualifiers (SEC-43). A call is its name and a plain list of
 /// unnamed expressions, with no `FILTER`, `OVER`, `WITHIN GROUP`, second
 /// parameter list, null treatment, `DISTINCT` or clause inside the
-/// parentheses. A binary operator is a comparison, `AND`, `OR` or one of
-/// `+ - * / %`; a unary one is `NOT`, `-` or `+`. A column may have one
-/// unquoted table name before it. Each of these was once a part of the
-/// parsed tree that the walk did not look at.
+/// parentheses, or the ODBC `{fn ...}` form. A binary operator is a
+/// comparison, `AND`, `OR` or one of `+ - * / %`; a unary one is `NOT`, `-`
+/// or `+`. A column may have one unquoted table name before it. Before
+/// SEC-43 the walk did not look at these parts of a call, at an operator, or
+/// at the table name before a column.
 ///
 /// A text value may not contain a backslash (SEC-32). This function parses
 /// with `GenericDialect`, which does not read a backslash as an escape, while
