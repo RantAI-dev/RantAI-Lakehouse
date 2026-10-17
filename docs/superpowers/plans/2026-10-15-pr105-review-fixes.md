@@ -399,3 +399,25 @@ conflicts in `store.rs` and this file resolved by hand (see the merge commit).
     real `origins` event newer than the copy wins.
 - **R-A2** — the three clippy fixes in `embed_tokens.rs` may stay in the
   merge commit; they are mechanical.
+
+### Review — R-A1 fix (`5679107b`), 2026-10-17, planner
+
+Re-run by the planner against the dev `ClickHouse` (26.8) in a scratch
+database with the same table shapes: the copy's `SELECT` picks the legacy
+board, returns nothing once an epoch event exists (idempotent), and
+`argMax(origins_json, at)` returns a real event's origins even when the copy
+is inserted after it. That half of the handoff's *not verified* is now
+verified; the `FINAL` read on the real `bi_board` is not.
+
+- **R-A3 SHOULD-FIX — a copy cut off half-way is never finished.** The
+  board's first `INSERT` already writes the epoch marker, so if the process
+  stops after it, the board's other events (a withdrawn jti) are never
+  copied and that token is accepted again. Write each board's events in
+  **one** multi-row `INSERT` (all columns listed, one `VALUES` tuple per
+  event): `ClickHouse` inserts one block whole or not at all. Accept: the
+  test that a board with a cut-off, a jti and origins issues one `INSERT`.
+- **R-A4 SHOULD-FIX — boards in the trash are skipped.** `is_deleted = 0`
+  leaves out phase 3's trashed boards (`is_deleted = 2`), which can be
+  restored; a restored board would lose its withdrawals. Drop the
+  `is_deleted` condition: an event for a deleted board is never read and
+  costs nothing. Accept: a test with a trashed legacy board.
