@@ -1330,3 +1330,36 @@ passed; `lakehouse-api --lib -- pipeline_lag` 42 passed;
 - Compose is proven by `config` under dummy `:?` values only; no profile
   was brought up (no compose file changed this round).
 - Nothing was verified in a browser.
+
+### Round 6 (planner, at `ed160bc2`) — final review
+
+Review of the round-5 delta (`86e2d93f..ed160bc2`; for the merge
+`ae8d38eb`, only its conflict resolution). R17, R18 and SHOULD-FIX 1–5 and 7
+are fixed, SHOULD-FIX 6 is partly fixed (its comment, finding 3 below); the
+handoff's commit mapping matches `git show --stat`. Reusing the list's
+`lag_states` map for the chain is sound: the chain query requires
+`target_lag_downstream = true` and the same tenant, and `0084`'s CHECK makes
+every such upstream `Some(Downstream)`, so it is always in the map. **No
+BLOCKER is open: approved for merge.**
+
+#### SHOULD-FIX (follow-up, comments and one test helper; no behaviour)
+
+1. `pipeline_lag.rs` ~1666: the doc of `upstream_stops_for_list` names a test
+   that does not exist and says it counts statements; the test is
+   `adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list` and
+   counts pool checkouts. "One `list_lag_states` per upstream" is stale too.
+2. `lakehouse-store/tests/pipelines.rs` ~2846: without the sort the attempts
+   arrive `pl-z, pl-a, pl-m, pl-a` (as `0f4c76b3` measured), not
+   `pl-z, pl-a, pl-a, pl-m`.
+3. `pipeline_lag.rs` ~702–713: tagged `R5 SHOULD-FIX 4`, but it is SHOULD-FIX
+   6; and `connector_listing::class_of_sqlx` does tell 57014 from 55P03 —
+   the real reasons are that it does not treat 55P03 as a budget error and
+   does not walk the error chain.
+4. Stacked docs: the old R16 paragraph sits on top of `UpstreamStop`'s R18
+   doc; the SHOULD-FIX 3 paragraph on `lock_lag_states_ordered` sits inside
+   `# Errors`.
+5. `seed_outstanding_state` copies `seed_exhausted_state`: one helper with a
+   parameter (rule 4).
+
+Also noted, not a finding of this plan: `downstream_without_readers` is
+still one query per downstream candidate (flagged by the developer).
