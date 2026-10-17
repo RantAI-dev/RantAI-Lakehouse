@@ -1234,3 +1234,99 @@ items below are the last round before merge.
 7. Nits: "decision R16 refused" (`routes/pipelines.rs` ~1077); "last 1
    runs" → singular when N = 1; the not-exhausted control in
    `pipeline_lag_page.rs` should not use `seed_exhausted_state`.
+
+### Handoff round 5 (developer)
+
+Appended at the end of the file, where round 4's developer handoff sits
+(right after its planner round), rather than in section 7.
+
+#### Round 5 findings → commits
+
+| Finding | Fixing commit (12 chars) | Note |
+| --- | --- | --- |
+| R17 — merge `main` | `ae8d38eb` | Merge commit, one conflicting hunk in `score_case`'s `expect_tool`: `main`'s `want` build (R17) kept together with this branch's R15 comparison. The `ai_eval` hunk was verified against `main`'s side before the commit. |
+| R18 / SHOULD-FIX 2 — the page stops where the check stops | `7b0bafc4` | `first_upstream_stop` walks the full chain in the check's order and answers at the first OPEN request (exhausted or outstanding), so page and check name the same U. |
+| SHOULD-FIX 1 — the list is N+1 | `d30a1768` | `upstream_stops_for_list`: every row's chain on ONE connection, stop answers from the `lag_states` map the route already read (no per-row state read at all). The doc proves that reuse is sound, not merely cheap (a chain upstream is `target_lag_downstream = true` ⇒ `Some(Downstream)` ⇒ it is in the route's `lag_ids`, and the chain query is tenant-scoped to the walked pipeline). Test `adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list` (2 rows sharing one exhausted U, then 3): fails without the fix, measured "two rows checked out 9, three checked out 11". |
+| SHOULD-FIX 3 — the ordered-lock test could not fail | `0f4c76b3` | Two tests replace the gap, each shown to fail by reverting the code it pins: a `BEFORE INSERT` trigger probe records the missing-row INSERT attempts (unsorted + duplicated input comes out `pl-a, pl-m, pl-z`; without the sort/dedup it is `pl-z, pl-a, pl-m, pl-a`), and a two-connection contention test holds `pl-a` while the walk runs with ids `pl-z, pl-a, pl-m` and a third connection asks for `pl-z` (granted = the walk never got past `pl-a`; locking one id per statement in input order fails it with `55P03`). |
+| SHOULD-FIX 4 — duplicated doc + a comment above the wrong item | `827b5092` | One copy of `is_check_budget_error`'s doc; the stray `R2 SHOULD-FIX 6` line above it labelled nothing (that finding's helper is `make_lag_update`, already tagged). |
+| SHOULD-FIX 6 — one comment at the SQLSTATE matcher | `827b5092` | Same commit (same function). Both existing helpers were read against their signatures first: `connector_probe::classify_sqlx_error` is a generic CONNECTION class for probe messages, `connector_listing::class_of_sqlx` buckets IO/TLS/pool-timeout/listing errors; neither walks an error CHAIN, which is what this predicate needs because the store folds the raw error into `StoreError::Database`. |
+| SHOULD-FIX 5 — `tool_args_match` | `619df4eb` | A wanted bool matches only a bool (`1 == True` in Python scored a numeric one); `json.dumps(got, ensure_ascii=False)` so a wanted non-ASCII string can match inside a list/object. Two tests, both failing on the previous matcher. `ops/ai_eval` is AI-team-owned; the behavioural change for them is in "Not verified" below. |
+| SHOULD-FIX 7 — three nits | `155ae428` | One `failed_runs` helper for all four places the count is written, so the reason reads "last 1 run"; `routes/pipelines.rs`'s "decision R16 refused" now says the old code refused R16's answer; the two not-exhausted controls seed through a new `seed_outstanding_state` instead of `seed_exhausted_state`. |
+
+No finding is skipped or left open.
+
+#### What happened to the inherited (uncommitted) SHOULD-FIX 1 diff
+
+It was reviewed first, as instructed. Its approach was sound — the
+batching of the chain walks and the reuse of the list's own state map — and
+its doc claim about that reuse was checked against the code
+(`upstream_downstream_pipelines_conn`'s `target_lag_downstream = true`
+predicate, `TargetLag::from_columns`, and the tenant-scoped read). What was
+not usable: it did not compile (it destructured a three-tuple from
+`build_state_and_pool`, which returns two), its test counted sqlx
+`tracing` events through a subscriber its own harness doc called
+unreliable in a parallel test binary, it carried `eprintln!` scaffolding
+and named a test that did not exist, and it left a
+`spin_up_with_env_counting_acquires` helper unused. The implementation was
+kept and re-documented, the harness helper was rewritten (no
+`build_state_and_pool` change: the URL comes from `AppState::config`), and
+the test was written from scratch — so the diff is larger than the WIP
+patch, not smaller, and it is one commit per finding.
+
+Measured while choosing the counter, and written into the harness doc
+rather than assumed: `pg_stat_database.xact_commit` cannot count a
+request's statements here (the delta read 0 for a whole list request), and
+sqlx's `tracing` events cannot either. `PoolOptions::before_acquire` on a
+one-connection pool counts checkouts deterministically, and the test's own
+`with_two_rows > 0` assertion fails loudly rather than passing vacuously
+if the counter ever stops moving.
+
+#### Verification (all on `155ae428`, the final head of round 5)
+
+| Command | Result |
+| --- | --- |
+| `cd rust && cargo fmt --check` | rc 0 |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | rc 0, 0 warnings (`bld2-r5-clippy-ws.log`) |
+| `cargo-locked test -j 2 --workspace --no-fail-fast` | rc 101: 117 `test result:` lines, **6221 passed, 9 failed** (`bld2-r5-ws.log`). All 9 are two binaries and all 9 are SQLSTATE `53100` "could not resize shared memory segment … No space left on device" — the Postgres container's `/dev/shm` under this machine's parallel binaries, the flake round 4 also hit. Re-run alone: `--test connector_secret_reference` **6 passed**, `--test connector_secret_rotate` **7 passed**. With those: **6234 passed, 0 failed.** |
+| `bun run typecheck` | rc 0 |
+| `bun run lint` | rc 0; 0 errors, 8 warnings (all pre-existing files, same 8 as round 4) |
+| `bun run test` (full) | 1919 pass, 1 skip, 0 fail (194 files, 4311 `expect()` calls) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `venv-bld3/bin/python -m pytest ops/ai_eval -q` | 144 passed |
+| `venv-bld3/bin/python -m pytest dispar_orchestrate -q --basetemp=/home/shiro/rantai/review/pytest-bld2` (from `dagster/`, under `flock`) | 1534 passed, 33 subtests passed, 0 failed (961.14 s) |
+| `vars=$(grep -oE '\$\{[A-Z0-9_]+:\?' docker-compose.yml \| …); env $(for v in $vars; do echo "$v=dummy-value-0001"; done) docker compose --profile '*' config --quiet` | `COMPOSE_OK` |
+| `git status` | clean; only ignored build output (`node_modules/`, `.next/`, `__pycache__/`, `.pytest_cache/`) |
+
+Scoped per-commit runs are quoted in each commit body. The ones that
+matter for the review: the N+1 route test was run green and then with the
+fix stashed (failed, measured), the ordered-lock pair was run green and
+then against a reverted `lock_lag_states_ordered` (both new tests failed),
+and `ops/ai_eval` was run green and then against the previous matcher
+(both new tests failed). Also run: `lakehouse-store --test pipelines` 60
+passed; `lakehouse-api --lib -- pipeline_lag` 42 passed;
+`--test pipeline_lag_page` 4 passed; `--test pipeline_lag_check` 6 passed.
+
+#### Not verified
+
+- **The gate was not re-run.** Round 5 changed the list route's batching,
+  test code, comments, the `ai_eval` matcher and one reason's plural
+  (`last 1 run`). The check interval, the budget arithmetic and the
+  statuses are untouched, so the R8 measurements stand — but the reason
+  string that reaches an alert changed for `max_retries: 0`, and no gate
+  run here would have caught it anyway.
+- **No current `ops/ai_eval` case changes verdict** from SHOULD-FIX 5, and
+  this was measured rather than assumed: `cases.json` (30 cases) and
+  `dashboard_cases.json` (41 cases) hold no boolean anywhere in
+  `expect_tool`, so the strict bool arm has nothing to bite on today. A
+  future case that wants `true` and whose tool call sent `1` will now stop
+  matching — that is the finding's intent, but `cases.json` is AI-team
+  owned and no live eval run was made here. The non-ASCII change likewise
+  only affects a wanted string that carries the character itself.
+- `downstream_without_readers` still issues one
+  `count_lag_pipelines_reading` per `downstream` candidate. It is not the
+  read SHOULD-FIX 1 named, and batching it is a new store query; said in
+  the commit body and left for the reviewer to rule on.
+- Compose is proven by `config` under dummy `:?` values only; no profile
+  was brought up (no compose file changed this round).
+- Nothing was verified in a browser.
