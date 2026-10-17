@@ -15,5 +15,5 @@ RUN pip install --no-cache-dir "requests==2.32.3" "psycopg2-binary==2.9.10"
 # The script is bind-mounted read-only at `/work` (`docker-compose.yml`);
 # this image carries no gate code of its own, so a stale copy can never be
 # what CI ran.
+# BLD-2 review R2 SHOULD-FIX 8: command is defined in docker-compose.yml, ensure trailing newline
 WORKDIR /work
-CMD ["python", "g7_pipeline_test.py"]

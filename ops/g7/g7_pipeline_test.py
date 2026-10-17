@@ -165,15 +165,16 @@ SOURCE_UNAVAILABLE_BODY = {"error": "source provenance is unavailable for this b
 def lag_sensor_name(pipeline_id: str) -> str:
     """The Dagster sensor name the code location gives pipeline `pipeline_id`.
 
-    BLD-2 review R1 SHOULD-FIX 14: the SAME derivation as
-    `authored_factory._dagster_safe_name` followed by
+    BLD-2 review R1 SHOULD-FIX 14 / R2 SHOULD-FIX 8: the SAME character-by-character
+    derivation as `authored_factory._dagster_safe_name` followed by
     `authored_factory.lag_sensor_name`. It is duplicated rather than
     imported because this runner image carries no code location (the gate
     scripts share no module -- see this file's module doc), so a change to
     either side has to change both; the comment is what keeps them
     honestly in step.
     """
-    return f"authored__{re.sub(r'[^A-Za-z0-9_]', '_', pipeline_id)}_lag"
+    safe = "".join(c if c.isalnum() or c == '_' else '_' for c in pipeline_id)
+    return f"authored__{safe}_lag"
 
 # ClickHouse, for the row assertion: the Silver output and the Bronze
 # source are counted through the same client `ops/g3a/g3a_test.py` uses
@@ -664,7 +665,10 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
     if not resp.ok:
         raise G7Failure(f"PUT /target-lag failed: {resp.status_code} {resp.text}")
 
-    pipe_detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+    # BLD-2 review R2 SHOULD-FIX 8: raise_for_status on detail request
+    pipe_detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+    pipe_detail_resp.raise_for_status()
+    pipe_detail = pipe_detail_resp.json()
     if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": TARGET_LAG_MINUTES}:
         raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
 
@@ -736,25 +740,11 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
             ).strip()
         )
 
-        last_log_t = 0.0
+        # BLD-2 review R2 SHOULD-FIX 8: clean silver wait without polling debug probe
         def silver_reached() -> bool:
-            nonlocal last_log_t
             curr_silver = int(
                 ch_query(f"SELECT count() FROM silver.`{SILVER_TABLE_NAME}` FORMAT TabSeparated").strip()
             )
-            now = time.time()
-            if now - last_log_t >= 10.0:
-                last_log_t = now
-                ticks_data = requests.post(
-                    DAGSTER_URL,
-                    json={
-                        "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { ... on Sensor { sensorState { status ticks(limit: 2) { status timestamp skipReason } } } } }",
-                        "variables": {"sel": sel},
-                    },
-                    timeout=5,
-                ).json()
-                runs_list = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5).json().get("runs", [])
-                print(f"[g7] waiting for silver: curr_silver={curr_silver}/{bronze_rows}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}, sensor={ticks_data}")
             return curr_silver >= bronze_rows
 
         _wait_for(f"Silver table to reach {bronze_rows} rows", silver_reached, timeout_s=180, interval_s=2.0)
@@ -777,14 +767,19 @@ def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
 
     for check_idx in range(1, 6):
         time.sleep(30)
-        detail = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10).json()
+        # BLD-2 review R2 SHOULD-FIX 8: raise_for_status in unchanged checks
+        detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+        detail_resp.raise_for_status()
+        detail = detail_resp.json()
         lag = detail.get("lag") or {}
         status = lag.get("status")
         if status != "met":
             raise G7Failure(
                 f"Unchanged inputs check {check_idx}/5 expected status 'met', got {status!r} (reason: {lag.get('reason')})"
             )
-        runs_now = len(API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10).json().get("runs", []))
+        runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10)
+        runs_resp.raise_for_status()
+        runs_now = len(runs_resp.json().get("runs", []))
         if runs_now != baseline_run_count:
             raise G7Failure(
                 f"Unchanged inputs check {check_idx}/5 expected {baseline_run_count} runs, got {runs_now} (new run launched unexpectedly)"

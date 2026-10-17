@@ -893,7 +893,17 @@ def score_case(
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
         want = expect_tool.get("args_contains", {})
-        if any(all(str(v).lower() in str(t.get("args", {}).get(k, "")).lower() for k, v in want.items()) for t in trace):
+        # BLD-2 review R2 SHOULD-FIX 9: dotted keys traverse nested args so matching is key-order independent
+        def _get_arg(args: dict, key: str):
+            curr = args
+            for part in key.split("."):
+                if isinstance(curr, dict):
+                    curr = curr.get(part, "")
+                else:
+                    return ""
+            return curr
+
+        if any(all(str(v).lower() in str(_get_arg(t.get("args", {}), k)).lower() for k, v in want.items()) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")

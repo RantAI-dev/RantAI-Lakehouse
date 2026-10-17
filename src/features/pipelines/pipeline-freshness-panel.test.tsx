@@ -130,6 +130,16 @@ describe("PipelineFreshnessPanel display", () => {
     expect(screen.getByText("Not configured")).toBeTruthy()
     expect(screen.getByText("None (runs on schedule or demand)")).toBeTruthy()
   })
+
+  // BLD-2 review R2 SHOULD-FIX 10: unknown widened kind renders honestly
+  it("renders Unknown target lag when kind is unknown", () => {
+    const p = makePipeline({
+      targetLag: { kind: "future_kind" } as any,
+    })
+    render(<PipelineFreshnessPanel pipeline={p} />)
+
+    expect(screen.getByText("Unknown target lag")).toBeTruthy()
+  })
 })
 
 describe("PipelineFreshnessPanel authorization and controls", () => {
@@ -193,7 +203,8 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
 
       fireEvent.click(screen.getByLabelText("Configure target lag"))
       fireEvent.click(screen.getByText("Downstream"))
-      fireEvent.click(screen.getByText("Save target lag"))
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
 
       await waitFor(() => {
         expect(updatedPayload).toEqual({ kind: "downstream" })
@@ -217,7 +228,8 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
 
       fireEvent.click(screen.getByLabelText("Configure target lag"))
       fireEvent.click(screen.getByText("None (clear)"))
-      fireEvent.click(screen.getByText("Save target lag"))
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
 
       await waitFor(() => {
         expect(updatedPayload).toBeNull()
@@ -238,12 +250,43 @@ describe("PipelineFreshnessPanel authorization and controls", () => {
       render(<PipelineFreshnessPanel pipeline={p} />)
 
       fireEvent.click(screen.getByLabelText("Configure target lag"))
-      fireEvent.click(screen.getByText("Save target lag"))
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
 
       await waitFor(() => {
         expect(
           screen.getByText("target lag would create a cycle: pl-orders -> pl-upstream -> pl-orders")
         ).toBeTruthy()
+      })
+    } finally {
+      pipelineService.setTargetLag = orig
+    }
+  })
+
+  // BLD-2 review R2 SHOULD-FIX 10: minutes below floor is refused with floor message
+  it("refuses minutes below the configured floor", async () => {
+    const p = makePipeline()
+    let called = false
+    const orig = pipelineService.setTargetLag
+    pipelineService.setTargetLag = async (id, targetLag) => {
+      called = true
+      return { ...p, targetLag }
+    }
+
+    try {
+      render(<PipelineFreshnessPanel pipeline={p} />)
+
+      fireEvent.click(screen.getByLabelText("Configure target lag"))
+
+      const minutesInput = screen.getByLabelText("Minutes (2 - 10080)") as HTMLInputElement
+      fireEvent.change(minutesInput, { target: { value: "1" } })
+
+      const form = screen.getByText("Save target lag").closest("form")!
+      fireEvent.submit(form)
+
+      await waitFor(() => {
+        expect(screen.getByRole("alert").textContent).toContain("Minutes must be between 2 and 10080")
+        expect(called).toBe(false)
       })
     } finally {
       pipelineService.setTargetLag = orig

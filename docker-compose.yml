@@ -2418,17 +2418,12 @@ services:
       # setting needs this pair.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
-      # BLD-2 review R1 BLOCKER 8: pass Postgres credentials to g7-test-runner
-      PGHOST: ${PGHOST:-postgres}
-      PGPORT: ${PGPORT:-5432}
+      # BLD-2 review R1 BLOCKER 8 / R2 SHOULD-FIX 8: pass Postgres credentials to g7-test-runner (hard-coded host/port in compose network, drop duplicate POSTGRES_* pairs)
+      PGHOST: postgres
+      PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
-      POSTGRES_HOST: ${PGHOST:-postgres}
-      POSTGRES_PORT: ${PGPORT:-5432}
-      POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
-      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
       PYTHONDONTWRITEBYTECODE: "1"
     # BLD-2 review R1 BLOCKER 8: no `pip install` at run time — both
     # dependencies come from the image (see `ops/g7/Dockerfile`).
