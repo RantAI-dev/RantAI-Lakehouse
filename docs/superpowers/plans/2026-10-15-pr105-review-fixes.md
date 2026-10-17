@@ -343,9 +343,29 @@ conflicts in `store.rs` and this file resolved by hand (see the merge commit).
   after this change they are no longer read, so a withdrawn token would be
   accepted again. A one-time backfill of those columns into the event table
   (guarded by `system.columns`) is needed before this ships if `main` has
-  been deployed. Not built: it is a scope decision for the planner.
+  been deployed. Not built in this entry; built afterwards as R-A1 (below).
 - Not verified: `route_auth`, the full workspace test run, `bun run lint`
   and `bun run test`, anything against a live ClickHouse.
+
+### R-A1 fix — developer (Claude Sonnet), 2026-10-17
+
+- Commit: `fix(bi): copy the embed state stored on the board row into the event table (PR #105 review R-A1 BLOCKER)`;
+  `copy_legacy_embed_state` in `store.rs`, called at the end of `ensure_bi_table`.
+- Tests added (5, in `store.rs`): copy keeps jti/cut-off/origins effective;
+  second run inserts nothing; no legacy columns runs no copy; copied
+  origins event is epoch-stamped (the `argMax` read half is pinned by a
+  source check, not run); unparseable list revokes everything.
+- DDL-count test 22 to 23: the `system.columns` check request.
+- Commands (foreground, shared target, jobs 2): `cargo fmt --check` clean;
+  clippy on bi/api/dagster/core `--all-targets -D warnings` clean;
+  `cargo test -p lakehouse-bi` 432 passed, 3 ignored, doc-test 1;
+  `-p lakehouse-api --lib -- embed dashboard upstream_error connectors` 223;
+  `--test embed_tokens` 21; `--test sec11_guard` 4; `--test upstream_errors` 6;
+  `--test route_auth` (threads 2) 42.
+- Not verified: against a live ClickHouse. The `NOT IN (... at = epoch)`
+  idempotence and the `FINAL` read are SQL the mock stands in for (the mock
+  emulates the idempotence); the real statements are unrun. No full
+  workspace run, `bun run lint/test`.
 
 ## 7. Review
 
