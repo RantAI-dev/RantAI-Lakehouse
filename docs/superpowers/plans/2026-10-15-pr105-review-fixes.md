@@ -310,4 +310,18 @@ is a `5xx`, so it keeps the retry code. No gate needed a change.
   `orchestrator_unreachable` as the answer for every orchestrator failure),
   are the planner's and were left untouched.
 
+### Slice A — developer (Antigravity), 2026-10-15
+
+- Implemented Task A1: moved embed access state from `console.bi_board` row to append-only `console.bi_board_embed_event` table read by aggregation (`PR #105 review SHOULD-FIX 1`).
+- Commit: `3d2263c7` (`fix(bi): keep embed access out of the board row (PR #105 review SHOULD-FIX 1)`)
+- Commands verified:
+  - `cargo fmt --check`: passed (clean)
+  - `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets -- -D warnings`: passed (clean)
+  - `cargo test -p lakehouse-bi`: 96 passed, 0 failed, 1 doc-test passed
+  - `cargo test -p lakehouse-api --lib embed`: 8 passed, 0 failed
+  - `cargo test -p lakehouse-api --lib dashboard`: 22 passed, 0 failed
+  - `cargo test -p lakehouse-api --test embed_tokens`: 21 passed, 0 failed
+- Not verified:
+  - `cargo test --workspace` or workspace-wide clippy (skipped per rule to conserve memory on 11 GB host; CI runs workspace checks).
+
 ## 7. Review
