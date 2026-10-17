@@ -1197,14 +1197,14 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
         Expr::Like {
             expr: inner,
             pattern,
-            negated,
+            negated: _,
             any,
             escape_char,
         }
         | Expr::ILike {
             expr: inner,
             pattern,
-            negated,
+            negated: _,
             any,
             escape_char,
         } => {
@@ -1215,17 +1215,16 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
             // or a real column inside the pattern does not leak through
             // when the whole node is the only rejection. Every field is
             // named (no `..`) so a field a later `sqlparser` adds stops
-            // the build here until someone decides what it means.
+            // the build here until someone decides what it means. `negated`
+            // is the `NOT` flag and is discarded here (`negated: _`) — it is
+            // still named so a later field stops the build, but its value is
+            // irrelevant to the shape; `NOT LIKE` with one pattern stays
+            // accepted.
             if *any {
                 return Err(RewriteError::InvalidRowFilter {
                     reason: LIKE_ANY_REFUSAL.to_owned(),
                 });
             }
-            // `negated` is the `NOT` flag — checked explicitly to keep
-            // the unused-binding lint quiet while the field is named
-            // here for completeness. Today every value is fine; SEC-44
-            // changes `any`, not `negated`.
-            let _: &bool = negated;
             validate_expr_shape(inner, real_columns)?;
             validate_expr_shape(pattern, real_columns)?;
             // SEC-32 review fix (BLOCKER): the escape is an expression too.
@@ -2378,19 +2377,20 @@ mod row_filter {
     }
 
     // SEC-44: every refusal below pins a fixed reason (no filter text, no
-    // marker word) and matches the plan's exact wording so the
-    // `policy_engine::refusal_message` mapping can keep using a single
-    // fixed text per reason. The constants themselves live next to the
-    // other refusal strings (SIGN_REFUSAL, CONTROL_CHAR_REFUSAL,
-    // LIKE_ANY_REFUSAL) so the production text and the test pin the same
-    // source.
+    // marker word) so the reason stays stable and never echoes the filter.
+    // Note `policy_engine::refusal_message` maps the whole
+    // `InvalidRowFilter { .. }` VARIANT to one fixed caller message
+    // (`policy_engine.rs` matches `{ .. }`, ignoring the reason), so these
+    // fixed reason texts are for logs and tests, not a per-reason caller
+    // mapping. The constants live next to the other refusal strings
+    // (SIGN_REFUSAL, CONTROL_CHAR_REFUSAL, LIKE_ANY_REFUSAL) so the
+    // production text and the test pin the same source.
 
     #[test]
     fn validate_row_filter_expr_refuses_a_unary_minus_whose_operand_is_a_unary_minus() {
+        // The canonical case; the full sign-over-sign matrix (and the same
+        // `x = - -1` row) lives in the loop test below.
         let cols = vec!["x".to_owned()];
-        // `x = - -1` parses to `BinaryOp(Eq, x, UnaryOp(Minus, UnaryOp(Minus, 1)))`
-        // — the outer Minus has a Minus operand, which `Display` writes
-        // as `--`, and `--` starts a SQL line comment.
         assert_eq!(
             invalid_reason("x = - -1", &cols),
             SIGN_REFUSAL,
@@ -2400,6 +2400,9 @@ mod row_filter {
 
     #[test]
     fn validate_row_filter_expr_refuses_every_sign_over_sign_combination() {
+        // `x = - -1` parses to `BinaryOp(Eq, x, UnaryOp(Minus, UnaryOp(Minus, 1)))`
+        // — the outer sign has a sign operand, which `Display` writes as
+        // `--` (or `++`/`-+`/`+-`), and `--` starts a SQL line comment.
         let cols = vec!["x".to_owned()];
         for raw in ["x = - -1", "x = + +1", "x = -+1", "x = +-1"] {
             assert_eq!(invalid_reason(raw, &cols), SIGN_REFUSAL, "{raw}");
@@ -2424,17 +2427,24 @@ mod row_filter {
         assert_eq!(invalid_reason(raw, &cols), CONTROL_CHAR_REFUSAL);
     }
 
-    /// Rows from the table below are filtered through the validator.
-    /// Each `LIKE`/`ILIKE` row sets only the `any` flag to `true` (the
-    /// pattern is otherwise valid and the operator/kind are on the
-    /// allowlist), so the only thing the new check refuses is `any`.
-    /// The plain-pattern row is the row whose `any: true` is the ONLY
-    /// refusal trigger — the row used by mutation (c).
+    /// Every row below carries the `any` flag and, verified by running the
+    /// pinned test, parses under `GenericDialect` — `sqlparser` 0.63 parses
+    /// `LIKE`/`ILIKE` as `any: parse_keyword(ANY)` followed by a general
+    /// subexpr pattern, so the paren forms become `Expr::Tuple` /
+    /// `Expr::Nested`, not a parse error. The `any` check returns before the
+    /// children are visited, so every parsed form carries the fixed
+    /// `LIKE_ANY_REFUSAL` reason. For `ANY 'a%'`, `ANY 'a'` and `ANY ('a')`
+    /// the pattern is otherwise valid (the no-`any` variant is accepted), so
+    /// `any: true` is the only shape outside the simple-`LIKE` allowlist. For
+    /// `ANY ('a', 'b')` the pattern is a tuple the shape walk would refuse on
+    /// its own, but the `any` check fires first. The plain-pattern row
+    /// (`ANY 'a%'`) is the row whose `any: true` is the only refusal trigger,
+    /// so it carries a dedicated test below.
     const LIKE_ANY_TEST_CASES: &[(&str, &str)] = &[
         ("x LIKE ANY 'a%'", "plain pattern"),
         ("x ILIKE ANY 'a'", "plain pattern, case-insensitive"),
-        ("x LIKE ANY ('a', 'b')", "tuple pattern (may not parse)"),
-        ("x ILIKE ANY ('a')", "single-element tuple pattern"),
+        ("x LIKE ANY ('a', 'b')", "tuple pattern"),
+        ("x ILIKE ANY ('a')", "single-element paren pattern"),
     ];
 
     #[test]
@@ -2455,40 +2465,21 @@ mod row_filter {
 
     #[test]
     fn validate_row_filter_expr_refuses_every_any_form_that_parses_under_generic_dialect() {
-        // The plan's verified facts: some `LIKE ANY (...)` shapes do not
-        // even parse under `GenericDialect`, so the parser (not the
-        // validator) refuses them. We loop over the same set, assert the
-        // EITHER path ends in `InvalidRowFilter`, and pin the wording only
-        // on the rows that reach the new check. The non-parseable rows
-        // are recorded here for the handoff (per the plan).
+        // Verified: every form in `LIKE_ANY_TEST_CASES` parses under
+        // `GenericDialect` and reaches the `any` check, so each is pinned to
+        // the fixed `LIKE_ANY_REFUSAL` reason. There is no parse-error row
+        // today; if a future form stops parsing it carries the parser's own
+        // message under `InvalidRowFilter` and must move to its own row that
+        // asserts only `InvalidRowFilter`, not this fixed text. The two
+        // plain-pattern rows are isolated further by the dedicated tests
+        // above.
         let cols = vec!["x".to_owned()];
         for (raw, _) in LIKE_ANY_TEST_CASES {
-            let err = validate_row_filter_expr(raw, &cols).unwrap_err();
-            match err {
-                RewriteError::InvalidRowFilter { reason } => {
-                    // The plain-pattern rows must end at the new rule with
-                    // the LIKE-ANY fixed reason; a tuple-pattern row that
-                    // fails to parse carries the parser's own message.
-                    let expected = if raw.contains('\'') && !raw.contains(',') {
-                        LIKE_ANY_REFUSAL // plain pattern (with or without tuple wrapping)
-                    } else if raw.contains(',') {
-                        // `x LIKE ANY ('a', 'b')`: a tuple pattern with
-                        // more than one element. Either the validator
-                        // refuses `any` (and we get LIKE_ANY_REFUSAL), or
-                        // the parser refuses the tuple first. Either path
-                        // keeps the test green; we just don't pin the
-                        // fixed text here.
-                        "tuple"
-                    } else {
-                        unreachable!("unexpected shape: {raw}")
-                    };
-                    assert!(
-                        reason == LIKE_ANY_REFUSAL || expected == "tuple",
-                        "{raw}: unexpected refusal reason `{reason}`"
-                    );
-                }
-                other => panic!("{raw}: expected InvalidRowFilter, got {other:?}"),
-            }
+            assert_eq!(
+                invalid_reason(raw, &cols),
+                LIKE_ANY_REFUSAL,
+                "{raw}: every parsed `LIKE ... ANY` form must carry the fixed reason"
+            );
         }
     }
 
