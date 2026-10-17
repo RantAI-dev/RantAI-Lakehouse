@@ -18,17 +18,23 @@
 -- database should refuse no matter which caller wrote it, including a
 -- future one that forgets the route-level validation.
 --
--- # The floor is the MEASURED one, not the spec's
+-- # The floor is 1 minute: the spec's own target, then measured
 --
--- The spec's signed range starts at 60 seconds (1 minute); the floor here
--- is 60 (1 minute), backed by gate measurements on the compose stack (plan D11).
--- Under review round 1 R6b (`47fcf9ad4618` in `bld2-gate-r6.log`), a 2-minute
--- target was used while pre-R6a runs exceeded 120 s (worst sample 129.77 s
--- in `bld2-gate-r1.log`). With R6a (request-to-land budget), the R8 gate runs
--- (`bld2-gate-r8-1min.log` and `bld2-gate-r8-final.log`) confirmed that a
--- 1-minute target passed all 5 samples (worst sample 32.70 s <= 60 s,
--- avg 25.64 s in `bld2-gate-r8-final.log`; worst sample 26.35 s <= 60 s,
--- avg 20.75 s in `bld2-gate-r8-1min.log`). The floor is confirmed at 1 minute
+-- The spec's signed range starts at 60 seconds (1 minute), and the gate
+-- runs confirm the spec floor holds; no measured counterfactual loosens
+-- it. The gate history, by commit (plan D11):
+--
+-- 1. `9a59250c77ec` (`bld2-gate-r1.log`) — BEFORE the R6a
+--    request-to-land budget: a 2-minute target FAILED, samples
+--    [103.5, 129.77, 115.69, 101.79, 129.69] s (max 129.77 s > 120 s).
+-- 2. `47fcf9ad4618` (`bld2-gate-r6.log`) — the round-1-R6 gate, WITH the
+--    R6a budget: a 2-minute target PASSED, all 5 samples
+--    [77.2, 95.13, 68.9, 71.11, 89.1] s, worst 95.13 s <= 120 s.
+-- 3. The R8 gate (`bld2-gate-r8-1min.log`, `bld2-gate-r8-final.log`) — the
+--    spec's 1-minute target PASSED both times: worst 26.35 s (avg 20.75 s)
+--    and worst 32.70 s (avg 25.64 s) against 60 s.
+--
+-- The floor is confirmed at 1 minute
 -- (`docs/plans/BLD-2-TARGET-LAG-RESULT.md`). The route's own bound
 -- (`routes::authored_pipelines::validate_target_lag`) carries the same
 -- number, and the two move together.
@@ -49,8 +55,9 @@ ALTER TABLE pipeline_definition
 
 COMMENT ON COLUMN pipeline_definition.target_lag_seconds IS
     'Target lag in WHOLE MINUTES × 60: 60..604800 (the floor is the '
-    'measured one, plan D11), NULL when the pipeline has no target lag or '
-    'is "downstream" (see target_lag_downstream).';
+    'spec''s own 1-minute target, measured, plan D11), NULL when the '
+    'pipeline has no target lag or is "downstream" (see '
+    'target_lag_downstream).';
 COMMENT ON COLUMN pipeline_definition.target_lag_downstream IS
     'true = Snowflake DOWNSTREAM: this pipeline refreshes only when a '
     'pipeline with a target lag that reads it needs it. Mutually exclusive '
