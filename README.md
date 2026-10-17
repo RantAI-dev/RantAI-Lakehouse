@@ -198,16 +198,13 @@ cargo deny check licenses
 
 ### Rust toolchain / MSRV
 
-The workspace declares `rust-version = "1.88"` in `rust/Cargo.toml` — that's
-the real floor this code has been verified to compile on (`Cargo.lock`
-pulls in `time@0.3.55`, which needs rustc >= 1.88, plus
-`testcontainers`/`etcetera`/`ferroid` transitively pushing past the raw
-edition-2024 minimum of `1.85`; see `rust/Cargo.toml`'s comment and
-`docs/CI.md` for how that was verified). `rust/rust-toolchain.toml` pins
-the toolchain actually used for local dev/CI (currently `1.96.1`, newer
-than the MSRV floor) so contributors and CI build with the same compiler;
-`rustup` will fetch it automatically the first time you run `cargo` inside
-`rust/`.
+The workspace declares `rust-version = "1.99"` in `rust/Cargo.toml` (owner
+decision D1 for `REL-9`, allowing modern language features and safe compiler
+hardening while exceeding `SEC-41` requirements; see `rust/Cargo.toml` and
+`docs/CI.md`). `rust/rust-toolchain.toml` pins the toolchain actually used for
+local dev/CI (currently `1.99.1`, matching production container images) so
+contributors and CI build with the same compiler; `rustup` will fetch it
+automatically the first time you run `cargo` inside `rust/`.
 
 ## Configuration
 

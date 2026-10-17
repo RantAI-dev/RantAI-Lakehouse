@@ -140,18 +140,15 @@ evicted: reduce what `rust-cache` stores before anything else (CI-SPEED-PLAN §9
 
 ## MSRV
 
-`rust/Cargo.toml`'s `rust-version` is `1.88`, not the edition-2024 floor of
-`1.85`. This was verified empirically, not assumed: building `--locked`
-against 1.85.0 fails because `testcontainers`/`testcontainers-modules`
-require rustc 1.88, `time`/`time-core`/`time-macros` require 1.88.0,
-`etcetera` requires 1.87.0, and `ferroid` requires 1.85.1. Building against
-1.88.0 succeeds.
+`rust/Cargo.toml`'s `rust-version` is `1.99` (owner decision D1 for `REL-9`,
+advancing from the historical 1.88 floor while exceeding `SEC-41` requirements).
+Building `--locked` against 1.99.0 succeeds across the entire workspace.
 
 In CI, the `msrv` job runs a dedicated `cargo check --workspace --all-targets --locked`
-under toolchain `1.88.0` to verify compatibility without duplicating test run
-times, while the full test suite runs under `stable`.
+under toolchain `1.99.0` to verify compatibility without duplicating test run
+times, while the full test suite runs under `stable` (pinned via `rust-toolchain.toml`).
 
-`rust-toolchain.toml` pins `1.96.1` — intentionally newer than the MSRV. That
+`rust-toolchain.toml` pins `1.99.1` (with MSRV checked at `1.99.0`). That
 file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
 with; the MSRV check job exists specifically to catch MSRV regressions that the
 day-to-day toolchain wouldn't.

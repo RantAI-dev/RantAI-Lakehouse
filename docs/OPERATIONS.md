@@ -16,12 +16,12 @@ they have since been converged onto this single file, and
 
 The old committed `rust/Dockerfile` broke a clean-clone build two ways:
 `Cargo.lock` requires a toolchain new enough for `time@0.3.55` (rustc
->= 1.88 — see the `rust-toolchain.toml` `channel = "1.96.1"` pin, which
-is what the workspace actually builds with), and `sqlx::migrate!
-("../../migrations")` in `lakehouse-store/src/lib.rs` embeds the
-migrations directory at *compile* time, so it must exist in the build
+>= 1.88; bumped to `1.99.1` under `REL-9` — see the `rust-toolchain.toml`
+`channel = "1.99.1"` pin, which is what the workspace actually builds with),
+and `sqlx::migrate!("../../migrations")` in `lakehouse-store/src/lib.rs` embeds
+the migrations directory at *compile* time, so it must exist in the build
 context or `cargo build` fails outright. The current `rust/Dockerfile`
-pins `rust:1.96.1-slim` to match `rust-toolchain.toml`, copies
+pins `rust:1.99.1-slim` to match `rust-toolchain.toml`, copies
 `migrations/` into the build context before the build step, installs
 `sqlx-cli`, and uses `entrypoint.api.sh` to apply migrations at boot.
 
