@@ -546,7 +546,7 @@ All round-3 findings, fixed on branch `feat/bld-2-target-lag` (nothing force-pus
 | SHOULD-FIX 3: U statuses | `f7f53e56d50e` | U is `not_measured` on every branch, check recorded while outstanding, unreachable branches removed; test asserts U's row |
 | SHOULD-FIX 4: run-key ordering test and doc | `7f6e698f33a6` | Older-created run starts after the newer one |
 | SHOULD-FIX 5: stale docs | `7f6e698f33a6` | `run_key_for`, `settle_request` FAILURE bullet, orphaned paragraph removed |
-| SHOULD-FIX 6: copies | `eaae582a2911` | `orchestrator_unavailable` (5 copies), `store_err` for the one inline store `map_err` I found in `pipeline_lag.rs` (the round said two; I found one), handler uses `make_lag_update`, `CheckState::from_stored` |
+| SHOULD-FIX 6: copies | `eaae582a291f` | `orchestrator_unavailable` (5 copies), `store_err` for the one inline store `map_err` I found in `pipeline_lag.rs` (the round said two; I found one), handler uses `make_lag_update`, `CheckState::from_stored` |
 | SHOULD-FIX 7: `tools/mod.rs` reason and count | `9e5fa1ec3d6a` | Main's string restored (continuations); 66 arms naming a tool + guard = 67. I call `set_pipeline_target_lag` a plain delegation wrapped by rustfmt, not "not a one-liner" as the round put it |
 | SHOULD-FIX 8: sensor tenant | `49ed556ce379` | Added `tenantId` to `RunnablePipeline` (kept the test), store test, docstring on the `dependsOn` target edge not attached |
 | SHOULD-FIX 9: compose comment | `5dbc38ef901f` | Comment only |
