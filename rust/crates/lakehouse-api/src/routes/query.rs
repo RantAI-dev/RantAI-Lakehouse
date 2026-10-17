@@ -689,11 +689,13 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// # Errors
 ///
 /// Returns 400 [`ApiError::BadRequest`] on an unparseable body or a
-/// missing/blank `sql`. An `EXPLAIN ESTIMATE` failure (e.g. non-`SELECT`
-/// input) still answers 200 — the console shows the estimate panel either
-/// way — but `estimatedBytes`/costs are `null` and the `ClickHouse` message
-/// is carried in `error`, rather than a zeroed estimate that looked
-/// identical to "this query reads nothing".
+/// missing/blank `sql`, and 422 [`ApiError::Unprocessable`] when `sql` fails
+/// [`is_read_only`] or the rewrite refuses it, as [`run`] does. An `EXPLAIN
+/// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
+/// console shows the estimate panel either way — but `estimatedBytes`/costs
+/// are `null` and the `ClickHouse` message is carried in `error`, rather
+/// than a zeroed estimate that looked identical to "this query reads
+/// nothing".
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -704,6 +706,17 @@ pub async fn estimate(
         Some(s) if !s.trim().is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    // SEC-19: the estimate refuses what the run refuses, with the run's
+    // status and message, and does so before the rewrite below, whose policy
+    // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
+    // statement this route may send, so a non-read never reaches it.
+    if !is_read_only(&sql) {
+        return Err(ApiError::Unprocessable(
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+                .to_owned(),
+        )
+        .into());
+    }
 
     // A failed EXPLAIN is reported, not swallowed. It used to come back as
     // a zeroed estimate, so "this query cannot even be planned" and "this
