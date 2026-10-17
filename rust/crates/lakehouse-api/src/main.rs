@@ -31,6 +31,7 @@ mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
+mod pdf;
 mod pipeline_source;
 mod policy;
 mod policy_engine;

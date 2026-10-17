@@ -295,6 +295,15 @@ services:
       # per-request 503 rather than lakehouse-api refusing to boot.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
       EMBED_SECRET: ${EMBED_SECRET:-}
+      # BI-1 (D1, D5): dashboard PDFs. GOTENBERG_URL is the `gotenberg` service
+      # below; CONSOLE_INTERNAL_URL is the console as that container reaches
+      # it (the console is not a compose service: it is run next to the stack,
+      # `lakehouse-frontend:3000` on staging) and is empty by default, which
+      # makes the PDF item say "PDF export is not set up on this deployment".
+      # PDF export also needs EMBED_SECRET, the key of the 2-minute render
+      # token. An internal address, not a credential.
+      GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
+      CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-}
       # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
       # means 86400. A value that is not a positive whole number stops the
       # API at start, on purpose (a typo must not silently keep 24 hours).
@@ -854,6 +863,44 @@ services:
         done;
         exit 1
     restart: "no"
+
+  # BI-1 (D1): Gotenberg (headless Chromium) makes the dashboard PDFs. The
+  # API gives it one address, the console's print view with a 2-minute render
+  # token in it (`routes::pdf_export`), and Gotenberg returns the PDF.
+  #
+  # Pinned to an exact tag (8.37.0, published 2026-09-11, the newest 8.x tag
+  # at least two weeks old when this was added). Flags checked against that
+  # image's `gotenberg --help` and the Chromium module documentation,
+  # https://gotenberg.dev/docs/configuration#chromium:
+  #   --api-timeout=70s        above the API's own 60 s deadline for a PDF.
+  #   --chromium-allow-list    regular expressions; Chromium may open ONLY a
+  #                            URL that matches (feature decision 3: the
+  #                            renderer opens the console and nothing else, so
+  #                            a card that points elsewhere cannot make this
+  #                            container fetch it). The expression is
+  #                            CONSOLE_INTERNAL_URL followed by `/` or the end;
+  #                            its dots stand for any character, which only
+  #                            widens a host name by one character in the same
+  #                            position. An unset CONSOLE_INTERNAL_URL leaves a
+  #                            pattern that matches no real address, and the API
+  #                            refuses PDFs then anyway.
+  #   --chromium-disable-javascript=false  the print view is a script.
+  #   --log-level=warn
+  # No `ports:` mapping, like `openfga`: Gotenberg has no authentication, so it
+  # is reachable by its service name from the compose network only and nothing
+  # is published on the host. 1 GiB: Chromium plus two conversions at once
+  # (`PDF_AT_ONCE`) fits; a bigger dashboard fails with a fixed sentence
+  # instead of taking the host down.
+  gotenberg:
+    image: gotenberg/gotenberg:8.37.0
+    command:
+      - gotenberg
+      - --api-timeout=70s
+      - --chromium-allow-list=^${CONSOLE_INTERNAL_URL:-console-url-not-set}(/|$$)
+      - --chromium-disable-javascript=false
+      - --log-level=warn
+    mem_limit: 1g
+    restart: unless-stopped
 
   # R1 — mock OIDC discovery + JWKS issuer. Lakekeeper's ONLY generic
   # (non-Trino, non-Kubernetes) authentication mechanism is OIDC bearer

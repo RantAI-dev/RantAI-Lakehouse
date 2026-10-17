@@ -289,6 +289,12 @@ pub struct RenderClaims {
     pub jti: String,
 }
 
+/// When a render token issued at `iat` expires.
+#[must_use]
+pub fn render_expiry(iat: f64) -> f64 {
+    iat + seconds_as_f64(RENDER_LIFETIME_SECONDS)
+}
+
 /// The label the render key is derived under; changing it retires every token.
 const RENDER_KEY_LABEL: &str = "lakehouse/render-token/v1";
 

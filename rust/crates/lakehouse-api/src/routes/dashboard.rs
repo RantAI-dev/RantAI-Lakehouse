@@ -169,6 +169,15 @@ pub async fn get(
     }
 }
 
+/// Whether the deployment can make a PDF: a Gotenberg to ask, an address the
+/// renderer reaches the console at, and the secret the render token is signed
+/// with. Any one missing is "not set up" (`BI-1`, feature decision 6).
+pub(crate) fn pdf_supported(config: &crate::config::Config) -> bool {
+    config.gotenberg_url.is_some()
+        && config.console_internal_url.is_some()
+        && config.embed_secret.is_some()
+}
+
 /// The payload `GET /api/dashboard` answers for `principal`: the board's
 /// tiles read as that person (masks, row filters), the formatting settings and
 /// whether the person may download. The one copy, called by the route and by
@@ -225,6 +234,12 @@ pub(crate) async fn payload_for(
             // BI-1 D7: the console hides the download items for a person
             // whose every role is switched off; the routes refuse anyway.
             if let Some(map) = body.as_object_mut() {
+                // BI-1 D1/feature decision 6: the console offers the PDF item
+                // only when the deployment has a renderer and a key for its token.
+                map.insert(
+                    "pdfSupported".to_owned(),
+                    Value::Bool(pdf_supported(&state.config)),
+                );
                 map.insert(
                     "canDownload".to_owned(),
                     Value::Bool(crate::routes::settings::may_download(
@@ -599,6 +614,17 @@ async fn get_body(
 ///
 /// 400 with a message of ours when the text is not a JSON filter list or a
 /// filter fails [`validate_filters`].
+/// Whether `raw` is a `filters` text `GET /api/dashboard` would accept, so a
+/// route that only forwards the text (the PDF's token) refuses a bad one at
+/// once, with the page's own sentence.
+///
+/// # Errors
+///
+/// 400 with the sentence `GET /api/dashboard` gives.
+pub(crate) fn check_filters_text(raw: Option<&str>) -> Result<(), ApiError> {
+    parse_filters_param(raw).map(|_| ())
+}
+
 fn parse_filters_param(raw: Option<&str>) -> Result<Option<Vec<FilterDef>>, ApiError> {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(None);
@@ -2160,7 +2186,7 @@ const DASHBOARD_QUERY: upstream_error::Context = upstream_error::Context::new(
 /// text (AGENTS.md principle 4): a server-side error is a fixed 422,
 /// anything else a fixed 503, both with a reference id; the real detail is
 /// only logged.
-fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+pub(crate) fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
     upstream_error::ch_error(&DASHBOARD_QUERY, err)
 }
 
@@ -2839,10 +2865,10 @@ impl From<TableExportQuery> for ChartExportQuery {
     }
 }
 
-/// A file name from a tile's title: letters, digits, `-` and `_` only, so it
-/// can sit in a `Content-Disposition` header unquoted-safe. A file that was
-/// cut at the row cap says so in its name (feature decision 8).
-fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+/// A name safe in a file name from a title: letters, digits, `-` and `_` only,
+/// so it can sit in a `Content-Disposition` header unquoted-safe. `fallback`
+/// when nothing is left.
+pub(crate) fn file_slug(title: &str, fallback: &str) -> String {
     let slug: String = title
         .trim()
         .chars()
@@ -2859,11 +2885,17 @@ fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let slug = if slug.is_empty() {
-        "table"
+    if slug.is_empty() {
+        fallback.to_owned()
     } else {
-        slug.as_str()
-    };
+        slug
+    }
+}
+
+/// A file name from a tile's title (see [`file_slug`]). A file that was cut at
+/// the row cap says so in its name (feature decision 8).
+fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+    let slug = file_slug(title, "table");
     match cut_at {
         Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
         None => format!("{slug}.{extension}"),
@@ -2880,13 +2912,14 @@ struct ExportOutcome {
     values: crate::export::Values,
 }
 
-/// The audit entry of one export, written before the file is returned: an
-/// export that cannot be recorded is not handed over.
-async fn record_export_audit(
+/// The audit entry of one download (a chart's file or a dashboard's PDF),
+/// written before the file is returned: a download that cannot be recorded is
+/// not handed over (`BI-1` D8). One writer for every kind of download.
+pub(crate) async fn record_download_audit(
     state: &AppState,
     principal: &Principal,
-    chart: &StoredChartSpec,
-    outcome: &ExportOutcome,
+    (action, resource_kind, resource_id): (&str, &str, &str),
+    args: Value,
 ) -> Result<(), ApiError> {
     let pool = state
         .pg
@@ -2896,18 +2929,10 @@ async fn record_export_audit(
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
         actor_label: Some(principal.display_name.clone()),
-        action: outcome.action.to_owned(),
-        resource_kind: Some("dashboard_tile".to_owned()),
-        resource_id: Some(chart.spec.id.clone()),
-        args: Some(json!({
-            "board": chart.board,
-            "tile": chart.spec.id,
-            "rows": outcome.rows,
-            "cut": outcome.cut,
-            "cap": outcome.cap,
-            "format": outcome.format.extension(),
-            "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
-        })),
+        action: action.to_owned(),
+        resource_kind: Some(resource_kind.to_owned()),
+        resource_id: Some(resource_id.to_owned()),
+        args: Some(args),
         outcome: "executed".to_owned(),
         ..lakehouse_store::audit::NewAuditEvent::default()
     };
@@ -2915,9 +2940,33 @@ async fn record_export_audit(
         .await
         .map(|_| ())
         .map_err(|err| {
-            tracing::warn!(%err, "failed to record a table export; the export is refused");
+            tracing::warn!(%err, "failed to record a download; the download is refused");
             ApiError::Unavailable("the audit store is unavailable".to_owned())
         })
+}
+
+/// The audit entry of one chart download.
+async fn record_export_audit(
+    state: &AppState,
+    principal: &Principal,
+    chart: &StoredChartSpec,
+    outcome: &ExportOutcome,
+) -> Result<(), ApiError> {
+    record_download_audit(
+        state,
+        principal,
+        (outcome.action, "dashboard_tile", &chart.spec.id),
+        json!({
+            "board": chart.board,
+            "tile": chart.spec.id,
+            "rows": outcome.rows,
+            "cut": outcome.cut,
+            "cap": outcome.cap,
+            "format": outcome.format.extension(),
+            "values": if outcome.values == crate::export::Values::Raw { "raw" } else { "formatted" },
+        }),
+    )
+    .await
 }
 
 /// The tile's visible columns in order (a hidden one is left out) and the
