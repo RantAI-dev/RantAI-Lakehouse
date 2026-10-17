@@ -1072,6 +1072,12 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertTrue(problems({}))
         self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 0, "y": 4, "w": 12, "h": 4}}))
         self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}}))
+        # Each of the four layout keys is guarded on its own: chart a correct,
+        # chart b wrong in exactly one of width or row.
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 0, "y": 0, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 4, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 4, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
         self.assertEqual(
             problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}), []
         )
