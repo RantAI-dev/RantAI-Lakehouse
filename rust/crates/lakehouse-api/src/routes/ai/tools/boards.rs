@@ -790,16 +790,7 @@ mod tests {
         let b2 = board_row("b2", "{}", r#"[{"id":"t_x","title":"X"}]"#);
         mount(server, "WHERE is_deleted = 0 AND id='b1'", vec![b1]).await;
         mount(server, "WHERE is_deleted = 0 AND id='b2'", vec![b2]).await;
-        mount(
-            server,
-            "FROM console.bi_chart FINAL",
-            vec![
-                chart_row("c1", "b1"),
-                chart_row("c2", "b1"),
-                chart_row("c3", "b1"),
-            ],
-        )
-        .await;
+        mount_charts(server).await;
         mount(server, "", Vec::new()).await;
         let env = HashMap::from([
             ("CH_URL".to_owned(), server.uri()),
@@ -809,6 +800,77 @@ mod tests {
             ),
         ]);
         AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    async fn mount_charts(server: &MockServer) {
+        // BI-18 part C review fix R13 (regression: move_chart): the chart table
+        // is stateful. A static answer kept `c1` live on `b1` after the move
+        // had written it onto `b2`, and the placement of unboxed charts gave
+        // the source board a box for a chart that had left it. The real order
+        // (the chart row first, the boards after) is what this mock now
+        // reproduces: an insert moves the chart, and the live-charts read
+        // honours its `board =` condition.
+        let charts = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            ("c1".to_owned(), "b1".to_owned()),
+            ("c2".to_owned(), "b1".to_owned()),
+            ("c3".to_owned(), "b1".to_owned()),
+        ]));
+        let on_insert = charts.clone();
+        Mock::given(method("POST"))
+            .and(body_string_contains("INSERT INTO console.bi_chart"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body).into_owned();
+                let id = body
+                    .split_once("VALUES ('")
+                    .and_then(|(_, rest)| rest.split_once('\''))
+                    .map(|(id, _)| id.to_owned());
+                if let (Some(id), Ok(mut all)) = (id, on_insert.lock()) {
+                    for chart in all.iter_mut().filter(|c| c.0 == id) {
+                        if body.contains("'b2'") {
+                            chart.1 = "b2".to_owned();
+                        }
+                    }
+                }
+                ResponseTemplate::new(200)
+            })
+            .mount(server)
+            .await;
+        let live = charts.clone();
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "SELECT id, spec_json FROM console.bi_chart FINAL",
+            ))
+            .respond_with(move |req: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&req.body).into_owned();
+                let data: Vec<Value> = live
+                    .lock()
+                    .map(|all| all.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(_, board)| body.contains(&format!("board = '{board}'")))
+                    .map(|(id, board)| chart_row(id, board))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() }))
+            })
+            .mount(server)
+            .await;
+        let listed = charts.clone();
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_chart FINAL"))
+            .respond_with(move |_: &wiremock::Request| {
+                let data: Vec<Value> = listed
+                    .lock()
+                    .map(|all| all.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(id, board)| chart_row(id, board))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() }))
+            })
+            .mount(server)
+            .await;
     }
 
     async fn sent(server: &MockServer) -> Vec<String> {
