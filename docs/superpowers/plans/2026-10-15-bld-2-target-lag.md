@@ -1128,3 +1128,59 @@ against target (the `8eaeeb86` over-reach was undone in `f7f53e56`).
    8 s budget. `decide`'s own-budget error is `FailedAs::Internal` (500) while
    U's is 503: make them one.
 5. The outstanding-U test's comment says "request_attempt = 2" but seeds 0.
+
+### Handoff round 4 (developer)
+
+#### Round 4 findings → commits
+
+| Finding | Fixing commit (12 chars) | Note |
+| --- | --- | --- |
+| BLOCKER 1(a) — pages walk only `depends_on` for an exhausted upstream (decision R16) | `c0afcf95` | New `upstream_retries_exhausted` + `exhausted_upstream_of` in `pipeline_lag.rs`; list route and `detail_lag` call it (only when `target_lag` is set); store errors propagate (`?`, SF3's `detail_lag` fix); route-level tests `rust/crates/lakehouse-api/tests/pipeline_lag_page.rs` (P reading U only through U's target table, plus an outstanding-not-exhausted control); new `ExhaustedUpstream` unit tests |
+| BLOCKER 1(b) — exhausted U spoke the outstanding reason | `46174a8d` | `"upstream pipeline {U}'s last N runs for this change failed; the next input change starts again"` in check, page (`lag_json`) and hence the alert; outstanding keeps the old words |
+| BLOCKER 2 — `ops/ai_eval` regression (decision R15) | `5d066291` | `tool_args_match`: numbers exact, strings case-insensitive substrings of a string or of a list/object's JSON text, absent keys match nothing; 12 new tests. `ops/ai_eval` is AI-team-owned — said in the commit body |
+| BLOCKER 3 — migration `0084` header | `47fa1ee5` | "The floor is 1 minute: the spec's own target, then measured", ordered gate history (`9a59250c77ec` FAILED pre-R6a → `47fcf9ad4618` R6 PASS → R8 both PASS); migration never applied, header-only edit, COMMENT text corrected too |
+| SHOULD-FIX 1 — `lock_lag_states_ordered` | `33601bf6` | Sorts/dedups internally, returns `BTreeMap` (sorted-key snapshot asserted from unsorted input); `get_lag_state_for_update` deleted; test doc says it pins ordering, not in-process blocking liveness |
+| (clippy fallout of SF 1) | `0af52cfb` | `sort_unstable` on the `&str` vector and the method-reference form in the order test; caught by the next all-crate clippy pass, cited there |
+| SHOULD-FIX 2 — sensor tenant filter | `4b84928b` | A tenant-less reading pipeline links nothing (a second unassigned pipeline cannot match); docstring of `build_authored_lag_sensors` no longer claims unassigned pairs match; new test fails with the fix stashed |
+| SHOULD-FIX 4 — the check's own timeout cuts | `33a3b271` | 55P03 (`lock_timeout`) and 57014 (`statement_timeout`) chase the SQLSTATE through `StoreError::Database`'s source chain in `store_err` and answer the same classified 503 as the 8 s clock; `decide`'s own run-budget read joins the shared `orchestrator_unavailable` helper instead of `FailedAs::Internal`. Tests fail against a reverted classifier |
+| SHOULD-FIX 5 — outstanding-U test comment | `39df2885` | Comment only; the seed was always correct (attempt 0, outstanding), the comment claimed "exhausted: attempt 2"; the same docstring described U outstanding as `requested_run_key` at 0 inside target |
+
+SHOULD-FIX 3 propagated with BLOCKER 1(a) in `c0afcf95` (it was the same
+call site). Nothing skipped; no finding is left open.
+
+#### Verification (all on `39df2885`)
+
+| Command | Result |
+| --- | --- |
+| `cd rust && cargo fmt --check` | rc 0 |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | rc 0 (`bld2-r4-ws-clippy.log`) |
+| `cargo-locked test -j 2 --workspace --no-fail-fast` | rc 0: 117 `test result:` blocks, 6215 passed, 0 failed (`bld2-r4-ws.log`) |
+| `bun run typecheck` | rc 0 |
+| `bun run lint` | rc 0; 0 errors, 8 warnings (round 3 saw 9; none introduced here, all are pre-existing files) |
+| `bun run test` (full) | 1911 pass, 1 skip, 0 fail (194 files) |
+| `python3 ops/lint/check_intra_package_imports.py` | `OK: all intra-package dispar_orchestrate imports resolve` |
+| `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
+| `venv-bld3/bin/python -m pytest ops/ai_eval -q` | 118 passed |
+| `venv-bld3/bin/python -m pytest dispar_orchestrate -q --basetemp=/home/shiro/rantai/review/pytest-bld2` (from `dagster/`, under `flock`) | 1534 passed, 33 subtests passed, 0 failed (966.46 s) |
+| `vars=$(grep -oE '\$\{[A-Z0-9_]+:\?' docker-compose.yml \| …); env $(for v in $vars; do echo "$v=dummy-value-0001"; done) docker compose --profile '*' config --quiet` | `COMPOSE_OK` |
+| `git status` | clean; nothing generated staged |
+
+Scoped per-commit runs are quoted in each commit body; the notable ones:
+holly `pipeline_lag_page` 2 passed; `lakehouse-api` full 4681 then 4670+
+re-runs; `lakehouse-store` 647 three times; `test_authored_factory.py`
+105 passed and the full Dagster suite twice (1534). The machine's
+`53100 / No space left on device` shared-memory flake hit four full-run
+binaries across the round (`connector_repoint`, `connector_secret_reference`,
+`upload_routes`, `upstream_errors`); each was re-run alone and passed
+(6/6, 12/12, 94/94, 6/6). The final workspace run had no failures.
+
+#### Not verified
+
+- The R8 gate re-measure was not re-run this round: this round changed
+  response words, argument matching, a migration header, lock ordering,
+  error classification, and one Dagster sensor walk — none touches the
+  check interval or the budget arithmetic — so the R8 numbers stand.
+- Compose was proven with `config` under dummy `:?` values only; no
+  profile was brought up this round (no compose file changed; the branch's
+  compose up proof remains round 3's gate run).
+- Nothing was verified in a browser.
