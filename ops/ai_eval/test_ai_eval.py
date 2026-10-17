@@ -1300,6 +1300,31 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIs(case.get("confirm"), True, case["id"])
             self.assertIn("expect_state", case, case["id"])
 
+    def test_the_two_chained_write_cases_ask_for_the_chart_in_a_second_turn(self) -> None:
+        # One message cannot carry both writes: the board or the field waits
+        # for its own Confirm, so the chart has nothing to name in that turn.
+        # `run_case` confirms inside each turn before sending the next, so the
+        # chart is asked for in a turn of its own.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        want = {
+            "chart_on_new_board": (
+                "Now put a bar chart of events per year on the board \"Eval Events Board\".",
+                {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
+            ),
+            "calc_then_chart": (
+                "Now chart per_event by year.",
+                {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
+            ),
+        }
+        for case_id, (second_turn, expect_tool) in want.items():
+            case = cases[case_id]
+            self.assertEqual(len(case["turns"]), 2, case_id)
+            self.assertNotIn("chart", case["turns"][0].lower(), case_id)
+            self.assertEqual(case["turns"][1], second_turn, case_id)
+            self.assertIs(case.get("confirm"), True, case_id)
+            self.assertEqual(case["expect_tool"], expect_tool, case_id)
+            self.assertEqual(len(case["expect_state"]), 2, case_id)
+
 
 if __name__ == "__main__":
     unittest.main()

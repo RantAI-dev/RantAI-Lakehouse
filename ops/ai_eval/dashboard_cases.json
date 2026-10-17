@@ -176,7 +176,7 @@
     "id": "chart_on_new_board",
     "mode": "build",
     "confirm": true,
-    "turns": ["Make a board \"Eval Events Board\" and put a bar chart of events per year on it."],
+    "turns": ["Make a board \"Eval Events Board\".", "Now put a bar chart of events per year on the board \"Eval Events Board\"."],
     "expect_tool": {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
     "expect_state": [
       {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval Events Board"}, "count": 1},
@@ -238,7 +238,7 @@
     "id": "calc_then_chart",
     "mode": "build",
     "confirm": true,
-    "turns": ["Make a field called per_event that divides events by two on mart_event, then chart it by year."],
+    "turns": ["Make a field called per_event that divides events by two on mart_event.", "Now chart per_event by year."],
     "expect_tool": {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
     "expect_state": [
       {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "per_event"}, "count": 1},
