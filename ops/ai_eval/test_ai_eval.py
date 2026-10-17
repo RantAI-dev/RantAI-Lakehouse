@@ -1021,13 +1021,25 @@ class DashboardCasesTests(unittest.TestCase):
 
 
 class ToolArgsMatchTest(unittest.TestCase):
-    """BLD-2 review R3 SHOULD-FIX 10: scalars compare equal, not as substrings."""
+    """BLD-2 review R4 BLOCKER 2 / decision R15: a wanted NUMBER matches only
+    a number equal to it (`minutes: 10` never matches `100`), a wanted
+    STRING matches case-insensitively as a substring of a string value AND
+    of the JSON text of a list or object value (a filters array of objects,
+    a qualified table name)."""
 
-    def test_a_scalar_that_only_contains_the_wanted_value_does_not_match(self) -> None:
+    def test_a_number_that_merely_contains_the_wanted_number_does_not_match(self) -> None:
         args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 100}}
         self.assertFalse(m.tool_args_match(args, {"targetLag.minutes": 10}))
 
-    def test_an_equal_scalar_matches_case_insensitively_at_a_dotted_key(self) -> None:
+    def test_an_equal_number_matches_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_a_wanted_number_matches_an_equal_member_of_a_list(self) -> None:
+        self.assertTrue(m.tool_args_match({"minutes": [10, 100]}, {"minutes": 10}))
+        self.assertFalse(m.tool_args_match({"minutes": [100]}, {"minutes": 10}))
+
+    def test_an_equal_string_matches_case_insensitively_at_a_dotted_key(self) -> None:
         args = {"pipeline": "Orders_Clean", "targetLag": {"kind": "lag", "minutes": 10}}
         self.assertTrue(
             m.tool_args_match(
@@ -1036,12 +1048,30 @@ class ToolArgsMatchTest(unittest.TestCase):
             )
         )
 
+    def test_a_wanted_string_matches_inside_a_qualified_table_name(self) -> None:
+        self.assertTrue(
+            m.tool_args_match({"pipeline": "silver.orders_clean"}, {"pipeline": "orders_clean"})
+        )
+        self.assertFalse(
+            m.tool_args_match({"pipeline": "silver.orders_cleaned"}, {"pipeline": "orders_clean."})
+        )
+
+    def test_a_wanted_string_matches_the_json_text_of_one_filters_shaped_list(self) -> None:
+        filters = [
+            {"column": "created_year", "first": {"op": "eq", "value": "2026"}},
+            {"column": "region", "first": {"op": "in", "value": ["Asia", "Europe"]}},
+        ]
+        self.assertTrue(m.tool_args_match({"filters": filters}, {"filters": "created_year"}))
+        self.assertFalse(m.tool_args_match({"filters": filters}, {"filters": "wilayah"}))
+
+    def test_a_wanted_string_matches_the_json_text_of_a_list_but_never_a_number(self) -> None:
+        self.assertTrue(m.tool_args_match({"measures": ["a", "b"]}, {"measures": "b"}))
+        self.assertTrue(m.tool_args_match({"measures": ["ab"]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"measures": [1, 2]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"minutes": 100}, {"minutes": "only-a-string"}))
+
     def test_an_absent_key_never_matches(self) -> None:
         self.assertFalse(m.tool_args_match({"mart": "x"}, {"grain": ""}))
-
-    def test_a_list_holds_the_wanted_value_as_a_member(self) -> None:
-        self.assertTrue(m.tool_args_match({"measures": ["a", "b"]}, {"measures": "b"}))
-        self.assertFalse(m.tool_args_match({"measures": ["ab"]}, {"measures": "b"}))
 
 
 if __name__ == "__main__":

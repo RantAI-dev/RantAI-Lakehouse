@@ -275,16 +275,47 @@ def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
     """Whether a tool call's args carry every `want` key (dotted keys read
     into nested args, so the match does not depend on key order).
 
-    BLD-2 review R2 SHOULD-FIX 9 / R3 SHOULD-FIX 10: a scalar is compared
-    EQUAL, case-insensitively, as text -- the old substring test let
-    `minutes: 10` match `100`. A list holds the wanted value as a member."""
+    BLD-2 review R4 BLOCKER 2 / decision R15, restoring the string
+    semantics commit `5ec778414e86` broke: a wanted NUMBER matches only a
+    number EQUAL to it (`minutes: 10` never matches `100` -- the
+    SHOULD-FIX 9/10 intent stays), but a wanted STRING matches
+    case-insensitively as a substring of a string value AND of the JSON
+    text of a list or object value (`"filters": "tahun"` matches a filters
+    array of objects, `silver.orders_clean` matches `"pipeline":
+    "orders_clean"`), because a schema never guarantees a value's exact
+    string shape. A wanted string never matches a number and vice versa."""
     for key, wanted in want.items():
         got = _tool_arg(args, key)
         if got is None:
             return False
-        members = got if isinstance(got, list) else [got]
-        if not any(str(member).lower() == str(wanted).lower() for member in members):
-            return False
+        if isinstance(wanted, bool) or wanted is None:
+            if got != wanted:
+                return False
+        elif isinstance(wanted, (int, float)):
+            # The number comparison is member-wise over a list but is an
+            # equality per member: 10 must never match 100.
+            if isinstance(got, list):
+                if not any(
+                    isinstance(member, (int, float))
+                    and not isinstance(member, bool)
+                    and member == wanted
+                    for member in got
+                ):
+                    return False
+            elif not (
+                isinstance(got, (int, float)) and not isinstance(got, bool) and got == wanted
+            ):
+                return False
+        else:
+            wanted_text = str(wanted).lower()
+            if isinstance(got, str):
+                matched = wanted_text in got.lower()
+            elif isinstance(got, (list, dict)):
+                matched = wanted_text in json.dumps(got).lower()
+            else:
+                matched = False
+            if not matched:
+                return False
     return True
 
 
