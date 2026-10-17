@@ -1806,7 +1806,7 @@ mod tests {
         let mut b = chart(&json!({}));
         b.spec.id = "u_2".to_owned();
         assert_eq!(charts_using(&[a.clone(), b], "n"), ["u_1"]);
-        assert!(charts_using(&[a], "other").is_empty());
+        assert_eq!(charts_using(&[a], "other"), [] as [&str; 0]);
         let _ = ColumnKind::Text;
     }
 }

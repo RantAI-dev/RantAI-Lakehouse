@@ -4517,7 +4517,7 @@ mod tests {
         assert_eq!(input.kind, ChartKind::Text);
         assert_eq!(input.mart, "");
         assert_eq!(input.dimension, "");
-        assert!(input.measures.is_empty());
+        assert_eq!(input.measures, Vec::<String>::new());
     }
 
     /// Same D1 regression, for `kind: "kpi"`: the tool schema doesn't
@@ -5086,7 +5086,8 @@ mod tests {
              SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30"
         );
         assert_eq!(spec.def.tables.table_mode.as_deref(), Some("rows"));
-        assert!(spec.def.measures.is_empty() && spec.def.dimension.is_empty());
+        assert_eq!(spec.def.measures, Vec::<String>::new());
+        assert_eq!(spec.def.dimension, "");
         // Round trip: the wire shape stays flat and camel case.
         let json = serde_json::to_value(&spec.def).unwrap();
         assert_eq!(json["tableMode"], "rows");

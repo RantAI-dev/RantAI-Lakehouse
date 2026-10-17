@@ -3390,10 +3390,9 @@ mod tests {
         // `next` without `n` is not valid and never reaches SQL.
         let f = filter(r#"{"column":"d","op":"relative","anchor":"next","unit":"day"}"#);
         assert!(f.validate().is_err());
-        assert!(
-            filter_predicates(&typed(&cols), &[], &[f])
-                .predicates
-                .is_empty()
+        assert_eq!(
+            filter_predicates(&typed(&cols), &[], &[f]).predicates,
+            [] as [String; 0]
         );
     }
 
@@ -3601,7 +3600,7 @@ mod tests {
         )
         .unwrap();
         assert!(got.sql.contains("materials <= 5) AS flt"), "{}", got.sql);
-        assert!(got.skipped.is_empty());
+        assert_eq!(got.skipped, [] as [SkippedFilter; 0]);
     }
 
     // BI-18·A review BLOCKER 1: a predicate on a column the SELECT also
@@ -3745,7 +3744,7 @@ mod tests {
             got.count,
             "SELECT count() AS n FROM serving.mart_x WHERE region = 'o''brien\\\\' AND n >= 3"
         );
-        assert!(got.skipped.is_empty());
+        assert_eq!(got.skipped, [] as [SkippedFilter; 0]);
     }
 
     #[test]
@@ -4721,7 +4720,7 @@ mod tests {
     fn a_chart_without_a_bin_carries_none_and_builds_what_it_always_did() {
         let got = sql_with_filters_report(&bi6_spec("{}"), &[], &[], &bi6_cols());
         assert_eq!(got.sql, "SELECT stored");
-        assert!(got.bins.is_empty());
+        assert_eq!(got.bins, [] as [binned::BinRead; 0]);
         let filtered = sql_with_filters_report(
             &bi6_spec("{}"),
             &[],
@@ -4729,7 +4728,7 @@ mod tests {
             &bi6_cols(),
         );
         assert!(!filtered.sql.contains("rng"), "{}", filtered.sql);
-        assert!(filtered.bins.is_empty());
+        assert_eq!(filtered.bins, [] as [binned::BinRead; 0]);
     }
 
     #[test]

@@ -585,7 +585,7 @@ mod tests {
             range.clone(),
         ];
         assert_eq!(without_inert(&list), vec![keep, range]);
-        assert!(without_inert(&[]).is_empty());
+        assert_eq!(without_inert(&[]), [] as [super::FilterDef; 0]);
     }
 
     #[test]

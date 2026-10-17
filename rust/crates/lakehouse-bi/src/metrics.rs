@@ -1133,12 +1133,12 @@ mod tests {
             charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&fields, &c), name)
         };
         assert_eq!(used("total"), vec!["bare", "marked"]);
-        assert!(used("v2").is_empty());
+        assert_eq!(used("v2"), [] as [&str; 0]);
         // A metric that has a column's name never claims the column's users.
         let clash = catalog_entries(&[metric("v", "Sum(w)", vec![])], &[]);
-        assert!(
-            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&clash, &c), "v")
-                .is_empty()
+        assert_eq!(
+            charts_using_metric(&charts, (SourceKind::Mart, "mart_x"), (&clash, &c), "v"),
+            [] as [&str; 0]
         );
     }
 
@@ -1164,7 +1164,10 @@ mod tests {
             "S".to_owned(),
         );
         bare.spec.id = "bare".to_owned();
-        assert!(catalog.metric_labels(&bare.def, None).is_empty());
+        assert_eq!(
+            catalog.metric_labels(&bare.def, None),
+            std::collections::BTreeMap::new()
+        );
         let healed = catalog.metric_labels(&bare.def, Some(&c));
         assert_eq!(healed.len(), 1, "{healed:?}");
         assert_eq!(healed["total"], "Total visitors");

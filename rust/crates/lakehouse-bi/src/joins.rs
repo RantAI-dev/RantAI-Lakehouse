@@ -989,7 +989,7 @@ mod tests {
         assert!(!covers_key(&[], &["id"]));
         // Nothing in common: no pair is suggested, and nothing is invented.
         let s = suggest(&left, &[meta("zzz", ColumnKind::Text, true)]);
-        assert!(s.pairs.is_empty());
+        assert_eq!(s.pairs, [] as [super::Suggestion; 0]);
         assert!(!s.covers_right_key);
     }
 }

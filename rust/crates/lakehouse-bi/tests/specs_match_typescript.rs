@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Drift guard: `lakehouse-bi`'s shipped built-in dashboard spec
 //! (`specs/builtin-default.json`) vs. its `TypeScript` source of truth,
 //! `src/lib/dashboard-specs.ts`.

@@ -1787,7 +1787,7 @@ mod tests {
     fn params_in_finds_names_by_syntax_alone() {
         let names = params_in("If({a} > 1, [x] * {b}, {a})");
         assert_eq!(names.into_iter().collect::<Vec<_>>(), ["a", "b"]);
-        assert!(params_in("amount +").is_empty());
+        assert_eq!(params_in("amount +"), std::collections::BTreeSet::new());
     }
 
     /// BI-11: the property test of the compiler, extended to parameter values.
@@ -2045,7 +2045,10 @@ mod tests {
         assert!(c.reads.contains("amount"));
         // A grand total needs no columns.
         let total = in_chart("Sum(amount) / Fixed(Sum(amount))", by_label()).unwrap();
-        assert!(total.staged.fixed[0].columns.is_empty());
+        assert_eq!(
+            total.staged.fixed[0].columns,
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

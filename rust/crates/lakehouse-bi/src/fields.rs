@@ -1484,8 +1484,14 @@ mod tests {
             charts_using(&charts, SourceKind::Mart, "mart_x", "profit"),
             vec!["test"]
         );
-        assert!(charts_using(&charts, SourceKind::Mart, "mart_other", "profit").is_empty());
-        assert!(charts_using(&charts, SourceKind::SqlSource, "s_1", "profit").is_empty());
+        assert_eq!(
+            charts_using(&charts, SourceKind::Mart, "mart_other", "profit"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            charts_using(&charts, SourceKind::SqlSource, "s_1", "profit"),
+            [] as [&str; 0]
+        );
         let cat = catalog();
         let t = TimeContext::default();
         let users = fields_using(cat.of(SourceKind::Mart, "mart_x"), &cols(), &t, "profit");
