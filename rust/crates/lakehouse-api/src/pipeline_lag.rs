@@ -1021,13 +1021,29 @@ async fn evaluate_upstream_chain(
                 })?;
 
         if u_outstanding {
+            // BLD-2 review R3 SHOULD-FIX 3: record U's check while its run is
+            // outstanding, so a run over 90 s does not read "no check recorded".
+            let u_update =
+                make_lag_update(u_pipe, &u_state, now, LagStatus::NotMeasured.as_str(), 0);
+            pipelines::upsert_lag_state_conn(tx, &u_update)
+                .await
+                .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
             let pending_since = state.pending_since.unwrap_or(now);
             state.pending_since = Some(pending_since);
             let lag_seconds = (now - pending_since).whole_seconds();
-            // BLD-2 review R3 BLOCKER 1 / decision R14: For a P waiting on an exhausted U,
-            // P is behind with a reason naming U whatever the lag.
-            let status = LagStatus::Behind;
-            let behind_streak = stored.map_or(1, |row| row.behind_streak + 1);
+            // BLD-2 review R3 BLOCKER 1: U's run is merely outstanding here (not exhausted),
+            // so P is judged by its own lag against its target as before; only an
+            // exhausted U (R14) forces `behind`.
+            let target = target_seconds.map_or(i64::MAX, i64::from);
+            let status = if state.consumed_tokens.is_none() || lag_seconds > target {
+                LagStatus::Behind
+            } else {
+                LagStatus::Met
+            };
+            let behind_streak = match status {
+                LagStatus::Behind => stored.map_or(1, |row| row.behind_streak + 1),
+                LagStatus::Met | LagStatus::NotMeasured => 0,
+            };
             // BLD-2 review R1 BLOCKER 5: keep P request
             let p_update = make_lag_update(pipeline, state, now, status.as_str(), behind_streak);
             pipelines::upsert_lag_state_conn(tx, &p_update)
@@ -1107,12 +1123,9 @@ async fn evaluate_upstream_chain(
             u_state.pending_since = None;
             u_state.request_attempt = 0;
             // BLD-2 review R2 SHOULD-FIX 1: record check for unchanged U; never copy old status forward on settle
-            let u_status = if u_state.consumed_tokens.is_some() {
-                "met"
-            } else {
-                "not_measured"
-            };
-            let u_update = make_lag_update(u_pipe, &u_state, now, u_status, 0);
+            // BLD-2 review R3 SHOULD-FIX 3: a U has no target, so it is never `met`.
+            let u_update =
+                make_lag_update(u_pipe, &u_state, now, LagStatus::NotMeasured.as_str(), 0);
             pipelines::upsert_lag_state_conn(tx, &u_update)
                 .await
                 .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
@@ -1121,17 +1134,10 @@ async fn evaluate_upstream_chain(
 
         if u_retries_exhausted {
             // BLD-2 review R2 BLOCKER 2: do not request U when retries exhausted
-            let (u_target, _) = target_of(u_pipe);
-            let (u_status, u_streak) = if u_target.is_some() {
-                (
-                    "behind",
-                    u_stored.as_ref().map_or(1, |s| s.behind_streak + 1),
-                )
-            } else {
-                // BLD-2 review R2 SHOULD-FIX 1: never hard-code behind for pipeline with no target
-                ("not_measured", 0)
-            };
-            let u_update = make_lag_update(u_pipe, &u_state, now, u_status, u_streak);
+            // BLD-2 review R3 SHOULD-FIX 3: a chain U is `downstream`, it has no target,
+            // so it is `not_measured` (the `u_target.is_some()` branch was unreachable).
+            let u_update =
+                make_lag_update(u_pipe, &u_state, now, LagStatus::NotMeasured.as_str(), 0);
             pipelines::upsert_lag_state_conn(tx, &u_update)
                 .await
                 .map_err(|err| store_err(&u_pipe.id, "upstream state row unwritable", err))?;
@@ -1196,23 +1202,8 @@ async fn evaluate_upstream_chain(
             lag_seconds >= target.saturating_sub(total_budget)
         };
 
-        let (u_target, _) = target_of(u_pipe);
-        let (u_status, u_streak) = if u_target.is_some() {
-            let u_pending = u_state.pending_since.unwrap_or(now);
-            let u_lag = (now - u_pending).whole_seconds();
-            let u_tgt = u_target.map_or(i64::MAX, i64::from);
-            if u_state.consumed_tokens.is_none() || u_lag > u_tgt {
-                (
-                    "behind",
-                    u_stored.as_ref().map_or(1, |s| s.behind_streak + 1),
-                )
-            } else {
-                ("met", 0)
-            }
-        } else {
-            // BLD-2 review R2 SHOULD-FIX 1: never hard-code behind for pipeline with no target
-            ("not_measured", 0)
-        };
+        // BLD-2 review R3 SHOULD-FIX 3: a chain U has no target; never `met` or `behind`.
+        let (u_status, u_streak) = (LagStatus::NotMeasured.as_str(), 0);
 
         if due {
             // BLD-2 review R1 decision R2 / BLOCKER 4: run_key carries attempt
@@ -3480,6 +3471,138 @@ mod tests {
             page["reason"],
             "waiting for upstream pipeline pl-u-exh to finish"
         );
+    }
+
+    /// BLD-2 review R3 BLOCKER 1: a U whose run is merely OUTSTANDING (not exhausted)
+    /// does not make P `behind`: P is judged by its own lag (30 s) against its
+    /// target (600 s), so it stays `met`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn downstream_waiting_on_an_outstanding_upstream_run_stays_met_inside_its_target(
+        pool: PgPool,
+    ) {
+        let tenant_id = seed_tenant(&pool).await;
+        let u = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "u_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "u_clean".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-u-out".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create u");
+
+        let p = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "p_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "u_clean".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "p_mart".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: Some(1),
+                tenant_id: Some(tenant_id),
+                depends_on: vec!["pl-u-out".to_owned()],
+                connector_id: None,
+                id: Some("pl-p-out".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create p");
+
+        let t0 = at(1_000);
+        let t_past = t0 - time::Duration::seconds(30);
+        let u_old = tokens_of(&[("bronze.orders", "iceberg:1")]);
+        let u_new = tokens_of(&[("bronze.orders", "iceberg:2")]);
+        // Set U to exhausted: request_attempt = 2 > max_retries(1), requested != consumed
+        let update_u = LagStateUpdate {
+            pipeline_id: u.id.clone(),
+            tenant_id: u.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&u_old)),
+            consumed_at: Some(t_past),
+            pending_since: Some(t_past),
+            requested_run_key: Some("lag:pl-u-out:abc:0".to_owned()),
+            requested_tokens: Some(tokens_to_json(&u_new)),
+            requested_at: Some(t_past),
+            request_attempt: 0,
+            last_check_at: t0,
+            last_status: "not_measured".to_owned(),
+            behind_streak: 0,
+        };
+        pipelines::upsert_lag_state(&pool, &update_u).await.unwrap();
+
+        // P has consumed silver.u_clean before, lag is 30s <= target 600s
+        let p_tokens = tokens_of(&[("silver.u_clean", "fp:1")]);
+        let update_p = LagStateUpdate {
+            pipeline_id: p.id.clone(),
+            tenant_id: p.tenant_id,
+            consumed_tokens: Some(tokens_to_json(&p_tokens)),
+            consumed_at: Some(t_past),
+            pending_since: Some(t_past),
+            requested_run_key: None,
+            requested_tokens: None,
+            requested_at: None,
+            request_attempt: 0,
+            last_check_at: t0,
+            last_status: "met".to_owned(),
+            behind_streak: 0,
+        };
+        pipelines::upsert_lag_state(&pool, &update_p).await.unwrap();
+
+        let reader = FakeTokens::new()
+            .with("bronze.orders", "iceberg:2")
+            .with("silver.u_clean", "fp:1");
+        let (dagster, _s) = dagster_with(&job_name(&u.id), Some("STARTED"), &[]).await;
+        let p_inputs = inputs_of(&pool, &p).await.unwrap().unwrap();
+        let outcome = run_lag_check(&pool, &dagster, &reader, &p, &p_inputs, t0)
+            .await
+            .expect("run check");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(
+            outcome.status,
+            LagStatus::Met,
+            "an outstanding U run is not an exhausted U"
+        );
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("waiting for upstream pipeline pl-u-out to finish")
+        );
+        // BLD-2 review R3 SHOULD-FIX 3: U's check is recorded while its run is
+        // outstanding, and a U (no target) is never `met`.
+        let u_row = pipelines::get_lag_state(&pool, &u.id)
+            .await
+            .unwrap()
+            .expect("u row");
+        assert_eq!(u_row.last_check_at, Some(t0));
+        assert_eq!(u_row.last_status.as_deref(), Some("not_measured"));
     }
 
     // BLD-2 review R3 BLOCKER 2 / decision R13:
