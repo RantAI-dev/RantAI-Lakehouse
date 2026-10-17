@@ -44,6 +44,19 @@ export const READY_SAFETY_MS = 20_000;
 /** What replaces an image or web-page card (feature decision 3): the renderer opens the console and nothing else. */
 export const NOT_IN_PDF = "Shown in the console only";
 
+/**
+ * How a page that could not load its data fails the PDF (`BI-1` review fix
+ * (SHOULD-FIX) R3). Gotenberg is asked for `failOnConsoleExceptions`, so an
+ * uncaught exception in this page fails the conversion and the route answers
+ * "The PDF could not be made." instead of sending a PDF of an error sentence.
+ * An object, so a test can replace `raise` (a real throw would fail the test run).
+ */
+export const renderFailure = {
+  raise(message: string): void {
+    window.setTimeout(() => { throw new Error(message); }, 0);
+  },
+};
+
 /** Set on `window` when every tile has drawn or shown its error; Gotenberg waits for it. */
 function markReady() {
   (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady = true;
@@ -58,7 +71,9 @@ function markReady() {
  * starting on a new page with its title; sections are unfolded (nothing here
  * folds); image and web cards are a placeholder; charts draw without animation.
  * `window.__lakehouseRenderReady` is set once every chart has finished and the
- * browser has painted, or after {@link READY_SAFETY_MS}.
+ * browser has painted, or after {@link READY_SAFETY_MS}. A page that cannot load
+ * its data shows the sentence and raises an uncaught exception, which fails the
+ * conversion (R3); it is marked ready so Gotenberg checks at once.
  */
 export function RenderView({ token }: { token: string }) {
   const [data, setData] = React.useState<RenderPayload | null>(null);
@@ -87,12 +102,13 @@ export function RenderView({ token }: { token: string }) {
           const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
           setMessage(typeof body?.error === "string" ? body.error : "This dashboard could not be loaded.");
           setState("error");
+          renderFailure.raise("render data refused");
           return;
         }
         setData((await res.json()) as RenderPayload);
         setState("ok");
       } catch {
-        if (alive) { setMessage("This dashboard could not be loaded."); setState("error"); }
+        if (alive) { setMessage("This dashboard could not be loaded."); setState("error"); renderFailure.raise("render data failed"); }
       }
     })();
     return () => { alive = false; };

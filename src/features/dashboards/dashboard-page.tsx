@@ -1293,7 +1293,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {noteFor ? <NoteDialog point={noteFor.point} saving={savingNote} error={noteError} onSave={(t) => void saveNote(t)} onClose={() => setNoteFor(null)} /> : null}
 
       {tileDialog?.kind === "data" && dialogSpec ? (
-        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />
+        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} canDownload={canDownload} />
       ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />

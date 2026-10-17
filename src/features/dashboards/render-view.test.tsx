@@ -37,7 +37,7 @@ afterAll(() => {
 })
 
 import * as React from "react"
-const { RenderView, NOT_IN_PDF } = await import("./render-view")
+const { RenderView, NOT_IN_PDF, renderFailure } = await import("./render-view")
 
 const originalFetch = global.fetch
 const flag = () => (window as unknown as { __lakehouseRenderReady?: boolean }).__lakehouseRenderReady
@@ -133,10 +133,32 @@ describe("the PDF print view", () => {
     await waitFor(() => expect(flag()).toBe(true))
   })
 
-  it("shows the server's sentence when the token is refused, and is ready so the PDF holds the sentence", async () => {
-    serve({ error: "render token is invalid or expired" }, 401)
-    render(<RenderView token="x" />)
-    expect((await screen.findByRole("alert")).textContent).toBe("render token is invalid or expired")
-    await waitFor(() => expect(flag()).toBe(true))
+  it("shows the server's sentence when the token is refused, raises a failure so the conversion fails, and is ready so Gotenberg checks at once (R3)", async () => {
+    const raised: string[] = []
+    const real = renderFailure.raise
+    renderFailure.raise = (m) => { raised.push(m) }
+    try {
+      serve({ error: "render token is invalid or expired" }, 401)
+      render(<RenderView token="x" />)
+      expect((await screen.findByRole("alert")).textContent).toBe("render token is invalid or expired")
+      await waitFor(() => expect(flag()).toBe(true))
+      expect(raised).toEqual(["render data refused"])
+    } finally {
+      renderFailure.raise = real
+    }
+  })
+
+  it("raises no failure when the data loads", async () => {
+    const raised: string[] = []
+    const real = renderFailure.raise
+    renderFailure.raise = (m) => { raised.push(m) }
+    try {
+      serve(payload())
+      render(<RenderView token="t" />)
+      await screen.findByRole("heading", { name: "Visits" })
+      expect(raised).toEqual([])
+    } finally {
+      renderFailure.raise = real
+    }
   })
 })
