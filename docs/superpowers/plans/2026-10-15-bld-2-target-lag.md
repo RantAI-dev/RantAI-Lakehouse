@@ -1184,3 +1184,53 @@ binaries across the round (`connector_repoint`, `connector_secret_reference`,
   profile was brought up this round (no compose file changed; the branch's
   compose up proof remains round 3's gate run).
 - Nothing was verified in a browser.
+
+### Round 5 (planner, at `2374d895`)
+
+Review of the round-4 delta (`c9aa28ae..2374d895`): every round-4 BLOCKER is
+fixed (R16's one chain-walking helper with a route test that can fail; the
+distinct exhausted reason reaches the alert; R15's matcher; the `0084`
+header matches the r1/r6/r8 logs), and SHOULD-FIX 2–5 are fixed. **No
+BLOCKER is open.** The branch now conflicts with `main` in
+`ops/ai_eval/ai_eval.py` (#198, #200 by the AI team); that merge and the
+items below are the last round before merge.
+
+#### Decisions (planner)
+
+- **R17. Merge `main` into the branch** (a merge commit, not a rebase; the PR
+  is open). One conflicting hunk, `score_case`'s `expect_tool` block: keep
+  `main`'s line that builds `want` with `fill_value(…, names or {})` (#198:
+  `{board}`/`{chart}` filling and `--rescore`), and the branch's comparison
+  `any(tool_args_match(t.get("args", {}), want) for t in trace)` (R15).
+  Every `args_contains` value on `main` is a string, so the AI team's cases
+  keep matching. The merge commit body says the AI team owns this file.
+- **R18. The page stops where the check stops:** `exhausted_upstream_of`
+  walks the chain in the check's order and stops at the first upstream that
+  is outstanding *or* exhausted, so page and check name the same U.
+
+#### SHOULD-FIX
+
+1. **The list is N+1** (`routes/pipelines.rs` ~226): one chain walk plus one
+   `get_lag_state` per upstream per row. Batch it: one store walk for all
+   rows' chains on one connection and one `ANY($1)` lag-state read (or reuse
+   the `lag_states` map the list already loaded). Test: the list answers
+   right for two P rows sharing one exhausted U.
+2. Per R18; fix the doc at `pipeline_lag.rs` ~1540 to say so; test: deeper
+   U1 outstanding, nearer U2 exhausted → the page names the one the check
+   names.
+3. The ordered-lock test still cannot fail (a `BTreeMap` is always sorted):
+   assert something only the sort and dedup produce — e.g. a second
+   connection holding `pl-a` under a short `lock_timeout` while asking for
+   `pl-z` (it must not be locked before `pl-a`), or the lock order from
+   `pg_locks` — and test the dedup; otherwise the test's doc says only what
+   it pins.
+4. `pipeline_lag.rs` ~696–709: the doc of `is_check_budget_error` is
+   duplicated, and the `R2 SHOULD-FIX 6` line sits above the wrong item.
+5. `tool_args_match`: a wanted `True` matches `1`/`1.0` — bools compare as
+   bools only (test); `json.dumps(got, ensure_ascii=False)` so a non-ASCII
+   wanted string can match inside a list/object (test).
+6. At the SQLSTATE matcher (~715): one comment why `classify_sqlx_error`
+   and `connector_listing::class_of_sqlx` are not reused (rule 4).
+7. Nits: "decision R16 refused" (`routes/pipelines.rs` ~1077); "last 1
+   runs" → singular when N = 1; the not-exhausted control in
+   `pipeline_lag_page.rs` should not use `seed_exhausted_state`.
