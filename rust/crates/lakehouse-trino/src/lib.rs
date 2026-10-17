@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! A thin client for `Trino`'s `/v1/statement` REST protocol.
 //!
 //! `Trino` has no official Rust SDK, so this crate speaks its documented
