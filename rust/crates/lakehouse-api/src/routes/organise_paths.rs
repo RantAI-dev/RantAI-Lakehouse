@@ -1796,6 +1796,83 @@ async fn going_back_to_an_unstamped_version_keeps_every_tile_on_the_tab_it_showe
     assert!(tile_of(board, "c1", "t_b"), "{board}");
 }
 
+/// BI-18 part C review fix (BLOCKER) R13: any write of a board gives every live
+/// chart with no stored box one, on the first tab, below that tab's stored
+/// bottom; a stored tile does not move.
+#[tokio::test]
+async fn a_board_write_gives_every_live_chart_a_box_on_the_first_tab() {
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, "")],
+        ),
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board(&format!("[{T_A},{T_B}]"))],
+        ),
+        (
+            &["SELECT id, spec_json FROM console.bi_chart FINAL WHERE is_deleted = 0 AND (board = 'b1')"],
+            ["c1", "c2", "c3", "u1", "u2", "u3"]
+                .iter()
+                .map(|id| chart_row(id, "b1", "mart_a", None))
+                .collect(),
+        ),
+    ])
+    .await;
+    let body = json!({ "id": "b1", "name": "Renamed" });
+    boards_update(
+        State(state_for(&server)),
+        Extension(person(ME, "dashboard:write")),
+        body.to_string().into(),
+    )
+    .await
+    .done("saved");
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    assert_tiles_stayed(board);
+    // c1 and c2 end at y 4 on t_a; c3 is on t_b and does not count.
+    for (id, x, y) in [("u1", 0, 4), ("u2", 6, 4), ("u3", 0, 10)] {
+        assert!(tile_of(board, id, "t_a"), "{id}: {board}");
+        assert!(
+            board.contains(&format!(r#""{id}":{{"x":{x},"y":{y},"w":6,"h":6"#)),
+            "{id}: {board}"
+        );
+    }
+}
+
+/// BI-18 part C review fix (SHOULD-FIX) R14, closed by R13: deleting a chart on
+/// a board whose other charts had no stored box leaves no hole; they get their
+/// boxes in the same write, below what is left of the tab.
+#[tokio::test]
+async fn deleting_a_chart_leaves_no_hole_for_charts_that_had_no_box() {
+    let server = engine(vec![
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![untagged_board(&format!("[{T_A},{T_B}]"))],
+        ),
+        (
+            &["SELECT id, spec_json FROM console.bi_chart FINAL WHERE is_deleted = 0 AND (board = 'b1')"],
+            // c1 is in the trash already; u1 never had a box.
+            ["c2", "c3", "u1"]
+                .iter()
+                .map(|id| chart_row(id, "b1", "mart_a", None))
+                .collect(),
+        ),
+    ])
+    .await;
+    lakehouse_bi::store::drop_tile_of_deleted_chart(&client(&server), "b1", "c1")
+        .await
+        .unwrap();
+    let written = writes(&server).await;
+    let board = last_board_write(&written);
+    assert!(!board.contains(r#""c1":{"#), "{board}");
+    assert!(tile_of(board, "u1", "t_a"), "{board}");
+    assert!(
+        board.contains(r#""u1":{"x":0,"y":4,"w":6,"h":6"#),
+        "{board}"
+    );
+}
+
 // ── BI-18 part C review fixes R7 to R10 ─────────────────────────────────
 
 /// The rules of a revert to version 2 of board `b1` whose one chart `c1` is

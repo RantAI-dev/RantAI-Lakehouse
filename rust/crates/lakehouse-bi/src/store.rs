@@ -1269,6 +1269,38 @@ async fn upsert_board(
     ch.exec(&sql, None).await
 }
 
+/// The live charts of a board, in creation order, with what their place on the
+/// grid depends on (`BI-18` part C review fix (BLOCKER) R13). A chart in the
+/// trash is not live; a row whose `spec_json` does not parse is skipped, as
+/// [`list_stored_charts`] skips it. The built-in board's id also matches the
+/// charts saved with no board.
+async fn live_charts_of(
+    ch: &ChClient,
+    board_id: &str,
+) -> Result<Vec<crate::layout::LiveChart>, ChError> {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, spec_json FROM console.bi_chart FINAL WHERE is_deleted = 0 AND (board = {board}{none}) ORDER BY created_at",
+                board = SqlLiteral::from(board_id),
+                none = if board_id == DEFAULT_BOARD_ID { " OR board = ''" } else { "" },
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let parsed = serde_json::from_str::<StoredEnvelope>(row_str(row, "spec_json")).ok()?;
+            Some(crate::layout::LiveChart {
+                id: row_str(row, "id").to_owned(),
+                span: parsed.spec.span,
+                kind: parsed.spec.kind,
+            })
+        })
+        .collect())
+}
+
 async fn save_board_patch(
     ch: &ChClient,
     board: &Board,
@@ -1320,16 +1352,17 @@ async fn save_board_patch(
     // BI-18 part C review fix (BLOCKER) R1: no tile of a tabbed board is left
     // naming no tab, whatever this write was for. The first tab is the one the
     // board had BEFORE this write.
+    let before_tabs = board.tabs.as_deref().unwrap_or_default();
     let mut stamped = layout.clone();
-    let layout = if crate::layout::stamp_untagged(
-        &mut stamped,
-        board.tabs.as_deref().unwrap_or_default(),
-        tabs,
-    ) {
-        &stamped
-    } else {
-        layout
-    };
+    let mut changed = crate::layout::stamp_untagged(&mut stamped, before_tabs, tabs);
+    // BI-18 part C review fix (BLOCKER) R13: every live chart of the board has a
+    // stored box. The chart list is read here, from the chart table itself,
+    // because this is the one place every board write passes through; it is the
+    // same live set the dashboard read draws, so there is no second list to
+    // keep in step.
+    let live = live_charts_of(ch, &board.id).await?;
+    changed |= crate::layout::place_unboxed(&mut stamped, before_tabs, tabs, &live);
+    let layout = if changed { &stamped } else { layout };
     let phone_layout = patch
         .phone_layout
         .or(board.phone_layout.as_deref())

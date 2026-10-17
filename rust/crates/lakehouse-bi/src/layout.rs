@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::filters::FilterDef;
+use crate::specs::ChartKind;
 use crate::store::LayoutMap;
 
 /// Most tabs a board may have.
@@ -220,18 +221,110 @@ pub fn stamp_untagged(layout: &mut LayoutMap, before: &[Tab], after: &[Tab]) -> 
         }
         return changed;
     };
-    let target = before
-        .first()
-        .filter(|b| after.iter().any(|t| t.id == b.id))
-        .unwrap_or(first_after)
-        .id
-        .clone();
+    let target = untagged_tab(before, after)
+        .unwrap_or(first_after.id.as_str())
+        .to_owned();
     let mut changed = false;
     for tile in layout.values_mut().filter(|t| t.tab.is_none()) {
         tile.tab = Some(target.clone());
         changed = true;
     }
     changed
+}
+
+/// The tab a tile that names none sits on while `before` becomes `after`: the
+/// first of `before` while `after` still has it, else the first of `after`;
+/// `None` when `after` has no tab.
+fn untagged_tab<'a>(before: &'a [Tab], after: &'a [Tab]) -> Option<&'a str> {
+    let first_after = after.first()?;
+    Some(
+        before
+            .first()
+            .filter(|b| after.iter().any(|t| t.id == b.id))
+            .unwrap_or(first_after)
+            .id
+            .as_str(),
+    )
+}
+
+/// A live chart of a board, as far as its place on the grid is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveChart {
+    /// The chart's id, the key of its tile.
+    pub id: String,
+    /// The chart's grid span (`2` = full width), as the builder saved it.
+    pub span: Option<u8>,
+    /// The chart's kind: a heading, a section header and a divider are one row high.
+    pub kind: ChartKind,
+}
+
+/// Grid columns, as `COLS` in `dashboard-grid.tsx`.
+const GRID_COLS: i32 = 12;
+/// Width and height of a chart tile with no box, as `DEFAULT` there.
+const DEFAULT_TILE: (i32, i32) = (6, 6);
+
+/// Give every live chart that has no tile a box (`BI-18` part C review fix
+/// (BLOCKER) R13). The console drew such a chart wherever its grid's `resolve()`
+/// put it and never stored the place, so the server did not know it: a tab
+/// reorder, a move and the closing of a space all missed it. The rule is
+/// `resolve()`'s, in `dashboard-grid.tsx` (`placeUnboxed` in
+/// `src/lib/dashboard-tabs.ts`), and both are tested on
+/// `ops/fixtures/place_unboxed.json`: below the stored bottom of the first
+/// tab (of the board with no tabs), in the order of `charts` (creation order),
+/// half width (6 by 6) or 12 wide for `span: 2`, a heading, section header or
+/// divider one row high, two half-width tiles to a row and a row as tall as its
+/// tallest tile. On a tabbed board the new tile names the tab a tile with none
+/// sits on ([`stamp_untagged`]'s target), so call this after it. The bottom
+/// counts every stored tile of that tab, even one whose chart is gone: it can
+/// only leave a gap, never an overlap. Returns whether a tile was added.
+pub fn place_unboxed(
+    layout: &mut LayoutMap,
+    before: &[Tab],
+    after: &[Tab],
+    charts: &[LiveChart],
+) -> bool {
+    let tab = untagged_tab(before, after).map(str::to_owned);
+    let mut y = match &tab {
+        Some(t) => bottom_of_tab(after, layout, t, &HashSet::new()),
+        None => layout.values().map(|t| t.y + t.h).max().unwrap_or(0),
+    };
+    let (mut col, mut row_h, mut added) = (0, 0, false);
+    for chart in charts {
+        if layout.contains_key(&chart.id) {
+            continue;
+        }
+        let w = if chart.span == Some(2) {
+            GRID_COLS
+        } else {
+            DEFAULT_TILE.0
+        };
+        let h = match chart.kind {
+            ChartKind::Heading | ChartKind::Section | ChartKind::Divider => 1,
+            _ => DEFAULT_TILE.1,
+        };
+        if col + w > GRID_COLS {
+            y += row_h;
+            (col, row_h) = (0, 0);
+        }
+        layout.insert(
+            chart.id.clone(),
+            crate::store::TileBox {
+                x: col,
+                y,
+                w,
+                h,
+                tab: tab.clone(),
+            },
+        );
+        added = true;
+        col += w;
+        row_h = row_h.max(h);
+        if col >= GRID_COLS {
+            y += row_h;
+            (col, row_h) = (0, 0);
+        }
+    }
+    added
 }
 
 /// The filters a tile on `tab` is given.
@@ -1000,5 +1093,95 @@ mod tests {
             .collect();
         assert_eq!(without_tile(&[], &plain, "a")["b"].y, 0);
         assert_eq!(without_tile(&[], &plain, "zz"), plain);
+    }
+
+    /// BI-18 part C review fix (BLOCKER) R13: the cases the console's
+    /// `placeUnboxed` is tested on too (`src/lib/dashboard-tabs.test.ts`).
+    #[test]
+    fn charts_with_no_box_get_the_place_the_grid_gave_them_on_the_shared_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../ops/fixtures/place_unboxed.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let tabs: Vec<Tab> = case["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| tab(t.as_str().unwrap(), "T"))
+                .collect();
+            let mut layout: LayoutMap = serde_json::from_value(case["layout"].clone()).unwrap();
+            let charts: Vec<LiveChart> = case["charts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| LiveChart {
+                    id: c["id"].as_str().unwrap().to_owned(),
+                    span: c["span"].as_u64().map(|n| u8::try_from(n).unwrap()),
+                    kind: serde_json::from_value(c["kind"].clone()).unwrap(),
+                })
+                .collect();
+            // The order a board write does it in: stamp, then place.
+            stamp_untagged(&mut layout, &tabs, &tabs);
+            let stored = layout.clone();
+            assert!(place_unboxed(&mut layout, &tabs, &tabs, &charts), "{name}");
+            let placed: LayoutMap = serde_json::from_value(case["placed"].clone()).unwrap();
+            for (id, want) in &placed {
+                let mut want = want.clone();
+                if let Some(first) = tabs.first() {
+                    want.tab = Some(first.id.clone());
+                }
+                assert_eq!(layout.get(id), Some(&want), "{name}: {id}");
+            }
+            for (id, box_) in &stored {
+                assert_eq!(layout.get(id), Some(box_), "{name}: stored {id} moved");
+            }
+            assert_eq!(layout.len(), stored.len() + placed.len(), "{name}");
+            // Idempotent: a second write adds nothing.
+            assert!(!place_unboxed(&mut layout, &tabs, &tabs, &charts), "{name}");
+        }
+    }
+
+    /// R13 with R1: a reorder of the tabs that is also the write that places
+    /// the charts leaves an unboxed chart on the tab it showed on.
+    #[test]
+    fn an_unboxed_chart_stays_on_the_tab_it_showed_on_when_the_tabs_are_reordered() {
+        let (a, b) = (tab("t_a", "A"), tab("t_b", "B"));
+        let before = vec![a.clone(), b.clone()];
+        let after = vec![b, a];
+        let mut layout = layout_of(&[("c1", None, 0, 6)]);
+        stamp_untagged(&mut layout, &before, &after);
+        let charts: Vec<LiveChart> = ["c1", "c2"]
+            .iter()
+            .map(|id| LiveChart {
+                id: (*id).to_owned(),
+                span: Some(1),
+                kind: ChartKind::Bar,
+            })
+            .collect();
+        assert!(place_unboxed(&mut layout, &before, &after, &charts));
+        assert_eq!(tab_of(&after, &layout, "c1"), Some("t_a"));
+        assert_eq!(tab_of(&after, &layout, "c2"), Some("t_a"));
+        assert_eq!(layout["c2"].y, 6);
+    }
+
+    /// R14 (closed by R13): once the charts under a deleted one have boxes,
+    /// the whole column follows it up.
+    #[test]
+    fn deleting_a_chart_closes_the_space_for_charts_that_had_no_box_before_the_write() {
+        let tabs = vec![tab("t_a", "A")];
+        let mut layout = layout_of(&[("top", Some("t_a"), 0, 6)]);
+        let charts: Vec<LiveChart> = ["top", "mid", "low"]
+            .iter()
+            .map(|id| LiveChart {
+                id: (*id).to_owned(),
+                span: Some(2),
+                kind: ChartKind::Bar,
+            })
+            .collect();
+        assert!(place_unboxed(&mut layout, &tabs, &tabs, &charts));
+        assert_eq!((layout["mid"].y, layout["low"].y), (6, 12));
+        let out = without_tile(&tabs, &layout, "top");
+        assert_eq!((out["mid"].y, out["low"].y), (0, 6));
     }
 }
