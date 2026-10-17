@@ -18,6 +18,7 @@ once a first release is tagged.
 - The assistant's data map now needs `catalog:read` (backlog `SEC-24`). The chat's system prompt gives the tables, row counts and column facts only to a user with `catalog:read`. Column ranges, which come from `/api/catalog/{id}/profile`, and sample values, which come from `/api/catalog/{id}/sample`, go only to a user who also has `query:read`, the permission both routes require. Of the seeded roles, Platform Admin, which holds `*:*`, and Analyst get the full map. Governance Admin gets `catalog:read` from migration `0031_governance_admin_catalog_read.sql` but no `query:read`, so it gets the map without ranges and sample values. Approver, Data Engineer, Data Scientist and Dashboard Viewer get no map, since none of them holds `catalog:read`.
 - Query Studio's cost estimate refuses a statement that is not a read, as a run already does (backlog `SEC-19`).
 - A ClickHouse run stops at the result cap inside the engine, so a huge result no longer fills the API's memory. A statement may use SETTINGS only for `iceberg_snapshot_id`, the version picker's setting, so no statement can lift that cap (backlog `SEC-21`).
+- A row filter's text value cannot contain a backslash (backlog `SEC-32`). The policy check and ClickHouse read a backslash differently, so the filter that was checked could differ from the filter that ran. A row filter now accepts only plain `'text'` values, numbers, booleans and NULL. A policy that breaks this refuses queries on its table until the policy is edited.
 
 ### Added
 
