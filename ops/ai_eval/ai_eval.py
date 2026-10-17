@@ -70,8 +70,10 @@ crash, and a delete that fails is a problem of that case.
 Exit code 0 when the set passes, 1 when it fails, 2 when the run could not
 start (no stack, no login, a port already in use).
 
-This run belongs to a person, not to CI: it needs a model key, it builds an
-image, and it answers are read by whoever runs it. Put the numbers in the
+This run belongs to a person, not to CI: it needs a model key, and whoever
+runs it reads the answers. The runner (`run_dashboard_eval.sh`) builds the api
+image from the working tree under its own tag, or uses the image given with
+`--image`, and removes what it built when it ends. Put the numbers in the
 review of the PR that changed the tool or prompt. Results are never kept in
 the repository.
 """
