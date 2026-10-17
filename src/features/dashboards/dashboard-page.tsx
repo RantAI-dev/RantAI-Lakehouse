@@ -1026,18 +1026,15 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"))} style={look.style}>
       <PageHeader
         title={
-          <span className="flex min-w-0 items-center gap-2">
-            <BoardSwitcher
-              boards={boards}
-              activeId={board}
-              activeName={dashName}
-              onSelect={(id) => router.push(`/dashboards/${id}`)}
-              onCreate={() => void createDashboard()}
-              folders={folders}
-            />
-            {ownerId ? <PrivateBadge /> : null}
-          </span>
-
+          <BoardSwitcher
+            boards={boards}
+            activeId={board}
+            activeName={dashName}
+            onSelect={(id) => router.push(`/dashboards/${id}`)}
+            onCreate={() => void createDashboard()}
+            folders={folders}
+            badge={ownerId ? <PrivateBadge /> : undefined}
+          />
         }
         actions={
           <span data-print-hide className="contents">
