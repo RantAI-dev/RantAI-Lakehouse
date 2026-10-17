@@ -466,27 +466,27 @@ almost everything.
 | Finding / Decision | Fixing commit (12 chars) | Note |
 | --- | --- | --- |
 | BLOCKER 1: `apply_set_target_lag` drops `X-Tenant` | `89e050629c5b` | Pass caller's headers in; test user in tenants [A, B] acting in B, and Platform Admin |
-| BLOCKER 2: Downstream upstream U retry limit and token reset | `d6f288874676` | Shared retry helper applies to U; test U whose runs keep failing |
-| BLOCKER 3: Lock and write U's row in same transaction as P | `eb1760debc04` | `get_lag_state_for_update` and transactional upsert for U |
+| BLOCKER 2: Downstream upstream U retry limit and token reset | `f011c7b9b038` | `evaluate_upstream_chain` resets `request_attempt` on token change and stops after `max_retries + 1` (R3 BLOCKER 4 corrected the commit; the earlier table credited `d6f288874676`) |
+| BLOCKER 3: Lock and write U's row in the same transaction as P | `f011c7b9b038` | U's row locked and written in P's transaction (R3 BLOCKER 4 corrected the commit; the earlier table credited `eb1760debc04`) |
 | BLOCKER 4: Result file quotes non-existent numbers | `1d08a9818f84` | Rewritten strictly from surviving logs (`bld2-gate-r1.log`, `bld2-gate-r6.log`, `bld2-gate-r8-1min.log`, `bld2-gate-r8-final.log`) with 12-char commits, dates, commands, computed headroom, and real 3-column fingerprint query |
 | BLOCKER 5: `CHANGELOG.md` quotes unlogged sample numbers | `1d08a9818f84` | Updated with real measurements from R8 gate run at 1-minute floor |
 | BLOCKER 6: Handoff misstates evidence in `bld2-gate-r1.log` | `1d08a9818f84` | Corrected handoff lines to note all 5 samples survive in `bld2-gate-r1.log` and note real 3-column fingerprint times |
 | SHOULD-FIX 1: Status writes for U | `f011c7b9b038` | Never hard-code `behind` for pipeline without target, record check on unchanged, do not copy old status forward on settle |
 | SHOULD-FIX 2: Unparseable source branch | `5a0627cb888b` | No `let _ =`, preserve state row, run after no-target-lag guard |
 | SHOULD-FIX 3: Manual `lag-check` on `downstream` pipeline | `3823e23e2f5b` | Manual check on `downstream` pipeline answers `wait` |
-| SHOULD-FIX 4: Stale doc comments and citations | `4d1d91b6c907` | Updated doc comments in Rust, Python, migrations |
-| SHOULD-FIX 5: Store test for migration 0084 CHECK | `8fb46da5a495` | `target_lag_seconds_check_refuses_out_of_range_and_sub_minute_values` covering floor, ceiling, and whole minutes (updated to 1m in `29d889340b1a`) |
-| SHOULD-FIX 6: Tool registry description floor | `16d007662702` | Mention minimum floor in tool schema description (updated to 1m in `29d889340b1a`) |
-| SHOULD-FIX 7: `authored_factory.py` typing and error handling | `16d007662702` | Typed `inputs_of` and robust Dagster error handling |
-| SHOULD-FIX 8: Gate scripts cleanup | `16d007662702` | Isolated compose project and volume teardown |
-| SHOULD-FIX 9: Compose config dummy env | `16d007662702` | Automated dummy env validation script |
-| SHOULD-FIX 10: Console validation for floor | `16d007662702` | Validate floor in `pipeline-freshness-panel.tsx` and test (updated to 1m in `29d889340b1a`) |
-| SHOULD-FIX 11: Tool schema description & fixture | `16d007662702` | Updated description in registry and generated fixture (updated to 1m in `29d889340b1a`) |
-| SHOULD-FIX 12: Python sensor logging | `16d007662702` | Log warning on missing token |
+| SHOULD-FIX 4: Stale doc comments and citations | `4d1d91b6c907` | `run_key_for` attempt suffix, `requested_tokens` anchor, `settle_request` lost-request bullet, factory floor text, migration/route floor citations |
+| SHOULD-FIX 5: Regression tests (consumed-before retry case, store CHECK test, `find_run_by_run_key` ordering) | `eb1760debc04`, `29d889340b1a` | `eb1760de`: consumed-before case in the failed-run retries test, the CHECK test at 150 s, the run-key test with separate `creationTime`/`startTime`; `29d88934` moved the CHECK test to the 1-minute floor. (R3 SHOULD-FIX 4 later found the ordering test did not discriminate; fixed in `7f6e698f`) |
+| SHOULD-FIX 6: Dead code and copies | `f011c7b9b038` | Removed dead `lag_pipelines_reading` and `FakeTokens::with_error`; `LagStateUpdate` and `map_err` helpers (R3 SHOULD-FIX 6 finished the remaining copies) |
+| SHOULD-FIX 7: Lag sensor attaches only jobs it reads | `8fb46da5a495` | `authored_factory.py` and its tests |
+| SHOULD-FIX 8: Gate scripts and compose | `16d007662702` | `g7_pipeline_test.py` probe/`raise_for_status`/sensor name, compose `PGHOST`/`PGPORT`, `ops/g7/Dockerfile` |
+| SHOULD-FIX 9: AI eval dotted keys | `16d007662702` | `cases.json` dotted keys and nested-arg traversal in `ai_eval.py` (R3 SHOULD-FIX 10 later replaced its substring test) |
+| SHOULD-FIX 10: Console floor test | `16d007662702` | `pipeline-freshness-panel.test.tsx` refusal below the floor and an unknown widened kind |
+| SHOULD-FIX 11: Tool description and fixture | `4d1d91b6c907`, `29d889340b1a` | Plain minimum in the model-facing description and `tool_schemas.json`; `29d88934` moved it to 1 minute |
+| SHOULD-FIX 12: Unset run token logged once | `8fb46da5a495` | Logs once per sensor run; code-load comment moved back with its assignments |
 | R7: Merge `origin/main` | `3b418d07de54` | Clean merge of origin/main, kept BLD-4 ingest_job logic and BLD-2 lag sensor, regenerated fixture |
-| R8: Clean compose gate runs and 1-min floor | `29d889340b1a` | Ran 1-minute target runs (`bld2r81m` and `bld2r8fin`), all samples <= 60s, lowered floor to 1m permanently across route, migration CHECK, store, schemas, console, tests, docs |
-| R9: Rust scoped checks | `16d007662702` | Clippy, fmt, and per-crate tests run on each commit and verified on final head |
-| R10: Machine lock rules | N/A | Strictly adhered to: cargo commands via `cargo-locked -j 2` without flock, heavy non-cargo wrapped in flock |
+| R8: Re-measure at 1 minute; floor to 1 minute | `29d889340b1a` | Floor lowered in route, migration CHECK, store, schema, console, tests. Two runs: `bld2r81m` ran on `3b418d07de54` plus an uncommitted floor patch (`bld2-r2-wip-0101.patch`, see R3 BLOCKER 5), `bld2r8fin` ran on `29d889340b1a` (clean) |
+| R9: A lost request is not an attempt | `d6f288874676` | A request Dagster never created is cleared without incrementing `request_attempt`; test updated |
+| R10: Retries exhausted reads `behind` | `eb1760debc04` | Reason "the last N runs for this change failed; the next input change starts again" (R3 BLOCKER 1 / R14 carried it to the page and the alert) |
 | R11: History preservation of `1bc2e332` | `1bc2e332` | Described below; preserved as-is in git history |
 
 #### Description of Catch-all Commit `1bc2e332` (R11)
@@ -522,12 +522,56 @@ Commit `1bc2e332` ("wip: BLD-2 review round 1 fixes in progress") was the catch-
 | `python3 ops/lint/check_bare_iceberg_count.py` | `R11 guard: no bare count() against a Bronze Iceberg table found.` |
 | `venv-bld3/bin/python -m pytest dispar_orchestrate -q --basetemp=/home/shiro/rantai/review/pytest-bld2` | 1533 passed, 585 warnings, 33 subtests passed in 966.09s (0:16:06), 0 failed |
 | Compose config with dummy env | `COMPOSE_OK` |
-| Gate run initial 1-min (`3b418d07de54`, project `bld2r81m`) | `[g7] PASS`: 5 samples = `[16.37, 22.36, 22.32, 26.35, 16.35]` s, avg 20.75 s; 5 unchanged checks met; log `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
+| Gate run initial 1-min (`3b418d07de54` plus an uncommitted floor patch, project `bld2r81m`) | `[g7] PASS`: 5 samples = `[16.37, 22.36, 22.32, 26.35, 16.35]` s, avg 20.75 s; 5 unchanged checks met; log `/home/shiro/rantai/review/bld2-gate-r8-1min.log` |
 | Gate run final 1-min (`29d889340b1a`, project `bld2r8fin`) | `[g7] PASS`: 5 samples = `[18.34, 32.70, 16.37, 28.41, 32.39]` s, avg 25.64 s; 5 unchanged checks met; 3-column fingerprint elapsed: 0.011s, 0.012s, 0.009s; log `/home/shiro/rantai/review/bld2-gate-r8-final.log` |
 
 #### Not Verified
 
 - Full workspace `cargo test` is not verified (tool execution limit; the reviewer runs it).
+- Nothing was verified in a browser.
+
+### Handoff round 3
+
+All round-3 findings, fixed on branch `feat/bld-2-target-lag` (nothing force-pushed; the PR was not touched). Code head for all verification: `37a3437e4812`; the only later commit changes this plan file.
+
+| Finding / Decision | Fixing commit (12 chars) | Note |
+| --- | --- | --- |
+| R14 and BLOCKER 1: page and alert after exhausted retries / waiting on exhausted U | `8eaeeb861269`, `f7f53e56d50e` | `lag_json` derives "the last N runs for this change failed; ..." from `request_attempt` over `max_retries`; the alert carries the reason; tests for the R10 case (lag 30 s, target 600 s) and for P waiting on an exhausted U. Review of `8eaeeb86` found it also forced P to `behind` while U's run was merely outstanding; `f7f53e56` restores the lag-vs-target judgement there (new test `downstream_waiting_on_an_outstanding_upstream_run_stays_met_inside_its_target`) |
+| R12 and R13, BLOCKER 2: ordered chain lock, bounded while locked | `f8da6a2db10b` | `lock_lag_states_ordered` (`ANY($1) ORDER BY pipeline_id FOR UPDATE`), `SET LOCAL lock_timeout = '5s'` / `statement_timeout = '8s'`, 8 s `tokio::time::timeout`, reads on `tx`, classified 503 and rollback. Tests: `lock_lag_states_ordered_locks_rows_and_inserts_missing_without_deadlock` (store) and `unanswering_dagster_times_out_within_budget_returns_503_and_leaves_row_unchanged` (api). Not done: two concurrent checks with differing DFS orders racing in one test; the ordered-id lock test is the unit-level proof the round allowed |
+| BLOCKER 3: floor docs and migration `0084` header say 1 minute | `645a19b85727` | Header cites `bld2-gate-r8-1min.log` (worst 26.35 s, avg 20.75 s) and `bld2-gate-r8-final.log` (worst 32.70 s, avg 25.64 s), numbers re-read from the logs; docs in `authored_pipelines.rs`, store, `pipeline_lag.rs` test comment, `authored_factory.py`, `g7_pipeline_test.py`, `pipeline-freshness-panel.tsx`. The 68.94 s pre-R6a figure was dropped from the g7 comment: no log on disk holds it |
+| BLOCKER 4: Handoff round 2 table | this commit (plan file) | Rewritten against `git show` of each commit |
+| BLOCKER 5: first R8 run credited to `3b418d07de54` | `37a3437e4812` | Result file notes it ran on that commit plus the uncommitted patch `bld2-r2-wip-0101.patch`; the round-2 table and commands table say so too |
+| SHOULD-FIX 1: result file | `37a3437e4812` | Like-for-like explanation (R6a), path fixed, `[fp]` lines and reconstructed commands labelled |
+| SHOULD-FIX 2: CHANGELOG | `37a3437e4812` | Run budget wording; "counted from the ingest run's completion" |
+| SHOULD-FIX 3: U statuses | `f7f53e56d50e` | U is `not_measured` on every branch, check recorded while outstanding, unreachable branches removed; test asserts U's row |
+| SHOULD-FIX 4: run-key ordering test and doc | `7f6e698f33a6` | Older-created run starts after the newer one |
+| SHOULD-FIX 5: stale docs | `7f6e698f33a6` | `run_key_for`, `settle_request` FAILURE bullet, orphaned paragraph removed |
+| SHOULD-FIX 6: copies | `eaae582a2911` | `orchestrator_unavailable` (5 copies), `store_err` for the one inline store `map_err` I found in `pipeline_lag.rs` (the round said two; I found one), handler uses `make_lag_update`, `CheckState::from_stored` |
+| SHOULD-FIX 7: `tools/mod.rs` reason and count | `9e5fa1ec3d6a` | Main's string restored (continuations); 66 arms naming a tool + guard = 67. I call `set_pipeline_target_lag` a plain delegation wrapped by rustfmt, not "not a one-liner" as the round put it |
+| SHOULD-FIX 8: sensor tenant | `49ed556ce379` | Added `tenantId` to `RunnablePipeline` (kept the test), store test, docstring on the `dependsOn` target edge not attached |
+| SHOULD-FIX 9: compose comment | `5dbc38ef901f` | Comment only |
+| SHOULD-FIX 10: ai_eval equality | `5ec77841e786` | `tool_args_match`, 4 tests including 10 vs 100 |
+
+#### Commands (round 3)
+
+| Command | Commit | Result |
+| --- | --- | --- |
+| `cargo fmt --check` | `37a3437e4812` | clean |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | `37a3437e4812` | exit 0 |
+| `cargo-locked test -j 2 --workspace --no-fail-fast` (`bld2-r3-ws.log`) | `37a3437e4812` | 117 `test result` lines: 6199 passed, 10 failed, 38 ignored. All 10 failures are in `lakehouse-api --test upload_routes` with Postgres `53100 ... could not resize shared memory segment ... No space left` (environment) |
+| `cargo-locked test -j 2 -p lakehouse-api --test upload_routes` (`bld2-r3-upload.log`) | `37a3437e4812` | 94 passed, 0 failed. With it, no failure remains: 6199 + 10 re-run = all 94 of that binary pass |
+| `bun run typecheck` | `37a3437e4812` | rc 0 |
+| `bun run lint` | `37a3437e4812` | rc 0, 8 warnings, 0 errors |
+| `bun test` src/features / services / lib / components | `37a3437e4812` | 1043 / 85 / 756 (+1 skip) / 27 pass, 0 fail; sum 1911 passed, 1 skipped, 0 failed |
+| `check_intra_package_imports.py` and `check_bare_iceberg_count.py` | `37a3437e4812` | both OK |
+| `pytest dispar_orchestrate -q --basetemp=...pytest-bld2` (from `dagster/`) | `37a3437e4812` | 1533 passed, 33 subtests passed, 0 failed |
+| Compose `config --quiet` with dummy `:?` values | `37a3437e4812` | `COMPOSE_OK` |
+| `pytest ops/ai_eval/test_ai_eval.py` | `5ec77841e786` | 114 passed (run when written; not part of the block above) |
+
+#### Not verified
+
+- No gate (`docker compose up`) re-run for round 3: none was asked for; the compose edit is a comment.
+- The new tests were not each run red against the old code except by construction (the ordering test's data and the 10-vs-100 case discriminate by design); I did not stash and re-run them.
 - Nothing was verified in a browser.
 
 ## 8. Review
