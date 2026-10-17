@@ -1020,5 +1020,29 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIn("expect_state", case, case["id"])
 
 
+class ToolArgsMatchTest(unittest.TestCase):
+    """BLD-2 review R3 SHOULD-FIX 10: scalars compare equal, not as substrings."""
+
+    def test_a_scalar_that_only_contains_the_wanted_value_does_not_match(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 100}}
+        self.assertFalse(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_an_equal_scalar_matches_case_insensitively_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "Orders_Clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(
+            m.tool_args_match(
+                args,
+                {"pipeline": "orders_clean", "targetLag.kind": "lag", "targetLag.minutes": 10},
+            )
+        )
+
+    def test_an_absent_key_never_matches(self) -> None:
+        self.assertFalse(m.tool_args_match({"mart": "x"}, {"grain": ""}))
+
+    def test_a_list_holds_the_wanted_value_as_a_member(self) -> None:
+        self.assertTrue(m.tool_args_match({"measures": ["a", "b"]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"measures": ["ab"]}, {"measures": "b"}))
+
+
 if __name__ == "__main__":
     unittest.main()

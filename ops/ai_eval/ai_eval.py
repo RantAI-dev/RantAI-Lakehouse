@@ -260,6 +260,34 @@ def dig(value: Any, path: str) -> list[Any]:
     return current
 
 
+def _tool_arg(args: Any, key: str) -> Any:
+    """The value at a dotted `key` of a tool call's args, or `None` when any
+    part of the path is absent (so a missing key never matches an empty want)."""
+    current = args
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def tool_args_match(args: Any, want: dict[str, Any]) -> bool:
+    """Whether a tool call's args carry every `want` key (dotted keys read
+    into nested args, so the match does not depend on key order).
+
+    BLD-2 review R2 SHOULD-FIX 9 / R3 SHOULD-FIX 10: a scalar is compared
+    EQUAL, case-insensitively, as text -- the old substring test let
+    `minutes: 10` match `100`. A list holds the wanted value as a member."""
+    for key, wanted in want.items():
+        got = _tool_arg(args, key)
+        if got is None:
+            return False
+        members = got if isinstance(got, list) else [got]
+        if not any(str(member).lower() == str(wanted).lower() for member in members):
+            return False
+    return True
+
+
 def where_matches(item: Any, where: dict[str, Any]) -> bool:
     """Whether `item` satisfies every `where` key. A flat key reads the item's
     own field; a dotted key reads into it (`def.grain` is the `grain` of the
@@ -893,17 +921,7 @@ def score_case(
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
         want = expect_tool.get("args_contains", {})
-        # BLD-2 review R2 SHOULD-FIX 9: dotted keys traverse nested args so matching is key-order independent
-        def _get_arg(args: dict, key: str):
-            curr = args
-            for part in key.split("."):
-                if isinstance(curr, dict):
-                    curr = curr.get(part, "")
-                else:
-                    return ""
-            return curr
-
-        if any(all(str(v).lower() in str(_get_arg(t.get("args", {}), k)).lower() for k, v in want.items()) for t in trace):
+        if any(tool_args_match(t.get("args", {}), want) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")
