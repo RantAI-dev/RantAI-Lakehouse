@@ -216,20 +216,18 @@ async fn list_body(
         for p in &authored {
             if let Ok(mut val) = serde_json::to_value(p) {
                 if let Value::Object(obj) = &mut val {
-                    // BLD-2 review R3 BLOCKER 1 / decision R14: check if an upstream U has exhausted retries
-                    let upstream_exhausted = p.depends_on.iter().find_map(|u_id| {
-                        let u_state = lag_states.get(u_id)?;
-                        let u_pipe = authored.iter().find(|cand| &cand.id == u_id)?;
-                        let u_max = i32::from(u_pipe.max_retries);
-                        if u_state.request_attempt > u_max
-                            && u_state.requested_tokens.is_some()
-                            && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
-                        {
-                            Some(u_id.as_str())
-                        } else {
-                            None
-                        }
-                    });
+                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16: the
+                    // answer comes from the SAME chain the check walks,
+                    // not from `dependsOn` alone — a pipeline that reads
+                    // its upstream only through its source table used to
+                    // show the wrong page while the check scheduled that
+                    // upstream. A pipeline with no target lag is never
+                    // shown a `lag` object, so its chain is not walked.
+                    let upstream_exhausted = if p.target_lag.is_some() {
+                        crate::pipeline_lag::exhausted_upstream_of(pg, p).await?
+                    } else {
+                        None
+                    };
                     obj.insert(
                         "lag".to_owned(),
                         crate::pipeline_lag::lag_json(
@@ -238,7 +236,7 @@ async fn list_body(
                             now,
                             no_readers.contains(&p.id),
                             i32::from(p.max_retries),
-                            upstream_exhausted,
+                            upstream_exhausted.as_ref().map(|e| e.pipeline_id.as_str()),
                         ),
                     );
                 }
@@ -1076,29 +1074,20 @@ async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Val
     let no_readers =
         crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
             .await?;
-    // BLD-2 review R3 BLOCKER 1 / decision R14: check if an upstream U has exhausted retries
-    let mut upstream_exhausted: Option<String> = None;
-    for u_id in &pipeline.depends_on {
-        if let Ok(Some(u_pipe)) = pipelines::get_pipeline(pool, u_id).await
-            && let Ok(Some(u_state)) = pipelines::get_lag_state(pool, u_id).await
-        {
-            let u_max = i32::from(u_pipe.max_retries);
-            if u_state.request_attempt > u_max
-                && u_state.requested_tokens.is_some()
-                && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
-            {
-                upstream_exhausted = Some(u_id.clone());
-                break;
-            }
-        }
-    }
+    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 refused + SHOULD-FIX 3:
+    // the answer comes from the SAME chain the check walks (not
+    // `dependsOn` alone) and the read propagates with `?` — the old code
+    // walked `dependsOn` and swallowed every store error with
+    // `if let Ok(...)`, so a failing read silently answered "nothing is
+    // blocking this pipeline".
+    let upstream_exhausted = crate::pipeline_lag::exhausted_upstream_of(pool, pipeline).await?;
     Ok(crate::pipeline_lag::lag_json(
         pipeline.target_lag,
         state.as_ref(),
         time::OffsetDateTime::now_utc(),
         no_readers.contains(&pipeline.id),
         i32::from(pipeline.max_retries),
-        upstream_exhausted.as_deref(),
+        upstream_exhausted.as_ref().map(|e| e.pipeline_id.as_str()),
     ))
 }
 

@@ -1448,6 +1448,68 @@ pub async fn downstream_without_readers(
     Ok(without)
 }
 
+/// BLD-2 review R4 BLOCKER 1 (a) / decision R16: the one helper every
+/// "is this P blocked by an exhausted U?" reader uses. The list page and
+/// the detail page used to answer from `dependsOn` alone, so a pipeline
+/// that reads its upstream only through its source table showed a page
+/// while the check scheduled U — the two answers must come from one store
+/// walk, the same shape as [`downstream_without_readers`].
+pub struct ExhaustedUpstream {
+    /// The id of the upstream pipeline whose retries are exhausted. The
+    /// reason text a page consumer reads is built from `$1`'s state rows,
+    /// so the id is what must reach it — not a pre-rendered decision.
+    pub pipeline_id: String,
+}
+
+/// The three-part condition every retry-exhausted consumer derives from U's
+/// lag-state row: U was requested for this input change, those runs failed
+/// without ever being consumed, and the attempt counter has passed
+/// `u.max_retries`. The check's own counters (`check_retries_and_reset`)
+/// arrive at this state in the transaction that also writes it; this is the
+/// page-side and `lag_json`-side derivation of the SAME condition, so the
+/// page and the decision cannot disagree about what "exhausted" means.
+#[must_use]
+pub fn upstream_retries_exhausted(
+    u_state: &pipelines::PipelineLagState,
+    u_max_retries: i32,
+) -> bool {
+    u_state.request_attempt > u_max_retries
+        && u_state.requested_tokens.is_some()
+        && u_state.consumed_tokens.as_ref() != u_state.requested_tokens.as_ref()
+}
+
+/// BLD-2 review R4 BLOCKER 1 (a) / decision R16: which upstream pipeline
+/// blocks `pipeline` with exhausted retries, answered by walking the SAME
+/// chain the check walks (`pipelines::upstream_downstream_chain`) — never
+/// `pipeline.depends_on` alone, because an edge the check schedules on
+/// (P's source = U's target) shows up there and not in `dependsOn`.
+/// Deepest-first order means the upstream furthest from P is named, which
+/// is also the one the check reports first.
+///
+/// A U with no state row has never been checked, so it is not exhausted.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if chain discovery or a lag-state read fails —
+/// a swallowed failure would report every blocked pipeline as unblocked.
+pub async fn exhausted_upstream_of(
+    pool: &PgPool,
+    pipeline: &Pipeline,
+) -> Result<Option<ExhaustedUpstream>, StoreError> {
+    let chain = pipelines::upstream_downstream_chain(pool, pipeline).await?;
+    for u in &chain {
+        let Some(u_state) = pipelines::get_lag_state(pool, &u.id).await? else {
+            continue;
+        };
+        if upstream_retries_exhausted(&u_state, i32::from(u.max_retries)) {
+            return Ok(Some(ExhaustedUpstream {
+                pipeline_id: u.id.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// BLD-2 plan D8: compute the `lag: { status, lagSeconds, lastCheckAt,
 /// reason }` object for the pipeline list and detail payloads.
 ///
@@ -1517,12 +1579,11 @@ pub fn lag_json(
         st.pending_since.map(|ps| (now - ps).whole_seconds().max(0))
     };
 
-    // BLD-2 review R3 BLOCKER 1 / decision R14:
-    // Derives "the last N runs for this change failed; the next input change starts again"
-    // from the state row (request_attempt over max_retries, tokens not consumed).
-    let retries_exhausted = st.request_attempt > max_retries
-        && st.requested_tokens.is_some()
-        && st.consumed_tokens.as_ref() != st.requested_tokens.as_ref();
+    // BLD-2 review R3 BLOCKER 1 / decision R14 derives exhausted retries
+    // from the state row; BLD-2 review R4 BLOCKER 1 (a) / decision R16
+    // moved that derivation into the one shared predicate so the page and
+    // `lag_json` cannot disagree about what "exhausted" means.
+    let retries_exhausted = upstream_retries_exhausted(st, max_retries);
 
     let reason = if let Some(u_id) = upstream_exhausted {
         status = LagStatus::Behind;
