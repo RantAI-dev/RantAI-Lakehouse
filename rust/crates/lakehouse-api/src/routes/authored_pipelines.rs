@@ -1089,20 +1089,14 @@ pub async fn lag_check(
         // BLD-2 review R2 SHOULD-FIX 2: unparseable source preserves existing row and propagates errors
         let now = time::OffsetDateTime::now_utc();
         let existing = pipelines::get_lag_state(pool, &pipeline.id).await?;
-        let p_update = lakehouse_store::pipelines::LagStateUpdate {
-            pipeline_id: pipeline.id.clone(),
-            tenant_id: pipeline.tenant_id,
-            consumed_tokens: existing.as_ref().and_then(|s| s.consumed_tokens.clone()),
-            consumed_at: existing.as_ref().and_then(|s| s.consumed_at),
-            pending_since: existing.as_ref().and_then(|s| s.pending_since),
-            requested_run_key: existing.as_ref().and_then(|s| s.requested_run_key.clone()),
-            requested_tokens: existing.as_ref().and_then(|s| s.requested_tokens.clone()),
-            requested_at: existing.as_ref().and_then(|s| s.requested_at),
-            request_attempt: existing.as_ref().map_or(0, |s| s.request_attempt),
-            last_check_at: now,
-            last_status: "not_measured".to_owned(),
-            behind_streak: 0,
-        };
+        // BLD-2 review R3 SHOULD-FIX 6: the shared builder, not a hand-built copy.
+        let p_update = crate::pipeline_lag::make_lag_update(
+            &pipeline,
+            &crate::pipeline_lag::CheckState::from_stored(existing.as_ref()),
+            now,
+            "not_measured",
+            0,
+        );
         // BLD-2 review R2 SHOULD-FIX 2: do not let _ = a database error; propagate it
         pipelines::upsert_lag_state(pool, &p_update).await?;
         return Ok(ApiJson(serde_json::json!({

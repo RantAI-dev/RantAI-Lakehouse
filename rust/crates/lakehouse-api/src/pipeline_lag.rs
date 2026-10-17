@@ -549,7 +549,7 @@ const LOST_REQUEST_SECONDS: i64 = 120;
 
 /// What the previous check left behind, plus what this check adds.
 // BLD-2 review R1 decision R1/R2: CheckState holds requested_at and request_attempt
-struct CheckState {
+pub(crate) struct CheckState {
     consumed_tokens: Option<TokenMap>,
     consumed_at: Option<OffsetDateTime>,
     pending_since: Option<OffsetDateTime>,
@@ -560,6 +560,23 @@ struct CheckState {
 }
 
 impl CheckState {
+    /// The state a pipeline starts from: the stored row, or nothing yet.
+    /// BLD-2 review R3 SHOULD-FIX 6: one place for the empty state (rule 4).
+    pub(crate) fn from_stored(row: Option<&pipelines::PipelineLagState>) -> Self {
+        row.map_or_else(
+            || Self {
+                consumed_tokens: None,
+                consumed_at: None,
+                pending_since: None,
+                requested_run_key: None,
+                requested_tokens: None,
+                requested_at: None,
+                request_attempt: 0,
+            },
+            Self::from_row,
+        )
+    }
+
     fn from_row(row: &pipelines::PipelineLagState) -> Self {
         Self {
             consumed_tokens: tokens_from_json(row.consumed_tokens.as_ref()),
@@ -686,8 +703,21 @@ fn store_err(pipeline_id: &str, msg: &str, err: impl std::fmt::Display) -> ApiEr
     ApiError::Internal("the request could not be completed".to_owned())
 }
 
+/// A lag check that cannot ask the orchestrator decides nothing and answers
+/// the classified 503 (BLD-2 review R3 SHOULD-FIX 6: one helper for the five
+/// copies of this mapping).
+fn orchestrator_unavailable(err: impl std::fmt::Display, pipeline_id: &str, msg: &str) -> ApiError {
+    tracing::warn!(%err, pipeline = %pipeline_id, "target lag: {msg}");
+    crate::upstream_error::report(
+        &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
+        crate::upstream_error::Class::Unavailable,
+        &err.to_string(),
+    );
+    ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+}
+
 // BLD-2 review R2 SHOULD-FIX 6: helper for constructing LagStateUpdate
-fn make_lag_update(
+pub(crate) fn make_lag_update(
     pipeline: &Pipeline,
     state: &CheckState,
     now: OffsetDateTime,
@@ -763,15 +793,7 @@ pub async fn run_lag_check(
             pipeline.tenant_id,
         )
         .await
-        .map_err(|err| {
-            tracing::error!(%err, pipeline = %pipeline.id, "target lag: reader count failed");
-            crate::upstream_error::report(
-                &crate::upstream_error::STORE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Internal("the request could not be completed".to_owned())
-        })?;
+        .map_err(|err| store_err(&pipeline.id, "reader count failed", err))?;
         if readers == 0 {
             return Ok(LagCheckOutcome {
                 decision: Decision::Wait,
@@ -851,29 +873,16 @@ pub async fn run_lag_check(
                 .map_err(|err| store_err(&pipeline.id, "ordered lock failed", err))?;
 
         let stored = locked_states.remove(&pipeline.id).flatten();
-        let mut state = stored.as_ref().map_or_else(
-            || CheckState {
-                consumed_tokens: None,
-                consumed_at: None,
-                pending_since: None,
-                requested_run_key: None,
-                requested_tokens: None,
-                requested_at: None,
-                request_attempt: 0,
-            },
-            CheckState::from_row,
-        );
+        let mut state = CheckState::from_stored(stored.as_ref());
 
         let outstanding = settle_request(dagster, &mut state, &job_name, now)
             .await
             .map_err(|err| {
-                tracing::warn!(%err, pipeline = %pipeline.id, "target lag: orchestrator unreachable; skipping this tick");
-                crate::upstream_error::report(
-                    &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+                orchestrator_unavailable(
+                    err,
+                    &pipeline.id,
+                    "orchestrator unreachable; skipping this tick",
+                )
             })?;
 
         if let Some(early) = evaluate_upstream_chain(
@@ -901,13 +910,7 @@ pub async fn run_lag_check(
         for up in &chain {
             let up_job = crate::routes::authored_pipelines::job_name(&up.id);
             extra_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
-                tracing::warn!(%err, "target lag: upstream run budget unreadable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+                orchestrator_unavailable(err, &pipeline.id, "upstream run budget unreadable")
             })?;
         }
 
@@ -997,31 +1000,17 @@ async fn evaluate_upstream_chain(
     for u_pipe in chain {
         // BLD-2 review R3 BLOCKER 2 / decision R12: U row was locked in one ordered statement with P
         let u_stored = locked_states.remove(&u_pipe.id).flatten();
-        let mut u_state = u_stored.as_ref().map_or_else(
-            || CheckState {
-                consumed_tokens: None,
-                consumed_at: None,
-                pending_since: None,
-                requested_run_key: None,
-                requested_tokens: None,
-                requested_at: None,
-                request_attempt: 0,
-            },
-            CheckState::from_row,
-        );
+        let mut u_state = CheckState::from_stored(u_stored.as_ref());
         let u_job_name = crate::routes::authored_pipelines::job_name(&u_pipe.id);
-        let u_outstanding =
-            settle_request(dagster, &mut u_state, &u_job_name, now)
-                .await
-                .map_err(|err| {
-                    tracing::warn!(%err, pipeline = %u_pipe.id, "target lag: orchestrator unreachable; skipping this tick");
-                    crate::upstream_error::report(
-                        &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                        crate::upstream_error::Class::Unavailable,
-                        &err.to_string(),
-                    );
-                    ApiError::Unavailable("the orchestrator is unavailable".to_owned())
-                })?;
+        let u_outstanding = settle_request(dagster, &mut u_state, &u_job_name, now)
+            .await
+            .map_err(|err| {
+                orchestrator_unavailable(
+                    err,
+                    &u_pipe.id,
+                    "orchestrator unreachable; skipping this tick",
+                )
+            })?;
 
         if u_outstanding {
             // BLD-2 review R3 SHOULD-FIX 3: record U's check while its run is
@@ -1172,25 +1161,13 @@ async fn evaluate_upstream_chain(
             }));
         }
 
-        let mut total_budget = run_budget_seconds(dagster, job_name).await.map_err(|err| {
-            tracing::warn!(%err, "target lag: run budget unreadable");
-            crate::upstream_error::report(
-                &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                crate::upstream_error::Class::Unavailable,
-                &err.to_string(),
-            );
-            ApiError::Unavailable("the orchestrator is unavailable".to_owned())
-        })?;
+        let mut total_budget = run_budget_seconds(dagster, job_name)
+            .await
+            .map_err(|err| orchestrator_unavailable(err, &pipeline.id, "run budget unreadable"))?;
         for up in chain {
             let up_job = crate::routes::authored_pipelines::job_name(&up.id);
             total_budget += run_budget_seconds(dagster, &up_job).await.map_err(|err| {
-                tracing::warn!(%err, "target lag: upstream run budget unreadable");
-                crate::upstream_error::report(
-                    &crate::upstream_error::ORCHESTRATOR_UNREACHABLE,
-                    crate::upstream_error::Class::Unavailable,
-                    &err.to_string(),
-                );
-                ApiError::Unavailable("the orchestrator is unavailable".to_owned())
+                orchestrator_unavailable(err, &pipeline.id, "upstream run budget unreadable")
             })?;
         }
 
