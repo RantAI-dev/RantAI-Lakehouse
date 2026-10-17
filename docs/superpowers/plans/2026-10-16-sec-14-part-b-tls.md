@@ -601,3 +601,29 @@ Proof required in the handoff (AGENTS.md rule 8): run G4, G6
 commands as `.github/workflows/ci.yml`, and quote each gate's result
 line. One gate at a time, under the heavy lock, `docker compose down -v`
 on your own project between them.
+
+Round 3 developer report (Gemini, 2026-10-17): BLOCKER 10 fixed in
+`476d709e` (`crypto_provider::install_default_provider` at the start of
+`main`, test `tests/crypto_provider.rs`, mutation reproduces the CI
+panic). `0d037a38` adds the G6 bundle. The developer stopped on two plan
+mismatches, both confirmed by the planner at the source:
+
+- **BLOCKER 11, the plan's fix was wrong.** `mssql-g6-cert-init`
+  (`docker-compose.yml` ~3490) mints a self-signed `openssl req -x509`
+  certificate, which carries `CA:TRUE`; webpki refuses it as a server
+  certificate (`CaUsedAsEndEntity`) whatever bundle holds it. Planner
+  decision: the fixture mints a CA and a `CA:FALSE`, `serverAuth`
+  server certificate signed by it (as `postgres-cert-init` does), deletes
+  the CA key after signing, and the G6 bundle and Dagster's
+  `SSL_CERT_FILE` hold the fixture's CA, not its server certificate.
+- **BLOCKER 12 (new). sqlx 0.8.6 cannot do `VerifyCa` to an IP.**
+  `PgSslMode::VerifyCa` is meant to skip the name check, but
+  `sqlx-core-0.8.6/src/net/tls/tls_rustls.rs:309` matches only
+  `CertificateError::NotValidForName`, and rustls 0.23.46 reports
+  `NotValidForNameContext`, so every `VerifyCa` dial to the approved IP
+  (E1, `SEC-15`) fails; discovery and CDC clean-up fail whenever a CA is
+  set. `sqlx-core` 0.9.0 matches both variants (its line 313). Owner
+  decision (Evan, 2026-10-17): upgrade sqlx to 0.9 first, as its own item,
+  `SEC-41`; **this PR is Blocked by `SEC-41`** and merges after it, on top
+  of it, with `VerifyCa` unchanged. No `Require` fallback, no patched
+  sqlx.
