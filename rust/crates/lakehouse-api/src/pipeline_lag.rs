@@ -768,6 +768,32 @@ pub async fn run_lag_check(
                 ),
             });
         }
+
+        // BLD-2 review R2 SHOULD-FIX 3: A manual lag-check on a downstream pipeline answers wait.
+        // A downstream pipeline is refreshed when the pipeline that reads it runs (plan D7),
+        // so checking it directly never starts a run.
+        let stored = pipelines::get_lag_state(pool, &pipeline.id)
+            .await
+            .map_err(|err| store_err(&pipeline.id, "state row unreadable", err))?;
+        let status = stored
+            .as_ref()
+            .and_then(|s| s.last_status.as_deref())
+            .map_or(LagStatus::NotMeasured, |st| match st {
+                "met" => LagStatus::Met,
+                "behind" => LagStatus::Behind,
+                _ => LagStatus::NotMeasured,
+            });
+        let behind_streak = stored.as_ref().map_or(0, |s| s.behind_streak);
+        return Ok(LagCheckOutcome {
+            decision: Decision::Wait,
+            run_key: None,
+            job_name,
+            status,
+            lag_seconds: None,
+            target_seconds: None,
+            behind_streak,
+            reason: Some("downstream pipelines are triggered by their readers".to_owned()),
+        });
     }
 
     // BLD-2 review R1 decision R5 / SHOULD-FIX 7: concurrency: read with SELECT FOR UPDATE in tx
@@ -3663,5 +3689,86 @@ mod tests {
             .expect("get u state")
             .expect("u state exists");
         assert_eq!(u_state_after.request_attempt, 0);
+    }
+
+    /// BLD-2 review R2 SHOULD-FIX 3: A manual `lag-check` on a `downstream` pipeline answers wait.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn manual_lag_check_on_downstream_pipeline_answers_wait(pool: PgPool) {
+        let (dagster, _server) = dagster_with(&job_name("pl-u-manual"), None, &[]).await;
+        let tenant_id = seed_tenant(&pool).await;
+
+        let u = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "u_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "orders".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "u_clean_manual".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-u-manual".to_owned()),
+                target_lag: Some(TargetLag::Downstream),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create u");
+
+        let _p = pipelines::create_pipeline(
+            &pool,
+            &pipelines::CreatePipelineInput {
+                name: "p_pipe".to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "silver".to_owned(),
+                source_table: "u_clean_manual".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "gold".to_owned(),
+                target_table: "p_mart_manual".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: Some(tenant_id),
+                depends_on: Vec::new(),
+                connector_id: None,
+                id: Some("pl-p-manual".to_owned()),
+                target_lag: Some(TargetLag::Lag { minutes: 10 }),
+                run_as: None,
+            },
+            None,
+        )
+        .await
+        .expect("create p");
+
+        let u_inputs = inputs_of(&pool, &u)
+            .await
+            .expect("u inputs")
+            .expect("u parseable");
+        let reader = FakeTokens::new().with("bronze.orders", "iceberg:1");
+
+        let now = at(1_000);
+        let outcome = run_lag_check(&pool, &dagster, &reader, &u, &u_inputs, now)
+            .await
+            .expect("check on u");
+
+        assert_eq!(outcome.decision, Decision::Wait);
+        assert_eq!(outcome.run_key, None);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("downstream pipelines are triggered by their readers")
+        );
     }
 }
