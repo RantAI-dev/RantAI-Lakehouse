@@ -2695,7 +2695,51 @@ class TestLagSensor:
         assert "authored__pl_u1" in attached_job_names, "Direct downstream upstream must be attached"
         assert "authored__pl_u2" in attached_job_names, "Transitive downstream upstream must be attached"
         assert "authored__pl_u3" not in attached_job_names, "Unrelated downstream must NOT be attached"
-        assert "authored__pl_u4" not in attached_job_names, "Different tenant downstream must NOT be attached" 
+        assert "authored__pl_u4" not in attached_job_names, "Different tenant downstream must NOT be attached"
+
+    def test_an_unassigned_lag_pipeline_links_no_downstream_even_to_another_unassigned_pipeline(
+        self,
+    ) -> None:
+        """BLD-2 review R4 SHOULD-FIX 2: an unassigned pipeline's runtime
+        `tenantId` is None, and per R3 a NULL tenant matches no membership —
+        so an unassigned lag pipeline has no reader edge at all, not even to
+        another unassigned pipeline, and it must attach nothing beyond its
+        own job. The R3 text claimed two unassigned pipelines match each
+        other; this test pins that they cannot."""
+        # Reading pipeline with no tenant at all.
+        p_pipe = {
+            "id": "pl-p-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "silver.u1",
+            "target": "gold.p",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        # Unassigned downstream pipeline producing silver.u1 — the tenant
+        # filter would pair them under the old None == None rule.
+        u_pipe = {
+            "id": "pl-u-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "bronze.x",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_p_unassigned")
+        def j_p() -> None:
+            pass
+
+        @job(name="authored__pl_u_unassigned")
+        def j_u() -> None:
+            pass
+
+        sensors = authored_factory.build_authored_lag_sensors([(p_pipe, j_p), (u_pipe, j_u)])
+        assert len(sensors) == 1
+        attached_job_names = {j.name for j in sensors[0].jobs}
+        assert attached_job_names == {"authored__pl_p_unassigned"}, (
+            "an unassigned lag pipeline links nothing: only its own job is attached"
+        )
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

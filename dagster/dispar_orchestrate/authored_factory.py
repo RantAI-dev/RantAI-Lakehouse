@@ -1519,9 +1519,11 @@ def build_authored_lag_sensors(
     (direct source/dependsOn or recursive chain in the same tenant).
 
     BLD-2 review R3 SHOULD-FIX 8: the tenant comes from the runnable payload's
-    `tenantId` (`RunnablePipeline.tenant_id`, absent when unassigned, in which
-    case only other unassigned pipelines match), so the same-tenant filter is
-    real in production, not only in tests.
+    `tenantId` (`RunnablePipeline.tenant_id`). BLD-2 review R4 SHOULD-FIX 2
+    sharpens it to the R3 decision: an unassigned pipeline's tenant is None
+    and NULL links nothing, so a reading pipeline with no tenant matches no
+    downstream at all — two unassigned pipelines are not a same-tenant
+    pair, they are two pipelines without a sharing rule.
 
     Not attached: a downstream pipeline that P reads ONLY through the target
     table of a pipeline in P's `dependsOn` (an edge the API's chain walk
@@ -1541,6 +1543,11 @@ def build_authored_lag_sensors(
         while queue:
             curr = queue.pop(0)
             curr_tenant = _pipeline_tenant(curr)
+            # BLD-2 review R4 SHOULD-FIX 2: a tenant-less reading pipeline
+            # links nothing — per R3, NULL tenant matches no membership, so
+            # two unassigned pipelines never share a lag sensor.
+            if curr_tenant is None:
+                continue
             curr_source = _pipeline_source(curr)
             curr_deps = set(_pipeline_depends_on(curr))
             for other_p, other_j in pipeline_jobs:
