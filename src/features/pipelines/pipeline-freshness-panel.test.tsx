@@ -134,7 +134,7 @@ describe("PipelineFreshnessPanel display", () => {
   // BLD-2 review R2 SHOULD-FIX 10: unknown widened kind renders honestly
   it("renders Unknown target lag when kind is unknown", () => {
     const p = makePipeline({
-      targetLag: { kind: "future_kind" } as any,
+      targetLag: { kind: "future_kind" },
     })
     render(<PipelineFreshnessPanel pipeline={p} />)
 

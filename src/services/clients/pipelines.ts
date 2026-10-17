@@ -11,7 +11,6 @@ import type {
   GeneratePipelineInput,
   ScheduleTicks,
   UpdatePipelineInput,
-  TargetLag,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
