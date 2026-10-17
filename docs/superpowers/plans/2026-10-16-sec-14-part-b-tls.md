@@ -627,3 +627,84 @@ mismatches, both confirmed by the planner at the source:
   `SEC-41`; **this PR is Blocked by `SEC-41`** and merges after it, on top
   of it, with `VerifyCa` unchanged. No `Require` fallback, no patched
   sqlx.
+### Handoff (2026-10-17, round 3b)
+
+#### 1. Commits on branch `fix/sec-14-part-b-tls`
+460ab242b6df fix(ops): mint separate CA and server certs for mssql-g6 fixture
+084c8b42c92b docs(plan): SEC-14 part B round 3 decisions; blocked by SEC-41 (sqlx 0.9)
+0d037a38cc1e fix(ops): combine Postgres CA and mssql-g6 certificate in gate bundle
+476d709e0d75 fix(api): install ring crypto provider at startup to resolve TLS dial panic
+b737f9497bdb docs(plan): SEC-14 part B round 3, two blockers from CI
+a5c46e83902c Merge remote-tracking branch 'origin/main' into fix/sec-14-part-b-tls
+876b2f75b471 docs(plan): SEC-14 part B round 2 review, no open blocker
+1668cbe2bd05 docs(plan): handoff for SEC-14 part B round 2 fixes
+7c6f664489de docs(connector_probe): add backticks to PostgreSQL in doc comment
+5dcdc2dc583b docs(connectors): correct TLS channel binding, CA bundling, Tiberius roots, and changelog names (SEC-14 part B)
+4ecafbf98c8f fix(deps): pin postgres-protocol to 0.6.12 for SCRAM iteration cap (SEC-14 part B)
+ae4822499661 fix(config): validate PEM certificate presence in CONNECTOR_TLS_CA_FILE at startup (SEC-14 part B)
+61b5c28db715 fix(connectors): require completed SCRAM exchange and reject unauthenticated Postgres connections (SEC-14 part B)
+1f86647e0cb5 fix(connectors): cap message length in pg_probe to prevent buffer expansion (SEC-14 part B)
+2db17d618eb1 fix(compose): restrict CA mount for API container to public certificate alone (SEC-14 part B)
+65443967a22a docs(plan): SEC-14 part B review round 1: 3 BLOCKERs, 6 SHOULD-FIX
+10e2b8fe6b26 docs: handoff for SEC-14 part B (TLS and secure probe)
+78cb75de434d test(connectors): route integration probes through TlsProxy for TLS requirement (SEC-14 part B)
+7638a4a5fd82 docs: document CONNECTOR_TLS_CA_FILE and compose TLS posture (SEC-14 part B)
+053eacb8459f feat(compose): TLS for bundled postgres and verify-full connector probe (SEC-14 part B)
+bbe40ee8ad06 feat(connectors): require TLS for SQL Server dials and verify CA when set (SEC-14 part B)
+75a192de04af feat(connectors): Postgres connection test speaks the protocol itself, SCRAM-SHA-256 only (SEC-14 part B)
+4dfbd687ce01 feat(connectors): require TLS for every sqlx Postgres dial (SEC-14 part B)
+832df0fc376f feat(config): CONNECTOR_TLS_CA_FILE for connector dials (SEC-14 part B)
+632138bccc52 docs(plan): SEC-14 part B, TLS and a SCRAM-only connection test; D5 amended
+
+#### 2. Verification Evidence
+
+1. **Compose Configuration Check**
+   - Command: `POSTGRES_PASSWORD=dummy RUSTFS_ACCESS_KEY=dummy RUSTFS_SECRET_KEY=dummy LAKEKEEPER_ENCRYPTION_KEY=dummy CONNECTOR_SECRETS_KEY=dummy docker compose -f docker-compose.yml --profile '*' config --quiet`
+   - Result: exit 0, no errors or warnings.
+
+2. **Gitleaks Scan**
+   - Command: `docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:v8.30.1 dir /repo --config /repo/.gitleaks.toml --no-banner --redact`
+   - Output:
+     ```
+     4:31AM INF scanned ~24639458 bytes (24.64 MB) in 4.89s
+     4:31AM INF no leaks found
+     ```
+   - Result: exit 0.
+
+3. **G6 Gate (`g6-sql` half) Local Acceptance Run**
+   - Clean, uniquely named project `sec14b-round3b` executed under heavy lock (`flock /home/shiro/rantai/.locks/heavy.lock`).
+   - Exact CI commands executed:
+     ```bash
+     docker compose -p sec14b-round3b -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile dagster build oidc-mock
+     docker compose -p sec14b-round3b -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile dagster up -d --no-build \
+       lakehouse-api dagster-code-location dagster-webserver dagster-daemon g3a-source-init mysql-g6 mariadb-g6 mssql-g6 mssql-g6-cert-init
+     docker compose -p sec14b-round3b -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml \
+       --profile g6-sql --profile dagster run --rm -T -e G6_GROUP=sql g6-test-runner
+     docker compose -p sec14b-round3b -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile g6-sql --profile dagster down -v
+     ```
+   - Verbatim result lines from `g6_ingest_matrix_test.py`:
+     - SQL Server connect:
+       `[g6] SQL Server connect: pass (99 ms)`
+     - SQL Server discover:
+       `[g6] SQL Server discover: pass (dbo.orders with 2 columns)`
+     - ODBC/Dagster SQL Server ingest (load & reload):
+       `[g6] ready: bronze.g6_mssql_orders rows visible`
+       `[g6] bronze.g6_mssql_orders: 2 rows, _ingested_at null count: 0`
+       `[g6] SQL Server load: pass (2 rows in bronze.g6_mssql_orders)`
+       `[g6] ready: bronze.g6_mssql_orders has 2 rows after the second run`
+       `[g6] SQL Server reload: pass (2 rows in bronze.g6_mssql_orders: replace left the same rows)`
+     - PostgreSQL discover (BLOCKER 12):
+       `[g6] PostgreSQL connect: pass (13 ms)`
+       `[g6] PostgreSQL discover: fail (expected the schemas to hold 'ingest_demo', got state='failed' [])`
+       *(Expected failure: sqlx 0.8.6 `VerifyCa` to IP mismatch with rustls `NotValidForNameContext`, out of scope per planner decision, blocked by SEC-41 / sqlx 0.9 upgrade).*
+   - Teardown:
+     Cleanly removed 38/38 containers and volumes via `docker compose -p sec14b-round3b down -v`.
+
+4. **Not Verified**
+   - Rust unit/integration test suites (`cargo test`): *not verified* (this commit modifies Docker Compose service definitions and overrides only; no Rust code was touched).
+   - TypeScript/frontend checks (`bun test`): *not verified* (no frontend code touched).
+   - Full Python DAG tests: *not verified* (no dagster asset/job code touched).
+
+#### 3. Scope & Plan Status
+- BLOCKER 11 fixed: `mssql-g6-cert-init` mints separate CA (`ca.crt`, `CA:TRUE`) and signed server certificate (`mssql-g6.pem`/`mssql-g6.key`, `CA:FALSE`, `serverAuth`, `SAN:DNS:mssql-g6`). `g6-ca-bundle-init` combines Postgres `ca.crt` and `mssql-g6`'s `ca.crt` into `g6_connector_ca` for `CONNECTOR_TLS_CA_FILE`. `dagster-code-location` sets `SSL_CERT_FILE` to `/etc/mssql-tls/ca.crt`. SQL Server connect, discover, and Dagster load/reload all pass.
+- BLOCKER 12 (sqlx VerifyCa to IP) remains deferred to SEC-41 (sqlx 0.9 upgrade).
