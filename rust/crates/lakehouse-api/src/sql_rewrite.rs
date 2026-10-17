@@ -1038,6 +1038,17 @@ fn build_masked_filtered_select(
 /// other child expression, so a backslash text, a subquery or a function off
 /// the allowlist is refused there too.
 ///
+/// A unary `-` or `+` may not be followed by another `-` or `+`, and a text
+/// value may not contain a control character (SEC-44): `Display` writes a
+/// unary sign with no space before its operand, so the validated `x = - -1`
+/// would print `x = --1` and `--` starts a SQL line comment in `ClickHouse`;
+/// a control character inside a single-quoted string lets the text cross a
+/// line, so what the validator checked and what `ClickHouse` reads can
+/// differ. The two refusals share one goal: a checked filter must print as
+/// a checked filter. `LIKE`/`ILIKE` with an `ANY` pattern is refused for
+/// the same reason — the grammar admits many forms, only one pattern is
+/// intended here.
+///
 /// # Errors
 /// [`RewriteError::InvalidRowFilter`] naming the specific problem.
 pub fn validate_row_filter_expr(raw: &str, real_columns: &[String]) -> Result<Expr, RewriteError> {
@@ -1091,6 +1102,42 @@ fn validate_identifier(name: &str, real_columns: &[String]) -> Result<(), Rewrit
     }
 }
 
+/// Admits `NOT`, `-` and `+`; any other [`UnaryOperator`] is refused.
+/// Then SEC-44: a `-` or `+` over a `-` or `+` is refused, because
+/// `Display` writes a sign with no space before its operand, so the
+/// validated `x = - -1` would print `x = --1` and `--` starts a SQL
+/// line comment in `ClickHouse`. `NOT` writes with a space, so
+/// `NOT -x` is safe. The split from [`validate_expr_shape`] keeps that
+/// walk under the line-length budget.
+fn validate_unary_op(
+    op: UnaryOperator,
+    inner: &Expr,
+    real_columns: &[String],
+) -> Result<(), RewriteError> {
+    if !matches!(
+        op,
+        UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
+    ) {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: OPERATOR_REFUSAL.to_owned(),
+        });
+    }
+    if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+        && matches!(
+            inner,
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                ..
+            }
+        )
+    {
+        return Err(RewriteError::InvalidRowFilter {
+            reason: SIGN_REFUSAL.to_owned(),
+        });
+    }
+    validate_expr_shape(inner, real_columns)
+}
+
 /// Recursively rejects a subquery/`EXISTS`/disallowed function call;
 /// every bare `Expr::Identifier`/`Expr::CompoundIdentifier` must be a
 /// real column OR [`PRINCIPAL_ID_PLACEHOLDER`]; an `Expr::InList` whose
@@ -1133,17 +1180,7 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
             validate_expr_shape(left, real_columns)?;
             validate_expr_shape(right, real_columns)
         }
-        Expr::UnaryOp { op, expr: inner } => {
-            if !matches!(
-                op,
-                UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
-            ) {
-                return Err(RewriteError::InvalidRowFilter {
-                    reason: OPERATOR_REFUSAL.to_owned(),
-                });
-            }
-            validate_expr_shape(inner, real_columns)
-        }
+        Expr::UnaryOp { op, expr: inner } => validate_unary_op(*op, inner.as_ref(), real_columns),
         Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             validate_expr_shape(inner, real_columns)
         }
@@ -1160,15 +1197,35 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
         Expr::Like {
             expr: inner,
             pattern,
+            negated,
+            any,
             escape_char,
-            ..
         }
         | Expr::ILike {
             expr: inner,
             pattern,
+            negated,
+            any,
             escape_char,
-            ..
         } => {
+            // SEC-44: `LIKE ... ANY` (the optional `ANY` keyword right
+            // after `LIKE`/`ILIKE`) admits a wider grammar than one
+            // pattern; the only intended form here is the simple one.
+            // Refused before the children are visited so a backslash text
+            // or a real column inside the pattern does not leak through
+            // when the whole node is the only rejection. Every field is
+            // named (no `..`) so a field a later `sqlparser` adds stops
+            // the build here until someone decides what it means.
+            if *any {
+                return Err(RewriteError::InvalidRowFilter {
+                    reason: LIKE_ANY_REFUSAL.to_owned(),
+                });
+            }
+            // `negated` is the `NOT` flag — checked explicitly to keep
+            // the unused-binding lint quiet while the field is named
+            // here for completeness. Today every value is fine; SEC-44
+            // changes `any`, not `negated`.
+            let _: &bool = negated;
             validate_expr_shape(inner, real_columns)?;
             validate_expr_shape(pattern, real_columns)?;
             // SEC-32 review fix (BLOCKER): the escape is an expression too.
@@ -1234,6 +1291,15 @@ fn validate_compound_identifier(
 const PLAIN_CALL_REFUSAL: &str = "a function call in a row filter takes plain arguments only";
 const OPERATOR_REFUSAL: &str = "operator not allowed in a row filter";
 const QUALIFIER_REFUSAL: &str = "a column in a row filter may have one plain table name before it";
+// SEC-44 refusals: the validator refuses shapes that print differently
+// than checked (a unary sign produces `--`/`-` etc. with no space, a
+// control character lets string text cross a line, `LIKE ... ANY` opens
+// a wider grammar). Fixed texts so the policy engine can map every
+// `InvalidRowFilter` to its own caller's message without echoing the
+// filter.
+const SIGN_REFUSAL: &str = "a row filter may not put two signs in a row";
+const CONTROL_CHAR_REFUSAL: &str = "a text value in a row filter must be on one line";
+const LIKE_ANY_REFUSAL: &str = "a row filter accepts LIKE with one pattern only";
 
 /// Admits numbers, booleans, `NULL` and a plain single-quoted string with
 /// no backslash in its text. Every other [`Value`] variant is refused, so a
@@ -1246,6 +1312,17 @@ fn validate_literal(value: &Value) -> Result<(), RewriteError> {
             if text.contains('\\') {
                 Err(RewriteError::InvalidRowFilter {
                     reason: "a text value in a row filter cannot contain a backslash".to_owned(),
+                })
+            } else if text.chars().any(|c| c < '\u{20}' || c == '\u{7f}') {
+                // SEC-44: a control character (U+0000–U+001F here, plus
+                // DEL at U+007F) inside a single-quoted string lets the
+                // text cross a line — what the validator read and what
+                // `ClickHouse` reads can then differ. `char::is_control`
+                // covers U+0080–U+009F too; that range is plain ASCII
+                // text to `ClickHouse` and the plan's decision is the
+                // narrow set, so the comparison is written by hand.
+                Err(RewriteError::InvalidRowFilter {
+                    reason: CONTROL_CHAR_REFUSAL.to_owned(),
                 })
             } else {
                 Ok(())
@@ -1750,8 +1827,9 @@ mod row_filter {
     use sqlparser::parser::Parser;
 
     use super::{
-        PlaceholderValues, RewriteError, build_masked_filtered_select, expand_placeholders,
-        validate_expr_shape, validate_row_filter_expr,
+        CONTROL_CHAR_REFUSAL, LIKE_ANY_REFUSAL, PlaceholderValues, RewriteError, SIGN_REFUSAL,
+        build_masked_filtered_select, expand_placeholders, validate_expr_shape,
+        validate_row_filter_expr,
     };
 
     const BACKSLASH_REASON: &str = "a text value in a row filter cannot contain a backslash";
@@ -2234,6 +2312,300 @@ mod row_filter {
                 "{raw}"
             );
         }
+    }
+
+    // SEC-44: `Display` writes a unary `-` or `+` with no space before its
+    // operand, so `x = - -1` (parsed) prints `x = --1` and `--` starts a
+    // SQL line comment. A control character inside a single-quoted string
+    // carries the string across a line, so a literal checked here can read
+    // differently in `ClickHouse`. The four accepted shapes below all
+    // expand to the SAME text the validator saw, so the checked filter and
+    // the running filter stay one expression.
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_a_unary_minus_left_of_an_int_operand() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x = -1", &cols)
+            .unwrap_or_else(|e| panic!("x = -1 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x = -1"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_a_binary_minus_over_a_unary_minus() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x - -1 > 0", &cols)
+            .unwrap_or_else(|e| panic!("x - -1 > 0 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x - -1 > 0"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_not_over_a_signed_operand() {
+        // `NOT` writes with a space, so the printed text keeps the space
+        // that separates it from the inner sign and never produces `--`.
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("NOT -x = 1", &cols)
+            .unwrap_or_else(|e| panic!("NOT -x = 1 was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "NOT -x = 1"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_and_expands_like_with_one_pattern() {
+        let cols = vec!["x".to_owned()];
+        let expr = validate_row_filter_expr("x LIKE 'a%'", &cols)
+            .unwrap_or_else(|e| panic!("x LIKE 'a%' was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x LIKE 'a%'"
+        );
+        // `negated` is a flag distinct from `any`; today (and after this
+        // change) a `NOT LIKE` with one pattern stays accepted. The
+        // expansion keeps the `NOT` because `Display` prints it with a
+        // space.
+        let expr = validate_row_filter_expr("x NOT LIKE 'a%'", &cols)
+            .unwrap_or_else(|e| panic!("x NOT LIKE 'a%' was refused: {e:?}"));
+        assert_eq!(
+            expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+            "x NOT LIKE 'a%'"
+        );
+    }
+
+    // SEC-44: every refusal below pins a fixed reason (no filter text, no
+    // marker word) and matches the plan's exact wording so the
+    // `policy_engine::refusal_message` mapping can keep using a single
+    // fixed text per reason. The constants themselves live next to the
+    // other refusal strings (SIGN_REFUSAL, CONTROL_CHAR_REFUSAL,
+    // LIKE_ANY_REFUSAL) so the production text and the test pin the same
+    // source.
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_unary_minus_whose_operand_is_a_unary_minus() {
+        let cols = vec!["x".to_owned()];
+        // `x = - -1` parses to `BinaryOp(Eq, x, UnaryOp(Minus, UnaryOp(Minus, 1)))`
+        // — the outer Minus has a Minus operand, which `Display` writes
+        // as `--`, and `--` starts a SQL line comment.
+        assert_eq!(
+            invalid_reason("x = - -1", &cols),
+            SIGN_REFUSAL,
+            "raw must be refused with the fixed sign reason"
+        );
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_sign_over_sign_combination() {
+        let cols = vec!["x".to_owned()];
+        for raw in ["x = - -1", "x = + +1", "x = -+1", "x = +-1"] {
+            assert_eq!(invalid_reason(raw, &cols), SIGN_REFUSAL, "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_raw_newline() {
+        // A control character (U+000A here) lets the text inside a single
+        // quoted string cross a line, so what the validator saw and what
+        // `ClickHouse` reads can differ — and a text containing `\n` can
+        // also carry the rest of the comment a leading `--` opened.
+        let cols = vec!["x".to_owned()];
+        let raw = "x = 'a\nb'";
+        assert_eq!(invalid_reason(raw, &cols), CONTROL_CHAR_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_tab_character() {
+        let cols = vec!["x".to_owned()];
+        let raw = "x = 'a\tb'";
+        assert_eq!(invalid_reason(raw, &cols), CONTROL_CHAR_REFUSAL);
+    }
+
+    /// Rows from the table below are filtered through the validator.
+    /// Each `LIKE`/`ILIKE` row sets only the `any` flag to `true` (the
+    /// pattern is otherwise valid and the operator/kind are on the
+    /// allowlist), so the only thing the new check refuses is `any`.
+    /// The plain-pattern row is the row whose `any: true` is the ONLY
+    /// refusal trigger — the row used by mutation (c).
+    const LIKE_ANY_TEST_CASES: &[(&str, &str)] = &[
+        ("x LIKE ANY 'a%'", "plain pattern"),
+        ("x ILIKE ANY 'a'", "plain pattern, case-insensitive"),
+        ("x LIKE ANY ('a', 'b')", "tuple pattern (may not parse)"),
+        ("x ILIKE ANY ('a')", "single-element tuple pattern"),
+    ];
+
+    #[test]
+    fn validate_row_filter_expr_refuses_like_with_any_and_a_plain_pattern() {
+        // Isolates rule (3): with `ANY 'a%'`, the only shape outside the
+        // simple-`LIKE` allowlist is `any: true`. If the validator stops
+        // refusing `any`, this test alone fails — no other row could mask
+        // the regression.
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason("x LIKE ANY 'a%'", &cols), LIKE_ANY_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_ilike_with_any_and_a_plain_pattern() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason("x ILIKE ANY 'a'", &cols), LIKE_ANY_REFUSAL);
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_any_form_that_parses_under_generic_dialect() {
+        // The plan's verified facts: some `LIKE ANY (...)` shapes do not
+        // even parse under `GenericDialect`, so the parser (not the
+        // validator) refuses them. We loop over the same set, assert the
+        // EITHER path ends in `InvalidRowFilter`, and pin the wording only
+        // on the rows that reach the new check. The non-parseable rows
+        // are recorded here for the handoff (per the plan).
+        let cols = vec!["x".to_owned()];
+        for (raw, _) in LIKE_ANY_TEST_CASES {
+            let err = validate_row_filter_expr(raw, &cols).unwrap_err();
+            match err {
+                RewriteError::InvalidRowFilter { reason } => {
+                    // The plain-pattern rows must end at the new rule with
+                    // the LIKE-ANY fixed reason; a tuple-pattern row that
+                    // fails to parse carries the parser's own message.
+                    let expected = if raw.contains('\'') && !raw.contains(',') {
+                        LIKE_ANY_REFUSAL // plain pattern (with or without tuple wrapping)
+                    } else if raw.contains(',') {
+                        // `x LIKE ANY ('a', 'b')`: a tuple pattern with
+                        // more than one element. Either the validator
+                        // refuses `any` (and we get LIKE_ANY_REFUSAL), or
+                        // the parser refuses the tuple first. Either path
+                        // keeps the test green; we just don't pin the
+                        // fixed text here.
+                        "tuple"
+                    } else {
+                        unreachable!("unexpected shape: {raw}")
+                    };
+                    assert!(
+                        reason == LIKE_ANY_REFUSAL || expected == "tuple",
+                        "{raw}: unexpected refusal reason `{reason}`"
+                    );
+                }
+                other => panic!("{raw}: expected InvalidRowFilter, got {other:?}"),
+            }
+        }
+    }
+
+    /// Walks every accepted shape the test module exercises for this
+    /// validator, expanding each through `expand_placeholders`, and
+    /// asserts neither SQL comment opener (`--` or `/*`) appears OUTSIDE a
+    /// single-quoted string. The structural invariant the validator must
+    /// preserve: the SQL `ClickHouse` parses is the SQL the validator
+    /// checked. The accepted literal set already guarantees no `'` inside
+    /// a literal's text (a backslash is refused, a control character now
+    /// too), so toggling `in_string` on every `'` is a safe boundary
+    /// (doubled `''` toggles twice and the literal is still tracked to
+    /// the closing quote).
+    #[test]
+    fn expand_placeholders_never_prints_a_comment_opener_outside_a_string() {
+        fn assert_no_comment_opener(text: &str) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut in_string = false;
+            for (i, c) in chars.iter().enumerate() {
+                if *c == '\'' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if in_string {
+                    continue;
+                }
+                let next = chars.get(i + 1).copied().unwrap_or('\0');
+                if *c == '-' && next == '-' {
+                    panic!("found `--` outside a string in: {text}");
+                } else if *c == '/' && next == '*' {
+                    panic!("found `/*` outside a string in: {text}");
+                }
+            }
+        }
+
+        let v_none_a = PlaceholderValues::none();
+        let v_principal_only = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec!["t-1".to_owned()],
+        };
+        // The four SEC-44-allowed expansion forms plus the shapes the
+        // pre-existing accepted tests exercise — one representative per
+        // shape, not the full table. Bound locals (not closures) keep the
+        // `&PlaceholderValues` references valid for the slice's lifetime.
+        let cols_ab = vec!["x".to_owned(), "y".to_owned()];
+        let cols_xf = vec!["x".to_owned(), "flag".to_owned()];
+        let cols_x = vec!["x".to_owned()];
+        let accepted: &[(&[String], &PlaceholderValues, &[&str])] = &[
+            (
+                &cols_x,
+                &v_none_a,
+                &[
+                    "x = -1",
+                    "x - -1 > 0",
+                    "NOT -x = 1",
+                    "x LIKE 'a%'",
+                    "x NOT LIKE 'a%'",
+                    "x = 'tenant-a'",
+                    "x IN (__principal_tenant_ids__)",
+                    "x = 'plain'",
+                    "x = 'it''s'",
+                    "x = 42",
+                    "x > 1.5",
+                    "x IS NULL",
+                    "x = NULL",
+                    "x IN ('a', 'b')",
+                ],
+            ),
+            (
+                &cols_xf,
+                &v_principal_only,
+                &[
+                    "flag = true",
+                    "x LIKE 'a' ESCAPE '!'",
+                    "x NOT LIKE 'a%' ESCAPE '!'",
+                    "x LIKE 'a' ESCAPE __principal_id__",
+                    "x = __principal_id__",
+                ],
+            ),
+            (
+                &cols_ab,
+                &v_none_a,
+                &[
+                    "lower(x) = 'a'",
+                    "upper(x) = 'A'",
+                    "tostring(x) = '1'",
+                    "todate(x) > '2020-01-01'",
+                    "t.x = 1",
+                    "_a.x = 1",
+                    "x = 1 AND y <> 2",
+                    "x != 1",
+                    "x <= 1 OR x < 0",
+                    "NOT x = 1",
+                    "-x < 1",
+                    "+x = 1",
+                    "x + 1 > 2",
+                    "x % 2 = 0",
+                    "x * 2 / 4 >= 1",
+                    "x - 1 >= 0",
+                ],
+            ),
+        ];
+
+        let mut saw = 0usize;
+        for (cols, values, raws) in accepted {
+            for raw in *raws {
+                let expr = validate_row_filter_expr(raw, cols)
+                    .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+                let out = expand_placeholders(&expr, values).unwrap();
+                assert_no_comment_opener(&out);
+                saw += 1;
+            }
+        }
+        assert!(
+            saw > 30,
+            "sweep should cover a useful slice of accepted forms, saw {saw}"
+        );
     }
 
     #[test]
