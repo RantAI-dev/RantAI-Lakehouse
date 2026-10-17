@@ -2007,6 +2007,14 @@ pub async fn upsert_lag_state_conn(
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
+/// BLD-2 review R5 SHOULD-FIX 3, measured on the tests this function is
+/// pinned by (both in `tests/pipelines.rs`): the sort below owns the
+/// missing-row INSERT order — a `BEFORE INSERT` probe fails without it,
+/// because that loop has no `ORDER BY` to save it — while the ROW locks
+/// are taken in the order of the statement's own `ORDER BY pipeline_id`.
+/// Both halves are asserted rather than assumed; a caller that ever locks
+/// the rows one statement at a time inherits the sorted order from HERE,
+/// which is what the contention test is there to say.
 pub async fn lock_lag_states_ordered(
     conn: &mut sqlx::PgConnection,
     ids: &[String],

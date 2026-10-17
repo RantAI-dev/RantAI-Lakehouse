@@ -22,6 +22,7 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use lakehouse_store::error::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{self, CreatePipelineInput, PipelineFilter, UpdatePipelineInput};
 use sqlx::PgPool;
@@ -2767,18 +2768,15 @@ async fn update_leaves_the_author_alone(pool: PgPool) -> sqlx::Result<()> {
 }
 
 /// BLD-2 review R4 SHOULD-FIX 1 (and R3 BLOCKER 2 / decision R12): the ONE
-/// function that takes the lag-state locks owns the id order. `ids` arrive
-/// unsorted and the returned map is keyed in sorted order (a `BTreeMap`),
-/// so every caller observes the SAME sorted-key locked snapshot regardless
-/// of how it collected the chain — the property the two-connection lock
-/// interleaving used to depend on without any code owning it.
+/// function that takes the lag-state locks owns the id order, and every
+/// caller observes the same snapshot however it collected the chain.
 ///
-/// An honest limit of what this test can pin down in-process: a
-/// second-connection blocker assertion would need a connection that
-/// blocks forever, which has no completion to await inside one test's
-/// runtime, so ordering is what this test asserts, not liveness under
-/// contention. The blocking property is the `FOR UPDATE` row the SQL
-/// itself carries — same statement shape the R3 review quoted.
+/// What this test pins, exactly: the returned map is keyed in sorted order
+/// from unsorted input, and a row that was never checked maps to `None`.
+/// What it cannot pin: the order the locks were TAKEN in — the keys come
+/// out of a `BTreeMap`, which is sorted whether this function sorts or not.
+/// The two tests below are the ones that can fail if the sort or the dedup
+/// is removed (`BLD-2 review R5 SHOULD-FIX 3`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn lock_lag_states_ordered_returns_states_keyed_in_sorted_order_from_unsorted_ids(
     pool: PgPool,
@@ -2809,5 +2807,183 @@ async fn lock_lag_states_ordered_returns_states_keyed_in_sorted_order_from_unsor
         locked.values().all(std::option::Option::is_none),
         "never-checked rows map to None"
     );
+    Ok(())
+}
+
+/// Records every row the missing-row INSERTs attempt, in attempt order. A
+/// `BEFORE INSERT` row trigger fires for a row an `ON CONFLICT DO NOTHING`
+/// then discards too, so a duplicated id is visible here as a second
+/// attempt — which is the whole point: the returned `BTreeMap` collapses a
+/// duplicate either way, so nothing downstream of the map can show that the
+/// function dropped one.
+async fn install_insert_attempt_probe(pool: &PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "CREATE TABLE insert_attempt_probe (\
+             ordinal BIGSERIAL PRIMARY KEY, pipeline_id TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE FUNCTION record_insert_attempt() RETURNS trigger AS $$ \
+         BEGIN INSERT INTO insert_attempt_probe (pipeline_id) VALUES (NEW.pipeline_id); \
+         RETURN NEW; \
+         END $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER insert_attempt_probe_trigger BEFORE INSERT ON pipeline_lag_state \
+         FOR EACH ROW EXECUTE FUNCTION record_insert_attempt()",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// BLD-2 review R5 SHOULD-FIX 3: the sort AND the dedup, observed instead
+/// of inferred. This fails if either is removed: unsorted input plus a
+/// duplicated id comes out as `pl-a, pl-m, pl-z` inserted once each, in
+/// that order. With the sort removed the attempts arrive `pl-z, pl-a,
+/// pl-a, pl-m`; with the dedup removed `pl-a` is attempted twice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lock_lag_states_ordered_attempts_each_missing_row_once_in_sorted_order(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["pl-z", "pl-a", "pl-m"] {
+        let mut inp = input();
+        inp.id = Some(id.to_owned());
+        inp.name = id.to_owned();
+        pipelines::create_pipeline(&pool, &inp, None)
+            .await
+            .expect("create pipeline");
+    }
+    install_insert_attempt_probe(&pool).await?;
+
+    let mut conn = pool.acquire().await?;
+    let ids = vec![
+        "pl-z".to_owned(),
+        "pl-a".to_owned(),
+        "pl-m".to_owned(),
+        "pl-a".to_owned(),
+    ];
+    let locked = pipelines::lock_lag_states_ordered(&mut conn, &ids, None)
+        .await
+        .expect("lock ordered");
+
+    let attempts: Vec<String> =
+        sqlx::query_scalar("SELECT pipeline_id FROM insert_attempt_probe ORDER BY ordinal")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        attempts,
+        vec!["pl-a".to_owned(), "pl-m".to_owned(), "pl-z".to_owned()],
+        "the missing-row INSERTs run sorted, and a duplicated id is attempted once"
+    );
+    assert_eq!(
+        locked.len(),
+        3,
+        "one entry per DISTINCT id, not one per input slot: {locked:?}"
+    );
+    Ok(())
+}
+
+/// BLD-2 review R5 SHOULD-FIX 3: the row locks are taken in sorted order,
+/// which is the property the deadlock-freedom of the check rests on — and
+/// it is what the returned map cannot show. One connection holds `pl-a`
+/// (`SELECT … FOR UPDATE`, committed rows so a bare lock is enough), the
+/// walk runs on a second connection with the ids in the order
+/// `pl-z, pl-a, pl-m`, and a third connection asks for `pl-z` while the
+/// walk is waiting.
+///
+/// A sorted walk asks for `pl-a` first and never reaches `pl-z`, so the
+/// probe is granted; a walk that took the ids in the order it was given
+/// holds `pl-z` on its way to `pl-a` and the probe times out (measured:
+/// this test fails with exactly that `55P03` when the ids are locked one
+/// statement at a time in input order). The walk ending on its own
+/// `lock_timeout` is what proves it really was blocked rather than done.
+///
+/// What this does NOT pin, measured: the order is today enforced by the
+/// statement's own `ORDER BY pipeline_id` (and by the primary key's scan
+/// order), so dropping the Rust-side sort alone still locks in sorted order
+/// — see the trigger test above, which is the one that fails without the
+/// sort, because the INSERT loop has no `ORDER BY` to save it.
+///
+/// Times: the sleep plus the walk's own lock timeout.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lock_lag_states_ordered_waits_for_the_first_sorted_id_before_locking_a_later_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["pl-z", "pl-a", "pl-m"] {
+        let mut inp = input();
+        inp.id = Some(id.to_owned());
+        inp.name = id.to_owned();
+        pipelines::create_pipeline(&pool, &inp, None)
+            .await
+            .expect("create pipeline");
+    }
+    // Committed rows, so the holder can lock one without the helper.
+    let mut setup = pool.acquire().await?;
+    for id in ["pl-a", "pl-m", "pl-z"] {
+        sqlx::query(
+            "INSERT INTO pipeline_lag_state (pipeline_id, tenant_id) VALUES ($1, NULL) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *setup)
+        .await?;
+    }
+    drop(setup);
+
+    let mut holder = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *holder).await?;
+    sqlx::query("SELECT pipeline_id FROM pipeline_lag_state WHERE pipeline_id = 'pl-a' FOR UPDATE")
+        .execute(&mut *holder)
+        .await?;
+
+    let mut walker = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *walker).await?;
+    // Longer than the probe's sleep below, so the walk is still waiting
+    // when the probe asks.
+    sqlx::query("SET LOCAL lock_timeout = '4s'")
+        .execute(&mut *walker)
+        .await?;
+
+    let mut prober = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *prober).await?;
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *prober)
+        .await?;
+
+    let walk = async {
+        let ids = vec!["pl-z".to_owned(), "pl-a".to_owned(), "pl-m".to_owned()];
+        pipelines::lock_lag_states_ordered(&mut walker, &ids, None).await
+    };
+    let probe = async {
+        // Server-side sleep: no timer on this crate's tokio features, and
+        // it holds no lock while it waits.
+        sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *prober)
+            .await?;
+        sqlx::query(
+            "SELECT pipeline_id FROM pipeline_lag_state WHERE pipeline_id = 'pl-z' FOR UPDATE",
+        )
+        .execute(&mut *prober)
+        .await
+    };
+    let (walked, probed) = tokio::join!(walk, probe);
+
+    probed.expect("pl-z must still be free: a sorted walk waits on pl-a before it gets to pl-z");
+    assert!(
+        matches!(
+            &walked,
+            Err(StoreError::Database(sqlx::Error::Database(db)))
+                if db.code().as_deref() == Some("55P03")
+        ),
+        "the walk must still be waiting on the held pl-a, not finished: {walked:?}"
+    );
+
+    for conn in [&mut holder, &mut walker, &mut prober] {
+        let _ = sqlx::query("ROLLBACK").execute(&mut **conn).await;
+    }
     Ok(())
 }
