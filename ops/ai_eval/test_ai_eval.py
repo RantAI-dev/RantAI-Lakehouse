@@ -271,6 +271,18 @@ class CleanupPlanTests(unittest.TestCase):
         # charts, then calculated fields, then SQL sources, then boards.
         self.assertEqual(order, [("chart", "c2"), ("chart", "c1"), ("field", "f1"), ("source", "s1"), ("board", "b1")])
 
+    def test_a_metric_is_deleted_after_the_charts_that_use_it_and_before_its_source_and_fields(self) -> None:
+        # A metric refuses its delete with 409 while a chart uses it, and a
+        # metric on a SQL source must go before that source.
+        created = [
+            {"kind": "source", "id": "s1"},
+            {"kind": "metric", "id": "m1"},
+            {"kind": "field", "id": "f1"},
+            {"kind": "chart", "id": "c1"},
+        ]
+        order = [s["kind"] for s in m.cleanup_plan(created)]
+        self.assertEqual(order, ["chart", "metric", "field", "source"])
+
     def test_within_a_kind_the_last_created_is_deleted_first(self) -> None:
         created = [{"kind": "chart", "id": "c1"}, {"kind": "chart", "id": "c2"}, {"kind": "chart", "id": "c3"}]
         self.assertEqual([s["id"] for s in m.cleanup_plan(created)], ["c3", "c2", "c1"])
@@ -280,6 +292,7 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertEqual(m.DELETE_ROUTES["field"], "/api/dashboard/calc-fields")
         self.assertEqual(m.DELETE_ROUTES["source"], "/api/dashboard/sources")
         self.assertEqual(m.DELETE_ROUTES["board"], "/api/dashboard/boards")
+        self.assertEqual(m.DELETE_ROUTES["metric"], "/api/dashboard/metrics")
 
     def test_cleanup_deletes_what_the_run_created_and_nothing_else(self) -> None:
         cfg = make_cfg()
@@ -446,6 +459,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(m.kind_of_path("/api/dashboard/boards"), "board")
         self.assertEqual(m.kind_of_path("/api/dashboard/sources"), "source")
         self.assertEqual(m.kind_of_path("/api/dashboard/calc-fields"), "field")
+        self.assertEqual(m.kind_of_path("/api/dashboard/metrics"), "metric")
         self.assertIsNone(m.kind_of_path("/api/other"))
 
     def test_a_setup_name_substitutes_into_a_turn(self) -> None:
@@ -616,11 +630,12 @@ class WhereMatchTests(unittest.TestCase):
         # The three cases that could never pass (P1) must now resolve against
         # the shape the route returns, so a perfect assistant can match them.
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        # The seed has no date column, so both read a SQL source the case makes.
         self.assertEqual(
-            cases["chart_line_monthly"]["expect_state"][0]["where"], {"mart": "mart_wisman", "kind": "line", "def.grain": "month"}
+            cases["chart_line_monthly"]["expect_state"][0]["where"], {"sqlSource": "{src}", "kind": "line", "def.grain": "month"}
         )
         self.assertEqual(
-            cases["chart_quarterly_id"]["expect_state"][0]["where"], {"kind": "line", "def.grain": "quarter"}
+            cases["chart_quarterly_id"]["expect_state"][0]["where"], {"sqlSource": "{src}", "kind": "line", "def.grain": "quarter"}
         )
         table = {"id": "t", "kind": "table", "mart": "mart_event", "def": {"tableMode": "rows", "kind": "table"}}
         self.assertEqual(
@@ -1035,12 +1050,16 @@ class DashboardRowsTests(unittest.TestCase):
 
     def test_kpi_compare_asserts_the_compare_is_set(self) -> None:
         # row 11: "KPI with `compare` set" -> def.compare.kind matches.
-        where = self.cases()["chart_kpi_compare"]["expect_state"][0]["where"]
+        # A compare needs a date column, which only the case's SQL source has.
+        case = self.cases()["chart_kpi_compare"]
+        where = m.fill_check(case["expect_state"][0], {"src": "s-1"})["where"]
         self.assertEqual(where.get("def.compare.kind"), "previous")
-        kpi = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi", "compare": {"kind": "previous", "period": "month"}}}
+        kpi = {"id": "k", "kind": "kpi", "mart": "", "sqlSource": "s-1", "def": {"kind": "kpi", "compare": {"kind": "previous", "period": "month"}}}
         self.assertTrue(m.where_matches(kpi, where))
-        plain = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi"}}
+        plain = {"id": "k", "kind": "kpi", "mart": "", "sqlSource": "s-1", "def": {"kind": "kpi"}}
         self.assertFalse(m.where_matches(plain, where))
+        other_source = {**kpi, "sqlSource": "s-2"}
+        self.assertFalse(m.where_matches(other_source, where))
 
     def test_pivot_asserts_its_kind_and_its_rows_and_columns(self) -> None:
         # row 13: "Pivot with `rows` and `columns`" -> kind pivot, rows and columns.
@@ -1053,6 +1072,73 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertTrue(m.where_matches(pivot, where))
         grouped = {"id": "g", "kind": "table", "mart": "mart_wisman", "def": {"kind": "table"}}
         self.assertFalse(m.where_matches(grouped, where))
+
+    def test_pivot_totals_case_asserts_a_grand_total(self) -> None:
+        # A pivot without `totals: grand` must fail, whatever its rows and columns.
+        where = self.cases()["chart_pivot_totals"]["expect_state"][0]["where"]
+        self.assertEqual(where["kind"], "pivot")
+        self.assertEqual(where.get("def.totals"), "grand")
+        with_totals = {"id": "p", "kind": "pivot", "mart": "mart_wisman",
+                       "def": {"kind": "pivot", "rows": ["tahun"], "columns": ["bulan_no"], "totals": "grand"}}
+        self.assertTrue(m.where_matches(with_totals, where))
+        for totals in ("none", "all"):
+            other = {**with_totals, "def": {**with_totals["def"], "totals": totals}}
+            self.assertFalse(m.where_matches(other, where), totals)
+        no_totals = {**with_totals, "def": {k: v for k, v in with_totals["def"].items() if k != "totals"}}
+        self.assertFalse(m.where_matches(no_totals, where))
+
+    def test_the_date_cases_read_a_sql_source_made_in_setup_with_a_date_column(self) -> None:
+        # The seed has no date column. Each case builds one in a source and the
+        # state check names that source, so a model that charts the mart fails.
+        for case_id in ("chart_line_monthly", "chart_quarterly_id", "chart_kpi_compare"):
+            case = self.cases()[case_id]
+            setup = case["setup"]
+            self.assertEqual([c["path"] for c in setup], ["/api/dashboard/sources"], case_id)
+            self.assertIn("makeDate(", setup[0]["body"]["sql"], case_id)
+            self.assertIn("serving.mart_wisman", setup[0]["body"]["sql"], case_id)
+            where = case["expect_state"][0]["where"]
+            self.assertEqual(where["sqlSource"], "{" + setup[0]["name"] + "}", case_id)
+            self.assertNotIn("mart", where, case_id)
+            self.assertNotIn("mart", case["expect_tool"]["args_contains"], case_id)
+            self.assertEqual(case["expect_tool"]["args_contains"]["sqlSource"], where["sqlSource"], case_id)
+            # The turn names the source by its title, so the model finds it with list_sql_sources.
+            self.assertIn(setup[0]["body"]["title"], case["turns"][0], case_id)
+
+    def test_the_quarterly_case_stays_in_indonesian(self) -> None:
+        self.assertEqual(self.cases()["chart_quarterly_id"].get("lang"), "id")
+
+    def test_metric_first_cases_make_a_metric_and_assert_the_chart_uses_it(self) -> None:
+        # A metric measure is saved as {"metric": <name>}, so a plain
+        # `def.measures` match cannot see it; `def.measures[].metric` can.
+        for case_id, lang in (("metric_first", None), ("metric_first_id", "id")):
+            case = self.cases()[case_id]
+            self.assertEqual(case.get("lang"), lang, case_id)
+            self.assertIs(case.get("confirm"), True, case_id)
+            metric = case["setup"][0]
+            self.assertEqual(metric["path"], "/api/dashboard/metrics", case_id)
+            self.assertEqual(metric["id_at"], "metric.id", case_id)
+            self.assertEqual(metric["body"]["mart"], "mart_wisman", case_id)
+            self.assertEqual(metric["body"]["formula"], "Sum([jumlah])", case_id)
+            name = metric["body"]["name"]
+            self.assertNotEqual(name, "jumlah", case_id)
+            where = case["expect_state"][0]["where"]
+            self.assertEqual(where["def.measures[].metric"], name, case_id)
+            self.assertEqual(case["expect_state"][0]["count"], 1, case_id)
+            # The turn does not name the metric: the model has to find it.
+            self.assertNotIn(name, case["turns"][0], case_id)
+
+            def chart(measures: list[Any]) -> dict[str, Any]:
+                return {"id": "c", "kind": "bar", "mart": "mart_wisman",
+                        "def": {"kind": "bar", "dimension": "negara", "measures": measures}}
+
+            self.assertTrue(m.where_matches(chart([{"metric": name}]), where), case_id)
+            self.assertFalse(m.where_matches(chart(["jumlah"]), where), case_id)
+            self.assertFalse(m.where_matches(chart([{"metric": "other_metric"}]), where), case_id)
+
+    def test_the_two_metric_first_cases_use_different_metric_names(self) -> None:
+        cases = self.cases()
+        names = {cases[c]["setup"][0]["body"]["name"] for c in ("metric_first", "metric_first_id")}
+        self.assertEqual(len(names), 2)
 
     def test_arrange_case_is_true_only_for_a_board_whose_tiles_are_half_width(self) -> None:
         # `GET /api/dashboard/boards` returns each board's `layout` as
