@@ -142,6 +142,12 @@ REFUSAL_CUES = (
     "tidak mencakup",
     "hanya mencakup",
     "hanya tersedia",
+    "can't",
+    "cannot",
+    "can not",
+    "not able to",
+    "tidak bisa",
+    "tidak dapat",
 )
 
 # Words that appear in almost any Indonesian answer and almost never in an
@@ -487,13 +493,22 @@ def formula_problems(
             formulas.append(_created_formula(step.get("result")))
     for confirm in confirms:
         if confirm.get("tool") == "create_calculated_field":
-            formulas.append(_created_formula(confirm.get("result")))
+            formulas.append(_created_formula(confirmed_result(confirm)))
     problems: list[str] = []
     for formula in formulas:
         for word in forbidden:
             if re.search(word, formula, re.IGNORECASE):
                 problems.append(f"formula contains {word}")
     return problems
+
+
+def confirmed_result(confirm: dict[str, Any]) -> dict[str, Any]:
+    """The tool's own result inside a confirm. `send_confirm` keeps the whole
+    `POST /api/ai/tool` reply `{tool, outcome, result}` under `result`, so the
+    created object's `id` and `created` are one level further in."""
+    reply = confirm.get("result")
+    inner = reply.get("result") if isinstance(reply, dict) else None
+    return inner if isinstance(inner, dict) else {}
 
 
 def _created_formula(result: Any) -> str:
@@ -537,6 +552,27 @@ def send_confirm(
         body = {"error": f"non-JSON response, HTTP {resp.status_code}"}
     body["_status"] = resp.status_code
     return body
+
+
+def confirm_problems(confirms: list[dict[str, Any]]) -> list[str]:
+    """A confirm that did not come back `executed` with HTTP 200 is a problem of
+    the case: HTTP 400 and up, an `error` in the reply, or any other `outcome`.
+    Without this a rejected confirm only shows as an object missing from the
+    state check, or not at all."""
+    problems: list[str] = []
+    for confirm in confirms:
+        reply = confirm.get("result")
+        if not isinstance(reply, dict):
+            reply = {}
+        status = reply.get("_status")
+        outcome = reply.get("outcome")
+        if status == 200 and outcome == "executed" and "error" not in reply:
+            continue
+        text = f"confirm {confirm.get('tool')}: HTTP {status}, outcome {outcome}"
+        if reply.get("error"):
+            text += f", error {reply['error']}"
+        problems.append(text)
+    return problems
 
 
 def run_setup(
@@ -590,12 +626,12 @@ def collect_created(
                 found.append({"kind": "field", "id": str(result["id"])})
     for confirm in confirms:
         tool = confirm.get("tool")
-        result = confirm.get("result") or {}
-        if isinstance(result, dict) and result.get("id") and result.get("created"):
+        result = confirmed_result(confirm)
+        if result.get("id") and result.get("created"):
             kind = {"create_chart": "chart", "create_board": "board"}.get(tool or "")
             if kind:
                 found.append({"kind": kind, "id": str(result["id"])})
-        if tool == "create_calculated_field" and isinstance(result, dict) and result.get("id") and result.get("ok") is True:
+        if tool == "create_calculated_field" and result.get("id") and result.get("ok") is True:
             found.append({"kind": "field", "id": str(result["id"])})
     return found
 
@@ -770,8 +806,9 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
                         response = send_confirm(cfg, session, step, mode, body.get("sessionId"))
                         confirms.append({"tool": pending_of(step)["tool"], "result": response})
             messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
-        scored = score_case(cfg, session, case, bodies)
+        scored = score_case(cfg, session, case, bodies, names)
         scored["confirms"] = confirms
+        scored["problems"].extend(confirm_problems(confirms))
         trace = [s for b in bodies for s in b.get("toolTrace", [])]
         created = collect_created(setup_created, [trace], confirms)
         own_ids = {c["id"] for c in created}
@@ -861,8 +898,15 @@ def bodies_from_saved(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def score_case(
-    cfg: Config, session: requests.Session, case: dict[str, Any], bodies: list[dict[str, Any]]
+    cfg: Config,
+    session: requests.Session,
+    case: dict[str, Any],
+    bodies: list[dict[str, Any]],
+    names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Score one case from its response bodies. `names` are the ids the case's
+    setup saved, used to fill `{name}` in `expect_tool.args_contains` the way
+    the turns are filled; `--rescore` has no setup and passes none."""
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -892,13 +936,15 @@ def score_case(
     if expect_tool:
         required += 1
         trace = [t for b in bodies for t in b.get("toolTrace", []) if t.get("tool") == expect_tool["name"]]
-        want = expect_tool.get("args_contains", {})
+        want = fill_value(expect_tool.get("args_contains", {}), names or {})
         if any(all(str(v).lower() in str(t.get("args", {}).get(k, "")).lower() for k, v in want.items()) for t in trace):
             hit += 1
         else:
             missing.append(f"tool={expect_tool['name']}{want}")
 
-    refused = any(cue in lowered for cue in REFUSAL_CUES)
+    # The cues are written with a straight apostrophe; a model often answers
+    # with a curly one.
+    refused = any(cue in lowered.replace("\u2019", "'") for cue in REFUSAL_CUES)
     # No expected facts (e.g. no pipeline is failing right now): completeness
     # is about declining only when the case expects that.
     if required:
