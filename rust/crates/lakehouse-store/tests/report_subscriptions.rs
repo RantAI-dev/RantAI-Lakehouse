@@ -14,7 +14,7 @@ use lakehouse_store::report_subscriptions::{
     DeliveryStatus, NewDelivery, NewSubscription, PAUSE_AFTER_FAILURES, Recipient,
     UNSCHEDULABLE_REASON, claim_due, create, delete, get, last_deliveries, list_deliveries,
     list_for_board, list_for_owner, note_outcome, prune_deliveries, recipients, record_delivery,
-    set_paused, update,
+    retry_at, set_paused, update,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -507,5 +507,42 @@ async fn deleting_the_owner_removes_their_subscriptions(pool: PgPool) -> sqlx::R
         .execute(&pool)
         .await?;
     assert!(get(&pool, s.id).await.unwrap().is_none());
+    Ok(())
+}
+
+/// RPT-1 review fix (SHOULD-FIX) R9: a retry brings the next time forward, never
+/// back, and leaves a paused subscription alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retry_brings_the_next_time_forward_and_never_pushes_it_back(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let owner = user(&pool, "owner").await;
+    let now = OffsetDateTime::now_utc();
+    let s = create(&pool, &new_sub(owner, "a", now + Duration::days(1)))
+        .await
+        .unwrap();
+    assert!(
+        retry_at(&pool, s.id, now + Duration::minutes(5))
+            .await
+            .unwrap()
+    );
+    let moved = get(&pool, s.id).await.unwrap().unwrap().next_run_at;
+    assert!((moved - (now + Duration::minutes(5))).abs() < Duration::milliseconds(5));
+    // A later time does not push it back.
+    assert!(
+        !retry_at(&pool, s.id, now + Duration::hours(2))
+            .await
+            .unwrap()
+    );
+    assert_eq!(get(&pool, s.id).await.unwrap().unwrap().next_run_at, moved);
+    // A paused subscription stays where it is.
+    set_paused(&pool, s.id, true, Some("x"), None)
+        .await
+        .unwrap();
+    assert!(
+        !retry_at(&pool, s.id, now + Duration::minutes(1))
+            .await
+            .unwrap()
+    );
     Ok(())
 }

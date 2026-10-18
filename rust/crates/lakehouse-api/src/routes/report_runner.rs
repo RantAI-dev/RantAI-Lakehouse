@@ -340,18 +340,61 @@ pub async fn run_subscription(
     )
     .await?;
     if let Outcome::Failed(reason) = &outcome {
-        let paused_now = if manual {
-            false
-        } else {
-            subscriptions::note_outcome(pool, sub.id, DeliveryStatus::Failed, PAUSED_AFTER_FAILURES)
-                .await?
-                .is_some_and(|s| s.paused_now)
-        };
+        // RPT-1 review fix (SHOULD-FIX) R9. A failed "Send now" is shown in the
+        // dialog, not emailed to the owner, and is not counted. "Email is not
+        // set up" is the deployment's state, not the report's: it is not counted
+        // toward the five and there is no mail to tell the owner with. A send
+        // that found the PDF service busy is tried again in a few minutes, once,
+        // and is not counted either.
+        if manual || reason == EMAIL_NOT_SET_UP {
+            return Ok(delivery);
+        }
+        if reason == PDF_BUSY && retry_busy_once(pool, sub, &delivery).await? {
+            return Ok(delivery);
+        }
+        let paused_now = subscriptions::note_outcome(
+            pool,
+            sub.id,
+            DeliveryStatus::Failed,
+            PAUSED_AFTER_FAILURES,
+        )
+        .await?
+        .is_some_and(|s| s.paused_now);
         tell_owner(state, mailer, sub, reason, paused_now).await;
     } else if !manual {
         subscriptions::note_outcome(pool, sub.id, outcome.status(), PAUSED_AFTER_FAILURES).await?;
     }
     Ok(delivery)
+}
+
+/// How long after a busy PDF service the send is tried again.
+const BUSY_RETRY_AFTER: time::Duration = time::Duration::minutes(5);
+
+/// Whether the delivery just recorded is a second busy failure in a row: the
+/// previous delivery was a scheduled busy failure less than 15 minutes ago.
+fn is_second_busy(previous: Option<&Delivery>, now: OffsetDateTime) -> bool {
+    previous.is_some_and(|p| {
+        p.reason.as_deref() == Some(PDF_BUSY)
+            && p.origin == "schedule"
+            && now - p.finished_at < time::Duration::minutes(15)
+    })
+}
+
+/// Bring the next run forward by [`BUSY_RETRY_AFTER`] after a busy PDF service,
+/// once: a second busy failure right after counts as a failure like any other.
+/// Whether the retry was set.
+async fn retry_busy_once(
+    pool: &lakehouse_store::PgPool,
+    sub: &Subscription,
+    just_recorded: &Delivery,
+) -> Result<bool, StoreError> {
+    let recent = subscriptions::list_deliveries(pool, sub.id, 2).await?;
+    let previous = recent.iter().find(|d| d.id != just_recorded.id);
+    let now = OffsetDateTime::now_utc();
+    if is_second_busy(previous, now) {
+        return Ok(false);
+    }
+    subscriptions::retry_at(pool, sub.id, now + BUSY_RETRY_AFTER).await
 }
 
 /// Everything between "this subscription is due" and "the email is handed to
@@ -1367,6 +1410,43 @@ mod tests {
         let cut = cap_reason(&long);
         assert_eq!(cut.chars().count(), MAX_REASON_CHARS);
         assert!(cut.ends_with('…'));
+    }
+
+    // RPT-1 review fix (SHOULD-FIX) R9.
+    #[test]
+    fn a_busy_pdf_service_is_retried_once_not_twice() {
+        let now = OffsetDateTime::now_utc();
+        let delivery = |reason: &str, ago: time::Duration, origin: &str| Delivery {
+            id: uuid::Uuid::new_v4(),
+            subscription_id: uuid::Uuid::new_v4(),
+            started_at: now - ago,
+            finished_at: now - ago,
+            status: "failed".to_owned(),
+            origin: origin.to_owned(),
+            recipient_count: 0,
+            reason: Some(reason.to_owned()),
+        };
+        assert!(!is_second_busy(None, now));
+        assert!(!is_second_busy(
+            Some(&delivery(
+                "The PDF could not be made.",
+                time::Duration::minutes(5),
+                "schedule"
+            )),
+            now
+        ));
+        assert!(is_second_busy(
+            Some(&delivery(PDF_BUSY, time::Duration::minutes(5), "schedule")),
+            now
+        ));
+        assert!(!is_second_busy(
+            Some(&delivery(PDF_BUSY, time::Duration::hours(3), "schedule")),
+            now
+        ));
+        assert!(!is_second_busy(
+            Some(&delivery(PDF_BUSY, time::Duration::minutes(5), "manual")),
+            now
+        ));
     }
 
     #[test]

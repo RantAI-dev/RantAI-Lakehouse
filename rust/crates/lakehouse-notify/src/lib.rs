@@ -229,14 +229,22 @@ fn build_message_with_attachments(
         return Err(lettre::error::Error::MissingTo);
     }
     let sender = from_mailbox(from);
-    let mut builder = Message::builder().from(sender.clone()).to(sender);
+    let mut builder = Message::builder().from(sender.clone()).to(sender.clone());
+    let mut envelope_to = Vec::with_capacity(bcc.len());
     for recipient in bcc {
-        builder = builder.bcc(
-            recipient
-                .parse::<Mailbox>()
-                .map_err(|_| lettre::error::Error::MissingTo)?,
-        );
+        let mailbox = recipient
+            .parse::<Mailbox>()
+            .map_err(|_| lettre::error::Error::MissingTo)?;
+        envelope_to.push(mailbox.email.clone());
+        builder = builder.bcc(mailbox);
     }
+    // RPT-1 review fix (SHOULD-FIX) R9: the SMTP envelope holds the Bcc list and
+    // nothing else, so the sender's own mailbox (the visible To) gets no copy of
+    // every report.
+    builder = builder.envelope(
+        lettre::address::Envelope::new(Some(sender.email), envelope_to)
+            .map_err(|_| lettre::error::Error::MissingTo)?,
+    );
     let mut parts = MultiPart::mixed().singlepart(
         SinglePart::builder()
             .header(header::ContentType::TEXT_HTML)
@@ -900,7 +908,19 @@ mod tests {
                 "{expected} is addressed"
             );
         }
-        assert!(envelope.len() >= 3);
+        assert_eq!(envelope.len(), 3, "the Bcc list and nothing else");
+        assert!(
+            !envelope.iter().any(|a| a == "reports@company.example"),
+            "the sender's own mailbox gets no copy: {envelope:?}"
+        );
+        assert_eq!(
+            message
+                .envelope()
+                .from()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("reports@company.example")
+        );
     }
 
     #[test]

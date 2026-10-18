@@ -374,6 +374,26 @@ pub async fn set_paused(
         .await?)
 }
 
+/// Bring a subscription's next time forward to `at`, never later than it is
+/// (`RPT-1` review fix (SHOULD-FIX) R9: a send that found the PDF service busy
+/// is tried again in a few minutes instead of waiting a whole period). A paused
+/// subscription is left alone. Whether a row changed.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the update fails.
+pub async fn retry_at(pool: &PgPool, id: Uuid, at: OffsetDateTime) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "UPDATE report_subscription SET next_run_at = LEAST(next_run_at, $2) \
+         WHERE id = $1 AND NOT paused AND next_run_at > $2",
+    )
+    .bind(id)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Take the subscriptions that are due at `now`, at most `limit`, oldest first,
 /// and move each one's next due time forward in the same transaction (see the
 /// module doc). `next_after` works the new time out from the claim; `None`

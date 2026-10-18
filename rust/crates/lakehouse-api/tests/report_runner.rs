@@ -986,3 +986,34 @@ async fn a_recipient_without_the_right_to_see_or_download_or_a_shared_tenant_is_
     assert_eq!(f.mailer.reports().len(), 2);
     assert_eq!(f.mailer.reports()[1].bcc, ["colleague@company.example"]);
 }
+
+/// RPT-1 review fix (SHOULD-FIX) R9: a failed "Send now" is not emailed to the
+/// owner; "Email is not set up" never counts toward the five failures.
+#[tokio::test]
+async fn send_now_failures_do_not_email_the_owner_and_no_email_setup_is_not_counted() {
+    let f = fixture(ok_pdf(), true).await;
+    f.mailer.fail_reports.store(true, Ordering::SeqCst);
+    let sub = subscription(&f, |s| {
+        s.next_run_at = OffsetDateTime::now_utc() + Duration::days(3)
+    })
+    .await;
+    let failed = run_subscription(&f.state, &f.mailer, &sub, true)
+        .await
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(
+        f.mailer.notices().is_empty(),
+        "the dialog shows the reason; no email"
+    );
+
+    let g = fixture(ok_pdf(), false).await;
+    let sub = subscription(&g, |_| {}).await;
+    for _ in 0..6 {
+        tick(&g.state, &g.mailer).await;
+        make_due(&g, &sub).await;
+    }
+    let stored = subs::get(&g.pool, sub.id).await.unwrap().unwrap();
+    assert_eq!(deliveries(&g, &sub).await.len(), 6, "each run is recorded");
+    assert_eq!(stored.consecutive_failures, 0);
+    assert!(!stored.paused);
+}
