@@ -347,8 +347,9 @@ mod table_resolution {
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident as SqlIdent, ObjectName,
-    ObjectNamePart, SelectItem, SetExpr, Statement, TableAlias, Value, ValueWithSpan,
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident as SqlIdent, ObjectName, ObjectNamePart, SelectItem, SetExpr,
+    Statement, TableAlias, UnaryOperator, Value, ValueWithSpan,
 };
 
 /// Reasons this module refuses to rewrite a statement. Every variant is
@@ -960,6 +961,11 @@ fn substitute_table_factor(
 /// through [`validate_row_filter_expr`] and re-serialized from ITS OWN
 /// parse (with placeholders expanded), never the raw authored string
 /// concatenated.
+///
+/// A `mask` entry never reaches the SQL as text. It is compared with
+/// `real_columns` (the table's own column names, each validated through
+/// `Ident`), and only the matching real column name is written, so an entry
+/// that is not a column adds nothing to the statement.
 fn build_masked_filtered_select(
     name: &ObjectName,
     real_columns: &[String],
@@ -1003,6 +1009,34 @@ fn build_masked_filtered_select(
 /// element of an `IN (...)` list; every function call is on
 /// [`ALLOWED_ROW_FILTER_FUNCTIONS`]; no subquery/`EXISTS`/anything else
 /// outside this narrow, explicitly allowed shape.
+///
+/// The shape is deny by default for literals (SEC-32), and for calls,
+/// operators and qualifiers (SEC-43). A call is its name and a plain list of
+/// unnamed expressions, with no `FILTER`, `OVER`, `WITHIN GROUP`, second
+/// parameter list, null treatment, `DISTINCT` or clause inside the
+/// parentheses, or the ODBC `{fn ...}` form. A binary operator is a
+/// comparison, `AND`, `OR` or one of `+ - * / %`; a unary one is `NOT`, `-`
+/// or `+`. A column may have one unquoted table name before it. Before
+/// SEC-43 the walk did not look at these parts of a call, at an operator, or
+/// at the table name before a column.
+///
+/// A text value may not contain a backslash (SEC-32). This function parses
+/// with `GenericDialect`, which does not read a backslash as an escape, while
+/// `ClickHouse` reads `\'` as an escaped quote. The two parsers can then
+/// disagree on where a string ends. For `x = '\' OR 1=1 --'` the policy
+/// check sees the complete text `\`, then `OR 1=1`, then a `--` comment, so
+/// the filter is `x = '\' OR 1=1`. The validated filter is written back as
+/// `x = '\' OR 1 = 1`, and `ClickHouse` reads `\'` as an escaped quote and
+/// finds an unterminated string. Today that ends in an error, which fails
+/// closed. A crafted text could make both parsers accept the filter and read
+/// it differently, so the backslash is refused instead of relied on to fail.
+/// Only numbers, booleans, `NULL` and a plain single-quoted string are
+/// literals here. The `R'..'`, `N'..'`, `X'..'`, `E'..'` and `$$..$$` forms
+/// are refused too, because the two engines may read them differently.
+///
+/// The `ESCAPE` expression of `LIKE` and `ILIKE` is validated like any
+/// other child expression, so a backslash text, a subquery or a function off
+/// the allowlist is refused there too.
 ///
 /// # Errors
 /// [`RewriteError::InvalidRowFilter`] naming the specific problem.
@@ -1066,13 +1100,8 @@ fn validate_identifier(name: &str, real_columns: &[String]) -> Result<(), Rewrit
 fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), RewriteError> {
     match expr {
         Expr::Identifier(ident) => validate_identifier(&ident.value, real_columns),
-        Expr::CompoundIdentifier(parts) => {
-            let last = parts.last().ok_or_else(|| RewriteError::InvalidRowFilter {
-                reason: "empty compound identifier".to_owned(),
-            })?;
-            validate_identifier(&last.value, real_columns)
-        }
-        Expr::Value(_) => Ok(()),
+        Expr::CompoundIdentifier(parts) => validate_compound_identifier(parts, real_columns),
+        Expr::Value(v) => validate_literal(&v.value),
         Expr::InList {
             expr: inner, list, ..
         } => {
@@ -1093,14 +1122,31 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
                 Ok(())
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
+        // SEC-43: the operator was ignored, so `OPERATOR(pg_catalog.+)`, `||`,
+        // `XOR` and the bit and regex operators passed.
+        Expr::BinaryOp { left, op, right } => {
+            if !is_allowed_binary_operator(op) {
+                return Err(RewriteError::InvalidRowFilter {
+                    reason: OPERATOR_REFUSAL.to_owned(),
+                });
+            }
             validate_expr_shape(left, real_columns)?;
             validate_expr_shape(right, real_columns)
         }
-        Expr::UnaryOp { expr: inner, .. }
-        | Expr::Nested(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner) => validate_expr_shape(inner, real_columns),
+        Expr::UnaryOp { op, expr: inner } => {
+            if !matches!(
+                op,
+                UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
+            ) {
+                return Err(RewriteError::InvalidRowFilter {
+                    reason: OPERATOR_REFUSAL.to_owned(),
+                });
+            }
+            validate_expr_shape(inner, real_columns)
+        }
+        Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            validate_expr_shape(inner, real_columns)
+        }
         Expr::Between {
             expr: inner,
             low,
@@ -1114,15 +1160,24 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
         Expr::Like {
             expr: inner,
             pattern,
+            escape_char,
             ..
         }
         | Expr::ILike {
             expr: inner,
             pattern,
+            escape_char,
             ..
         } => {
             validate_expr_shape(inner, real_columns)?;
-            validate_expr_shape(pattern, real_columns)
+            validate_expr_shape(pattern, real_columns)?;
+            // SEC-32 review fix (BLOCKER): the escape is an expression too.
+            // Unvisited, it let a backslash text, a subquery or a function
+            // off the allowlist pass.
+            if let Some(escape) = escape_char {
+                validate_expr_shape(escape, real_columns)?;
+            }
+            Ok(())
         }
         Expr::Function(f) => validate_function_call(f, real_columns),
         _ => Err(RewriteError::InvalidRowFilter {
@@ -1131,36 +1186,158 @@ fn validate_expr_shape(expr: &Expr, real_columns: &[String]) -> Result<(), Rewri
     }
 }
 
+/// The binary operators a row filter may use (SEC-43): comparisons, `AND`,
+/// `OR` and the arithmetic of `+ - * / %`. Every other variant is refused,
+/// including the ones a later `sqlparser` adds.
+fn is_allowed_binary_operator(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+    )
+}
+
+/// A column, with at most one plain table name before it (SEC-43). Only the
+/// last part was checked, and every part is written back as it came, so a
+/// quoted qualifier such as `"a\".x` reached `ClickHouse` unchecked. The
+/// qualifier only has to be a plain name; it is not compared with the
+/// table's name.
+fn validate_compound_identifier(
+    parts: &[SqlIdent],
+    real_columns: &[String],
+) -> Result<(), RewriteError> {
+    match parts {
+        [] => Err(RewriteError::InvalidRowFilter {
+            reason: "empty compound identifier".to_owned(),
+        }),
+        [column] => validate_identifier(&column.value, real_columns),
+        [qualifier, column] if is_plain_qualifier(qualifier) => {
+            validate_identifier(&column.value, real_columns)
+        }
+        _ => Err(RewriteError::InvalidRowFilter {
+            reason: QUALIFIER_REFUSAL.to_owned(),
+        }),
+    }
+}
+
+const PLAIN_CALL_REFUSAL: &str = "a function call in a row filter takes plain arguments only";
+const OPERATOR_REFUSAL: &str = "operator not allowed in a row filter";
+const QUALIFIER_REFUSAL: &str = "a column in a row filter may have one plain table name before it";
+
+/// Admits numbers, booleans, `NULL` and a plain single-quoted string with
+/// no backslash in its text. Every other [`Value`] variant is refused, so a
+/// variant a later `sqlparser` adds is refused too (SEC-32). The reasons
+/// are fixed texts: a refusal never echoes the literal.
+fn validate_literal(value: &Value) -> Result<(), RewriteError> {
+    match value {
+        Value::Number(..) | Value::Boolean(_) | Value::Null => Ok(()),
+        Value::SingleQuotedString(text) => {
+            if text.contains('\\') {
+                Err(RewriteError::InvalidRowFilter {
+                    reason: "a text value in a row filter cannot contain a backslash".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(RewriteError::InvalidRowFilter {
+            reason: "a row filter accepts plain 'text' values only".to_owned(),
+        }),
+    }
+}
+
+/// Admits a call to a function on [`ALLOWED_ROW_FILTER_FUNCTIONS`] and
+/// nothing else about it (SEC-43). `Function` and `FunctionArgumentList` are
+/// destructured with every field named and no `..`, so a field a later
+/// `sqlparser` adds stops the build here until someone decides what it
+/// means. Before, only `args` was visited: `FILTER (WHERE ...)` with a
+/// subquery, `OVER (...)`, `WITHIN GROUP`, a clause inside the parentheses,
+/// a second parameter list, `DISTINCT`, a null treatment and the ODBC
+/// `{fn ...}` form all passed unseen. The reasons are fixed texts, so a
+/// refusal never repeats the filter.
 fn validate_function_call(f: &Function, real_columns: &[String]) -> Result<(), RewriteError> {
-    let name = f.name.to_string().to_ascii_lowercase();
+    let Function {
+        name,
+        uses_odbc_syntax,
+        parameters,
+        args,
+        within_group,
+        filter,
+        null_treatment,
+        over,
+    } = f;
+    let name = name.to_string().to_ascii_lowercase();
     if !ALLOWED_ROW_FILTER_FUNCTIONS.contains(&name.as_str()) {
         return Err(RewriteError::InvalidRowFilter {
             reason: format!("function '{name}' is not allowed in a row filter"),
         });
     }
-    match &f.args {
-        FunctionArguments::None => Ok(()),
-        FunctionArguments::Subquery(_) => Err(RewriteError::InvalidRowFilter {
-            reason: "a row filter may not contain a subquery".to_owned(),
-        }),
-        FunctionArguments::List(list) => {
-            for arg in &list.args {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                    | FunctionArg::Named {
-                        arg: FunctionArgExpr::Expr(e),
-                        ..
-                    } => validate_expr_shape(e, real_columns)?,
-                    _ => {
-                        return Err(RewriteError::InvalidRowFilter {
-                            reason: "unsupported function argument in a row filter".to_owned(),
-                        });
-                    }
-                }
+    let refuse = || RewriteError::InvalidRowFilter {
+        reason: PLAIN_CALL_REFUSAL.to_owned(),
+    };
+    if *uses_odbc_syntax
+        || !matches!(parameters, FunctionArguments::None)
+        || !within_group.is_empty()
+        || filter.is_some()
+        || null_treatment.is_some()
+        || over.is_some()
+    {
+        return Err(refuse());
+    }
+    // A subquery passed as the sole argument without parentheses is refused
+    // here with the rest of the non-list forms.
+    let FunctionArguments::List(list) = args else {
+        return Err(refuse());
+    };
+    let FunctionArgumentList {
+        duplicate_treatment,
+        args,
+        clauses,
+    } = list;
+    if duplicate_treatment.is_some() || !clauses.is_empty() {
+        return Err(refuse());
+    }
+    for arg in args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                validate_expr_shape(e, real_columns)?;
             }
-            Ok(())
+            // None of the four allowed functions takes a named argument or
+            // a wildcard.
+            FunctionArg::Named { .. }
+            | FunctionArg::ExprNamed { .. }
+            | FunctionArg::Unnamed(
+                FunctionArgExpr::QualifiedWildcard(_)
+                | FunctionArgExpr::Wildcard
+                | FunctionArgExpr::WildcardWithOptions(_),
+            ) => return Err(refuse()),
         }
     }
+    Ok(())
+}
+
+/// One unquoted table name made of ASCII letters, digits and `_`, not
+/// starting with a digit. The qualifier is written back verbatim, so
+/// anything else (a quote, a backslash, a space, a non-ASCII letter) may be
+/// read differently by `ClickHouse` than by the parser used here.
+fn is_plain_qualifier(ident: &SqlIdent) -> bool {
+    let mut chars = ident.value.chars();
+    ident.quote_style.is_none()
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn string_literal_expr(value: &str) -> Expr {
@@ -1278,7 +1455,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         Expr::ILike {
             negated,
@@ -1291,7 +1468,7 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
             any: *any,
             expr: Box::new(expand_expr(inner, values)?),
             pattern: Box::new(expand_expr(pattern, values)?),
-            escape_char: escape_char.clone(),
+            escape_char: expand_escape(escape_char.as_deref(), values)?,
         }),
         // Every other shape (a plain identifier, a literal, an already
         // validated function call whose args contain no placeholder —
@@ -1299,6 +1476,15 @@ fn expand_expr_rest(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, Rew
         // else reaches here) is returned unchanged.
         _ => Ok(expr.clone()),
     }
+}
+
+fn expand_escape(
+    escape: Option<&Expr>,
+    values: &PlaceholderValues,
+) -> Result<Option<Box<Expr>>, RewriteError> {
+    escape
+        .map(|e| expand_expr(e, values).map(Box::new))
+        .transpose()
 }
 
 fn expand_expr(expr: &Expr, values: &PlaceholderValues) -> Result<Expr, RewriteError> {
@@ -1560,10 +1746,35 @@ mod table_substitution {
 mod row_filter {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use sqlparser::ast::Expr;
+    use sqlparser::ast::{Expr, Ident as SqlIdent, ObjectName, ObjectNamePart};
     use sqlparser::parser::Parser;
 
-    use super::{PlaceholderValues, RewriteError, expand_placeholders, validate_row_filter_expr};
+    use super::{
+        PlaceholderValues, RewriteError, build_masked_filtered_select, expand_placeholders,
+        validate_expr_shape, validate_row_filter_expr,
+    };
+
+    const BACKSLASH_REASON: &str = "a text value in a row filter cannot contain a backslash";
+    const PLAIN_TEXT_REASON: &str = "a row filter accepts plain 'text' values only";
+    const PLAIN_CALL_REASON: &str = "a function call in a row filter takes plain arguments only";
+    const OPERATOR_REASON: &str = "operator not allowed in a row filter";
+    const QUALIFIER_REASON: &str =
+        "a column in a row filter may have one plain table name before it";
+    /// A word every refused filter below carries somewhere (in a literal, a
+    /// qualifier or a name), so the helper can prove a refusal reason never
+    /// echoes the filter text.
+    const MARKER: &str = "zebra";
+
+    fn invalid_reason(raw: &str, cols: &[String]) -> String {
+        match validate_row_filter_expr(raw, cols).unwrap_err() {
+            RewriteError::InvalidRowFilter { reason } => reason,
+            other => panic!("expected InvalidRowFilter, got {other:?}"),
+        }
+    }
+
+    fn table_name() -> ObjectName {
+        ObjectName(vec![ObjectNamePart::Identifier(SqlIdent::new("t"))])
+    }
 
     fn parse_test_expr(raw: &str) -> Expr {
         let dialect = sqlparser::dialect::GenericDialect {};
@@ -1629,6 +1840,400 @@ mod row_filter {
         let err = validate_row_filter_expr("tenant_id IN (__principal_tenant_ids__, 'x')", &cols)
             .unwrap_err();
         assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    // SEC-32: the policy check parses a filter with `GenericDialect`, which
+    // does not read a backslash as an escape, while `ClickHouse` does. The
+    // two parsers can disagree on where a string ends, so a text value with
+    // a backslash is refused rather than re-encoded.
+    #[test]
+    fn validate_row_filter_expr_refuses_a_text_value_with_a_backslash() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(invalid_reason(r"x = 'a\\b'", &cols), BACKSLASH_REASON);
+    }
+
+    #[test]
+    fn a_filter_that_ends_a_string_with_a_backslash_is_refused_and_produces_no_sql() {
+        let cols = vec!["x".to_owned()];
+        let raw = r"x = '\' OR 1=1 --'";
+        assert_eq!(invalid_reason(raw, &cols), BACKSLASH_REASON);
+        let built = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &[],
+            Some(raw),
+            &PlaceholderValues::none(),
+        );
+        assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
+    }
+
+    #[test]
+    fn validate_row_filter_expr_refuses_every_text_form_but_the_plain_single_quoted_one() {
+        let cols = vec!["x".to_owned()];
+        // All five parse under `GenericDialect` today, so each reaches the
+        // literal rule rather than being refused by the parse.
+        for raw in ["x = R'a'", "x = N'a'", "x = X'61'", "x = E'a'", "x = $$a$$"] {
+            assert_eq!(invalid_reason(raw, &cols), PLAIN_TEXT_REASON, "{raw}");
+        }
+    }
+
+    // SEC-32 review fix (BLOCKER): `LIKE ... ESCAPE <expr>` carries a child
+    // expression in `escape_char`. The shape walk used to skip it, so a
+    // backslash text, a subquery or an unknown column passed in that slot.
+    #[test]
+    fn a_like_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+        assert_eq!(
+            invalid_reason(r"x NOT LIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn an_ilike_escape_with_a_backslash_is_refused() {
+        let cols = vec!["x".to_owned()];
+        assert_eq!(
+            invalid_reason(r"x ILIKE 'a' ESCAPE '\'", &cols),
+            BACKSLASH_REASON
+        );
+    }
+
+    #[test]
+    fn a_second_string_opened_after_a_backslash_escape_is_refused() {
+        // The policy check reads a `LIKE` with a one-backslash escape and a
+        // comparison against a long text. `ClickHouse` reads `\'` as an
+        // escaped quote, so the string boundaries differ. The backslash in
+        // the escape is the refusal reason.
+        let cols = vec!["x".to_owned()];
+        let raw = r"x LIKE 'a' ESCAPE '\' AND x = ' OR 1=1 OR x = '";
+        assert_eq!(invalid_reason(raw, &cols), BACKSLASH_REASON);
+        let built = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &[],
+            Some(raw),
+            &PlaceholderValues::none(),
+        );
+        assert!(matches!(built, Err(RewriteError::InvalidRowFilter { .. })));
+    }
+
+    #[test]
+    fn a_like_escape_with_a_plain_character_still_passes_and_expands_unchanged() {
+        let cols = vec!["x".to_owned()];
+        for raw in [
+            "x LIKE 'a' ESCAPE '!'",
+            "x ILIKE 'a' ESCAPE '!'",
+            "x NOT LIKE 'a%' ESCAPE '!'",
+            "x LIKE 'a'",
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn a_like_escape_holding_a_subquery_or_an_unknown_column_is_refused() {
+        let cols = vec!["x".to_owned()];
+        let reason = invalid_reason("x LIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x ILIKE 'a' ESCAPE (SELECT 1)", &cols);
+        assert!(
+            reason.starts_with("unsupported row-filter expression"),
+            "{reason}"
+        );
+        let reason = invalid_reason("x LIKE 'a' ESCAPE secret_col", &cols);
+        assert!(reason.contains("is not a real column"), "{reason}");
+        let reason = invalid_reason("x LIKE 'a' ESCAPE sleep(1)", &cols);
+        assert!(
+            reason.contains("is not allowed in a row filter"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_like_escape_placeholder_is_expanded_not_left_as_an_identifier() {
+        let cols = vec!["x".to_owned()];
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        let expr = validate_row_filter_expr("x LIKE 'a' ESCAPE __principal_id__", &cols).unwrap();
+        assert_eq!(
+            expand_placeholders(&expr, &values).unwrap(),
+            "x LIKE 'a' ESCAPE 'u-1'"
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_echo_the_literal() {
+        let cols = vec!["x".to_owned()];
+        let reason = invalid_reason(r"x = 'secret\\value'", &cols);
+        assert!(!reason.contains("secret"));
+        let reason = invalid_reason("x = N'secret'", &cols);
+        assert!(!reason.contains("secret"));
+    }
+
+    #[test]
+    fn a_plain_text_number_boolean_and_null_filter_still_passes_and_expands_unchanged() {
+        let cols = vec!["x".to_owned(), "flag".to_owned()];
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        for (raw, expected) in [
+            ("x = 'plain'", "x = 'plain'"),
+            ("x = 'it''s'", "x = 'it''s'"),
+            ("x = 42", "x = 42"),
+            ("x > 1.5", "x > 1.5"),
+            ("flag = true", "flag = true"),
+            ("x IS NULL", "x IS NULL"),
+            ("x = NULL", "x = NULL"),
+            ("x IN ('a', 'b')", "x IN ('a', 'b')"),
+            ("x = __principal_id__", "x = 'u-1'"),
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &values).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    // Regression: passes on `main` already. A mask entry is compared with the
+    // table's real columns only and never reaches the SQL as text.
+    #[test]
+    fn a_mask_entry_that_is_not_a_column_adds_no_text_to_the_statement() {
+        let cols = vec!["x".to_owned(), "y".to_owned()];
+        let sql = build_masked_filtered_select(
+            &table_name(),
+            &cols,
+            &["x') OR 1=1 --".to_owned()],
+            None,
+            &PlaceholderValues::none(),
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT `x`, `y` FROM t");
+    }
+
+    /// Asserts that `raw` is refused with exactly `expected` and that the
+    /// reason does not repeat any part of the filter.
+    fn assert_refused(raw: &str, expected: &str) {
+        assert!(raw.contains(MARKER), "{raw} carries no marker word");
+        let cols = vec!["x".to_owned(), "y".to_owned(), "t".to_owned()];
+        let reason = invalid_reason(raw, &cols);
+        assert_eq!(reason, expected, "{raw}");
+        assert!(!reason.contains(MARKER), "{raw}: reason echoes the filter");
+    }
+
+    // SEC-43 (follow-up of SEC-32): a function call is checked in every
+    // part. Each test below puts one part of `Function` outside the plain
+    // shape, with the same allowlisted name and a valid argument, so the
+    // only thing wrong with the call is that part.
+    #[test]
+    fn a_call_with_a_filter_clause_is_refused() {
+        assert_refused(
+            "lower(x) FILTER (WHERE x = 'zebra') = 'a'",
+            PLAIN_CALL_REASON,
+        );
+        // The subquery inside `FILTER` is never reached: the clause itself
+        // is refused first, with the same fixed text.
+        assert_refused(
+            "lower(x) FILTER (WHERE x IN (SELECT y FROM zebra)) = 'a'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_an_over_clause_is_refused() {
+        assert_refused(
+            "lower(x) OVER (PARTITION BY x) = 'zebra'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_within_group_clause_is_refused() {
+        assert_refused(
+            "lower(x) WITHIN GROUP (ORDER BY x) = 'zebra'",
+            PLAIN_CALL_REASON,
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_null_treatment_after_the_arguments_is_refused() {
+        assert_refused("lower(x) IGNORE NULLS = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_second_parameter_list_is_refused() {
+        assert_refused("lower(1)(x) = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_in_the_odbc_form_is_refused() {
+        assert_refused("{fn lower(x)} = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_named_argument_is_refused() {
+        assert_refused("lower(zebra => x) = 'a'", PLAIN_CALL_REASON);
+        assert_refused("lower(zebra := x) = 'a'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_duplicate_treatment_is_refused() {
+        assert_refused("lower(DISTINCT x) = 'zebra'", PLAIN_CALL_REASON);
+        assert_refused("lower(ALL x) = 'zebra'", PLAIN_CALL_REASON);
+    }
+
+    #[test]
+    fn a_call_with_a_clause_inside_the_parentheses_is_refused() {
+        for raw in [
+            "lower(x ORDER BY x) = 'zebra'",
+            "lower(x LIMIT 1) = 'zebra'",
+            "lower(x IGNORE NULLS) = 'zebra'",
+            "lower(x WHERE x = 'zebra') = 'a'",
+        ] {
+            assert_refused(raw, PLAIN_CALL_REASON);
+        }
+    }
+
+    #[test]
+    fn a_call_with_a_wildcard_argument_is_refused_without_echoing_the_filter() {
+        // `lower(*)` was already refused; the reason now is the same fixed
+        // text as for every other argument that is not a plain expression.
+        assert_refused("lower(*) = 'zebra'", PLAIN_CALL_REASON);
+        assert_refused("lower(zebra.*) = 'a'", PLAIN_CALL_REASON);
+    }
+
+    // SEC-43: a binary operator is checked against a fixed list. These
+    // parse under `GenericDialect`; `x # 1` and `x DIV 2` do not parse, so
+    // the parser already refuses them.
+    #[test]
+    fn a_custom_operator_is_refused() {
+        assert_refused(
+            "x = 1 OPERATOR(pg_catalog.+) 2 AND x = 'zebra'",
+            OPERATOR_REASON,
+        );
+    }
+
+    #[test]
+    fn an_operator_outside_the_fixed_list_is_refused() {
+        for raw in [
+            "x || 'zebra' = 'b'",
+            "x XOR 'zebra'",
+            "x & 1 = 0 OR x = 'zebra'",
+            "x ^ 1 = 0 OR x = 'zebra'",
+            "x <=> 'zebra'",
+            "x ~ 'zebra'",
+            "x @> 'zebra'",
+            "x -> 'zebra'",
+        ] {
+            assert_refused(raw, OPERATOR_REASON);
+        }
+    }
+
+    #[test]
+    fn a_unary_operator_outside_not_minus_and_plus_is_refused() {
+        assert_refused("~x = 'zebra'", OPERATOR_REASON);
+    }
+
+    // SEC-43: a column may carry one plain table name before it. `!x`, `x!`,
+    // `|/x`, `[t].x` and `1t.x` do not reach the shape walk: the parser
+    // refuses them already.
+    #[test]
+    fn a_quoted_qualifier_is_refused() {
+        assert_refused("\"zebra\\\".x = 1", QUALIFIER_REASON);
+        assert_refused("\"zebra\".x = 1", QUALIFIER_REASON);
+        assert_refused("`zebra`.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_column_with_two_names_before_it_is_refused() {
+        assert_refused("zebra.b.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_qualifier_with_a_character_outside_ascii_letters_digits_and_underscore_is_refused() {
+        assert_refused("zebra\u{e9}.x = 1", QUALIFIER_REASON);
+    }
+
+    #[test]
+    fn a_qualifier_that_starts_with_a_digit_is_refused() {
+        // `GenericDialect` cannot parse `1zebra.x`, so the shape walk is
+        // given the node directly.
+        let expr = Expr::CompoundIdentifier(vec![SqlIdent::new("1zebra"), SqlIdent::new("x")]);
+        let err = validate_expr_shape(&expr, &["x".to_owned()]).unwrap_err();
+        match err {
+            RewriteError::InvalidRowFilter { reason } => assert_eq!(reason, QUALIFIER_REASON),
+            other => panic!("expected InvalidRowFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_call_operator_or_qualifier_produces_no_sql() {
+        let cols = vec!["x".to_owned()];
+        for raw in [
+            "lower(x) OVER (PARTITION BY x) = 'zebra'",
+            "x = 1 OPERATOR(pg_catalog.+) 2",
+            "\"zebra\\\".x = 1",
+        ] {
+            let built = build_masked_filtered_select(
+                &table_name(),
+                &cols,
+                &[],
+                Some(raw),
+                &PlaceholderValues::none(),
+            );
+            assert!(
+                matches!(built, Err(RewriteError::InvalidRowFilter { .. })),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_calls_operators_and_qualifiers_still_pass_and_expand_unchanged() {
+        let cols = vec!["x".to_owned(), "y".to_owned()];
+        for (raw, expected) in [
+            ("lower(x) = 'a'", "lower(x) = 'a'"),
+            ("upper(x) = 'A'", "upper(x) = 'A'"),
+            ("tostring(x) = '1'", "tostring(x) = '1'"),
+            ("todate(x) > '2020-01-01'", "todate(x) > '2020-01-01'"),
+            ("t.x = 1", "t.x = 1"),
+            ("_a.x = 1", "_a.x = 1"),
+            ("x = 1 AND y <> 2", "x = 1 AND y <> 2"),
+            ("x != 1", "x <> 1"),
+            ("x <= 1 OR x < 0", "x <= 1 OR x < 0"),
+            ("NOT x = 1", "NOT x = 1"),
+            ("-x < 1", "-x < 1"),
+            ("+x = 1", "+x = 1"),
+            ("x + 1 > 2", "x + 1 > 2"),
+            ("x % 2 = 0", "x % 2 = 0"),
+            ("x * 2 / 4 >= 1", "x * 2 / 4 >= 1"),
+            ("x - 1 >= 0", "x - 1 >= 0"),
+        ] {
+            let expr = validate_row_filter_expr(raw, &cols)
+                .unwrap_or_else(|e| panic!("{raw} was refused: {e:?}"));
+            assert_eq!(
+                expand_placeholders(&expr, &PlaceholderValues::none()).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

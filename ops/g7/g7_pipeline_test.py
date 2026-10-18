@@ -103,6 +103,15 @@ run). That was true of the commit that first added this file and is not
 true now; SRC-20 runs this gate for real, after G3a, in the
 `g3a-dagster` CI job.
 
+In addition to graph, source, and row materializations, this gate includes
+the BLD-2 D11 target lag verification step (`step_verify_target_lag_bronze_to_silver`):
+measures Bronze-to-Silver lag across 5 append iterations against the
+measured floor (1 minute; BLD-2 review R3 BLOCKER 3: R8 gate runs met it, worst
+sample 32.70 s -- plan D11), then verifies 5 checks with unchanged
+inputs launch no unneeded runs.
+Because of settling intervals and up to 5 runs, this step can take up to
+~20 minutes in worst-case conditions inside the job timeout.
+
 # A failed run must fail the gate (BLD-3 / D7)
 
 `step_trigger_and_wait_for_real_row_materializations` treats FAILURE as
@@ -165,6 +174,8 @@ change what the gate checks.
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 import time
 
@@ -194,6 +205,21 @@ SOURCE_PROVENANCE_MODES = ("required", "unavailable")
 # assertion is on the message and the whole body, not on the serializer's
 # key spacing.
 SOURCE_UNAVAILABLE_BODY = {"error": "source provenance is unavailable for this build"}
+
+
+def lag_sensor_name(pipeline_id: str) -> str:
+    """The Dagster sensor name the code location gives pipeline `pipeline_id`.
+
+    BLD-2 review R1 SHOULD-FIX 14 / R2 SHOULD-FIX 8: the SAME character-by-character
+    derivation as `authored_factory._dagster_safe_name` followed by
+    `authored_factory.lag_sensor_name`. It is duplicated rather than
+    imported because this runner image carries no code location (the gate
+    scripts share no module -- see this file's module doc), so a change to
+    either side has to change both; the comment is what keeps them
+    honestly in step.
+    """
+    safe = "".join(c if c.isalnum() or c == '_' else '_' for c in pipeline_id)
+    return f"authored__{safe}_lag"
 
 # ClickHouse, for the row assertion: the Silver output and the Bronze
 # source are counted through the same client `ops/g3a/g3a_test.py` uses
@@ -1052,6 +1078,244 @@ def _assert_source_refused(op: dict) -> None:
     )
 
 
+
+
+def psql_insert_order(customer: str, amount: float) -> None:
+    """Insert one order into the Postgres demo source table so bronze_ingest_job
+    can load it into Bronze."""
+    # BLD-2 review R1 BLOCKER 8: no runtime pip install, use pinned binary from runner image;
+    # read must-set password without fallback; turn connection errors into G7Failure.
+    try:
+        import psycopg2
+    except ImportError as e:
+        raise G7Failure(f"psycopg2 is required but not installed: {e}") from e
+
+    pg_host = os.environ.get("PGHOST") or os.environ.get("POSTGRES_HOST", "postgres")
+    pg_port = int(os.environ.get("PGPORT") or os.environ.get("POSTGRES_PORT", "5432"))
+    pg_user = os.environ.get("PGUSER") or os.environ.get("POSTGRES_USER", "lakehouse")
+    pg_password = os.environ.get("PGPASSWORD") or os.environ.get("POSTGRES_PASSWORD")
+    if not pg_password:
+        raise G7Failure("POSTGRES_PASSWORD (or PGPASSWORD) environment variable is required")
+    pg_db = os.environ.get("PGDATABASE") or os.environ.get("POSTGRES_DB", "lakehouse")
+
+    try:
+        conn = psycopg2.connect(
+            host=pg_host,
+            port=pg_port,
+            user=pg_user,
+            password=pg_password,
+            dbname=pg_db,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ingest_demo.orders (customer, amount) VALUES (%s, %s);",
+                (customer, amount),
+            )
+        conn.commit()
+        conn.close()
+    except psycopg2.Error as exc:
+        # BLD-2 review R1 BLOCKER 8: a driver/connection error is a gate
+        # failure in its own right, not a traceback that reads as an
+        # unrelated crash. The driver's own text is printed because this
+        # is CI output an operator reads, not an API response.
+        raise G7Failure(f"Failed to insert order into Postgres: {exc}") from exc
+
+
+def trigger_bronze_ingest() -> str:
+    """Triggers bronze_ingest_job and waits for it to succeed."""
+    resp = _post_trigger(f"{API_URL}/api/pipelines/bronze_ingest_job/trigger", "bronze_ingest_job")
+    if not resp.ok:
+        raise G7Failure(f"POST bronze_ingest_job trigger failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    run_id = body.get("id") or body.get("runId")
+    if not run_id:
+        raise G7Failure(f"trigger bronze_ingest_job had no runId: {body}")
+
+    query = (
+        "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename "
+        "... on Run { status } } }"
+    )
+
+    def check() -> bool:
+        r = requests.post(
+            DAGSTER_URL,
+            json={"query": query, "variables": {"rid": run_id}},
+            timeout=10,
+        )
+        r.raise_for_status()
+        status = r.json().get("data", {}).get("pipelineRunOrError", {}).get("status")
+        if status == "FAILURE":
+            raise G7Failure(f"bronze_ingest_job run {run_id} failed")
+        return status == "SUCCESS"
+
+    _wait_for(f"bronze_ingest_job run {run_id} SUCCESS", check, 180, interval_s=2.0)
+    return run_id
+
+
+# The target this gate measures against, in minutes, and the same number in
+# seconds for the assertion. 1 minute is the MEASURED floor (plan D11): before
+# R6a a 1-minute target missed (pre-R6a gate runs), and with R6a's
+# request-to-land budget the R8 runs met it (worst sample 32.70 s). The API's
+# minimum, the migration's CHECK and this gate's target all sit at 1 (BLD-2
+# review R3 BLOCKER 3). They move together, and only with a measurement.
+TARGET_LAG_MINUTES = 1
+TARGET_LAG_SECONDS = float(TARGET_LAG_MINUTES * 60)
+
+
+def step_verify_target_lag_bronze_to_silver(pipeline_id: str) -> None:
+    """BLD-2 D11 gate: measure Bronze-to-Silver lag with the measured
+    floor as target on the compose stack.
+
+    Appends rows to Bronze 5 times, measuring each time-to-Silver.
+    Then leaves inputs unchanged for 5 checks, asserting no new run and
+    status 'met'."""
+    print(f"[g7] configuring targetLag={TARGET_LAG_MINUTES} minutes on {pipeline_id}")
+    resp = API.put(
+        f"{API_URL}/api/pipelines/{pipeline_id}/target-lag",
+        json={"targetLag": {"kind": "lag", "minutes": TARGET_LAG_MINUTES}},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise G7Failure(f"PUT /target-lag failed: {resp.status_code} {resp.text}")
+
+    # BLD-2 review R2 SHOULD-FIX 8: raise_for_status on detail request
+    pipe_detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+    pipe_detail_resp.raise_for_status()
+    pipe_detail = pipe_detail_resp.json()
+    if pipe_detail.get("targetLag") != {"kind": "lag", "minutes": TARGET_LAG_MINUTES}:
+        raise G7Failure(f"pipeline targetLag not set as expected: {pipe_detail.get('targetLag')}")
+
+    # BLD-2 review R1 SHOULD-FIX 14: the same derivation as the factory's
+    # `_dagster_safe_name`, through `lag_sensor_name()` below.
+    sensor_name = lag_sensor_name(pipeline_id)
+    sel = {
+        "repositoryName": "__repository__",
+        "repositoryLocationName": "dispar_orchestrate.definitions",
+        "sensorName": sensor_name,
+    }
+    def sensor_running() -> bool:
+        r = requests.post(
+            DAGSTER_URL,
+            json={
+                "query": "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { __typename ... on Sensor { sensorState { status } } } }",
+                "variables": {"sel": sel},
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", {}).get("sensorOrError", {})
+        if data.get("__typename") != "Sensor":
+            return False
+        return data.get("sensorState", {}).get("status") == "RUNNING"
+
+    # BLD-2 review R1 SHOULD-FIX 14: assert the lag sensor is RUNNING instead of starting it (D6 default_status)
+    _wait_for(f"sensor {sensor_name} to appear and be RUNNING in Dagster", sensor_running, timeout_s=90, interval_s=2.0)
+    print(f"[g7] confirmed sensor {sensor_name} is RUNNING")
+
+    print(f"[g7] waiting for initial baseline lag status to settle to 'met'...")
+    def baseline_settled() -> bool:
+        detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+        detail_resp.raise_for_status()
+        detail = detail_resp.json()
+        lag = detail.get("lag") or {}
+        st = lag.get("status")
+        # BLD-2 review R1 SHOULD-FIX 14: remove unused ticks fetch and one-liner
+        runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=5)
+        runs_resp.raise_for_status()
+        runs_list = runs_resp.json().get("runs", [])
+        print(f"[g7] baseline probe: status={st!r}, reason={lag.get('reason')!r}, runs={[(r.get('id'), r.get('status')) for r in runs_list]}")
+        return st == "met"
+
+    _wait_for("initial baseline lag status 'met'", baseline_settled, timeout_s=180, interval_s=5.0)
+
+    samples: list[float] = []
+    for sample_idx in range(1, 6):
+        cust_name = f"lag_cust_{sample_idx}_{int(time.time())}"
+        psql_insert_order(cust_name, 100.0 + sample_idx)
+
+        trigger_bronze_ingest()
+        # BLD-2 review R1 SHOULD-FIX 15: `trigger_bronze_ingest` polls the
+        # ingest run to SUCCESS at a 2 s interval, so this timestamp is
+        # taken AFTER the row landed in Bronze -- by the ingest run's own
+        # duration plus up to one poll interval. Every sample therefore
+        # reads LOW by that amount. The bias is printed with every sample
+        # (and carried into the result file) rather than corrected: reading
+        # the snapshot's own `last_updated_ms` would need either an Iceberg
+        # metadata surface this runner does not have or a second derivation
+        # of the same instant, and a gate that quietly measures a
+        # different thing is worse than one that says what it measured.
+        commit_t = time.time()
+
+        bronze_rows = int(
+            ch_query(
+                f"SELECT count(DISTINCT id) FROM {CATALOG_DB}.`bronze.{BRONZE_TABLE_NAME}` "
+                "WHERE 1 SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+            ).strip()
+        )
+
+        # BLD-2 review R2 SHOULD-FIX 8: clean silver wait without polling debug probe
+        def silver_reached() -> bool:
+            curr_silver = int(
+                ch_query(f"SELECT count() FROM silver.`{SILVER_TABLE_NAME}` FORMAT TabSeparated").strip()
+            )
+            return curr_silver >= bronze_rows
+
+        _wait_for(f"Silver table to reach {bronze_rows} rows", silver_reached, timeout_s=180, interval_s=2.0)
+        silver_t = time.time()
+        elapsed = silver_t - commit_t
+        samples.append(elapsed)
+        print(
+            f"[g7] TARGET_LAG_SAMPLE_{sample_idx}: Bronze commit -> Silver reached "
+            f"{bronze_rows} rows in {elapsed:.2f}s "
+            f"(commit_t is taken after the ingest run reached SUCCESS, so the sample "
+            f"EXCLUDES the ingest run and reads low by its duration plus up to 2 s of "
+            f"poll granularity — review R1 SHOULD-FIX 15)"
+        )
+
+    runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10)
+    if not runs_resp.ok:
+        raise G7Failure(f"GET /runs failed: {runs_resp.status_code}")
+    baseline_run_count = len(runs_resp.json().get("runs", []))
+    print(f"[g7] baseline run count before unchanged checks: {baseline_run_count}")
+
+    for check_idx in range(1, 6):
+        time.sleep(30)
+        # BLD-2 review R2 SHOULD-FIX 8: raise_for_status in unchanged checks
+        detail_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}", timeout=10)
+        detail_resp.raise_for_status()
+        detail = detail_resp.json()
+        lag = detail.get("lag") or {}
+        status = lag.get("status")
+        if status != "met":
+            raise G7Failure(
+                f"Unchanged inputs check {check_idx}/5 expected status 'met', got {status!r} (reason: {lag.get('reason')})"
+            )
+        runs_resp = API.get(f"{API_URL}/api/pipelines/{pipeline_id}/runs", timeout=10)
+        runs_resp.raise_for_status()
+        runs_now = len(runs_resp.json().get("runs", []))
+        if runs_now != baseline_run_count:
+            raise G7Failure(
+                f"Unchanged inputs check {check_idx}/5 expected {baseline_run_count} runs, got {runs_now} (new run launched unexpectedly)"
+            )
+        print(f"[g7] UNCHANGED_CHECK_{check_idx}/5: status=met, runs={runs_now} (no new run)")
+
+    avg_sample = sum(samples) / len(samples)
+    print(f"[g7] TARGET_LAG_RESULT: 5 samples = {[round(s, 2) for s in samples]}s, avg = {avg_sample:.2f}s")
+    # BLD-2 review R1 BLOCKER 8: a sample over the target FAILS the gate
+    # (D11: the floor is reported and the minimum raised in the same PR,
+    # never a pass).
+    if any(s > TARGET_LAG_SECONDS for s in samples):
+        raise G7Failure(
+            f"NOT ALL SAMPLES MET THE {TARGET_LAG_MINUTES}-MINUTE TARGET "
+            f"(<= {int(TARGET_LAG_SECONDS)}s): samples={[round(s, 2) for s in samples]}s, "
+            f"max={max(samples):.2f}s > {int(TARGET_LAG_SECONDS)}s"
+        )
+    print(
+        f"[g7] TARGET_LAG_RESULT: ALL 5 SAMPLES MET THE {TARGET_LAG_MINUTES}-MINUTE TARGET "
+        f"(<= {int(TARGET_LAG_SECONDS)}s)"
+    )
+
+
 def main() -> int:
     seeded_spec: dict | None = None
     try:
@@ -1108,6 +1372,7 @@ def main() -> int:
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
         step_verify_the_silver_rows_match_the_bronze_source()
         step_verify_graph_and_source()
+        step_verify_target_lag_bronze_to_silver(pipeline_id)
     except G7Failure as exc:
         print(f"[g7] FAILED: {exc}", file=sys.stderr)
         return 1

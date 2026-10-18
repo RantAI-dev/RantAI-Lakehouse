@@ -86,6 +86,12 @@ class FakeSession:
         return self._answer("DELETE", url, None)
 
 
+def confirm_reply(tool: str, result: dict[str, Any], outcome: str = "executed", status: int = 200) -> dict[str, Any]:
+    """What `send_confirm` returns: the `POST /api/ai/tool` reply
+    `{tool, outcome, result}` with the HTTP status added as `_status`."""
+    return {"tool": tool, "outcome": outcome, "result": result, "_status": status}
+
+
 # ── pass rule and set verdict ─────────────────────────────────────────────
 
 
@@ -265,6 +271,18 @@ class CleanupPlanTests(unittest.TestCase):
         # charts, then calculated fields, then SQL sources, then boards.
         self.assertEqual(order, [("chart", "c2"), ("chart", "c1"), ("field", "f1"), ("source", "s1"), ("board", "b1")])
 
+    def test_a_metric_is_deleted_after_the_charts_that_use_it_and_before_its_source_and_fields(self) -> None:
+        # A metric refuses its delete with 409 while a chart uses it, and a
+        # metric on a SQL source must go before that source.
+        created = [
+            {"kind": "source", "id": "s1"},
+            {"kind": "metric", "id": "m1"},
+            {"kind": "field", "id": "f1"},
+            {"kind": "chart", "id": "c1"},
+        ]
+        order = [s["kind"] for s in m.cleanup_plan(created)]
+        self.assertEqual(order, ["chart", "metric", "field", "source"])
+
     def test_within_a_kind_the_last_created_is_deleted_first(self) -> None:
         created = [{"kind": "chart", "id": "c1"}, {"kind": "chart", "id": "c2"}, {"kind": "chart", "id": "c3"}]
         self.assertEqual([s["id"] for s in m.cleanup_plan(created)], ["c3", "c2", "c1"])
@@ -274,6 +292,7 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertEqual(m.DELETE_ROUTES["field"], "/api/dashboard/calc-fields")
         self.assertEqual(m.DELETE_ROUTES["source"], "/api/dashboard/sources")
         self.assertEqual(m.DELETE_ROUTES["board"], "/api/dashboard/boards")
+        self.assertEqual(m.DELETE_ROUTES["metric"], "/api/dashboard/metrics")
 
     def test_cleanup_deletes_what_the_run_created_and_nothing_else(self) -> None:
         cfg = make_cfg()
@@ -348,7 +367,7 @@ class CleanupPlanTests(unittest.TestCase):
     def test_created_objects_are_collected_from_setup_trace_and_confirm(self) -> None:
         setup_results = [{"kind": "board", "id": "b1"}]
         trace = [{"tool": "create_chart", "result": {"created": True, "id": "c1"}}, {"tool": "create_chart", "result": {"error": "no"}}]
-        confirms = [{"tool": "create_calculated_field", "result": {"ok": True, "id": "f1"}}]
+        confirms = [{"tool": "create_calculated_field", "result": confirm_reply("create_calculated_field", {"ok": True, "id": "f1"})}]
         found = m.collect_created(setup_results, [trace], confirms)
         # The confirmed calculated field is collected too; the failed chart is not.
         self.assertEqual(
@@ -368,8 +387,44 @@ class CleanupPlanTests(unittest.TestCase):
         self.assertEqual(m.collect_created([], [trace], []), [])
 
     def test_a_calc_field_confirm_that_failed_is_not_collected(self) -> None:
-        confirms = [{"tool": "create_calculated_field", "result": {"error": "bad", "id": "f-theirs"}}]
+        confirms = [{"tool": "create_calculated_field", "result": confirm_reply("create_calculated_field", {"error": "bad", "id": "f-theirs"}, outcome="failed")}]
         self.assertEqual(m.collect_created([], [], confirms), [])
+
+    def test_a_confirmed_chart_and_board_are_collected_from_the_real_reply_shape(self) -> None:
+        # `POST /api/ai/tool` answers {tool, outcome, result}; the created
+        # object's id and `created` marker are in the inner `result`.
+        confirms = [
+            {"tool": "create_chart", "result": confirm_reply("create_chart", {"created": True, "id": "c77"})},
+            {"tool": "create_board", "result": confirm_reply("create_board", {"created": True, "id": "b88"})},
+        ]
+        self.assertEqual(
+            m.collect_created([], [], confirms),
+            [{"kind": "chart", "id": "c77"}, {"kind": "board", "id": "b88"}],
+        )
+
+    def test_a_confirmed_chart_reaches_the_state_check_and_the_cleanup_of_a_run(self) -> None:
+        # The seam: a case that confirms a chart. The chart the confirm made
+        # counts in `expect_state`, and the run deletes it afterwards.
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/ai/chat"): {
+                "answer": "Drafted.",
+                "toolTrace": [{"tool": "create_chart", "args": {"caption": "C"},
+                               "result": {"needs_confirmation": True, "tool": "create_chart", "args": {"caption": "C"}}}],
+            },
+            ("POST", "/api/ai/tool"): confirm_reply("create_chart", {"created": True, "id": "c77"}),
+            ("GET", "/api/dashboard/specs"): {"specs": [{"id": "c77"}]},
+        })
+        case = {
+            "id": "confirmed_chart",
+            "mode": "build",
+            "confirm": True,
+            "turns": ["Draw it."],
+            "expect_state": [{"path": "/api/dashboard/specs", "list": "specs", "where": {}, "count": 1}],
+        }
+        result = m.run_case(cfg, session, case)
+        self.assertEqual(result["problems"], [])
+        self.assertIn(("DELETE", "http://api.test/api/dashboard/specs?id=c77", None), session.calls)
 
     def test_a_calc_field_created_in_a_turn_is_collected_as_a_field(self) -> None:
         # The real success: `{ok: true, field: {id}}`, with `id` lifted to the top.
@@ -404,6 +459,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(m.kind_of_path("/api/dashboard/boards"), "board")
         self.assertEqual(m.kind_of_path("/api/dashboard/sources"), "source")
         self.assertEqual(m.kind_of_path("/api/dashboard/calc-fields"), "field")
+        self.assertEqual(m.kind_of_path("/api/dashboard/metrics"), "metric")
         self.assertIsNone(m.kind_of_path("/api/other"))
 
     def test_a_setup_name_substitutes_into_a_turn(self) -> None:
@@ -435,6 +491,13 @@ class SetupTests(unittest.TestCase):
         filled = m.fill_check(check, names)
         self.assertEqual(filled["where"], {"id": "c-1"})
         self.assertEqual(m.expect_state_problems(cfg, session, filled, own_ids={"c-1"}), [])
+
+    def test_an_expect_state_where_key_can_use_a_saved_name(self) -> None:
+        # A board's layout is keyed by chart id, so the id is part of the key.
+        check = {"path": "/api/dashboard/boards", "list": "boards",
+                 "where": {"id": "{board}", "layout.{chart}.w": 6}, "count": 1}
+        filled = m.fill_check(check, {"board": "b-7", "chart": "c-1"})
+        self.assertEqual(filled["where"], {"id": "b-7", "layout.c-1.w": 6})
 
     def test_a_failed_setup_call_raises_so_the_run_is_a_setup_error(self) -> None:
         cfg = make_cfg()
@@ -567,11 +630,12 @@ class WhereMatchTests(unittest.TestCase):
         # The three cases that could never pass (P1) must now resolve against
         # the shape the route returns, so a perfect assistant can match them.
         cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        # The seed has no date column, so both read a SQL source the case makes.
         self.assertEqual(
-            cases["chart_line_monthly"]["expect_state"][0]["where"], {"mart": "mart_wisman", "kind": "line", "def.grain": "month"}
+            cases["chart_line_monthly"]["expect_state"][0]["where"], {"sqlSource": "{src}", "kind": "line", "def.grain": "month"}
         )
         self.assertEqual(
-            cases["chart_quarterly_id"]["expect_state"][0]["where"], {"kind": "line", "def.grain": "quarter"}
+            cases["chart_quarterly_id"]["expect_state"][0]["where"], {"sqlSource": "{src}", "kind": "line", "def.grain": "quarter"}
         )
         table = {"id": "t", "kind": "table", "mart": "mart_event", "def": {"tableMode": "rows", "kind": "table"}}
         self.assertEqual(
@@ -677,6 +741,69 @@ class RunCaseTests(unittest.TestCase):
         self.assertEqual(modes, ["ask", "build"])
 
 
+    def test_a_run_fills_the_setup_names_in_the_expected_tool_args(self) -> None:
+        cfg = make_cfg()
+        session = FakeSession({
+            ("POST", "/api/dashboard/boards"): {"board": {"id": "b-9"}},
+            ("POST", "/api/ai/chat"): {
+                "answer": "Renamed.",
+                "toolTrace": [{"tool": "update_board", "args": {"id": "b-9", "name": "N"}, "result": {"ok": True}}],
+            },
+        })
+        case = {
+            "id": "rename",
+            "mode": "build",
+            "setup": [{"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {}, "id_at": "board.id"}],
+            "turns": ["Rename it."],
+            "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}},
+        }
+        result = m.run_case(cfg, session, case)
+        self.assertEqual(result["missing"], [])
+
+    def run_confirming_case(self, reply: Any) -> dict[str, Any]:
+        session = FakeSession({
+            ("POST", "/api/ai/chat"): {
+                "answer": "Drafted.",
+                "toolTrace": [{"tool": "create_chart", "args": {"caption": "C"},
+                               "result": {"needs_confirmation": True, "tool": "create_chart", "args": {"caption": "C"}}}],
+            },
+            ("POST", "/api/ai/tool"): reply,
+        })
+        case = {"id": "confirming", "mode": "build", "confirm": True, "turns": ["Draw it."]}
+        return m.run_case(make_cfg(), session, case)
+
+    def test_a_confirm_that_came_back_executed_adds_no_problem(self) -> None:
+        result = self.run_confirming_case(confirm_reply("create_chart", {"created": True, "id": "c1"}))
+        self.assertEqual(result["problems"], [])
+
+    def test_a_confirm_with_http_500_is_a_problem_naming_the_status(self) -> None:
+        reply = FakeResponse(500, {"error": "boom"})
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("HTTP 500", problem[0])
+
+    def test_a_confirm_with_an_error_status_is_a_problem_even_when_the_body_says_executed(self) -> None:
+        reply = FakeResponse(502, confirm_reply("create_chart", {"created": True, "id": "c1"}))
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("HTTP 502", problem[0])
+
+    def test_a_confirm_with_an_outcome_other_than_executed_is_a_problem_naming_it(self) -> None:
+        reply = confirm_reply("create_chart", {"error": "bad spec"}, outcome="failed")
+        result = self.run_confirming_case(reply)
+        problem = [p for p in result["problems"] if p.startswith("confirm create_chart")]
+        self.assertEqual(len(problem), 1)
+        self.assertIn("outcome failed", problem[0])
+        self.assertIn("HTTP 200", problem[0])
+
+    def test_a_confirm_reply_with_an_error_is_a_problem(self) -> None:
+        reply = {"tool": "create_chart", "outcome": "executed", "error": "late failure", "result": {}}
+        result = self.run_confirming_case(reply)
+        self.assertTrue([p for p in result["problems"] if p.startswith("confirm create_chart")])
+
+
 # ── the existing 28 cases score as before ─────────────────────────────────
 
 
@@ -716,6 +843,58 @@ class ExistingCasesTests(unittest.TestCase):
         self.assertEqual(out["completeness"], 1.0)
         self.assertEqual(len(out["runs"]), 1)
         self.assertTrue(out["passed"])
+
+
+class ScoreCaseTests(unittest.TestCase):
+    """`score_case` on one scripted turn: no facts, so the tool check, the
+    refusal cues and the confirm problems are the only things judged."""
+
+    @staticmethod
+    def body(answer: str, trace: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return {"answer": answer, "toolTrace": trace or [], "_status": 200, "_elapsed_s": 1}
+
+    def test_a_name_in_args_contains_is_filled_before_it_is_compared(self) -> None:
+        case = {"id": "rename", "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}}}
+        trace = [{"tool": "update_board", "args": {"id": "b-42", "name": "New"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)], names={"board": "b-42"})
+        self.assertEqual(scored["missing"], [])
+
+    def test_a_name_that_is_not_the_called_id_is_still_missing(self) -> None:
+        case = {"id": "rename", "expect_tool": {"name": "update_board", "args_contains": {"id": "{board}"}}}
+        trace = [{"tool": "update_board", "args": {"id": "b-other"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)], names={"board": "b-42"})
+        self.assertEqual(len(scored["missing"]), 1)
+
+    def test_names_are_optional_for_a_rescore(self) -> None:
+        # `--rescore` has no setup names: an `args_contains` without a
+        # placeholder scores as before.
+        case = {"id": "t", "expect_tool": {"name": "create_chart", "args_contains": {"kind": "bar"}}}
+        trace = [{"tool": "create_chart", "args": {"kind": "bar"}}]
+        scored = m.score_case(make_cfg(), None, case, [self.body("Done.", trace)])
+        self.assertEqual(scored["missing"], [])
+
+    def refused(self, answer: str) -> bool:
+        case = {"id": "r", "expect_refusal": True}
+        scored = m.score_case(make_cfg(), None, case, [self.body(answer)])
+        return "answered a question the data cannot answer" not in scored["problems"]
+
+    def test_a_plain_cannot_is_a_refusal(self) -> None:
+        self.assertTrue(self.refused("I can't create charts here."))
+        self.assertTrue(self.refused("Charts can't read a Silver table directly."))
+        self.assertTrue(self.refused("I cannot do that in ask mode."))
+        self.assertTrue(self.refused("I can not draw that."))
+        self.assertTrue(self.refused("I am not able to change the board."))
+
+    def test_an_indonesian_cannot_is_a_refusal(self) -> None:
+        self.assertTrue(self.refused("Saya tidak bisa membuat grafik di sini."))
+        self.assertTrue(self.refused("Itu tidak dapat dilakukan."))
+
+    def test_a_curly_apostrophe_still_counts(self) -> None:
+        self.assertTrue(self.refused("I can\u2019t create charts here."))
+        self.assertTrue(self.refused("That isn\u2019t available."))
+
+    def test_an_answer_with_no_cue_is_not_a_refusal(self) -> None:
+        self.assertFalse(self.refused("Here is the chart you asked for."))
 
 
 # ── exit codes and the output file ────────────────────────────────────────
@@ -871,12 +1050,16 @@ class DashboardRowsTests(unittest.TestCase):
 
     def test_kpi_compare_asserts_the_compare_is_set(self) -> None:
         # row 11: "KPI with `compare` set" -> def.compare.kind matches.
-        where = self.cases()["chart_kpi_compare"]["expect_state"][0]["where"]
+        # A compare needs a date column, which only the case's SQL source has.
+        case = self.cases()["chart_kpi_compare"]
+        where = m.fill_check(case["expect_state"][0], {"src": "s-1"})["where"]
         self.assertEqual(where.get("def.compare.kind"), "previous")
-        kpi = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi", "compare": {"kind": "previous", "period": "month"}}}
+        kpi = {"id": "k", "kind": "kpi", "mart": "", "sqlSource": "s-1", "def": {"kind": "kpi", "compare": {"kind": "previous", "period": "month"}}}
         self.assertTrue(m.where_matches(kpi, where))
-        plain = {"id": "k", "kind": "kpi", "mart": "mart_wisman", "def": {"kind": "kpi"}}
+        plain = {"id": "k", "kind": "kpi", "mart": "", "sqlSource": "s-1", "def": {"kind": "kpi"}}
         self.assertFalse(m.where_matches(plain, where))
+        other_source = {**kpi, "sqlSource": "s-2"}
+        self.assertFalse(m.where_matches(other_source, where))
 
     def test_pivot_asserts_its_kind_and_its_rows_and_columns(self) -> None:
         # row 13: "Pivot with `rows` and `columns`" -> kind pivot, rows and columns.
@@ -889,6 +1072,104 @@ class DashboardRowsTests(unittest.TestCase):
         self.assertTrue(m.where_matches(pivot, where))
         grouped = {"id": "g", "kind": "table", "mart": "mart_wisman", "def": {"kind": "table"}}
         self.assertFalse(m.where_matches(grouped, where))
+
+    def test_pivot_totals_case_asserts_a_grand_total(self) -> None:
+        # A pivot without `totals: grand` must fail, whatever its rows and columns.
+        where = self.cases()["chart_pivot_totals"]["expect_state"][0]["where"]
+        self.assertEqual(where["kind"], "pivot")
+        self.assertEqual(where.get("def.totals"), "grand")
+        with_totals = {"id": "p", "kind": "pivot", "mart": "mart_wisman",
+                       "def": {"kind": "pivot", "rows": ["tahun"], "columns": ["bulan_no"], "totals": "grand"}}
+        self.assertTrue(m.where_matches(with_totals, where))
+        for totals in ("none", "all"):
+            other = {**with_totals, "def": {**with_totals["def"], "totals": totals}}
+            self.assertFalse(m.where_matches(other, where), totals)
+        no_totals = {**with_totals, "def": {k: v for k, v in with_totals["def"].items() if k != "totals"}}
+        self.assertFalse(m.where_matches(no_totals, where))
+
+    def test_the_date_cases_read_a_sql_source_made_in_setup_with_a_date_column(self) -> None:
+        # The seed has no date column. Each case builds one in a source and the
+        # state check names that source, so a model that charts the mart fails.
+        for case_id in ("chart_line_monthly", "chart_quarterly_id", "chart_kpi_compare"):
+            case = self.cases()[case_id]
+            setup = case["setup"]
+            self.assertEqual([c["path"] for c in setup], ["/api/dashboard/sources"], case_id)
+            self.assertIn("makeDate(", setup[0]["body"]["sql"], case_id)
+            self.assertIn("serving.mart_wisman", setup[0]["body"]["sql"], case_id)
+            where = case["expect_state"][0]["where"]
+            self.assertEqual(where["sqlSource"], "{" + setup[0]["name"] + "}", case_id)
+            self.assertNotIn("mart", where, case_id)
+            self.assertNotIn("mart", case["expect_tool"]["args_contains"], case_id)
+            self.assertEqual(case["expect_tool"]["args_contains"]["sqlSource"], where["sqlSource"], case_id)
+            # The turn names the source by its title, so the model finds it with list_sql_sources.
+            self.assertIn(setup[0]["body"]["title"], case["turns"][0], case_id)
+
+    def test_the_quarterly_case_stays_in_indonesian(self) -> None:
+        self.assertEqual(self.cases()["chart_quarterly_id"].get("lang"), "id")
+
+    def test_metric_first_cases_make_a_metric_and_assert_the_chart_uses_it(self) -> None:
+        # A metric measure is saved as {"metric": <name>}, so a plain
+        # `def.measures` match cannot see it; `def.measures[].metric` can.
+        for case_id, lang in (("metric_first", None), ("metric_first_id", "id")):
+            case = self.cases()[case_id]
+            self.assertEqual(case.get("lang"), lang, case_id)
+            self.assertIs(case.get("confirm"), True, case_id)
+            metric = case["setup"][0]
+            self.assertEqual(metric["path"], "/api/dashboard/metrics", case_id)
+            self.assertEqual(metric["id_at"], "metric.id", case_id)
+            self.assertEqual(metric["body"]["mart"], "mart_wisman", case_id)
+            self.assertEqual(metric["body"]["formula"], "Sum([jumlah])", case_id)
+            name = metric["body"]["name"]
+            self.assertNotEqual(name, "jumlah", case_id)
+            where = case["expect_state"][0]["where"]
+            self.assertEqual(where["def.measures[].metric"], name, case_id)
+            self.assertEqual(case["expect_state"][0]["count"], 1, case_id)
+            # The turn does not name the metric: the model has to find it.
+            self.assertNotIn(name, case["turns"][0], case_id)
+
+            def chart(measures: list[Any]) -> dict[str, Any]:
+                return {"id": "c", "kind": "bar", "mart": "mart_wisman",
+                        "def": {"kind": "bar", "dimension": "negara", "measures": measures}}
+
+            self.assertTrue(m.where_matches(chart([{"metric": name}]), where), case_id)
+            self.assertFalse(m.where_matches(chart(["jumlah"]), where), case_id)
+            self.assertFalse(m.where_matches(chart([{"metric": "other_metric"}]), where), case_id)
+
+    def test_the_two_metric_first_cases_use_different_metric_names(self) -> None:
+        cases = self.cases()
+        names = {cases[c]["setup"][0]["body"]["name"] for c in ("metric_first", "metric_first_id")}
+        self.assertEqual(len(names), 2)
+
+    def test_arrange_case_is_true_only_for_a_board_whose_tiles_are_half_width(self) -> None:
+        # `GET /api/dashboard/boards` returns each board's `layout` as
+        # {chartId: {x, y, w, h}}. A board with its charts but no saved layout
+        # (the state before the write) must fail the check; the arranged one passes.
+        cfg = make_cfg()
+        check = self.cases()["board_arrange_half_width"]["expect_state"][0]
+        names = {"board": "b-7", "chart_a": "c-a", "chart_b": "c-b"}
+        filled = m.fill_check(check, names)
+
+        def problems(layout: dict[str, Any]) -> list[str]:
+            session = FakeSession({("GET", "/api/dashboard/boards"): {"boards": [
+                {"id": "b-7", "name": "T", "layout": layout, "chartCount": 2, "builtin": False},
+            ]}})
+            return m.expect_state_problems(cfg, session, filled, own_ids={"b-7"})
+
+        self.assertTrue(problems({}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 0, "y": 4, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}}))
+        # Each of the four layout keys is guarded on its own: chart a correct,
+        # chart b wrong in exactly one of width or row.
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 0, "y": 0, "w": 12, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 4, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 0, "w": 12, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
+        self.assertTrue(problems({"c-a": {"x": 0, "y": 4, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}))
+        self.assertEqual(
+            problems({"c-a": {"x": 0, "y": 0, "w": 6, "h": 4}, "c-b": {"x": 6, "y": 0, "w": 6, "h": 4}}), []
+        )
+        self.assertEqual(
+            problems({"c-a": {"x": 6, "y": 0, "w": 6, "h": 2}, "c-b": {"x": 0, "y": 0, "w": 6, "h": 2}}), []
+        )
 
     def test_chart_on_new_board_links_the_chart_to_the_board_it_created(self) -> None:
         # row 14: the chart's `board` is the id of the board this run created.
@@ -941,7 +1222,7 @@ class DashboardRowsTests(unittest.TestCase):
                   "result": {"needs_confirmation": True, "tool": "create_calculated_field",
                              "args": {"formula": "SELECT 1"}}}]
         confirms = [{"tool": "create_calculated_field",
-                     "result": {"ok": True, "field": {"formula": "SELECT 1"}}}]
+                     "result": confirm_reply("create_calculated_field", {"ok": True, "field": {"formula": "SELECT 1"}})}]
         self.assertTrue(m.formula_problems(trace, confirms, ["SELECT"]))
 
     def test_a_clean_confirmed_formula_is_not_a_problem(self) -> None:
@@ -949,7 +1230,7 @@ class DashboardRowsTests(unittest.TestCase):
                   "result": {"needs_confirmation": True, "tool": "create_calculated_field",
                              "args": {"formula": "[jumlah_event] / 2"}}}]
         confirms = [{"tool": "create_calculated_field",
-                     "result": {"ok": True, "field": {"formula": "[jumlah_event] / 2"}}}]
+                     "result": confirm_reply("create_calculated_field", {"ok": True, "field": {"formula": "[jumlah_event] / 2"}})}]
         self.assertEqual(m.formula_problems(trace, confirms, ["SELECT"]), [])
 
     def test_a_pending_confirmation_alone_is_not_a_created_formula(self) -> None:
@@ -1018,6 +1299,121 @@ class DashboardCasesTests(unittest.TestCase):
                 continue
             self.assertIs(case.get("confirm"), True, case["id"])
             self.assertIn("expect_state", case, case["id"])
+
+    def test_the_two_chained_write_cases_ask_for_the_chart_in_a_second_turn(self) -> None:
+        # One message cannot carry both writes: the board or the field waits
+        # for its own Confirm, so the chart has nothing to name in that turn.
+        # `run_case` confirms inside each turn before sending the next, so the
+        # chart is asked for in a turn of its own.
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        want = {
+            "chart_on_new_board": (
+                "Now put a bar chart of events per year on the board \"Eval Events Board\".",
+                {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
+            ),
+            "calc_then_chart": (
+                "Now chart per_event by year.",
+                {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
+            ),
+        }
+        for case_id, (second_turn, expect_tool) in want.items():
+            case = cases[case_id]
+            self.assertEqual(len(case["turns"]), 2, case_id)
+            self.assertNotIn("chart", case["turns"][0].lower(), case_id)
+            self.assertEqual(case["turns"][1], second_turn, case_id)
+            self.assertIs(case.get("confirm"), True, case_id)
+            self.assertEqual(case["expect_tool"], expect_tool, case_id)
+            self.assertEqual(len(case["expect_state"]), 2, case_id)
+
+
+class ToolArgsMatchTest(unittest.TestCase):
+    """BLD-2 review R4 BLOCKER 2 / decision R15: a wanted NUMBER matches only
+    a number equal to it (`minutes: 10` never matches `100`), a wanted
+    STRING matches case-insensitively as a substring of a string value AND
+    of the JSON text of a list or object value (a filters array of objects,
+    a qualified table name)."""
+
+    def test_a_number_that_merely_contains_the_wanted_number_does_not_match(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 100}}
+        self.assertFalse(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_an_equal_number_matches_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "orders_clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(m.tool_args_match(args, {"targetLag.minutes": 10}))
+
+    def test_a_wanted_number_matches_an_equal_member_of_a_list(self) -> None:
+        self.assertTrue(m.tool_args_match({"minutes": [10, 100]}, {"minutes": 10}))
+        self.assertFalse(m.tool_args_match({"minutes": [100]}, {"minutes": 10}))
+
+    def test_an_equal_string_matches_case_insensitively_at_a_dotted_key(self) -> None:
+        args = {"pipeline": "Orders_Clean", "targetLag": {"kind": "lag", "minutes": 10}}
+        self.assertTrue(
+            m.tool_args_match(
+                args,
+                {"pipeline": "orders_clean", "targetLag.kind": "lag", "targetLag.minutes": 10},
+            )
+        )
+
+    def test_a_wanted_string_matches_inside_a_qualified_table_name(self) -> None:
+        self.assertTrue(
+            m.tool_args_match({"pipeline": "silver.orders_clean"}, {"pipeline": "orders_clean"})
+        )
+        self.assertFalse(
+            m.tool_args_match({"pipeline": "silver.orders_cleaned"}, {"pipeline": "orders_clean."})
+        )
+
+    def test_a_wanted_string_matches_the_json_text_of_one_filters_shaped_list(self) -> None:
+        filters = [
+            {"column": "created_year", "first": {"op": "eq", "value": "2026"}},
+            {"column": "region", "first": {"op": "in", "value": ["Asia", "Europe"]}},
+        ]
+        self.assertTrue(m.tool_args_match({"filters": filters}, {"filters": "created_year"}))
+        self.assertFalse(m.tool_args_match({"filters": filters}, {"filters": "wilayah"}))
+
+    def test_a_wanted_string_matches_the_json_text_of_a_list_but_never_a_number(self) -> None:
+        self.assertTrue(m.tool_args_match({"measures": ["a", "b"]}, {"measures": "b"}))
+        self.assertTrue(m.tool_args_match({"measures": ["ab"]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"measures": [1, 2]}, {"measures": "b"}))
+        self.assertFalse(m.tool_args_match({"minutes": 100}, {"minutes": "only-a-string"}))
+
+    def test_an_absent_key_never_matches(self) -> None:
+        self.assertFalse(m.tool_args_match({"mart": "x"}, {"grain": ""}))
+
+    def test_a_wanted_bool_matches_only_a_bool_of_the_same_value(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: Python says `1 == True` and
+        `1.0 == True`, so a wanted `True` used to score a call that sent the
+        number 1 -- a case asking for a flag could pass on a numeric one."""
+        self.assertTrue(m.tool_args_match({"enabled": True}, {"enabled": True}))
+        self.assertTrue(m.tool_args_match({"enabled": False}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": 1}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 1.0}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": 0}, {"enabled": False}))
+        self.assertFalse(m.tool_args_match({"enabled": "true"}, {"enabled": True}))
+        self.assertFalse(m.tool_args_match({"enabled": True}, {"enabled": False}))
+        self.assertTrue(
+            m.tool_args_match(
+                {"spec": {"ifChanged": True, "ttlDays": 30}}, {"spec.ifChanged": True}
+            )
+        )
+        self.assertFalse(
+            m.tool_args_match({"spec": {"ifChanged": 1, "ttlDays": 30}}, {"spec.ifChanged": True}),
+            "a dotted key reads the same values and is held to the same rule",
+        )
+
+    def test_a_wanted_string_matches_a_non_ascii_member_of_a_list(self) -> None:
+        """BLD-2 review R5 SHOULD-FIX 5: `json.dumps` escapes non-ASCII by
+        default, so a wanted string carrying an accented or CJK character
+        was looked for as `\\uXXXX` and could never be found inside a list
+        or object value. The wanted string has to carry the character itself
+        for this to differ -- a wanted ASCII substring of a non-ASCII value
+        matched either way."""
+        members = ["São Paulo", "Berlin"]
+        self.assertTrue(m.tool_args_match({"regions": members}, {"regions": "são paulo"}))
+        self.assertTrue(m.tool_args_match({"region": "São Paulo"}, {"region": "São Paulo"}))
+        self.assertTrue(
+            m.tool_args_match({"filters": [{"region": "São Paulo"}]}, {"filters": "São Paulo"})
+        )
+        self.assertFalse(m.tool_args_match({"regions": ["Berlin"]}, {"regions": "São Paulo"}))
 
 
 if __name__ == "__main__":
