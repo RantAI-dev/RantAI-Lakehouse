@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::audit` against a real Postgres.
 //!
 //! # Postgres backing
@@ -263,11 +259,9 @@ async fn list_for_resources_gathers_one_kind_across_several_ids(pool: PgPool) ->
     let actions: Vec<&str> = found.iter().map(|e| e.action.as_str()).collect();
     assert_eq!(actions, vec!["quality.rule_create", "catalog.annotate"]);
 
-    assert!(
-        list_for_resources(&pool, "catalog", &[], 50)
-            .await
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        list_for_resources(&pool, "catalog", &[], 50).await.unwrap(),
+        [] as [lakehouse_store::audit::AuditEvent; 0]
     );
     Ok(())
 }

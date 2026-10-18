@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests against a real Postgres, exercising the `0001_init`
 //! migration and the [`StoreError`] classification it feeds.
 //!

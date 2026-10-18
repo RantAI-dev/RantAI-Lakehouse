@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::chat_term` against a real
 //! Postgres (`#[sqlx::test]`, see `tests/maintenance_policy.rs` for how the
 //! database is provided).
@@ -37,11 +33,9 @@ async fn fill(pool: &PgPool, owner: &str, count: usize) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_owner_with_no_terms_lists_nothing(pool: PgPool) -> sqlx::Result<()> {
-    assert!(
-        list_for_owner(&pool, "owner-a")
-            .await
-            .expect("list")
-            .is_empty()
+    assert_eq!(
+        list_for_owner(&pool, "owner-a").await.expect("list"),
+        [] as [lakehouse_store::chat_term::ChatTerm; 0]
     );
     Ok(())
 }
@@ -104,11 +98,9 @@ async fn one_owner_never_reads_overwrites_or_deletes_another_owners_term(
         .await
         .expect("upsert a");
 
-    assert!(
-        list_for_owner(&pool, "owner-b")
-            .await
-            .expect("list b")
-            .is_empty()
+    assert_eq!(
+        list_for_owner(&pool, "owner-b").await.expect("list b"),
+        [] as [lakehouse_store::chat_term::ChatTerm; 0]
     );
 
     let theirs = upsert(&pool, "owner-b", "revenue", "gross sales", "")
@@ -148,11 +140,9 @@ async fn delete_normalises_the_term_and_reports_whether_a_row_existed(
             .await
             .expect("delete")
     );
-    assert!(
-        list_for_owner(&pool, "owner-a")
-            .await
-            .expect("list")
-            .is_empty()
+    assert_eq!(
+        list_for_owner(&pool, "owner-a").await.expect("list"),
+        [] as [lakehouse_store::chat_term::ChatTerm; 0]
     );
     assert!(
         !delete(&pool, "owner-a", "revenue")
@@ -203,11 +193,9 @@ async fn each_bound_is_refused_naming_its_field_and_stores_nothing(
     );
     assert!(message.starts_with("question"), "{message:?}");
 
-    assert!(
-        list_for_owner(&pool, "owner-a")
-            .await
-            .expect("list")
-            .is_empty()
+    assert_eq!(
+        list_for_owner(&pool, "owner-a").await.expect("list"),
+        [] as [lakehouse_store::chat_term::ChatTerm; 0]
     );
     Ok(())
 }

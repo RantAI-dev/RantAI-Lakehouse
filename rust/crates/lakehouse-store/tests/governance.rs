@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::governance` against a real
 //! Postgres.
 //!
@@ -298,7 +294,10 @@ async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()>
 async fn expected_interval_minutes_for_is_none_with_no_authored_row(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    assert!(list_dataset_sla(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        list_dataset_sla(&pool).await.unwrap(),
+        [] as [lakehouse_store::governance::DatasetSla; 0]
+    );
     let interval = expected_interval_minutes_for(&pool, "gold.orders")
         .await
         .unwrap();

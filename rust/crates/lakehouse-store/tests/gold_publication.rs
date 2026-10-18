@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `gold_publication.rs` (DATA-1, migration
 //! `0054`): the store half of the per-mart publish-to-`Iceberg` switch.
 //!

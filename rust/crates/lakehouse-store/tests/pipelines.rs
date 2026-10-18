@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `pipelines.rs` against a real Postgres — WS4 item
 //! D3: `CreatePipelineBody`'s `incremental_column`/`transforms`/
 //! `fbic_enabled` used to be accepted and dropped on the floor
@@ -119,7 +115,7 @@ async fn get_definition_reports_absent_optional_fields_honestly(pool: PgPool) ->
         .expect("definition should exist");
 
     assert_eq!(definition.incremental_column, None);
-    assert!(definition.transforms.is_empty());
+    assert_eq!(definition.transforms, [] as [std::string::String; 0]);
     assert!(!definition.fbic_enabled);
     Ok(())
 }

@@ -1,10 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::assert_is_empty,
-        reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-    )
-)]
 //! Postgres-backed OLTP storage for Phase 2 (`console`/mutation state that
 //! `ClickHouse` — an analytical, transaction-less store — is a poor fit
 //! for). `ClickHouse` stays the analytics store; this crate is additive,

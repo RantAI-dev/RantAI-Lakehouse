@@ -2201,7 +2201,10 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys["a"], vec!["id".to_owned()]);
         assert_eq!(keys["b"], vec!["x".to_owned(), "y".to_owned()]);
-        assert!(dedup_keys(&serde_json::json!({})).is_empty());
+        assert_eq!(
+            dedup_keys(&serde_json::json!({})),
+            std::collections::HashMap::new()
+        );
     }
 
     #[test]
@@ -3311,7 +3314,10 @@ mod target_identity_tests {
             validate_excluded_columns(&sql_dial_of("oracle"), &objects),
             Ok(())
         );
-        assert!(inactive_exclusions(&objects).is_empty());
+        assert_eq!(
+            inactive_exclusions(&objects),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// `SRC-11` D11: a key column of a deduplicating or history table and the

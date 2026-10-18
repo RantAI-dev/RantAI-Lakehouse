@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::annotation` against a real
 //! Postgres.
 //!
@@ -114,7 +110,7 @@ async fn upsert_replaces_an_existing_annotation(pool: PgPool) -> sqlx::Result<()
         .expect("row present");
     assert_eq!(got.owner.as_deref(), Some("new-owner"));
     assert_eq!(got.steward.as_deref(), Some("new-steward"));
-    assert!(got.tags.is_empty());
+    assert_eq!(got.tags, [] as [std::string::String; 0]);
     assert_eq!(got.description, None);
     Ok(())
 }

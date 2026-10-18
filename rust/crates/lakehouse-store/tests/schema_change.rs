@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::schema_change` against a real
 //! Postgres (`SRC-8` task 3): the baseline, the identity of a pending
 //! change, approval, the connector pause and the cascade.
@@ -318,8 +314,14 @@ async fn a_second_identical_observation_writes_nothing(pool: PgPool) -> sqlx::Re
             .fetch_one(&pool)
             .await?;
     assert_eq!(first, second);
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
-    assert!(list_recent(&pool, &id, 50).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
+    assert_eq!(
+        list_recent(&pool, &id, 50).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
     Ok(())
 }
 
@@ -384,7 +386,10 @@ async fn a_pending_change_that_no_longer_holds_is_withdrawn(pool: PgPool) -> sql
     .unwrap();
     let accepted = tx.accepted().await.unwrap().unwrap();
     tx.commit().await.unwrap();
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
     assert!(accepted.waiting_columns.is_none());
     Ok(())
 }
@@ -496,7 +501,10 @@ async fn a_column_that_comes_back_is_no_longer_inactive(pool: PgPool) -> sqlx::R
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_inactive_columns(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::InactiveColumn; 0]
+    );
     Ok(())
 }
 
@@ -622,7 +630,13 @@ async fn an_added_table_joins_the_connectors_tables_with_load_mode_replace_and_i
     .unwrap();
 
     assert_eq!(result.added, ["public.customers"]);
-    assert!(result.not_added.is_empty());
+    assert_eq!(
+        result.not_added,
+        [] as [(
+            std::string::String,
+            lakehouse_store::schema_change::TableRefusal
+        ); 0]
+    );
     assert_eq!(
         objects(&pool, &id).await,
         serde_json::json!([
@@ -700,7 +714,7 @@ async fn a_table_the_caller_refused_is_not_added_and_waits_with_the_fixed_reason
     .await
     .unwrap();
 
-    assert!(result.added.is_empty());
+    assert_eq!(result.added, [] as [std::string::String; 0]);
     assert_eq!(
         result.not_added,
         [("public.files".to_owned(), TableRefusal::ReservedForUploads)]
@@ -909,7 +923,10 @@ async fn a_type_change_the_column_cannot_hold_is_refused_and_nothing_is_approved
         2,
         "not even the added column was approved"
     );
-    assert!(list_recent(&pool, &id, 50).await.unwrap().is_empty());
+    assert_eq!(
+        list_recent(&pool, &id, 50).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
 }
 
 /// The same refusal, then the exact sequence the console tells the person to
@@ -931,7 +948,10 @@ async fn the_table_leaves_the_waiting_state_when_the_source_is_put_back(pool: Pg
 
     observe_changes(&pool, &id, &original, &[]).await;
 
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
     assert_eq!(
         approve_object(&pool, &id, "orders", None, OffsetDateTime::now_utc())
             .await
@@ -1028,7 +1048,10 @@ async fn a_dismissed_refusal_does_not_come_back_but_a_different_reason_does(pool
     assert_eq!(approval.approved[0].status, "approved");
     assert!(!approval.pause_lifted);
     assert_eq!(objects(&pool, &id).await, stored, "nothing was added");
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
 
     let again = record_table_additions(
         &pool,
@@ -1041,7 +1064,10 @@ async fn a_dismissed_refusal_does_not_come_back_but_a_different_reason_does(pool
     .unwrap();
     assert!(again.changes.is_empty(), "no new row, so no alert");
     assert_eq!(again.not_added.len(), 1, "still reported as not added");
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
 
     let other = record_table_additions(
         &pool,
@@ -1174,8 +1200,14 @@ async fn removing_a_table_clears_what_waits_for_it_and_lifts_the_pause(pool: PgP
 
     select_tables(&pool, &id, &["customers"]).await;
 
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
-    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
+    assert_eq!(
+        list_inactive_columns(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::InactiveColumn; 0]
+    );
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
     assert_eq!(after.paused_at, None, "the pause went with the table");
     assert_eq!(after.paused_reason, None);
@@ -1214,7 +1246,10 @@ async fn removing_one_table_leaves_another_tables_pending_change_and_the_pause(p
         .await
         .unwrap();
     select_tables(&pool, &id, &["orders"]).await;
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
     assert_eq!(after.paused_reason.as_deref(), Some("other"));
 }
@@ -1288,7 +1323,10 @@ async fn an_unapprovable_change_on_another_table_does_not_keep_the_pause(pool: P
         .await
         .unwrap();
     select_tables(&pool, &id, &["orders"]).await;
-    assert!(list_pending(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_pending(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::SchemaChange; 0]
+    );
     let after = get_connector(&pool, &id).await.unwrap().unwrap().connector;
     assert_eq!(after.paused_at, None);
 }
@@ -1371,17 +1409,17 @@ async fn the_inactive_columns_of_a_bronze_table_are_found_by_target_and_loaded_n
         "the row without a loaded name marks nothing"
     );
     assert_eq!(marks[0].0, "order_date");
-    assert!(
+    assert_eq!(
         inactive_columns_of_table(&pool, "t_customers")
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [(std::string::String, lakehouse_store::schema_change::IsoTime); 0]
     );
-    assert!(
+    assert_eq!(
         inactive_columns_of_table(&pool, "no_such_target")
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [(std::string::String, lakehouse_store::schema_change::IsoTime); 0]
     );
     let listed = list_inactive_columns(&pool, &id).await.unwrap();
     assert_eq!(listed.len(), 2);
@@ -1584,13 +1622,19 @@ async fn a_column_left_out_is_marked_inactive_and_cleared_when_ticked_again(pool
         }]),
     )
     .await;
-    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_inactive_columns(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::InactiveColumn; 0]
+    );
 
     // A table taken out of the selection takes its marks with it.
     save_objects(&pool, &id, append(&["note"])).await;
     assert_eq!(list_inactive_columns(&pool, &id).await.unwrap().len(), 1);
     save_objects(&pool, &id, serde_json::json!([])).await;
-    assert!(list_inactive_columns(&pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        list_inactive_columns(&pool, &id).await.unwrap(),
+        [] as [lakehouse_store::schema_change::InactiveColumn; 0]
+    );
 }
 
 // --- SRC-21: the pause and a key column's pending removal (SRC-10 x SRC-16) ---

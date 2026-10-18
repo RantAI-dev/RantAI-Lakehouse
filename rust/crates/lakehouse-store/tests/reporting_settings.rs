@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::reporting_settings` against a real
 //! Postgres (`#[sqlx::test]`, see `tests/maintenance_policy.rs` for how the
 //! database is provided).

@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::connector_discovery` against a real
 //! Postgres (`SRC-13` task 1; same setup as `tests/connector_run.rs`).
 
@@ -326,7 +322,10 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
     );
     let stored = get(&pool, PG, Kind::Preview).await.unwrap().unwrap();
     assert_eq!(stored.state, State::Done);
-    assert!(stored.preview.unwrap().columns.is_empty());
+    assert_eq!(
+        stored.preview.unwrap().columns,
+        [] as [lakehouse_store::connector_discovery::ListedColumn; 0]
+    );
     Ok(())
 }
 

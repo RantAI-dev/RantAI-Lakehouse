@@ -624,19 +624,19 @@ mod tests {
     /// A first observation is the baseline: nothing to compare with.
     #[test]
     fn a_first_observation_has_no_changes() {
-        assert!(diff(None, &base()).is_empty());
+        assert_eq!(diff(None, &base()), [] as [super::Change; 0]);
         for policy in POLICIES {
             let d = evaluate(policy, true, None, &base());
             assert_eq!(d.action, Action::Load);
             assert_eq!(d.columns, None);
             assert!(!d.pause_connector);
-            assert!(d.changes.is_empty());
+            assert_eq!(d.changes, [] as [super::ClassifiedChange; 0]);
         }
     }
 
     #[test]
     fn the_same_shape_has_no_changes() {
-        assert!(diff(Some(&base()), &base()).is_empty());
+        assert_eq!(diff(Some(&base()), &base()), [] as [super::Change; 0]);
     }
 
     /// Spec row "Detection": added.
@@ -704,7 +704,7 @@ mod tests {
     fn a_changed_primary_key_is_found_and_its_order_is_not_a_change() {
         let two = shape(&[("a", "integer"), ("b", "integer")], &["a", "b"]);
         let swapped = shape(&[("a", "integer"), ("b", "integer")], &["b", "a"]);
-        assert!(diff(Some(&two), &swapped).is_empty());
+        assert_eq!(diff(Some(&two), &swapped), [] as [super::Change; 0]);
         let other = shape(&[("a", "integer"), ("b", "integer")], &["a"]);
         let changes = diff(Some(&two), &other);
         assert_eq!(changes.len(), 1);
@@ -984,7 +984,7 @@ mod tests {
                 } else {
                     ChangeStatus::Applied
                 };
-                assert!(!d.changes.is_empty(), "{policy:?}");
+                assert_ne!(d.changes, [] as [super::ClassifiedChange; 0], "{policy:?}");
                 assert!(d.changes.iter().all(|c| c.status == want), "{policy:?}");
                 assert_eq!(d.pause_connector, pause, "{policy:?}");
             }

@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Integration tests for `lakehouse_store::agents` against a real
 //! Postgres.
 //!
@@ -444,7 +440,10 @@ async fn mode_check_rejects_invalid_value(pool: PgPool) -> sqlx::Result<()> {
 /// (which is manual-only).
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_scheduled_employees_returns_only_cron_set(pool: PgPool) -> sqlx::Result<()> {
-    assert!(list_scheduled_employees(&pool).await.unwrap().is_empty());
+    assert_eq!(
+        list_scheduled_employees(&pool).await.unwrap(),
+        [] as [lakehouse_store::agents::DigitalEmployee; 0]
+    );
 
     let input = CreateEmployeeInput {
         name: "cron-copilot".to_owned(),
@@ -653,7 +652,7 @@ async fn create_run_inserts_running_row(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(run.status, "running");
     assert_eq!(run.trigger, "schedule");
     assert_eq!(run.actor, "risk-sentinel");
-    assert!(run.steps.is_empty());
+    assert_eq!(run.steps, [] as [lakehouse_store::agents::RunStep; 0]);
     assert!(run.ended_at.is_none());
     Ok(())
 }
@@ -933,7 +932,7 @@ async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
     // The run itself is untouched by `create_linked_approval` alone.
     let run = get_run(&pool, "run-headless-05").await.unwrap().unwrap();
     assert_eq!(run.status, "running");
-    assert!(run.steps.is_empty());
+    assert_eq!(run.steps, [] as [lakehouse_store::agents::RunStep; 0]);
     // But the run's own `approvals[]` projection already sees it, via the
     // `run_id` join — same mechanism `run_embeds_its_approvals` covers.
     assert_eq!(run.approvals.len(), 1);
