@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import {
-  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
+  ChartColumn, Check, Copy, Download, Eye, FileDown, History, Mail, Printer, Maximize2, Minimize2, MoreHorizontal, Palette, Pencil, RefreshCw, Save, Share2, Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,7 +22,7 @@ import { PDF_NOT_SET_UP } from "./chart-download";
 export function DashboardActionsMenu({
   isDefault, canWrite, isPrivate, onHistory, onTheme, loading, fullscreen, autoSec, savedSec, canSaveRefresh, savingRefresh,
   onRefresh, onToggleFullscreen, onAutoSec, onSaveRefresh, onRename, onShare, onExportPdf, onDuplicate, onDelete,
-  onDownloadPdf, pdfSupported = true, canDownload = true,
+  onDownloadPdf, pdfSupported = true, canDownload = true, onSubscriptions,
 }: {
   readonly isDefault: boolean;
   /**
@@ -60,6 +60,8 @@ export function DashboardActionsMenu({
   readonly pdfSupported?: boolean;
   /** False when every role of the viewer is switched off from downloading: the download items are hidden. */
   readonly canDownload?: boolean;
+  /** Opens "Subscriptions…" (`RPT-1`); left out when absent or when downloads are switched off for the viewer. */
+  readonly onSubscriptions?: () => void;
   readonly onDuplicate: () => void;
   readonly onDelete: () => void;
 }) {
@@ -177,6 +179,11 @@ export function DashboardActionsMenu({
                   </TooltipContent>
                 </Tooltip>
               )
+            ) : null}
+            {canDownload && onSubscriptions ? (
+              <DropdownMenuItem onClick={onSubscriptions}>
+                <Mail className="size-4" /> Subscriptions…
+              </DropdownMenuItem>
             ) : null}
             <DropdownMenuItem onClick={onExportPdf}>
               <Printer className="size-4" /> Print…

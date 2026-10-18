@@ -36,6 +36,11 @@ export type ReportingSettings = {
    * Empty: everyone may.
    */
   downloadDeniedRoles: string[]
+  /**
+   * Outside email domains a scheduled report may go to (`RPT-1`), lower case,
+   * at most 50, no wildcards. Empty: no report leaves the company.
+   */
+  reportAllowedDomains: string[]
 }
 
 /**
@@ -43,7 +48,7 @@ export type ReportingSettings = {
  * the value stored, so a caller that only changes the zone is unaffected.
  */
 export type ReportingSettingsInput = Pick<ReportingSettings, "timeZone" | "weekStart"> &
-  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites" | "downloadDeniedRoles">>
+  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites" | "downloadDeniedRoles" | "reportAllowedDomains">>
 
 export interface SettingsService {
   getReporting(signal?: AbortSignal): Promise<ReportingSettings>

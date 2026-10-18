@@ -29,7 +29,7 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -74,6 +74,7 @@ import { TileBody } from "./tile-body";
 import { exportNotice } from "./table-export";
 import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
 import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
+import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -913,6 +914,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const readState = (): ReadState => ({ filters, params: paramsQuery(data?.appliedParams ?? null), grain: grainQuery(gChoice) });
   const canDownload = data?.canDownload !== false;
   const [pdfOpen, setPdfOpen] = React.useState(false);
+  const [subsOpen, setSubsOpen] = React.useState(false);
   const [dataFor, setDataFor] = React.useState<{ id: string; title: string } | null>(null);
   async function downloadData(id: string, choice: DataChoice) {
     const done = await downloadChartData(id, choice, readState(), tableSorts.current[id]);
@@ -1100,6 +1102,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDownloadPdf={() => setPdfOpen(true)}
+              onSubscriptions={() => setSubsOpen(true)}
               pdfSupported={data?.pdfSupported === true}
               canDownload={canDownload}
               onDuplicate={() => void duplicateDashboard()}
@@ -1327,6 +1330,17 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
+      ) : null}
+      {subsOpen ? (
+        <SubscriptionsDialog
+          open={subsOpen}
+          onOpenChange={setSubsOpen}
+          board={board}
+          dashName={dashName}
+          charts={(data?.charts ?? []).filter((c) => c.def && !isStaticKind(c.kind)).map((c) => ({ id: c.id, title: c.title }))}
+          readState={readState()}
+          reportZone={data?.reporting?.timeZone ?? "UTC"}
+        />
       ) : null}
       {pdfOpen ? (
         <DownloadPdfDialog

@@ -122,6 +122,21 @@ describe("DashboardActionsMenu downloads (BI-1)", () => {
   })
 })
 
+describe("DashboardActionsMenu Subscriptions… (RPT-1)", () => {
+  it("opens the subscriptions for a viewer who may download", async () => {
+    const onSubscriptions = mock(() => {})
+    renderMenu({ onSubscriptions, canWrite: false })
+    fireEvent.click(await screen.findByText("Subscriptions…"))
+    expect(onSubscriptions).toHaveBeenCalledTimes(1)
+  })
+
+  it("leaves the item out when downloads are switched off for the viewer", async () => {
+    renderMenu({ onSubscriptions: () => {}, canDownload: false })
+    await screen.findByText("Print…")
+    expect(screen.queryByText("Subscriptions…")).toBeNull()
+  })
+})
+
 // BI-18 part C review fix (SHOULD-FIX) R18: no write control for a caller without dashboard:write.
 describe("write controls (R18)", () => {
   it("the dashboard menu leaves out Rename, Duplicate and Delete for a viewer, and keeps the read actions", async () => {

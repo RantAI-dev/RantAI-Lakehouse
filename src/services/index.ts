@@ -23,6 +23,7 @@ import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
 import { uploadService as uploadClientService } from "./clients/uploads"
 import { homeService as homeClientService } from "./clients/home"
+import { reportService as reportClientService } from "./clients/reports"
 import { settingsService as settingsClientService } from "./clients/settings"
 import { chatTermService as chatTermClientService } from "./clients/chat-terms"
 import { semanticService as semanticClientService } from "./clients/semantic"
@@ -105,6 +106,8 @@ export const homeService = homeClientService
 // The deployment's report time zone and first day of the week over
 // `/api/settings/reporting` (BI-9).
 export const settingsService = settingsClientService
+// Scheduled reports by email (RPT-1) over `/api/reports/...`. No mock ever existed.
+export const reportService = reportClientService
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

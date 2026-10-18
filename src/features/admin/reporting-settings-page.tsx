@@ -20,6 +20,7 @@ import {
   COMPANY_PALETTE_MAX,
   COMPANY_PALETTE_MIN,
   MAX_CONTENT_SITES,
+  MAX_REPORT_DOMAINS,
   NUMBER_LOCALES,
   SHIPPED_FONTS,
   isHexColor,
@@ -66,6 +67,8 @@ export function ReportingSettingsForm({
   const [sites, setSites] = React.useState<string[]>([])
   const [site, setSite] = React.useState("")
   const [denied, setDenied] = React.useState<string[]>([])
+  const [domains, setDomains] = React.useState<string[]>([])
+  const [domain, setDomain] = React.useState("")
   // The role names come from the identity service; a person who can save
   // settings but not read roles still sees (and can clear) the saved list.
   const roles = useService((signal) => identityService.listRoles(signal), [])
@@ -87,6 +90,7 @@ export function ReportingSettingsForm({
       setFonts(loaded.fonts)
       setSites(loaded.contentSites ?? [])
       setDenied(loaded.downloadDeniedRoles ?? [])
+      setDomains(loaded.reportAllowedDomains ?? [])
     }
   }, [loaded])
 
@@ -100,7 +104,8 @@ export function ReportingSettingsForm({
       palette.join() !== loaded.companyPalette.join() ||
       fonts.join() !== loaded.fonts.join() ||
       sites.join() !== (loaded.contentSites ?? []).join() ||
-      denied.join() !== (loaded.downloadDeniedRoles ?? []).join())
+      denied.join() !== (loaded.downloadDeniedRoles ?? []).join() ||
+      domains.join() !== (loaded.reportAllowedDomains ?? []).join())
 
   // Sorted like the server stores it, so the comparison with the saved list is stable.
   const roleNames = React.useMemo(() => {
@@ -131,6 +136,17 @@ export function ReportingSettingsForm({
     setSite("")
   }
 
+  // `RPT-1`: a domain name, no wildcard, address or path. The server has the
+  // last word; this keeps the obvious mistakes from reaching it.
+  const domainText = domain.trim().toLowerCase()
+  const domainValid = /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(domainText)
+
+  function addDomain() {
+    if (!domainValid || domains.includes(domainText) || domains.length >= MAX_REPORT_DOMAINS) return
+    setDomains([...domains, domainText].sort())
+    setDomain("")
+  }
+
   function toggleFont(id: string, on: boolean) {
     // Kept in the shipped order, so the comparison with the saved list is stable.
     setFonts(Object.keys(SHIPPED_FONTS).filter((f) => (f === id ? on : fonts.includes(f))))
@@ -145,6 +161,7 @@ export function ReportingSettingsForm({
       fonts,
       contentSites: sites,
       downloadDeniedRoles: denied,
+      reportAllowedDomains: domains,
     })
     if (result) state.reload()
   }
@@ -342,6 +359,51 @@ export function ReportingSettingsForm({
                   disabled={!siteValid || sites.length >= MAX_CONTENT_SITES}
                 >
                   Add site
+                </Button>
+              </div>
+            ) : null}
+          </section>
+          <section className="flex flex-col gap-1.5" aria-labelledby="settings-report-domains">
+            <h2 id="settings-report-domains" className="text-sm font-medium">
+              Reports: outside email domains
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              A scheduled report may be sent to an address outside the company only if its
+              domain is listed here, written example.com, no wildcards. At most{" "}
+              {MAX_REPORT_DOMAINS}. With none listed, no report leaves the company.
+            </p>
+            <ul className="flex flex-col gap-1" aria-label="Report domains">
+              {domains.map((d) => (
+                <li key={d} className="flex items-center gap-2 text-sm">
+                  <span className="font-mono">{d}</span>
+                  {canWrite ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`Remove ${d}`}
+                      onClick={() => setDomains(domains.filter((x) => x !== d))}
+                    >
+                      Remove
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+            {canWrite ? (
+              <div className="flex gap-2">
+                <Input
+                  aria-label="Report domain"
+                  value={domain}
+                  onChange={(e) => setDomain(e.target.value)}
+                  placeholder="partner.example.com"
+                  autoComplete="off"
+                />
+                <Button
+                  variant="outline"
+                  onClick={addDomain}
+                  disabled={!domainValid || domains.length >= MAX_REPORT_DOMAINS}
+                >
+                  Add domain
                 </Button>
               </div>
             ) : null}

@@ -56,6 +56,7 @@ const DEFAULTS = {
   fonts: ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
   contentSites: [],
   downloadDeniedRoles: [],
+  reportAllowedDomains: [],
 }
 
 describe("ReportingSettingsForm", () => {
@@ -103,6 +104,7 @@ describe("ReportingSettingsForm", () => {
       fonts: DEFAULTS.fonts,
       contentSites: [],
       downloadDeniedRoles: [],
+      reportAllowedDomains: [],
     })
   })
 
@@ -190,5 +192,33 @@ describe("ReportingSettingsForm", () => {
     render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
     const readOnly = (await screen.findByRole("checkbox", { name: "Viewer" })) as HTMLElement
     expect(readOnly.getAttribute("aria-disabled") === "true" || readOnly.hasAttribute("disabled")).toBe(true)
+  })
+
+  it("adds and removes an outside report domain, refuses a wildcard or an address, and saves the list", async () => {
+    const calls = mockSettings({ ...DEFAULTS, reportAllowedDomains: ["partner.example"] })
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const input = (await screen.findByLabelText("Report domain")) as HTMLInputElement
+    await screen.findByText("partner.example")
+    const add = screen.getByRole("button", { name: "Add domain" }) as HTMLButtonElement
+    for (const bad of ["*.example.com", "ann@example.com", "https://example.com", "example"]) {
+      fireEvent.change(input, { target: { value: bad } })
+      expect(add.disabled).toBe(true)
+    }
+    fireEvent.change(input, { target: { value: "Another.Example" } })
+    expect(add.disabled).toBe(false)
+    fireEvent.click(add)
+    expect(screen.getByText("another.example")).toBeDefined()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    const sent = JSON.parse(calls.find((c) => c.method === "PUT")?.body ?? "{}")
+    expect(sent.reportAllowedDomains).toEqual(["another.example", "partner.example"])
+  })
+
+  it("lists the report domains read-only without settings:write", async () => {
+    mockSettings({ ...DEFAULTS, reportAllowedDomains: ["partner.example"] })
+    render(<ReportingSettingsForm canWrite={false} zoneList={zoneList} />)
+    await screen.findByText("partner.example")
+    expect(screen.queryByLabelText("Report domain")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Remove partner.example" })).toBeNull()
   })
 })
