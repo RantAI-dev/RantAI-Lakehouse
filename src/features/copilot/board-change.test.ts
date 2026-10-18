@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 
 import { notifyDashboardsChanged, useDashboardsChanged } from "@/features/dashboards/dashboard-events"
-import { changedABoard } from "./board-change"
+import { changedABoard, takeNewBoardChanges } from "./board-change"
 
 describe("an assistant change to a board reloads the open page (BI-18 part C review fix (SHOULD-FIX) R23)", () => {
   it("counts a tab, layout, format or theme tool that worked", () => {
@@ -27,5 +27,28 @@ describe("an assistant change to a board reloads the open page (BI-18 part C rev
     window.removeEventListener("dashboards:changed", on)
     expect(reloads).toBe(1)
     expect(typeof useDashboardsChanged).toBe("function")
+  })
+})
+
+// BI-18 part C review fix (SHOULD-FIX) R29.
+describe("one reload per confirmed board-changing result", () => {
+  it("a streamed turn with several trace updates and one confirmed change reloads exactly once", () => {
+    const seen = new Set<string>()
+    const read = { tool: "list_charts", ok: true, result: {} }
+    const change = { tool: "move_charts_to_tab", ok: true, result: { updated: true, board: "b1" } }
+    let reloads = 0
+    // The trace grows as the turn streams; the same message is offered again each time.
+    for (const trace of [[read], [read, change], [read, change], [read, change, read], [read, change, read]]) {
+      if (takeNewBoardChanges("m1", trace, seen)) reloads += 1
+    }
+    expect(reloads).toBe(1)
+  })
+
+  it("never reloads on reads or a partial trace, and reloads again for a second change", () => {
+    const seen = new Set<string>()
+    expect(takeNewBoardChanges("m1", [{ tool: "list_charts", ok: true, result: {} }], seen)).toBe(false)
+    expect(takeNewBoardChanges("m1", [{ tool: "format_chart", ok: true, result: { error: "no" } }], seen)).toBe(false)
+    expect(takeNewBoardChanges("m1", [{ tool: "create_tab", ok: true, result: { updated: true } }], seen)).toBe(true)
+    expect(takeNewBoardChanges("m2", [{ tool: "create_tab", ok: true, result: { updated: true } }], seen)).toBe(true)
   })
 })

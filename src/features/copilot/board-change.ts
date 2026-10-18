@@ -22,3 +22,25 @@ export function changedABoard(step: { tool?: string; ok?: boolean; result?: unkn
   }
   return true
 }
+
+/**
+ * One reload per confirmed board-changing result (BI-18 part C review fix
+ * (SHOULD-FIX) R29). `seen` holds the results already counted, keyed by the
+ * message and the step; a streamed turn offers its growing trace many times, a
+ * re-render offers the same message again, and only a step not seen before that
+ * changed a board counts. Returns whether the page should reload now.
+ */
+export function takeNewBoardChanges(
+  messageKey: string,
+  steps: readonly { tool?: string; ok?: boolean; result?: unknown }[],
+  seen: Set<string>,
+): boolean {
+  let fresh = false
+  steps.forEach((step, i) => {
+    const key = `${messageKey}:${i}`
+    if (seen.has(key) || !changedABoard(step)) return
+    seen.add(key)
+    fresh = true
+  })
+  return fresh
+}

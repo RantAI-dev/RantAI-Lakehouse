@@ -6,7 +6,7 @@ import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
 import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events";
-import { changedABoard } from "./board-change";
+import { changedABoard, takeNewBoardChanges } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
 import { chatTermService } from "@/services";
@@ -112,6 +112,8 @@ function useCopilotState() {
   // Confirm/Cancel resolve after an `await`; they read the latest list from
   // here so the copy they persist is the same one they render.
   const messagesRef = React.useRef(messages);
+  // R29: the results that already reloaded the open board, by message and step.
+  const notifiedRef = React.useRef(new Set<string>());
   messagesRef.current = messages;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -303,10 +305,11 @@ function useCopilotState() {
           ),
       );
       const tools = result.toolTrace ?? [];
+      const assistantId = newMsgId();
       const full: Msg[] = [
         ...next,
         {
-          id: newMsgId(),
+          id: assistantId,
           role: "assistant",
           content: result.answer || (tools.length ? "" : "Copilot didn't return an answer."),
           tools,
@@ -321,7 +324,8 @@ function useCopilotState() {
       ];
       setMessages(full);
       // R23: any tool of this turn that changed a board reloads the open page.
-      if (chartCreated || tools.some((t) => changedABoard(t))) {
+      // R29: once per confirmed board-changing result, never per trace update.
+      if (takeNewBoardChanges(assistantId, tools, notifiedRef.current) || chartCreated) {
         notifyDashboardsChanged();
       }
       void persist(full, mode, sessionId);
@@ -416,7 +420,7 @@ function useCopilotState() {
         setMessages(updated);
         void persist(updated, mode, sessionId);
       }
-      if (created || (toolOk && !json.result?.error && !json.error && changedABoard({ tool: toolName, ok: true, result: json.result ?? json }))) {
+      if (created || (toolOk && !json.result?.error && !json.error && takeNewBoardChanges(key, [{ tool: toolName, ok: true, result: json.result ?? json }], notifiedRef.current))) {
         notifyDashboardsChanged();
       }
     } catch (e) {
