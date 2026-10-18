@@ -891,3 +891,98 @@ async fn a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed() {
     assert!(log.contains("pdf render failed"), "{log}");
     assert!(log.contains("reference"), "{log}");
 }
+
+/// RPT-1 review fix (SHOULD-FIX) R8: a console recipient who can no longer view
+/// dashboards, whose roles may not download, or who shares no tenant with the
+/// owner is skipped, and the record says how many.
+#[tokio::test]
+async fn a_recipient_without_the_right_to_see_or_download_or_a_shared_tenant_is_skipped() {
+    let f = fixture(ok_pdf(), true).await;
+    // Three more people: no dashboard:read, a role switched off from
+    // downloading, and one in a tenant the owner does not share.
+    let role = |name: &'static str, perms: &'static str| {
+        let pool = f.pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, 'test')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(perms)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let blind = person(&f.pool, "Blind", role("No Dashboards", "query:read").await).await;
+    let denied_role = role("No Downloads", "dashboard:read").await;
+    let denied = person(&f.pool, "Denied", denied_role).await;
+    sqlx::query("UPDATE reporting_settings SET download_denied_roles = ARRAY['No Downloads']")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let sub = subscription(&f, |s| {
+        s.recipients = vec![
+            Recipient::User(f.colleague),
+            Recipient::User(blind),
+            Recipient::User(denied),
+        ];
+    })
+    .await;
+    tick(&f.state, &f.mailer).await;
+    let reports = f.mailer.reports();
+    assert_eq!(
+        reports[0].bcc,
+        ["colleague@company.example"],
+        "{:?}",
+        reports[0].bcc
+    );
+    let rows = deliveries(&f, &sub).await;
+    assert_eq!(rows[0].status, "sent");
+    assert_eq!(rows[0].recipient_count, 1);
+    assert!(
+        rows[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("2 recipients were left out")
+    );
+
+    // Tenants: the owner belongs to one, the colleague does not.
+    let tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, 'T', 't-r8', 'standard', 'id')")
+        .bind(tenant)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(f.owner)
+        .bind(tenant)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    make_due(&f, &sub).await;
+    tick(&f.state, &f.mailer).await;
+    let rows = deliveries(&f, &sub).await;
+    assert_eq!(
+        rows[0].status, "failed",
+        "nobody shares the owner's tenant now"
+    );
+    assert_eq!(
+        rows[0].reason.as_deref(),
+        Some("Nobody is left to send this report to.")
+    );
+    // The colleague joins the tenant and receives it again.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(f.colleague)
+        .bind(tenant)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    make_due(&f, &sub).await;
+    tick(&f.state, &f.mailer).await;
+    assert_eq!(f.mailer.reports().len(), 2);
+    assert_eq!(f.mailer.reports()[1].bcc, ["colleague@company.example"]);
+}

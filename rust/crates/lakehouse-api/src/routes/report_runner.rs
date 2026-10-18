@@ -391,7 +391,9 @@ async fn build_and_send(
     let rows = subscriptions::recipients(pool, sub.id)
         .await
         .map_err(|_| stop(DATABASE_DOWN))?;
-    let audience = audience_of(&rows, &settings.report_allowed_domains);
+    let allowed_users =
+        users_who_may_receive(state, &rows, &owner, &settings.download_denied_roles).await;
+    let audience = audience_of(&rows, &settings.report_allowed_domains, &allowed_users);
     if audience.addresses.is_empty() {
         return Err(stop(NOBODY_LEFT));
     }
@@ -509,15 +511,20 @@ struct AuditWho {
 /// rules are checked again at send time because both can change after the
 /// subscription was saved; whoever no longer qualifies is left out and counted.
 /// Duplicates (the same address as a user and as an outside address) go once.
-fn audience_of(rows: &[RecipientRow], allowed_domains: &[String]) -> Audience {
+fn audience_of(
+    rows: &[RecipientRow],
+    allowed_domains: &[String],
+    allowed_users: &std::collections::HashSet<uuid::Uuid>,
+) -> Audience {
     let mut addresses: Vec<String> = Vec::new();
     let mut outside: Vec<String> = Vec::new();
     let mut left_out = 0;
     for row in rows {
         let address = match (&row.user_id, &row.email) {
-            (Some(_), _) => (row.user_status.as_deref() == Some("active"))
-                .then(|| row.user_email.as_deref().and_then(normalise_address))
-                .flatten(),
+            (Some(id), _) => (row.user_status.as_deref() == Some("active")
+                && allowed_users.contains(id))
+            .then(|| row.user_email.as_deref().and_then(normalise_address))
+            .flatten(),
             (None, Some(email)) => {
                 normalise_address(email).filter(|a| domain_allowed(a, allowed_domains))
             }
@@ -541,13 +548,45 @@ fn audience_of(rows: &[RecipientRow], allowed_domains: &[String]) -> Audience {
     }
 }
 
+/// The console recipients who may be sent this report today (`RPT-1` review fix
+/// (SHOULD-FIX) R8; planner default, the owner confirms at the QA): they can
+/// still view dashboards, their roles may download, and, when the owner belongs
+/// to tenants, they share one with the owner. Someone who fails any of these is
+/// left out and counted, as a disabled person is.
+async fn users_who_may_receive(
+    state: &AppState,
+    rows: &[RecipientRow],
+    owner: &Principal,
+    denied_roles: &[String],
+) -> std::collections::HashSet<uuid::Uuid> {
+    let mut allowed = std::collections::HashSet::new();
+    for id in rows.iter().filter_map(|r| r.user_id) {
+        let Ok(Some(person)) = crate::routes::render::principal_of(state, &id.to_string()).await
+        else {
+            continue;
+        };
+        let shares_a_tenant = owner.tenant_ids.is_empty()
+            || person
+                .tenant_ids
+                .iter()
+                .any(|t| owner.tenant_ids.contains(t));
+        if person.has("dashboard:read")
+            && crate::routes::settings::may_download(&person, denied_roles)
+            && shares_a_tenant
+        {
+            allowed.insert(id);
+        }
+    }
+    allowed
+}
+
 fn left_out_recipients(count: usize) -> String {
     if count == 1 {
-        "1 recipient was left out: they are disabled, or their domain is no longer allowed."
+        "1 recipient was left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, or their domain is no longer allowed."
             .to_owned()
     } else {
         format!(
-            "{count} recipients were left out: they are disabled, or their domain is no longer allowed."
+            "{count} recipients were left out: they are disabled, may no longer view or download dashboards, are outside the owner's tenants, or their domain is no longer allowed."
         )
     }
 }
@@ -1247,9 +1286,12 @@ mod tests {
             // The same person as a user and as an address goes once.
             outside_row("ANN@company.example"),
         ];
+        let everyone: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().filter_map(|r| r.user_id).collect();
         let got = audience_of(
             &rows,
             &["partner.example".to_owned(), "company.example".to_owned()],
+            &everyone,
         );
         assert_eq!(
             got.addresses,
@@ -1257,8 +1299,15 @@ mod tests {
         );
         assert_eq!(got.left_out, 2, "the disabled user and the unlisted domain");
         // With no domain listed, no outside address is addressed at all.
-        let none = audience_of(&rows, &[]);
+        let none = audience_of(&rows, &[], &everyone);
         assert_eq!(none.addresses, ["ann@company.example"]);
+        // RPT-1 review fix (SHOULD-FIX) R8: an active user who may no longer
+        // receive it (not in the allowed set) is left out too.
+        let nobody = std::collections::HashSet::new();
+        let none = audience_of(&rows, &["partner.example".to_owned()], &nobody);
+        assert_eq!(none.addresses, ["press@partner.example"]);
+        assert_eq!(none.outside, ["press@partner.example"]);
+        assert_eq!(none.left_out, 4);
     }
 
     #[test]
