@@ -224,6 +224,26 @@ Final tree (`b6b81f8c`, plus this handoff):
 - **A crash between claim and send** loses that one send (never sends twice); not tested by killing a process.
 - The planner note about a second migration: not needed.
 
+### Fix round 1 (developer, after Review 1)
+
+Commits, one per finding where the hunks allow; each site cites "RPT-1 review fix (BLOCKER|SHOULD-FIX) Rn".
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| R1 | `e7bffd08` | `headless_refusal` refuses `create/update/delete_report_subscription`; `headless_tools` does not offer them; `ownerId` is stripped from every headless call. Tests: refusal and tool list in both modes; `ownerId` dropped. |
+| R2 | `b3ec337d` | `tools::report_audience` loads, before the gate at both dispatch sites (chat loop, `POST /api/ai/tool`; headless refuses the tool, R1), who the update leaves receiving the report and whether it does more than narrow; `gate::decide_with` / `effective_risk_with` take it as a server-side argument (never in the arguments), failing closed. A new schedule, chart, filter or recipient for a stored outside list is an approval; pausing, resuming and removing a recipient are Confirms; the Confirm sentence says no recipient is added. Also fixed: the check before an approval validated an update with no recipients (now `keep_stored_recipients`). Tests: the audience rule and the gate (unit), `ai_report_tools` (approval for a new schedule and a new recipient, Confirm for removal and pause). |
+| R3 | `044a3a68` | `cap_reason` cuts the stored reason to 500 characters on a character boundary; the email keeps the full list. Tests: unit; ten missing charts send and record. |
+| R4, R5 | `4a367f60` | `PUT {"paused": bool}` and a paused-only assistant update go to `apply_pause` without re-validation; a non-owner administrator may only pause, resume, delete and remove recipients (`only_removes_recipients`), and Send now is owner-only. The two share the `update` route's hunks, so one commit. The dialog sends only the flag. Tests: route (pause after the domain and right are gone; the administrator's allowed and refused acts), assistant, dialog. |
+| R6, R7 | `2b38335c` | Each file's audit entry has `recipientCount`, `outsideAddresses`, `origin`; a PDF failure goes through `pdf_failure` (logged under a reference), chart failures and read-back failures are logged with the subscription and chart. Tests: audit entries of a scheduled and a manual send; the log holds the cause while the record stays fixed. |
+| R8 | `093d2f6b` | At send time a console recipient needs `dashboard:read`, a role that may download, and a shared tenant when the owner has tenants; others are skipped and counted. Tests: audience (unit) and the runner (skipped, then nobody left, then received after joining the tenant). The test fixture in `report_routes.rs` needed a recipient who can view dashboards. |
+| R9 | `a08be883` | No owner email after a failed Send now; "Email is not set up" is not counted toward the five; the SMTP envelope holds only the Bcc list; a busy PDF service brings the next run forward 5 minutes once (`store::retry_at`, `is_second_busy`). Tests: envelope, manual failure, six runs without email, `retry_at`, the second-busy rule. |
+
+The NOTE items (a requester holding `agent:approve` approving their own outside send; no rate limit on Send now; a report past the 310 s route budget cut with nothing recorded; the dialog's direct service calls; console Delete without a confirm) are left for the backlog, as the review says.
+
+**Checks** (`CARGO_INCREMENTAL=0`, detached, `--test-threads=1` for the `sqlx::test` files, crate sources touched before each run because the shared target kept a stale `lakehouse-bi`): `cargo fmt --check` clean; `cargo clippy -p lakehouse-notify -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` clean on the final tree; `lakehouse-api --lib` filters `routes::ai routes::report agents` 422 passed, 1 ignored; integration `report_runner` 19, `report_routes` 12, `ai_report_tools` 11, `agents_approval` 13, `ai_tool` 21, `route_auth` 49, `sec11_guard` 4; `lakehouse-store --test report_subscriptions` 13, `--test reporting_settings` 8; `lakehouse-notify` 25. TypeScript: typecheck clean, lint 0 errors / 8 warnings, `bun run test` 2234 pass, 1 skip, 0 fail.
+
+**Not verified:** the busy-PDF retry end to end (it needs both PDF slots held for the 60 s slot wait; the rule and the store move are tested separately); R8's tenant rule against a real multi-tenant deployment (tested with one tenant); `request_approval` and the audience lookup in the headless loop are not reachable by design (R1).
+
 ## 8. Review (planner appends)
 
 ### Review 1 (planner, 2026-10-18, at `d9f96362`)

@@ -994,7 +994,7 @@ async fn send_now_failures_do_not_email_the_owner_and_no_email_setup_is_not_coun
     let f = fixture(ok_pdf(), true).await;
     f.mailer.fail_reports.store(true, Ordering::SeqCst);
     let sub = subscription(&f, |s| {
-        s.next_run_at = OffsetDateTime::now_utc() + Duration::days(3)
+        s.next_run_at = OffsetDateTime::now_utc() + Duration::days(3);
     })
     .await;
     let failed = run_subscription(&f.state, &f.mailer, &sub, true)

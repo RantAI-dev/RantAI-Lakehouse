@@ -603,6 +603,10 @@ mod tests {
 
     use super::*;
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "every caller passes a fresh json! literal"
+    )]
     fn args(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
     }

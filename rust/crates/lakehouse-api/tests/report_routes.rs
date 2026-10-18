@@ -577,7 +577,9 @@ async fn send_now_to_an_unreachable_mail_server_gives_the_fixed_reason_only() {
     };
     let f = fixture(&[("SMTP_HOST", "127.0.0.1"), ("SMTP_PORT", &port.to_string())]).await;
     // No PDF and no skip-when-empty, so the run reaches the mail step.
-    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    // RPT-1 review fix (SHOULD-FIX) R8: a recipient must still be able to view
+    // dashboards, so this colleague holds a role that can.
+    let colleague = create_principal_with_permissions(&f.app.pool, "dashboard:read").await;
     let mut not_skipping = body(json!([{ "userId": colleague.to_string() }]));
     not_skipping["skipWhenEmpty"] = json!(false);
     let (_, made) = call(&f, "POST", SUBS, &f.owner_cookie, Some(not_skipping)).await;
