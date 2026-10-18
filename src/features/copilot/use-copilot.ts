@@ -6,6 +6,7 @@ import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
 import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events";
+import { changedABoard } from "./board-change";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
 import { chatTermService } from "@/services";
@@ -319,7 +320,8 @@ function useCopilotState() {
         },
       ];
       setMessages(full);
-      if (chartCreated) {
+      // R23: any tool of this turn that changed a board reloads the open page.
+      if (chartCreated || tools.some((t) => changedABoard(t))) {
         notifyDashboardsChanged();
       }
       void persist(full, mode, sessionId);
@@ -414,7 +416,7 @@ function useCopilotState() {
         setMessages(updated);
         void persist(updated, mode, sessionId);
       }
-      if (created) {
+      if (created || (toolOk && !json.result?.error && !json.error && changedABoard({ tool: toolName, ok: true, result: json.result ?? json }))) {
         notifyDashboardsChanged();
       }
     } catch (e) {
