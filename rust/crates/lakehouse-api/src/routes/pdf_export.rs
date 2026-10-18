@@ -87,7 +87,7 @@ pub struct PdfQuery {
 }
 
 /// The fixed answer for a failed conversion.
-fn pdf_failure(err: &PdfError) -> ApiError {
+pub(crate) fn pdf_failure(err: &PdfError) -> ApiError {
     let ctx = match err {
         PdfError::Timeout => &PDF_TIMEOUT,
         PdfError::Unreachable(_) => &PDF_UNREACHABLE,

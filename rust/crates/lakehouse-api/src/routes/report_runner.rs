@@ -321,7 +321,7 @@ pub async fn run_subscription(
         return Err(StoreError::Unavailable);
     };
     let started_at = OffsetDateTime::now_utc();
-    let (outcome, recipient_count) = match build_and_send(state, mailer, sub).await {
+    let (outcome, recipient_count) = match build_and_send(state, mailer, sub, manual).await {
         Ok(sent) => sent,
         Err(reason) => (Outcome::Failed(reason), 0),
     };
@@ -361,6 +361,7 @@ async fn build_and_send(
     state: &AppState,
     mailer: &dyn ReportMailer,
     sub: &Subscription,
+    manual: bool,
 ) -> Result<(Outcome, usize), Stop> {
     let pool = state.pg.as_deref().ok_or_else(|| stop(DATABASE_DOWN))?;
     // Checked first: no point making a PDF nobody can send.
@@ -406,7 +407,12 @@ async fn build_and_send(
 
     let spec: AttachmentSpec =
         serde_json::from_value(sub.attachments.clone()).map_err(|_| stop(PDF_FAILED))?;
-    let files = attach(state, &owner, sub, &spec, &values, &board_name).await?;
+    let who = AuditWho {
+        count: audience.addresses.len(),
+        outside: audience.outside.clone(),
+        origin: if manual { "manual" } else { "schedule" },
+    };
+    let files = attach(state, &owner, sub, (&spec, &values), (&board_name, who)).await?;
 
     let now = OffsetDateTime::now_utc();
     let date = lakehouse_store::report_schedule::local_date(&sub.time_zone, now)
@@ -485,7 +491,17 @@ async fn load_owner(state: &AppState, sub: &Subscription) -> Result<Principal, S
 #[derive(Debug, PartialEq, Eq)]
 struct Audience {
     addresses: Vec<String>,
+    /// The addresses among them that are outside addresses (not console users).
+    outside: Vec<String>,
     left_out: usize,
+}
+
+/// Who a report's files went to, written into each file's audit entry (`RPT-1`
+/// review fix (SHOULD-FIX) R6): the trail says what left and for whom.
+struct AuditWho {
+    count: usize,
+    outside: Vec<String>,
+    origin: &'static str,
 }
 
 /// The addresses to send to: a console user who is active (their address as it
@@ -495,6 +511,7 @@ struct Audience {
 /// Duplicates (the same address as a user and as an outside address) go once.
 fn audience_of(rows: &[RecipientRow], allowed_domains: &[String]) -> Audience {
     let mut addresses: Vec<String> = Vec::new();
+    let mut outside: Vec<String> = Vec::new();
     let mut left_out = 0;
     for row in rows {
         let address = match (&row.user_id, &row.email) {
@@ -508,12 +525,18 @@ fn audience_of(rows: &[RecipientRow], allowed_domains: &[String]) -> Audience {
         };
         match address {
             Some(a) if addresses.contains(&a) => {}
-            Some(a) => addresses.push(a),
+            Some(a) => {
+                if row.user_id.is_none() {
+                    outside.push(a.clone());
+                }
+                addresses.push(a);
+            }
             None => left_out += 1,
         }
     }
     Audience {
         addresses,
+        outside,
         left_out,
     }
 }
@@ -677,6 +700,7 @@ struct Collected<'a> {
     owner: &'a Principal,
     sub: &'a Subscription,
     values: &'a DashboardValues<'a>,
+    who: AuditWho,
     files: Files,
     budget: Budget,
     audit: Vec<AuditEntry>,
@@ -702,7 +726,17 @@ impl Collected<'_> {
             },
         )
         .await
-        .map_err(|failure| stop(pdf_reason(&failure)))?;
+        .map_err(|failure| {
+            // RPT-1 review fix (SHOULD-FIX) R7: the stored sentence is fixed;
+            // the cause goes to the log under a reference, as the download
+            // route does it.
+            if let PdfFailure::Conversion(err) = &failure {
+                let _logged = crate::routes::pdf_export::pdf_failure(err);
+            } else {
+                tracing::warn!(subscription = %self.sub.id, "scheduled report: no PDF was made");
+            }
+            stop(pdf_reason(&failure))
+        })?;
         if !self.budget.take(bytes.len()) {
             self.files.left_out.push(format!(
                 "The PDF was left out: with it the email would pass {} MB.",
@@ -720,6 +754,9 @@ impl Collected<'_> {
                 "paper": paper.as_str(),
                 "orientation": orientation.as_str(),
                 "bytes": bytes.len(),
+                "recipientCount": self.who.count,
+                "outsideAddresses": self.who.outside,
+                "origin": self.who.origin,
             }),
         ));
         self.files.attachments.push(Attachment {
@@ -749,7 +786,18 @@ impl Collected<'_> {
                 );
                 return Ok(());
             }
-            Err(_) => return Err(stop(CHART_FILE_FAILED)),
+            Err(other) => {
+                // RPT-1 review fix (SHOULD-FIX) R7: the engine's cause was
+                // logged under a reference when the error was made; this says
+                // which report and chart it belongs to.
+                tracing::warn!(
+                    subscription = %self.sub.id,
+                    chart = %wanted.chart,
+                    error = %other,
+                    "scheduled report: a chart's file could not be made"
+                );
+                return Err(stop(CHART_FILE_FAILED));
+            }
         };
         let title = file.chart.spec.title.clone();
         let cap = crate::export::EXPORT_ROW_CAP;
@@ -768,10 +816,10 @@ impl Collected<'_> {
         }
         let mut bytes = Vec::with_capacity(len);
         let mut handle = file.written.file;
-        handle
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| stop(CHART_FILE_FAILED))?;
+        handle.read_to_end(&mut bytes).await.map_err(|err| {
+            tracing::warn!(%err, subscription = %self.sub.id, "scheduled report: a chart's file could not be read back");
+            stop(CHART_FILE_FAILED)
+        })?;
         if cut {
             self.files
                 .left_out
@@ -789,6 +837,9 @@ impl Collected<'_> {
                 "cut": cut,
                 "format": file.format.extension(),
                 "bytes": bytes.len(),
+                "recipientCount": self.who.count,
+                "outsideAddresses": self.who.outside,
+                "origin": self.who.origin,
             }),
         ));
         self.files.attachments.push(Attachment {
@@ -809,15 +860,15 @@ async fn attach(
     state: &AppState,
     owner: &Principal,
     sub: &Subscription,
-    spec: &AttachmentSpec,
-    values: &DashboardValues<'_>,
-    board_name: &str,
+    (spec, values): (&AttachmentSpec, &DashboardValues<'_>),
+    (board_name, who): (&str, AuditWho),
 ) -> Result<Files, Stop> {
     let mut collected = Collected {
         state,
         owner,
         sub,
         values,
+        who,
         files: Files::default(),
         budget: Budget::default(),
         audit: Vec::new(),

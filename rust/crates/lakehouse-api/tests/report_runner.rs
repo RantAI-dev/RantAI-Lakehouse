@@ -809,3 +809,85 @@ async fn ten_left_out_charts_do_not_break_the_delivery_record() {
     assert_eq!(reason.chars().count(), 500);
     assert!(reason.ends_with('…'));
 }
+
+/// RPT-1 review fix (SHOULD-FIX) R6: each attached file's audit entry says how
+/// many people it went to, which outside addresses, and whether the schedule or
+/// "Send now" sent it.
+#[tokio::test]
+async fn the_audit_entry_of_each_file_says_who_received_it() {
+    let f = fixture(ok_pdf(), true).await;
+    let sub = subscription(&f, |_| {}).await;
+    tick(&f.state, &f.mailer).await;
+    run_subscription(&f.state, &f.mailer, &sub, true)
+        .await
+        .unwrap();
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT action, args FROM audit_event WHERE action LIKE 'report.%' ORDER BY action",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4, "two files, sent twice");
+    for (action, args) in &rows {
+        assert_eq!(args["recipientCount"], json!(2), "{action}");
+        assert_eq!(
+            args["outsideAddresses"],
+            json!(["press@partner.example"]),
+            "{action}"
+        );
+    }
+    let origins: Vec<&str> = rows
+        .iter()
+        .map(|(_, a)| a["origin"].as_str().unwrap())
+        .collect();
+    assert_eq!(origins.iter().filter(|o| **o == "schedule").count(), 2);
+    assert_eq!(origins.iter().filter(|o| **o == "manual").count(), 2);
+}
+
+/// A tracing writer that keeps what is logged, to read back.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// RPT-1 review fix (SHOULD-FIX) R7: a PDF failure leaves a trace for the
+/// operator (the cause under a reference), while the stored reason stays fixed.
+#[tokio::test]
+async fn a_pdf_failure_is_logged_for_the_operator_and_the_record_stays_fixed() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let f = fixture(
+        ResponseTemplate::new(500).set_body_string("chromium crashed at /srv/internal-path"),
+        true,
+    )
+    .await;
+    let sub = subscription(&f, |_| {}).await;
+    tick(&f.state, &f.mailer).await;
+    let rows = deliveries(&f, &sub).await;
+    assert_eq!(
+        rows[0].reason.as_deref(),
+        Some("The PDF could not be made.")
+    );
+    let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+    assert!(log.contains("pdf render failed"), "{log}");
+    assert!(log.contains("reference"), "{log}");
+}
