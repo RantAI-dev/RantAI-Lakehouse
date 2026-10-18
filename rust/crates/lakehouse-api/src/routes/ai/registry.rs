@@ -1568,6 +1568,81 @@ fn export_chart_schema() -> Value {
             "required": ["chart", "format"] } } })
 }
 
+/// The schedule, flat, as the console's form sends it (`RPT-1` feature decision 4).
+fn report_schedule_property() -> Value {
+    json!({ "type": "object", "description": "when it is sent, in the time zone given (default: the report time zone). kind hourly: minute; daily: hour, minute; weekly: weekday 1 (Monday) to 7 (Sunday), hour, minute; monthly: monthDay 1 to 28 or \"last\", hour, minute",
+        "properties": {
+            "kind": { "type": "string", "enum": ["hourly", "daily", "weekly", "monthly"] },
+            "minute": { "type": "integer", "minimum": 0, "maximum": 59 },
+            "hour": { "type": "integer", "minimum": 0, "maximum": 23 },
+            "weekday": { "type": "integer", "minimum": 1, "maximum": 7 },
+            "monthDay": { "description": "1 to 28, or the word last" } },
+        "required": ["kind"] })
+}
+
+fn create_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_report_subscription",
+        "description": "Send a dashboard by email on a schedule, as a PDF and/or chosen charts' data as Excel or CSV. By default it is sent to the person asking alone, who confirms with the Confirm button. Naming any other recipient (`recipients`) needs a human's approval first, and an outside address works only on a domain an administrator allowed in Admin > Settings. The report is made with the asking person's own permissions, masking and row filters, and every recipient sees the same data.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "the dashboard's id, from list_boards" },
+            "schedule": report_schedule_property(),
+            "timeZone": { "type": "string", "description": "an IANA zone such as Asia/Jakarta; leave out for the report time zone" },
+            "pdf": { "type": "boolean", "description": "attach the dashboard as a PDF; true for a request such as \"send me this dashboard as a PDF\"" },
+            "paper": { "type": "string", "enum": ["a4", "letter"], "description": "default a4" },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"], "description": "default portrait" },
+            "charts": { "type": "array", "maxItems": 10, "items": { "type": "object", "properties": {
+                "chart": { "type": "string", "description": "a data chart's id on this dashboard, from list_charts" },
+                "format": { "type": "string", "enum": ["xlsx", "csv"] },
+                "values": { "type": "string", "enum": ["formatted", "raw"] } }, "required": ["chart", "format"] },
+                "description": "charts whose data is attached as files" },
+            "filters": { "type": "array", "items": { "type": "object" }, "description": "the filters this report uses, copied from the page context's raw JSON; leave out for none" },
+            "params": { "type": "object", "description": "parameter values, name to value" },
+            "grain": { "type": "string", "enum": ["minute", "hour", "day", "week", "month", "quarter", "year"] },
+            "skipWhenEmpty": { "type": "boolean", "description": "send nothing when every chart has no rows" },
+            "sendToMe": { "type": "boolean", "description": "send to the person asking; default true" },
+            "recipients": { "type": "array", "maxItems": 49, "items": { "type": "object", "properties": {
+                "userId": { "type": "string", "description": "a console user's id" },
+                "email": { "type": "string", "description": "an outside address" } } },
+                "description": "OTHER recipients; naming any makes the call wait for human approval" } },
+            "required": ["board", "schedule"] } } })
+}
+
+fn list_report_subscriptions_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_report_subscriptions",
+        "description": "List the scheduled reports the person set up: their schedule, what they attach, who gets them and whether they are paused.",
+        "parameters": { "type": "object", "properties": {
+            "board": { "type": "string", "description": "only this dashboard's, optional" } } } } })
+}
+
+fn update_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "update_report_subscription",
+        "description": "Change a scheduled report the person set up: the schedule, time zone, attachments, filters or recipients, or pause or resume it. Give only what changes; everything left out stays. Naming recipients in `recipients` needs a human's approval.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the subscription's id, from list_report_subscriptions" },
+            "schedule": report_schedule_property(),
+            "timeZone": { "type": "string" },
+            "pdf": { "type": "boolean" },
+            "paper": { "type": "string", "enum": ["a4", "letter"] },
+            "orientation": { "type": "string", "enum": ["portrait", "landscape"] },
+            "charts": { "type": "array", "maxItems": 10, "items": { "type": "object" }, "description": "the full list of chart files; replaces the current one" },
+            "filters": { "type": "array", "items": { "type": "object" } },
+            "params": { "type": "object" },
+            "grain": { "type": "string" },
+            "skipWhenEmpty": { "type": "boolean" },
+            "sendToMe": { "type": "boolean" },
+            "recipients": { "type": "array", "items": { "type": "object" }, "description": "replaces the recipients; naming others needs approval" },
+            "paused": { "type": "boolean", "description": "true pauses, false resumes" } },
+            "required": ["id"] } } })
+}
+
+fn delete_report_subscription_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_report_subscription",
+        "description": "Delete a scheduled report. Needs human approval, like every deletion.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "the subscription's id, from list_report_subscriptions" } },
+            "required": ["id"] } } })
+}
+
 fn get_capacity_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_capacity",
         "description": "Storage capacity: each object-storage bucket's size and growth from the daily capacity snapshot, and ClickHouse's bytes on disk.",
@@ -2253,6 +2328,35 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // `RPT-1` / `AI-10`: scheduled reports. Creating or changing one for the
+    // person alone is `WriteLow` (the Confirm button); naming any other
+    // recipient makes that call `WriteHigh` (`gate::effective_risk`), and a
+    // delete is `WriteHigh` like every deletion. The permission is the
+    // console's: seeing the dashboard; the download right is checked in the tool.
+    ToolSpec {
+        name: "create_report_subscription",
+        schema: create_report_subscription_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "list_report_subscriptions",
+        schema: list_report_subscriptions_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "update_report_subscription",
+        schema: update_report_subscription_schema,
+        risk: Risk::WriteLow,
+        permission: "dashboard:read",
+    },
+    ToolSpec {
+        name: "delete_report_subscription",
+        schema: delete_report_subscription_schema,
+        risk: Risk::WriteHigh,
+        permission: "dashboard:read",
+    },
     // Asks the person a question and stores nothing, so it needs no
     // permission beyond being signed in. The console's click is what saves
     // the answer.
@@ -2340,8 +2444,28 @@ mod tests {
         // + the 6 dashboard-board tools from main (plan 20: `rename_board`,
         // `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`,
         // `save_board_filters`) + `set_pipeline_target_lag` (`BLD-2`, from main) +
-        // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`).
-        assert_eq!(tool_schemas().len(), 102);
+        // `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`)
+        // + `create_report_subscription`, `list_report_subscriptions`,
+        // `update_report_subscription` and `delete_report_subscription`
+        // (`AI-10`, with `RPT-1`).
+        assert_eq!(tool_schemas().len(), 106);
+    }
+
+    /// `RPT-1` (with `AI-10`): the report tools have the console's permission,
+    /// reading is free, creating and changing one is a confirmation, and a delete
+    /// is an approval.
+    #[test]
+    fn the_report_tools_have_the_risk_and_permission_decision_10_gives_them() {
+        for (name, risk) in [
+            ("create_report_subscription", Risk::WriteLow),
+            ("list_report_subscriptions", Risk::Read),
+            ("update_report_subscription", Risk::WriteLow),
+            ("delete_report_subscription", Risk::WriteHigh),
+        ] {
+            let spec = find(name).expect("registered tool");
+            assert_eq!(spec.risk, risk, "{name}");
+            assert_eq!(spec.permission, "dashboard:read", "{name}");
+        }
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,

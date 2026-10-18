@@ -13,6 +13,7 @@
 //!   `suggest_dashboard`.
 //! - [`export`] — `export_dashboard` and `export_chart` (`AI-10`, with `BI-1`): a
 //!   download link, made when the person opens it.
+//! - [`reports`] — the scheduled-report tools (`AI-10`, with `RPT-1`).
 //! - [`tabs`] — the dashboard tab tools (`BI-18` part C, with `AI-9`).
 //! - [`calc_fields`] — the calculated-field tools (`BI-8`, with `AI-4`).
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
@@ -50,6 +51,8 @@ mod ops;
 mod pipelines;
 mod propose;
 mod queries;
+mod reports;
+pub(in crate::routes) use reports::approval_args;
 mod tabs;
 
 use axum::response::{IntoResponse, Response};
@@ -176,6 +179,7 @@ pub(in crate::routes) async fn run_tool(
         "delete_chart" => dashboards::delete_chart(ch, principal, args).await,
         n if look::handles(n) => look::run(state, principal, name, args).await,
         n if export::handles(n) => export::run(state, principal, name, args).await,
+        n if reports::handles(n) => reports::run(state, principal, name, args).await,
         "rename_board"
         | "delete_board"
         | "arrange_board"

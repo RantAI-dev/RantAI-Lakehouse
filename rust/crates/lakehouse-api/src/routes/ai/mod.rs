@@ -897,18 +897,9 @@ async fn run_chat(
                     };
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
-                    let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor =
-                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
-                    let approval_result = gate::create_write_high_approval(
-                        state.pg.as_deref(),
-                        &actor,
-                        spec,
-                        &args,
-                        &redacted,
-                        resource_id.as_deref(),
-                    )
-                    .await;
+                    let approval_result =
+                        request_approval(state, principal, spec, &args, resource_id.as_deref())
+                            .await;
                     let (run_id, approval_id) = if approval_result
                         .get("needs_approval")
                         .and_then(Value::as_bool)
@@ -1225,17 +1216,11 @@ pub async fn tool_call(
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
-            let redacted = audit::redact(&Value::Object(parsed.args.clone()));
-            let actor = principal.as_ref().map_or_else(
-                || "unknown".to_owned(),
-                |Extension(p)| p.display_name.clone(),
-            );
-            let approval_result = gate::create_write_high_approval(
-                state.pg.as_deref(),
-                &actor,
+            let approval_result = request_approval(
+                &state,
+                principal.as_ref().map(|Extension(p)| p),
                 spec,
                 &parsed.args,
-                &redacted,
                 resource_id.as_deref(),
             )
             .await;
@@ -1300,6 +1285,39 @@ pub async fn tool_call(
         ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
     )
         .into_response()
+}
+
+/// Create the approval for a `WriteHigh` call that [`gate::decide`] flagged, and
+/// return what the model and the console see. The one copy for the chat loop and
+/// `POST /api/ai/tool`.
+///
+/// `RPT-1`: the report tools check the requester's rights now, before any
+/// approval exists, and carry the requester into the stored arguments
+/// (`ownerId`, see `tools::approval_args`); every other tool's arguments are
+/// stored as they are. A refusal is returned instead of an approval.
+async fn request_approval(
+    state: &AppState,
+    principal: Option<&Principal>,
+    spec: &registry::ToolSpec,
+    args: &Map<String, Value>,
+    resource_id: Option<&str>,
+) -> Value {
+    let actor = principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
+    match tools::approval_args(state, principal, spec.name, args).await {
+        Ok(stored) => {
+            let redacted = audit::redact(&Value::Object(stored.clone()));
+            gate::create_write_high_approval(
+                state.pg.as_deref(),
+                &actor,
+                spec,
+                &stored,
+                &redacted,
+                resource_id,
+            )
+            .await
+        }
+        Err(refusal) => refusal,
+    }
 }
 
 /// Builds the `/api/ai/chat` response body, matching the TypeScript's

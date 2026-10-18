@@ -77,6 +77,11 @@ export const TOOL_LABEL: Record<string, string> = {
   // BI-1 / AI-10: the link opens the same download the dashboard's menu makes.
   export_dashboard: "Export dashboard",
   export_chart: "Export chart data",
+  // RPT-1 / AI-10: scheduled reports by email.
+  create_report_subscription: "Schedule report",
+  list_report_subscriptions: "List scheduled reports",
+  update_report_subscription: "Change scheduled report",
+  delete_report_subscription: "Delete scheduled report",
 };
 
 /**

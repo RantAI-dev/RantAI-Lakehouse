@@ -27,7 +27,9 @@ export const CAPABILITIES: Capability[] = [
       // BI-2 / AI-7: a question for a number is answered from a named metric when one matches, in Ask mode too.
       "list_metrics", "describe_metric", "query_metric",
       // BI-1 / AI-10: "give me this dashboard as a PDF" is a question, not a change: a link, in Ask mode too.
-      "export_dashboard", "export_chart"],
+      "export_dashboard", "export_chart",
+      // RPT-1 / AI-10: listing one's scheduled reports is a question too.
+      "list_report_subscriptions"],
   },
   {
     key: "dashboard",
@@ -53,7 +55,10 @@ export const CAPABILITIES: Capability[] = [
       // Ask mode can offer it too) and save the board's default filters.
       "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters",
       // BI-1 / AI-10: a download link for a dashboard (PDF) or a chart's data (Excel, CSV). Read-only, so Ask mode can offer them too.
-      "export_dashboard", "export_chart"],
+      "export_dashboard", "export_chart",
+      // RPT-1 / AI-10: scheduled reports by email. Creating one for the person alone waits for the Confirm button;
+      // naming anyone else, and every delete, waits in Approvals (the composer sends this list as the allowlist, see BI-8 R1).
+      "list_report_subscriptions", "create_report_subscription", "update_report_subscription", "delete_report_subscription"],
   },
   {
     key: "pipeline",

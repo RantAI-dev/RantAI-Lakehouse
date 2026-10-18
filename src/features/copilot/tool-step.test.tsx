@@ -84,6 +84,8 @@ describe("ToolStepCard export links (BI-1, AI-10)", () => {
   it("labels the two export tools", () => {
     expect(toolLabel("export_dashboard")).toBe("Export dashboard")
     expect(toolLabel("export_chart")).toBe("Export chart data")
+    expect(toolLabel("create_report_subscription")).toBe("Schedule report")
+    expect(toolLabel("delete_report_subscription")).toBe("Delete scheduled report")
   })
 
   it("renders a download link to the console's own PDF route", () => {

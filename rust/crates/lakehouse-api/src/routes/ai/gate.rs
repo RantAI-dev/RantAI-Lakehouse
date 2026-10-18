@@ -138,6 +138,40 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "create_report_subscription" | "update_report_subscription" => {
+            let others = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let outside: Vec<&str> = args
+                .get("recipients")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.get("email").and_then(Value::as_str))
+                .collect();
+            let verb = if spec.name == "create_report_subscription" {
+                "Mengirim laporan terjadwal dashboard"
+            } else {
+                "Mengubah laporan terjadwal"
+            };
+            format!(
+                "{verb} {} ke {others} penerima selain peminta (alamat luar: {}). Penerima melihat data sesuai hak akses peminta, bukan hak Anda.",
+                if s("board").is_empty() {
+                    s("id")
+                } else {
+                    s("board")
+                },
+                if outside.is_empty() {
+                    "tidak ada".to_owned()
+                } else {
+                    outside.join(", ")
+                }
+            )
+        }
+        "delete_report_subscription" => {
+            format!("Menghapus laporan terjadwal {} secara permanen.", s("id"))
+        }
         "delete_tab" => format!(
             "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
             s("tab"),
@@ -317,6 +351,28 @@ fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
     format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
 }
 
+/// The confirmation sentence of the report tools (`RPT-1`): what is scheduled
+/// and, in words, that it goes to the person alone (anything else is an approval).
+fn report_summary(name: &str, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let when = args
+        .get("schedule")
+        .and_then(|v| v.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("jadwal yang sama");
+    if name == "create_report_subscription" {
+        format!(
+            "Menjadwalkan laporan dashboard {} ({when}) lewat email ke Anda sendiri.",
+            s("board")
+        )
+    } else {
+        format!(
+            "Mengubah laporan terjadwal {} (hanya penerimanya Anda sendiri).",
+            s("id")
+        )
+    }
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -370,6 +426,9 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
+        "create_report_subscription" | "update_report_subscription" => {
+            report_summary(spec.name, args)
+        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
@@ -416,6 +475,10 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
 pub fn strip_confirmed(args: &Map<String, Value>) -> Map<String, Value> {
     let mut out = args.clone();
     out.remove("confirmed");
+    // `ownerId` is written only by the server, into the stored arguments of an
+    // approval (`tools::reports::approval_args`, `RPT-1`); a model must not be
+    // able to name the person a report is made as.
+    out.remove("ownerId");
     out
 }
 
@@ -557,6 +620,21 @@ pub fn decide(
 #[must_use]
 pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
     if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
+        return Risk::WriteHigh;
+    }
+    // RPT-1 / AI-10 (feature decision 10; product owner, 2026-10-17): a report
+    // that goes only to the person asking is a confirmation; naming any other
+    // recipient emails someone else, so that call waits for a human's approval.
+    // Per call, not per tool, like `trigger_pipeline` above. A list that only
+    // holds the empty array names nobody.
+    if matches!(
+        spec.name,
+        "create_report_subscription" | "update_report_subscription"
+    ) && args
+        .get("recipients")
+        .and_then(Value::as_array)
+        .is_some_and(|others| !others.is_empty())
+    {
         return Risk::WriteHigh;
     }
     spec.risk

@@ -87,3 +87,27 @@ describe("the export tools", () => {
     for (const tool of ["export_dashboard", "export_chart"]) expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
   })
 })
+
+// RPT-1 / AI-10: the scheduled-report tools, named here or they never reach the model.
+describe("the scheduled-report tools", () => {
+  const fixture = JSON.parse(
+    readFileSync(`${process.cwd()}/rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json`, "utf8")
+  ) as { function: { name: string } }[]
+  const serverTools = fixture.map((t) => t.function.name)
+  const writers = ["create_report_subscription", "update_report_subscription", "delete_report_subscription"]
+
+  it("are on the server", () => {
+    for (const tool of [...writers, "list_report_subscriptions"]) expect(serverTools).toContain(tool)
+  })
+
+  it("lists in both modes, and creates, changes and deletes in build mode only", () => {
+    for (const mode of ["ask", "build"] as const) {
+      expect(toolsFromCaps(new Set(["data"]), mode)).toContain("list_report_subscriptions")
+    }
+    for (const tool of writers) {
+      expect(toolsFromCaps(new Set(["dashboard"]), "build")).toContain(tool)
+      expect(toolsFromCaps(new Set(["dashboard"]), "ask")).not.toContain(tool)
+      expect(toolsFromCaps(new Set(["data"]), "build")).not.toContain(tool)
+    }
+  })
+})
