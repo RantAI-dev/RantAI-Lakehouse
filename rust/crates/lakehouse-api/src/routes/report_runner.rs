@@ -286,6 +286,22 @@ fn stop(reason: &str) -> Stop {
     reason.to_owned()
 }
 
+/// The longest reason a delivery record holds (the table's `CHECK` is 500
+/// characters).
+const MAX_REASON_CHARS: usize = 500;
+
+/// `reason` cut to fit the record, on a character boundary, with an ellipsis
+/// when it was cut. `RPT-1` review fix (SHOULD-FIX) R3: ten left-out charts made
+/// a note longer than the `CHECK`, and the insert failed after the email had
+/// gone. The email carries the whole list; the record keeps the start of it.
+fn cap_reason(reason: &str) -> String {
+    if reason.chars().count() <= MAX_REASON_CHARS {
+        return reason.to_owned();
+    }
+    let kept: String = reason.chars().take(MAX_REASON_CHARS - 1).collect();
+    format!("{kept}…")
+}
+
 /// Run one subscription now and record what happened. The scheduled runner
 /// calls it for each claimed row (`manual: false`); "Send now" calls it with
 /// `manual: true`, which records the delivery and sends the failure notice but
@@ -318,7 +334,8 @@ pub async fn run_subscription(
             status: outcome.status(),
             manual,
             recipient_count: i32::try_from(recipient_count).unwrap_or(i32::MAX),
-            reason: outcome.reason(),
+            // RPT-1 review fix (SHOULD-FIX) R3.
+            reason: outcome.reason().map(|r| cap_reason(&r)),
         },
     )
     .await?;
@@ -1237,6 +1254,19 @@ mod tests {
             "formatted is the default"
         );
         assert_eq!(parsed.pdf, None);
+    }
+
+    // RPT-1 review fix (SHOULD-FIX) R3.
+    #[test]
+    fn a_long_reason_is_cut_to_fit_the_record_on_a_character_boundary() {
+        assert_eq!(cap_reason("short"), "short");
+        let exact = "x".repeat(MAX_REASON_CHARS);
+        assert_eq!(cap_reason(&exact), exact);
+        // Multi-byte characters: counted as characters, never split.
+        let long = "é".repeat(MAX_REASON_CHARS + 50);
+        let cut = cap_reason(&long);
+        assert_eq!(cut.chars().count(), MAX_REASON_CHARS);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

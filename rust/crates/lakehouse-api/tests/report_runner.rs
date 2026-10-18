@@ -780,3 +780,32 @@ async fn a_board_that_is_gone_fails_with_a_plain_sentence() {
         Some("The dashboard no longer exists, or its owner can no longer see it.")
     );
 }
+
+/// RPT-1 review fix (SHOULD-FIX) R3: ten charts left out make a note longer than
+/// the record holds; the email still goes and the record still lands, cut.
+#[tokio::test]
+async fn ten_left_out_charts_do_not_break_the_delivery_record() {
+    let f = fixture(ok_pdf(), true).await;
+    let charts: Vec<Value> = (0..10)
+        .map(|i| json!({ "chart": format!("c_gone_{i}"), "format": "csv", "values": "raw" }))
+        .collect();
+    let sub = subscription(&f, |s| {
+        s.attachments =
+            json!({ "pdf": { "paper": "a4", "orientation": "portrait" }, "charts": charts });
+    })
+    .await;
+    tick(&f.state, &f.mailer).await;
+    let reports = f.mailer.reports();
+    assert_eq!(reports.len(), 1, "{:?}", deliveries(&f, &sub).await);
+    assert_eq!(
+        reports[0].html.matches("was left out").count(),
+        10,
+        "the email lists every one"
+    );
+    let rows = deliveries(&f, &sub).await;
+    assert_eq!(rows.len(), 1, "the record landed");
+    assert_eq!(rows[0].status, "sent");
+    let reason = rows[0].reason.as_deref().unwrap();
+    assert_eq!(reason.chars().count(), 500);
+    assert!(reason.ends_with('…'));
+}
