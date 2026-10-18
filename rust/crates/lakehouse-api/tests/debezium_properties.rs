@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! WS0: the route must never return a resolved secret value — only
 //! `${ENV_VAR_NAME}` references the deployment's own shell expands at
 //! container start, exactly like `docker-compose.yml`'s `debezium-server`

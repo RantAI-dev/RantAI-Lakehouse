@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Every `/api/connectors/{id}/*` route answers only for a connector in one
 //! of the caller's tenants (`routes::connectors::require_connector_in_tenants`).
 //! Before it, `connector:manage` in one tenant reached every tenant's

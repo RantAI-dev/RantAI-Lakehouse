@@ -5323,7 +5323,10 @@ mod tests {
                 "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
             );
             assert_eq!(ops[0]["commit"], "unknown");
-            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert_eq!(
+                v["config"].as_array().expect("config array").as_slice(),
+                &[] as &[serde_json::Value]
+            );
             assert!(v["definition"].is_null());
         }
 
@@ -6274,7 +6277,10 @@ mod tests {
             // "failed", never the raw Dagster string.
             assert_eq!(steps[0]["status"], "failed");
             assert!(steps[0]["startMs"].is_number());
-            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                steps[0]["materializations"].as_array().unwrap().as_slice(),
+                &[] as &[serde_json::Value]
+            );
         }
 
         #[tokio::test]
@@ -8997,9 +9003,12 @@ mod tests {
         /// the caller sent a non-object (or no body at all).
         #[test]
         fn top_level_keys_for_non_objects_is_empty() {
-            assert!(top_level_keys(&Value::Null).is_empty());
-            assert!(top_level_keys(&json!([])).is_empty());
-            assert!(top_level_keys(&json!("string")).is_empty());
+            assert_eq!(top_level_keys(&Value::Null), [] as [std::string::String; 0]);
+            assert_eq!(top_level_keys(&json!([])), [] as [std::string::String; 0]);
+            assert_eq!(
+                top_level_keys(&json!("string")),
+                [] as [std::string::String; 0]
+            );
         }
     }
 

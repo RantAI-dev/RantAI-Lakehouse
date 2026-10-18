@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `GET /api/dashboard/table-export` — the whole-result CSV of a raw table
 //! (`BI-16` part A, T8), driven through the real router, a real per-test
 //! Postgres (policies, audit) and a `wiremock` stand-in for `ClickHouse`.

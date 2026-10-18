@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Golden-corpus parity harness — the cutover gate.
 //!
 //! Replays every entry in `rust/tests/parity/corpus/*.json` (73 real

@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! WS3 item 15: `POST /api/connectors/{id}/test` covers mysql/mssql
 //! adapters at the route level, using the same live-pool harness
 //! `tests/route_auth.rs`/`tests/debezium_properties.rs` already use.

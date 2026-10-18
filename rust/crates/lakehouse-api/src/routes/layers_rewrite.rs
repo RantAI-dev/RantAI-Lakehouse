@@ -396,7 +396,7 @@ async fn a_layer_the_role_cannot_read_is_refused_alone() {
         refused["error"].as_str().is_some_and(|e| !e.is_empty()),
         "{refused}"
     );
-    assert!(rows_of(refused).is_empty());
+    assert_eq!(rows_of(refused), [] as [serde_json::Value; 0]);
     let other = &tile["layers"][1];
     assert!(other.get("error").is_none(), "{other}");
     assert_eq!(rows_of(other).len(), 15);
@@ -709,7 +709,7 @@ async fn a_chart_without_layers_asks_nothing_and_gets_no_layers_key() {
     let after = stub_tile(&stub, &plain, before.clone()).await;
     assert_eq!(after, before);
     assert!(after.get("layers").is_none());
-    assert!(stub.asked().is_empty());
+    assert_eq!(stub.asked(), [] as [std::string::String; 0]);
 }
 
 /// A tile that carries an error is left alone: the layers are not asked.
@@ -719,7 +719,7 @@ async fn a_tile_that_failed_is_left_alone_and_its_layers_are_not_asked() {
     let base = by_province(5, &[capacity_layer("hotels")]);
     let failed = json!({ "error": "This chart could not be loaded.", "errorId": "x1" });
     assert_eq!(stub_tile(&stub, &base, failed.clone()).await, failed);
-    assert!(stub.asked().is_empty());
+    assert_eq!(stub.asked(), [] as [std::string::String; 0]);
 }
 
 /// Each way a statement can fail is that layer's own sentence; the database's
@@ -805,5 +805,5 @@ async fn a_layer_over_a_table_that_is_gone_is_not_asked() {
         tile["layers"][0]["error"],
         "this question's source is not available."
     );
-    assert!(stub.asked().is_empty());
+    assert_eq!(stub.asked(), [] as [std::string::String; 0]);
 }

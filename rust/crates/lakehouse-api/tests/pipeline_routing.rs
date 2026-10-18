@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! PR #57 review (NIT) F1.10: axum's `matchit` router resolves static
 //! segments ahead of path parameters regardless of registration order.
 //! This integration test pins the resolution the inline comment in

@@ -840,7 +840,7 @@ mod tests {
         let text = decode(&data.to_csv(Some(3)), Encoding::Utf8);
         assert_eq!(split_records(&text, ','), head);
         assert_eq!(data.records(Some(10_000)), all);
-        assert!(data.to_csv(Some(0)).is_empty());
+        assert_eq!(data.to_csv(Some(0)), [] as [u8; 0]);
     }
 
     #[test]
@@ -1160,6 +1160,6 @@ mod tests {
 
     #[test]
     fn nothing_is_written_for_no_records() {
-        assert!(encode_csv(&[]).is_empty());
+        assert_eq!(encode_csv(&[]), [] as [u8; 0]);
     }
 }

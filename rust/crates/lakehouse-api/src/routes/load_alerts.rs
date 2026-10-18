@@ -959,7 +959,7 @@ mod tests {
 
         let status = failed_status(&h, "run-1").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(h.posts_to("al-f").await.is_empty());
+        assert_eq!(h.posts_to("al-f").await, [] as [std::string::String; 0]);
         assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
         // Counted, not yet handed over.
         assert_eq!(
@@ -1025,7 +1025,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(streak(&pool).await, ("unhealthy".to_owned(), 3));
-        assert!(h.posts_to("al-r").await.is_empty());
+        assert_eq!(h.posts_to("al-r").await, [] as [std::string::String; 0]);
 
         let retry = h.failed("run-3").await;
         assert_eq!(retry["matched"], 2, "the failure and the repeated rule");
@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(resp["matched"], 1);
         assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
         assert_eq!(h.posts_to("al-s").await.len(), 1);
-        assert!(h.posts_to("al-other").await.is_empty());
+        assert_eq!(h.posts_to("al-other").await, [] as [std::string::String; 0]);
     }
 
     /// `SRC-10` decision 5: a clear loads nothing, so its run is neither a
@@ -1155,7 +1155,7 @@ mod tests {
         .0;
         assert_eq!(resp["matched"], 0);
         assert_eq!(streak(&pool).await, ("degraded".to_owned(), 1));
-        assert!(h.posts_to("al-s").await.is_empty());
+        assert_eq!(h.posts_to("al-s").await, [] as [std::string::String; 0]);
 
         // A FAILED clear is not counted against the load either.
         h.knows_run_config("run-clear-fail", config("clear"), "FAILURE")
@@ -1235,8 +1235,8 @@ mod tests {
 
         assert_eq!(resp["matched"], 1, "only the success rule matched");
         assert_eq!(h.posts_to("al-s").await.len(), 1);
-        assert!(h.posts_to("al-f").await.is_empty());
-        assert!(h.posts_to("al-r").await.is_empty());
+        assert_eq!(h.posts_to("al-f").await, [] as [std::string::String; 0]);
+        assert_eq!(h.posts_to("al-r").await, [] as [std::string::String; 0]);
         assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
         let kinds: Vec<(String, i64)> = sqlx::query_as(
             "SELECT kind, count(*) FROM pipeline_run_event \
@@ -1479,8 +1479,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(first.0.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(upload_status(&pool, "up-1").await.0, "failed");
-        assert!(h.posts_to("al-u").await.is_empty());
-        assert!(run_event_rows(&pool, "run-up").await.is_empty());
+        assert_eq!(h.posts_to("al-u").await, [] as [std::string::String; 0]);
+        assert_eq!(
+            run_event_rows(&pool, "run-up").await,
+            [] as [(std::string::String, i64); 0]
+        );
 
         for (expected_matched, expected_posts) in [(1, 1), (0, 1)] {
             let resp = run_failed_event(
@@ -1544,7 +1547,7 @@ mod tests {
         h.failed("run-1").await;
         h.failed("run-2").await;
         assert_eq!(paused_reason(&pool).await, None);
-        assert!(h.posts_to("al-d").await.is_empty());
+        assert_eq!(h.posts_to("al-d").await, [] as [std::string::String; 0]);
 
         let third = h.failed("run-3").await;
         assert_eq!(
@@ -1599,7 +1602,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(paused_reason(&pool).await.is_some());
-        assert!(h.posts_to("al-d").await.is_empty());
+        assert_eq!(h.posts_to("al-d").await, [] as [std::string::String; 0]);
 
         assert_eq!(h.failed("run-2").await["matched"], 1);
         assert_eq!(h.failed("run-2").await["matched"], 0);
@@ -1647,7 +1650,7 @@ mod tests {
         .0;
         assert_eq!(resp["matched"], 0);
         assert_eq!(streak(&pool).await.1, 2, "the streak was not reset");
-        assert!(h.posts_to("al-s").await.is_empty());
+        assert_eq!(h.posts_to("al-s").await, [] as [std::string::String; 0]);
         assert_eq!(
             run_status(&pool, CONNECTOR, "run-p")
                 .await

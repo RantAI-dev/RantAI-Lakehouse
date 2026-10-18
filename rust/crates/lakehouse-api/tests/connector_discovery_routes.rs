@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SRC-13`: the discovery routes of a connector (`POST` and `GET`
 //! `/api/connectors/{id}/discovery/{kind}`), over the real router and a
 //! migrated database. Nothing here reaches a network: the REST list is the

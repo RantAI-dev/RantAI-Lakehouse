@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SRC-12` part B (decisions 1, 2, 9, 11, 12): a connector's credential can
 //! be a REFERENCE to a secret in the installation's secret manager.
 //!

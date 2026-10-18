@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level acceptance tests for gold-publish-per-mart plan T1: the
 //! scheduled Gold export (`dagster/dispar_orchestrate/gold_export.py`)
 //! can authenticate against `POST /api/gold/export/{mart}`.

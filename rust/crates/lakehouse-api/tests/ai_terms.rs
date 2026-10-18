@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level tests for `GET`/`PUT`/`DELETE /api/ai/terms`: the round trip,
 //! that two users never see, overwrite or delete each other's terms, that a
 //! broken rule is a 400 naming the field, and that the list is capped. The

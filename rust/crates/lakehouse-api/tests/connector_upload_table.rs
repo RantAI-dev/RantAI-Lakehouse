@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `PUT /api/connectors/{id}/ingest-spec` refuses a `sourceObjects[].target`
 //! that is a raw table name uploads have claimed (T8 of
 //! `docs/superpowers/plans/2026-10-02-upload-file.md`, ADR 0014, decision 5;

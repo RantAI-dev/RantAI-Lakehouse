@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SRC-6` F3: a connector that connects only from the orchestrator
 //! (Oracle here) is "not testable from the console", not "supported and
 //! failed".

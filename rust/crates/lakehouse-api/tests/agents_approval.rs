@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level integration tests for T0.5 of the copilot-operations-handover
 //! plan: `WriteHigh` copilot calls create a pending approval, and
 //! `POST /api/agents/approvals/{id}/decide` is the only path that ever

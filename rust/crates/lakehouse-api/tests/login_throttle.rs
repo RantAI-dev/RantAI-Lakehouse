@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Acceptance tests for the password-login throttle (plan
 //! `2026-10-02-login-throttle-session-cleanup`, T3).
 //!

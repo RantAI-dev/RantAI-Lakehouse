@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `GET /api/connectors/{id}/probe-history` at the route level — same
 //! live-pool harness `tests/test_connection_route.rs`/`tests/route_auth.rs`
 //! already use (see that file's module doc comment for why this needs a

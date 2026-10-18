@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SRC-12` part C (decisions 6 to 8, 11, 12): a REST connector signs in with
 //! OAuth authorization code and PKCE, keeps a refresh token sealed, survives
 //! its rotation, and signs out.
@@ -849,7 +845,10 @@ async fn without_a_revocation_address_signing_out_says_the_provider_was_not_told
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["revocation"], "notConfigured");
     assert!(body["message"].as_str().unwrap().contains("stays valid"));
-    assert!(fx.provider.lock().unwrap().revoked.is_empty());
+    assert_eq!(
+        fx.provider.lock().unwrap().revoked,
+        [] as [std::string::String; 0]
+    );
     assert!(!stored_files(&fx).contains(&token_file()));
 }
 

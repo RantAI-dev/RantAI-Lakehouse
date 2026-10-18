@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level acceptance tests for gold-publish-per-mart plan T3 + T4:
 //! the per-mart publication routes (`GET /api/gold/publications`, and
 //! the detail/`PUT` pair on `/api/gold/export/{mart}/publication`), and

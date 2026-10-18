@@ -1235,7 +1235,7 @@ mod tests {
             summarize_usage(&[], &tables(&["silver.orders"]), uuid::Uuid::from_u128(1));
         assert_eq!(usage["queries7d"], 0);
         assert_eq!(usage["avgLatencyMs"], 0);
-        assert!(recent.is_empty());
+        assert_eq!(recent, [] as [serde_json::Value; 0]);
     }
 
     fn audit_event(action: &str, args: Value) -> lakehouse_store::audit::AuditEvent {
@@ -1411,7 +1411,10 @@ mod tests {
         let c = classify(&other, &tables(&["silver.orders"]));
         assert_eq!(c.level, "internal");
         assert!(!c.from_rule);
-        assert!(c.columns.is_empty());
+        assert_eq!(
+            c.columns,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// The newest rule wins, so a mistake is fixed by adding the right

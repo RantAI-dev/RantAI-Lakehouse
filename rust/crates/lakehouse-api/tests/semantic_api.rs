@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! Route-level tests for the semantic layer's API (`GET /api/semantic`,
 //! `GET`/`PUT /api/semantic/{asset}`, AI-16).
 //!
@@ -232,7 +228,10 @@ async fn a_table_outside_serving_and_silver_is_a_404() {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{asset}: {reply}");
     }
-    assert!(semantic::list_all(&app.pool).await.unwrap().is_empty());
+    assert_eq!(
+        semantic::list_all(&app.pool).await.unwrap(),
+        [] as [lakehouse_store::semantic::SemanticEntry; 0]
+    );
 }
 
 #[tokio::test]

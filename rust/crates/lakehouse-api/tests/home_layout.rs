@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level tests for `GET`/`PUT`/`DELETE /api/home/layout`: the round
 //! trip, the default (`layout: null`), that two users never see each
 //! other's layout, and that a bad body is a 400 with this route's own

@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SEC-12`: signed embed tokens always expire, can be withdrawn, are signed
 //! with a configured secret, and the embed pages say who may frame them.
 //!
@@ -525,7 +521,7 @@ async fn a_token_without_a_jti_cannot_be_withdrawn_singly_and_the_answer_says_so
     let message = body["error"].as_str().unwrap();
     assert!(message.contains("no id (jti)"), "{message}");
     assert!(message.contains("withdraw all"), "{message}");
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -561,7 +557,7 @@ async fn withdrawing_refuses_a_bad_token_a_token_for_another_board_and_a_bare_jt
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -623,7 +619,7 @@ async fn withdraw_all_can_only_be_true() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 // ── T4: allowed sites and the frame answer ─────────────────────────────
@@ -685,7 +681,7 @@ async fn editing_allowed_sites_needs_dashboard_write() {
     let app = app(&ch, Some(SECRET)).await;
     let (status, _) = put_origins(&app, "dashboard:read", json!(["https://a.example"])).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(fake.inserts_into_board().is_empty());
+    assert_eq!(fake.inserts_into_board(), [] as [std::string::String; 0]);
 }
 
 #[tokio::test]

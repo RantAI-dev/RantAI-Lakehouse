@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `GET /api/connectors/ingestible` shows a caller only its own tenant's
 //! connectors (`SEC-16`). Before the fix the route returned every tenant's
 //! hosts, usernames and secret names to anyone holding `ingest:read`.
@@ -186,5 +182,5 @@ async fn an_x_tenant_the_caller_is_not_in_is_not_found() {
     let bayu = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
     let (status, ids) = ingestible(&app, ("cookie", &bayu), Some(RETAIL)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(ids.is_empty());
+    assert_eq!(ids, [] as [std::string::String; 0]);
 }

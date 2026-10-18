@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! A chart draft that cannot be built is not offered (plan 18, step 3).
 //!
 //! A `create_chart` without `confirmed` used to come back as a

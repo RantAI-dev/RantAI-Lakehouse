@@ -1573,7 +1573,10 @@ mod tests {
     fn preview_body_reports_unmeasured_when_conditions_do_not_parse() {
         let v = preview_result_json(None, None);
         assert!(v["affectedRows"].is_null());
-        assert!(v["maskedColumns"].as_array().unwrap().is_empty());
+        assert_eq!(
+            v["maskedColumns"].as_array().unwrap().as_slice(),
+            &[] as &[serde_json::Value]
+        );
         assert_eq!(v["supported"], json!(false));
     }
 
@@ -1730,7 +1733,7 @@ mod tests {
 
         let rows = ingest_runs_or_empty(&ch, "conn-x").await.unwrap();
 
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [super::IngestRunRow; 0]);
     }
 
     #[tokio::test]

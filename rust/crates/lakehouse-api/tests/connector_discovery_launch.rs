@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! `SRC-13` task 3: the types only the orchestrator reads. The API launches
 //! `discover_job` (a `wiremock` Dagster), answers `running`, and stores the
 //! answer the orchestrator posts back on `discovery-results`.

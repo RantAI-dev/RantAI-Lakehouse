@@ -1,7 +1,3 @@
-#![allow(
-    clippy::assert_is_empty,
-    reason = "test assertions checking collection emptiness are idiomatic and avoid empty array type casts"
-)]
 //! HTTP-level integration tests for the Tier 1 (T1.1-T1.3) operations
 //! tools' `WriteHigh` members: `delete_connector`, `delete_alert_rule`,
 //! `pause_pipeline`, `cancel_pipeline_run`. Each must create a pending
