@@ -316,9 +316,38 @@ async fn users_terms(
         })
 }
 
+/// What the DATA MAP may show a caller (`SEC-24`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapAccess {
+    /// No map: the caller may not read the catalog.
+    None,
+    /// Tables and columns only: no column ranges and no sample values.
+    WithoutSamples,
+    /// The whole map.
+    Full,
+}
+
+/// What the DATA MAP may show `principal`, from its permissions alone. The
+/// map lists the catalog's tables, so it needs `catalog:read`, the
+/// permission of `/api/catalog`. Its column ranges come from
+/// `/api/catalog/{id}/profile` and its sample values from
+/// `/api/catalog/{id}/sample`. Both routes need `query:read`, so the ranges
+/// and samples need it too.
+/// `Principal::has` honours wildcards, so a `*:*` holder gets the full map.
+fn data_map_access(principal: Option<&Principal>) -> MapAccess {
+    match principal {
+        Some(p) if p.has("catalog:read") && p.has("query:read") => MapAccess::Full,
+        Some(p) if p.has("catalog:read") => MapAccess::WithoutSamples,
+        _ => MapAccess::None,
+    }
+}
+
 /// The system prompt: the rules for the mode, the rules for asking (when
 /// `AI_ASK_BACK` is on and `asking`, that is, `ask_user` is in the chat's
-/// tool list), the DATA MAP (when the caller may read the shared catalog),
+/// tool list), the DATA MAP (when the caller may read the shared catalog:
+/// the map follows `catalog:read`, the permission of `/api/catalog`, and its
+/// column ranges and sample values follow `query:read`, the permission of
+/// `/api/catalog/{id}/profile` and `/api/catalog/{id}/sample`, `SEC-24`),
 /// the caller's own words (when `AI_ASK_BACK` is on), the page the user is
 /// on, and the reply-language line last.
 ///
@@ -347,7 +376,13 @@ async fn system_prompt(
     // carries sample values, so it follows the catalog route's own rule
     // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
     // no map, and one it cannot evaluate gets none either (fail closed).
+    //
+    // The permission is checked first (`SEC-24`): `/api/ai/chat` needs only a
+    // signed-in user, so without this a Dashboard Viewer would read the
+    // tables and samples that the catalog routes refuse it.
+    let access = data_map_access(principal);
     let refusal = match principal {
+        Some(_) if access == MapAccess::None => Some("reading the data map needs catalog:read"),
         Some(p) => crate::routes::catalog::catalog_tenant_refusal(state, p, headers)
             .await
             .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
@@ -363,9 +398,18 @@ async fn system_prompt(
             } else {
                 std::collections::HashSet::new()
             };
+            // A caller without `query:read` gets `None` here, which drops
+            // every range and sample (`data_map` lists tables and columns
+            // only) and skips the shared cache, so such a caller costs one
+            // rebuild of the map per turn.
+            let withheld = if access == MapAccess::Full {
+                withheld.as_ref()
+            } else {
+                None
+            };
             data_map::data_map(
                 &state.clickhouse,
-                withheld.as_ref(),
+                withheld,
                 &notes,
                 &query_words,
                 state.config.ai_relevant_tables,
@@ -2373,6 +2417,69 @@ mod tests {
             must_change_password: false,
             role_names: Vec::new(),
         }
+    }
+
+    /// A signed-in user holding exactly `permissions`.
+    fn holding(permissions: &str) -> Principal {
+        Principal {
+            permissions: lakehouse_auth::PermissionSet::parse(permissions),
+            ..analyst(7)
+        }
+    }
+
+    #[test]
+    fn the_data_map_is_withheld_from_no_user_and_from_one_without_catalog_read() {
+        assert_eq!(data_map_access(None), MapAccess::None);
+        assert_eq!(
+            data_map_access(Some(&holding("dashboard:read"))),
+            MapAccess::None
+        );
+        // `query:read` alone does not open the map: the catalog route needs
+        // `catalog:read` for the tables themselves.
+        assert_eq!(
+            data_map_access(Some(&holding("query:read"))),
+            MapAccess::None
+        );
+        assert_eq!(data_map_access(Some(&holding(""))), MapAccess::None);
+    }
+
+    #[test]
+    fn catalog_read_alone_gets_the_map_without_samples() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read"))),
+            MapAccess::WithoutSamples
+        );
+    }
+
+    #[test]
+    fn catalog_read_with_query_read_and_a_wildcard_holder_get_the_full_map() {
+        assert_eq!(
+            data_map_access(Some(&holding("catalog:read, query:read"))),
+            MapAccess::Full
+        );
+        assert_eq!(data_map_access(Some(&holding("*:*"))), MapAccess::Full);
+    }
+
+    #[tokio::test]
+    async fn the_prompt_of_a_user_without_catalog_read_names_the_permission_and_lists_no_table() {
+        let state = state_with_ask_back_and_layer("false", "false");
+        let headers = axum::http::HeaderMap::new();
+        let who = holding("dashboard:read");
+        let text = system_prompt(
+            &state,
+            Some(&who),
+            &headers,
+            false,
+            "",
+            &[FIXED_QUESTION],
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            text.contains("DATA MAP\n(withheld: reading the data map needs catalog:read)"),
+            "{text}"
+        );
     }
 
     fn chat_body(tools: Option<&[&str]>) -> ChatBody {

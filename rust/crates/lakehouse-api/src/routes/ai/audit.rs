@@ -160,6 +160,14 @@ pub fn resource_for(
             args.get("id").and_then(Value::as_str).map(str::to_owned),
         ),
         "create_pipeline" | "mark_pipeline_ready" => (Some("pipeline"), str_field("id")),
+        "set_pipeline_target_lag" => (
+            Some("pipeline"),
+            result
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| args.get("pipeline").and_then(Value::as_str))
+                .map(str::to_owned),
+        ),
         "set_table_maintenance" => (
             Some("iceberg_table"),
             match (
@@ -486,5 +494,20 @@ mod tests {
         )
         .await;
         // Reaching this line without panicking is the assertion.
+    }
+
+    #[test]
+    fn resource_for_set_pipeline_target_lag_maps_pipeline_and_id_or_arg() {
+        let mut args = Map::new();
+        args.insert("pipeline".to_owned(), json!("from-args"));
+        let result = json!({ "id": "from-result" });
+        assert_eq!(
+            resource_for("set_pipeline_target_lag", &args, &result),
+            (Some("pipeline"), Some("from-result".to_owned()))
+        );
+        assert_eq!(
+            resource_for("set_pipeline_target_lag", &args, &json!({})),
+            (Some("pipeline"), Some("from-args".to_owned()))
+        );
     }
 }

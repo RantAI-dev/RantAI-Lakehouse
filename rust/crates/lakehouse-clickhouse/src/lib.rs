@@ -182,11 +182,56 @@ impl ChClient {
         sql: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<ChResult, ChError> {
+        self.query_with_settings(sql, &[], cancel).await
+    }
+
+    /// Run `sql` like [`ChClient::query`], but ask the engine to stop
+    /// producing rows once `max_result_rows` have been produced.
+    ///
+    /// The two settings travel as URL parameters of this one request
+    /// (`max_result_rows` and `result_overflow_mode=break`), not in the SQL
+    /// text, so the statement the caller wrote is the statement that runs.
+    /// With `break`, `ClickHouse` stops at a block boundary: up to one block
+    /// more than `max_result_rows` can still arrive, so a caller that needs
+    /// an exact count truncates the result itself. A caller that wants to
+    /// know whether the engine had more rows than it keeps passes one more
+    /// than the number it keeps.
+    ///
+    /// # Errors
+    ///
+    /// See [`ChClient::query`].
+    pub async fn query_limited(
+        &self,
+        sql: &str,
+        max_result_rows: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
+        let max_result_rows = max_result_rows.to_string();
+        self.query_with_settings(
+            sql,
+            &[
+                ("max_result_rows", &max_result_rows),
+                ("result_overflow_mode", "break"),
+            ],
+            cancel,
+        )
+        .await
+    }
+
+    /// The body of [`ChClient::query`] and [`ChClient::query_limited`]:
+    /// `settings` are sent as URL parameters of this request only.
+    async fn query_with_settings(
+        &self,
+        sql: &str,
+        settings: &[(&str, &str)],
+        cancel: Option<&CancellationToken>,
+    ) -> Result<ChResult, ChError> {
         let body = build_query_body(sql);
         let fut = async {
             let response = self
                 .client
                 .post(&self.url)
+                .query(settings)
                 .basic_auth(&self.user, Some(&self.password))
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .header(CACHE_CONTROL, "no-store")
@@ -418,7 +463,7 @@ fn server_error_message(status: StatusCode, body: &str) -> String {
 mod tests {
     #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
     use super::*;
-    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::matchers::{body_string_contains, method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(url: &str) -> ChClient {
@@ -692,5 +737,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChError::Server(msg) if msg.contains("Unknown identifier")));
+    }
+
+    // -- query_limited (SEC-21) -------------------------------------------
+
+    #[tokio::test]
+    async fn query_limited_sends_the_cap_as_url_parameters_not_in_the_sql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(query_param("max_result_rows", "2001"))
+            .and(query_param("result_overflow_mode", "break"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[{"n":1}],"rows":1}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client(&server.uri())
+            .query_limited("SELECT n FROM t", 2001, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows, 1);
+
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8(requests[0].body.clone()).unwrap();
+        assert!(
+            !body.contains("SETTINGS"),
+            "the SQL text stays as written: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_sends_no_url_parameters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+
+        client(&server.uri()).query("SELECT 1", None).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[0].url.query(), None);
     }
 }

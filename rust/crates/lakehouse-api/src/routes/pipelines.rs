@@ -5,6 +5,18 @@
 //! Ports `src/app/api/pipelines/route.ts`,
 //! `src/app/api/pipelines/[id]/runs/route.ts`, and
 //! `src/app/api/pipelines/[id]/trigger/route.ts`.
+//!
+//! # Target lag: read here, decided elsewhere
+//!
+//! This module serialises a pipeline's target lag (`targetLag`, plan D2)
+//! and attaches the `lag` measurement the console shows (plan D8), but it
+//! decides nothing about it: every "is it fresh enough, run or wait"
+//! question is answered once, in [`crate::pipeline_lag`], from the
+//! orchestrator's lag-check route. The list therefore reads the state
+//! table once for every lag pipeline it is returning instead of asking
+//! per pipeline, and the list payload and the detail payload cannot drift
+//! apart over what "behind" means, because neither of them is what
+//! decides it.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -187,7 +199,55 @@ async fn list_body(
             all_tenants,
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
-        pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
+        // BLD-2 plan D8: `targetLag` rides on the serialized row; `lag` is
+        // added here because it is a MEASUREMENT the check writes, and one
+        // read of many pipelines' state is one query (`AC5` makes it
+        // visible on the list too, not only on the page). Both store reads
+        // propagate: a swallowed failure would report every lag pipeline as
+        // "no check has run", which is a different and wrong claim.
+        let lag_ids: Vec<&str> = authored
+            .iter()
+            .filter(|p| p.target_lag.is_some())
+            .map(|p| p.id.as_str())
+            .collect();
+        let lag_states = pipelines::list_lag_states(pg, &lag_ids).await?;
+        let no_readers = crate::pipeline_lag::downstream_without_readers(pg, &authored).await?;
+        // BLD-2 review R5 SHOULD-FIX 1: the whole list's chain walks share
+        // ONE connection and the stop answers come from the `lag_states`
+        // map above — a per-row walk plus a per-upstream state read used
+        // to multiply the round trips by rows.
+        let upstream_stops =
+            crate::pipeline_lag::upstream_stops_for_list(pg, &authored, &lag_states).await?;
+        let now = time::OffsetDateTime::now_utc();
+        for p in &authored {
+            if let Ok(mut val) = serde_json::to_value(p) {
+                if let Value::Object(obj) = &mut val {
+                    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + R5
+                    // decision R18: the answer comes from the SAME chain the
+                    // check walks, and the walk stops where the check's own
+                    // upstream evaluation stops — first open request, deepest
+                    // first — not from `dependsOn` alone. A pipeline with no
+                    // target lag is never shown a `lag` object, and its chain
+                    // was not walked either, so it has no entry in
+                    // `upstream_stops` at all.
+                    let upstream_stop = upstream_stops
+                        .get(&p.id)
+                        .and_then(std::option::Option::as_ref);
+                    obj.insert(
+                        "lag".to_owned(),
+                        crate::pipeline_lag::lag_json(
+                            p.target_lag,
+                            lag_states.get(&p.id),
+                            now,
+                            no_readers.contains(&p.id),
+                            i32::from(p.max_retries),
+                            upstream_stop,
+                        ),
+                    );
+                }
+                pipelines.push(val);
+            }
+        }
     }
     match dagster_jobs_refused {
         None => Ok(json!({ "pipelines": pipelines })),
@@ -250,6 +310,8 @@ fn dagster_pipeline_row(
         "slaOk": sla_ok.map_or(Value::Null, Value::Bool),
         "late": late_value.map_or(Value::Null, Value::Bool),
         "freshnessLagSeconds": Value::Null,
+        "targetLag": Value::Null,
+        "lag": Value::Null,
     })
 }
 
@@ -958,6 +1020,15 @@ async fn authored_detail(
         );
         obj.insert("upstream".to_owned(), json!(upstream));
         obj.insert("downstream".to_owned(), json!(downstream));
+        // BLD-2 plan D8: the Freshness panel's `lag` object.
+        let lag = match detail_lag(pool, &pipeline).await {
+            Ok(lag) => lag,
+            Err(err) => {
+                tracing::warn!(%err, pipeline_id = %id, "authored_detail: target lag lookup failed");
+                return ApiRejection(err.into()).into_response();
+            }
+        };
+        obj.insert("lag".to_owned(), lag);
         // BLD-1 / D2: the author this pipeline reads as, by NAME. The
         // console shows "Reads as: <name>", and it cannot get that from
         // `GET /api/identity/users` -- that route is `identity:read`, which
@@ -983,6 +1054,46 @@ async fn authored_detail(
         );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// BLD-2 plan D8: the `lag` object for one pipeline's detail payload —
+/// what its target is, how far behind it is, and why. Two store reads
+/// when the pipeline has a target lag (and none when it has none, which is
+/// the common case).
+///
+/// Both reads fail loudly: a swallowed error would answer "no check has
+/// run" for a pipeline that is in fact being checked every 30 seconds,
+/// which is a different and wrong claim (`BLD-2-AC5`).
+async fn detail_lag(pool: &PgPool, pipeline: &pipelines::Pipeline) -> Result<Value, StoreError> {
+    if pipeline.target_lag.is_none() {
+        return Ok(crate::pipeline_lag::lag_json(
+            None,
+            None,
+            time::OffsetDateTime::now_utc(),
+            false,
+            0,
+            None,
+        ));
+    }
+    let state = pipelines::get_lag_state(pool, &pipeline.id).await?;
+    let no_readers =
+        crate::pipeline_lag::downstream_without_readers(pool, std::slice::from_ref(pipeline))
+            .await?;
+    // BLD-2 review R4 BLOCKER 1 (a) / decision R16 + SHOULD-FIX 3:
+    // the answer comes from the SAME chain the check walks (not
+    // `dependsOn` alone) and the read propagates with `?` — the old code
+    // refused decision R16's answer: it walked `dependsOn` and swallowed
+    // every store error with `if let Ok(...)`, so a failing read silently
+    // answered "nothing is blocking this pipeline".
+    let upstream_stop = crate::pipeline_lag::upstream_stop_of(pool, pipeline).await?;
+    Ok(crate::pipeline_lag::lag_json(
+        pipeline.target_lag,
+        state.as_ref(),
+        time::OffsetDateTime::now_utc(),
+        no_readers.contains(&pipeline.id),
+        i32::from(pipeline.max_retries),
+        upstream_stop.as_ref(),
+    ))
 }
 
 /// Build the `upstream` array for `authored_detail`: one entry per id
@@ -2931,6 +3042,9 @@ pub struct CreatePipelineBody {
     /// connector picker). Must be a connector in the creator's tenant.
     #[serde(default)]
     connector_id: Option<String>,
+    /// BLD-2: target lag (plan D2, D8).
+    #[serde(default)]
+    pub target_lag: Option<lakehouse_store::pipelines::TargetLag>,
 }
 
 /// BLD-1 / D1: the `app_user` id a principal may author a pipeline as, or
@@ -3037,6 +3151,7 @@ pub async fn create(
         &others,
         &dagster_jobs,
     )?;
+    crate::routes::authored_pipelines::validate_target_lag(body.target_lag)?;
     let connector_id = body
         .connector_id
         .map(|id| id.trim().to_owned())
@@ -3062,6 +3177,7 @@ pub async fn create(
         depends_on: body.depends_on,
         connector_id,
         id: Some(id),
+        target_lag: body.target_lag,
         // BLD-1 / D1: the creator is the author, so a pipeline reads as
         // the person who made it. Only a HUMAN principal gets an author:
         // `PrincipalId::Service` has no `app_user` row for the foreign
@@ -3262,6 +3378,9 @@ pub async fn generate(
         // so no id was minted in advance — the store's default `slug_id`
         // path applies. PR #57 review F1.7.
         id: None,
+        // BLD-2 T4: same as `create` — a pipeline an LLM drafts starts
+        // with no target lag until a user or the assistant sets one.
+        target_lag: None,
         // BLD-1 / D1: the LLM proposes the SHAPE, never the identity. The
         // author is the human who asked, exactly as in `create`.
         run_as: author_id(&principal),
@@ -5916,8 +6035,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: None,
-                    run_as: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                     // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -8490,8 +8611,10 @@ mod tests {
                     depends_on: Vec::new(),
                     connector_id: None,
                     id: Some(id.clone()),
-                    run_as: None,
+                    // BLD-2: this fixture is not about a target lag.
+                    target_lag: None,
                     // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                    run_as: None,
                 },
                 None,
             )
@@ -9426,8 +9549,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -10495,8 +10620,10 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 

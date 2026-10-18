@@ -1465,6 +1465,36 @@ fn get_pipeline_schema() -> Value {
             "required": ["id"] } } })
 }
 
+fn set_pipeline_target_lag_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_pipeline_target_lag",
+        "description": "Set or clear an authored pipeline's target lag. Target lag makes the pipeline refresh automatically whenever its inputs change, aiming to keep data within the given lag. Use targetLag: { kind: \"lag\", minutes: N } for a time target (minimum 1 minute, up to 10080 minutes / 7 days), { kind: \"downstream\" } to refresh whenever downstream readers need it, or null to clear.",
+        "parameters": { "type": "object", "properties": {
+            "pipeline": { "type": "string", "description": "pipeline id (pl-…) or pipeline name" },
+            "targetLag": {
+                "description": "target lag configuration: { kind: \"lag\", minutes } | { kind: \"downstream\" } | null to clear",
+                "oneOf": [
+                    { "type": "null" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["lag"] },
+                            "minutes": { "type": "integer", "minimum": 1, "maximum": 10080 }
+                        },
+                        "required": ["kind", "minutes"]
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["downstream"] }
+                        },
+                        "required": ["kind"]
+                    }
+                ]
+            }
+        },
+        "required": ["pipeline"] } } })
+}
+
 fn mark_pipeline_ready_schema() -> Value {
     json!({ "type": "function", "function": { "name": "mark_pipeline_ready",
         "description": "Move an authored pipeline (pl-…) from draft to ready, so the orchestrator builds a job for it and trigger_pipeline can run it.",
@@ -2146,6 +2176,12 @@ pub static TOOLS: &[ToolSpec] = &[
         permission: "pipeline:write",
     },
     ToolSpec {
+        name: "set_pipeline_target_lag",
+        schema: set_pipeline_target_lag_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
         name: "list_iceberg_tables",
         schema: list_iceberg_tables_schema,
         risk: Risk::Read,
@@ -2243,7 +2279,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_ninety_two_entries() {
+    fn tool_schemas_has_one_hundred_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
@@ -2261,8 +2297,8 @@ mod tests {
         // + `format_chart` and `set_dashboard_theme` (`BI-17` part A, `AI-8`)
         // + the 6 dashboard-board tools from main (plan 20: `rename_board`,
         // `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`,
-        // `save_board_filters`).
-        assert_eq!(tool_schemas().len(), 99);
+        // `save_board_filters`) + `set_pipeline_target_lag` (`BLD-2`, from main).
+        assert_eq!(tool_schemas().len(), 100);
     }
 
     /// `BI-2` (with `AI-7`): reading a metric needs `dashboard:read`; defining,
