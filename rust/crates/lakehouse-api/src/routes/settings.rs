@@ -74,12 +74,16 @@ https://host or https://host:port, with no wildcard, path or user name.";
 /// not exist.
 const DOWNLOAD_ROLES_REFUSED: &str = "downloadDeniedRoles must name roles that exist.";
 
+/// What the person is told when `reportAllowedDomains` is not at most 50
+/// domain names (`RPT-1`, D8).
+const REPORT_DOMAINS_REFUSED: &str = "reportAllowedDomains must be at most 50 domain names such as example.com, with no wildcard, address or path.";
+
 /// What the person is told when their roles may not download (`BI-1`, D7).
 pub(crate) const DOWNLOADS_OFF: &str = "Downloads are switched off for your role.";
 
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...]}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,6 +95,7 @@ struct SettingsBody {
     fonts: Option<Vec<String>>,
     content_sites: Option<Vec<String>>,
     download_denied_roles: Option<Vec<String>>,
+    report_allowed_domains: Option<Vec<String>>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -249,14 +254,41 @@ fn checked_formatting(
         }
         _ => current.download_denied_roles.clone(),
     };
+    let report_allowed_domains = match &parsed.report_allowed_domains {
+        // A fixed sentence: the entries are the administrator's own text.
+        Some(domains) => validate_report_domains(domains)
+            .ok_or_else(|| ApiError::BadRequest(REPORT_DOMAINS_REFUSED.to_owned()))?,
+        None => current.report_allowed_domains.clone(),
+    };
     Ok(FormatSettings {
         number_locale,
         company_palette,
         fonts,
         content_sites,
         download_denied_roles,
-        report_allowed_domains: current.report_allowed_domains.clone(),
+        report_allowed_domains,
     })
+}
+
+/// The outside email domains for reports (`RPT-1`, D8): at most 50, each a
+/// valid domain name (`report_runner::domain_is_valid`: no wildcard, at least
+/// two labels), lower-cased, sorted, no duplicates. `None` when any entry or the
+/// count is refused.
+fn validate_report_domains(domains: &[String]) -> Option<Vec<String>> {
+    if domains.len() > 50 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(domains.len());
+    for raw in domains {
+        let domain = raw.trim().to_ascii_lowercase();
+        if !crate::routes::report_runner::domain_is_valid(&domain) {
+            return None;
+        }
+        out.push(domain);
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 /// Whether `principal` may download (`BI-1`, D7): a Platform Admin always,
@@ -361,6 +393,7 @@ fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
         "weekStart": ctx.week_start().as_str(),
         "saved": saved,
         "downloadDeniedRoles": format.download_denied_roles,
+        "reportAllowedDomains": format.report_allowed_domains,
     });
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), format.to_json()) {
         map.extend(fields);
@@ -515,7 +548,7 @@ mod tests {
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
-                "contentSites": [], "downloadDeniedRoles": [],
+                "contentSites": [], "downloadDeniedRoles": [], "reportAllowedDomains": [],
             })
         );
         assert_eq!(
@@ -683,5 +716,64 @@ mod tests {
         let mut none = json!({});
         add_formatting(&mut none, &FormatSettings::default());
         assert_eq!(none, json!({}));
+    }
+
+    /// `RPT-1` D8: the outside domains are validated names, lower-cased, sorted,
+    /// without duplicates, at most 50, and refused with one fixed sentence.
+    #[test]
+    fn report_domains_are_validated_lower_cased_and_bounded() {
+        let current = FormatSettings::default();
+        let got = checked_formatting(
+            &body(r#","reportAllowedDomains":["Partner.Example "," a.example","partner.example"]"#),
+            &current,
+            None,
+        )
+        .unwrap();
+        assert_eq!(got.report_allowed_domains, ["a.example", "partner.example"]);
+        for bad in [
+            r#"["*.example.com"]"#,
+            r#"["example"]"#,
+            r#"["a@example.com"]"#,
+            r#"["https://example.com"]"#,
+            r#"[""]"#,
+        ] {
+            let err = checked_formatting(
+                &body(&format!(r#","reportAllowedDomains":{bad}"#)),
+                &current,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, ApiError::BadRequest(m) if m == REPORT_DOMAINS_REFUSED),
+                "{bad}"
+            );
+        }
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("d{i}.example")).collect();
+        assert!(validate_report_domains(&fifty_one).is_none());
+        assert!(validate_report_domains(&fifty_one[..50]).is_some());
+        // Absent: what is stored stays.
+        let kept = FormatSettings {
+            report_allowed_domains: vec!["x.example".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert_eq!(
+            checked_formatting(&body(""), &kept, None)
+                .unwrap()
+                .report_allowed_domains,
+            ["x.example"]
+        );
+    }
+
+    #[test]
+    fn the_domain_list_is_in_the_settings_screen_and_not_in_the_dashboard_payload() {
+        let f = FormatSettings {
+            report_allowed_domains: vec!["x.example".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert!(f.to_json().get("reportAllowedDomains").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &f, true)["reportAllowedDomains"],
+            json!(["x.example"])
+        );
     }
 }

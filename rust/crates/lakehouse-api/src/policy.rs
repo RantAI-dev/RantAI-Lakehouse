@@ -560,6 +560,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // switched off from downloading (D7), audited before the file is sent.
     ("GET",    "/api/dashboard/export/pdf",   Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/embed-info",   Policy::RequiresPermission("dashboard:read")),
+    // RPT-1 (D7): scheduled reports. `dashboard:read` gets past the gate; the
+    // handlers then require the download right to create, and the owner or an
+    // administrator (`settings:write`) to read, change, pause, send or delete.
+    ("GET",    "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions",  Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("PUT",    "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("DELETE", "/api/reports/subscriptions/{id}", Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/reports/subscriptions/{id}/send", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/subscriptions/{id}/deliveries", Policy::RequiresPermission("dashboard:read")),
+    ("GET",    "/api/reports/recipients",     Policy::RequiresPermission("dashboard:read")),
     // SEC-12: withdrawing a token changes who can read the dashboard, so it
     // is a write, like the embed toggle on `PUT /api/dashboard/boards`.
     ("POST",   "/api/dashboard/embed-revoke", Policy::RequiresPermission("dashboard:write")),

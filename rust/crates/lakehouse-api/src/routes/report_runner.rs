@@ -75,6 +75,10 @@ use crate::state::AppState;
 
 /// The attachments of one email, in all (feature decision 5).
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// Chart files in one email (feature decision 5).
+pub const MAX_CHART_FILES: usize = 10;
+/// People one subscription may address (feature decision 3).
+pub const MAX_RECIPIENTS: usize = 50;
 /// Subscriptions one tick takes.
 const CLAIM_LIMIT: i64 = 5;
 /// How often the runner looks for due subscriptions.
@@ -141,9 +145,45 @@ pub struct AttachmentSpec {
     /// The dashboard as a PDF, or none.
     #[serde(default)]
     pub pdf: Option<PdfAttachment>,
-    /// The chart files, in the order they are attached.
+    /// Up to [`MAX_CHART_FILES`] chart files, in the order they are attached.
     #[serde(default)]
     pub charts: Vec<ChartAttachment>,
+}
+
+impl AttachmentSpec {
+    /// Check the closed lists and the count.
+    ///
+    /// # Errors
+    ///
+    /// The sentence the person is told.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(pdf) = &self.pdf {
+            if Paper::parse(&pdf.paper).is_none() {
+                return Err("paper must be a4 or letter.");
+            }
+            if Orientation::parse(&pdf.orientation).is_none() {
+                return Err("orientation must be portrait or landscape.");
+            }
+        }
+        if self.pdf.is_none() && self.charts.is_empty() {
+            return Err("Choose at least one thing to attach: the PDF or a chart's data.");
+        }
+        if self.charts.len() > MAX_CHART_FILES {
+            return Err("A report attaches at most 10 chart files.");
+        }
+        for c in &self.charts {
+            if c.chart.trim().is_empty() || c.chart.len() > 200 {
+                return Err("Every chart file needs a chart.");
+            }
+            if !matches!(c.format.as_str(), "xlsx" | "csv") {
+                return Err("A chart file is xlsx or csv.");
+            }
+            if !matches!(c.values.as_str(), "formatted" | "raw") {
+                return Err("values must be formatted or raw.");
+            }
+        }
+        Ok(())
+    }
 }
 
 // ── Addresses ────────────────────────────────────────────────────────────
@@ -1151,6 +1191,37 @@ mod tests {
         // With no domain listed, no outside address is addressed at all.
         let none = audience_of(&rows, &[]);
         assert_eq!(none.addresses, ["ann@company.example"]);
+    }
+
+    #[test]
+    fn the_attachment_spec_is_checked_against_the_closed_lists() {
+        let pdf = |paper: &str| {
+            Some(PdfAttachment {
+                paper: paper.to_owned(),
+                orientation: "portrait".to_owned(),
+            })
+        };
+        let chart = |format: &str, values: &str| ChartAttachment {
+            chart: "c1".to_owned(),
+            format: format.to_owned(),
+            values: values.to_owned(),
+        };
+        let spec = |pdf, charts| AttachmentSpec { pdf, charts };
+        assert_eq!(spec(pdf("a4"), vec![]).validate(), Ok(()));
+        assert!(spec(None, vec![]).validate().is_err(), "nothing attached");
+        assert!(spec(pdf("a3"), vec![]).validate().is_err());
+        assert_eq!(spec(None, vec![chart("xlsx", "raw")]).validate(), Ok(()));
+        assert!(spec(None, vec![chart("pdf", "raw")]).validate().is_err());
+        assert!(spec(None, vec![chart("csv", "weird")]).validate().is_err());
+        let ten: Vec<_> = (0..MAX_CHART_FILES).map(|_| chart("csv", "raw")).collect();
+        assert_eq!(
+            spec(None, ten.clone()).validate(),
+            Ok(()),
+            "ten is the limit"
+        );
+        let mut eleven = ten;
+        eleven.push(chart("csv", "raw"));
+        assert!(spec(None, eleven).validate().is_err());
     }
 
     #[test]

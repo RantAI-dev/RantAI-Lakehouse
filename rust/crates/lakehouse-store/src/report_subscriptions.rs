@@ -647,3 +647,31 @@ pub async fn prune_deliveries(pool: &PgPool, cutoff: OffsetDateTime) -> Result<u
         .await?;
     Ok(done.rows_affected())
 }
+
+/// Active console users whose name or address contains `needle` (case
+/// insensitive), for the recipient picker: id, name, address; at most `limit`,
+/// by name. An empty `needle` lists the first `limit`. The needle is bound, and
+/// its `%`, `_` and `\` are escaped so it matches literally.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the query fails.
+pub async fn search_active_users(
+    pool: &PgPool,
+    needle: &str,
+    limit: i64,
+) -> Result<Vec<(Uuid, String, String)>, StoreError> {
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Ok(sqlx::query_as(
+        "SELECT id, name, email FROM app_user \
+         WHERE status = 'active' AND (name ILIKE $1 OR email ILIKE $1) \
+         ORDER BY name, email LIMIT $2",
+    )
+    .bind(format!("%{escaped}%"))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}

@@ -34,6 +34,7 @@ mod embed;
 mod pdf_export;
 mod render;
 pub mod report_runner;
+mod reports;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
@@ -168,6 +169,11 @@ fn route_timeout(path: &str) -> Duration {
         "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
         "/api/dashboard/chart-export" | "/api/dashboard/table-export" => EXPORT_REQUEST_TIMEOUT,
         "/api/dashboard/export/pdf" => PDF_REQUEST_TIMEOUT,
+        // RPT-1: "Send now" makes the PDF and the chart files in the request,
+        // so it gets the longest export deadline.
+        other if other.starts_with("/api/reports/subscriptions/") && other.ends_with("/send") => {
+            EXPORT_REQUEST_TIMEOUT
+        }
         other if is_discovery_path(other) => DISCOVERY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
@@ -1113,6 +1119,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .route("/api/embed/data", axum::routing::post(embed::data))
         .route("/api/render/data", axum::routing::post(render::data))
+        // RPT-1 (D7): scheduled reports. Authorisation beyond `dashboard:read`
+        // (owner or administrator, download right) is in the handlers.
+        .route(
+            "/api/reports/subscriptions",
+            get(reports::list).post(reports::create),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}",
+            get(reports::get)
+                .put(reports::update)
+                .delete(reports::delete),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/send",
+            axum::routing::post(reports::send_now),
+        )
+        .route(
+            "/api/reports/subscriptions/{id}/deliveries",
+            get(reports::deliveries),
+        )
+        .route("/api/reports/recipients", get(reports::recipients))
         .route(
             "/api/embed/frame",
             axum::routing::post(embed::frame_origins),
@@ -1283,6 +1310,15 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+        // RPT-1: "Send now" makes the files in the request.
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e/send"),
+            EXPORT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            route_timeout("/api/reports/subscriptions/0b7e"),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     /// `SRC-13` decision D9: the discovery routes carry a listing call of up to
