@@ -66,6 +66,10 @@ describe("a dashboard with its own theme and font", () => {
     await waitFor(() => expect(screen.getByTestId("tile").getAttribute("data-dark")).toBe("true"))
     const page = container.firstElementChild as HTMLElement
     expect(page.className).toContain("dark")
+    // BI-18 part C review fix (SHOULD-FIX) R22: the scope paints its own surface and text colour from
+    // its own (dark) tokens, so tile text is light on a light console and no grey box shows.
+    expect(page.className).toContain("text-foreground")
+    expect(page.className).toContain("bg-background")
     expect(page.style.fontFamily).toContain("--font-source-serif")
     expect(screen.queryByRole("button", { name: /^(Light|Dark|Theme)$/ })).toBeNull()
   })

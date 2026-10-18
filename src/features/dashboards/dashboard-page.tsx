@@ -1041,7 +1041,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // console, and anything portalled out of this element, keeps its theme.
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"))} style={look.style}>
+    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
       <PageHeader
         title={
           <BoardSwitcher
