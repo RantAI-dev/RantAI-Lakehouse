@@ -62,5 +62,12 @@ function prefixedHint(message: string): string | null {
  * banner used to print the raw text, code first.
  */
 export function readableErrorMessage(message: string): string {
-  return prefixedHint(message) ?? message
+  const hint = prefixedHint(message)
+  if (hint === null) return message
+  // BI-18 part C review fix R20 (follow-up: keep the server's sentence): when
+  // what follows the code is a sentence the server wrote for the reader ("Downloads
+  // are switched off for your role."), show it; the generic hint is for a bare
+  // permission id such as `dashboard:write`, which tells the reader nothing.
+  const detail = message.slice(message.indexOf(":") + 1).trim()
+  return message.includes(":") && /\s/.test(detail) && detail.endsWith(".") ? detail : hint
 }
