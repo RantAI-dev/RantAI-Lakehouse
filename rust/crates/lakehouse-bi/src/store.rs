@@ -3830,7 +3830,19 @@ pub async fn spec_from_input(
     if !input.shape.layers_list().is_empty() {
         spec.def.shape.layers = Some(checked_layers(ch, input, source, created_by, time).await?);
     }
+    key_look_by_drawn_names(&mut spec);
     Ok(spec)
+}
+
+/// BI-18 part C review fix (BLOCKER) R24: series colours are keyed by the name
+/// the chart draws, whichever path saved them (builder, `create_chart`,
+/// `update_chart`, `format_chart`: all end in [`spec_from_input`]).
+fn key_look_by_drawn_names(spec: &mut StoredChartSpec) {
+    let drawn: Vec<String> = match &spec.spec.y {
+        crate::specs::ChartY::Single(y) => vec![y.clone()],
+        crate::specs::ChartY::Multi(ys) => ys.clone(),
+    };
+    crate::style::key_series_by_drawn_name(&mut spec.def, &drawn);
 }
 
 /// `BI-13`: the layers of `input` as they are stored, each validated by
@@ -6209,6 +6221,38 @@ mod tests {
             spec.spec.sql.contains("GROUP BY place"),
             "{}",
             spec.spec.sql
+        );
+    }
+
+    /// BI-18 part C review fix (BLOCKER) R24, the request of `AI-8-AC1` ("Show
+    /// values in rupiah, make the bars green, add a target line at 1,000") on the
+    /// chart the tile reads: the stored definition carries the currency format,
+    /// the line, and the colour under the name the chart draws.
+    #[test]
+    fn the_formatted_chart_the_tile_reads_has_the_format_the_line_and_the_colour_of_the_series_it_draws()
+     {
+        let mut spec = grain_build(&serde_json::json!({
+            "kind": "bar", "dimension": "place", "measures": ["visitors"], "aggregate": "sum",
+            "format": { "style": "currency", "currency": "IDR" },
+            "colors": { "series": { "sum_visitors": "#16a34a" } },
+            "referenceLines": [{ "value": 1000.0, "label": "Target" }],
+        }))
+        .unwrap();
+        key_look_by_drawn_names(&mut spec);
+        let drawn = match &spec.spec.y {
+            crate::specs::ChartY::Single(y) => y.clone(),
+            crate::specs::ChartY::Multi(ys) => ys[0].clone(),
+        };
+        let payload = serde_json::to_value(&spec.def).unwrap();
+        assert_eq!(payload["format"]["currency"], "IDR", "{payload}");
+        assert_eq!(payload["referenceLines"][0]["value"], 1000.0, "{payload}");
+        assert_eq!(
+            payload["colors"]["series"][drawn.as_str()],
+            "#16a34a",
+            "{payload}"
+        );
+        assert!(
+            payload["colors"]["series"].get("sum_visitors").is_none() || drawn == "sum_visitors"
         );
     }
 

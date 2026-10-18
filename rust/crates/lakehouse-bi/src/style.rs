@@ -863,6 +863,45 @@ pub fn check_style_names<S: std::hash::BuildHasher>(
     Ok(())
 }
 
+/// Key a chart's series colours by the name the chart draws (`BI-18` part C
+/// review fix (BLOCKER) R24). The assistant (and a person) names a measure's
+/// colour `sum_visitors`, but the series a tile draws is named by the result
+/// column (`visitors` on a SQL source, whatever `y` is), so the colour matched
+/// nothing and the bars stayed the palette's. A key that is a measure's column
+/// or `<aggregate>_<column>` becomes the `y` name of that measure; any other
+/// key (a breakdown value, a name already right) is left as it is, and a key
+/// is never moved onto one that is already set.
+pub fn key_series_by_drawn_name(def: &mut ChartInput, y: &[String]) {
+    let Some(colors) = def.style.colors.as_mut() else {
+        return;
+    };
+    if colors.series.is_empty() {
+        return;
+    }
+    let chart_aggregate = def.aggregate.clone();
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (i, (column, own)) in def.measures.entries().enumerate() {
+        let Some(drawn) = y.get(i) else { continue };
+        let mut aliases = vec![column.to_owned()];
+        for aggregate in [own, chart_aggregate.as_deref()].into_iter().flatten() {
+            aliases.push(format!("{aggregate}_{column}"));
+        }
+        for alias in aliases {
+            if alias != *drawn {
+                moves.push((alias, drawn.clone()));
+            }
+        }
+    }
+    for (from, to) in moves {
+        if colors.series.contains_key(&to) {
+            continue;
+        }
+        if let Some(colour) = colors.series.remove(&from) {
+            colors.series.insert(to, colour);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1094,5 +1133,52 @@ mod tests {
         let bad_rule = chart(&json!({"kind": "table", "conditional": [
             {"column": "nope", "rule": {"type": "contains", "text": "x"}, "color": "#000000"}]}));
         assert!(check_style_names(&bad_rule, &cols).is_err());
+    }
+
+    fn colours_of(extra: serde_json::Value) -> ChartInput {
+        let mut def = serde_json::json!({
+            "title": "t", "mart": "m", "kind": "hbar", "dimension": "provinsi",
+            "measures": ["visitors"], "aggregate": "sum",
+        });
+        def.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(def).unwrap()
+    }
+
+    /// `BI-18` part C review fix (BLOCKER) R24: the chart of the owner's QA
+    /// (`u_be2bc0d2`) drew `visitors`; the colour was saved under `sum_visitors`.
+    #[test]
+    fn a_series_colour_is_keyed_by_the_name_the_chart_draws() {
+        let mut def = colours_of(serde_json::json!({
+            "colors": { "series": { "sum_visitors": "#16a34a" } },
+            "format": { "style": "currency", "currency": "IDR" },
+            "referenceLines": [{ "value": 1000.0, "label": "Target" }],
+        }));
+        key_series_by_drawn_name(&mut def, &["visitors".to_owned()]);
+        let colors = def.style.colors.as_ref().unwrap();
+        assert_eq!(
+            colors.series.get("visitors").map(String::as_str),
+            Some("#16a34a")
+        );
+        assert!(!colors.series.contains_key("sum_visitors"));
+        // The rest of the look is untouched.
+        assert!(def.style.format.is_some());
+        assert!(def.shape.reference_lines.is_some());
+        // A name the chart already draws, a breakdown value and an unknown name stay.
+        let mut right = colours_of(serde_json::json!({
+            "colors": { "series": { "sum_visitors": "#111111", "Bali": "#222222" } },
+        }));
+        key_series_by_drawn_name(&mut right, &["sum_visitors".to_owned()]);
+        let kept = &right.style.colors.as_ref().unwrap().series;
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains_key("sum_visitors") && kept.contains_key("Bali"));
+        // The bare column also maps, and a key is never moved onto one already set.
+        let mut both = colours_of(serde_json::json!({
+            "colors": { "series": { "visitors": "#333333", "sum_visitors": "#444444" } },
+        }));
+        key_series_by_drawn_name(&mut both, &["visitors".to_owned()]);
+        let series = &both.style.colors.as_ref().unwrap().series;
+        assert_eq!(series["visitors"], "#333333");
     }
 }
