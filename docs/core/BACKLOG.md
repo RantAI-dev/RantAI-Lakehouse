@@ -427,7 +427,7 @@ rejected** with the date.
 | `DEC-12` | Name staff as Owner and Acceptor in the public repo | Decided: no. The repo names the module; the base holds the person through the module's owner | 2026-10-09 |
 | `DEC-13` | Query Studio as a module in the base | Decided: yes, its own module | 2026-10-09 |
 | `DEC-14` | Priority of `SEC-14` and `SEC-15` | Decided: P0 | 2026-10-09 |
-| `DEC-8` | Which assistant actions need human approval before they run | Decided: besides deletions and pauses, all four wait for approval: making a dashboard public or embeddable, changing who can see a dashboard, emailing outside the company, deleting a dashboard | 2026-10-17 |
+| `DEC-8` | Which assistant actions need human approval before they run | Decided: besides deletions and pauses, all four wait for approval: making a dashboard public or embeddable, changing who can see a dashboard, emailing outside the company, deleting a dashboard. Refined 2026-10-18: an action that only narrows access (switching a public link off, withdrawing embed tokens) needs a confirm in the chat, not an approver | 2026-10-17, 2026-10-18 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
 
