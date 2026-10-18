@@ -367,7 +367,7 @@ fn report_summary(name: &str, args: &Map<String, Value>) -> String {
         )
     } else {
         format!(
-            "Mengubah laporan terjadwal {} (hanya penerimanya Anda sendiri).",
+            "Mengubah laporan terjadwal {} (tanpa penerima baru; penerima yang ada tetap atau berkurang).",
             s("id")
         )
     }
@@ -556,12 +556,31 @@ pub fn outcome_of(refusal: &Value) -> &'static str {
 ///   [`create_write_high_approval`] (T0.5). This is deliberately NOT the
 ///   same as executing, and NOT the `WriteLow` confirmation path — a
 ///   `WriteHigh` call must never slip through by carrying `confirmed: true`.
+#[cfg(test)]
 #[must_use]
 pub fn decide(
     is_build: bool,
     perms: Option<&PermissionSet>,
     spec: &ToolSpec,
     args: &Map<String, Value>,
+) -> Option<Value> {
+    decide_with(is_build, perms, spec, args, None)
+}
+
+/// [`decide`] with a fact the server worked out about the call, which the
+/// model cannot see or set. `RPT-1` review fix (BLOCKER) R2: for
+/// `update_report_subscription`, `audience_needs_approval` says whether the
+/// recipients the call leaves in place include anyone but the requester and the
+/// call does more than narrow them (`tools::report_audience`, loaded before the
+/// gate at every dispatch site). `None`: not worked out, the arguments alone
+/// decide.
+#[must_use]
+pub fn decide_with(
+    is_build: bool,
+    perms: Option<&PermissionSet>,
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
 ) -> Option<Value> {
     // F2.9 (PR #59 review): the Ask-mode / permission gates check the
     // STATIC risk (a Read tool must never refuse in Ask mode regardless
@@ -571,7 +590,7 @@ pub fn decide(
     // of the `WriteLow` confirmation path. Ask mode is intentionally
     // unaffected: a non-Read call is refused in Ask mode whether the
     // tool is `WriteLow` or `WriteHigh` in this call.
-    let effective = effective_risk(spec, args);
+    let effective = effective_risk_with(spec, args, audience_needs_approval);
     if !is_build && effective != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
@@ -617,8 +636,19 @@ pub fn decide(
 /// `pub` because the `decide` / `decide_by_name` arms in this module
 /// consult it directly, and the tests in `mod tests` pin both
 /// directions (with / without `runConfig`).
+#[cfg(test)]
 #[must_use]
 pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
+    effective_risk_with(spec, args, None)
+}
+
+/// [`effective_risk`] with the server-side audience fact of [`decide_with`].
+#[must_use]
+pub fn effective_risk_with(
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
+) -> Risk {
     if spec.name == "trigger_pipeline" && matches!(args.get("runConfig"), Some(Value::Object(_))) {
         return Risk::WriteHigh;
     }
@@ -627,15 +657,25 @@ pub fn effective_risk(spec: &ToolSpec, args: &Map<String, Value>) -> Risk {
     // recipient emails someone else, so that call waits for a human's approval.
     // Per call, not per tool, like `trigger_pipeline` above. A list that only
     // holds the empty array names nobody.
-    if matches!(
-        spec.name,
-        "create_report_subscription" | "update_report_subscription"
-    ) && args
+    let names_others = args
         .get("recipients")
         .and_then(Value::as_array)
-        .is_some_and(|others| !others.is_empty())
-    {
-        return Risk::WriteHigh;
+        .is_some_and(|others| !others.is_empty());
+    match (spec.name, audience_needs_approval) {
+        // RPT-1 review fix (BLOCKER) R2: an update is judged by who ends up
+        // receiving it, which the server looked up (the stored list when the
+        // call names none), not by the recipients it names: a new chart sent to
+        // a stored outside list is an approval; pausing or removing a recipient
+        // is a Confirm.
+        ("update_report_subscription", Some(needs)) => {
+            if needs {
+                return Risk::WriteHigh;
+            }
+        }
+        ("create_report_subscription" | "update_report_subscription", _) if names_others => {
+            return Risk::WriteHigh;
+        }
+        _ => {}
     }
     spec.risk
 }
@@ -649,9 +689,10 @@ pub fn decide_by_name(
     perms: Option<&PermissionSet>,
     tool_name: &str,
     args: &Map<String, Value>,
+    audience_needs_approval: Option<bool>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide(is_build, perms, spec, args)
+    decide_with(is_build, perms, spec, args, audience_needs_approval)
 }
 
 #[cfg(test)]
@@ -692,6 +733,38 @@ mod tests {
 
     /// BI-17 part A / AI-8: the formatting tools wait for the chat's confirmation, do not execute
     /// without it, are refused to a user without `dashboard:write`, and (being `WriteLow`) need no approval.
+    /// RPT-1 review fix (BLOCKER) R2: the audience fact, not the named
+    /// recipients, decides an update; creating still goes by what it names.
+    #[test]
+    fn a_report_update_is_judged_by_the_servers_audience_fact_when_there_is_one() {
+        let update = spec("update_report_subscription");
+        let create = spec("create_report_subscription");
+        let none = no_args();
+        assert_eq!(
+            effective_risk_with(update, &none, Some(true)),
+            Risk::WriteHigh
+        );
+        assert_eq!(
+            effective_risk_with(update, &none, Some(false)),
+            Risk::WriteLow
+        );
+        // Without the fact the arguments decide, as before.
+        assert_eq!(effective_risk_with(update, &none, None), Risk::WriteLow);
+        let mut named = Map::new();
+        named.insert("recipients".to_owned(), json!([{ "email": "a@b.example" }]));
+        assert_eq!(effective_risk_with(update, &named, None), Risk::WriteHigh);
+        // The fact says narrowing: naming a subset is a Confirm.
+        assert_eq!(
+            effective_risk_with(update, &named, Some(false)),
+            Risk::WriteLow
+        );
+        assert_eq!(
+            effective_risk_with(create, &named, Some(false)),
+            Risk::WriteHigh
+        );
+        assert_eq!(effective_risk_with(create, &none, None), Risk::WriteLow);
+    }
+
     #[test]
     fn the_formatting_tools_need_confirmation_and_dashboard_write() {
         let admin = admin_perms();
@@ -1034,11 +1107,11 @@ mod tests {
     #[test]
     fn unregistered_tool_is_never_refused() {
         assert_eq!(
-            decide_by_name(false, None, "not_a_real_tool", &no_args()),
+            decide_by_name(false, None, "not_a_real_tool", &no_args(), None),
             None
         );
         assert_eq!(
-            decide_by_name(true, None, "not_a_real_tool", &no_args()),
+            decide_by_name(true, None, "not_a_real_tool", &no_args(), None),
             None
         );
     }
@@ -1143,7 +1216,7 @@ mod tests {
         ];
         for tool in ["run_sql", "run_saved_query"] {
             for perms in &without {
-                let refused = decide_by_name(true, Some(perms), tool, &no_args())
+                let refused = decide_by_name(true, Some(perms), tool, &no_args(), None)
                     .unwrap_or_else(|| panic!("{tool} must be refused without query:read"));
                 assert_eq!(refused["reason"], json!("permission"), "{tool}");
                 assert_eq!(refused["required"], json!("query:read"), "{tool}");
@@ -1153,7 +1226,8 @@ mod tests {
                     true,
                     Some(&PermissionSet::parse("query:read")),
                     tool,
-                    &no_args()
+                    &no_args(),
+                    None
                 ),
                 None,
                 "{tool} must be allowed with query:read"

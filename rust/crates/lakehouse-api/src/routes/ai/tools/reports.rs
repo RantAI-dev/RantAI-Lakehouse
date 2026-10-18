@@ -338,6 +338,38 @@ async fn own(
     }
 }
 
+/// Recipients the call did not touch stay as stored. Shared by the tool and the
+/// check made before an approval (`RPT-1` review fix R2: that check validated an
+/// update with no recipients at all).
+async fn keep_stored_recipients(
+    pool: &lakehouse_store::PgPool,
+    sub: &Subscription,
+    args: &Map<String, Value>,
+    input: &mut SubscriptionInput,
+) -> Result<(), Value> {
+    if args.contains_key("recipients") || args.contains_key("sendToMe") {
+        return Ok(());
+    }
+    let rows = subscriptions::recipients(pool, sub.id)
+        .await
+        .map_err(|_| json!({ "error": FAILED }))?;
+    input.recipients = rows
+        .iter()
+        .filter_map(|r| match (&r.user_id, &r.email) {
+            (Some(id), _) => Some(reports::RecipientInput {
+                user_id: Some(id.to_string()),
+                email: None,
+            }),
+            (None, Some(email)) => Some(reports::RecipientInput {
+                user_id: None,
+                email: Some(email.clone()),
+            }),
+            (None, None) => None,
+        })
+        .collect();
+    Ok(())
+}
+
 async fn update(state: &AppState, owner: &Principal, args: &Map<String, Value>) -> Value {
     let sub = match own(state, owner, args).await {
         Ok(sub) => sub,
@@ -354,25 +386,8 @@ async fn update(state: &AppState, owner: &Principal, args: &Map<String, Value>) 
         Ok(input) => input,
         Err(e) => return json!({ "error": e }),
     };
-    // Recipients the call did not touch stay as stored.
-    if !args.contains_key("recipients") && !args.contains_key("sendToMe") {
-        input.recipients = match subscriptions::recipients(pool, sub.id).await {
-            Ok(rows) => rows
-                .iter()
-                .filter_map(|r| match (&r.user_id, &r.email) {
-                    (Some(id), _) => Some(reports::RecipientInput {
-                        user_id: Some(id.to_string()),
-                        email: None,
-                    }),
-                    (None, Some(email)) => Some(reports::RecipientInput {
-                        user_id: None,
-                        email: Some(email.clone()),
-                    }),
-                    (None, None) => None,
-                })
-                .collect(),
-            Err(_) => return json!({ "error": FAILED }),
-        };
+    if let Err(e) = keep_stored_recipients(pool, &sub, args, &mut input).await {
+        return e;
     }
     input.paused = args.get("paused").and_then(Value::as_bool);
     let new = match validate_input(state, owner, &sub.board, &input).await {
@@ -398,6 +413,113 @@ async fn delete(state: &AppState, owner: &Principal, args: &Map<String, Value>) 
         Ok(_) => json!({ "deleted": true, "id": sub.id }),
         Err(_) => json!({ "error": FAILED }),
     }
+}
+
+// ── Who an update leaves receiving the report (RPT-1 review fix R2) ──────
+
+/// A recipient as a comparable key: `u:<uuid>` for a console user, `e:<address>`
+/// for an outside address.
+fn recipient_key(user_id: Option<&str>, email: Option<&str>) -> String {
+    match (user_id, email) {
+        (Some(id), _) => format!(
+            "u:{}",
+            id.parse::<Uuid>()
+                .map_or_else(|_| id.to_lowercase(), |u| u.to_string())
+        ),
+        (None, Some(email)) => format!(
+            "e:{}",
+            crate::routes::report_runner::normalise_address(email)
+                .unwrap_or_else(|| email.trim().to_lowercase())
+        ),
+        (None, None) => "?".to_owned(),
+    }
+}
+
+/// The pure half of [`report_audience`]: whether an update of a subscription
+/// whose stored recipients are `stored` needs a human's approval. It does when
+/// the recipients the call leaves in place (the stored ones when it names none,
+/// else the person themselves unless `sendToMe` is false, plus the named ones)
+/// include anyone but `me`, unless the call only narrows: it touches nothing but
+/// `paused` and the recipients, and no recipient is new.
+fn update_needs_approval(args: &Map<String, Value>, me: Uuid, stored: &[String]) -> bool {
+    let me_key = format!("u:{me}");
+    let named = args.contains_key("recipients") || args.contains_key("sendToMe");
+    let resulting: Vec<String> = if named {
+        let mut list = Vec::new();
+        if args
+            .get("sendToMe")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            list.push(me_key.clone());
+        }
+        for r in args
+            .get("recipients")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            list.push(recipient_key(
+                r.get("userId").and_then(Value::as_str),
+                r.get("email").and_then(Value::as_str),
+            ));
+        }
+        list
+    } else {
+        stored.to_vec()
+    };
+    if resulting.iter().all(|k| *k == me_key) {
+        return false;
+    }
+    let only_narrowing_keys = args.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "id" | "paused" | "recipients" | "sendToMe" | "confirmed"
+        )
+    });
+    let nothing_new = resulting.iter().all(|k| stored.contains(k));
+    !(only_narrowing_keys && nothing_new)
+}
+
+/// `RPT-1` review fix (BLOCKER) R2: the server-side fact the gate needs before it
+/// decides an `update_report_subscription` call: `Some(true)` when it needs a
+/// human's approval. Looked up at every dispatch site (the chat loop and
+/// `POST /api/ai/tool`; headless runs refuse the tool, R1) and given to
+/// `gate::decide_with`, never put in the arguments. Fails closed: a lookup that
+/// cannot be made, or a subscription that is not there, reads as an approval
+/// (the approval step then refuses what the requester may not do). `None` for any
+/// other tool.
+pub(in crate::routes) async fn report_audience(
+    state: &AppState,
+    requester: Option<&Principal>,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Option<bool> {
+    if name != "update_report_subscription" {
+        return None;
+    }
+    let (Some(me), Some(pool)) = (requester, state.pg.as_deref()) else {
+        return Some(true);
+    };
+    let Ok(id) = arg_str(args, "id").parse::<Uuid>() else {
+        return Some(true);
+    };
+    let Ok(Some(sub)) = subscriptions::get(pool, id).await else {
+        return Some(true);
+    };
+    let Ok(rows) = subscriptions::recipients(pool, sub.id).await else {
+        return Some(true);
+    };
+    let stored: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            recipient_key(
+                r.user_id.map(|u| u.to_string()).as_deref(),
+                r.email.as_deref(),
+            )
+        })
+        .collect();
+    Some(update_needs_approval(args, me.id.uuid(), &stored))
 }
 
 // ── Before an approval exists ────────────────────────────────────────────
@@ -447,7 +569,9 @@ pub(in crate::routes) async fn approval_args(
             if sub.owner_id != me {
                 return Err(json!({ "error": NOT_YOURS }));
             }
-            let input = input_from_args(args, me, Some(&sub)).map_err(|e| json!({ "error": e }))?;
+            let mut input =
+                input_from_args(args, me, Some(&sub)).map_err(|e| json!({ "error": e }))?;
+            keep_stored_recipients(pool(state)?, &sub, args, &mut input).await?;
             validate_input(state, requester, &sub.board, &input)
                 .await
                 .map_err(|e| refusal(&e))?;
@@ -459,4 +583,80 @@ pub(in crate::routes) async fn approval_args(
     let mut stamped = args.clone();
     stamped.insert("ownerId".to_owned(), json!(me.to_string()));
     Ok(stamped)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn args(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    const ME: Uuid = Uuid::from_u128(1);
+    const COLLEAGUE: Uuid = Uuid::from_u128(2);
+
+    fn stored_with_outsiders() -> Vec<String> {
+        vec![
+            format!("u:{ME}"),
+            format!("u:{COLLEAGUE}"),
+            "e:press@partner.example".to_owned(),
+        ]
+    }
+
+    /// RPT-1 review fix (BLOCKER) R2.
+    #[test]
+    fn a_change_to_a_report_with_other_recipients_needs_approval_unless_it_only_narrows() {
+        let stored = stored_with_outsiders();
+        // A new chart sent to the stored list: approval.
+        assert!(update_needs_approval(
+            &args(json!({ "id": "x", "charts": [] })),
+            ME,
+            &stored
+        ));
+        // So is a new time, a filter, a recipient that is new.
+        assert!(update_needs_approval(
+            &args(json!({ "id": "x", "schedule": {} })),
+            ME,
+            &stored
+        ));
+        assert!(update_needs_approval(
+            &args(json!({ "id": "x", "recipients": [{ "email": "new@partner.example" }] })),
+            ME,
+            &stored
+        ));
+        // Pausing, resuming, removing a recipient: a Confirm.
+        assert!(!update_needs_approval(
+            &args(json!({ "id": "x", "paused": true })),
+            ME,
+            &stored
+        ));
+        assert!(!update_needs_approval(
+            &args(json!({ "id": "x", "recipients": [{ "email": "Press@Partner.example" }] })),
+            ME,
+            &stored
+        ));
+        assert!(!update_needs_approval(
+            &args(
+                json!({ "id": "x", "sendToMe": false, "recipients": [{ "userId": COLLEAGUE.to_string() }], "confirmed": true })
+            ),
+            ME,
+            &stored
+        ));
+        // Narrowing to the person alone while changing a chart: nobody else receives it.
+        assert!(!update_needs_approval(
+            &args(json!({ "id": "x", "recipients": [], "charts": [] })),
+            ME,
+            &stored
+        ));
+        // A report that only ever went to the person stays a Confirm for anything.
+        let alone = vec![format!("u:{ME}")];
+        assert!(!update_needs_approval(
+            &args(json!({ "id": "x", "charts": [] })),
+            ME,
+            &alone
+        ));
+    }
 }

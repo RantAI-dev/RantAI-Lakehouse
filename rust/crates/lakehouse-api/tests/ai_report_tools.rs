@@ -459,3 +459,121 @@ async fn someone_elses_subscription_is_not_found_to_the_assistant_and_a_stranger
     );
     assert_eq!(all(&f.app.pool).await.len(), 1);
 }
+
+/// A subscription of `f.me` whose stored list holds a colleague and an outside
+/// address (the domain is allowed), made through the store.
+async fn subscription_with_outsiders(f: &F) -> String {
+    sqlx::query(
+        "INSERT INTO reporting_settings (singleton, time_zone, week_start, report_allowed_domains) \
+         VALUES (TRUE, 'UTC', 'monday', ARRAY['partner.example']) \
+         ON CONFLICT (singleton) DO UPDATE SET report_allowed_domains = ARRAY['partner.example']",
+    )
+    .execute(&f.app.pool)
+    .await
+    .unwrap();
+    let colleague = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Colleague', 'colleague@company.example', 'active')")
+        .bind(colleague)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let new = subs::NewSubscription {
+        board: BOARD.to_owned(),
+        owner_id: f.me,
+        schedule: lakehouse_store::report_schedule::Schedule::Weekly {
+            weekday: 1,
+            hour: 8,
+            minute: 0,
+        },
+        time_zone: "UTC".to_owned(),
+        attachments: json!({ "pdf": { "paper": "a4", "orientation": "portrait" }, "charts": [] }),
+        filters: None,
+        params: None,
+        grain: None,
+        skip_when_empty: false,
+        next_run_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        recipients: vec![
+            subs::Recipient::User(f.me),
+            subs::Recipient::User(colleague),
+            subs::Recipient::Email("press@partner.example".to_owned()),
+        ],
+    };
+    subs::create(&f.app.pool, &new)
+        .await
+        .unwrap()
+        .id
+        .to_string()
+}
+
+/// RPT-1 review fix (BLOCKER) R2: a change to a report that goes to other people
+/// is judged by who receives it, not by the recipients the call names.
+#[tokio::test]
+async fn changing_what_a_stored_outside_list_receives_needs_approval_but_narrowing_is_a_confirm() {
+    let f = fixture().await;
+    let id = subscription_with_outsiders(&f).await;
+
+    // A new schedule for the stored list, with Confirm: still an approval.
+    let waiting = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "schedule": { "kind": "daily", "hour": 6 }, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(waiting["outcome"], "needs_approval", "{waiting}");
+    assert_eq!(
+        all(&f.app.pool).await[0].kind,
+        "weekly",
+        "nothing changed yet"
+    );
+
+    // Adding a recipient is an approval too.
+    let added = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "recipients": [{ "email": "other@partner.example" }], "confirmed": true }),
+    )
+    .await;
+    assert_eq!(added["outcome"], "needs_approval", "{added}");
+
+    // Removing the outside address, and pausing, are Confirms.
+    let removed = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "sendToMe": true, "recipients": [], "confirmed": true }),
+    )
+    .await;
+    assert_eq!(removed["outcome"], "executed", "{removed}");
+    let after = subs::recipients(&f.app.pool, all(&f.app.pool).await[0].id)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].user_id, Some(f.me));
+}
+
+#[tokio::test]
+async fn pausing_a_report_with_an_outside_list_is_a_confirm() {
+    let f = fixture().await;
+    let id = subscription_with_outsiders(&f).await;
+    let pending = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true }),
+    )
+    .await;
+    assert_eq!(pending["outcome"], "needs_confirmation", "{pending}");
+    assert!(
+        pending["result"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("tanpa penerima baru"),
+        "{pending}"
+    );
+    let done = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(done["outcome"], "executed", "{done}");
+    assert!(all(&f.app.pool).await[0].paused);
+}

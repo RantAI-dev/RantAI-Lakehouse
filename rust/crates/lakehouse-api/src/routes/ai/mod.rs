@@ -878,7 +878,13 @@ async fn run_chat(
             // have the call silently dropped) so it can tell the user
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            // RPT-1 review fix (BLOCKER) R2: who an update leaves receiving the
+            // report is looked up here, before the gate, and given to it as a
+            // server-side fact.
+            let audience =
+                tools::report_audience(state, principal, &call.function.name, &args).await;
+            let gate_result =
+                gate::decide_by_name(is_build, perms, &call.function.name, &args, audience);
             // plan 17: with an allowlist, the tools the console named are the
             // only ones a call may reach. The check is against the offered
             // list, not the request's strings, so a tool the switch removed,
@@ -1212,7 +1218,16 @@ pub async fn tool_call(
     };
     let is_build = parsed.mode.as_deref() == Some("build");
 
-    let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
+    // RPT-1 review fix (BLOCKER) R2: as in the chat loop, the audience of a
+    // report update is looked up before the gate.
+    let audience = tools::report_audience(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &parsed.tool,
+        &parsed.args,
+    )
+    .await;
+    let gate_result = gate::decide_with(is_build, perms, spec, &parsed.args, audience);
     let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
         if gate::is_write_high_pending(&refusal) {
             let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));

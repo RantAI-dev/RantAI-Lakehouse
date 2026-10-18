@@ -52,7 +52,7 @@ mod pipelines;
 mod propose;
 mod queries;
 mod reports;
-pub(in crate::routes) use reports::approval_args;
+pub(in crate::routes) use reports::{approval_args, report_audience};
 mod tabs;
 
 use axum::response::{IntoResponse, Response};
