@@ -95,6 +95,11 @@ export interface ReportService {
   /** A refusal (an outside domain not listed, 51 recipients) arrives as `invalid_request` with the server's sentence. */
   create(input: ReportSubscriptionInput & { board: string }, signal?: AbortSignal): Promise<ReportSubscription>
   update(id: string, input: ReportSubscriptionInput, signal?: AbortSignal): Promise<ReportSubscription>
+  /**
+   * Pause or resume only (`RPT-1` review fix R4): the server does not re-check
+   * recipients, domains or rights for it, so a report can always be stopped.
+   */
+  setPaused(id: string, paused: boolean, signal?: AbortSignal): Promise<ReportSubscription>
   remove(id: string, signal?: AbortSignal): Promise<void>
   /** Sends the report now, as a test; the delivery says `failed` and why when it could not. */
   sendNow(id: string, signal?: AbortSignal): Promise<ReportDelivery>

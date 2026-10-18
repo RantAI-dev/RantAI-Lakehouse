@@ -10,7 +10,6 @@ import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import { reportService } from "@/services";
 import type {
   ReportPerson,
-  ReportRecipientInput,
   ReportSchedule,
   ReportSubscription,
   ReportSubscriptionInput,
@@ -140,7 +139,8 @@ function SubscriptionRow({
             return d.status === "sent" ? "Sent. Check the inbox." : d.status === "skipped" ? `Skipped. ${d.reason ?? ""}` : `Not sent. ${d.reason ?? ""}`;
           })}>Send now</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={() => void run(async () => {
-            await reportService.update(s.id, toInput(s, { paused: !s.paused }));
+            // RPT-1 review fix (SHOULD-FIX) R4: pause and resume send only the flag.
+            await reportService.setPaused(s.id, !s.paused);
           })}>{s.paused ? "Resume" : "Pause"}</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={onEdit}>Edit</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={onHistory}>History</Button>
@@ -149,21 +149,6 @@ function SubscriptionRow({
       ) : null}
     </li>
   );
-}
-
-/** A stored subscription as the update body, with `change` applied. */
-function toInput(s: ReportSubscription, change: Partial<ReportSubscriptionInput>): ReportSubscriptionInput {
-  return {
-    schedule: s.schedule as ReportSchedule,
-    timeZone: s.timeZone,
-    attachments: s.attachments,
-    filters: s.filters,
-    params: s.params,
-    grain: s.grain,
-    skipWhenEmpty: s.skipWhenEmpty,
-    recipients: s.recipients.map((r): ReportRecipientInput => (r.userId ? { userId: r.userId } : { email: r.email ?? "" })),
-    ...change,
-  };
 }
 
 function History({ subscription, onBack }: { readonly subscription: ReportSubscription; readonly onBack: () => void }) {

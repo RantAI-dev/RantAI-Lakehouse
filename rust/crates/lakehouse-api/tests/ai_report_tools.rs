@@ -577,3 +577,31 @@ async fn pausing_a_report_with_an_outside_list_is_a_confirm() {
     assert_eq!(done["outcome"], "executed", "{done}");
     assert!(all(&f.app.pool).await[0].paused);
 }
+
+/// RPT-1 review fix (SHOULD-FIX) R4: the assistant pauses a report without
+/// re-validating it, so a delisted domain does not keep it running.
+#[tokio::test]
+async fn the_assistant_can_pause_a_report_whose_domain_is_no_longer_allowed() {
+    let f = fixture().await;
+    let id = subscription_with_outsiders(&f).await;
+    sqlx::query("UPDATE reporting_settings SET report_allowed_domains = '{}'")
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    let done = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": true, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(done["outcome"], "executed", "{done}");
+    assert!(all(&f.app.pool).await[0].paused);
+    let resumed = tool(
+        &f,
+        "update_report_subscription",
+        json!({ "id": id, "paused": false, "confirmed": true }),
+    )
+    .await;
+    assert_eq!(resumed["outcome"], "executed", "{resumed}");
+    assert!(!all(&f.app.pool).await[0].paused);
+}

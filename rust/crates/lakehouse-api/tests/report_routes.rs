@@ -487,17 +487,24 @@ async fn only_the_owner_or_an_administrator_changes_pauses_sends_or_deletes() {
     )
     .await;
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
-    let mut paused = body(recipients.clone());
-    paused["paused"] = json!(true);
-    paused["schedule"] = json!({ "kind": "daily", "hour": 6 });
-    let (status, got) = call(&f, "PUT", &one, &admin_cookie, Some(paused)).await;
+    // R5: an administrator who is not the owner pauses; the owner edits.
+    let (status, got) = call(
+        &f,
+        "PUT",
+        &one,
+        &admin_cookie,
+        Some(json!({ "paused": true })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{got}");
     assert_eq!(got["paused"], json!(true));
-    assert_eq!(got["schedule"]["kind"], "daily");
     assert_eq!(got["ownerId"], json!(f.owner), "the owner never changes");
-    let mut resumed = body(recipients.clone());
-    resumed["paused"] = json!(false);
-    let (_, got) = call(&f, "PUT", &one, &f.owner_cookie, Some(resumed)).await;
+    let mut edited = body(recipients.clone());
+    edited["schedule"] = json!({ "kind": "daily", "hour": 6 });
+    edited["paused"] = json!(false);
+    let (status, got) = call(&f, "PUT", &one, &f.owner_cookie, Some(edited)).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["schedule"]["kind"], "daily");
     assert_eq!(got["paused"], json!(false));
     assert!(got["pausedReason"].is_null());
 
@@ -682,4 +689,106 @@ async fn an_administrator_lists_the_outside_domains_and_a_bad_entry_is_refused()
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// RPT-1 review fix (SHOULD-FIX) R4: pausing and resuming do not re-validate the
+/// subscription, so a report whose recipients, domain or download right changed
+/// can still be stopped.
+#[tokio::test]
+async fn a_report_can_be_paused_and_resumed_after_its_domain_and_right_are_gone() {
+    let f = fixture(&[]).await;
+    allow_domain(&f.app.pool, "partner.example").await;
+    let (_, made) = call(
+        &f,
+        "POST",
+        SUBS,
+        &f.owner_cookie,
+        Some(body(json!([{ "email": "press@partner.example" }]))),
+    )
+    .await;
+    let one = format!("{SUBS}/{}", made["id"].as_str().unwrap());
+    // The domain is delisted and the owner's role may no longer download.
+    let role: String = sqlx::query_scalar(
+        "SELECT r.name FROM role r JOIN app_user_role ur ON ur.role_id = r.id WHERE ur.user_id = $1",
+    )
+    .bind(f.owner)
+    .fetch_one(&f.app.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE reporting_settings SET report_allowed_domains = '{}', download_denied_roles = ARRAY[$1]")
+        .bind(role)
+        .execute(&f.app.pool)
+        .await
+        .unwrap();
+    // A full edit is refused now ...
+    let (status, _) = call(
+        &f,
+        "PUT",
+        &one,
+        &f.owner_cookie,
+        Some(body(json!([{ "email": "press@partner.example" }]))),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    // ... but pausing and resuming are not.
+    let (status, paused) = call(
+        &f,
+        "PUT",
+        &one,
+        &f.owner_cookie,
+        Some(json!({ "paused": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{paused}");
+    assert_eq!(paused["paused"], json!(true));
+    let (status, resumed) = call(
+        &f,
+        "PUT",
+        &one,
+        &f.owner_cookie,
+        Some(json!({ "paused": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["paused"], json!(false));
+    assert!(resumed["pausedReason"].is_null());
+}
+
+/// RPT-1 review fix (SHOULD-FIX) R5: an administrator who is not the owner may
+/// pause, resume, delete and remove recipients, and nothing else.
+#[tokio::test]
+async fn a_non_owner_administrator_may_only_pause_delete_and_remove_recipients() {
+    let f = fixture(&[]).await;
+    allow_domain(&f.app.pool, "partner.example").await;
+    let colleague = user_id(&f.app.pool, "Colleague", "active").await;
+    let both = json!([{ "userId": colleague.to_string() }, { "email": "press@partner.example" }]);
+    let (_, made) = call(&f, "POST", SUBS, &f.owner_cookie, Some(body(both.clone()))).await;
+    let one = format!("{SUBS}/{}", made["id"].as_str().unwrap());
+    let admin =
+        create_principal_with_permissions(&f.app.pool, "dashboard:read, settings:write").await;
+    let cookie = session_cookie_for_user(&f.app.pool, admin).await;
+
+    // Adding a recipient, changing the schedule, and sending now are refused.
+    let mut more = both.as_array().unwrap().clone();
+    more.push(json!({ "email": "other@partner.example" }));
+    let (status, _) = call(&f, "PUT", &one, &cookie, Some(body(Value::Array(more)))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let mut moved = body(both.clone());
+    moved["schedule"] = json!({ "kind": "daily", "hour": 1 });
+    let (status, _) = call(&f, "PUT", &one, &cookie, Some(moved)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, sent) = call(&f, "POST", &format!("{one}/send"), &cookie, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{sent}");
+
+    // Pausing, resuming, and dropping the outside address are allowed.
+    let (status, _) = call(&f, "PUT", &one, &cookie, Some(json!({ "paused": true }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(&f, "PUT", &one, &cookie, Some(json!({ "paused": false }))).await;
+    assert_eq!(status, StatusCode::OK);
+    let fewer = body(json!([{ "userId": colleague.to_string() }]));
+    let (status, got) = call(&f, "PUT", &one, &cookie, Some(fewer)).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["recipients"].as_array().unwrap().len(), 1);
+    let (status, _) = call(&f, "DELETE", &one, &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
 }

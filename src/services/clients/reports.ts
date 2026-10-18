@@ -48,6 +48,8 @@ export const reportService: ReportService = {
     call<ReportSubscription>(SUBS, jsonInit("POST", input, signal), "The subscription could not be saved."),
   update: (id, input, signal) =>
     call<ReportSubscription>(`${SUBS}/${encodeURIComponent(id)}`, jsonInit("PUT", input, signal), "The subscription could not be saved."),
+  setPaused: (id, paused, signal) =>
+    call<ReportSubscription>(`${SUBS}/${encodeURIComponent(id)}`, jsonInit("PUT", { paused }, signal), "The subscription could not be changed."),
   async remove(id, signal) {
     await call<{ deleted: boolean }>(`${SUBS}/${encodeURIComponent(id)}`, { method: "DELETE", signal }, "The subscription could not be deleted.")
   },

@@ -57,6 +57,9 @@ use crate::state::AppState;
 use crate::upstream_error;
 
 const NOT_YOURS: &str = "Only the person who set this report up, or an administrator, can do this.";
+/// What an administrator who did not set a report up is told when they try more
+/// than pausing, resuming, deleting or removing recipients (`RPT-1` review fix R5).
+const NOT_THE_OWNER: &str = "An administrator who did not set this report up can pause, resume or delete it and remove recipients; only its owner can change anything else or send it now.";
 const NO_SUCH_SUBSCRIPTION: &str = "this subscription does not exist";
 const NO_SUCH_DASHBOARD: &str = "this dashboard does not exist";
 const NO_RECIPIENTS: &str = "Choose at least one recipient.";
@@ -631,6 +634,14 @@ pub async fn update(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let sub = own_or_admin(&state, &principal, &id).await?;
+    let pool = pool_of(&state)?;
+    // RPT-1 review fix (SHOULD-FIX) R4: pausing or resuming goes straight to the
+    // store. It must not re-check recipients, domains and rights, or a report
+    // the person no longer wants could not be stopped once any of them changed.
+    if let Some(paused) = pause_only(&body) {
+        let saved = apply_pause(pool, &sub, paused).await?;
+        return Ok(ApiJson(subscription_json(pool, &saved, None).await?));
+    }
     let input: SubscriptionInput = parse_body(&body)?;
     if input.board.as_deref().is_some_and(|b| b != sub.board) {
         return Err(ApiError::BadRequest(
@@ -640,9 +651,68 @@ pub async fn update(
     }
     let owner = owner_principal(&state, &principal, &sub).await?;
     let new = validate_input(&state, &owner, &sub.board, &input).await?;
-    let pool = pool_of(&state)?;
+    // RPT-1 review fix (SHOULD-FIX) R5: an administrator who is not the owner
+    // may pause, resume, delete and remove recipients, nothing else.
+    if sub.owner_id != principal.id.uuid() {
+        let stored = subscriptions::recipients(pool, sub.id)
+            .await
+            .map_err(|e| store_failed(&e))?;
+        if !only_removes_recipients(&sub, &new, &stored) {
+            return Err(ApiError::PermissionDenied(NOT_THE_OWNER.to_owned()).into());
+        }
+    }
     let saved = save_update(pool, &sub, &new, input.paused).await?;
     Ok(ApiJson(subscription_json(pool, &saved, None).await?))
+}
+
+/// Some(paused) when the body is exactly `{"paused": <bool>}`.
+pub(crate) fn pause_only(body: &Bytes) -> Option<bool> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let map = v.as_object()?;
+    (map.len() == 1).then(|| map.get("paused").and_then(Value::as_bool))?
+}
+
+/// Pause a subscription, or resume it with its next time worked out from now.
+/// The one copy for the route and the assistant's tool (`RPT-1` review fix R4).
+pub(crate) async fn apply_pause(
+    pool: &lakehouse_store::PgPool,
+    sub: &Subscription,
+    paused: bool,
+) -> Result<Subscription, ApiError> {
+    let resume_at = sub.schedule().ok().and_then(|s| {
+        s.next_run_after(&sub.time_zone, OffsetDateTime::now_utc())
+            .ok()
+    });
+    let reason = paused.then_some("Paused by hand.");
+    subscriptions::set_paused(pool, sub.id, paused, reason, resume_at)
+        .await
+        .map_err(|e| store_failed(&e))?
+        .ok_or_else(|| ApiError::NotFound(NO_SUCH_SUBSCRIPTION.to_owned()))
+}
+
+/// Whether `new` differs from the stored subscription only by dropping
+/// recipients (`RPT-1` review fix R5).
+fn only_removes_recipients(
+    sub: &Subscription,
+    new: &NewSubscription,
+    stored: &[RecipientRow],
+) -> bool {
+    let kept: Vec<Recipient> = stored
+        .iter()
+        .filter_map(|r| match (&r.user_id, &r.email) {
+            (Some(id), _) => Some(Recipient::User(*id)),
+            (None, Some(email)) => Some(Recipient::Email(email.clone())),
+            (None, None) => None,
+        })
+        .collect();
+    sub.schedule().ok() == Some(new.schedule)
+        && sub.time_zone == new.time_zone
+        && sub.attachments == new.attachments
+        && sub.filters == new.filters
+        && sub.params == new.params
+        && sub.grain == new.grain
+        && sub.skip_when_empty == new.skip_when_empty
+        && new.recipients.iter().all(|r| kept.contains(r))
 }
 
 /// `DELETE /api/reports/subscriptions/{id}`.
@@ -676,6 +746,11 @@ pub async fn send_now(
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     let sub = own_or_admin(&state, &principal, &id).await?;
+    // RPT-1 review fix (SHOULD-FIX) R5: sending the owner's data to the owner's
+    // recipients on someone else's say-so is more than an administrator may.
+    if sub.owner_id != principal.id.uuid() {
+        return Err(ApiError::PermissionDenied(NOT_THE_OWNER.to_owned()).into());
+    }
     let mailer =
         lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
     let delivery = run_subscription(&state, &mailer, &sub, true)

@@ -124,7 +124,7 @@ describe("SubscriptionsDialog", () => {
     expect(screen.getByText(/PDF service is not set up/)).toBeDefined()
   })
 
-  it("sends now and shows the plain reason, and pauses with the stored schedule", async () => {
+  it("sends now and shows the plain reason, and pauses by sending only the flag", async () => {
     const calls = mockApi({ items: [sub] })
     render(<SubscriptionsDialog {...props} />)
     fireEvent.click(await screen.findByRole("button", { name: "Send now" }))
@@ -133,8 +133,7 @@ describe("SubscriptionsDialog", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Pause" }))
     await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
     const put = calls.find((c) => c.method === "PUT")?.body as Record<string, unknown>
-    expect(put.paused).toBe(true)
-    expect(put.schedule).toEqual(sub.schedule)
-    expect(put.recipients).toEqual([{ userId: "u2" }, { email: "press@partner.example" }])
+    // RPT-1 review fix (SHOULD-FIX) R4: only the flag is sent.
+    expect(put).toEqual({ paused: true })
   })
 })

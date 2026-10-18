@@ -382,6 +382,18 @@ async fn update(state: &AppState, owner: &Principal, args: &Map<String, Value>) 
         Ok(p) => p,
         Err(e) => return e,
     };
+    // RPT-1 review fix (SHOULD-FIX) R4: pausing or resuming alone skips the
+    // re-validation, as on the console's route.
+    if let Some(paused) = args.get("paused").and_then(Value::as_bool)
+        && args
+            .keys()
+            .all(|k| matches!(k.as_str(), "id" | "paused" | "confirmed"))
+    {
+        return match reports::apply_pause(pool, &sub, paused).await {
+            Ok(saved) => json!({ "updated": true, "subscription": brief(state, &saved).await }),
+            Err(e) => refusal(&e),
+        };
+    }
     let mut input = match input_from_args(args, owner.id.uuid(), Some(&sub)) {
         Ok(input) => input,
         Err(e) => return json!({ "error": e }),
