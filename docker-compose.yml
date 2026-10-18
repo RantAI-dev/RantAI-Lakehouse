@@ -309,6 +309,10 @@ services:
       GOTENBERG_URL: ${GOTENBERG_URL:-http://gotenberg:3000}
       CONSOLE_INTERNAL_URL: ${CONSOLE_INTERNAL_URL:-}
       RENDER_TOKEN_SECRET: ${RENDER_TOKEN_SECRET:-}
+      # RPT-1: the console as people open it, for the link in a scheduled
+      # report's email (`<this>/dashboards/<id>`). An address, not a credential;
+      # empty means the email carries no link.
+      CONSOLE_PUBLIC_URL: ${CONSOLE_PUBLIC_URL:-}
       # SEC-12: longest exp - iat of a signed embed token, in seconds. Empty
       # means 86400. A value that is not a positive whole number stops the
       # API at start, on purpose (a typo must not silently keep 24 hours).

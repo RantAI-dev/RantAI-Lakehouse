@@ -146,7 +146,7 @@ fn render_block(requested_by: &str, claims: &lakehouse_embed::RenderClaims) -> V
 
 /// The person a token names, as they are now: `None` for a disabled or deleted
 /// person (or an id that is not a user's), a response for a store failure.
-async fn principal_of(
+pub(crate) async fn principal_of(
     state: &AppState,
     id: &str,
 ) -> Result<Option<lakehouse_auth::Principal>, Response> {

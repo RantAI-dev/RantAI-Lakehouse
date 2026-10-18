@@ -97,6 +97,107 @@ fn pdf_failure(err: &PdfError) -> ApiError {
         .into_api_error(FailedAs::ServiceUnavailable)
 }
 
+/// What a PDF is made of: the dashboard, the person it is made as, the values
+/// the print view reads it with and the paper.
+pub(crate) struct PdfJob<'a> {
+    pub board: &'a str,
+    /// The person the render token names (the print view reads as them).
+    pub person: uuid::Uuid,
+    pub values: DashboardValues<'a>,
+    pub paper: Paper,
+    pub orientation: Orientation,
+}
+
+/// The filter, parameter and grain text a dashboard is read with, exactly as
+/// `GET /api/dashboard` takes them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DashboardValues<'a> {
+    pub filters: Option<&'a str>,
+    pub params: Option<&'a str>,
+    pub grain: Option<&'a str>,
+}
+
+/// Why no PDF came back. The route turns it into a fixed sentence under a
+/// reference; the report runner turns it into the delivery's reason. Neither
+/// carries Gotenberg's own text (SEC-11).
+#[derive(Debug)]
+pub(crate) enum PdfFailure {
+    /// `GOTENBERG_URL`, `CONSOLE_INTERNAL_URL` or `RENDER_TOKEN_SECRET` unset.
+    NotSetUp,
+    /// No slot came free within [`crate::pdf::PDF_SLOT_WAIT`].
+    Busy,
+    /// Gotenberg did not give a PDF.
+    Conversion(PdfError),
+}
+
+impl PdfFailure {
+    /// The route's answer: the fixed sentences, Gotenberg's text only in the log.
+    pub(crate) fn into_api_error(self) -> ApiError {
+        match self {
+            Self::NotSetUp => ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()),
+            Self::Busy => ApiError::Unavailable(PDF_BUSY.to_owned()),
+            Self::Conversion(err) => pdf_failure(&err),
+        }
+    }
+}
+
+/// Make one dashboard's PDF: take a PDF slot, mint the render token for
+/// `job.person`, and have Gotenberg print the console's print view. The one
+/// copy of this path: the download route and the scheduled report (`RPT-1`)
+/// both call it, so the slot limit, the token (`RENDER_TOKEN_SECRET` only,
+/// `BI-1` review fix R1) and the address (built from configuration, never from
+/// a request) cannot differ between them.
+///
+/// The caller has already checked that the person may download and that the
+/// board is theirs to see; this function checks nothing about the person.
+///
+/// # Errors
+///
+/// [`PdfFailure`] as described there.
+pub(crate) async fn make_pdf(state: &AppState, job: &PdfJob<'_>) -> Result<Vec<u8>, PdfFailure> {
+    // The slots are taken for the whole conversion. A further request waits for
+    // one, but not longer than a minute (BI-1 review fix (BLOCKER) R2): then it
+    // is told, in a sentence, instead of meeting the route's deadline.
+    let _slot = crate::pdf::acquire_slot(&state.pdf_slots, crate::pdf::PDF_SLOT_WAIT)
+        .await
+        .ok_or(PdfFailure::Busy)?;
+
+    let (Some(secret), Some(gotenberg), Some(console)) = (
+        state.config.render_token_secret.as_ref(),
+        state.config.gotenberg_url.as_deref(),
+        state.config.console_internal_url.as_deref(),
+    ) else {
+        return Err(PdfFailure::NotSetUp);
+    };
+    let now = lakehouse_embed::unix_now().floor();
+    let token = lakehouse_embed::sign_render(
+        &lakehouse_embed::RenderClaims {
+            aud: lakehouse_embed::RENDER_AUDIENCE.to_owned(),
+            board: job.board.to_owned(),
+            principal: job.person.to_string(),
+            filters: job.values.filters.map(str::to_owned),
+            params: job.values.params.map(str::to_owned),
+            grain: job.values.grain.map(str::to_owned),
+            paper: job.paper.as_str().to_owned(),
+            orientation: job.orientation.as_str().to_owned(),
+            iat: now,
+            exp: lakehouse_embed::render_expiry(now),
+            jti: uuid::Uuid::new_v4().to_string(),
+        },
+        secret.expose_secret(),
+    );
+    // The address comes from configuration and the token only.
+    let page_url = format!("{}/render/dashboard/{token}", console.trim_end_matches('/'));
+    convert_url(
+        gotenberg,
+        &page_url,
+        (job.paper, job.orientation),
+        crate::pdf::PDF_DEADLINE,
+    )
+    .await
+    .map_err(PdfFailure::Conversion)
+}
+
 /// `GET /api/dashboard/export/pdf?board=&paper=&orientation=` — the PDF.
 ///
 /// # Errors
@@ -155,47 +256,22 @@ pub async fn export_pdf(
     }
     let name = board.as_ref().map_or("Main", |b| b.name.as_str());
 
-    // The slots are taken for the whole conversion. A further request waits for
-    // one, but not longer than a minute (BI-1 review fix (BLOCKER) R2): then it
-    // is told, in a sentence, instead of meeting the route's deadline.
-    let _slot = crate::pdf::acquire_slot(&state.pdf_slots, crate::pdf::PDF_SLOT_WAIT)
-        .await
-        .ok_or_else(|| ApiError::Unavailable(PDF_BUSY.to_owned()))?;
-
-    let (Some(secret), Some(gotenberg), Some(console)) = (
-        state.config.render_token_secret.as_ref(),
-        state.config.gotenberg_url.as_deref(),
-        state.config.console_internal_url.as_deref(),
-    ) else {
-        return Err(ApiError::Unavailable(PDF_NOT_SET_UP.to_owned()).into());
-    };
-    let now = lakehouse_embed::unix_now().floor();
-    let token = lakehouse_embed::sign_render(
-        &lakehouse_embed::RenderClaims {
-            aud: lakehouse_embed::RENDER_AUDIENCE.to_owned(),
-            board: board_id.to_owned(),
-            principal: principal.id.uuid().to_string(),
-            filters: q.filters.clone(),
-            params: q.params.clone(),
-            grain: q.grain.clone(),
-            paper: paper.as_str().to_owned(),
-            orientation: orientation.as_str().to_owned(),
-            iat: now,
-            exp: lakehouse_embed::render_expiry(now),
-            jti: uuid::Uuid::new_v4().to_string(),
+    let pdf = make_pdf(
+        &state,
+        &PdfJob {
+            board: board_id,
+            person: principal.id.uuid(),
+            values: DashboardValues {
+                filters: q.filters.as_deref(),
+                params: q.params.as_deref(),
+                grain: q.grain.as_deref(),
+            },
+            paper,
+            orientation,
         },
-        secret.expose_secret(),
-    );
-    // The address comes from configuration and the token only.
-    let page_url = format!("{}/render/dashboard/{token}", console.trim_end_matches('/'));
-    let pdf = convert_url(
-        gotenberg,
-        &page_url,
-        (paper, orientation),
-        crate::pdf::PDF_DEADLINE,
     )
     .await
-    .map_err(|err| pdf_failure(&err))?;
+    .map_err(PdfFailure::into_api_error)?;
 
     record_download_audit(
         &state,

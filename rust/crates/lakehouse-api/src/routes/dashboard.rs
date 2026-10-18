@@ -2850,6 +2850,30 @@ pub struct ChartExportQuery {
     grain: Option<String>,
 }
 
+impl ChartExportQuery {
+    /// The query a scheduled report reads one chart's file with (`RPT-1`, plan
+    /// D4): the same fields the console's menu sends, with the subscription's
+    /// own filter, parameter and grain text, so the file holds the rows the
+    /// subscription's dashboard shows.
+    pub(crate) fn for_report(
+        chart: &str,
+        (format, values): (&str, &str),
+        dashboard: &crate::routes::pdf_export::DashboardValues<'_>,
+    ) -> Self {
+        Self {
+            chart: Some(chart.to_owned()),
+            format: Some(format.to_owned()),
+            values: Some(values.to_owned()),
+            filters: dashboard.filters.map(str::to_owned),
+            sort_column: None,
+            sort_dir: None,
+            params: dashboard.params.map(str::to_owned),
+            year: None,
+            grain: dashboard.grain.map(str::to_owned),
+        }
+    }
+}
+
 impl From<TableExportQuery> for ChartExportQuery {
     fn from(q: TableExportQuery) -> Self {
         Self {
@@ -2895,7 +2919,7 @@ pub(crate) fn file_slug(title: &str, fallback: &str) -> String {
 
 /// A file name from a tile's title (see [`file_slug`]). A file that was cut at
 /// the row cap says so in its name (feature decision 8).
-fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
+pub(crate) fn export_file_name(title: &str, extension: &str, cut_at: Option<u32>) -> String {
     let slug = file_slug(title, "table");
     match cut_at {
         Some(rows) => format!("{slug}-first-{rows}-rows.{extension}"),
@@ -3315,16 +3339,34 @@ fn export_statement_settings(rows_mode: bool, statement: String) -> String {
     }
 }
 
-async fn export_chart(
+/// One chart's file, written and not yet sent or recorded.
+pub(crate) struct ChartFile {
+    pub chart: StoredChartSpec,
+    pub written: crate::export::Written,
+    pub format: crate::export::FileFormat,
+    pub values: crate::export::Values,
+}
+
+/// Read the chart's rows as `principal` and write them to a file: the one
+/// path the download routes and the scheduled report (`RPT-1`) share, so the
+/// masks and row filters (`rewrite_sql_for_roles`), the caps and the formats
+/// cannot differ between a download and an email.
+///
+/// The caller has checked that the person may download (the routes call
+/// `require_download`, the runner checks the owner's rights) and records the
+/// audit entry before the file is handed over.
+///
+/// # Errors
+///
+/// As [`chart_export`].
+pub(crate) async fn build_chart_file(
     state: &AppState,
     principal: &Principal,
     q: &ChartExportQuery,
-    action: &'static str,
     rows_only: bool,
-) -> ApiResult<Response> {
+) -> Result<ChartFile, ApiError> {
     use crate::export::{FileFormat, Values};
 
-    crate::routes::settings::require_download(state, principal).await?;
     let format = q
         .format
         .as_deref()
@@ -3367,13 +3409,12 @@ async fn export_chart(
     let locale = crate::routes::settings::format_settings(state)
         .await?
         .number_locale;
-    let cap = crate::export::EXPORT_ROW_CAP;
     let written = crate::export::write_export(
         &mut stream,
         &crate::export::ExportOptions {
             format,
             values,
-            cap: cap as usize,
+            cap: crate::export::EXPORT_ROW_CAP as usize,
             locale: &locale,
             labels: &labels,
             formats: &formats,
@@ -3381,6 +3422,29 @@ async fn export_chart(
     )
     .await
     .map_err(|err| export_failure(&err))?;
+    Ok(ChartFile {
+        chart,
+        written,
+        format,
+        values,
+    })
+}
+
+async fn export_chart(
+    state: &AppState,
+    principal: &Principal,
+    q: &ChartExportQuery,
+    action: &'static str,
+    rows_only: bool,
+) -> ApiResult<Response> {
+    crate::routes::settings::require_download(state, principal).await?;
+    let ChartFile {
+        chart,
+        written,
+        format,
+        values,
+    } = build_chart_file(state, principal, q, rows_only).await?;
+    let cap = crate::export::EXPORT_ROW_CAP;
 
     record_export_audit(
         state,

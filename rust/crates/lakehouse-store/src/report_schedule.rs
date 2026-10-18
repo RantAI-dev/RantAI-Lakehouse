@@ -301,6 +301,22 @@ pub fn zone_is_known(zone: &str) -> bool {
     TimeZone::get(zone).is_ok()
 }
 
+/// `now` as a `YYYY-MM-DD` date on the wall clock of `zone`, for the subject of
+/// a report ("<dashboard> report, <date in the subscription's zone>", plan D5).
+/// `None` for a zone the database does not have.
+#[must_use]
+pub fn local_date(zone: &str, now: OffsetDateTime) -> Option<String> {
+    let tz = TimeZone::get(zone).ok()?;
+    let at = Timestamp::from_second(now.unix_timestamp()).ok()?;
+    let date = at.to_zoned(tz).date();
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    ))
+}
+
 /// Hourly: walk the minutes after `now` until the zone's wall clock shows the
 /// chosen minute. Walking instants (not wall-clock times) is what makes a
 /// repeated hour run twice and a missing hour not run, and it is right in zones
@@ -607,6 +623,18 @@ mod tests {
         );
         assert!(zone_is_known("Asia/Jakarta"));
         assert!(!zone_is_known("Not/AZone"));
+    }
+
+    #[test]
+    fn the_report_date_is_the_date_on_the_zones_clock() {
+        // 20:00Z on the 18th is already the 19th in Jakarta (UTC+7).
+        let now = utc("2026-10-18T20:00:00Z");
+        assert_eq!(
+            local_date("Asia/Jakarta", now).as_deref(),
+            Some("2026-10-19")
+        );
+        assert_eq!(local_date("UTC", now).as_deref(), Some("2026-10-18"));
+        assert_eq!(local_date("Mars/Olympus", now), None);
     }
 
     #[test]

@@ -181,6 +181,9 @@ async fn run() -> anyhow::Result<()> {
     // SRC-11 D5/D6: the daily removal of run log lines and attempts older
     // than 30 days.
     spawn_run_log_cleanup(&state);
+    // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
+    // 90-day cleanup of deliveries).
+    routes::report_runner::spawn(&state);
 
     let app = routes::router(state);
 

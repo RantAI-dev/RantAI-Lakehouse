@@ -306,7 +306,8 @@ pub async fn list_for_owner(pool: &PgPool, owner: Uuid) -> Result<Vec<Subscripti
 }
 
 /// A subscription's recipients, user recipients with their current name,
-/// address and status.
+/// address and status. Console users first, then outside addresses, each by
+/// address, so the order is the same every time.
 ///
 /// # Errors
 ///
@@ -316,7 +317,8 @@ pub async fn recipients(pool: &PgPool, id: Uuid) -> Result<Vec<RecipientRow>, St
         "SELECT r.user_id, r.email, u.name AS user_name, u.email AS user_email, \
                 u.status AS user_status \
          FROM report_recipient r LEFT JOIN app_user u ON u.id = r.user_id \
-         WHERE r.subscription_id = $1 ORDER BY r.id",
+         WHERE r.subscription_id = $1 \
+         ORDER BY r.user_id IS NULL, COALESCE(u.email, r.email)",
     )
     .bind(id)
     .fetch_all(pool)

@@ -351,6 +351,13 @@ pub struct Config {
     /// `RENDER_TOKEN_SECRET` (the render token's key); any one missing means "PDF
     /// export is not set up on this deployment" (feature decision 6).
     pub console_internal_url: Option<String>,
+    /// The console's address as people open it (`CONSOLE_PUBLIC_URL`, e.g.
+    /// `https://lakehouse.example.com`): the link in a scheduled report's email
+    /// (`RPT-1`) is `<this>/dashboards/<id>`. Operator configuration, never
+    /// taken from a request (a header the caller controls would put a link of
+    /// their choosing in an email to others). `None` when unset, empty or not an
+    /// `http(s)` address: the email then has no link and says nothing about one.
+    pub console_public_url: Option<String>,
     /// The longest lifetime (`exp - iat`) a signed embed token may have, in
     /// seconds (`SEC-12`). `EMBED_TOKEN_MAX_LIFETIME_SECONDS`; default
     /// 86400. A value that is not a positive integer fails start-up
@@ -933,6 +940,7 @@ impl std::fmt::Debug for Config {
             )
             .field("gotenberg_url", &self.gotenberg_url)
             .field("console_internal_url", &self.console_internal_url)
+            .field("console_public_url", &self.console_public_url)
             .field(
                 "embed_token_max_lifetime_seconds",
                 &self.embed_token_max_lifetime_seconds,
@@ -1323,6 +1331,9 @@ impl Config {
                 .map(lakehouse_core::secret::SecretValue::new),
             gotenberg_url: truthy(env, "GOTENBERG_URL"),
             console_internal_url: truthy(env, "CONSOLE_INTERNAL_URL"),
+            console_public_url: truthy(env, "CONSOLE_PUBLIC_URL")
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
             embed_token_max_lifetime_seconds: parse_embed_token_max_lifetime(env)?,
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
@@ -1646,6 +1657,7 @@ mod tests {
         assert_eq!(cfg.gotenberg_url, None);
         assert!(cfg.render_token_secret.is_none());
         assert_eq!(cfg.console_internal_url, None);
+        assert_eq!(cfg.console_public_url, None);
         assert_eq!(cfg.embed_token_max_lifetime_seconds, 86_400);
         assert_eq!(cfg.alerts_run_token, None);
         assert_eq!(cfg.smtp_host, None);
@@ -2682,5 +2694,24 @@ mod tests {
         env.insert("CONSOLE_INTERNAL_URL".to_owned(), String::new());
         let blank = Config::from_map(&env).unwrap();
         assert_eq!(blank.console_internal_url, None);
+    }
+
+    /// `RPT-1`: the console's public address is plain configuration; empty, a
+    /// non-`http(s)` value and a trailing slash are handled so a link built
+    /// from it is never `javascript:` or `//`.
+    #[test]
+    fn the_console_public_address_is_read_trimmed_and_must_be_http() {
+        let with = |value: &str| {
+            let mut env = HashMap::new();
+            env.insert("CONSOLE_PUBLIC_URL".to_owned(), value.to_owned());
+            Config::from_map(&env).unwrap().console_public_url
+        };
+        assert_eq!(
+            with("https://lakehouse.example.com/").as_deref(),
+            Some("https://lakehouse.example.com")
+        );
+        assert_eq!(with("").as_deref(), None);
+        assert_eq!(with("javascript:alert(1)").as_deref(), None);
+        assert_eq!(with("lakehouse.example.com").as_deref(), None);
     }
 }

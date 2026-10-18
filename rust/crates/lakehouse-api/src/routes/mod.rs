@@ -33,6 +33,7 @@ pub(crate) mod drill;
 mod embed;
 mod pdf_export;
 mod render;
+pub mod report_runner;
 // DATA-10 review SHOULD-FIX 1: route modules stay private; tests call gold_export_history
 mod gold;
 mod governance;
