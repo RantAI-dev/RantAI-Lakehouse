@@ -562,7 +562,12 @@ async fn prepare_chat(
         sql_help,
     )
     .await;
-
+    // R30: before the language line, which stays last.
+    let closing = prompt::closing(
+        recent_user.last().copied().unwrap_or_default(),
+        state.config.ai_default_reply_language,
+    );
+    let sys = prompt::with_permission_note(sys, perms, &closing);
     let mut messages = vec![LlmMessage {
         role: LlmMessageRole::System,
         content: Some(sys),
@@ -2604,6 +2609,50 @@ mod tests {
             "the language line is unchanged in build mode: {system}"
         );
         assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
+    /// change dashboards says why the tools are withheld, ahead of the language
+    /// line; a person who can gets no such sentence.
+    #[tokio::test]
+    async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
+        let state = state_with_ask_back("false");
+        let headers = axum::http::HeaderMap::new();
+        let system = |who: Principal| {
+            let state = state.clone();
+            let headers = headers.clone();
+            async move {
+                let chat = prepare_chat(
+                    &state,
+                    Some(&who),
+                    &headers,
+                    history_of(&[("user", "Move the map charts to a new tab.")]),
+                )
+                .await
+                .map_err(|_| "a valid body")
+                .expect("a prepared chat");
+                chat.messages[0].content.clone().unwrap_or_default()
+            }
+        };
+        let viewer = system(analyst(1)).await;
+        assert!(
+            viewer.contains(
+                "Your account cannot change dashboards; ask an editor or an administrator."
+            ),
+            "{viewer}"
+        );
+        assert!(
+            viewer.find("Your account cannot change dashboards")
+                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            "the sentence comes before the language line"
+        );
+        let mut editor = analyst(2);
+        editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
+        assert!(
+            !system(editor)
+                .await
+                .contains("Your account cannot change dashboards")
+        );
     }
 
     #[tokio::test]
