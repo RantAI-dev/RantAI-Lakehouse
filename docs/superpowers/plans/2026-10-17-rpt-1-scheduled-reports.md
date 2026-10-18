@@ -161,4 +161,58 @@ new store tests (testcontainers Postgres).
 
 ## 7. Handoff (developer appends)
 
+Developer: Claude Sonnet. Branch `feat/bi-phase-4`, after BI-1 and the phase 3 merge (`7b37ac67`). Nothing pushed, no PR.
+
+### Commits (one per task, plan order)
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1 | `ca7255e4` | report subscriptions, recipients, deliveries and the schedule maths (migration 0088) |
+| T2 | `97183b52` | an email can carry attachments, every recipient in Bcc |
+| T3 | `ccec4e8a` | the report runner sends due subscriptions as their owner |
+| T4 | `841886c4` | subscription routes, the recipient picker and the outside-domain setting |
+| T5 | `654367c7` | Subscriptions on the dashboard menu and the outside-domain setting |
+| T6 | `538883a7` | the assistant schedules reports; others need approval (committed by the coordinator from my tree) |
+| T7 | `b6b81f8c` | CHANGELOG (committed by the coordinator from my tree) |
+
+Only one migration, `0088`; `0089` was not needed.
+
+### Deviations from the plan (all accepted by the planner)
+
+- **Time zone database: `jiff`, not `chrono-tz`.** The workspace has no `chrono-tz` (the zone list lives in the engine). `jiff 0.2.37` was already in `Cargo.lock` through `serde_with` with its bundled `jiff-tzdb`; it is now a direct dependency of `lakehouse-store` with `tzdb-bundle-always`, so the schedule does not depend on the image having `tzdata`. The lockfile gains two dependency edges and no package. `cargo deny check`: advisories, bans, licenses, sources ok. `cargo audit` (the CI ignores): exit 0, the same 2 allowed warnings as before (`paste` unmaintained, `chacha20` yanked).
+- **`CONSOLE_PUBLIC_URL`, a new optional variable** (compose `${CONSOLE_PUBLIC_URL:-}`, `.env.example`, `Config::console_public_url`, trimmed and `http(s)` only). The email links to `<it>/dashboards/<id>`. It is never taken from a request, because a header the caller controls would put a link of their choosing in an email to outsiders. Unset: no link.
+- **`send_with_attachments` takes the Bcc list first** (the To is the sender by D5).
+- **The claim is two statements in one transaction** (`SELECT ... FOR UPDATE SKIP LOCKED`, then one `UPDATE` per row with the next time computed in Rust), not one `UPDATE ... IN (SELECT ...)`.
+- **D6 falls back to the owner's email.** No per-user notification list exists (the bell lists open alerts and pending approvals for everyone), so a failed scheduled send emails the owner; the subscription's list shows the status and reason. The owner is emailed after every failed scheduled send (not after "Send now").
+- **Saving without email is allowed** (planner note); the list returns `emailSetUp: false`. A PDF is refused at save while the deployment has no PDF service.
+- **`report_delivery.origin`** (`schedule` or `manual`) was added to the plan's column list so "Send now" is recorded as such.
+- A person's list of a dashboard's subscriptions holds their own; an administrator (`settings:write`) sees all. The assistant changes only the asking person's own subscriptions.
+- Refactors of BI-1 code so the runner reuses it (rule 4): `pdf_export::make_pdf` and `PdfFailure` (the route calls it), `dashboard::build_chart_file` (the route calls it), `ChartExportQuery::for_report`, `render::principal_of`, `alerts::smtp_config` made `pub(crate)`; `ai::request_approval` is the one copy of approval creation for the chat loop and `POST /api/ai/tool`.
+
+### "Must verify" findings (section 5)
+
+1. **In-console notification path for a user:** none (above).
+2. **`lettre` features:** the existing `builder` feature already covers `MultiPart` and `Attachment`; no dependency change.
+3. **Another per-minute loop to join:** none exists (the other background tasks run hourly or daily); `routes::report_runner::spawn` is new.
+
+### How the assistant rules were built (T6, for the AI team)
+
+- `gate::effective_risk` makes `create_report_subscription` and `update_report_subscription` `WriteHigh` for a call whose `recipients` is not empty; otherwise `WriteLow` (Confirm). `delete_report_subscription` is always `WriteHigh`. Ask mode refuses all three.
+- An approved action runs as the approver. Before an approval exists, `tools::approval_args` checks the requester's rights with the same `validate_input` the tool uses, and writes their id into the stored arguments as `ownerId`. When the approved call runs, the tool makes the subscription the requester's and validates it as them today; the approver must also be able to download and see the dashboard (`decide_approval` already requires the registry permission `dashboard:read`). `gate::strip_confirmed` drops a model-supplied `ownerId`. Tests: `ai_report_tools.rs` (8).
+- **Known limit:** `update_report_subscription` that names no recipients is a confirmation even when the stored subscription already has other recipients, so a person can change what an existing outside list receives (attachments, filters) with Confirm only. Adding or replacing recipients needs approval. If the AI team wants it stricter, the gate would need the stored recipients (an async lookup); not built.
+- Standard request set (`AI-15`): `docs/core/specs/ai-15.md` is a spec and no request-set file exists; "Send this dashboard to me every Monday as a PDF." (`AI-10-AC1`) is covered by the test `the_quoted_request_creates_a_monday_pdf_subscription_for_the_person_after_confirm`, not by a request-set entry.
+
+### Checks (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one cargo command at a time, `--test-threads=2`)
+
+CHECKS_PLACEHOLDER
+
+### Not verified, and why
+
+- **A real mail server or a real Gotenberg run of a report.** The runner is proved with a fake `ReportMailer` and a `wiremock` Gotenberg; `lettre`'s own message is proved by building it and reading it back (multipart, Bcc kept out of the headers and in the envelope). No scratch SMTP container was started. The first real email is the owner's QA (`RPT-1-AC1`, `AC5`).
+- **The dialog in a real browser** (component tests only); the console's `next build --webpack` succeeds.
+- **The PDF of a real dashboard** as made by the print view: BI-1's open item.
+- **Daylight saving against a real clock:** proved by unit tests across Europe/Amsterdam's 2026 changes, not waited for.
+- **A crash between claim and send** loses that one send (never sends twice); not tested by killing a process.
+- The planner note about a second migration: not needed.
+
 ## 8. Review (planner appends)
