@@ -299,3 +299,7 @@ Read against the plan, the feature page, BI-1 section 8 and DEC-8. R1 was checke
 - console Delete has no confirm.
 
 **Accepted deviations:** `jiff`; `CONSOLE_PUBLIC_URL`; Bcc first; the two-statement claim; the owner email in place of an in-console notice; saving without SMTP; the `origin` column; the list scopes; the BI-1 refactors. **Not accepted:** the "known limit", which is R2.
+
+### Review 2 (planner, 2026-10-18, fix round 1 at `9c6730ee`)
+
+R1: the report write tools are refused and not offered in headless runs, and `ownerId` is stripped there. R2: `report_audience` runs before the gate at both dispatch sites, keeps the stored recipients when none are named, and fails closed (any lookup that cannot be made reads as approval); its result reaches `effective_risk_with` server-side only. R3 to R9 as the handoff states; R4/R5 and R6/R7 share commits because the hunks interleave (accepted). The R8 fixture change gives the test's recipient a role that may view dashboards instead of weakening the rule (accepted). No open BLOCKER on RPT-1. The review's NOTE items are `BI-34` in the backlog; BI-1's export limits are `BI-33`. Next: the owner's phase 4 QA of BI-1 and RPT-1 together on `:3100` with Gotenberg and Mailpit.
