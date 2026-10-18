@@ -51,7 +51,13 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
         (typeof m === "object" && m !== null && typeof (m as { metric?: unknown }).metric === "string") ||
         (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
+  // BI-18 part C review fix (SHOULD-FIX) R25, R26: the draft is the model's own
+  // arguments first, as Confirm sends them, then the fields normalised below.
+  // Before, every field not listed here (`histogram`, `goal`, `bands`, `url`,
+  // `alt`, the style fields) was dropped, so a histogram asked for in bins of 500
+  // previewed as automatic and a progress bar with a goal previewed as "needs a goal".
   return {
+    ...(args as Partial<ChartDef>),
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? str(args.text) ?? "",
     subtitle: str(args.subtitle),
     mart: str(args.mart),
