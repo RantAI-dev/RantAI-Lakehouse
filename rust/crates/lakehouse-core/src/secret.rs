@@ -287,7 +287,7 @@ impl EnvSecretResolver {
     }
 }
 
-#[allow(
+#[expect(
     clippy::unused_async_trait_impl,
     reason = "SecretResolver trait defines async fn; implementation is synchronous"
 )]
@@ -520,7 +520,7 @@ impl FileSecretResolver {
     }
 }
 
-#[allow(
+#[expect(
     clippy::unused_async_trait_impl,
     reason = "SecretResolver trait defines async fn; implementation is synchronous"
 )]

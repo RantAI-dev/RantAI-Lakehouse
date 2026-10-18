@@ -623,7 +623,7 @@ impl Stub {
     }
 }
 
-#[allow(
+#[expect(
     clippy::unused_async_trait_impl,
     reason = "LayerRunner trait defines async fn; test stub is synchronous"
 )]

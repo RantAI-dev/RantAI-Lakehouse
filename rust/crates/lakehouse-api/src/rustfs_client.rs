@@ -210,7 +210,7 @@ mod tests {
     }
 
     impl SecretResolver for CountingResolver {
-        #[allow(
+        #[expect(
             clippy::unused_async_trait_impl,
             reason = "SecretResolver trait defines async fn; test stub is synchronous"
         )]
@@ -346,10 +346,6 @@ mod tests {
     }
 
     impl SecretResolver for Recording {
-        #[allow(
-            clippy::unused_async_trait_impl,
-            reason = "SecretResolver trait defines async fn; test stub is synchronous"
-        )]
         async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
             self.asked.lock().unwrap().push(secret_ref.to_owned());
             self.inner.resolve(secret_ref).await

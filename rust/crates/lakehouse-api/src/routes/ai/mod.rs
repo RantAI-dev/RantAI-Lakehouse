@@ -423,7 +423,7 @@ fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<
 
 /// Validates the body and assembles the system prompt, history and the tool
 /// list for this principal and mode. A bad body is a ready 400 response.
-#[allow(
+#[expect(
     clippy::result_large_err,
     reason = "axum::response::Response is returned directly as early error responses"
 )]
