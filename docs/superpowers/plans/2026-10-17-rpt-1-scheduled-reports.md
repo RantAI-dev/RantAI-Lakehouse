@@ -172,8 +172,8 @@ Developer: Claude Sonnet. Branch `feat/bi-phase-4`, after BI-1 and the phase 3 m
 | T3 | `ccec4e8a` | the report runner sends due subscriptions as their owner |
 | T4 | `841886c4` | subscription routes, the recipient picker and the outside-domain setting |
 | T5 | `654367c7` | Subscriptions on the dashboard menu and the outside-domain setting |
-| T6 | `538883a7` | the assistant schedules reports; others need approval (committed by the coordinator from my tree) |
-| T7 | `b6b81f8c` | CHANGELOG (committed by the coordinator from my tree) |
+| T6 | `538883a7` | the assistant schedules reports; others need approval |
+| T7 | `b6b81f8c` | CHANGELOG |
 
 Only one migration, `0088`; `0089` was not needed.
 
@@ -204,7 +204,16 @@ Only one migration, `0088`; `0089` was not needed.
 
 ### Checks (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, one cargo command at a time, `--test-threads=2`)
 
-CHECKS_PLACEHOLDER
+Final tree (`b6b81f8c`, plus this handoff):
+
+- `cargo fmt --check` (workspace): clean. `cargo clippy -p lakehouse-notify -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings`: clean (crate sources touched first, because a second worktree shares the target and left a stale `lakehouse-bi`; several runs failed to compile for that reason and were rerun after a `touch`).
+- `cargo test -p lakehouse-notify`: 25. `lakehouse-store`: lib `report_schedule` 15; `--test report_subscriptions` 12; `--test reporting_settings` 8.
+- `lakehouse-api --lib`, filters `routes::ai routes::report routes::settings routes::tests policy config pdf export`: 672 passed, 1 ignored (run on the tree before the last test-only edits; the `request_approval` refactor is covered by the integration files below).
+- Integration, one file at a time: `report_runner` 14, `report_routes` 10, `reporting_settings_route` 11, `ai_report_tools` 8, `ai_tool` 21, `agents_approval` 13, `ai_export_tools` 7, `route_auth` 49, `sec11_guard` 4. `write_tool_schema_fixture` run once: `tool_schemas.json` +308 lines, 102 to 106 tools.
+- `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok (cargo-deny 0.20.2). `cargo audit` with the CI ignores (0.22.2): exit 0, the same 2 allowed warnings (`paste`, `chacha20` yanked).
+- TypeScript: `bun run typecheck` clean; `bun run lint` 0 errors, 8 warnings (none in files of this branch); `bun run test` 2234 pass, 1 skip, 0 fail; `bun --bun next build --webpack` succeeds.
+- `docker compose --profile '*' config --quiet` with throwaway values: exit 0, `CONSOLE_PUBLIC_URL` reaches `lakehouse-api`.
+
 
 ### Not verified, and why
 
