@@ -225,3 +225,57 @@ Final tree (`b6b81f8c`, plus this handoff):
 - The planner note about a second migration: not needed.
 
 ## 8. Review (planner appends)
+
+### Review 1 (planner, 2026-10-18, at `d9f96362`)
+
+Read against the plan, the feature page, BI-1 section 8 and DEC-8. R1 was checked by the planner in the code: `agents.rs` passes the model's arguments to the tool without stripping and takes `spec.risk` as declared, not `gate::effective_risk`. The reviewer's own test re-run was skipped at the owner's standing request.
+
+**R1 BLOCKER: headless employee runs skip the DEC-8 gate and the owner stamp.**
+- **Where:** `agents.rs` (around 1218, 1348, 1371) and `tools/reports.rs` (`ownerId` is trusted).
+- **How it fails:** a build-mode employee can create a subscription to outside recipients with no confirm and no approval. With a model-supplied `ownerId`, it can make that subscription as an administrator, whose unmasked data then goes out on a schedule.
+- **Decision:** the report write tools are refused in headless runs (`headless_refusal`). This fails closed: a scheduled run has no person to own a report. `ownerId` is stripped in the headless loop as well.
+- **Accept:** tests that a headless call with recipients is refused, and that a model-supplied `ownerId` never reaches the tool.
+
+**R2 BLOCKER: changing what an existing outside list receives needs only a Confirm, and the Confirm says "only you".**
+- **Decision:** before `gate::decide`, at every dispatch site, an async step loads the recipients the call will leave in place for `update_report_subscription`: the stored ones when none are named, else the named ones. The call is `WriteHigh` when that list holds anyone but the requester, unless it only narrows (pausing, or recipients that are a subset of the stored ones), which is a chat Confirm under DEC-8's refinement.
+- The result is passed to `effective_risk` as a server-side argument, never as a model-visible one. The Confirm sentence names the real audience.
+- **Accept:** a stored outside list with a new chart needs approval; removing a recipient or pausing is a Confirm.
+
+**R3 SHOULD-FIX: a long "left out" note breaks the delivery record after the email has gone.**
+- **Cause:** the reason exceeds the 500-character `CHECK`.
+- **Decision:** cap the stored reason on a character boundary; the full list stays in the email.
+- **Accept:** a test with 10 left-out charts.
+
+**R4 SHOULD-FIX: Pause and Resume re-validate the whole subscription,** so a report the person no longer wants cannot be stopped once a recipient, domain or right has changed.
+- **Decision:** pause and resume only (route and tool) go straight to `set_paused`.
+- **Accept:** a test per case.
+
+**R5 SHOULD-FIX: a non-owner administrator can add recipients to someone else's report and "Send now".**
+- **Decision:** a non-owner administrator may view, pause, resume, delete and remove recipients, nothing else. Anything else is refused with a sentence.
+- **Accept:** a test.
+
+**R6 SHOULD-FIX: the audit does not say who received the files.**
+- **Decision:** add the recipient count, the outside addresses and `origin` to each attachment entry.
+
+**R7 SHOULD-FIX: PDF and chart-file failures leave no operator trace.**
+- **Decision:** log the cause through `upstream_error`. The stored sentence stays fixed.
+
+**R8 SHOULD-FIX (planner default, owner confirms at QA): recipients' own rights.**
+- At send time, a console recipient who no longer has `dashboard:read`, or whose roles may not download, is skipped. The delivery says how many were skipped.
+- Tenants: a console recipient must share a tenant with the owner when the owner has tenants.
+- **Accept:** tests.
+
+**R9 SHOULD-FIX (from the review's notes):**
+- A failed "Send now" does not email the owner; the dialog shows the reason, as the handoff says.
+- "Email is not set up" does not count toward the five failures.
+- The SMTP envelope holds only the Bcc list, so the `SMTP_FROM` mailbox gets no copy, or the page says it does.
+- `PDF_BUSY` retries in 5 minutes once, instead of losing the period's send.
+
+**NOTE (backlog, not here):**
+- a requester holding `agent:approve` can approve their own outside send;
+- "Send now" has no rate limit;
+- a report over the 310 s route budget is cut with nothing recorded;
+- the dialog's direct service calls should use `useServiceAction`;
+- console Delete has no confirm.
+
+**Accepted deviations:** `jiff`; `CONSOLE_PUBLIC_URL`; Bcc first; the two-statement claim; the owner email in place of an in-console notice; saving without SMTP; the `origin` column; the list scopes; the BI-1 refactors. **Not accepted:** the "known limit", which is R2.
