@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Eye, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -21,6 +21,8 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
+import { createBoard, deleteBoard, deleteChart, duplicateBoard, renameBoard, saveBoardLayout } from "./board-writes";
+import { readableErrorMessage } from "@/lib/notify-message";
 import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
 import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-chat";
@@ -39,7 +41,8 @@ import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { fmtInt } from "./chart-option";
-import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions";
+import { DashboardActionsMenu, EditLayoutButton, NewChartButton, RenameDashboardDialog } from "./dashboard-actions";
+import { chartWriteItems } from "./tile-write-items";
 import { ThemeFontDialog } from "./theme-font-dialog";
 import { dashboardLook, type DashboardTheme } from "@/lib/dashboard-look";
 import { NOTE_KINDS, withNote } from "@/lib/style-draft";
@@ -559,42 +562,51 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     setLayout(next);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      void apiFetch("/api/dashboard/boards", {
-        method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: board, layout: next }),
-      });
+      // BI-18 part C review fix (SHOULD-FIX) R19: a refused save is said, not dropped.
+      saveBoardLayout(board, next).catch((e) => notifyFailure("The layout was not saved", e instanceof Error ? e.message : undefined));
     }, 600);
   }, [board]);
 
   async function removeChart(id: string) {
     setRemoveBusy(true);
     try {
-      await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      await deleteChart(id);
       setRemoving(null);
       void load();
+    } catch (e) {
+      notifyFailure("The chart was not deleted", e instanceof Error ? e.message : undefined);
     } finally {
       setRemoveBusy(false);
     }
   }
-  async function boardRequest(method: "POST" | "PUT", body: Record<string, unknown>) {
-    const res = await apiFetch("/api/dashboard/boards", {
-      method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    });
-    return (await res.json()) as { board?: { id: string } };
-  }
+  // BI-18 part C review fix (SHOULD-FIX) R19: every write below checks the answer
+  // (`board-writes.ts`) and says the server's sentence when it is refused.
   async function duplicateDashboard() {
-    const json = await boardRequest("POST", { duplicate: board });
-    notifyDashboardsChanged();
-    if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+    try {
+      const json = await duplicateBoard(board);
+      notifyDashboardsChanged();
+      if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+    } catch (e) {
+      notifyFailure("The dashboard was not duplicated", e instanceof Error ? e.message : undefined);
+    }
   }
   async function createDashboard() {
-    const json = await boardRequest("POST", { name: "New dashboard" });
-    notifyDashboardsChanged();
-    if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+    try {
+      const json = await createBoard("New dashboard");
+      notifyDashboardsChanged();
+      if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+    } catch (e) {
+      notifyFailure("The dashboard was not created", e instanceof Error ? e.message : undefined);
+    }
   }
   async function deleteDashboard() {
     if (isDefault) return;
-    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
+    try {
+      await deleteBoard(board);
+    } catch (e) {
+      notifyFailure("The dashboard was not deleted", e instanceof Error ? e.message : undefined);
+      return;
+    }
     notifySuccess("Dashboard moved to the trash", "Restore it from Trash on the dashboard list for 30 days.");
     notifyDashboardsChanged();
     // Lupakan sebelum pergi, kalau tidak `/dashboards` menuntun balik ke sini.
@@ -603,7 +615,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   }
   async function renameDashboard(name: string) {
     if (isDefault) return;
-    await boardRequest("PUT", { id: board, name });
+    try {
+      await renameBoard(board, name);
+    } catch (e) {
+      notifyFailure("The dashboard was not renamed", e instanceof Error ? e.message : undefined);
+      return;
+    }
     setRenameOpen(false);
     notifyDashboardsChanged();
   }
@@ -932,6 +949,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
     const downloadKind = downloadMenuKind({ own, hasRows: hasRows(cell) && cell.rows.length > 0 }, canDownload);
+    const write = chartWriteItems({
+      canWrite, own, hasDef: Boolean(spec.def),
+      onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
+      onDelete: () => setRemoving({ id: spec.id, title: spec.title }),
+    });
     const menu: TileMenuItem[] = [
       { label: "Expand", icon: <Maximize2 />, onSelect: () => setTileDialog({ kind: "expand", id: spec.id }) },
       { label: "View data", icon: <Table2 />, onSelect: () => setTileDialog({ kind: "data", id: spec.id }) },
@@ -956,13 +978,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         : downloadKind === "csv"
           ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
           : []),
-      ...(own && spec.def
-        ? [{ label: "Edit chart", icon: <Pencil />, separatorBefore: true, onSelect: () => setEditing({ id: spec.id, def: spec.def as ChartDef }) }]
-        : []),
+      ...write.edit,
       ...moveItems(spec.id),
-      ...(own
-        ? [{ label: "Delete chart", icon: <Trash2 />, destructive: true, separatorBefore: !spec.def, onSelect: () => setRemoving({ id: spec.id, title: spec.title }) }]
-        : []),
+      ...write.remove,
     ];
     return {
       id: spec.id,
@@ -1052,9 +1070,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <Moon className="size-4" /> Dark
               </Button>
             ) : null}
-            <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
-              {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
-            </Button>
+            <EditLayoutButton canWrite={canWrite} edit={edit} onToggle={() => setEdit((e) => !e)} />
             {!isDefault ? (
               <FavouriteButton
                 on={isFavourite}
@@ -1066,6 +1082,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
+              canWrite={canWrite}
               isPrivate={Boolean(ownerId)}
               onHistory={() => setHistoryOpen(true)}
               onTheme={hasPermission("dashboard:write") ? () => { setThemeError(null); setThemeOpen(true); } : undefined}
@@ -1093,14 +1110,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 <SlidersHorizontal className="size-4" /> Parameters
               </Button>
             ) : null}
-            <Button size="sm" onClick={() => setNewChartOpen(true)}>
-              <ChartColumn className="size-4" /> New chart
-            </Button>
+            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
           </span>
         }
       />
 
-      {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
+      {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{readableErrorMessage(error)}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {showFilterBar || grainedCharts.length > 0 || paramControls.length > 0 ? (
@@ -1161,9 +1176,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="flex-row justify-center gap-2">
-            <Button size="sm" onClick={() => setNewChartOpen(true)}>
-              <ChartColumn className="size-4" /> New chart
-            </Button>
+            <NewChartButton canWrite={canWrite} onClick={() => setNewChartOpen(true)} />
             <Button
               size="sm"
               variant="outline"

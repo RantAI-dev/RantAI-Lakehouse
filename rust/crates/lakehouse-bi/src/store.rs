@@ -4586,7 +4586,7 @@ fn spec_from_histogram_input(
     }
     let mode = match &input.types.histogram {
         Some(bins) => bins.mode().map_err(BiError::Validation)?,
-        None => crate::bin::BinMode::Count(crate::types_b::AUTO_HISTOGRAM_BINS),
+        None => crate::bin::BinMode::Nearest(crate::types_b::AUTO_HISTOGRAM_BINS),
     };
     // As for BI-10's bins: a SQL source's rows are cut at a fixed cap, so a
     // range read from the cut result would be wrong.

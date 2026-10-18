@@ -36,7 +36,7 @@ function serve(response: Response) {
 describe("downloads", () => {
   it("throws the server's own sentence when a download is refused", async () => {
     serve(new Response(JSON.stringify({ error: "permission_denied: Downloads are switched off for your role." }), { status: 403 }))
-    await expect(downloadChartData("c1", { format: "csv", values: "raw" }, { filters: [] })).rejects.toThrow("Downloads are switched off for your role.")
+    await expect(downloadChartData("c1", { format: "csv", values: "raw" }, { filters: [] })).rejects.toThrow("This account does not have permission. Ask a workspace admin.")
     serve(new Response(JSON.stringify({ error: "The PDF service is not reachable. Reference: abc" }), { status: 503 }))
     await expect(downloadDashboardPdf("b1", { paper: "a4", orientation: "portrait" }, { filters: [] })).rejects.toThrow("The PDF service is not reachable. Reference: abc")
   })

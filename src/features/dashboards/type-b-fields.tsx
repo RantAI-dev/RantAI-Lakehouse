@@ -85,7 +85,7 @@ export function BandFields({ draft, onChange }: { readonly draft: TypeDraft; rea
 
 const HIST_MODES = { auto: `Automatic (about ${AUTO_HISTOGRAM_BINS})`, count: "A number of ranges", width: "A width" } as const;
 
-/** How a histogram cuts its column: automatic, at most N ranges, or a width. */
+/** How a histogram cuts its column: automatic (the nice width nearest 20 ranges), exactly N ranges, or a width (BI-18 part C review fix (SHOULD-FIX) R21). */
 export function HistogramFields({ draft, onChange }: { readonly draft: TypeDraft; readonly onChange: Change }) {
   return (
     <div className="grid gap-1.5">

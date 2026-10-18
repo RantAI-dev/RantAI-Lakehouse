@@ -32,20 +32,20 @@ diagram, a status page).
 
 ## Decisions
 
-Planner defaults; the owner confirms or changes them at the phase 3 QA.
+Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 
 | # | Decision | Default |
 | --- | --- | --- |
-| 1 | Progress: one value and a goal, either a fixed number or a second value of the same source. Above 100 % the bar is full and the label says the real percentage (for example 112 %). A goal of zero or less shows "No goal to compare with". | Planner |
-| 2 | Histogram: one number column, counted per range. Automatic ranges use the same rounded widths as `BI-10` bins, aiming at about 20 ranges; the user may set a width or a number of ranges, at most 100. Empty ranges between two filled ones are shown as zero, so the shape is not distorted. | Planner |
-| 3 | Bullet: one value, an optional target (fixed or a second value) and up to three bands with fixed limits; with a category, one bullet per category, at most 20, the rest summarised as "N more not shown". | Planner |
-| 4 | Image and web cards take only `https://` addresses whose site is on the administrator's list of allowed content sites (Admin > Settings, at most 50 sites, written `https://host` or `https://host:port`, no wildcards, as for signed-embed sites). An address on another site is refused at save with a plain sentence, and a card whose site is later removed from the list shows "This site is no longer allowed" instead of loading it. | Planner |
-| 5 | A web page is shown in a sandboxed frame (scripts and pop-ups allowed, no access to the console, no referrer sent). The card always shows "Open in a new tab". | Planner |
-| 6 | An image card needs a short description (alt text, at most 200 characters). | Planner |
-| 7 | Image and web cards are layout tiles: they take no filter, like text and headings, and are shown in public links and signed embeds as on the dashboard. | Planner |
-| 8 | Progress, histogram and bullet take the dashboard's filters like any chart, and use the value formats of `BI-17` part A. | Planner |
-| 9 | The coverage check is a list in this page and a test: every Metabase chart type maps to one of ours or to a decision that drops it. | Planner |
-| 10 | Changing these cards needs `dashboard:write`; changing the allowed sites needs `settings:write`. | Planner |
+| 1 | Progress: one value and a goal, either a fixed number or a second value of the same source. Above 100 % the bar is full and the label says the real percentage (for example 112 %). A goal of zero or less shows "No goal to compare with". | Planner, confirmed by the owner 2026-10-17 |
+| 2 | Histogram: one number column, counted per range. Automatic ranges use the same rounded widths as `BI-10` bins, aiming at about 20 ranges; the user may set a width or a number of ranges, at most 100. Empty ranges between two filled ones are shown as zero, so the shape is not distorted. | Planner, confirmed by the owner 2026-10-17 |
+| 3 | Bullet: one value, an optional target (fixed or a second value) and up to three bands with fixed limits; with a category, one bullet per category, at most 20, the rest summarised as "N more not shown". | Planner, confirmed by the owner 2026-10-17 |
+| 4 | Image and web cards take only `https://` addresses whose site is on the administrator's list of allowed content sites (Admin > Settings, at most 50 sites, written `https://host` or `https://host:port`, no wildcards, as for signed-embed sites). An address on another site is refused at save with a plain sentence, and a card whose site is later removed from the list shows "This site is no longer allowed" instead of loading it. | Planner, confirmed by the owner 2026-10-17 |
+| 5 | A web page is shown in a sandboxed frame (scripts and pop-ups allowed, no access to the console, no referrer sent). The card always shows "Open in a new tab". | Planner, confirmed by the owner 2026-10-17 |
+| 6 | An image card needs a short description (alt text, at most 200 characters). | Planner, confirmed by the owner 2026-10-17 |
+| 7 | Image and web cards are layout tiles: they take no filter, like text and headings, and are shown in public links and signed embeds as on the dashboard. | Planner, confirmed by the owner 2026-10-17 |
+| 8 | Progress, histogram and bullet take the dashboard's filters like any chart, and use the value formats of `BI-17` part A. | Planner, confirmed by the owner 2026-10-17 |
+| 9 | The coverage check is a list in this page and a test: every Metabase chart type maps to one of ours or to a decision that drops it. | Planner, confirmed by the owner 2026-10-17 |
+| 10 | Changing these cards needs `dashboard:write`; changing the allowed sites needs `settings:write`. | Planner, confirmed by the owner 2026-10-17 |
 
 ## Limits to tell a customer
 

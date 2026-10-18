@@ -41,25 +41,25 @@ dark mode and its font.
 
 ## Decisions
 
-Planner defaults; the owner confirms or changes them at the phase 3 QA.
+Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 
 | # | Decision | Default |
 | --- | --- | --- |
-| 1 | A chart has one format, and each value (measure or column) may override it. A chart saved before this keeps showing what it showed, except that a number format already saved on it is now honoured. | Planner |
-| 2 | Separators follow one deployment setting, "Number locale", in Admin > Settings: `en-US` (1,234.5) or `id-ID` (1.234,5). Default `en-US`, so no existing chart changes until an administrator chooses. | Planner |
-| 3 | Compact numbers use K, M, B, T in every locale (the spec's 1.2 K, 3.4 M), not the locale's own words (jt, rb). With currency: "Rp 1,2 M" in `id-ID`. | Planner |
-| 4 | Currency is any ISO 4217 code; an unknown code is refused at save with a plain sentence. | Planner |
-| 5 | Prefix and suffix are at most 16 characters each, plain text. | Planner |
-| 6 | Built-in palettes: the current default, plus four (categorical bright, categorical muted, sequential blue, diverging red-blue), all passing the contrast check in light and dark themes. The company palette holds 2 to 12 colours; with it set, it is the default for new charts. | Planner |
-| 7 | Colour by value: a range of two or three colours over the measure's shown minimum and maximum, for single-series bar, column, row, pie, treemap and map charts. | Planner |
-| 8 | A logarithmic axis needs every value above zero; a chart with a zero or negative value shows the tile message "A logarithmic axis cannot show zero or negative values" instead of drawing a wrong axis. | Planner |
-| 9 | Reference lines that are computed (average, median, minimum, maximum, trend) use the rows the chart shows. When the result was cut off, the line's label says "of the N shown". | Planner |
-| 10 | At most 5 reference lines and bands, 20 notes and 20 conditional rules per chart. | Planner |
-| 11 | A note is pinned to a category or date value and, on a chart with several series, to one series; its text is at most 140 characters, plain text. A note whose point is no longer in the result is listed under the chart as "1 note not shown: its point is not in the result". | Planner |
-| 12 | Fonts: the console ships a fixed set (Inter, IBM Plex Sans, Source Serif, JetBrains Mono, the system font). An administrator chooses which of them dashboards may use; nothing is loaded from the internet. | Planner |
-| 13 | A dashboard's theme and font apply to its tiles everywhere it is shown, including public links and signed embeds. | Planner |
-| 14 | Changing a chart's format needs `dashboard:write`; changing the palette, fonts and number locale needs `settings:write`. | Planner |
-| 15 | The assistant gets one tool, `format_chart`, that changes only formatting and leaves everything else of the chart as it is; and `set_dashboard_theme`. Neither deletes, shares or publishes, so neither waits for approval. | Planner |
+| 1 | A chart has one format, and each value (measure or column) may override it. A chart saved before this keeps showing what it showed, except that a number format already saved on it is now honoured. | Planner, confirmed by the owner 2026-10-17 |
+| 2 | Separators follow one deployment setting, "Number locale", in Admin > Settings: `en-US` (1,234.5) or `id-ID` (1.234,5). Default `en-US`, so no existing chart changes until an administrator chooses. | Planner, confirmed by the owner 2026-10-17 |
+| 3 | Compact numbers use K, M, B, T in every locale (the spec's 1.2 K, 3.4 M), not the locale's own words (jt, rb). With currency: "Rp 1,2 M" in `id-ID`. | Planner, confirmed by the owner 2026-10-17 |
+| 4 | Currency is any ISO 4217 code; an unknown code is refused at save with a plain sentence. | Planner, confirmed by the owner 2026-10-17 |
+| 5 | Prefix and suffix are at most 16 characters each, plain text. | Planner, confirmed by the owner 2026-10-17 |
+| 6 | Built-in palettes: the current default, plus four (categorical bright, categorical muted, sequential blue, diverging red-blue), the four new ones passing the 3:1 contrast check in light and dark themes. The current default does not (sky 2.77:1 on white; amber, lime, orange also short); the owner chose on 2026-10-17 to keep it unchanged so saved charts keep their colours. The company palette holds 2 to 12 colours; with it set, it is the default for new charts. | Planner, confirmed by the owner 2026-10-17 |
+| 7 | Colour by value: a range of two or three colours over the measure's shown minimum and maximum, for single-series bar, column, row, pie, treemap and map charts. | Planner, confirmed by the owner 2026-10-17 |
+| 8 | A logarithmic axis needs every value above zero; a chart with a zero or negative value shows the tile message "A logarithmic axis cannot show zero or negative values" instead of drawing a wrong axis. | Planner, confirmed by the owner 2026-10-17 |
+| 9 | Reference lines that are computed (average, median, minimum, maximum, trend) use the rows the chart shows. When the result was cut off, the line's label says "of the N shown". | Planner, confirmed by the owner 2026-10-17 |
+| 10 | At most 5 reference lines and bands, 20 notes and 20 conditional rules per chart. | Planner, confirmed by the owner 2026-10-17 |
+| 11 | A note is pinned to a category or date value and, on a chart with several series, to one series; its text is at most 140 characters, plain text. A note whose point is no longer in the result is listed under the chart as "1 note not shown: its point is not in the result". | Planner, confirmed by the owner 2026-10-17 |
+| 12 | Fonts: the console ships a fixed set (Inter, IBM Plex Sans, Source Serif, JetBrains Mono, the system font). An administrator chooses which of them dashboards may use; nothing is loaded from the internet. | Planner, confirmed by the owner 2026-10-17 |
+| 13 | A dashboard's theme and font apply to its tiles everywhere it is shown, including public links and signed embeds. | Planner, confirmed by the owner 2026-10-17 |
+| 14 | Changing a chart's format needs `dashboard:write`; changing the palette, fonts and number locale needs `settings:write`. | Planner, confirmed by the owner 2026-10-17 |
+| 15 | The assistant gets one tool, `format_chart`, that changes only formatting and leaves everything else of the chart as it is; and `set_dashboard_theme`. Neither deletes, shares or publishes, so neither waits for approval. | Planner, confirmed by the owner 2026-10-17 |
 
 ## Limits to tell a customer
 

@@ -1,3 +1,4 @@
+import { readableErrorMessage } from "@/lib/notify-message";
 import { normalizeFilters } from "@/lib/dashboard-filter-state";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
@@ -35,10 +36,15 @@ export function saveBlob(blob: Blob, fileName: string): void {
   URL.revokeObjectURL(url);
 }
 
-/** The sentence the server gave for a refused download, or `fallback`. */
+/**
+ * The sentence for a refused download, or `fallback`. A body that starts with an
+ * API error code (`permission_denied: ...`) reads as that code's hint, not as
+ * the code (`readableErrorMessage`, BI-18 part C review fix (SHOULD-FIX) R20,
+ * applied to BI-1's routes by the phase 3 merge).
+ */
 export async function refusalOf(res: Response, fallback: string): Promise<string> {
   const json = (await res.json().catch(() => null)) as { error?: unknown } | null;
-  return typeof json?.error === "string" ? json.error : fallback;
+  return typeof json?.error === "string" ? readableErrorMessage(json.error) : fallback;
 }
 
 /**

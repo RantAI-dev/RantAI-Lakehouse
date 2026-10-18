@@ -48,7 +48,7 @@ pub fn chart_layers(def: &ChartInput) -> Option<Vec<Layer>> {
     if def.kind == crate::specs::ChartKind::Histogram {
         let mode = match &def.types.histogram {
             Some(bins) => bins.mode().ok()?,
-            None => BinMode::Count(crate::types_b::AUTO_HISTOGRAM_BINS),
+            None => BinMode::Nearest(crate::types_b::AUTO_HISTOGRAM_BINS),
         };
         return Some(vec![Layer {
             column: Ident::new(def.dimension.clone()).ok()?,
@@ -202,8 +202,8 @@ pub fn reads(from: &Relation, predicates: &[String], layers: &[Layer]) -> Vec<Bi
         .map(|l| BinRead {
             column: l.column.to_string(),
             mode: match l.mode {
-                BinMode::Auto => "auto",
-                BinMode::Count(_) => "count",
+                BinMode::Auto | BinMode::Nearest(_) => "auto",
+                BinMode::Count(_) | BinMode::Ranges(_) => "count",
                 BinMode::Width(_) => "width",
             }
             .to_owned(),
