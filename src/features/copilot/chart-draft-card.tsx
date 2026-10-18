@@ -115,6 +115,16 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
 }
 
 /**
+ * The spec a draft tile is drawn from: the preview's render spec, which carries no
+ * `def`, with the draft's own definition in it (BI-18 part C review fix
+ * (SHOULD-FIX) R28). A progress bar, bullet graph and the style fields read
+ * their goal, bands, format and colours from `spec.def`.
+ */
+export function previewSpecWithDef<S extends object>(spec: S, def: ChartDef): S & { def: unknown } {
+  return { ...spec, def: (spec as { def?: unknown }).def ?? def };
+}
+
+/**
  * The footer's measure text for a draft. A saved metric reads by its label
  * (its name until the preview has answered) and carries no aggregate, because
  * the metric defines its own; a measure with its own aggregate shows that one;
@@ -208,7 +218,10 @@ export function ChartDraftCard({
           </div>
         ) : preview ? (
           <TileBody
-            spec={preview.spec}
+            // BI-18 part C review fix (SHOULD-FIX) R28: the preview answers with the render spec
+            // only; a card reads its goal, bands, format and colours from `spec.def`, as a saved
+            // tile does, so the draft's own definition goes in when the answer carries none.
+            spec={previewSpecWithDef(preview.spec, def)}
             cell={preview.result}
             dark={resolvedTheme === "dark"}
             loading={loading}
