@@ -2461,6 +2461,7 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
@@ -2829,6 +2830,7 @@ dependencies = [
 name = "lakehouse-store"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "lakehouse-core",
  "lakehouse-test-support",
  "serde",

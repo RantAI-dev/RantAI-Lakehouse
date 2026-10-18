@@ -12,7 +12,8 @@ use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
 /// Settings with the formatting defaults of migration `0085` and the empty
-/// content-site list of `0086` and the empty denied-roles list of `0087`.
+/// content-site list of `0086` and the empty denied-roles list of `0087` and the empty
+/// report-domain list of `0088`.
 fn settings(zone: &str, week: &str) -> ReportingSettings {
     ReportingSettings {
         time_zone: zone.to_owned(),
@@ -22,6 +23,7 @@ fn settings(zone: &str, week: &str) -> ReportingSettings {
         fonts: SHIPPED.iter().map(|f| (*f).to_owned()).collect(),
         content_sites: Vec::new(),
         download_denied_roles: Vec::new(),
+        report_allowed_domains: Vec::new(),
     }
 }
 
@@ -108,6 +110,7 @@ async fn the_formatting_settings_round_trip_and_a_row_saved_before_them_keeps_th
         "https://cdn.example:8443".to_owned(),
     ];
     chosen.download_denied_roles = vec!["Viewer".to_owned(), "Guest".to_owned()];
+    chosen.report_allowed_domains = vec!["example.com".to_owned(), "partner.example".to_owned()];
     assert_eq!(upsert(&pool, &chosen, "u").await.expect("upsert"), chosen);
     assert_eq!(get(&pool).await.expect("get"), Some(chosen));
     Ok(())
@@ -192,5 +195,22 @@ async fn the_table_refuses_content_sites_that_are_not_https_origins_or_are_too_m
     let mut fifty = settings("UTC", "monday");
     fifty.content_sites = (0..50).map(|i| format!("https://s{i}.example")).collect();
     assert_eq!(upsert(&pool, &fifty, "u").await.expect("fifty"), fifty);
+    Ok(())
+}
+
+/// `RPT-1` T1 (D1): the table is the backstop for the report-domain list's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_table_refuses_an_empty_report_domain_and_more_than_fifty(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for domains in [
+        vec![String::new()],
+        (0..51).map(|i| format!("d{i}.example")).collect::<Vec<_>>(),
+    ] {
+        let mut s = settings("UTC", "monday");
+        s.report_allowed_domains = domains;
+        assert!(upsert(&pool, &s, "u").await.is_err());
+    }
+    assert_eq!(get(&pool).await.expect("get"), None, "nothing was stored");
     Ok(())
 }

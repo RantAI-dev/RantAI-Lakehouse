@@ -106,6 +106,9 @@ pub(crate) struct FormatSettings {
     /// settings screen reads it through `body_json`, and the dashboard page
     /// gets only the answer for its own viewer (`canDownload`).
     pub download_denied_roles: Vec<String>,
+    /// The outside email domains a scheduled report may go to (`RPT-1`, D8).
+    /// Like `download_denied_roles`, not part of [`Self::to_json`].
+    pub report_allowed_domains: Vec<String>,
 }
 
 impl Default for FormatSettings {
@@ -118,6 +121,7 @@ impl Default for FormatSettings {
             fonts: SHIPPED_FONTS.iter().map(|f| (*f).to_owned()).collect(),
             content_sites: Vec::new(),
             download_denied_roles: Vec::new(),
+            report_allowed_domains: Vec::new(),
         }
     }
 }
@@ -130,6 +134,7 @@ impl FormatSettings {
             fonts: row.fonts.clone(),
             content_sites: row.content_sites.clone(),
             download_denied_roles: row.download_denied_roles.clone(),
+            report_allowed_domains: row.report_allowed_domains.clone(),
         }
     }
 
@@ -250,6 +255,7 @@ fn checked_formatting(
         fonts,
         content_sites,
         download_denied_roles,
+        report_allowed_domains: current.report_allowed_domains.clone(),
     })
 }
 
@@ -437,6 +443,7 @@ pub async fn put_reporting(
             fonts: format.fonts,
             content_sites: format.content_sites,
             download_denied_roles: format.download_denied_roles,
+            report_allowed_domains: format.report_allowed_domains,
         },
         &principal.id.uuid().to_string(),
     )
@@ -532,6 +539,7 @@ mod tests {
             fonts: vec!["inter".to_owned()],
             content_sites: vec!["https://img.example".to_owned()],
             download_denied_roles: vec!["Viewer".to_owned()],
+            report_allowed_domains: vec!["example.com".to_owned()],
         };
         assert_eq!(
             checked_formatting(&body(""), &current, None).unwrap(),
