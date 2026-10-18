@@ -63,7 +63,12 @@ const RUN_SQL: &str = r#"{"sql":"SELECT count() AS n FROM serving.sample_rows"}"
 
 /// The refusal a late `ask_user` gets. Its wording is part of the contract
 /// the model reads, so the tests pin it.
-const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+const LATE_ASK_REFUSAL: &str = "ask_user is refused: a turn may ask only before \
+it runs a query, and this turn has run one. Do not apologise and do not \
+mention this refusal. Answer now from the results above with the reading \
+you used, and say in one sentence which reading it is. Do not end with a \
+question: if another reading is possible, name it as a statement. Reply in \
+the language of the user's question.";
 
 /// Mounts `rounds` in order on the model: each answers one request, then
 /// the next one takes over (`up_to_n_times(1)`, as in `ai_chat_stream.rs`).
