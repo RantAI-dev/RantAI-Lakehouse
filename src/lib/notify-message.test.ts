@@ -94,3 +94,28 @@ test("every known code prefix is dropped, and a message without one is left as i
   assert.equal(readableErrorMessage("permissions: nothing"), "permissions: nothing")
   assert.ok(!buildErrorDescription(new ServiceError("invalid_request", "invalid_request: x"))?.includes("invalid_request:"))
 })
+
+// BI-18 part C review fix R20 (follow-up: keep the server's sentence).
+test("a sentence after the code is shown as the server wrote it", () => {
+  assert.equal(
+    readableErrorMessage("permission_denied: Downloads are switched off for your role."),
+    "Downloads are switched off for your role."
+  )
+  assert.equal(
+    readableErrorMessage("unavailable: The PDF service is not reachable. Reference: abc."),
+    "The PDF service is not reachable. Reference: abc."
+  )
+})
+
+test("a bare permission id or a fragment after the code still reads as the generic hint", () => {
+  assert.equal(
+    readableErrorMessage("permission_denied: dashboard:write"),
+    "This account does not have permission. Ask a workspace admin."
+  )
+  assert.equal(
+    readableErrorMessage("permission_denied"),
+    "This account does not have permission. Ask a workspace admin."
+  )
+  // A space but no closing full stop is not taken for a sentence.
+  assert.ok(!readableErrorMessage("not_found: row 12 in table x").includes("row 12"))
+})
