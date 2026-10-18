@@ -280,6 +280,143 @@ ok
 ```
 
 
+### Handoff (round 2)
+
+#### 1. Commits on branch `chore/rel-9-rust-1-99`
+```
+0750a3d99957 docs(plan): redo T1 compatibility audit table from official RELEASES.md (REL-9)
+97f4b967d34e fix(rust): convert remaining allows to expect and remove unfulfilled (REL-9)
+4234af6e5264 fix(api): replace assert is_empty with assert_eq and drop allows (REL-9)
+efa11c68c08f fix(store): replace assert is_empty with assert_eq and drop allows (REL-9)
+47f3988a992c fix(bi): replace assert is_empty with assert_eq and drop allows (REL-9)
+5d08ff193d24 fix(auth): replace assert is_empty with assert_eq and drop allows (REL-9)
+1a7e73fd8811 fix(dagster): replace assert is_empty with assert_eq and drop allow (REL-9)
+0c6df63d336c fix(clickhouse): replace assert is_empty with assert_eq and drop allow (REL-9)
+7270b2a21b08 fix(notify): remove assert_is_empty allow (REL-9)
+b5466f1db3dc fix(trino): remove assert_is_empty allow (REL-9)
+351fe0cb3f71 fix(test-support): remove assert_is_empty allow (REL-9)
+6668ab08c407 fix(llm): remove assert_is_empty allow (REL-9)
+45b5db088ed3 fix(iceberg): remove assert_is_empty allows (REL-9)
+48b57ac022df fix(embed): remove assert_is_empty allows (REL-9)
+7bdef1818559 fix(core): remove assert_is_empty allow (REL-9)
+db2e5a88379e fix(alerts): replace assert is_empty with assert_eq and drop allow (REL-9)
+262ea3557090 docs(plan): REL-9 review round 1, three blockers
+0d1fcba09632 docs(rel-9): add handoff verification and audit records
+f6a163b83f7e docs(rust): update toolchain docs and changelog for 1.99.1 (REL-9)
+b870f9a04908 fix(rust): address 1.99 warnings and lints (REL-9)
+aa87a92372c7 chore(rust): bump toolchain and minimum to 1.99.1 / 1.99 (REL-9)
+1b571ca5d97c docs(plan): T1 release-notes audit (REL-9)
+da8984e332d6 docs(plan): add REL-9 plan
+```
+
+#### 2. Verification Commands and Per-Binary Totals
+
+1. **Clippy assert_is_empty check (BLOCKER 1):**
+```
+$ grep -rn 'clippy::assert_is_empty' --include=*.rs rust
+(exit code 1, 0 matches across workspace)
+```
+
+2. **Formatting check:**
+```
+$ (cd rust && cargo fmt --check)
+(exit code 0, clean formatting)
+```
+
+3. **Workspace clippy check (with --all-targets --all-features):**
+```
+$ flock /home/shiro/rantai/.locks/heavy.lock bash -c 'cd rust && export CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target && cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings'
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.44s
+(exit code 0, 0 warnings across all crates, targets, and features)
+```
+
+4. **Workspace full test run (BLOCKER 3):**
+Command:
+```
+sg docker -c "flock /home/shiro/rantai/.locks/heavy.lock bash -c 'cd /home/shiro/rantai/wt/rel-9/rust && export CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target CARGO_PROFILE_DEV_DEBUG=line-tables-only RUST_TEST_THREADS=2 && cargo test -j 4 --workspace --no-fail-fast'"
+```
+- Disk space checked right before run: 45 GB available (`df -h /`).
+- Removed `debug/incremental` under lock prior to run as instructed.
+- All workspace members and 86 integration test binaries built and compiled cleanly.
+- Test suites results:
+  - Clean passing suites (16 test suites): 763 passed, 0 failed, 9 ignored:
+    - `lakehouse_alerts (unittests src/lib.rs)`: ok (89 passed, 0 failed, 1 ignored)
+    - `lakehouse_alerts (tests/parity.rs)`: ok (0 passed, 0 failed, 2 ignored)
+    - `lakehouse_alerts (tests/sec11_guard.rs)`: ok (4 passed, 0 failed, 0 ignored)
+    - `lakehouse_auth (tests/openfga.rs)`: ok (7 passed, 0 failed, 0 ignored)
+    - `lakehouse_bi (unittests src/lib.rs)`: ok (425 passed, 0 failed, 3 ignored)
+    - `lakehouse_bi (tests/specs_match_typescript.rs)`: ok (1 passed, 0 failed, 0 ignored)
+    - `lakehouse_clickhouse (unittests src/lib.rs)`: ok (21 passed, 0 failed, 0 ignored)
+    - `lakehouse_core (unittests src/lib.rs)`: ok (47 passed, 0 failed, 0 ignored)
+    - `lakehouse_dagster (unittests src/lib.rs)`: ok (69 passed, 0 failed, 0 ignored)
+    - `lakehouse_embed (unittests src/lib.rs)`: ok (15 passed, 0 failed, 0 ignored)
+    - `lakehouse_embed (tests/cross_language.rs)`: ok (2 passed, 0 failed, 0 ignored)
+    - `lakehouse_iceberg (unittests src/lib.rs)`: ok (32 passed, 0 failed, 0 ignored)
+    - `lakehouse_iceberg (tests/g1_lakekeeper.rs)`: ok (0 passed, 0 failed, 3 ignored)
+    - `lakehouse_llm (unittests src/lib.rs)`: ok (26 passed, 0 failed, 0 ignored)
+    - `lakehouse_notify (unittests src/lib.rs)`: ok (17 passed, 0 failed, 0 ignored)
+    - `lakehouse_trino (unittests src/lib.rs)`: ok (8 passed, 0 failed, 0 ignored)
+  - Aborted suites (85 test suites): Every suite that depends on `lakehouse-test-support` aborted during `#[ctor]` initialization before tests ran with:
+    ```
+    lakehouse-test-support: failed to start the Postgres testcontainer (is Docker running and reachable?): failed to start a container: Docker responded with status code 409: container is marked for removal and cannot be started
+    ```
+    Cause: Existing dead container `clever_pike` (ID `d7ec29d2b66d`), created 2 days prior with label `org.rantai.lakehouse-test-support = postgres-16`, is in Docker state `Dead` (`RemovalInProgress: true`). Testcontainers attempts to reuse/start the labeled container, returning HTTP 409. Per developer rules ("Never remove any Docker container, image or volume"), this container was left untouched.
+    Concrete next step: run `docker rm -f d7ec29d2b66d` to remove the dead container so testcontainers can initialize a fresh Postgres container.
+
+#### 3. Every `expect(` from `git diff origin/main -- '*.rs'`
+Extracted verbatim from `git diff origin/main -- '*.rs'`:
+1. `rust/crates/lakehouse-api/src/routes/ai/mod.rs:426`:
+```rust
+#[expect(
+    clippy::result_large_err,
+    reason = "axum::response::Response is returned directly as early error responses"
+)]
+```
+2. `rust/crates/lakehouse-api/src/routes/layers_rewrite.rs:626`:
+```rust
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "LayerRunner trait defines async fn; test stub is synchronous"
+)]
+```
+3. `rust/crates/lakehouse-api/src/routes/pipelines.rs:2814`:
+```rust
+#[expect(
+    clippy::result_large_err,
+    reason = "axum::response::Response is returned directly as early error responses"
+)]
+```
+4. `rust/crates/lakehouse-api/src/routes/pipelines.rs:3714`:
+```rust
+#[expect(
+    clippy::result_large_err,
+    reason = "axum::response::Response is returned directly as early error responses"
+)]
+```
+5. `rust/crates/lakehouse-api/src/rustfs_client.rs:213`:
+```rust
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "SecretResolver trait defines async fn; test stub is synchronous"
+)]
+```
+6. `rust/crates/lakehouse-core/src/secret.rs:290`:
+```rust
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "SecretResolver trait defines async fn; implementation is synchronous"
+)]
+```
+7. `rust/crates/lakehouse-core/src/secret.rs:523`:
+```rust
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "SecretResolver trait defines async fn; implementation is synchronous"
+)]
+```
+*Note on deleted unfulfilled expectation:* `Recording::resolve` in `rust/crates/lakehouse-api/src/rustfs_client.rs` calls `.await` on its inner resolver. When tagged with `#[expect(clippy::unused_async_trait_impl)]`, `cargo clippy` reported `unfulfilled_lint_expectations`; the suppression was deleted per SHOULD-FIX 4.
+
+
 ## 9. Review
 
 Round 1, 2026-10-17, at `0d1fcba0` (planner). The bump itself (T2), the
