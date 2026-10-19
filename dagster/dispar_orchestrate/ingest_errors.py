@@ -6,9 +6,11 @@ one word of a CLOSED list (`ERROR_CLASSES`, the list `lakehouse-api` accepts
 in a run report: `rust/crates/lakehouse-store/src/connector_run.rs`) and says
 whether that word is retried:
 
-    retried (transient)   unreachable, timeout, source_busy, api_unreachable
-    not retried           sign_in_refused, address_refused, unsupported,
-                          setting_rejected, schema_decision_pending, other
+    retried (transient)   unreachable, timeout, source_busy, api_unreachable,
+                          rate_limited
+    not retried           sign_in_refused, permission_missing, address_refused,
+                          unsupported, setting_rejected,
+                          schema_decision_pending, other
 
 `other` is a failure nobody taught this module about. It is NOT retried: a
 retry of something unexplained only delays the failure alert, and the
@@ -85,8 +87,12 @@ UNSUPPORTED = "unsupported"
 SETTING_REJECTED = "setting_rejected"
 SCHEMA_DECISION_PENDING = "schema_decision_pending"
 OTHER = "other"
+# SRC-3 (migration 0097, slice 1 review BLOCKER 1): a business app limited the
+# rate (retried like `source_busy`), or the account lacks a permission there.
+PERMISSION_MISSING = "permission_missing"
+RATE_LIMITED = "rate_limited"
 
-RETRIED_CLASSES = frozenset({UNREACHABLE, TIMEOUT, SOURCE_BUSY, API_UNREACHABLE})
+RETRIED_CLASSES = frozenset({UNREACHABLE, TIMEOUT, SOURCE_BUSY, API_UNREACHABLE, RATE_LIMITED})
 ERROR_CLASSES = RETRIED_CLASSES | {
     SIGN_IN_REFUSED,
     ADDRESS_REFUSED,
@@ -94,6 +100,7 @@ ERROR_CLASSES = RETRIED_CLASSES | {
     SETTING_REJECTED,
     SCHEMA_DECISION_PENDING,
     OTHER,
+    PERMISSION_MISSING,
 }
 
 # The fixed phrase for each class, for a Dagster `Failure` description. The
@@ -110,6 +117,8 @@ CLASS_PHRASES = {
     SETTING_REJECTED: "a connector setting was rejected",
     SCHEMA_DECISION_PENDING: "the table waits for a schema decision",
     OTHER: "the load failed",
+    PERMISSION_MISSING: "the account lacks a permission at the source",
+    RATE_LIMITED: "the source limited the rate of requests",
 }
 
 
@@ -421,17 +430,17 @@ def _classify_one(exc: BaseException) -> str | None:
     # connector page offers Sign in.
     if isinstance(exc, rest_adapter.OAuthSignInRefused):
         return SIGN_IN_REFUSED
-    # SRC-3 (business-app vendors). The run-report classes are a CLOSED list the
-    # API and a database CHECK enforce, and `permission_missing` and
-    # `rate_limited` are not in it (plan T1.9 assumed they could be added; that
-    # needs a migration, see the slice 1 handoff). Until the planner decides:
-    # a refused credential and a missing permission are both "sign_in_refused"
-    # (not retried; both need a person at the vendor), and a rate limit that
-    # outlasted the bounded waits is "source_busy" (retried by the run's policy).
-    if isinstance(exc, (saas_session.SaasSignInRefused, saas_session.SaasPermissionMissing)):
+    # SRC-3 (business-app vendors), slice 1 review BLOCKER 1: each failure has
+    # its own word, so the run says "the vendor limited the rate" and "the
+    # account lacks a permission", not "busy" and "sign-in refused" (decision
+    # 13, page item 7). Migration 0097 and `connector_run::ErrorClass` carry the
+    # same two words. A refused credential stays `sign_in_refused`.
+    if isinstance(exc, saas_session.SaasSignInRefused):
         return SIGN_IN_REFUSED
+    if isinstance(exc, saas_session.SaasPermissionMissing):
+        return PERMISSION_MISSING
     if isinstance(exc, saas_session.SaasRateLimited):
-        return SOURCE_BUSY
+        return RATE_LIMITED
     if isinstance(
         exc,
         (

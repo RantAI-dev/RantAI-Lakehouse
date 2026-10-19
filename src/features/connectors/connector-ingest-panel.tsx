@@ -1236,10 +1236,12 @@ const ERROR_CLASS_LABEL: Record<string, string> = {
   setting_rejected: "A setting was rejected",
   schema_decision_pending: "The table is waiting for a schema decision",
   other: "Failed for another reason",
+  permission_missing: "The account lacks a permission at the source",
+  rate_limited: "The source limited the rate of requests",
 }
 
 /** The retried classes, for the word beside them; the others fail at once. */
-const RETRIED_CLASSES = new Set(["unreachable", "timeout", "source_busy", "api_unreachable"])
+const RETRIED_CLASSES = new Set(["unreachable", "timeout", "source_busy", "api_unreachable", "rate_limited"])
 
 const EVENT_LABEL: Record<string, string> = {
   run_started: "Run started",

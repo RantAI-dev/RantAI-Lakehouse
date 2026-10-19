@@ -1068,6 +1068,22 @@ describe("ConnectorIngestPanel run log", () => {
     expect(calls.some((c) => c.url.endsWith("/runs/run-log-000001/log"))).toBe(true)
   })
 
+  it("words the two business-app classes (SRC-3, migration 0097) and says a rate limit used its retries", async () => {
+    const log = {
+      ...LOG,
+      attempts: [
+        { table: "tickets", attempt: 1, startedAt: "2026-10-12T08:00:01.000Z", endedAt: "2026-10-12T08:00:02.000Z", rowsLoaded: 0, result: "failed", errorClass: "rate_limited", waitSeconds: null },
+        { table: "owners", attempt: 1, startedAt: "2026-10-12T08:01:05.000Z", endedAt: "2026-10-12T08:01:06.000Z", rowsLoaded: 0, result: "failed", errorClass: "permission_missing", waitSeconds: null },
+      ],
+    }
+    stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": log } })
+    panel()
+    fireEvent.click(await screen.findByRole("button", { name: "Show log" }))
+    // A rate limit is retried, so with no wait left it says the retries are used up; a missing permission is not.
+    expect(await screen.findByText("The source limited the rate of requests. Retries are used up.")).toBeDefined()
+    expect(screen.getByText("The account lacks a permission at the source")).toBeDefined()
+  })
+
   it("downloads the same log as text from the same route with ?format=text", async () => {
     const calls = stubFetch(SPEC, { runs: [LOG.run], logs: { "run-log-000001": LOG } })
     const created: Blob[] = []

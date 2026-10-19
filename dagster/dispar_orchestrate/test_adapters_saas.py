@@ -185,14 +185,15 @@ def test_an_integration_credential_the_vendor_does_not_have_is_a_rejected_settin
     assert ingest_errors.classify(raised.value).error_class == ingest_errors.SETTING_REJECTED
 
 
-def test_the_saas_failures_are_classified_without_new_classes() -> None:
+def test_each_saas_failure_has_its_own_class_and_only_the_rate_limit_is_retried() -> None:
     sign_in = ingest_errors.classify(saas_session.SaasSignInRefused())
-    assert (sign_in.error_class, sign_in.retried) == (ingest_errors.SIGN_IN_REFUSED, False)
+    assert (sign_in.error_class, sign_in.retried) == ("sign_in_refused", False)
     permission = ingest_errors.classify(saas_session.SaasPermissionMissing())
-    assert (permission.error_class, permission.retried) == (ingest_errors.SIGN_IN_REFUSED, False)
+    assert (permission.error_class, permission.retried) == ("permission_missing", False)
     assert ingest_errors.is_permission_refusal(saas_session.SaasPermissionMissing())
     limited = ingest_errors.classify(saas_session.SaasRateLimited())
-    assert (limited.error_class, limited.retried) == (ingest_errors.SOURCE_BUSY, True)
+    assert (limited.error_class, limited.retried) == ("rate_limited", True)
+    assert ingest_errors.CLASS_PHRASES["rate_limited"] == "the source limited the rate of requests"
     assert "limited the rate" in str(saas_session.SaasRateLimited())
 
 

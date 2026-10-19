@@ -79,7 +79,7 @@ class SaasPermissionMissing(Exception):
 
 class SaasRateLimited(Exception):
     """The vendor limited the rate and still did after the bounded waits
-    (decision 13). Retried by the run's own retry policy as `source_busy`."""
+    (decision 13). Classified `rate_limited` (`ingest_errors`), which the run retries."""
 
     def __init__(self) -> None:
         super().__init__("the vendor limited the rate of requests")

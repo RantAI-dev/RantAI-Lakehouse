@@ -957,6 +957,8 @@ export type AttemptErrorClass =
   | "setting_rejected"
   | "schema_decision_pending"
   | "other"
+  | "permission_missing"
+  | "rate_limited"
   | string
 
 /** One attempt at one table of a run. */
