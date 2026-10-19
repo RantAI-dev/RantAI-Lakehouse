@@ -970,6 +970,7 @@ async fn list_s3(
                 meta.last_modified
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ),
+            load: None,
         });
     }
     Ok(Listing { objects, truncated })

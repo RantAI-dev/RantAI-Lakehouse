@@ -267,6 +267,21 @@ async fn a_result_past_a_bound_or_with_a_bad_string_is_refused(pool: PgPool) -> 
             }],
             truncated: false,
         },
+        // SRC-3: a load description is short text without control characters.
+        Listing {
+            objects: vec![ListedObject {
+                load: Some("re-read in full: a\nb".to_owned()),
+                ..ListedObject::named("tickets", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
+        Listing {
+            objects: vec![ListedObject {
+                load: Some("x".repeat(201)),
+                ..ListedObject::named("tickets", ObjectKind::Object)
+            }],
+            truncated: false,
+        },
     ];
     for bad in bad_sets {
         let err = finish(&pool, PG, Kind::List, "req-1", &Outcome::Listing(bad), t0)

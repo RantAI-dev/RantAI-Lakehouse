@@ -23,6 +23,8 @@
 //! { "kind": "list", "state": "done", "scope": "public",
 //!   "objects": [ { "name": "public.orders", "kind": "table",
 //!                  "size": 1024, "modifiedAt": "2026-10-15T09:00:00Z" } ],
+//!   (a business-app object also has "load": "incremental", or
+//!    "re-read in full: <reason>"; `SRC-3` decision 6)
 //!   "truncated": false }
 //! { "kind": "preview", "state": "done", "object": "public.orders",
 //!   "columns": [ { "name": "id", "typeName": "integer", "inferred": false } ],
@@ -85,6 +87,9 @@ pub const MAX_NAME_CHARS: usize = 256;
 
 /// The longest type name accepted, in characters.
 pub const MAX_TYPE_CHARS: usize = 128;
+
+/// The longest load description of a listed object, in characters.
+pub const MAX_LOAD_CHARS: usize = 200;
 
 /// How long a `running` request is believed. The orchestrator's job takes
 /// seconds; past this the row is shown as a timeout.
@@ -255,6 +260,9 @@ pub enum ObjectKind {
     Topic,
     /// A `MongoDB` collection.
     Collection,
+    /// An object of a business-app (`saas`) vendor: a Salesforce object, a
+    /// Zendesk resource, a Dataverse table (`SRC-3`).
+    Object,
 }
 
 /// One listed object. `name` is what a source object's `name` is in the ingest
@@ -273,6 +281,12 @@ pub struct ListedObject {
     /// When it last changed, RFC 3339, for a file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<String>,
+    /// How a business-app object loads (`SRC-3` decision 6): `incremental`, or
+    /// `re-read in full: <reason>`. Fixed text from the vendor module's own
+    /// declaration (`saas/objects.py`), never the vendor's words; only a `saas`
+    /// listing carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
 }
 
 impl ListedObject {
@@ -284,6 +298,7 @@ impl ListedObject {
             kind,
             size: None,
             modified_at: None,
+            load: None,
         }
     }
 }
@@ -377,6 +392,9 @@ impl Listing {
                 return Err(StoreError::Validation(
                     "an object size must not be negative".to_owned(),
                 ));
+            }
+            if let Some(load) = object.load.as_deref() {
+                check_name("a load description", load, MAX_LOAD_CHARS)?;
             }
             if object
                 .modified_at
