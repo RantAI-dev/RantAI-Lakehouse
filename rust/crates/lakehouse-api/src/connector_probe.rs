@@ -27,6 +27,9 @@
 //! only for a pre-WS3 row with no adapter — see [`probe`]'s doc comment for
 //! the `adapter`-first-then-legacy-`kind` dispatch rule.
 //!
+//! A `saas` adapter (`SRC-3`, the business-app vendors) is tested by the
+//! child module `saas`: one `GET` of the vendor's "who am I" request.
+//!
 //! A `sheets` adapter is registered (`connector_type`, `0035`) but ships
 //! **`supported: false` unconditionally** — see [`probe_sheets`]'s doc
 //! comment for why (no verified Google service-account token exchange
@@ -143,6 +146,8 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::connector_oauth::{self, OAuthSettings, TokenFailure};
 use crate::internal_hosts::InternalHosts;
+
+mod saas;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
 /// to be a "few seconds" per the task brief — long enough that a healthy
@@ -297,6 +302,9 @@ pub async fn probe_with(
         }
         Some("rest") => probe_rest_info(info, resolver, internal_hosts, oauth).await,
         Some("sheets") => probe_sheets(),
+        // `SRC-3` T1.4: the vendor's own "who am I" request, at an address the
+        // vendor table builds from the connector's account.
+        Some("saas") => saas::probe_saas_info(info, resolver, internal_hosts, oauth).await,
         // SRC-6 F4: these connect only from the orchestrator. Explicit arms,
         // so the answer does not depend on falling through to the `kind`
         // dispatch, whose label for an adapter row is free-form.

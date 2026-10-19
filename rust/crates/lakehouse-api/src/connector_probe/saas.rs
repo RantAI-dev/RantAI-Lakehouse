@@ -1,0 +1,597 @@
+//! The connection test of a `saas` connector (`SRC-3` T1.4, plan AD2, AD8).
+//!
+//! One bounded `GET` of the vendor's "who am I" request
+//! (`SaasVendor::whoami`), at an address the vendor table builds from the
+//! connector's `account`. The same rules as the `rest` test:
+//!
+//! - the address is checked ([`resolve_checked`]) and pinned
+//!   ([`pinned_http_client`]) BEFORE any credential is resolved, so a
+//!   refused address makes no call to the secret store;
+//! - redirects are reported, never followed, and the system proxy is not used;
+//! - every message is fixed text built from the vendor's label and the status
+//!   class; nothing the vendor said is echoed (`AGENTS.md` principle 4).
+//!
+//! # What this slice tests
+//!
+//! A browser sign-in (refresh token, then an access token from the vendor's
+//! token endpoint) and an integration credential that is a single token. An
+//! integration credential of another shape (a pair, a key file) answers
+//! `supported: false` with a reason until its vendor's own task teaches this
+//! module the vendor's scheme (plan Vn.3): "unsupported, honestly".
+
+use std::time::Instant;
+
+use lakehouse_core::secret::{DynSecretResolver, SecretValue};
+use lakehouse_store::connectors::ConnectorDialInfo;
+use lakehouse_store::ingest_spec::{Dial, SaasAuth};
+use lakehouse_store::saas_vendors::{self, ClientAuth, SaasVendor};
+
+use super::{
+    DIAL_TIMEOUT, Outcome, classify_reqwest_error, parse_endpoint_host_port, pinned_http_client,
+    resolve_checked, token_failure_outcome,
+};
+use crate::connector_oauth::{self, OAuthSettings};
+use crate::internal_hosts::InternalHosts;
+
+/// What one test asks: the vendor, the account as the person typed it, the
+/// request address and the token address (both built from the vendor table),
+/// and how the connector signs in.
+struct Request<'a> {
+    vendor: &'static SaasVendor,
+    account: &'a str,
+    url: String,
+    token_url: String,
+    auth: &'a SaasAuth,
+}
+
+/// The connector's credential references and the resolver that reads them.
+struct Secrets<'a> {
+    primary: &'a str,
+    secondary: Option<&'a str>,
+    resolver: &'a dyn DynSecretResolver,
+}
+
+/// Parses `info.dial` as a `saas` dial, builds the addresses from the vendor
+/// table and runs the test.
+pub(super) async fn probe_saas_info(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Outcome {
+    let dial = match Dial::parse("saas", &info.dial) {
+        Ok(Dial::Saas(dial)) => dial,
+        Ok(_) => {
+            return Outcome::misconfigured(
+                "connector is misconfigured: its dial does not match its own adapter \"saas\"",
+            );
+        }
+        Err(err) => return Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
+    };
+    let Some(vendor) = saas_vendors::vendor(&dial.vendor) else {
+        return Outcome::misconfigured("connector is misconfigured: its vendor is not offered");
+    };
+    let Ok(parts) = vendor.validate_account(&dial.account) else {
+        return Outcome::misconfigured("connector is misconfigured: its account is not valid");
+    };
+    let Some(whoami) = vendor.whoami else {
+        return Outcome::not_testable_with(format!(
+            "{} has no generic connection test in this build. A load reports whether the \
+             connection worked.",
+            vendor.label
+        ));
+    };
+    let request = Request {
+        vendor,
+        account: &dial.account,
+        url: SaasVendor::render(&format!("{}{}", vendor.api_base, whoami.path), &parts),
+        token_url: SaasVendor::render(vendor.oauth.token_url, &parts),
+        auth: &dial.auth,
+    };
+    let secrets = Secrets {
+        primary: &info.secret_ref,
+        secondary: info.secret_ref_secondary.as_deref(),
+        resolver,
+    };
+    probe_saas_at(&request, &secrets, internal_hosts, oauth).await
+}
+
+/// The access token for one test, and the refresh token a rotating vendor
+/// issued while it was obtained.
+struct Access {
+    token: SecretValue,
+    rotated: Option<SecretValue>,
+}
+
+/// Resolve one credential reference, or the outcome that ends the test.
+async fn resolve(
+    resolver: &dyn DynSecretResolver,
+    reference: &str,
+) -> Result<SecretValue, Outcome> {
+    resolver.resolve_dyn(reference).await.map_err(|err| {
+        Outcome::misconfigured(format!(
+            "could not resolve the connector's credential: {err}"
+        ))
+    })
+}
+
+/// Resolve the credential and obtain an access token, or the outcome that
+/// ends the test instead.
+async fn access_token(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    match request.auth {
+        SaasAuth::Oauth2AuthorizationCode { client_id } => {
+            if request.vendor.oauth.client_auth == ClientAuth::Basic {
+                // `SRC-3` T1.5 adds the token request with the client's
+                // credentials in an `Authorization: Basic` header; until then
+                // this vendor's sign-in cannot be tested from here.
+                return Err(Outcome::not_testable_with(format!(
+                    "This build cannot test {}'s sign-in from the console yet.",
+                    request.vendor.label
+                )));
+            }
+            let client_secret = resolve(secrets.resolver, secrets.primary).await?;
+            // No refresh token means nobody has signed in: nothing is wrong
+            // with the connector, so this is `supported: false` with the
+            // reason, never a failure that would stop the client secret being
+            // saved before the first sign-in (as for `rest`, `SRC-12`).
+            let refresh_token = match secrets.secondary {
+                Some(secondary) => secrets.resolver.resolve_dyn(secondary).await.ok(),
+                None => None,
+            };
+            let Some(refresh_token) = refresh_token else {
+                return Err(Outcome::not_testable_with(
+                    "Nobody has signed in to this connector yet, so the connection cannot be \
+                     tested. Use Sign in on the connector page, then test again.",
+                ));
+            };
+            let started = Instant::now();
+            let tokens = connector_oauth::token_request(
+                &request.token_url,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.expose_secret()),
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+            .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+            Ok(Access {
+                token: tokens.access_token,
+                rotated: tokens.refresh_token,
+            })
+        }
+        SaasAuth::Integration => {
+            let fields = request
+                .vendor
+                .integration
+                .map_or(&[][..], |integration| integration.secret_fields);
+            if fields != ["token"] {
+                return Err(Outcome::not_testable_with(format!(
+                    "This build cannot test {}'s integration credential from the console yet. \
+                     A load reports whether the connection worked.",
+                    request.vendor.label
+                )));
+            }
+            Ok(Access {
+                token: resolve(secrets.resolver, secrets.primary).await?,
+                rotated: None,
+            })
+        }
+    }
+}
+
+/// The fixed sentence for a status the vendor answered with.
+fn rejected(label: &str, status: u16) -> String {
+    match status {
+        401 => format!("{label} refused the sign-in. Sign in again or check the credential."),
+        403 => format!(
+            "{label} accepted the sign-in but the account lacks a permission the connector needs."
+        ),
+        429 => format!("{label} limited the rate of requests. Try again later."),
+        other => format!("{label} request rejected: HTTP {other}"),
+    }
+}
+
+/// Run the test for `request`. Split from [`probe_saas_info`] so a test can
+/// point the vendor's address at a local server.
+async fn probe_saas_at(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Outcome {
+    let label = request.vendor.label;
+    let Some((host, port)) = parse_endpoint_host_port(&request.url) else {
+        return Outcome::misconfigured("connector is misconfigured: its address is not valid");
+    };
+    let approved = match resolve_checked(host, port, internal_hosts).await {
+        Ok(approved) => approved,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    let client = match pinned_http_client(&request.url, host, port, &approved) {
+        Ok(client) => client,
+        Err(message) => return Outcome::misconfigured(message),
+    };
+    // Only now are credentials read (AGENTS.md, `SEC-15`).
+    let access = match access_token(request, secrets, internal_hosts, oauth).await {
+        Ok(access) => access,
+        Err(outcome) => return outcome,
+    };
+    let started = Instant::now();
+    let attempt = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        client
+            .get(&request.url)
+            .bearer_auth(access.token.expose_secret())
+            .send(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let mut outcome = match attempt {
+        // A redirect is reported, never followed; the `Location` is the
+        // vendor's text and may name an address.
+        Ok(Ok(response)) if response.status().is_redirection() => Outcome::failure(
+            elapsed,
+            format!(
+                "{label} answered with a redirect (HTTP {}); connection tests do not follow \
+                 redirects",
+                response.status().as_u16()
+            ),
+        ),
+        Ok(Ok(response)) if response.status().is_success() => Outcome::success(
+            elapsed,
+            format!("Connected to {label} account {}.", request.account),
+        ),
+        Ok(Ok(response)) => Outcome::failure(elapsed, rejected(label, response.status().as_u16())),
+        Ok(Err(err)) => Outcome::failure(
+            elapsed,
+            format!("{label} request failed: {}", classify_reqwest_error(&err)),
+        ),
+        Err(_) => Outcome::failure(
+            elapsed,
+            format!(
+                "{label} request timed out after {}s",
+                DIAL_TIMEOUT.as_secs()
+            ),
+        ),
+    };
+    // A vendor that rotated the refresh token has retired the old one:
+    // hand the new one back whatever the request answered.
+    outcome.rotated_refresh_token = access.rotated;
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_core::secret::EnvSecretResolver;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// A resolver that panics when asked for anything: proves an address
+    /// refusal happens before any credential is read.
+    #[derive(Debug)]
+    struct PanicIfCalledResolver;
+
+    #[async_trait::async_trait]
+    impl DynSecretResolver for PanicIfCalledResolver {
+        async fn resolve_dyn(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<SecretValue, lakehouse_core::secret::SecretError> {
+            panic!("a credential was resolved before the address was approved");
+        }
+    }
+
+    fn resolver() -> EnvSecretResolver {
+        let mut map = HashMap::new();
+        map.insert("SAAS_TEST_TOKEN".to_owned(), "token-value".to_owned());
+        map.insert("SAAS_TEST_SECRET".to_owned(), "client-secret".to_owned());
+        EnvSecretResolver::with_map(map)
+    }
+
+    fn request<'a>(
+        vendor: &str,
+        url: String,
+        token_url: String,
+        auth: &'a SaasAuth,
+    ) -> Request<'a> {
+        Request {
+            vendor: saas_vendors::vendor(vendor).unwrap(),
+            account: "acme",
+            url,
+            token_url,
+            auth,
+        }
+    }
+
+    async fn answer(status: u16) -> (MockServer, Outcome) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer token-value"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let resolver = resolver();
+        let auth = SaasAuth::Integration;
+        // HubSpot's integration credential is one token.
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_TOKEN",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        (server, outcome)
+    }
+
+    #[tokio::test]
+    async fn a_200_is_a_success_that_names_the_vendor_and_account() {
+        let (_server, outcome) = answer(200).await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(outcome.latency_ms.is_some());
+        assert_eq!(outcome.message, "Connected to HubSpot account acme.");
+    }
+
+    #[tokio::test]
+    async fn a_401_a_403_and_a_429_are_each_their_own_fixed_sentence() {
+        for (status, needle) in [
+            (401, "refused the sign-in"),
+            (403, "lacks a permission"),
+            (429, "limited the rate"),
+            (500, "HTTP 500"),
+        ] {
+            let (_server, outcome) = answer(status).await;
+            assert!(!outcome.ok && outcome.supported, "{status}");
+            assert!(
+                outcome.message.contains(needle),
+                "{status}: {}",
+                outcome.message
+            );
+            assert!(
+                !outcome.message.contains("vendor secret text"),
+                "the vendor's body must not be echoed: {}",
+                outcome.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_reported_and_never_followed() {
+        let target = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/internal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let resolver = resolver();
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                format!("{}/who", origin.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_TOKEN",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && outcome.supported);
+        assert!(outcome.message.contains("redirect"), "{}", outcome.message);
+        assert!(
+            !outcome
+                .message
+                .contains(&target.address().port().to_string()),
+            "{}",
+            outcome.message
+        );
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_internal_address_is_refused_before_any_credential_is_read() {
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "hubspot",
+                "http://127.0.0.1:9/who".to_owned(),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:UNUSED",
+                secondary: None,
+                resolver: &PanicIfCalledResolver,
+            },
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_connector_nobody_has_signed_in_to_is_not_testable_not_failed() {
+        let server = MockServer::start().await;
+        let resolver = resolver();
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_SECRET",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.message.contains("Nobody has signed in"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_token_is_exchanged_and_its_replacement_handed_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(
+            outcome.rotated_refresh_token.unwrap().expose_secret(),
+            "refresh-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_integration_credential_that_is_not_one_token_is_not_testable_yet() {
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                "http://127.0.0.1:9/who".to_owned(),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:UNUSED",
+                secondary: None,
+                resolver: &PanicIfCalledResolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.message.contains("integration credential"));
+    }
+
+    #[tokio::test]
+    async fn a_vendor_without_a_who_am_i_request_is_not_testable_and_reads_no_secret() {
+        let info = ConnectorDialInfo {
+            kind: "Workday Reports".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "workday",
+                "account": "wd2.workday.com/acme",
+                "auth": {"type": "integration"}
+            }),
+        };
+        let outcome = probe_saas_info(
+            &info,
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dial_the_table_refuses_is_misconfigured_not_dialled() {
+        let info = ConnectorDialInfo {
+            kind: "Zendesk".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "zendesk",
+                "account": "evil.example.invalid",
+                "auth": {"type": "integration"}
+            }),
+        };
+        let outcome = probe_saas_info(
+            &info,
+            &PanicIfCalledResolver,
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+    }
+}
