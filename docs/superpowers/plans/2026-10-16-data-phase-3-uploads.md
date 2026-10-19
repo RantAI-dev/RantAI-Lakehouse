@@ -532,3 +532,38 @@ No `BLOCKER`.
 4. **`UPLOAD_SESSION_TTL_HOURS` passthrough** in `docker-compose.yml` (`${UPLOAD_SESSION_TTL_HOURS:-}`, with a comment) and `.env.example` (no value). The g9 CI job's `compose up` proves it (rule 8).
 
 **Noted:** the one combined run with 6 failures did not recur in the reviewer's runs. Watch for it in CI.
+
+### Slice 2, round 1 (planner/reviewer, Claude Opus), at `4d4431ba`, 2026-10-19
+
+**Re-run by the reviewer:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -j 4 -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-store --test uploads` | 52 passed |
+| `cargo test -p lakehouse-api --lib -- upload_` | 144 passed, 1 ignored |
+| `cargo test -p lakehouse-api --test upload_routes -- --test-threads=2` | 110 passed |
+| `cargo test -p lakehouse-api --test route_auth` | 44 passed |
+| `pytest test_file_ingest.py test_parquet_ingest.py test_authored_factory.py` (the `DATA-19` sensor included) | 342 passed, 1 skipped |
+| `ops/lint` (both scripts) | OK |
+| `pytest ops/g9/test_large_upload.py` | 5 passed |
+
+**Reading:**
+
+- The four slice-1 `SHOULD-FIX` items are done, each cited at its fix site.
+- The run config replaces `storage_key` with `storage_keys` and adds `format`. `bronze_table_name` stays where the `DATA-19` sensor reads it, and its tests pass.
+- The Parquet preview bounds the footer length, the chunk offsets and the row-group sizes before it reads them.
+- The `pyarrow==25.0.1` pin is accepted. The job now imports it directly, and the comment says why. AD8 is amended in spirit: one more named dependency. The PR's dependency checks must stay green.
+- The separate `g9-upload-large.yml` workflow is accepted, with the developer's reason (on a manual run `ci.yml`'s change detector has nothing to compare).
+
+No `BLOCKER` and no `SHOULD-FIX`.
+
+**Not verified, carried to CI and slice 6:**
+
+- A real Iceberg write through the streamed and Parquet paths (the `g9-upload` job, after the push).
+- The 200 MB harness run against a stack (the first manual dispatch of `g9-upload-large`).
+- The full workspace `cargo test` and the whole Dagster suite.
+
+**Noted:** the session cap can overshoot by one under two simultaneous requests. This is accepted: the cap guards against abuse, not exact accounting.
+
