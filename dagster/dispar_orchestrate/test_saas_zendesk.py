@@ -196,6 +196,40 @@ def test_a_429_with_retry_after_is_waited_out(api: Zendesk) -> None:
     assert slept == [7.0]
 
 
+def test_the_vendor_row_is_what_zendesks_documentation_says() -> None:
+    """V-Zendesk.3, review item 5: each fact below was read in Zendesk's documentation on
+    2026-10-19 (see the module doc of `saas/vendors/zendesk.py` for the pages)."""
+    row = vendors.vendor("zendesk")
+    assert row.oauth["authorizeUrl"] == "https://{account}.zendesk.com/oauth/authorizations/new"
+    assert row.oauth["tokenUrl"] == "https://{account}.zendesk.com/oauth/tokens"
+    assert row.oauth["scopes"] == ["read"], "read: all GET endpoints, the incremental exports included"
+    assert row.oauth["revocationUrl"] is None, "Zendesk revokes with DELETE /api/v2/oauth/tokens/{id}, not RFC 7009"
+    assert row.whoami == {"method": "GET", "path": "/api/v2/users/me.json"}
+    assert row.integration == {"secretKey": "integration:zendesk", "secretFields": ["email", "apiToken"]}
+    assert row.api_url(row.validate_account("Acme")) == "https://acme.zendesk.com", "a sub-domain, never a host a person types"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Zendesk's POST /oauth/tokens must be JSON; SRC-12's token request is form-encoded (plan section 11, slice 2 handoff)",
+)
+def test_the_browser_sign_in_sends_zendesks_token_request_as_json(api: Zendesk, monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict] = []
+
+    def token(url: str, **kw: Any) -> Reply:
+        sent.append({"url": url, **kw})
+        return Reply(200, {"access_token": "a", "refresh_token": "r2", "expires_in": 1800})
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", token)
+    dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "app"}}
+    module, _v, parts, session = saas_adapter.open_session(
+        dial, {"clientSecret": "s", "refreshToken": "r"}, resolve_checked=resolver, http_get=api.get, sleep=lambda _s: None
+    )
+    api.groups = [{"id": 1}]
+    list(module.read(session, parts, dial, module.declaration(session, parts, dial, "groups"), since=None))
+    assert "json" in sent[0] and "data" not in sent[0]
+
+
 # ---- the whole path: adapter, dlt incremental, merge on the key, real Iceberg -------------------
 
 

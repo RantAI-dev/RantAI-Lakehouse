@@ -31,6 +31,26 @@ Incremental exports are limited to 10 requests a minute (30 with the High Volume
 add-on) and Zendesk answers 429 with `Retry-After` (developer.zendesk.com, rate
 limits); `SaasSession` waits that out within its bound (decision 13).
 
+# Sign-in (decision 3), checked against Zendesk's documentation on 2026-10-19
+
+* **Email + API token** (built): HTTP Basic with `<email>/token` as the user name
+  and the token as the password
+  (https://developer.zendesk.com/api-reference/introduction/security-and-auth/;
+  Zendesk marks API tokens "deprecated" there in favour of OAuth, which is why the
+  browser sign-in matters).
+* **Browser sign-in** (NOT BUILT, mismatch reported in plan section 11, "Handoff:
+  slice 2"): the table row's addresses and scope are right
+  (`/oauth/authorizations/new` with PKCE, scope `read`, refresh tokens that rotate:
+  https://support.zendesk.com/hc/en-us/articles/4408845965210 and
+  https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/),
+  but `POST /oauth/tokens` "must be formatted as JSON" and `SRC-12`'s token request
+  (Rust `connector_oauth::token_request`, the probe, and `rest._token_request`) is
+  form-encoded, which the table's `clientAuth` cannot express. A third client
+  authentication method (`post_json`) is needed in Rust, Python, the fixture and the
+  console. `test_saas_zendesk.py` has a strict `xfail` that turns red when it is.
+* Revocation is `DELETE /api/v2/oauth/tokens/{id}`, not RFC 7009, so the table's
+  revocation address stays empty.
+
 # Schema changes (decision 9)
 
 Zendesk does not describe its fields before a read (the decision lists the vendors that
