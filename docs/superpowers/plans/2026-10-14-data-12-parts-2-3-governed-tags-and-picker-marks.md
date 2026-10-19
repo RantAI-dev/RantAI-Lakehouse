@@ -82,7 +82,8 @@ rename. Code comments that say "`0062`" (`connector_type.rs:11`, its tests)
 refer to main's migration and stay correct.
 
 **Record fix, needed only where asset_certification was already applied as
-version 62** — known instance: the product owner's QA instance (`:18082`, not
+version 62** — <!-- PR #106 review R1 SHOULD-FIX repo 5 -->
+known instance: the product owner's QA instance (`<masked-port>`, not
 running at the time of writing). Run this once on its Postgres **before**
 starting the API on the new head; the content did not change, so the recorded
 checksum stays valid, and main's `0062` then applies fresh on next start:
