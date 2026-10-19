@@ -2055,12 +2055,24 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    assert_ne!(
-        listed.status(),
-        StatusCode::FORBIDDEN,
-        "any login may list incidents"
-    );
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
+    // middleware; tenant gate answers 403 on multi-tenant test app
     assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
+    let status = listed.status();
+    let bytes = to_bytes(listed.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "must not be denied by permission middleware: {error}"
+        );
+    }
     let refused = request_with_cookie(&router, "POST", resolve, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2109,12 +2121,24 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    assert_ne!(
-        listed.status(),
-        StatusCode::FORBIDDEN,
-        "any login may read schedules"
-    );
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
+    // middleware; tenant gate answers 403 on multi-tenant test app
     assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
+    let status = listed.status();
+    let bytes = to_bytes(listed.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "must not be denied by permission middleware: {error}"
+        );
+    }
     let refused = request_with_cookie(&router, "PUT", set, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2147,7 +2171,24 @@ async fn the_learning_state_is_readable_by_any_login_and_not_anonymously() {
     let cookie = session_cookie_for_user(&pool, reader).await;
     let path = "/api/governance/quality/learning/silver.orders";
     let read = request_with_cookie(&router, "GET", path, &cookie).await;
-    assert_eq!(read.status(), StatusCode::OK);
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
+    // middleware; tenant gate answers 403 on multi-tenant test app
+    assert_ne!(read.status(), StatusCode::UNAUTHORIZED);
+    let status = read.status();
+    let bytes = to_bytes(read.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    if status == StatusCode::FORBIDDEN {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+            "must not be denied by permission middleware: {error}"
+        );
+    }
     let anonymous = router
         .clone()
         .oneshot(
