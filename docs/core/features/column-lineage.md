@@ -1,19 +1,20 @@
 # Column-level lineage
 
+<!-- PR #106 review R1 SHOULD-FIX DATA-13 5 -->
 | | |
 | --- | --- |
 | Module | Data |
 | Backlog | `DATA-13` |
 | Spec | `docs/core/specs/data-13.md` |
 | Kind | Feature |
-| Status | Decisions **signed by the product owner (2026-10-15, all)** — plan is next |
+| Status | In review (Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
-| Started | Not yet |
+| Started | 2026-10-14 |
 | Shipped | Not yet |
 | Evidence | The Phase 2 pull request (#106) |
-| Plan | Not yet written; follows the signature |
+| Plan | `docs/superpowers/plans/2026-10-16-data-13-column-lineage.md` |
 
 ## Problem
 
@@ -53,6 +54,15 @@ reported, not quietly lowered.
 - A mapping marked partial covers only what was mapped; the reason is shown.
 - Mappings older than 1 year are gone.
 
+## Spec rows
+
+| Spec row | Status |
+| --- | --- |
+| Column mappings recorded for every pipeline, Gold build and saved SQL source | **Partly met.** Built for all three producers. Rows are written from now on: a pipeline gets rows at its next successful run, a SQL source when next saved (no backfill), builds on the next tick (first pass looks back 180 days, 200 statements per tick). A pipeline run only records if the orchestrator's sensor reports it. Whatever the parser cannot prove is stored partial with a reason; a statement that cannot be read at all clears its producer's rows and logs. |
+| View: column lineage on the Lineage tab, up and down | **Met** (code and component tests; not seen in a browser). |
+| Impact: from a source column, every downstream column, chart and dashboard | **Partly met.** Downstream columns and saved charts (matched on mart or SQL source plus any column the chart definition names) with their dashboards, for `dashboard:read`. Not covered: the built-in default dashboard's tiles, and legacy charts saved without a `def`. |
+| Retention 1 year | **Met in code**: purge on the 15-minute tick, and the answer states `days: 365` and the oldest visible record. Purge not run. |
+
 ## Acceptance checklist
 
 Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
@@ -61,9 +71,9 @@ A step not performed is never Pass. Rows follow the spec's three.
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | `DATA-13-AC1` | Open a Gold column's lineage. | It names the Bronze source columns, from persisted mappings of the run that built it. | Not run: no pipeline run, build or SQL-source save on the QA instance since the release, so no mappings exist yet; the `g7` gate step proves Silver columns map back to Bronze in CI |
-| `DATA-13-AC2` | Open a Bronze column's downstream impact. | It lists downstream columns and, chart by chart, the dashboards that read them. | Not run: as AC1 |
+| `DATA-13-AC2` | Open a Bronze column's downstream impact. | It lists downstream columns and, chart by chart, the dashboards that read them. | Not run: as AC1. Impact is partly met (downstream columns and saved charts with their dashboards; default dashboard tiles and legacy charts without a def are not covered). |
 | `DATA-13-AC3` | Read lineage as a user without the permission; force a lineage failure. | Refused like the table-level tab; a failure shows an honest message (principles 2 and 4). | Not run: covered by the column route's tests in CI |
-| `DATA-13-AC4` | Run the g3a lineage gate against a project with `build` links. | The gate passes with `build` listed, not fails on the unknown kind. | Pass in CI: the `g3a` gate accepts the `build` and `upload` kinds |
+| `DATA-13-AC4` | Run the g3a lineage gate against a project with `build` links. | The gate passes with `build` listed, not fails on the unknown kind. | Not run with build links in CI: CI drew only catalog and publisher edges; the g3a gate accepts the build kind. |
 
 ## Asking the assistant
 
