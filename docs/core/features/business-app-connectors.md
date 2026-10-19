@@ -6,12 +6,12 @@
 | Backlog | `SRC-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-3.md`. This page follows it row by row; anything the spec does not say is a decision below. The spec has no *(proposed)* number; its one *(proposed)* item, dropping a no-code connector builder, is decision 14 |
-| Status | Planned. `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest); decisions below not yet signed |
+| Status | Building, in #214 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
-| Plan | `docs/superpowers/plans/2026-10-19-data-phase-4-connectors.md` (written once the decisions are signed) |
-| Started | Not yet |
+| Plan | `docs/superpowers/plans/2026-10-19-data-phase-4-connectors.md` |
+| Started | 2026-10-19; also in `BACKLOG.md` Dates |
 | Shipped | Not yet |
 | Evidence | The phase 4 pull request, with the first run of the SaaS gate |
 
@@ -87,25 +87,41 @@ for any adapter.
 
 ## Decisions
 
-The planner's default is used until signed.
+The planner's default is used until signed. Signed 2026-10-19 on the condition that each follows the spec; decision 3 was corrected to the spec before signing.
 
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
-| 1 | Where the verified-source code lives. It installs by copying, and three of the four have defects. | Copied once from a pinned upstream commit into the repo, with its Apache-2.0 notice; our fixes are made in the copy, each cited; no automatic re-sync. A later upstream fix is taken by hand, with a review. | |
-| 2 | Which vendor API each connector reads. Databricks reads a different path for four. | GA4: the GA4 Data API (reports the user defines: dimensions and metrics), not the BigQuery raw-event export. Dynamics 365: the Dataverse Web API, not Synapse Link exports. NetSuite: SuiteQL over REST, not SuiteAnalytics JDBC (needs a licence). Workday: Reports-as-a-Service (one custom report per object). Others: the vendor's main REST API. | |
-| 3 | How each connector signs in (one main way each; a second only where the first does not fit every customer). | Salesforce: sign-in in the browser (OAuth). HubSpot: private-app token. Zendesk: email + API token, or sign-in. GA4: Google sign-in, or a service-account key. ServiceNow: OAuth client credentials, or user + password. Workday: integration user + password. Confluence: email + API token. Dynamics 365 and SharePoint: Microsoft Entra app (client credentials). NetSuite: OAuth 2.0 client credentials (certificate). | |
-| 4 | Salesforce's password + security-token sign-in, retired by Salesforce in Summer '27. | Not offered. | |
-| 5 | Which objects each connector offers. | Listed by the vendor where it can list them: Salesforce standard and custom objects; HubSpot CRM objects (companies, contacts, deals, tickets, products, quotes, owners, pipelines); Zendesk Support (tickets, ticket events, users, organizations, groups and the rest of the verified source's list; Chat and Talk not offered); GA4: the reports the user defines; ServiceNow: any table by name, with incident, change request, problem, user and CMDB item suggested; Workday: each custom report the user names; Confluence: spaces, pages, blog posts, comments; Dynamics 365: any Dataverse table; NetSuite: any record type SuiteQL can read; SharePoint: the lists of the sites the user picks. | |
-| 6 | Incremental loads. | Every object whose API filters by a "last modified" value loads incrementally (merge on the vendor's id); the others are re-read in full each run, and the connector page says which and why. HubSpot is made incremental in our copy. | |
-| 7 | Records deleted at the vendor. | Applied only where the vendor reports deletes in the same read (Salesforce `IsDeleted`, Graph and Dataverse delta, Zendesk deleted status). Elsewhere a deleted record stays until a full reload, and the page says so. | |
-| 8 | Following a vendor's "next page" link and Salesforce's returned host (the REST adapter refuses both today, rule Z5). | Followed only when the link points to the same host as the request it came from, or for Salesforce, when the returned host ends in `.salesforce.com` or `.force.com`; every host is checked against the internal-address rules (`SEC-15`) before it is dialled. Anything else stops the run with a plain message. | |
-| 9 | Schema changes. | Found before the load where the vendor describes its fields (Salesforce, HubSpot, ServiceNow, Dynamics 365, NetSuite), so "ask first" and "pause" work for them; after the load for the others, as for other API sources today. | |
-| 10 | A connector we cannot test on a real account (Workday and NetSuite have no free developer account). | Built and proven on the gate's mock, but listed as **not supported**, with the reason, until its acceptance row passes on a real account. Same for any vendor whose real-account row is not run. | |
-| 11 | Who provides the vendor test accounts for the acceptance checklist. | The product owner arranges them: Salesforce Developer Edition, HubSpot developer account, Zendesk trial, a GA4 property, ServiceNow developer instance, Atlassian free site, Power Apps Developer Plan; Microsoft 365, Workday and NetSuite through a partner or a customer. | |
-| 12 | Build order (one pull request for the phase). | Shared parts first (the SaaS adapter, link rule, incremental and column choice for SaaS, the gate), then HubSpot, Zendesk, Salesforce, GA4, ServiceNow, Confluence, SharePoint, Dynamics 365, Workday, NetSuite. | |
-| 13 | Rate limits. | Honour the vendor's `Retry-After` and back off; a run that is still limited after the `SRC-11` retries fails with "the vendor limited the rate", never partial data reported as complete. | |
-| 14 | A no-code builder for custom connectors (the spec's proposed drop; also in `DEC-10`). | Dropped from `SRC-3`. | |
-| 15 | The gate. | One new CI job with a mock server per vendor that behaves like the vendor (paging, sign-in, rate limit, a changed field), all ten in it, within the 20 minutes signed for connector gates. | |
+| 1 | Where the verified-source code lives. It installs by copying, and three of the four have defects. | Copied once from a pinned upstream commit into the repo, with its Apache-2.0 notice; our fixes are made in the copy, each cited; no automatic re-sync. A later upstream fix is taken by hand, with a review. | 2026-10-19 |
+| 2 | Which vendor API each connector reads. Databricks reads a different path for four. | GA4: the GA4 Data API (reports the user defines: dimensions and metrics), not the BigQuery raw-event export. Dynamics 365: the Dataverse Web API, not Synapse Link exports. NetSuite: SuiteQL over REST, not SuiteAnalytics JDBC (needs a licence). Workday: Reports-as-a-Service (one custom report per object). Others: the vendor's main REST API. | 2026-10-19 |
+| 3 | How each connector signs in. The spec asks for OAuth sign-in wherever the vendor offers it, and AC1 for "one sign-in". | Sign-in in the browser (OAuth authorisation code, `SRC-12`) for every vendor that offers it: Salesforce, HubSpot, Zendesk, GA4 (Google), ServiceNow, Confluence (Atlassian), Dynamics 365 and SharePoint (Microsoft Entra), NetSuite, and Workday where the tenant has registered an API client. Second way, for customers whose admins use integration credentials: HubSpot private-app token, Zendesk email + API token, GA4 service-account key, ServiceNow and Dynamics/SharePoint client credentials, Confluence email + API token, Workday integration user + password, NetSuite client credentials (certificate). Where `SRC-12`'s sign-in cannot serve a vendor as it stands (it sends the client secret in the form body only), it is extended for that vendor, not dropped. | 2026-10-19 |
+| 4 | Salesforce's password + security-token sign-in, retired by Salesforce in Summer '27. | Not offered. | 2026-10-19 |
+| 5 | Which objects each connector offers. | Listed by the vendor where it can list them: Salesforce standard and custom objects; HubSpot CRM objects (companies, contacts, deals, tickets, products, quotes, owners, pipelines); Zendesk Support (tickets, ticket events, users, organizations, groups and the rest of the verified source's list; Chat and Talk not offered); GA4: the reports the user defines; ServiceNow: any table by name, with incident, change request, problem, user and CMDB item suggested; Workday: each custom report the user names; Confluence: spaces, pages, blog posts, comments; Dynamics 365: any Dataverse table; NetSuite: any record type SuiteQL can read; SharePoint: the lists of the sites the user picks. | 2026-10-19 |
+| 6 | Incremental loads. | Every object whose API filters by a "last modified" value loads incrementally (merge on the vendor's id); the others are re-read in full each run, and the connector page says which and why. HubSpot is made incremental in our copy. | 2026-10-19 |
+| 7 | Records deleted at the vendor. | Applied only where the vendor reports deletes in the same read (Salesforce `IsDeleted`, Graph and Dataverse delta, Zendesk deleted status). Elsewhere a deleted record stays until a full reload, and the page says so. | 2026-10-19 |
+| 8 | Following a vendor's "next page" link and Salesforce's returned host (the REST adapter refuses both today, rule Z5). | Followed only when the link points to the same host as the request it came from, or for Salesforce, when the returned host ends in `.salesforce.com` or `.force.com`; every host is checked against the internal-address rules (`SEC-15`) before it is dialled. Anything else stops the run with a plain message. | 2026-10-19 |
+| 9 | Schema changes. | Found before the load where the vendor describes its fields (Salesforce, HubSpot, ServiceNow, Dynamics 365, NetSuite), so "ask first" and "pause" work for them; after the load for the others, as for other API sources today. | 2026-10-19 |
+| 10 | A connector we cannot test on a real account (Workday and NetSuite have no free developer account). | Built and proven on the gate's mock, but listed as **not supported**, with the reason, until its acceptance row passes on a real account. Same for any vendor whose real-account row is not run. | 2026-10-19 |
+| 11 | Who provides the vendor test accounts for the acceptance checklist. | The product owner arranges them: Salesforce Developer Edition, HubSpot developer account, Zendesk trial, a GA4 property, ServiceNow developer instance, Atlassian free site, Power Apps Developer Plan; Microsoft 365, Workday and NetSuite through a partner or a customer. | 2026-10-19 |
+| 12 | Build order (one pull request for the phase). | Shared parts first (the SaaS adapter, link rule, incremental and column choice for SaaS, the gate), then HubSpot, Zendesk, Salesforce, GA4, ServiceNow, Confluence, SharePoint, Dynamics 365, Workday, NetSuite. | 2026-10-19 |
+| 13 | Rate limits. | Honour the vendor's `Retry-After` and back off; a run that is still limited after the `SRC-11` retries fails with "the vendor limited the rate", never partial data reported as complete. | 2026-10-19 |
+| 14 | A no-code builder for custom connectors (the spec's proposed drop; also in `DEC-10`). | Dropped from `SRC-3`. | 2026-10-19 |
+| 15 | The gate. | One new CI job with a mock server per vendor that behaves like the vendor (paging, sign-in, rate limit, a changed field), all ten in it, within the 20 minutes signed for connector gates. | 2026-10-19 |
+
+## Spec targets this feature does not meet
+
+Reported, not lowered (`AGENTS.md`, step 0):
+
+- **Second wave** (the spec's "match Databricks' beta list, about 45, by
+  customer demand"): not in this pull request. Each beta connector becomes
+  its own backlog item when a customer asks for it.
+- **Incremental loads for every connector**: Workday Reports cannot filter a
+  report by a change date (only by prompts the customer's admin defines), so
+  a Workday report is re-read in full each run. Other vendors' objects
+  without a "last modified" filter are listed on the connector page
+  (decision 6).
+- **Real-account proof for Workday and NetSuite** (`SRC-3-AC1`): no free
+  developer account exists; they stay "not supported" until a partner or
+  customer account is used (decision 10).
 
 ## Limits to tell a customer
 
