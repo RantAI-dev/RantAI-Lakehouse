@@ -716,13 +716,47 @@ fn build_target(target: &str) -> Option<String> {
 ///   was last written by something that cannot be traced).
 /// * The cursor moves only to the newest time handled, so a pass that failed
 ///   reading the log changes nothing and the next tick retries.
-// PR #106 review R1 SHOULD-FIX DATA-13 3: skip Dagster's CREATE ... LIMIT 0 schema setup statements
+fn is_expr_zero(expr: &sqlparser::ast::Expr) -> bool {
+    match expr {
+        sqlparser::ast::Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(n, _) => n == "0",
+            _ => false,
+        },
+        sqlparser::ast::Expr::Nested(inner) => is_expr_zero(inner),
+        _ => false,
+    }
+}
+
+struct LimitZeroVisitor(bool);
+
+impl sqlparser::ast::Visitor for LimitZeroVisitor {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        if let Some(clause) = &query.limit_clause {
+            let is_zero = match clause {
+                sqlparser::ast::LimitClause::LimitOffset { limit, .. } => {
+                    limit.as_ref().is_some_and(is_expr_zero)
+                }
+                sqlparser::ast::LimitClause::OffsetCommaLimit { limit, .. } => is_expr_zero(limit),
+            };
+            if is_zero {
+                self.0 = true;
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+// PR #106 review R2 SHOULD-FIX 4: match the AST's LIMIT clause, not raw tokens
 fn is_limit_zero(sql: &str) -> bool {
-    sql.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| w[0].eq_ignore_ascii_case("limit") && w[1] == "0")
+    let Ok(statements) = sqlparser::parser::Parser::parse_sql(&ClickHouseDialect {}, sql) else {
+        return false;
+    };
+    let mut visitor = LimitZeroVisitor(false);
+    let _ = sqlparser::ast::Visit::visit(&statements, &mut visitor);
+    visitor.0
 }
 
 pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
@@ -1122,6 +1156,20 @@ mod tests {
                 mart.iter()
                     .all(|r| r.reason.as_deref() == Some("the statement exceeds 20,000 characters"))
             );
+        }
+
+        // PR #106 review R2 SHOULD-FIX 4
+        #[test]
+        fn is_limit_zero_matches_ast_limit_and_not_tokens() {
+            assert!(is_limit_zero("SELECT * FROM silver.users LIMIT 0"));
+            assert!(is_limit_zero(
+                "CREATE TABLE silver.dagster ENGINE = MergeTree ORDER BY tuple() AS SELECT * FROM silver.users LIMIT 0"
+            ));
+            assert!(!is_limit_zero(
+                "CREATE TABLE silver.limit_0 AS SELECT id FROM silver.users"
+            ));
+            assert!(!is_limit_zero("SELECT 'LIMIT 0' AS msg FROM silver.users"));
+            assert!(!is_limit_zero("SELECT * FROM silver.users LIMIT 10"));
         }
 
         // PR #106 review R1 SHOULD-FIX DATA-13 3
