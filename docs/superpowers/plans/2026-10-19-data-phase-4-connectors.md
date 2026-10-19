@@ -409,6 +409,13 @@ Commands run on the final tree, with counts:
 - `src/features/connectors/connector-ingest-panel.test.tsx` has one expected sentence updated with the copy it checks ("SQL sources and business apps only").
 
 
+### Handoff: slice 1 fix round (developer, 2026-10-19)
+
+- **BLOCKER 1** fixed in `5f811fa6` (SRC-3 fix(runs): permission_missing and rate_limited are run-report classes): migration `0097_connector_run_attempt_saas_classes.sql` (DROP and ADD of `connector_run_attempt_class_check`, a statement shape no lint reads); `connector_run::ErrorClass::{PermissionMissing, RateLimited}` with fixed texts, `RateLimited` transient and `PermissionMissing` not; `ingest_errors` (`PERMISSION_MISSING`, `RATE_LIMITED`, `RETRIED_CLASSES` includes the second; `SaasPermissionMissing` and `SaasRateLimited` classify to them, `SaasSignInRefused` stays `sign_in_refused`); console contract and wording (`permission_missing`, `rate_limited`, and "Retries are used up" for a rate limit). The retry loop reads `classify().retried`, so the run's own delays apply to `rate_limited` with no change to `_fail_or_retry`. Discovery is unchanged (it has `no_permission` already).
+  - Run: `cargo fmt --check` clean; `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings` 0 warnings; pytest `test_ingest_errors.py`, `test_adapters_saas.py`, `test_ingest_run_reports.py`, `test_ingest_retries.py`, `test_discover.py`, `test_saas_session.py`: 214 passed; `bun test src/features/connectors/connector-ingest-panel.test.tsx`: 85 pass, 0 fail; `bun run lint` 0 errors; typecheck 0 errors outside `features/landing/scene`; `check_connector_gate_coverage.py` OK; no duplicate migration numbers.
+  - **Not verified:** the new Rust test `the_two_saas_classes_are_stored_worded_and_retried_only_for_the_rate_limit` (DB round trip, and that a made-up word is still refused by the CHECK) compiled but did not run; nor did `0097` itself against a database.
+- **SHOULD-FIX 2** not changed, and *not verified*: the repository's generator is the ignored Rust test `routes::ai::registry::tests::write_tool_schema_fixture` (`cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored`), a `cargo test` run that this machine may not do. The hand edit stays (one enum value, one description string, both in `registry.rs` and in the fixture); `tool_schemas_snapshot_is_byte_identical` in CI is the check. If it fails, run the generator on a machine that can and commit the difference.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
