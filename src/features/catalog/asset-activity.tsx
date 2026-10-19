@@ -119,17 +119,14 @@ function signed(value: Measured, sign: "+" | "−") {
 function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored: () => void }) {
   const { hasPermission } = useAuth()
   const status = useService(
-    (s) => (assetService.getRestoreStatus ? assetService.getRestoreStatus(a.id, s) : Promise.resolve(null)),
+    (s) => assetService.getRestoreStatus(a.id, s),
     [a.id]
   )
   // PR #106 review R1 SHOULD-FIX DATA-15 1: withNotify delivers error toast with real error
   const restore = useServiceAction(
     withNotify(
       { success: "Table restored", error: "Failed to restore the table" },
-      (signal) => {
-        if (!assetService.restoreTable) return Promise.reject(new Error("This deployment cannot restore a table."))
-        return assetService.restoreTable(a.id, signal)
-      }
+      (signal) => assetService.restoreTable(a.id, signal)
     )
   )
   const restorable = status.status === "success" && status.data && status.data.supported === undefined && status.data.restorable

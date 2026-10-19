@@ -539,10 +539,10 @@ export interface AssetService {
   /**
    * `PUT /api/catalog/{id}/certification` — set, change or clear the
    * certified / deprecated mark (needs `governance:write`, not the
-   * `catalog:write` of the details). Optional for the same dead-fixture
-   * reason; no mock implements it.
+   * `catalog:write` of the details).
    */
-  setCertification?(
+  // PR #106 review R1 SHOULD-FIX repo 2 / D3: required method
+  setCertification(
     id: string,
     input: AssetCertificationInput,
     signal?: AbortSignal
@@ -586,31 +586,30 @@ export interface AssetService {
     comment: string | undefined,
     signal?: AbortSignal
   ): Promise<DecideAccessRequestResult>
+  // PR #106 review R1 SHOULD-FIX repo 2 / D3: required methods (DATA-15)
   /**
    * `GET /api/catalog/{id}/grants` — the grants in force made from this
-   * asset. Needs `access:approve`. Optional for the same dead-fixture
-   * reason as `requestAccess`; no mock implements it.
+   * asset. Needs `access:approve`.
    */
-  listGrants?(id: string, signal?: AbortSignal): Promise<AssetGrant[]>
+  listGrants(id: string, signal?: AbortSignal): Promise<AssetGrant[]>
   /**
    * `POST /api/catalog/{id}/grants` — give a user a permission for 30 days.
    * Refused (as a `ServiceError` carrying the server's sentence) for an
    * unknown e-mail, for oneself, and for a permission the user already holds.
    */
-  grantAccess?(id: string, input: GrantAccessInput, signal?: AbortSignal): Promise<void>
+  grantAccess(id: string, input: GrantAccessInput, signal?: AbortSignal): Promise<void>
   /**
    * `GET /api/catalog/{id}/restore` — whether the asset's dropped table can
-   * be restored. Optional for the same dead-fixture reason as
-   * `requestAccess`; no mock implements it.
+   * be restored.
    */
-  getRestoreStatus?(id: string, signal?: AbortSignal): Promise<AssetRestoreStatus>
+  getRestoreStatus(id: string, signal?: AbortSignal): Promise<AssetRestoreStatus>
   /**
    * `POST /api/catalog/{id}/restore` — undrop the table (needs
    * `governance:write`). Refused with the server's sentence when a table of
    * that name exists again (409), nothing is kept (404) or the window has
    * passed (410).
    */
-  restoreTable?(id: string, signal?: AbortSignal): Promise<void>
+  restoreTable(id: string, signal?: AbortSignal): Promise<void>
   /** `DELETE /api/catalog/{id}/grants/{grantId}` — end a grant made from this asset. */
-  revokeGrant?(id: string, grantId: string, signal?: AbortSignal): Promise<void>
+  revokeGrant(id: string, grantId: string, signal?: AbortSignal): Promise<void>
 }

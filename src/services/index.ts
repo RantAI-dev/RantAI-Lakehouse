@@ -2,7 +2,6 @@
  * Service registry — pages import from here, never from mock modules directly.
  * Swap `mock*` for HTTP/Flight adapters when backends are ready.
  */
-import { mockAssetService } from "./mock/assets"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
 import { dagsterPipelineService } from "./clients/pipelines"
@@ -34,7 +33,6 @@ import * as authClient from "./clients/auth"
 // has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
-void mockAssetService
 // Pipelines is now fully real — list/get/runs/trigger from Dagster,
 // create/generate from Postgres + LLM, cancel/retry/pause/resume are
 // real Dagster mutations. mock/pipelines.ts has been deleted.

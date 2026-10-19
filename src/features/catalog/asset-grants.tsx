@@ -40,26 +40,22 @@ function sentence(message: string): string {
  */
 export function AssetGrants({ asset: a }: { asset: AssetDetail }) {
   const { hasPermission } = useAuth()
-  const allowed = hasPermission("access:approve") && Boolean(assetService.listGrants)
+  const allowed = hasPermission("access:approve")
   const grants = useService(
-    (s) => (allowed && assetService.listGrants ? assetService.listGrants(a.id, s) : Promise.resolve(null)),
+    (s) => (allowed ? assetService.listGrants(a.id, s) : Promise.resolve(null)),
     [a.id, allowed]
   )
   const [email, setEmail] = React.useState("")
   const [permission, setPermission] = React.useState<string>(GRANTABLE[0])
   const [revoking, setRevoking] = React.useState<AssetGrant | null>(null)
   const grant = useServiceAction((signal, input: { email: string; permission: string }) => {
-    if (!assetService.grantAccess) return Promise.reject(new Error("This deployment cannot grant access."))
     return assetService.grantAccess(a.id, input, signal)
   })
   // PR #106 review R1 SHOULD-FIX DATA-15 1: withNotify delivers error toast with real error
   const revoke = useServiceAction(
     withNotify(
       { success: "Grant revoked", error: "Failed to revoke the grant" },
-      (signal, grantId: string) => {
-        if (!assetService.revokeGrant) return Promise.reject(new Error("This deployment cannot revoke a grant."))
-        return assetService.revokeGrant(a.id, grantId, signal)
-      }
+      (signal, grantId: string) => assetService.revokeGrant(a.id, grantId, signal)
     )
   )
 
