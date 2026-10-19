@@ -468,6 +468,13 @@ services:
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       SAAS_STUB_URL: http://saas-stub-g6:8080
+      # SRC-3 V-HubSpot.4: the vendor steps run the vendor modules in this container against
+      # the mock vendor on its per-vendor ports (`SAAS_GATE_ORIGINS` is built by the script from
+      # `saas_stub.VENDOR_PORTS`). GATE-ONLY, like the two switches in this file's first
+      # comment: the mock speaks plain `http` at an internal address, which the product
+      # refuses unless these are on. The main compose file sets neither.
+      CONNECTOR_OAUTH_ALLOW_HTTP: "true"
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
       PYTHONPATH: /opt/gates

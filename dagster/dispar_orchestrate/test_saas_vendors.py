@@ -83,3 +83,22 @@ def test_the_secret_mapping_resolves_saas_slots_through_the_vendor_table() -> No
             secret_map.secret_field_names("saas", bad)
     # Decision 4: Salesforce has no integration credential.
     assert vendors.vendor("salesforce").secret_key(oauth=False) is None
+
+
+def test_the_gate_rebase_does_nothing_unless_the_gate_only_switch_and_the_vendor_are_named(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SRC-3 V-HubSpot.4: `SAAS_GATE_ORIGINS` goes round "hosts come only from the table", so it is
+    closed twice and falls back to the real host on anything odd."""
+    real = "https://api.hubapi.com/oauth/v1/token?x=1"
+    origins = '{"hubspot": "http://saas-stub-g6:8101"}'
+    monkeypatch.delenv("CONNECTOR_OAUTH_ALLOW_HTTP", raising=False)
+    monkeypatch.setenv("SAAS_GATE_ORIGINS", origins)
+    assert vendors.rebase_for_gate("hubspot", real) == real, "without the switch the variable is ignored"
+    monkeypatch.setenv("CONNECTOR_OAUTH_ALLOW_HTTP", "true")
+    assert vendors.rebase_for_gate("hubspot", real) == "http://saas-stub-g6:8101/oauth/v1/token?x=1"
+    assert vendors.rebase_for_gate("zendesk", real) == real, "a vendor the variable does not name is untouched"
+    for odd in ("not json", "[]", '{"hubspot": 5}', '{"hubspot": "ftp://x:1"}', '{"hubspot": "http://u:p@x:1"}', '{"hubspot": "http://x:1/prefix"}', '{"hubspot": "http://x:1/?q=1"}'):
+        monkeypatch.setenv("SAAS_GATE_ORIGINS", odd)
+        assert vendors.rebase_for_gate("hubspot", real) == real, odd
+    monkeypatch.setenv("CONNECTOR_OAUTH_ALLOW_HTTP", "yes")
+    monkeypatch.setenv("SAAS_GATE_ORIGINS", origins)
+    assert vendors.rebase_for_gate("hubspot", real) == real, "only the exact word true opens the switch"

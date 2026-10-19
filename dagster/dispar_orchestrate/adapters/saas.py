@@ -114,7 +114,7 @@ def _auth(
         session = rest_adapter.AuthSession(
             {
                 "type": kind,
-                "tokenUrl": vendor.token_url(parts),
+                "tokenUrl": vendors.rebase_for_gate(vendor.id, vendor.token_url(parts)),
                 "clientId": auth["clientId"],
                 "clientAuth": vendor.oauth["clientAuth"],
             },
@@ -174,7 +174,7 @@ def open_session(
     if sleep is not None:
         extra["sleep"] = sleep
     session = SaasSession(
-        vendor.api_url(parts),
+        vendors.rebase_for_gate(vendor.id, vendor.api_url(parts)),
         headers,
         adopt_suffixes=tuple(getattr(module, "adopt_suffixes", ())),
         http_get=http_get,

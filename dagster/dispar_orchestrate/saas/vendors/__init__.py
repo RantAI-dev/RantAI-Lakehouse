@@ -27,6 +27,8 @@ other way in, for a test's fake vendor; it takes precedence over the path.
 from __future__ import annotations
 
 import importlib
+import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -181,6 +183,39 @@ _TABLE: list[dict[str, Any]] = [{'id': 'salesforce',
                   'secretFields': ['clientId', 'clientSecret']},
   'whoami': {'method': 'GET', 'path': '/v1.0/sites/{account}.sharepoint.com'}}]
 # ---------------------------------------------------------------------------------
+
+GATE_ORIGINS_ENV = "SAAS_GATE_ORIGINS"
+
+
+def rebase_for_gate(vendor_id: str, url: str) -> str:
+    """`url` with its scheme, host and port replaced by the gate's mock vendor
+    (`SAAS_GATE_ORIGINS`, a JSON object of vendor id to `http://host:port`).
+
+    This goes round the rule that a vendor's hosts come only from the table (AD2),
+    so it is closed twice: it does nothing unless the gate-only switch
+    `CONNECTOR_OAUTH_ALLOW_HTTP=true` is on (the one `rest.py` and the API read for
+    their own mock providers; a real installation never sets it) AND the variable
+    names this vendor. The gate's mock vendor server answers on plain `http` at an
+    internal address, so the gate also sets `INGEST_ALLOW_INTERNAL_HOSTS`; nothing in
+    the product reads `SAAS_GATE_ORIGINS` for any other purpose. A value that is not
+    a bare `http(s)://host[:port]` is ignored (fail closed to the real host).
+    """
+    if os.environ.get("CONNECTOR_OAUTH_ALLOW_HTTP", "").strip() != "true":
+        return url
+    try:
+        table = json.loads(os.environ.get(GATE_ORIGINS_ENV, "") or "{}")
+    except ValueError:
+        return url
+    origin = table.get(vendor_id) if isinstance(table, dict) else None
+    if not isinstance(origin, str):
+        return url
+    from urllib.parse import urlparse
+
+    mock, real = urlparse(origin), urlparse(url)
+    if mock.scheme not in ("http", "https") or not mock.hostname or mock.path not in ("", "/") or mock.username or mock.query:
+        return url
+    return f"{mock.scheme}://{mock.netloc}{real.path}" + (f"?{real.query}" if real.query else "")
+
 
 OAUTH_AUTH_TYPE = "oauth2_authorization_code"
 OAUTH_SECRET_FIELDS = ("clientSecret", "refreshToken")
