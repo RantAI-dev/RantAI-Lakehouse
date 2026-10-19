@@ -677,6 +677,15 @@ fn build_target(target: &str) -> Option<String> {
 ///   was last written by something that cannot be traced).
 /// * The cursor moves only to the newest time handled, so a pass that failed
 ///   reading the log changes nothing and the next tick retries.
+// PR #106 review R1 SHOULD-FIX DATA-13 3: skip Dagster's CREATE ... LIMIT 0 schema setup statements
+fn is_limit_zero(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0].eq_ignore_ascii_case("limit") && w[1] == "0")
+}
+
 pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
     let cursor = match column_lineage::builds_cursor(pool).await {
         Ok(cursor) => cursor,
@@ -698,7 +707,8 @@ pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
             return 0;
         }
     };
-    let pipeline_targets: HashSet<String> = lakehouse_store::pipelines::list_pipelines(
+    // PR #106 review R1 SHOULD-FIX DATA-13 3: fail pass when list_pipelines fails instead of unwrap_or_default
+    let pipeline_targets: HashSet<String> = match lakehouse_store::pipelines::list_pipelines(
         pool,
         &lakehouse_store::pipelines::PipelineFilter {
             tenant_id: None,
@@ -706,10 +716,16 @@ pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
         },
     )
     .await
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|p| zone_key(&p.target))
-    .collect();
+    {
+        Ok(list) => list
+            .into_iter()
+            .filter_map(|p| zone_key(&p.target))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "column lineage: could not list pipelines for build targets");
+            return 0;
+        }
+    };
 
     let mut cache = ColumnCache::default();
     let mut latest: HashMap<String, Vec<NewMapping>> = HashMap::new();
@@ -728,6 +744,10 @@ pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
             continue;
         };
         if pipeline_targets.contains(&target) {
+            continue;
+        }
+        // PR #106 review R1 SHOULD-FIX DATA-13 3: skip Dagster's CREATE ... LIMIT 0 statements
+        if is_limit_zero(&query) {
             continue;
         }
         let known = cache
@@ -1062,6 +1082,33 @@ mod tests {
             assert!(
                 mart.iter()
                     .all(|r| r.reason.as_deref() == Some("the statement exceeds 20,000 characters"))
+            );
+        }
+
+        // PR #106 review R1 SHOULD-FIX DATA-13 3
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn dagster_limit_zero_is_skipped_even_when_not_a_pipeline_target(pool: sqlx::PgPool) {
+            let ch = MockServer::start().await;
+            mount_columns(&ch).await;
+            mount_log(
+                &ch,
+                &[(
+                    "1760000000000",
+                    "CREATE TABLE IF NOT EXISTS silver.dagster_table ENGINE = MergeTree                      ORDER BY tuple() AS SELECT id FROM silver.users LIMIT 0",
+                )],
+            )
+            .await;
+            let state = state_for(&pool, &ch.uri());
+            let written = run_builds_pass(&state, &pool).await;
+            assert_eq!(
+                written, 0,
+                "LIMIT 0 must be skipped and never recorded as a build"
+            );
+            assert!(
+                touching_table(&pool, "silver.dagster_table", everything())
+                    .await
+                    .expect("read")
+                    .is_empty()
             );
         }
 
