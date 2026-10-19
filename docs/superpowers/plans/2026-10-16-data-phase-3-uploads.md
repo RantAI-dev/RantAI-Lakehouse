@@ -393,6 +393,63 @@ A "no" stops the task and is reported to the planner.
 (Developer, per slice: commits, the exact commands with their counts, and what
 was not verified, with the reason.)
 
+### Slice 1
+
+Branch `feat/data-phase-3-uploads`, five task commits on top of `7a2fd421`, in
+plan order. Nothing pushed.
+
+| Task | Commit |
+| --- | --- |
+| T1.1 migration `0090` and the store | `fc0e79eb` |
+| T1.2 `UploadStore` multipart and ranged reads | `a8be24be` |
+| T1.3 routes, sweep, session lifetime | `3cd0bd28` |
+| T1.4 console uploader | `eef458df` |
+| T1.5 docs at the code | `193d9d81` |
+
+Environment: `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target`,
+`CARGO_INCREMENTAL=0`, `-j 4`, one cargo job at a time. `ls rust/migrations | cut -c1-4 | sort | uniq -d` printed nothing.
+
+**What was run (all in the foreground, from this branch's sources; the sources were `touch`ed before the clippy runs because the target dir is shared):**
+
+- `cargo fmt --check` (workspace): clean.
+- `cargo clippy -j 4 --workspace --all-targets --all-features -- -D warnings`: clean (`Finished` after a `touch` of every `crates/*/src/**.rs`).
+- T1.1: `cargo test -p lakehouse-store --test uploads`: **51 passed**, 0 failed (14 are new: the session row and its wire form, the zero-byte refusal, pieces out of order and again, only a `receiving` upload takes a piece, finishing, deleting, the sweep query, the duplicate digest, `0090` over an earlier upload). The `0058` migration test now stops at 0058 (`migrations_up_to(58)`), because it pins what `0058` alone adds to `file_upload`.
+- T1.2: `cargo test -p lakehouse-api --lib upload_store`: 17 passed, 1 ignored. With a live store: `UPLOAD_PROOF_ENDPOINT=… UPLOAD_PROOF_ACCESS=… UPLOAD_PROOF_SECRET=… cargo test -p lakehouse-api --lib upload_store -- --include-ignored`: **18 passed**.
+- T1.3: `cargo test -p lakehouse-api --test upload_routes -- --test-threads=2`: **108 passed** (15 new, listed in the commit); `--test route_auth -- --test-threads=2`: **44 passed** (the upload test now loops the four new routes: an engineer is never refused at the gate, an analyst always is); `--lib -- sessions upload_ routes::tests config::tests::the_upload`: 144 passed, 1 ignored; `--lib -- timeout upload_session config::`: 99 passed. `cargo test -p lakehouse-store --test uploads` again after the `finish_receiving` change: 51 passed.
+- T1.4: `bun run typecheck`: clean. `bun run lint`: 0 errors, 8 warnings, none in a file this slice touched (all were there before). `bun test src/lib/upload-queue.test.ts src/lib/uploads.test.ts src/services/clients/uploads.test.ts src/features/connectors/`: **404 passed**, 0 failed, 19 files (`bun test v1.4.0`). 14 of them are the queue's own (concurrency cap and turn-taking, progress, backoff 1 s to 30 s, re-read after a failure, 429 and `Retry-After`, offline and back, a hung request ended when the connection returns, fatal refusal, completion 409, a lost completion answer, remove, snapshot, dispose); the page tests were rewritten for the new flow (10 files, the 11th left out, a bar that moves, a refusal in its row, 413 and 500 from a proxy, 429 waited out, the others still sending).
+
+**The `object_store` / RustFS proof (section 8, item 1), through `UploadStore`:** a throwaway `rustfs/rustfs:1.0.0-rc.4` container, run-time credentials in a file under `/tmp` (deleted afterwards), bucket made with `boto3`, then the ignored test `rustfs_multipart_keeps_the_last_copy_of_a_piece_and_aborts_cleanly` in `upload_store.rs`: create; part 2 (3 MiB), part 1 (8 MiB, wrong bytes), part 1 again (right bytes); complete with the last ETags; the object is 11 MiB, the first 8 MiB are the **last** copy of part 1, and a 4-byte ranged read across the join is right. Create, part 1 (6 MiB), abort, abort again: both succeed (`NotFound` is mapped to success) and the object is absent. Parts of 1 MiB and 1 MiB: completion is **refused** (the 5 MiB minimum). The container was removed afterwards (`docker rm -f`); the shared dev stack was not touched. The test keeps the credentials out of the repo (it reads three environment variables).
+
+**Section 8, item 2 (the Next.js rewrite passes an 8 MiB `PUT` unchanged):** `next dev --webpack` (Turbopack refuses the symlinked `node_modules` this worktree uses) with `RUST_API_URL` pointing at a stdlib echo server that hashes what it receives. An 8,388,608-byte random file, `Content-Type: application/octet-stream`, 200; the server saw the same length and the same SHA-256 and the same content type, and no `Transfer-Encoding`.
+
+**Section 8, item 3 (memory of the console's proxy with 4 pieces in flight):** the same `next dev` process, resident set before 345,296 KB, peak 418,984 KB over three rounds of four simultaneous 8 MiB `PUT`s (about +72 MB). It is a development server, one run, sampled every 0.1 s: **not verified for the production (`standalone`) build**, and it is not the slice 6 measurement.
+
+**Not verified, with the reason:**
+
+- `cargo test --workspace` (the full block's test line): **not run to the end.** The root disk reached 100% (1.5 GB free of 293 GB; the shared target holds 24 GB of test binaries of 750 to 930 MB each) and `cc` crashed while linking `agents_run`, `agents_approval` and `connector_discovery_launch`. I stopped it rather than fill the disk another session shares. What did run is listed above; the other crates' tests were not run by me. Someone should free disk before the reviewer's run.
+- `bun run test` (the whole suite) and a production `next build`: not run (a whole `bun test src` is OOM-killed on this machine; the plan names the scoped files).
+- Python lints and `pytest`, `docker compose config`: no Python, compose or ops file was touched.
+- Browser behaviour of the new file step (a real drag and drop, a real connection drop, a real 8 MiB piece through the proxy to the API): not seen in a browser. The routes were exercised through the Rust route tests against a fake bucket that speaks S3 multipart, and the page through happy-dom with a fake `fetch`.
+- One combined run, `cargo test -p lakehouse-api --test upload_routes --test route_auth`, showed 6 failures in `upload_routes` (the same binary alone passed 108 of 108, three times, including after the last code change). I did not find the cause; the failing tests were the timing-sensitive and large-body ones while another session's `cargo` was compiling on the same machine. Treat as unproven flakiness under load and look at it in the review run.
+
+**Where the code differs from, or adds to, the plan (none changes a decision):**
+
+1. `finish_receiving` (T1.1) no longer sets `sha256`: a file never held whole has no hash of its bytes, and writing the digest of the pieces into `sha256` would be a different quantity under the same name. The duplicate check reads `parts_digest` (`find_by_parts_digest`). The T1.1 commit has the function with a `sha256` argument; T1.3 removes it (the commit says so).
+2. The sweep is a module of its own, `upload_sweep.rs` (in `lib.rs` and `main.rs`), not code in `main.rs`, so a route test can call it; `main.rs` only spawns it (`spawn_upload_session_sweep`, hourly, first tick at start). It also deletes the object at the session's key, tolerating its absence, for a process that died between S3's "complete" and the row's move to `uploaded`.
+3. The handlers live in a child module, `routes/uploads/sessions.rs`, to keep `uploads.rs` from growing by 600 lines. `classify_head` is `check_file`'s kind rules split out so both paths give the same sentences.
+4. `PUT /api/uploads/{id}/parts/{n}` takes the request, not a `Bytes`, so the `SEC-17` place is taken before the body is read; it has the 300 s request timeout the single upload has (the default 60 s would cut a piece on a link under about 1 Mbit/s). `is_upload_part_path` in `routes/mod.rs`, with a test.
+5. `POST .../complete` reads a workbook or a Parquet file **whole** (as `POST /api/uploads` does today, under a `SEC-17` place) and refuses one above `MAX_UPLOAD_BYTES`; that is where decision 9 (Excel stays at 50 MB) holds when slice 6 raises the session cap, and the Parquet read is what slice 2 removes. A text file is classed from its first 64 KiB.
+6. `MAX_SESSION_BYTES` is its own constant (50 MiB) so slice 6 changes one line without touching `POST /api/uploads`.
+7. `UPLOAD_SESSION_TTL_HOURS` (default 24, config error if not a whole number of 1 or more) is read from the process environment but **is not passed through in `docker-compose.yml` or `.env.example`**: rule 8 asks a real `docker compose up` for a compose edit, which I did not run. A container runs with 24 until that is added.
+8. The queue and the page start sending when files are picked, not when Next is pressed; Next opens when the first file (the first not refused) has been received. The others keep sending in the background and the page says so and where to load them.
+
+**Things I saw and did not change (for the planner):**
+
+- A user can open any number of sessions (each is a row and an S3 multipart upload) before the 24 h sweep removes them; the plan sets no per-user bound.
+- If S3's "complete" succeeds and the database write that follows fails, the retry of `complete` meets `NoSuchUpload` (503) until the sweep removes the session; the queue recovers the case where only the *answer* was lost (it reads the upload and takes it if it is `uploaded`).
+- `connector-create-page.tsx` still says "Have a file instead? Upload a CSV or TSV" (the plan asks only for the sentence at `uploads-panel.tsx:66`).
+- Running `next dev` regenerated `AGENTS.md` in the worktree (Next's agent rules). I reverted it with `git checkout`; the file is not in any commit. The worktree has a `node_modules` symlink to `/home/hv/lakehouse-phase3-build/node_modules` (git-ignored), used read-only; it is removed with this handoff.
+
 ## 12. Review
 
 (Planner, per slice: findings tagged `BLOCKER` or `SHOULD-FIX`.)
