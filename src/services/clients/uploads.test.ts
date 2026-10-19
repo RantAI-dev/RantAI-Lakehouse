@@ -92,6 +92,86 @@ describe("uploadService requests", () => {
     expect((init.headers as Headers).has("Content-Type")).toBe(false)
   })
 
+  it("opens a chunked upload with a JSON body of the name and the size", async () => {
+    const calls = stubFetch(() =>
+      json({ upload: { ...UPLOAD, status: "receiving" }, partSize: 8 * 1024 * 1024, partCount: 3 }, 201)
+    )
+    const session = await uploadService.createSession({ filename: "big.csv", sizeBytes: 20_000_000 })
+
+    expect(session.partCount).toBe(3)
+    expect(session.partSize).toBe(8 * 1024 * 1024)
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/sessions")
+    expect(init.method).toBe("POST")
+    expect((init.headers as Headers).get("Content-Type")).toBe("application/json")
+    expect(JSON.parse(init.body as string)).toEqual({ filename: "big.csv", sizeBytes: 20_000_000 })
+  })
+
+  it("sends a piece as a raw PUT of the bytes to its numbered path", async () => {
+    const calls = stubFetch(() => json({ partNumber: 2, sizeBytes: 4 }))
+    const piece = new Blob(["abcd"])
+    const receipt = await uploadService.putPart("up 1", 2, piece)
+
+    expect(receipt).toEqual({ partNumber: 2, sizeBytes: 4 })
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up%201/parts/2")
+    expect(init.method).toBe("PUT")
+    expect((init.headers as Headers).get("Content-Type")).toBe("application/octet-stream")
+    expect(init.body).toBe(piece)
+  })
+
+  it("carries the 429's Retry-After on the error of a piece, and the API's sentence as its message", async () => {
+    stubFetch(
+      () =>
+        new Response(JSON.stringify({ error: "Too many uploads are in progress. Try again in a moment." }), {
+          status: 429,
+          headers: { "Content-Type": "application/json", "Retry-After": "5" },
+        })
+    )
+    const err = await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))
+    expect(err.status).toBe(429)
+    expect(err.retryAfterSecs).toBe(5)
+    expect(err.message).toBe("Too many uploads are in progress. Try again in a moment.")
+  })
+
+  it("leaves retryAfterSecs unset for a 429 that names none, and for every other status", async () => {
+    stubFetch(() => json({ error: "No." }, 429))
+    expect((await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))).retryAfterSecs).toBeUndefined()
+    stubFetch(
+      () => new Response(JSON.stringify({ error: "No." }), { status: 503, headers: { "Retry-After": "7" } })
+    )
+    expect((await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))).retryAfterSecs).toBeUndefined()
+  })
+
+  it("does not show a proxy's plain-text answer to a piece: it says the upload did not reach the service", async () => {
+    stubFetch(() => new Response("Request Entity Too Large", { status: 413 }))
+    const err = await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))
+    expect(err.status).toBe(413)
+    expect(err.message).toContain("did not reach the service")
+    expect(err.message).not.toContain("Request Entity Too Large")
+  })
+
+  it("reads the pieces the API holds, and completes an upload with a POST that has no body", async () => {
+    const calls = stubFetch(() => json({ received: [1, 3], partSize: 8, partCount: 3 }))
+    expect(await uploadService.listParts("up-1")).toEqual({ received: [1, 3], partSize: 8, partCount: 3 })
+    expect(calls[0]!.url).toBe("/api/uploads/up-1/parts")
+    expect(calls[0]!.init.method).toBeUndefined()
+
+    const done = stubFetch(() => json({ ...UPLOAD, duplicateOf: { ...UPLOAD, id: "up-0" } }))
+    const completed = await uploadService.complete("up-1")
+    expect(completed.duplicateOf?.id).toBe("up-0")
+    expect(done[0]!.url).toBe("/api/uploads/up-1/complete")
+    expect(done[0]!.init.method).toBe("POST")
+    expect(done[0]!.init.body).toBeUndefined()
+  })
+
+  it("shows the API's sentence when completion is refused", async () => {
+    stubFetch(() => json({ error: "Some pieces have not arrived: 2." }, 409))
+    const err = await rejection(uploadService.complete("up-1"))
+    expect(err.status).toBe(409)
+    expect(err.message).toBe("Some pieces have not arrived: 2.")
+  })
+
   it("asks for a preview with no query when nothing is overridden", async () => {
     const calls = stubFetch(() => json({}))
     await uploadService.preview("up-1")

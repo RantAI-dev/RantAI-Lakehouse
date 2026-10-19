@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils"
  */
 
 const STATUS_TONE: Record<string, "neutral" | "info" | "success" | "destructive"> = {
+  receiving: "info",
   uploaded: "neutral",
   ingesting: "info",
   ingested: "success",

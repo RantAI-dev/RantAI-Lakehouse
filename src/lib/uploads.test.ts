@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 import type { Upload } from "@/services/contracts/uploads"
 import {
+  MAX_FILES,
   MAX_TABLE_NAME_CHARS,
   MAX_UPLOAD_BYTES,
   REGISTRATION_FAILED_REASON,
@@ -18,6 +19,7 @@ import {
   headerRowDisplay,
   headerRowFromDisplay,
   isUploadedTable,
+  planPick,
   rawTableFullName,
   retryInput,
   statusLabel,
@@ -172,7 +174,8 @@ test("suggestTableName always suggests a name tableNameProblem accepts", () => {
   }
 })
 
-test("statusLabel names the four statuses and shows an unknown one as received", () => {
+test("statusLabel names the five statuses and shows an unknown one as received", () => {
+  assert.equal(statusLabel("receiving"), "Receiving")
   assert.equal(statusLabel("uploaded"), "Uploaded")
   assert.equal(statusLabel("ingesting"), "Loading")
   assert.equal(statusLabel("ingested"), "Loaded")
@@ -393,4 +396,53 @@ test("tableNameFault names the specific break and is null exactly when tableName
     assert.notEqual(tableNameProblem(name), null, name)
     assert.notEqual(tableNameFault(name), null, name)
   }
+})
+
+/** A file of `size` bytes without allocating it. */
+function fileOfSize(name: string, size: number): File {
+  const file = new File(["x"], name)
+  Object.defineProperty(file, "size", { value: size })
+  return file
+}
+
+test("planPick keeps the first ten files of a pick and counts the rest as left out", () => {
+  assert.equal(MAX_FILES, 10)
+  const picked = Array.from({ length: 12 }, (_, i) => fileOfSize(`f${i}.csv`, 10))
+  const { candidates, dropped } = planPick([], picked)
+  assert.equal(candidates.length, 10)
+  assert.equal(dropped, 2)
+  assert.deepEqual(
+    candidates.map((c) => c.file.name),
+    picked.slice(0, 10).map((f) => f.name)
+  )
+  assert.ok(candidates.every((c) => c.problem === null))
+})
+
+test("planPick counts the files already listed against the ten", () => {
+  const existing = Array.from({ length: 9 }, () => ({ size: 1, state: "received" }))
+  const { candidates, dropped } = planPick(existing, [fileOfSize("a.csv", 1), fileOfSize("b.csv", 1)])
+  assert.equal(candidates.length, 1)
+  assert.equal(dropped, 1)
+  assert.equal(planPick(Array.from({ length: 10 }, () => ({ size: 1, state: "received" })), [fileOfSize("c.csv", 1)]).dropped, 1)
+})
+
+test("planPick gives a file its own problem: a kind the API does not read, or one over the limit", () => {
+  const { candidates } = planPick(
+    [],
+    [fileOfSize("stock.XLSM", 10), fileOfSize("big.csv", MAX_UPLOAD_BYTES + 1), fileOfSize("ok.csv", 10)]
+  )
+  assert.match(candidates[0].problem ?? "", /not an \.xls or \.xlsx file/)
+  assert.match(candidates[1].problem ?? "", /over the 50 MB limit/)
+  assert.equal(candidates[2].problem, null)
+})
+
+test("planPick counts the 50 MB of one upload over all its files, and a refused file does not count", () => {
+  const half = MAX_UPLOAD_BYTES / 2
+  const { candidates } = planPick(
+    [{ size: half, state: "received" }, { size: MAX_UPLOAD_BYTES, state: "refused" }],
+    [fileOfSize("a.csv", half), fileOfSize("b.csv", 1), fileOfSize("c.csv", 1)]
+  )
+  assert.equal(candidates[0].problem, null, "exactly the limit in all")
+  assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 50 MB limit for one upload/)
+  assert.match(candidates[2].problem ?? "", /c\.csv would bring the files/)
 })

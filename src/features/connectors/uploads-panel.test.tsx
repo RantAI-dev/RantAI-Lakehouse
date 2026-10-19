@@ -83,6 +83,27 @@ describe("UploadsPanel", () => {
     expect(within(rowOf("fresh.csv")).getByText("Not measured")).toBeDefined()
   })
 
+  it("shows a file still being received as Receiving, with the size it announced, and offers no Load", async () => {
+    stubFetch(() => [
+      upload({ id: "up-5", originalFilename: "big.csv", status: "receiving", sizeBytes: 0, declaredSize: 20 * 1024 * 1024 }),
+    ])
+    render(<UploadsPanel />)
+    await screen.findByText("big.csv")
+    const row = within(rowOf("big.csv"))
+    expect(row.getByText("Receiving")).toBeDefined()
+    expect(row.getByText("20.0 MB")).toBeDefined()
+    expect(row.queryByText("Load")).toBeNull()
+    // It can still be deleted: that aborts the upload.
+    expect((row.getByRole("button", { name: "Delete big.csv" }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it("says in the empty state that CSV, TSV, Excel and Parquet files can be uploaded", async () => {
+    stubFetch(() => [])
+    render(<UploadsPanel />)
+    expect(await screen.findByText("No uploaded files")).toBeDefined()
+    expect(screen.getByText("Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables.")).toBeDefined()
+  })
+
   it("offers Load for an uploaded or failed file, opening the upload page on it, and for no other", async () => {
     stubFetch(() => [
       upload({ id: "up-1", originalFilename: "a.csv", status: "uploaded" }),

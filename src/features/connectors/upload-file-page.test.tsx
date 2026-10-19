@@ -4,6 +4,10 @@
 // preview shows what was detected and what is in force and reads again when a
 // setting changes, the choice to replace or add appears only for a table an
 // upload created, and a load is shown Loading, Loaded or Failed.
+//
+// Files are sent in pieces (DATA-17): the stub answers the session, the piece
+// and the completion routes, and a test that needs a bar to be seen moving
+// holds a piece's answer back.
 const url = { search: "" }
 mock.module("next/navigation", () => ({
   usePathname: () => "/connectors/upload",
@@ -74,18 +78,34 @@ function preview(over: Partial<UploadPreview> = {}): UploadPreview {
 
 type Call = { url: string; method: string; body: unknown }
 
+/** What a route answers: a response, or a function making a fresh one (a body can be read once). */
+type Answer<Args extends unknown[] = []> = Response | ((...args: Args) => Response | Promise<Response>)
+
 type Routes = {
   list?: Upload[] | Response
-  create?: Response
+  /** `POST /api/uploads/sessions`; the default opens `up-N` with 8 MiB pieces. */
+  session?: Answer<[{ filename: string; sizeBytes: number }]>
+  /** `PUT /api/uploads/{id}/parts/{n}`; the default stores the piece. */
+  part?: Answer<[string, number]>
+  /** `POST /api/uploads/{id}/complete`; the default is the stored upload. */
+  complete?: Answer<[string]>
   get?: (n: number) => Upload | Response
   preview?: (query: URLSearchParams) => UploadPreview | Response
   ingest?: Response
 }
 
+const PIECE = 8 * 1024 * 1024
+
+async function answer<Args extends unknown[]>(value: Answer<Args>, ...args: Args): Promise<Response> {
+  return typeof value === "function" ? value(...args) : value
+}
+
 /** Answers every request the page makes; records them in order. A request nobody expects throws. */
 function stubFetch(routes: Routes = {}): Call[] {
   const calls: Call[] = []
+  const names = new Map<string, string>()
   let gets = 0
+  let sessions = 0
   global.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const target = new URL(String(input), "http://console.test")
     const method = init?.method ?? "GET"
@@ -93,9 +113,33 @@ function stubFetch(routes: Routes = {}): Call[] {
     calls.push({ url: `${target.pathname}${target.search}`, method, body })
     const reply = (value: unknown) => (value instanceof Response ? value : json(value))
     if (target.pathname === "/api/uploads" && method === "GET") return reply(routes.list ?? [])
-    if (target.pathname === "/api/uploads" && method === "POST") {
-      if (routes.create) return routes.create
+    if (target.pathname === "/api/uploads/sessions" && method === "POST") {
+      const input = body as { filename: string; sizeBytes: number }
+      if (routes.session) return answer(routes.session, input)
+      sessions += 1
+      const id = `up-${sessions}`
+      names.set(id, input.filename)
+      return json(
+        {
+          upload: upload({ id, originalFilename: input.filename, status: "receiving", declaredSize: input.sizeBytes, sizeBytes: 0 }),
+          partSize: PIECE,
+          partCount: Math.max(1, Math.ceil(input.sizeBytes / PIECE)),
+        },
+        201
+      )
     }
+    const piece = /^\/api\/uploads\/([^/]+)\/parts\/(\d+)$/.exec(target.pathname)
+    if (piece && method === "PUT") {
+      const number = Number(piece[2])
+      if (routes.part) return answer(routes.part, piece[1], number)
+      return json({ partNumber: number, sizeBytes: (init?.body as Blob).size })
+    }
+    const done = /^\/api\/uploads\/([^/]+)\/complete$/.exec(target.pathname)
+    if (done && method === "POST") {
+      if (routes.complete) return answer(routes.complete, done[1])
+      return json(upload({ id: done[1], originalFilename: names.get(done[1]) ?? "stock.csv" }))
+    }
+    if (/^\/api\/uploads\/[^/]+$/.test(target.pathname) && method === "DELETE") return new Response(null, { status: 204 })
     if (target.pathname.endsWith("/preview") && routes.preview) return reply(routes.preview(target.searchParams))
     if (target.pathname.endsWith("/ingest") && method === "POST" && routes.ingest) return routes.ingest
     if (/^\/api\/uploads\/[^/]+$/.test(target.pathname) && method === "GET" && routes.get) {
@@ -107,8 +151,17 @@ function stubFetch(routes: Routes = {}): Call[] {
   return calls
 }
 
+function chooseFiles(files: File[]) {
+  fireEvent.change(screen.getByLabelText("Choose files"), { target: { files } })
+}
+
 function chooseFile(file: File) {
-  fireEvent.change(screen.getByLabelText("Choose a file"), { target: { files: [file] } })
+  chooseFiles([file])
+}
+
+/** The calls of one kind, by their path. */
+function sent(calls: Call[], method: string, pattern: RegExp) {
+  return calls.filter((c) => c.method === method && pattern.test(c.url))
 }
 
 function next() {
@@ -130,23 +183,23 @@ describe("UploadFilePage, first step", () => {
     expect(alert.textContent).toContain("50 MB limit")
     expect(next().disabled).toBe(true)
     fireEvent.click(next())
-    expect(calls.filter((c) => c.method === "POST")).toEqual([])
+    expect(calls.filter((c) => c.method !== "GET")).toEqual([])
   })
 
-  it("shows the API's refusal in place, word for word, and stays on the first step", async () => {
+  it("shows the API's refusal of a file in its row, word for word, and stays on the first step", async () => {
     const sentence = "This looks like a workbook. Save it as CSV and upload that."
-    stubFetch({ create: json({ error: sentence }, 400) })
+    stubFetch({ complete: () => json({ error: sentence }, 400) })
     render(<UploadFilePage />)
-    // A name the console does not refuse by itself (it refuses .xlsx before any
+    // A name the console does not refuse by itself (it refuses .xlsm before any
     // request, see below), so the API's own refusal by content is what shows.
     chooseFile(new File(["x"], "stock.dat"))
-    fireEvent.click(next())
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toBe(sentence)
-    // The file is still chosen (shown as a row), and the same control can pick another.
-    expect(screen.getByLabelText("Choose another")).toBeDefined()
+    // The file is still listed, and the same control can pick another.
     expect(screen.getByText("stock.dat")).toBeDefined()
+    expect(screen.getByLabelText("Choose files")).toBeDefined()
+    expect(next().disabled).toBe(true)
   })
 
   it("refuses a workbook the API does not read by its name before any request, saying what to save it as", async () => {
@@ -160,7 +213,7 @@ describe("UploadFilePage, first step", () => {
     expect(alert.textContent).toContain("save the sheet as .xlsx or CSV first")
     expect(next().disabled).toBe(true)
     fireEvent.click(next())
-    expect(calls.filter((c) => c.method === "POST")).toEqual([])
+    expect(calls.filter((c) => c.method !== "GET")).toEqual([])
   })
 
   it("states the limits as short facts up front, and suggests text and Excel files in the picker", () => {
@@ -170,12 +223,14 @@ describe("UploadFilePage, first step", () => {
       screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
     )
     expect(facts.get("Accepted")).toBe("CSV, TSV, .xls, .xlsx, .parquet")
-    expect(facts.get("Size")).toBe("Up to 50 MB")
+    expect(facts.get("Files")).toContain("Up to 10 at once")
+    expect(facts.get("Size")).toBe("Up to 50 MB in all")
     expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, archives")
     expect(facts.get("Workbooks")).toContain("One sheet is loaded")
     expect(facts.get("Parquet")).toContain("binary or nested column is refused")
-    const input = screen.getByLabelText("Choose a file") as HTMLInputElement
+    const input = screen.getByLabelText("Choose files") as HTMLInputElement
     expect(input.type).toBe("file")
+    expect(input.multiple).toBe(true)
     expect(input.accept).toContain(".csv")
     expect(input.accept).toContain(".tsv")
     expect(input.accept).toContain(".xls")
@@ -186,22 +241,22 @@ describe("UploadFilePage, first step", () => {
   it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
     stubFetch()
     render(<UploadFilePage />)
-    expect(screen.getByText("Drop a file here, or choose one")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV, Excel or Parquet file in as a raw table/)).toBeDefined()
-    const input = screen.getByLabelText("Choose a file")
-    const button = screen.getByText("Choose a file", { selector: "label" })
+    expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
+    expect(screen.getByText(/CSV, TSV, Excel or Parquet files in as raw tables/)).toBeDefined()
+    const input = screen.getByLabelText("Choose files")
+    const button = screen.getByText("Choose files", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)
   })
 
-  it("highlights the area while a file is dragged over it, and takes the dropped file as a row", async () => {
+  it("highlights the area while files are dragged over it, and takes the dropped files as rows that start to be sent", async () => {
     const calls = stubFetch()
     render(<UploadFilePage />)
-    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
+    const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     expect(area.dataset.dragging).toBe("false")
 
     fireEvent.dragOver(area)
     expect(area.dataset.dragging).toBe("true")
-    expect(screen.getByText("Release to choose this file")).toBeDefined()
+    expect(screen.getByText("Release to choose these files")).toBeDefined()
     fireEvent.dragLeave(area)
     expect(area.dataset.dragging).toBe("false")
 
@@ -210,14 +265,16 @@ describe("UploadFilePage, first step", () => {
     fireEvent.drop(area, { dataTransfer: { files: [file] } })
     expect(area.dataset.dragging).toBe("false")
     await waitFor(() => expect(screen.getByText("stock.csv")).toBeDefined())
-    expect(screen.getByText(formatBytes(file.size))).toBeDefined()
-    expect(screen.getByText("Choose another")).toBeDefined()
-    expect(screen.queryByText("Drop a file here, or choose one")).toBeNull()
-    expect(next().disabled).toBe(false)
-    expect(calls.filter((c) => c.method === "POST")).toEqual([])
+    expect(screen.getByText(new RegExp(formatBytes(file.size)))).toBeDefined()
+    // The drop area stays, so more files can be added.
+    expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
+    await waitFor(() => expect(next().disabled).toBe(false))
+    const session = sent(calls, "POST", /\/api\/uploads\/sessions$/)
+    expect(session.length).toBe(1)
+    expect(session[0].body).toEqual({ filename: "stock.csv", sizeBytes: file.size })
   })
 
-  it("marks the chosen file by its format: green spreadsheet and XLS/XLSX, text and CSV/TSV, neutral otherwise, in any case", () => {
+  it("marks the chosen files by their format: green spreadsheet and XLS/XLSX, text and CSV/TSV, neutral otherwise, in any case", () => {
     stubFetch()
     render(<UploadFilePage />)
     const cases: [string, string | null, string, string][] = [
@@ -230,25 +287,24 @@ describe("UploadFilePage, first step", () => {
       ["notes.txt", "TXT", "other", "text-muted-foreground"],
       ["export", null, "other", "text-muted-foreground"],
     ]
-    for (const [name, label, kind, tone] of cases) {
-      // After the first file the label reads "Choose another"; the input is the same.
-      fireEvent.change(document.getElementById("upload-file-input") as HTMLInputElement, {
-        target: { files: [new File(["x"], name)] },
-      })
-      const mark = document.querySelector("[data-file-mark]") as HTMLElement
+    chooseFiles(cases.map(([name]) => new File(["x"], name)))
+    const marks = Array.from(document.querySelectorAll("[data-file-mark]")) as HTMLElement[]
+    expect(marks.length).toBe(cases.length)
+    cases.forEach(([, label, kind, tone], index) => {
+      const mark = marks[index]
       expect(mark.dataset.fileMark).toBe(kind)
       expect(mark.className).toContain(tone)
       expect(mark.getAttribute("aria-hidden")).toBe("true")
       expect(mark.textContent).toBe(label ?? "")
       // Same size whatever the kind: the mark never changes the row's height.
       expect(mark.className).toContain("size-10")
-    }
+    })
   })
 
-  it("refuses a dropped file by the same checks as a chosen one, and a drop with no file keeps the file chosen", async () => {
+  it("refuses a dropped file by the same checks as a chosen one, and a drop with no file changes nothing", async () => {
     stubFetch()
     render(<UploadFilePage />)
-    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
+    const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     fireEvent.drop(area, { dataTransfer: { files: [new File(["x"], "stock.XLSM")] } })
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("not an .xls or .xlsx file")
@@ -256,85 +312,210 @@ describe("UploadFilePage, first step", () => {
 
     fireEvent.drop(area, { dataTransfer: { files: [] } })
     expect(screen.getByText("stock.XLSM")).toBeDefined()
+    expect(screen.getAllByRole("alert").length).toBe(1)
   })
 
-  it("says only the first of several files was taken", async () => {
-    stubFetch()
+  it("takes up to ten files at once, sends each, and says how many were left out of a larger pick", async () => {
+    const calls = stubFetch()
     render(<UploadFilePage />)
-    const area = screen.getByText("Drop a file here, or choose one").closest("[data-dragging]") as HTMLElement
-    fireEvent.drop(area, { dataTransfer: { files: [CSV(), new File(["x"], "other.csv")] } })
-    expect(await screen.findByText("One file at a time: the first one was taken.")).toBeDefined()
-    expect(screen.getByText("stock.csv")).toBeDefined()
+    const picked = Array.from({ length: 11 }, (_, i) => new File([`a,b\n${i},1\n`], `part-${i}.csv`))
+    chooseFiles(picked)
+
+    expect(await screen.findByText(/the first ones were taken and 1 was left out/)).toBeDefined()
+    expect(screen.getAllByRole("progressbar").length).toBe(10)
+    expect(screen.queryByText("part-10.csv")).toBeNull()
+    await waitFor(() => expect(sent(calls, "POST", /\/complete$/).length).toBe(10))
+    expect(sent(calls, "POST", /\/sessions$/).length).toBe(10)
+    // More files cannot be added once ten are listed.
+    chooseFiles([new File(["x"], "extra.csv")])
+    expect(await screen.findByText(/the first ones were taken and 1 was left out/)).toBeDefined()
+    expect(screen.queryByText("extra.csv")).toBeNull()
+  })
+
+  it("shows a bar per file that moves as the API acknowledges pieces, then says Received", async () => {
+    let release: (() => void) | null = null
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    stubFetch({
+      // Pieces of 4 bytes: the 8-byte file is two pieces; the second is held back.
+      session: ({ filename, sizeBytes }) =>
+        json(
+          { upload: upload({ id: "up-9", originalFilename: filename, status: "receiving", sizeBytes: 0 }), partSize: 4, partCount: Math.ceil(sizeBytes / 4) },
+          201
+        ),
+      part: async (_id, n) => {
+        if (n === 2) await held
+        return json({ partNumber: n, sizeBytes: 4 })
+      },
+    })
+    render(<UploadFilePage />)
+    chooseFile(new File(["12345678"], "bars.csv"))
+
+    const bar = await screen.findByRole("progressbar", { name: "bars.csv sent" })
+    await waitFor(() => expect(bar.getAttribute("aria-valuenow")).toBe("50"))
+    expect(screen.getByText(/Sending/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+
+    release!()
+    await waitFor(() => expect(bar.getAttribute("aria-valuenow")).toBe("100"))
+    await screen.findByText(/Received/)
+    await waitFor(() => expect(next().disabled).toBe(false))
   })
 
   it("sends an .xlsx instead of refusing it by name, and lands on a Check step with a sheet picker", async () => {
     const calls = stubFetch({
-      create: json({ ...upload({ originalFilename: "stock.xlsx" }), workbook: WORKBOOK }, 201),
+      complete: (id) => json({ ...upload({ id, originalFilename: "stock.xlsx" }), workbook: WORKBOOK }),
       preview: (q) => workbookPreview(q.get("sheet") ?? WORKBOOK.defaultSheet),
     })
     render(<UploadFilePage />)
     chooseFile(new File(["x"], "stock.xlsx"))
     expect(screen.queryByRole("alert")).toBeNull()
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
 
     await screen.findByLabelText("Sheet")
-    expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/uploads")
+    expect(sent(calls, "POST", /\/api\/uploads\/sessions$/).length).toBe(1)
   })
 
   it("sends a .parquet instead of refusing it by name, and lands on a Check step without controls", async () => {
-    const calls = stubFetch({
-      create: json({ ...upload({ originalFilename: "orders.parquet" }), parquet: PARQUET }, 201),
+    stubFetch({
+      complete: (id) => json({ ...upload({ id, originalFilename: "orders.parquet" }), parquet: PARQUET }),
       preview: () => parquetPreview(),
     })
     render(<UploadFilePage />)
     chooseFile(new File(["x"], "orders.parquet"))
     expect(screen.queryByRole("alert")).toBeNull()
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
 
     await screen.findByRole("columnheader", { name: /sku/ })
-    expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/uploads")
   })
 
-  it("does not show a proxy's plain-text 500 or 413 as such: it says the upload did not reach the service and names the limit", async () => {
-    for (const status of [500, 413]) {
-      stubFetch({ create: new Response("Internal Server Error", { status }) })
-      render(<UploadFilePage />)
-      chooseFile(CSV())
-      fireEvent.click(next())
+  it("does not show a proxy's plain-text 413 as such: it says the upload did not reach the service and names the limit", async () => {
+    stubFetch({ session: () => new Response("Request Entity Too Large", { status: 413 }) })
+    render(<UploadFilePage />)
+    chooseFile(CSV())
 
-      const alert = await screen.findByRole("alert")
-      expect(alert.textContent).toContain("did not reach the service")
-      expect(alert.textContent).toContain(`${status}`)
-      expect(alert.textContent).toContain("50 MB")
-      expect(alert.textContent).not.toContain("Internal Server Error")
-      cleanup()
-    }
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("did not reach the service")
+    expect(alert.textContent).toContain("413")
+    expect(alert.textContent).toContain("50 MB")
+    expect(alert.textContent).not.toContain("Request Entity Too Large")
   })
 
-  it("sends the file as a multipart form and moves to the Check step, with the repeated-file notice", async () => {
+  it("keeps trying when a proxy answers 500: the file waits for the connection, with no alert, and is not refused", async () => {
+    stubFetch({ part: () => new Response("Internal Server Error", { status: 500 }) })
+    render(<UploadFilePage />)
+    chooseFile(CSV())
+
+    expect(await screen.findByText(/Waiting for the connection/)).toBeDefined()
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(screen.queryByText(/Internal Server Error/)).toBeNull()
+    expect(next().disabled).toBe(true)
+  })
+
+  it("waits as the API asks when it has no free place, then sends again by itself", async () => {
+    let refused = true
+    stubFetch({
+      part: (_id, n) => {
+        if (refused) {
+          refused = false
+          return new Response(JSON.stringify({ error: TOO_MANY_UPLOADS }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": "0" },
+          })
+        }
+        return json({ partNumber: n, sizeBytes: 1 })
+      },
+    })
+    render(<UploadFilePage />)
+    chooseFile(CSV())
+
+    await screen.findByText(/Received/)
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(next().disabled).toBe(false)
+  })
+
+  it("carries on with the first file that arrives and moves to the Check step with the repeated-file notice", async () => {
     const calls = stubFetch({
-      create: json({ ...upload(), duplicateOf: upload({ id: "up-0", originalFilename: "stock_old.csv", bronzeTable: "stock" }) }, 201),
+      complete: (id) =>
+        json({ ...upload({ id }), duplicateOf: upload({ id: "up-0", originalFilename: "stock_old.csv", bronzeTable: "stock" }) }),
       preview: () => preview(),
     })
     render(<UploadFilePage />)
     chooseFile(CSV())
+    await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
 
     await screen.findByLabelText("Encoding")
-    const post = calls.find((c) => c.method === "POST")
-    expect(post?.url).toBe("/api/uploads")
-    expect(post?.body).toBeInstanceOf(FormData)
+    // The order of the requests: open, one piece, complete.
+    const writes = calls.filter((c) => c.method !== "GET" && c.url.startsWith("/api/uploads/"))
+    expect(writes.map((c) => `${c.method} ${c.url}`)).toEqual([
+      "POST /api/uploads/sessions",
+      "PUT /api/uploads/up-1/parts/1",
+      "POST /api/uploads/up-1/complete",
+    ])
+    expect(writes[1].body).toBeInstanceOf(Blob)
     const notice = screen.getByText(/This file was uploaded before/)
     expect(notice.textContent).toContain("stock_old.csv")
     expect(notice.textContent).toMatch(/Oct.*2026|2026.*Oct/)
   })
 
-  it("says a refusal for a missing permission through the existing state", async () => {
-    stubFetch({ create: json({ error: "You do not have permission to do this." }, 403) })
+  it("says the others are still being sent on the next steps, and where the ones that arrived are loaded from", async () => {
+    let release: (() => void) | null = null
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    stubFetch({
+      part: async (id, n) => {
+        // The second file's piece is held back.
+        if (id === "up-2") await held
+        return json({ partNumber: n, sizeBytes: 1 })
+      },
+      preview: () => preview(),
+    })
+    render(<UploadFilePage />)
+    chooseFiles([CSV(), new File(["a,b\n1,2\n"], "second.csv")])
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+
+    expect(screen.getByText(/1 other file is still being sent/)).toBeDefined()
+    release!()
+    await waitFor(() => expect(screen.getByText(/1 other file has arrived/)).toBeDefined())
+    expect(screen.getByText(/load the other from Uploaded files/)).toBeDefined()
+  })
+
+  it("takes a file out of the list, and removes the unfinished upload from the API", async () => {
+    let release: (() => void) | null = null
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const calls = stubFetch({
+      part: async (_id, n) => {
+        await held
+        return json({ partNumber: n, sizeBytes: 1 })
+      },
+    })
     render(<UploadFilePage />)
     chooseFile(CSV())
-    fireEvent.click(next())
-    expect(await screen.findByText("You don't have access")).toBeDefined()
+    await screen.findByRole("progressbar", { name: "stock.csv sent" })
+    await waitFor(() => expect(sent(calls, "PUT", /parts\/1$/).length).toBe(1))
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove stock.csv" }))
+    expect(screen.queryByText("stock.csv")).toBeNull()
+    await waitFor(() => expect(sent(calls, "DELETE", /\/api\/uploads\/up-1$/).length).toBe(1))
+    release!()
+  })
+
+  it("shows a refusal for a missing permission in the file's row, in the API's sentence", async () => {
+    stubFetch({ session: () => json({ error: "You do not have permission to do this." }, 403) })
+    render(<UploadFilePage />)
+    chooseFile(CSV())
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe("You do not have permission to do this.")
+    expect(next().disabled).toBe(true)
   })
 })
 
@@ -803,7 +984,7 @@ describe("UploadFilePage, after Load", () => {
     expect(screen.getByRole("button", { name: "Try again" })).toBeDefined()
     expect(screen.getByRole("button", { name: "Change settings" })).toBeDefined()
     fireEvent.click(screen.getByRole("button", { name: "Upload another file" }))
-    expect(await screen.findByText("Drop a file here, or choose one")).toBeDefined()
+    expect(await screen.findByText("Drop files here, or choose some")).toBeDefined()
   })
 
   it("sends append when Add to its rows was chosen for a table an upload created", async () => {
@@ -982,26 +1163,6 @@ describe("UploadFilePage, limits", () => {
     expect(alert.textContent).toBe(TOO_MANY_COLUMNS)
     expect((screen.getByLabelText("Delimiter") as HTMLSelectElement).disabled).toBe(false)
     expect(next().disabled).toBe(true)
-  })
-
-  it("shows the too-many-uploads sentence for a file that was not accepted and sends again on the next press", async () => {
-    const calls = stubFetch({ create: json({ error: TOO_MANY_UPLOADS }, 429) })
-    render(<UploadFilePage />)
-    chooseFile(CSV())
-    fireEvent.click(next())
-
-    const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toBe(TOO_MANY_UPLOADS)
-    // The form is as it was: the file is still chosen, so the file control is
-    // the one the picked state shows ("Choose another"), and Next is on.
-    // PR #86 review round 2, BLOCKER 1: main's reworked wizard labels the input
-    // "Choose a file" only before a file is chosen, so this is the control the
-    // step actually shows here.
-    expect(screen.getByText("stock.csv")).toBeDefined()
-    expect(screen.getByLabelText("Choose another")).toBeDefined()
-    expect(next().disabled).toBe(false)
-    fireEvent.click(next())
-    await waitFor(() => expect(calls.filter((c) => c.method === "POST").length).toBe(2))
   })
 
   it("shows the too-many-uploads sentence for a load that was not started and leaves Load available", async () => {

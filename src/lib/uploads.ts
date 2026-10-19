@@ -10,6 +10,7 @@
  */
 
 import { formatBytes } from "@/lib/format"
+import type { Candidate } from "@/lib/upload-queue"
 import type {
   IngestUploadInput,
   Upload,
@@ -23,6 +24,9 @@ import type {
  * a byte of it is sent.
  */
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+/** The most files one upload takes (decision 5 of `docs/core/features/upload-big-files-and-more-formats.md`). */
+export const MAX_FILES = 10
 
 /** The longest raw table name the API accepts (its `MAX_TABLE_NAME_CHARS`). */
 export const MAX_TABLE_NAME_CHARS = 128
@@ -106,6 +110,8 @@ export function suggestTableName(fileName: string): string {
 /** What a status is called on screen. A status this version does not know is shown as received. */
 export function statusLabel(status: UploadStatus): string {
   switch (status) {
+    case "receiving":
+      return "Receiving"
     case "uploaded":
       return "Uploaded"
     case "ingesting":
@@ -258,6 +264,41 @@ export function fileKindProblem(name: string): string | null {
 /** Why a chosen file cannot be sent (its kind by name, then its size), or `null`. */
 export function fileProblem(name: string, sizeBytes: number): string | null {
   return fileKindProblem(name) ?? fileSizeProblem(name, sizeBytes)
+}
+
+/**
+ * What a pick of files becomes: `candidates` for the upload queue, in order,
+ * and how many files of the pick were left out because the list is full.
+ *
+ * - The list holds at most [`MAX_FILES`]; the first files of a pick are kept
+ *   (decision 5) and `dropped` counts the rest.
+ * - A file with a problem of its own ([`fileProblem`]) is listed with it.
+ * - The 50 MB limit counts all the files of one upload together (decision 2):
+ *   a file that would take the sum over it is listed with a sentence saying
+ *   so and is not sent, so a person never waits for files the load would
+ *   refuse. `existing` is what the list holds already (a refused file does not
+ *   count: it is not sent).
+ */
+export function planPick(
+  existing: readonly { readonly size: number; readonly state: string }[],
+  picked: readonly File[]
+): { candidates: Candidate[]; dropped: number } {
+  const room = Math.max(0, MAX_FILES - existing.length)
+  const taken = picked.slice(0, room)
+  let total = existing.filter((f) => f.state !== "refused").reduce((sum, f) => sum + f.size, 0)
+  const candidates = taken.map((file): Candidate => {
+    const own = fileProblem(file.name, file.size)
+    if (own !== null) return { file, problem: own }
+    if (total + file.size > MAX_UPLOAD_BYTES) {
+      return {
+        file,
+        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 50 MB limit for one upload (all its files together). Remove a file, then choose this one again.`,
+      }
+    }
+    total += file.size
+    return { file, problem: null }
+  })
+  return { candidates, dropped: picked.length - taken.length }
 }
 
 /**

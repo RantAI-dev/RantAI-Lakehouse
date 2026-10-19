@@ -10,12 +10,13 @@
  */
 
 /**
- * `uploaded` (stored, never loaded), `ingesting` (a load is running),
- * `ingested` (loaded) or `failed`. Widened with `| string` because the Rust
+ * `receiving` (a chunked upload whose pieces are still arriving: it cannot be
+ * previewed or loaded yet), `uploaded` (stored, never loaded), `ingesting` (a
+ * load is running), `ingested` (loaded) or `failed`. Widened with `| string` because the Rust
  * field is a plain `String` (`lakehouse_store::uploads::Upload::status`), so
  * the client stays honest about a value a later version might add.
  */
-export type UploadStatus = "uploaded" | "ingesting" | "ingested" | "failed" | string
+export type UploadStatus = "receiving" | "uploaded" | "ingesting" | "ingested" | "failed" | string
 
 /**
  * What a load does with the rows a table already holds: `replace` swaps them
@@ -103,6 +104,12 @@ export type Upload = {
   /** Display name of whoever uploaded it. */
   uploadedBy: string
   status: UploadStatus
+  /**
+   * The size the client announced when it opened a chunked upload. Present only
+   * on a `receiving` upload or one that arrived in pieces (`sizeBytes` is `0`
+   * until the pieces are assembled).
+   */
+  declaredSize?: number
   /** ISO 8601, UTC. When the bytes were stored. */
   createdAt: string
   /** ISO 8601, UTC. When the row last changed state; for a load, the time it was claimed. */
@@ -148,6 +155,30 @@ export type CreateUploadResponse = Upload & {
   workbook?: UploadWorkbook
   /** Present when the file is a Parquet file: its columns with their declared types. */
   parquet?: UploadParquet
+}
+
+/**
+ * `POST /api/uploads/sessions`'s response (201): the new `receiving` upload and
+ * the shape of the pieces to send (`DATA-17`). Every piece but the last is
+ * exactly `partSize` bytes; pieces are numbered `1..=partCount`.
+ */
+export type UploadSession = {
+  upload: Upload
+  partSize: number
+  partCount: number
+}
+
+/** `GET /api/uploads/{id}/parts`: the numbers of the pieces the API holds, ascending, so a client that lost its connection sends only the rest. */
+export type UploadParts = {
+  received: number[]
+  partSize: number
+  partCount: number
+}
+
+/** `PUT /api/uploads/{id}/parts/{n}`'s response: the piece the API stored. */
+export type UploadPartReceipt = {
+  partNumber: number
+  sizeBytes: number
 }
 
 /**
@@ -219,6 +250,35 @@ export interface UploadService {
    * each with its own sentence.
    */
   create(file: File, signal?: AbortSignal): Promise<CreateUploadResponse>
+  /**
+   * `POST /api/uploads/sessions` (`DATA-17`): opens a chunked upload for a file
+   * of `sizeBytes` bytes. Refused (400) for a size of 0 or above the limit,
+   * each with the API's sentence.
+   */
+  createSession(
+    input: { filename: string; sizeBytes: number },
+    signal?: AbortSignal
+  ): Promise<UploadSession>
+  /**
+   * `PUT /api/uploads/{id}/parts/{n}`: sends piece `number` (from 1) as raw
+   * bytes. A piece sent again replaces the earlier copy, so a retry is safe.
+   * A 429 carries `retryAfterSecs` on the `ServiceError`.
+   */
+  putPart(
+    id: string,
+    number: number,
+    bytes: Blob,
+    signal?: AbortSignal
+  ): Promise<UploadPartReceipt>
+  /** `GET /api/uploads/{id}/parts`: which pieces the API holds. 409 when the upload is no longer receiving. */
+  listParts(id: string, signal?: AbortSignal): Promise<UploadParts>
+  /**
+   * `POST /api/uploads/{id}/complete`: assembles the pieces and checks the
+   * file. The answer is `create`'s: the upload and, for a workbook or a
+   * Parquet file, its facts, with `duplicateOf` when the tenant holds the same
+   * file. 409 lists the pieces still missing.
+   */
+  complete(id: string, signal?: AbortSignal): Promise<CreateUploadResponse>
   /**
    * `GET /api/uploads/{id}/preview`. Each option given overrides detection;
    * one left out is detected. `headerRow` is zero-based. `sheet` chooses the

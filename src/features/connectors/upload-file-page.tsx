@@ -8,18 +8,19 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { fileProblem, isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
+import { isUploadedTable, suggestTableName, tableNameProblem } from "@/lib/uploads"
 import { uploadService } from "@/services"
 import type { IngestUploadInput, Upload, UploadLoadMode } from "@/services/contracts/uploads"
 import { UploadCheckStep, useUploadPreview } from "./upload-check-step"
 import { FileStep } from "./upload-file-step"
-import { DuplicateNotice, LoadFailure, Refusal } from "./upload-parts"
+import { DuplicateNotice, LoadFailure } from "./upload-parts"
 import { UploadReviewStep } from "./upload-review-step"
 import { UploadRunView } from "./upload-run-view"
 import { UploadTableStep } from "./upload-table-step"
+import { useUploadQueue } from "./use-upload-queue"
 
 const STEPS: FormStep[] = [
-  { id: "file", label: "File", description: "Choose a CSV, TSV, Excel or Parquet file" },
+  { id: "file", label: "File", description: "Choose CSV, TSV, Excel or Parquet files" },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
   { id: "review", label: "Review", description: "Load the file" },
@@ -48,12 +49,17 @@ function setAddress(pathname: string, id: string | null) {
  * With `?id=` (the list's "Load", or a refresh) the upload exists already, so
  * the first step is skipped. Everything the API refuses is shown where the
  * person is, in the API's own sentence.
+ *
+ * Files are sent in pieces from the moment they are picked (`DATA-17`, the
+ * upload queue), up to ten at a time. The next steps carry on with the first
+ * file that arrives; the rest are loaded from the list of uploaded files until
+ * a load can take several (a later slice of the same item).
  */
 function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; readonly pollMs?: number }) {
   const pathname = usePathname()
   const [upload, setUpload] = React.useState<Upload | null>(initial)
   const [duplicate, setDuplicate] = React.useState<Upload | null>(null)
-  const [file, setFile] = React.useState<File | null>(null)
+  const [leftOut, setLeftOut] = React.useState(0)
   const [step, setStep] = React.useState(initial ? CHECK_STEP : FILE_STEP)
   const [run, setRun] = React.useState<Upload | null>(initial?.status === "ingesting" ? initial : null)
   const [tableName, setTableName] = React.useState(
@@ -66,7 +72,9 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   // (only then is there a choice to make). If the list cannot be read, no
   // choice is offered and the load replaces, as it does for a new table.
   const uploads = useService((s) => uploadService.list(s), [])
-  const send = useServiceAction((signal, f: File) => uploadService.create(f, signal))
+  const queue = useUploadQueue()
+  // The file the next steps carry on with: the first one that was not refused.
+  const primary = queue.files.find((f) => f.state !== "refused") ?? null
   const ingest = useServiceAction((signal, id: string, input: IngestUploadInput) =>
     uploadService.ingest(id, input, signal)
   )
@@ -78,23 +86,22 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   function reset() {
     setUpload(null)
     setDuplicate(null)
-    setFile(null)
+    setLeftOut(0)
+    queue.clear()
     setStep(FILE_STEP)
     setRun(null)
     setTableName("")
     setMode("replace")
     view.reset()
-    send.reset()
     ingest.reset()
     setAddress(pathname, null)
   }
 
-  async function changeStep(next: number) {
+  function changeStep(next: number) {
     if (step === FILE_STEP && next > FILE_STEP && upload === null) {
-      if (file === null) return
-      const created = await send.run(file)
-      if (created === null) return
-      const { duplicateOf, ...stored } = created
+      // Only a file the API has assembled and accepted can be checked.
+      if (primary === null || primary.result === null) return
+      const { duplicateOf, ...stored } = primary.result
       setUpload(stored)
       setDuplicate(duplicateOf ?? null)
       setTableName(suggestTableName(stored.originalFilename))
@@ -140,17 +147,35 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
 
   const canProceed =
     step === FILE_STEP
-      ? upload !== null || (file !== null && fileProblem(file.name, file.size) === null)
+      ? upload !== null || primary?.state === "received"
       : step === CHECK_STEP
         ? view.ready
         : step === TABLE_STEP
           ? tableName !== "" && nameProblem === null
           : view.ready && tableName !== "" && nameProblem === null
 
+  // The files after the first are not part of this load (a later slice lets
+  // one load take several): say where they go, and that they need the page.
+  const others = queue.files.filter((f) => f.state !== "refused" && f.result?.id !== upload?.id)
+  const stillSending = others.filter((f) => f.state !== "received").length
+  const arrived = others.length - stillSending
+
   const notices =
     upload !== null && step !== FILE_STEP ? (
       <div className="space-y-3">
         {duplicate !== null ? <DuplicateNotice earlier={duplicate} /> : null}
+        {stillSending > 0 ? (
+          <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
+            {stillSending === 1 ? "1 other file is" : `${stillSending} other files are`} still being sent. Keep this page
+            open until {stillSending === 1 ? "it arrives" : "they arrive"}.
+          </p>
+        ) : null}
+        {arrived > 0 ? (
+          <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
+            {arrived === 1 ? "1 other file has" : `${arrived} other files have`} arrived. This load takes the first file;
+            load {arrived === 1 ? "the other" : "each of the others"} from Uploaded files on the Sources page.
+          </p>
+        ) : null}
         {upload.status === "failed" ? (
           <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 space-y-1">
             <p className="text-sm font-medium">The last load of this file failed.</p>
@@ -170,24 +195,22 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       // frame; from `lg` the pattern's own two columns apply.
       className="grid-cols-[minmax(0,1fr)]"
       currentIndex={step}
-      onStepChange={(next) => void changeStep(next)}
+      onStepChange={changeStep}
       canProceed={canProceed}
       onSubmit={() => void load()}
       submitLabel="Load"
-      submitting={send.status === "pending" || ingest.status === "pending"}
-      submittingLabel={send.status === "pending" ? "Sending…" : "Starting…"}
+      submitting={ingest.status === "pending"}
+      submittingLabel="Starting…"
     >
       {notices}
       {step === FILE_STEP ? (
         <FileStep
-          file={file}
-          onFile={(next) => {
-            send.reset()
-            setFile(next)
-          }}
+          files={queue.files}
+          onPick={(picked) => setLeftOut(queue.add(picked))}
+          onRemove={queue.remove}
+          leftOut={leftOut}
           sent={upload}
           onChooseAnother={reset}
-          refusal={send.error !== null ? <Refusal error={send.error} /> : null}
         />
       ) : null}
       {step === CHECK_STEP ? <UploadCheckStep view={view} /> : null}
@@ -232,7 +255,7 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring a CSV, TSV, Excel or Parquet file in as a raw table. Check how it is read, name the table, then load it."
+        description="Bring CSV, TSV, Excel or Parquet files in as raw tables. Check how the first one is read, name the table, then load it."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

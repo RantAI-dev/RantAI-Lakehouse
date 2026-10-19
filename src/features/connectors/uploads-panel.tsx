@@ -63,7 +63,7 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
     return (
       <EmptyState
         title="No uploaded files"
-        description="Upload a CSV or TSV file to bring it in as a raw table."
+        description="Upload CSV, TSV, Excel or Parquet files to bring them in as raw tables."
         action={
           <Button size="sm" render={<Link href="/connectors/upload" />}>
             <UploadIcon data-icon="inline-start" />
@@ -103,7 +103,10 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
                 <TableCell className="max-w-64 truncate font-medium" title={upload.originalFilename}>
                   {upload.originalFilename}
                 </TableCell>
-                <TableCell>{formatBytes(upload.sizeBytes)}</TableCell>
+                <TableCell>
+                  {/* A file still being received has stored no bytes yet: show the size it announced. */}
+                  {formatBytes(upload.status === "receiving" ? (upload.declaredSize ?? 0) : upload.sizeBytes)}
+                </TableCell>
                 <TableCell>
                   <div className="space-y-1">
                     <UploadStatusPill status={upload.status} />
