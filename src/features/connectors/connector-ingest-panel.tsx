@@ -162,7 +162,9 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
  * no other adapter runs them (SRC-10 decision 2).
  */
 function loadModesFor(adapter: string): LoadMode[] {
-  return adapter === "sql"
+  // SRC-3 AD6: a business-app object loads incrementally by the cursor its vendor declares (the finder shows
+  // which objects have one), so `saas` offers the incremental modes too.
+  return adapter === "sql" || adapter === "saas"
     ? ["replace", "incremental", "append", "replace_dedup", "incremental_dedup", "history"]
     : ["replace", "append", "replace_dedup", "history"]
 }
@@ -171,7 +173,7 @@ function loadModesFor(adapter: string): LoadMode[] {
 function missingModesNote(modes: LoadMode[]): string | null {
   return modes.includes("incremental")
     ? null
-    : "Adding only new rows, with or without one row per key, is offered for SQL sources only: they can ask the source for just the new rows."
+    : "Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only: they can ask the source for just the new rows."
 }
 
 const isDedup = (mode: LoadMode) => mode === "replace_dedup" || mode === "incremental_dedup"
@@ -212,12 +214,13 @@ export function loadModeProblem(selected: {
  * `SRC-11` decision 9: the sources whose columns the product lists before loading, so a column can be left
  * out: `sql` connectors on the PostgreSQL, MySQL (MariaDB uses it) or SQL Server driver. Oracle is listed by
  * `SRC-13` but the API refuses `excludedColumns` for it (`validate_excluded_columns`), so it is not offered here;
- * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. The columns come from the
+ * files, REST, MongoDB, Kafka and SFTP have no declared column list to choose from. Business apps (`saas`, `SRC-3`
+ * AD6) are offered it too: a vendor that describes its fields lists them. The columns come from the
  * preview route (`useColumnPreviews`), also for a table saved in an earlier visit.
  */
 export function supportsColumnChoice(adapter: string, dial: Dial | null | undefined): boolean {
   const driver = typeof dial?.driver === "string" ? dial.driver : ""
-  return adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql")
+  return adapter === "saas" || (adapter === "sql" && (driver === "postgres" || driver === "mysql" || driver === "mssql"))
 }
 
 /**

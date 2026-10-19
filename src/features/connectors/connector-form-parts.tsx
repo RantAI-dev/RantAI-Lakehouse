@@ -16,12 +16,14 @@ import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
 import { MongoDialForm } from "@/features/connectors/dial-forms/mongo-dial-form"
 import { OracleDialForm } from "@/features/connectors/dial-forms/oracle-dial-form"
 import { RestDialForm } from "@/features/connectors/dial-forms/rest-dial-form"
+import { SaasDialForm } from "@/features/connectors/dial-forms/saas-dial-form"
 import { SftpDialForm } from "@/features/connectors/dial-forms/sftp-dial-form"
 import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-form"
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
 import { SECRET_MANAGER_LABEL, referenceProblem } from "@/lib/connectors/secret-reference"
+import { saasVendorById } from "@/lib/connectors/saas-vendors"
 import type {
   CdcDial,
   CredentialKind,
@@ -31,6 +33,7 @@ import type {
   KafkaDial,
   MongoDial,
   RestDial,
+  SaasDial,
   SftpDial,
   SheetsDial,
   SqlDial,
@@ -59,6 +62,9 @@ export function hostFromDial(adapter: string | null, dial: Record<string, unknow
       return typeof dial.baseUrl === "string" ? dial.baseUrl : ""
     case "sheets":
       return typeof dial.spreadsheetId === "string" ? dial.spreadsheetId : ""
+    case "saas":
+      // The vendor's per-customer part of its address; the vendor table builds the rest (AD2).
+      return typeof dial.account === "string" ? dial.account : ""
     case "mongodb":
       return Array.isArray(dial.hosts) && typeof dial.hosts[0] === "string" ? (dial.hosts[0] as string) : ""
     case "kafka":
@@ -154,6 +160,8 @@ export function credentialSlotsFor(adapter: string | null, dial: Record<string, 
         default:
           return { primary: { kind: "api_key", label: "API key" }, secondary: null }
       }
+    case "saas":
+      return saasCredentialSlots(dial)
     case "sheets":
       return {
         primary: {
@@ -166,6 +174,49 @@ export function credentialSlotsFor(adapter: string | null, dial: Record<string, 
       }
     default:
       return { primary: PASSWORD, secondary: null }
+  }
+}
+
+/** How each named secret field of a vendor's integration credential is asked for. */
+const SAAS_FIELD_SLOTS: Record<string, CredentialSlot> = {
+  token: { kind: "token", label: "Access token" },
+  email: { kind: "access_key", label: "Email address", plain: true },
+  apiToken: { kind: "token", label: "API token" },
+  username: { kind: "access_key", label: "Username", plain: true },
+  password: PASSWORD,
+  clientId: { kind: "access_key", label: "Client ID", plain: true },
+  clientSecret: { kind: "secret_key", label: "Client secret" },
+  privateKey: {
+    kind: "private_key",
+    label: "Private key",
+    multiline: true,
+    placeholder: "-----BEGIN PRIVATE KEY-----",
+  },
+  serviceAccountJson: {
+    kind: "password",
+    label: "Service account JSON",
+    multiline: true,
+    placeholder: '{ "type": "service_account", ... }',
+  },
+}
+
+/**
+ * The credential fields of a `saas` connector (`SRC-3`): a browser sign-in
+ * asks for the client secret and gets the refresh token from signing in (as a
+ * REST authorization-code connector does); an integration credential fills the
+ * slots the vendor table names, in its order. Mirrors `secret_fields_for`
+ * (`saas_vendors.rs`, `saas/vendors`).
+ */
+function saasCredentialSlots(dial: Record<string, unknown> | null): CredentialSlots {
+  const vendor = saasVendorById(dial?.vendor)
+  const authType = (dial?.auth as { type?: unknown } | undefined)?.type
+  if (authType === "integration" && vendor?.integration) {
+    const [first, second] = vendor.integration.secretFields.map((field) => SAAS_FIELD_SLOTS[field] ?? PASSWORD)
+    return { primary: first ?? PASSWORD, secondary: second ?? null }
+  }
+  return {
+    primary: { kind: "secret_key", label: "Client secret" },
+    secondary: { kind: "token", label: "Refresh token", signIn: true },
   }
 }
 
@@ -256,6 +307,15 @@ export function DialFormFor({
       return (
         <RestDialForm
           value={dial as unknown as RestDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+          oauthCallbackUrl={oauthCallbackUrl}
+        />
+      )
+    case "saas":
+      return (
+        <SaasDialForm
+          typeName={typeName}
+          value={dial as unknown as SaasDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
           oauthCallbackUrl={oauthCallbackUrl}
         />

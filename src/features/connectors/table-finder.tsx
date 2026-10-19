@@ -23,7 +23,7 @@ import type { Dial, DiscoveryAnswer, DiscoveryObject, DiscoveryRequest } from "@
  * (D3); a MongoDB database's collections; a Kafka broker's topics (D4); an Oracle login's
  * schemas, then its tables (D5).
  */
-export type FinderKind = "sql" | "oracle" | "files" | "sftp" | "rest" | "mongodb" | "kafka"
+export type FinderKind = "sql" | "oracle" | "files" | "sftp" | "rest" | "mongodb" | "kafka" | "saas"
 
 /** The finder a connector type gets, or `null` for a type that cannot list (Google Sheets). */
 export function finderKind(adapter: string, dial: Dial | null | undefined): FinderKind | null {
@@ -36,6 +36,7 @@ export function finderKind(adapter: string, dial: Dial | null | undefined): Find
     case "rest":
     case "mongodb":
     case "kafka":
+    case "saas":
       return adapter
     default:
       return null
@@ -54,6 +55,7 @@ export const FINDER_WORDS: Record<FinderKind, { many: string; find: string }> = 
   rest: { many: "endpoints", find: "Find endpoints" },
   mongodb: { many: "collections", find: "Find collections" },
   kafka: { many: "topics", find: "Find topics" },
+  saas: { many: "objects", find: "Find objects" },
 }
 
 /**
@@ -110,6 +112,12 @@ function ObjectRow({
           <span className="shrink-0 text-xs text-muted-foreground">
             {formatBytes(object.size)}
             {object.modifiedAt ? ` · ${formatDateTime(object.modifiedAt)}` : ""}
+          </span>
+        ) : null}
+        {/* SRC-3 decision 6: say how a business-app object loads, so nobody finds out from a slow run. */}
+        {object.load ? (
+          <span data-testid="object-load" className="shrink-0 text-xs text-muted-foreground">
+            {object.load}
           </span>
         ) : null}
       </label>
@@ -406,6 +414,8 @@ export function TableFinder({
               ? "Lists the endpoints this connector declares."
               : kind === "mongodb"
                 ? "Lists the collections of this connector's database."
+                : kind === "saas"
+                  ? "Lists the objects the vendor offers, and says which load only what changed."
                 : "Lists the topics of this connector's broker; internal ones are hidden."}
           </p>
         )}

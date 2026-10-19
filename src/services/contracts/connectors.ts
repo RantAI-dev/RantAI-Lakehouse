@@ -691,6 +691,7 @@ export type IngestAdapter =
   | "mongodb"
   | "kafka"
   | "sftp"
+  | "saas"
   | string
 
 /**
@@ -752,6 +753,20 @@ export type IngestSpecInput = {
 }
 
 /**
+ * `dial` for the `saas` adapter (`SRC-3`): the vendor, the one part of its
+ * address a person supplies, and how the connector signs in. Mirrors Rust
+ * `SaasDial` (`lakehouse-store/src/ingest_spec.rs`). No address or secret is
+ * part of it: the vendor's addresses come from the vendor table.
+ */
+export type SaasDial = {
+  vendor: string
+  account: string
+  /** Objects the person names where the vendor has no listing of them. */
+  objects?: string[]
+  auth: { type: "oauth2_authorization_code"; clientId: string } | { type: "integration" }
+}
+
+/**
  * One row of `connector_type` (`rust/migrations/0035_connector_type.sql`),
  * as returned by the wizard's type listing. Mirrors Rust
  * `ConnectorType` (`rust/crates/lakehouse-store/src/connector_type.rs`)
@@ -794,8 +809,16 @@ export type DiscoveryErrorClass =
   | "failed"
   | string
 
-/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic or a MongoDB collection. */
-export type DiscoveryObjectKind = "schema" | "table" | "file" | "endpoint" | "topic" | "collection" | string
+/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection or a business-app object. */
+export type DiscoveryObjectKind =
+  | "schema"
+  | "table"
+  | "file"
+  | "endpoint"
+  | "topic"
+  | "collection"
+  | "object"
+  | string
 
 /**
  * One listed object. `name` is what a source object's `name` is in the ingest spec:
@@ -807,6 +830,11 @@ export type DiscoveryObject = {
   kind: DiscoveryObjectKind
   size?: number
   modifiedAt?: string
+  /**
+   * A business-app object only (`SRC-3` decision 6): `incremental`, or
+   * `re-read in full: <reason>`. Fixed text from the vendor module's declaration.
+   */
+  load?: string
 }
 
 /** One column of a preview; `inferred` is true when `typeName` was guessed from a sample (D6). */

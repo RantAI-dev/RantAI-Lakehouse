@@ -509,7 +509,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
       "Keep history",
     ])
     // Nothing is missing, so there is no line about a missing mode.
-    expect(screen.queryByText(/offered for SQL sources only/)).toBeNull()
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("offers four modes to any other batch source and says why the incremental ones are missing", async () => {
@@ -522,7 +522,7 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
     const mode = await modeOf("orders")
     expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
-    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources only/)).toBeDefined()
+    expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
   })
 
   it("says in each hint what happens to the rows already in the table", async () => {

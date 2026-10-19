@@ -7,6 +7,7 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { connectorService } from "@/services"
+import { saasVendorById } from "@/lib/connectors/saas-vendors"
 import type { OAuthSignOut } from "@/services/contracts/connectors"
 
 /**
@@ -15,6 +16,13 @@ import type { OAuthSignOut } from "@/services/contracts/connectors"
  * address. `null` for every other connector, so the page shows no Sign in panel.
  */
 export function oauthSignIn(spec: { adapter: string | null; dial: unknown }): { revocationConfigured: boolean } | null {
+  if (spec.adapter === "saas") {
+    // SRC-3 AD8: a business-app connector names no address; whether the vendor
+    // can be told to revoke is the vendor table's.
+    const dial = spec.dial as { vendor?: unknown; auth?: { type?: unknown } } | null
+    if (dial?.auth?.type !== "oauth2_authorization_code") return null
+    return { revocationConfigured: saasVendorById(dial.vendor)?.oauth.revocationUrl != null }
+  }
   if (spec.adapter !== "rest") return null
   const auth = (spec.dial as { auth?: { type?: unknown; revocationUrl?: unknown } } | null)?.auth
   if (auth?.type !== "oauth2_authorization_code") return null
