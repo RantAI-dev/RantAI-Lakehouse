@@ -787,13 +787,27 @@ fn resolve_unqualified(column: &str, scope: &Scope<'_>) -> Result<(String, Strin
         [] => Err(format!("the column {} has no table in FROM", short(column))),
         [only] => on_table(scope, only, column),
         several => {
-            let holders: Vec<(&String, String)> = several
-                .iter()
-                .filter_map(|key| match lookup(scope, key, column) {
-                    Lookup::Found(real) => Some((*key, real)),
-                    Lookup::Unchecked | Lookup::Absent => None,
-                })
-                .collect();
+            // PR #106 review R1 BLOCKER 7: an unchecked table makes an unqualified column ambiguous
+            let mut holders: Vec<(&String, String)> = Vec::new();
+            let mut unchecked: Vec<&String> = Vec::new();
+            for key in several {
+                match lookup(scope, key, column) {
+                    Lookup::Found(real) => holders.push((*key, real)),
+                    Lookup::Unchecked => unchecked.push(*key),
+                    Lookup::Absent => {}
+                }
+            }
+            if !unchecked.is_empty() {
+                return Err(format!(
+                    "the column {} is ambiguous: the columns of {} are not known; qualify it",
+                    short(column),
+                    unchecked
+                        .iter()
+                        .map(|k| short(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             match holders.as_slice() {
                 [(key, real)] => Ok(((*key).clone(), real.clone())),
                 [] => Err(format!(
@@ -928,6 +942,20 @@ mod tests {
             vec![(
                 "id".to_owned(),
                 "the column id matches more than one table in FROM; qualify it".to_owned()
+            )]
+        );
+    }
+
+    // PR #106 review R1 BLOCKER 7
+    #[test]
+    fn one_table_known_one_unknown_makes_an_unqualified_column_ambiguous() {
+        let l = run("SELECT Amount FROM silver.orders o JOIN silver.unknown u ON o.id = u.id");
+        assert!(l.mappings.is_empty());
+        assert_eq!(
+            reasons(&l),
+            vec![(
+                "Amount".to_owned(),
+                "the column Amount is ambiguous: the columns of silver.unknown are not known; qualify it".to_owned()
             )]
         );
     }
