@@ -19,7 +19,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use lakehouse_auth::Secret;
-use lakehouse_auth::openfga::{LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage};
+use lakehouse_auth::openfga::{
+    DeletedTableLookup, LakekeeperAdminClient, OpenfgaError, TenantWarehouseStorage,
+};
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -300,20 +302,43 @@ async fn find_deleted_table_pages_matches_exactly_and_picks_the_newest_drop() {
         .mount(&server)
         .await;
     let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
-    let found = client
+    let found = match client
         .find_deleted_table("wh-1", "bronze", "orders")
         .await
         .unwrap()
-        .expect("a dropped table");
+    {
+        DeletedTableLookup::Found(t) => t,
+        other => panic!("expected Found, got {other:?}"),
+    };
     assert_eq!(found.id, "t-new");
     assert_eq!(found.expires_at, "2026-10-23T00:00:00Z");
-    assert!(
+    assert_eq!(
         client
             .find_deleted_table("wh-1", "bronze", "nothing")
             .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        DeletedTableLookup::None
     );
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[tokio::test]
+async fn find_deleted_table_stops_after_20_pages_and_returns_could_not_tell() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [],
+            "next-page-token": "more"
+        })))
+        .mount(&server)
+        .await;
+    let client = LakekeeperAdminClient::new(server.uri(), Secret::new("admin-token"));
+    let lookup = client
+        .find_deleted_table("wh-1", "bronze", "orders")
+        .await
+        .unwrap();
+    assert_eq!(lookup, DeletedTableLookup::CouldNotTell);
 }
 
 /// `DATA-15` F4: undrop sends the table's id as a `table` target.

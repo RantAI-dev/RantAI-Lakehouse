@@ -217,6 +217,32 @@ async fn with_no_dropped_copy_the_status_says_so_and_the_undrop_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[tokio::test]
+async fn when_deleted_list_is_truncated_status_answers_could_not_tell_and_undrop_is_503() {
+    let server = MockServer::start().await;
+    mount_registry(&server, "orders").await;
+    mount_missing_table(&server).await;
+    mount_warehouse(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/management/v1/warehouse/wh-1/deleted-tabulars"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tabulars": [],
+            "next-page-token": "more"
+        })))
+        .mount(&server)
+        .await;
+    let TestApp { router, pool } = app(&server, true).await;
+    let cookie = admin_cookie(&pool).await;
+
+    let (_, body) = call(&router, "GET", RESTORE, &cookie).await;
+    assert_eq!(body["restorable"], json!(false));
+    assert!(body["reason"].as_str().unwrap().contains("could not tell"));
+    let (status, body) = call(&router, "POST", RESTORE, &cookie).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"].as_str().unwrap().contains("could not tell"));
+}
+
 #[tokio::test]
 async fn without_the_admin_client_restore_is_unsupported_and_the_undrop_is_503() {
     let server = MockServer::start().await;

@@ -29,7 +29,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_auth::Principal;
-use lakehouse_auth::openfga::{DeletedTabular, LakekeeperAdminClient, OpenfgaError};
+use lakehouse_auth::openfga::{DeletedTableLookup, LakekeeperAdminClient, OpenfgaError};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::rest::{self, RestError};
 use serde_json::{Value, json};
@@ -51,6 +51,9 @@ const NOT_ICEBERG: &str = "only an open table can be restored; this table is rew
 const NO_TABLE: &str = "this dataset has no table";
 const EXISTS: &str = "the table exists";
 const NOTHING: &str = "no dropped copy of this table is kept (a table dropped before restore was set up cannot come back)";
+// PR #106 review R1 SHOULD-FIX DATA-15 2: answer "could not tell" when it stopped early
+const COULD_NOT_TELL: &str =
+    "could not tell whether a dropped copy of this table is kept (the deleted list is too long)";
 const EXPIRED: &str = "the 7-day window to restore this table has passed";
 const UNREACHABLE: &str = "the catalog could not be asked about this table; try again shortly";
 
@@ -62,6 +65,8 @@ pub(crate) enum Assessment {
     Exists,
     /// `Lakekeeper` lists no dropped copy.
     Nothing,
+    /// `Lakekeeper` deleted-tabulars list reached page limit while more pages remained.
+    CouldNotTell,
     /// A dropped copy is listed, but its window has passed.
     Expired {
         dropped_at: String,
@@ -81,30 +86,35 @@ pub(crate) enum Assessment {
 /// # Errors
 ///
 /// [`ApiError::Unavailable`] when the dropped copy's expiry is not RFC 3339.
+// PR #106 review R1 SHOULD-FIX DATA-15 2
 pub(crate) fn assess(
     exists: bool,
-    dropped: Option<DeletedTabular>,
+    dropped: DeletedTableLookup,
     now: OffsetDateTime,
 ) -> Result<Assessment, ApiError> {
     if exists {
         return Ok(Assessment::Exists);
     }
-    let Some(dropped) = dropped else {
-        return Ok(Assessment::Nothing);
-    };
-    let expires = OffsetDateTime::parse(&dropped.expires_at, &Rfc3339)
-        .map_err(|_| ApiError::Unavailable(UNREACHABLE.to_owned()))?;
-    if expires <= now {
-        return Ok(Assessment::Expired {
-            dropped_at: dropped.deleted_at,
-            expires_at: dropped.expires_at,
-        });
+    match dropped {
+        DeletedTableLookup::None => Ok(Assessment::Nothing),
+        DeletedTableLookup::CouldNotTell => Ok(Assessment::CouldNotTell),
+        DeletedTableLookup::Found(dropped) => {
+            let expires = OffsetDateTime::parse(&dropped.expires_at, &Rfc3339)
+                .map_err(|_| ApiError::Unavailable(UNREACHABLE.to_owned()))?;
+            if expires <= now {
+                Ok(Assessment::Expired {
+                    dropped_at: dropped.deleted_at,
+                    expires_at: dropped.expires_at,
+                })
+            } else {
+                Ok(Assessment::Restorable {
+                    id: dropped.id,
+                    dropped_at: dropped.deleted_at,
+                    expires_at: dropped.expires_at,
+                })
+            }
+        }
     }
-    Ok(Assessment::Restorable {
-        id: dropped.id,
-        dropped_at: dropped.deleted_at,
-        expires_at: dropped.expires_at,
-    })
 }
 
 /// Where an asset's restore stands before `Lakekeeper` is asked.
@@ -209,6 +219,7 @@ pub async fn status(
     Ok(ApiJson(match assessment {
         Assessment::Exists => json!({ "restorable": false, "reason": EXISTS }),
         Assessment::Nothing => json!({ "restorable": false, "reason": NOTHING }),
+        Assessment::CouldNotTell => json!({ "restorable": false, "reason": COULD_NOT_TELL }),
         Assessment::Expired {
             dropped_at,
             expires_at,
@@ -271,6 +282,9 @@ pub async fn restore(
             )
             .into());
         }
+        Assessment::CouldNotTell => {
+            return Err(ApiError::Unavailable(COULD_NOT_TELL.to_owned()).into());
+        }
         Assessment::Expired { .. } => return Err(ApiError::Gone(EXPIRED.to_owned()).into()),
         Assessment::Restorable { id, expires_at, .. } => (id, expires_at),
     };
@@ -309,6 +323,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use lakehouse_auth::openfga::DeletedTabular;
 
     fn dropped(expires_at: &str) -> DeletedTabular {
         DeletedTabular {
@@ -325,21 +340,38 @@ mod tests {
     #[test]
     fn a_table_that_exists_is_not_restorable_even_with_a_dropped_copy() {
         let now = at("2026-10-17T00:00:00Z");
-        let got = assess(true, Some(dropped("2026-10-23T08:00:00Z")), now).unwrap();
+        let got = assess(
+            true,
+            DeletedTableLookup::Found(dropped("2026-10-23T08:00:00Z")),
+            now,
+        )
+        .unwrap();
         assert_eq!(got, Assessment::Exists);
     }
 
     #[test]
     fn no_dropped_copy_is_nothing_to_restore() {
-        let got = assess(false, None, at("2026-10-17T00:00:00Z")).unwrap();
+        let got = assess(false, DeletedTableLookup::None, at("2026-10-17T00:00:00Z")).unwrap();
         assert_eq!(got, Assessment::Nothing);
+    }
+
+    // PR #106 review R1 SHOULD-FIX DATA-15 2
+    #[test]
+    fn stopped_early_is_could_not_tell() {
+        let got = assess(
+            false,
+            DeletedTableLookup::CouldNotTell,
+            at("2026-10-17T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(got, Assessment::CouldNotTell);
     }
 
     #[test]
     fn a_dropped_copy_inside_its_window_is_restorable_until_its_expiry() {
         let got = assess(
             false,
-            Some(dropped("2026-10-23T08:00:00Z")),
+            DeletedTableLookup::Found(dropped("2026-10-23T08:00:00Z")),
             at("2026-10-17T00:00:00Z"),
         )
         .unwrap();
@@ -357,7 +389,7 @@ mod tests {
     fn a_dropped_copy_past_its_window_is_expired_not_restorable() {
         let got = assess(
             false,
-            Some(dropped("2026-10-23T08:00:00Z")),
+            DeletedTableLookup::Found(dropped("2026-10-23T08:00:00Z")),
             at("2026-10-23T08:00:00Z"),
         )
         .unwrap();
@@ -366,7 +398,12 @@ mod tests {
 
     #[test]
     fn an_unreadable_expiry_is_unavailable_not_a_guess() {
-        let err = assess(false, Some(dropped("soon")), at("2026-10-17T00:00:00Z")).unwrap_err();
+        let err = assess(
+            false,
+            DeletedTableLookup::Found(dropped("soon")),
+            at("2026-10-17T00:00:00Z"),
+        )
+        .unwrap_err();
         assert_eq!(err.status(), 503);
     }
 }

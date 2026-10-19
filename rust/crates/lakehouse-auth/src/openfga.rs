@@ -131,6 +131,18 @@ pub struct DeletedTabular {
     pub expires_at: String,
 }
 
+/// The outcome of looking for a soft-deleted table.
+// PR #106 review R1 SHOULD-FIX DATA-15 2
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletedTableLookup {
+    /// A soft-deleted table was found.
+    Found(DeletedTabular),
+    /// Reached the end of the deleted list without finding a matching table.
+    None,
+    /// The search reached the page limit (20 pages) while more pages remained.
+    CouldNotTell,
+}
+
 /// Pages of 100 `find_deleted_table` reads before it stops looking: a
 /// warehouse with more than 2,000 soft-deleted tables inside the window is
 /// not a case this lookup serves.
@@ -374,12 +386,13 @@ impl LakekeeperAdminClient {
     /// [`OpenfgaError::Transport`] if a request never reaches `Lakekeeper`;
     /// [`OpenfgaError::Rejected`] on a `4xx`; [`OpenfgaError::Server`] on a
     /// `5xx` or a body that does not parse.
+    // PR #106 review R1 SHOULD-FIX DATA-15 2
     pub async fn find_deleted_table(
         &self,
         warehouse_id: &str,
         namespace: &str,
         table: &str,
-    ) -> Result<Option<DeletedTabular>, OpenfgaError> {
+    ) -> Result<DeletedTableLookup, OpenfgaError> {
         let mut found: Option<DeletedTabular> = None;
         let mut token: Option<String> = None;
         for _ in 0..DELETED_LIST_MAX_PAGES {
@@ -421,10 +434,20 @@ impl LakekeeperAdminClient {
             }
             match page.next_page_token {
                 Some(next) if !next.is_empty() => token = Some(next),
-                _ => break,
+                _ => {
+                    token = None;
+                    break;
+                }
             }
         }
-        Ok(found)
+        if let Some(tabular) = found {
+            Ok(DeletedTableLookup::Found(tabular))
+        } else if token.is_some() {
+            // PR #106 review R1 SHOULD-FIX DATA-15 2: stopped after 20 pages with more pages remaining
+            Ok(DeletedTableLookup::CouldNotTell)
+        } else {
+            Ok(DeletedTableLookup::None)
+        }
     }
 
     /// Undrops the soft-deleted table `tabular_id` in `warehouse_id`
