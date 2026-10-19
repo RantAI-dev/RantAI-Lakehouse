@@ -1,5 +1,6 @@
-import { governedPairLabels } from "@/features/catalog/governed-tags"
 "use client"
+
+import { governedPairLabels } from "@/features/catalog/governed-tags"
 
 import type { ReactNode } from "react"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"

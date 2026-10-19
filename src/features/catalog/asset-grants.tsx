@@ -13,7 +13,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDate } from "@/lib/format"
-import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
+import { notifySuccess, withNotify } from "@/lib/notify"
 import { assetService } from "@/services"
 import type { AssetDetail, AssetGrant } from "@/services/contracts/assets"
 

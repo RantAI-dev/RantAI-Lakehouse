@@ -1,6 +1,7 @@
+"use client";
+
 import { governedPairLabels } from "@/features/catalog/governed-tags"
 import { Pill } from "@/components/patterns/status-badge"
-"use client";
 
 import * as React from "react";
 import { useTheme } from "next-themes";
