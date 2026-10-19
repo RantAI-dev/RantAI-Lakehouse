@@ -78,12 +78,8 @@ def zendesk_support(
     ) -> Iterator[TDataItem]:
         # URL For ticket events
         # 'https://d3v-dlthub.zendesk.com/api/v2/incremental/ticket_events.json?start_time=946684800'
-        event_pages = zendesk_client.get_pages(
-            "/api/v2/incremental/ticket_events.json",
-            "ticket_events",
-            PaginationType.STREAM,
-            params={"start_time": timestamp.last_value},
-        )
+        # SRC-3 local change 3: events that share an id and a time are yielded once.
+        event_pages = zendesk_client.get_incremental("ticket_events", timestamp.last_value)
         for page in event_pages:
             yield page
             if timestamp.end_out_of_range:
@@ -129,12 +125,9 @@ def zendesk_support(
             load_ticket_fields_state(zendesk_client)
         fields_dict = dlt.current.source_state().setdefault(CUSTOM_FIELDS_STATE_KEY, {})
         # include_objects = ["users", "groups", "organisation", "brands"]
-        ticket_pages = zendesk_client.get_pages(
-            "/api/v2/incremental/tickets",
-            "tickets",
-            PaginationType.STREAM,
-            params={"start_time": updated_at.last_value.int_timestamp},
-        )
+        # SRC-3 local change 3 (dlt-hub/verified-sources#659): the cursor-based export,
+        # which repeats no ticket within an export; upstream read the time-based one.
+        ticket_pages = zendesk_client.get_incremental("tickets", updated_at.last_value.int_timestamp)
         for page in ticket_pages:
             yield [
                 process_ticket(ticket, fields_dict, pivot_custom_fields=pivot_fields)

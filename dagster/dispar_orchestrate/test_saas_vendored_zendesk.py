@@ -55,8 +55,9 @@ def ticket(i: int, ts: int, **extra: Any) -> dict[str, Any]:
 class FakeZendesk:
     """The documented incremental exports, over the HTTP seam of `SaasSession`."""
 
-    def __init__(self, tickets: list[dict[str, Any]], page_size: int = 3) -> None:
+    def __init__(self, tickets: list[dict[str, Any]], page_size: int = 3, **others: list[dict[str, Any]]) -> None:
         self.tickets = tickets
+        self.others = others  # ticket_events=[...], organizations=[...], users=[...]: the time-based ones
         self.page_size = page_size
         self.log: list[str] = []
         self.headers: list[dict] = []
@@ -66,12 +67,14 @@ class FakeZendesk:
         parsed = urlparse(url)
         query = {**{k: v[0] for k, v in parse_qs(parsed.query).items()}, **{k: str(v) for k, v in (params or {}).items()}}
         self.log.append(f"{parsed.path}?{'&'.join(f'{k}={v}' for k, v in sorted(query.items()))}")
-        if parsed.path == "/api/v2/incremental/tickets.json":  # time-based
+        name = parsed.path.removeprefix("/api/v2/incremental/").removesuffix(".json")
+        if name in ("tickets", "ticket_events", "organizations"):  # time-based
+            store = self.tickets if name == "tickets" else self.others[name]
             start = int(query["start_time"])
-            hits = sorted((t for t in self.tickets if t["generated_timestamp"] >= start), key=lambda t: (t["generated_timestamp"], t["id"]))
+            hits = sorted((t for t in store if t["generated_timestamp"] >= start), key=lambda t: (t["generated_timestamp"], t["id"]))
             page = hits[: self.page_size]
             end = page[-1]["generated_timestamp"] if page else start
-            body = {"tickets": page, "count": len(page), "end_time": end, "end_of_stream": len(hits) <= self.page_size}
+            body = {name: page, "count": len(page), "end_time": end, "end_of_stream": len(hits) <= self.page_size}
             body["next_page"] = f"{ORIGIN}{parsed.path}?start_time={end}&per_page={self.page_size}"
             return Reply(body=body)
         if parsed.path == "/api/v2/incremental/tickets/cursor.json":  # cursor-based
@@ -138,3 +141,48 @@ def test_the_time_based_export_sends_the_tickets_at_a_page_boundary_twice() -> N
     pages = client.get_pages("/api/v2/incremental/tickets.json", "tickets", talk_api.PaginationType.STREAM, params={"start_time": 0})
     ids = [t["id"] for page in pages for t in page]
     assert ids == [1, 2, 3, 3, 4, 5, 5, 6], f"the vendor repeats tickets at the boundaries: {ids}"
+
+
+def test_the_cursor_based_export_the_fix_reads_repeats_no_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """V-Zendesk.1, local change 3: the same data as above, read the way the fixed source
+    reads tickets, comes once each, and only the cursor export is asked."""
+    monkeypatch.setattr(zd_settings, "INCREMENTAL_PAGE_SIZE", 3)
+    fake = FakeZendesk([ticket(1, 100), ticket(2, 200), ticket(3, 300), ticket(4, 300), ticket(5, 400), ticket(6, 500)])
+    client = talk_api.ZendeskAPIClient(session_over(fake))
+    ids = [t["id"] for page in client.get_incremental("tickets", 0) for t in page]
+    assert ids == [1, 2, 3, 4, 5, 6]
+    assert all("/cursor.json" in line for line in fake.log) and "start_time=0" in fake.log[0] and "cursor=3" in fake.log[1]
+
+
+def test_the_cursor_export_starts_from_the_time_it_is_given_and_a_second_run_from_the_same_time_re_reads_only_what_is_at_or_after_it() -> None:
+    fake = FakeZendesk([ticket(1, 100), ticket(2, 200), ticket(3, 300)], page_size=10)
+    client = talk_api.ZendeskAPIClient(session_over(fake))
+    assert [t["id"] for page in client.get_incremental("tickets", 200) for t in page] == [2, 3], "inclusive: ticket 2 is at the start time"
+
+
+def test_time_based_exports_without_a_cursor_variant_are_filtered_by_zendesks_own_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ticket events and organizations have only the time-based export; Zendesk says to drop
+    items sharing id + created_at (events) or id + updated_at (organizations)."""
+    monkeypatch.setattr(zd_settings, "INCREMENTAL_PAGE_SIZE", 3)
+
+    def event(i: int, ts: int) -> dict[str, Any]:
+        return {"id": i, "ticket_id": 1, "created_at": iso(ts), "timestamp": ts, "generated_timestamp": ts}
+
+    events = [event(1, 100), event(2, 200), event(3, 300), event(4, 300), event(5, 400), event(6, 500)]
+    fake = FakeZendesk([], ticket_events=events)
+    client = talk_api.ZendeskAPIClient(session_over(fake))
+    raw = [e["id"] for page in client.get_pages("/api/v2/incremental/ticket_events.json", "ticket_events", talk_api.PaginationType.STREAM, params={"start_time": 0}) for e in page]
+    assert raw == [1, 2, 3, 3, 4, 5, 5, 6], "the vendor repeats events at the boundaries"
+    fixed = [e["id"] for page in client.get_incremental("ticket_events", 0) for e in page]
+    assert fixed == [1, 2, 3, 4, 5, 6]
+    orgs = [{"id": i, "name": f"o{i}", "updated_at": iso(ts), "generated_timestamp": ts} for i, ts in ((1, 100), (2, 200), (3, 300), (4, 300), (5, 400), (6, 500))]
+    fake = FakeZendesk([], organizations=orgs)
+    client = talk_api.ZendeskAPIClient(session_over(fake))
+    assert [o["id"] for page in client.get_incremental("organizations", 0) for o in page] == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_changed_item_with_the_same_id_but_a_new_time_is_not_a_duplicate() -> None:
+    """The filter is id + time, not id: a ticket updated again must come again."""
+    events = [{"id": 1, "created_at": iso(100), "generated_timestamp": 100}, {"id": 1, "created_at": iso(200), "generated_timestamp": 200}]
+    client = talk_api.ZendeskAPIClient(session_over(FakeZendesk([], page_size=10, ticket_events=events)))
+    assert [e["created_at"] for page in client.get_incremental("ticket_events", 0) for e in page] == [iso(100), iso(200)]
