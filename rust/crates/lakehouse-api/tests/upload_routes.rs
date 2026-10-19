@@ -5453,3 +5453,57 @@ async fn the_sweep_aborts_and_removes_old_sessions_and_leaves_the_rest() {
     assert_eq!((outcome.removed, outcome.failed), (0, 1));
     assert_eq!(stack.row_count(&fresh).await, 1);
 }
+
+/// Phase 3 slice 1 review SHOULD-FIX 1: past 20 open sessions a user's next one
+/// is a 429 with a fixed sentence and opens nothing in the bucket; another user
+/// is not affected, and finishing or removing one frees a place.
+#[tokio::test]
+async fn a_twenty_first_open_session_of_one_user_is_429_and_opens_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    let mut ids = Vec::new();
+    for n in 0..20 {
+        ids.push(stack.session(&bayu, &format!("s{n}.csv"), 10).await);
+    }
+    assert_eq!(stack.bucket.open_multiparts().len(), 20);
+
+    let refused = stack.open_session(&bayu, "one-more.csv", 10).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        refused.text
+    );
+    assert_eq!(
+        refused.json["error"],
+        "Too many uploads are open. Finish or remove some of them, then try again."
+    );
+    assert_eq!(refused.retry_after.as_deref(), Some("30"));
+    assert_eq!(
+        stack.bucket.open_multiparts().len(),
+        20,
+        "the refusal opened nothing"
+    );
+
+    // Another user has their own twenty.
+    stack.session(&andi, "andi.csv", 10).await;
+    // Removing one frees a place; so does finishing one.
+    let removed = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{}", ids[0]),
+            Payload::None,
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT);
+    stack.session(&bayu, "again.csv", 10).await;
+    assert_eq!(
+        stack.open_session(&bayu, "full-again.csv", 10).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    stack.put_part(&bayu, &ids[1], "1", b"a,b\n1,2\n3\n").await;
+    assert_eq!(stack.complete(&bayu, &ids[1]).await.status, StatusCode::OK);
+    stack.session(&bayu, "after-complete.csv", 10).await;
+}

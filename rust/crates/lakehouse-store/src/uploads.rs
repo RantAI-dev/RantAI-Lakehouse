@@ -339,6 +339,22 @@ pub async fn insert_receiving(pool: &PgPool, new: &NewReceiving<'_>) -> Result<U
         .await?)
 }
 
+/// How many `receiving` sessions `uploaded_by` has open: what the session cap
+/// of the sessions route counts (Phase 3 slice 1 review SHOULD-FIX 1). Keyed by
+/// the display name the row records, the same text the `SEC-17` limits use.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn count_receiving(pool: &PgPool, uploaded_by: &str) -> Result<i64, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM file_upload WHERE status = 'receiving' AND uploaded_by = $1",
+    )
+    .bind(uploaded_by)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// One piece of a chunked upload, as recorded.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct UploadPart {

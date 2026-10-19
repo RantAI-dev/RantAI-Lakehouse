@@ -40,8 +40,8 @@ use lakehouse_store::uploads::{
     table_being_loaded, table_claim, table_claimed, upload_in_tenants,
 };
 use lakehouse_store::uploads::{
-    find_by_parts_digest, finish_receiving, insert_receiving, list_parts, record_part,
-    stale_receiving,
+    count_receiving, find_by_parts_digest, finish_receiving, insert_receiving, list_parts,
+    record_part, stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -2328,5 +2328,26 @@ async fn migration_0090_leaves_an_earlier_upload_as_it_was(pool: PgPool) -> sqlx
             "received_at"
         ]
     );
+    Ok(())
+}
+
+/// Phase 3 slice 1 review SHOULD-FIX 1: the count the session cap reads is of
+/// `receiving` rows of one uploader, and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_receiving_counts_only_open_sessions_of_one_uploader(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-count").await;
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 0);
+    open_session(&pool, "up-c1", tenant_a).await;
+    open_session(&pool, "up-c2", tenant_a).await;
+    add(&pool, "up-c3", tenant_a, "").await; // uploaded by "Test User", but not receiving
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 2);
+    assert_eq!(count_receiving(&pool, "Someone Else").await.unwrap(), 0);
+    finish_receiving(&pool, "up-c1", 10, &[1u8; 32])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 1);
     Ok(())
 }

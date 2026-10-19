@@ -99,6 +99,19 @@ const COMPLETE_SNIFF_BYTES: u64 = 64 * 1024;
 /// more". A bound on the sentence, not on the check.
 const MAX_LISTED_MISSING: usize = 20;
 
+/// Open (`receiving`) sessions one user may hold. Feature page decision 5 needs
+/// 10 at once; 20 leaves room for a retry or two that has not been swept (Phase 3
+/// slice 1 review SHOULD-FIX 1). The count is read before the new session is made,
+/// so two requests at the same moment can overshoot by one: it bounds the rows
+/// and multipart uploads a user can leave behind, it is not a security limit.
+const MAX_OPEN_SESSIONS: i64 = 20;
+
+/// The 429 for a user at [`MAX_OPEN_SESSIONS`]: fixed text, and a longer wait
+/// than the piece limit's, since a session is freed by finishing or removing
+/// an upload and not by a request ending.
+const TOO_MANY_SESSIONS: &str =
+    "Too many uploads are open. Finish or remove some of them, then try again.";
+
 const SESSION_BODY: &str =
     "The request body must be a JSON object with a filename and a sizeBytes (a whole number).";
 const NOT_RECEIVING: &str = "This upload is not receiving pieces.";
@@ -195,6 +208,15 @@ pub async fn create_session(
     let declared = i64::try_from(request.size_bytes)
         .map_err(|_| ApiError::BadRequest(TOO_LARGE.to_owned()))?;
     let pool = pool(&state)?;
+    // Phase 3 slice 1 review SHOULD-FIX 1: counted before anything is opened
+    // in storage, so a refusal leaves no multipart upload behind.
+    if uploads::count_receiving(pool, &principal.display_name).await? >= MAX_OPEN_SESSIONS {
+        return Err(ApiError::TooManyRequests {
+            message: TOO_MANY_SESSIONS.to_owned(),
+            retry_after_secs: 30,
+        }
+        .into());
+    }
     let store = UploadStore::connect(&state.config).await?;
 
     let filename = display_name(Some(&request.filename));
