@@ -43,7 +43,8 @@ async fn call(
 #[tokio::test]
 async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
     let TestApp { router, pool } = spin_up().await;
-    let user = create_principal_with_permissions(&pool, "governance:write").await;
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
+    let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
 
     let (code, listed) = call(
@@ -109,7 +110,8 @@ async fn a_table_can_be_scheduled_every_n_minutes_or_on_every_load() {
 #[tokio::test]
 async fn a_bad_schedule_is_refused_and_stores_nothing() {
     let TestApp { router, pool } = spin_up().await;
-    let user = create_principal_with_permissions(&pool, "governance:write").await;
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
+    let user = create_principal_with_permissions(&pool, "*:*,governance:write").await;
     let cookie = session_cookie_for_user(&pool, user).await;
     let put = |asset: &'static str, body: Value| {
         let (router, cookie) = (router.clone(), cookie.clone());

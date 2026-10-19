@@ -110,7 +110,8 @@ async fn rule(pool: &PgPool, name: &str, threshold: &str) -> String {
 /// A session for a principal who may run a rule, change one and resolve an
 /// incident. None of the requests below logs out, so one session serves a test.
 async fn admin(pool: &PgPool) -> String {
-    let user = create_principal_with_permissions(pool, "query:read,governance:write").await;
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: *:* passes catalog tenant gate
+    let user = create_principal_with_permissions(pool, "*:*,query:read,governance:write").await;
     session_cookie_for_user(pool, user).await
 }
 
