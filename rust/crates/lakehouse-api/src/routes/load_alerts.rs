@@ -273,7 +273,7 @@ pub(super) async fn deliver_event(
 
 /// Read the alert rules once. A failure is logged and answered with fixed
 /// text (principle 4).
-async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiError> {
+pub(crate) async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiError> {
     lakehouse_alerts::load_rules(&state.clickhouse)
         .await
         .map_err(|err| unavailable(RULES_UNAVAILABLE, err))
@@ -321,20 +321,19 @@ async fn deliver_with_rules(
 /// never upstream error text. A rule store that cannot be read is logged and
 /// delivers nothing: the incident is already open and listed. Returns how
 /// many deliveries were attempted.
-pub(super) async fn deliver_quality_incident(
+// PR #106 review R1 SHOULD-FIX DATA-14 2
+pub(crate) async fn deliver_quality_incident_with_rules(
     state: &AppState,
     pool: &PgPool,
+    rules: &[AlertRule],
     asset: &str,
     text: &str,
 ) -> usize {
-    let Ok(rules) = read_rules(state).await else {
-        return 0;
-    };
     let http = state.webhook_sender();
     let email = EmailSender::new(smtp_config(&state.config));
     let silence = ApiSilenceSource { pg: pool };
     let attempted = lakehouse_alerts::deliver_quality_incident_to(
-        &rules,
+        rules,
         &http,
         &email,
         asset,

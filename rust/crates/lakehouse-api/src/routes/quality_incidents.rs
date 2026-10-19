@@ -41,6 +41,14 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     let Some(pg) = state.pg.as_deref() else {
         return;
     };
+    // PR #106 review R1 SHOULD-FIX DATA-14 2: read alert rules before committing incident row (SRC-17 F2)
+    let rules = match crate::routes::load_alerts::read_rules(state).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, rule = %rule.name, "quality: alert rules unavailable, deferring incident commit");
+            return;
+        }
+    };
     let detail = format!("{} — {measured} (threshold: {})", rule.name, rule.threshold);
     match quality::record_failure(
         pg,
@@ -56,7 +64,7 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
             // the `quality_incident` rules, as `open_anomaly` does; one seen
             // again (`opened` false) is the same incident and sends nothing.
             if recorded.opened {
-                notify_opened(state, &rule.asset, &detail);
+                notify_opened(state, &rule.asset, &detail, rules);
             }
             tracing::debug!(rule = %rule.name, opened = recorded.opened, "quality: incident recorded");
         }
@@ -72,12 +80,20 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
 /// delivers: an incident seen again is the same incident. The message is the
 /// table, what was found and a relative link; the rules' webhook and email
 /// channels and silences are SRC-7's.
-fn notify_opened(state: &AppState, asset: &str, detail: &str) {
+fn notify_opened(
+    state: &AppState,
+    asset: &str,
+    detail: &str,
+    rules: Vec<lakehouse_alerts::AlertRule>,
+) {
     let (state, asset) = (state.clone(), asset.to_owned());
     let text = format!("{asset}: {detail}. View: /governance/data-quality");
     tokio::spawn(async move {
         if let Some(pg) = state.pg.as_deref() {
-            crate::routes::load_alerts::deliver_quality_incident(&state, pg, &asset, &text).await;
+            crate::routes::load_alerts::deliver_quality_incident_with_rules(
+                &state, pg, &rules, &asset, &text,
+            )
+            .await;
         }
     });
 }
@@ -93,10 +109,18 @@ pub(crate) async fn open_anomaly(
     detail: &str,
 ) -> Option<String> {
     let pg = state.pg.as_deref()?;
+    // PR #106 review R1 SHOULD-FIX DATA-14 2: read alert rules before committing incident row (SRC-17 F2)
+    let rules = match crate::routes::load_alerts::read_rules(state).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: alert rules unavailable, deferring anomaly incident commit");
+            return None;
+        }
+    };
     match quality::record_failure(pg, asset, None, kind, detail).await {
         Ok(recorded) => {
             if recorded.opened {
-                notify_opened(state, asset, detail);
+                notify_opened(state, asset, detail, rules);
             }
             recorded.opened.then_some(recorded.id)
         }
@@ -446,5 +470,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(open.len(), 1);
+    }
+
+    // PR #106 review R1 SHOULD-FIX DATA-14 2
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rule_store_failure_does_not_commit_incident_row(pool: sqlx::PgPool) {
+        let ch = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("clickhouse down"))
+            .mount(&ch)
+            .await;
+        let options = pool.connect_options();
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named test database"),
+            ),
+        );
+        env.insert("CH_URL".to_owned(), ch.uri());
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+        open_for_failed_run(&state, &rule("silver.orders"), "90%").await;
+
+        let open_incidents = quality::list(&pool, StatusFilter::Open, None)
+            .await
+            .unwrap();
+        assert!(
+            open_incidents.is_empty(),
+            "incident row must not be committed when reading alert rules fails"
+        );
     }
 }
