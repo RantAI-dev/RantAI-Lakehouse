@@ -365,3 +365,39 @@ async fn a_granter_cannot_give_a_permission_they_do_not_hold() {
         json!("permission_denied: you cannot grant a permission you do not hold")
     );
 }
+
+// PR #106 review R1 BLOCKER 5
+#[tokio::test]
+async fn a_grant_cannot_go_to_a_user_outside_the_catalog_tenant() {
+    let mut overrides = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000002";
+    let other_tenant = "11111111-1111-4111-8111-000000000001";
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+
+    let admin = create_principal_with_permissions(&pool, "*:*").await;
+    let cookie = session_cookie_for_user(&pool, admin).await;
+
+    let outsider = create_zero_permission_principal(&pool).await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(outsider)
+        .bind(other_tenant.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let outsider_email = email_of(&pool, outsider).await;
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": outsider_email, "permission": "query:read"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: grantee must be a member of the catalog tenant")
+    );
+}

@@ -114,6 +114,8 @@ pub async fn list(
 /// - `403` when the granter does not hold the permission themselves.
 /// - `403` when the grantee is the caller (as approving one's own request
 ///   is refused).
+/// - `403` when the grantee is outside the catalog tenant on a multi-tenant
+///   install.
 /// - `409` when the user already holds the permission, through a role or a
 ///   grant.
 /// - `503` without a Postgres pool; a classified store error otherwise.
@@ -174,6 +176,20 @@ pub async fn create(
         return Err(
             ApiError::Conflict("that user already holds this permission".to_owned()).into(),
         );
+    }
+    // PR #106 review R1 BLOCKER 5: grantee must belong to the catalog tenant when multiple tenants exist
+    let (tenant_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenant")
+        .fetch_one(pool)
+        .await
+        .map_err(|_err| ApiError::Unavailable("could not verify tenant count".to_owned()))?;
+    if tenant_count > 1
+        && let Some(catalog_tenant_id) = state.config.catalog_tenant_id
+        && !held.in_tenant(catalog_tenant_id)
+    {
+        return Err(ApiError::PermissionDenied(
+            "grantee must be a member of the catalog tenant".to_owned(),
+        )
+        .into());
     }
     let grant = lakehouse_store::agents::create_direct_grant(
         pool,
