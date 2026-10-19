@@ -571,3 +571,24 @@ async fn an_unrunnable_rule_does_not_fail_the_event_or_stop_the_others() {
     assert_eq!(status, StatusCode::OK, "{body}");
     app.wait_for_incident("silver.orders_clean").await;
 }
+
+// PR #106 review R2 SHOULD-FIX 3
+#[tokio::test]
+async fn an_unknown_dagster_connector_run_fails_closed_and_does_not_silently_skip() {
+    let app = app().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("runOrError"))
+        .and(body_string_contains("unknown-run"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "runOrError": { "__typename": "RunNotFoundError" } }
+        })))
+        .mount(&app.dagster)
+        .await;
+
+    let (status, body) = app.run_finished("unknown-run", "ingest_job").await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an unknown dagster run must not return 200: {body}"
+    );
+}

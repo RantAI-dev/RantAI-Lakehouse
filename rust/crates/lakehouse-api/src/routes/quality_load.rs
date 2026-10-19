@@ -116,48 +116,44 @@ async fn pipeline_loaded(pool: &PgPool, pipeline_id: &str) -> Option<Loaded> {
 
 /// The tables the connector behind run `run_id` loads. `None` when the run
 /// belongs to no connector (a clear, an unknown connector).
-async fn connector_loaded(state: &AppState, pool: &PgPool, run_id: &str) -> Option<Loaded> {
-    let connector = match load_alerts::find_connector(state, pool, run_id).await {
-        Ok(Found::This(connector)) => connector,
-        Ok(Found::Skip(_)) => return None,
-        Err(err) => {
-            tracing::warn!(%err, run = run_id, "quality load: the connector run could not be read");
-            return None;
-        }
+// PR #106 review R2 SHOULD-FIX 3: surface Dagster run inspection failures fail-closed
+async fn connector_loaded(
+    state: &AppState,
+    pool: &PgPool,
+    run_id: &str,
+) -> Result<Option<Loaded>, ApiError> {
+    let connector = match load_alerts::find_connector(state, pool, run_id).await? {
+        Found::This(connector) => connector,
+        Found::Skip(_) => return Ok(None),
     };
     // PR #106 review R1 BLOCKER 3: skip clear and filter scoped object
-    let config = match state.dagster.run_config(run_id).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            tracing::warn!(run = run_id, "quality load: run not found in Dagster");
-            return None;
-        }
-        Err(err) => {
-            tracing::warn!(%err, run = run_id, "quality load: Dagster run config could not be read");
-            return None;
-        }
+    let config = state
+        .dagster
+        .run_config(run_id)
+        .await
+        .map_err(|err| ApiError::Unavailable(format!("could not reach Dagster: {err}")))?;
+    let Some(config) = config else {
+        return Err(ApiError::NotFound(format!(
+            "run {run_id} not found in Dagster"
+        )));
     };
     if config
         .pointer("/ops/run_ingest/config/action")
         .and_then(Value::as_str)
         == Some("clear")
     {
-        return None;
+        return Ok(None);
     }
     let object_filter = config
         .pointer("/ops/run_ingest/config/object")
         .and_then(Value::as_str);
 
-    match connectors::get_ingest_spec(pool, &connector.id).await {
-        Ok(Some(spec)) => Some((
+    match connectors::get_ingest_spec(pool, &connector.id).await? {
+        Some(spec) => Ok(Some((
             format!("connector:{}", connector.id),
             connector_tables(&spec.source_objects, object_filter),
-        )),
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(?err, "quality load: the ingest spec could not be read");
-            None
-        }
+        ))),
+        None => Ok(None),
     }
 }
 
@@ -224,20 +220,22 @@ pub(super) async fn connector_success(
     let handled = load_alerts::connector_run_event(state, pool, req, Outcome::Success).await?;
     // PR #106 review R1 BLOCKER 3: follow up only when the event counted a load (not skipped)
     if handled.get("reason").is_none() {
-        spawn_connector(state, req);
+        // PR #106 review R2 SHOULD-FIX 3: surface Dagster run inspection failures fail-closed
+        let loaded = connector_loaded(state, pool, &req.run_id).await?;
+        if let Some(loaded) = loaded {
+            spawn_follow_up(state, &req.run_id, loaded);
+        }
     }
     Ok(handled)
 }
 
-fn spawn_connector(state: &AppState, req: &RunFailedBody) {
-    let (state, run_id) = (state.clone(), req.run_id.clone());
+fn spawn_follow_up(state: &AppState, run_id: &str, loaded: Loaded) {
+    let (state, run_id) = (state.clone(), run_id.to_owned());
     tokio::spawn(async move {
         let Some(pool) = state.pg.as_deref() else {
             return;
         };
-        if let Some(loaded) = connector_loaded(&state, pool, &run_id).await {
-            follow_up(&state, pool, &run_id, loaded).await;
-        }
+        follow_up(&state, pool, &run_id, loaded).await;
     });
 }
 
