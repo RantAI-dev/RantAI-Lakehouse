@@ -6,7 +6,18 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from dlt.common.schema.typing import TColumnSchema
 
-from .settings import OBJECT_TYPE_PLURAL, HS_TO_DLT_TYPE
+from datetime import datetime, timezone
+
+from .settings import (
+    CRM_BATCH_READ_ENDPOINT,
+    CRM_SEARCH_ENDPOINT,
+    HS_TO_DLT_TYPE,
+    OBJECT_TYPE_PLURAL,
+    SEARCH_MAX_PROPS_LENGTH,
+    SEARCH_MAX_RESULTS,
+    SEARCH_PAGE_LIMIT,
+)
+from .utils import chunk_properties
 
 # SRC-3 AD3/AD4 (local change 1): upstream called `dlt.sources.helpers.requests`
 # with `BASE_URL`, a bearer header built from an API key, and the next-page link
@@ -156,6 +167,116 @@ def fetch_data(
 
         # Follow pagination links if they exist
         _data = pagination(_data, session)
+
+
+class SearchOutOfBoundsException(Exception):
+    """More than `SEARCH_MAX_RESULTS` records share one modification time, so
+    the search cannot move past them. The caller reads the object in full."""
+
+
+def _to_ms(value: Any) -> int:
+    """A HubSpot date value (ISO 8601 text, or milliseconds as text or number) as
+    UTC epoch milliseconds."""
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+        return int(value)
+    return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _flatten(result: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The same shape `fetch_data` gives a record: the properties, plus `id`."""
+    _obj = dict(result.get("properties", result))
+    if "id" not in _obj and "id" in result:
+        _obj["id"] = result["id"]
+    if context:
+        _obj.update(context)
+    return _obj
+
+
+def search_data_since(
+    endpoint: str,
+    session: Any,
+    last_modified_prop: str,
+    since_ms: int,
+    props: List[str],
+    context: Optional[Dict[str, Any]] = None,
+) -> Iterator[List[Dict[str, Any]]]:
+    """Records of a CRM object modified at or after `since_ms`, through the CRM
+    search API (SRC-3 local change 2: upstream read every record on every run,
+    upstream PR #662 is the open attempt at this).
+
+    A search is a POST of a filter (`last_modified_prop >= since`), sorted by that
+    property ascending, 100 results a page. Three documented limits are handled,
+    not assumed away:
+
+    * a query returns at most `SEARCH_MAX_RESULTS`; when the pages run out at
+      the limit, the search restarts from the newest modification time seen
+      (the records at that instant come again; the merge key removes them);
+    * if the limit is reached and no newer time was seen, 10,000 records share
+      one instant and the search cannot move: `SearchOutOfBoundsException`;
+    * the request body may hold 3,000 characters, so the properties that do not
+      fit in the first request are read with the batch-read endpoint for the
+      ids of each page, then merged into the record.
+
+    Archived records do not appear in search results (HubSpot's search
+    documentation), so this path reports no deletes.
+
+    Raises:
+        SearchOutOfBoundsException: see above.
+    """
+    first, *later = _search_property_chunks(props, last_modified_prop)
+    url = CRM_SEARCH_ENDPOINT.format(crm_endpoint=endpoint)
+    while True:
+        body: Dict[str, Any] = {
+            "properties": first,
+            "limit": SEARCH_PAGE_LIMIT,
+            "filterGroups": [
+                {"filters": [{"propertyName": last_modified_prop, "operator": "GTE", "value": str(since_ms)}]}
+            ],
+            "sorts": [{"propertyName": last_modified_prop, "direction": "ASCENDING"}],
+        }
+        newest = since_ms
+        capped = False
+        while True:
+            data = session.post_json(url, body)
+            results = data.get("results", [])
+            if results:
+                objects = [_flatten(r, context) for r in results]
+                for obj in objects:
+                    if obj.get(last_modified_prop):
+                        newest = max(newest, _to_ms(obj[last_modified_prop]))
+                for chunk in later:
+                    extra = _batch_read(endpoint, session, [str(o["id"]) for o in objects], chunk)
+                    for obj in objects:
+                        obj.update(extra.get(str(obj["id"]), {}))
+                yield objects
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                return
+            if int(after) >= SEARCH_MAX_RESULTS:
+                capped = True
+                break
+            body["after"] = after
+        if capped:
+            if newest <= since_ms:
+                raise SearchOutOfBoundsException()
+            since_ms = newest
+
+
+def _search_property_chunks(props: List[str], last_modified_prop: str) -> List[List[str]]:
+    """The properties as request-sized chunks; the first holds the cursor
+    property, which every record must carry."""
+    rest = sorted(p for p in set(props) if p != last_modified_prop)
+    chunks = list(chunk_properties([last_modified_prop] + rest, SEARCH_MAX_PROPS_LENGTH))
+    return chunks or [[last_modified_prop]]
+
+
+def _batch_read(endpoint: str, session: Any, ids: List[str], props: List[str]) -> Dict[str, Dict[str, Any]]:
+    """`props` of the records `ids` (at most 100), by id."""
+    data = session.post_json(
+        CRM_BATCH_READ_ENDPOINT.format(crm_endpoint=endpoint),
+        {"properties": props, "inputs": [{"id": i} for i in ids]},
+    )
+    return {str(r["id"]): dict(r.get("properties", {})) for r in data.get("results", [])}
 
 
 def _get_property_names_types(

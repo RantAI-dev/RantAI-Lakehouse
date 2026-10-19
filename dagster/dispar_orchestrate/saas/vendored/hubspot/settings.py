@@ -19,6 +19,9 @@ CRM_OWNERS_ENDPOINT = "/crm/v3/owners/"
 CRM_PROPERTIES_ENDPOINT = "/crm/v3/properties/{objectType}/{property_name}"
 CRM_PIPELINES_ENDPOINT = "/crm/v3/pipelines/{objectType}"
 
+CRM_SEARCH_ENDPOINT = "{crm_endpoint}/search"
+CRM_BATCH_READ_ENDPOINT = "{crm_endpoint}/batch/read"
+
 CRM_OBJECT_ENDPOINTS = {
     "contact": CRM_CONTACTS_ENDPOINT,
     "company": CRM_COMPANIES_ENDPOINT,
@@ -112,6 +115,25 @@ ENTITY_PROPERTIES = {
     "quote": DEFAULT_QUOTE_PROPS,
 }
 
+
+# SRC-3 local change 2: the property the CRM search API filters and sorts by.
+# HubSpot names it `lastmodifieddate` for contacts and `hs_lastmodifieddate` for
+# every other object (the same split upstream PR #662 found; both are listed in
+# DEFAULT_*_PROPS above, so a record always carries its cursor).
+LAST_MODIFIED_PROPERTY = {
+    "company": "hs_lastmodifieddate",
+    "contact": "lastmodifieddate",
+    "deal": "hs_lastmodifieddate",
+    "ticket": "hs_lastmodifieddate",
+    "product": "hs_lastmodifieddate",
+    "quote": "hs_lastmodifieddate",
+}
+# HubSpot's documented search limits: at most 10,000 results for one query, 200
+# per page, 3,000 characters of request body, and "a few moments" before an
+# updated object shows in search (https://developers.hubspot.com/docs/api/crm/search).
+SEARCH_MAX_RESULTS = 10_000
+SEARCH_PAGE_LIMIT = 100  # also the batch-read maximum of 100 inputs
+SEARCH_MAX_PROPS_LENGTH = 2000  # leaves the filter and sort inside the 3,000 characters
 
 PIPELINES_OBJECTS = ["deals", "tickets"]
 SOFT_DELETE_KEY = "is_deleted"

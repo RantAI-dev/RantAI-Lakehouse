@@ -23,3 +23,21 @@ directory; `git diff` against it shows exactly what follows.
    and docstrings) and call `session.get_json(path_or_link, params)`;
    `BASE_URL`, `get_url`, `_get_headers` and the `requests` import are gone.
    Nothing else in the files changed.
+2. **Incremental reads through the CRM search API** (`helpers.py`
+   `search_data_since`, `settings.py` `LAST_MODIFIED_PROPERTY` and the search
+   limits; `SRC-3` decision 6, V-HubSpot.1). Upstream reads every record of
+   every object on every run (its issue is dlt-hub/verified-sources#662, the
+   open attempt is that pull request; it was read, not copied). A search with
+   `last_modified >= cursor`, sorted ascending, pages with `after`. Differences
+   from the pull request, each for a documented HubSpot limit
+   (https://developers.hubspot.com/docs/api/crm/search): the 10,000-result cap
+   restarts the query from the newest time seen and, if 10,000 records share
+   one instant, raises `SearchOutOfBoundsException` (the caller reads the
+   object in full) instead of silently stopping; properties beyond the
+   3,000-character body limit are read with the batch-read endpoint for the ids
+   of each page (the pull request would send a body HubSpot refuses once an
+   account has many custom properties); contacts use `lastmodifieddate`, every
+   other object `hs_lastmodifieddate`. Search does not return archived records,
+   so this path reports no deletes. Associations are not read (the search
+   response has none; the list path of upstream still can). Tests:
+   `test_saas_vendored_hubspot.py`.
