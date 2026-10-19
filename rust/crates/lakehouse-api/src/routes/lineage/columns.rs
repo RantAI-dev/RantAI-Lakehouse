@@ -523,6 +523,60 @@ pub(crate) async fn note_pipeline_sql(pool: &PgPool, pipeline_id: &str, sql: &st
 /// Nothing pending (a run that never reached the enforce call, or an event
 /// delivered twice) is a no-op. A failed run never reaches this function: the
 /// success event is refused first (`routes::pipelines::run_finished_event`).
+// PR #106 review R1 SHOULD-FIX DATA-13 1, SHOULD-FIX DATA-13 2
+fn unmappable_rows(
+    target: &str,
+    reason: &str,
+    known: &HashMap<String, Vec<String>>,
+) -> Vec<NewMapping> {
+    if let Some(probed) = known.get(target).filter(|p| !p.is_empty()) {
+        probed
+            .iter()
+            .map(|col| NewMapping {
+                from_table: None,
+                from_column: None,
+                to_table: target.to_owned(),
+                to_column: col.clone(),
+                transform: "unknown".to_owned(),
+                partial: true,
+                reason: Some(reason.to_owned()),
+            })
+            .collect()
+    } else {
+        vec![NewMapping {
+            from_table: None,
+            from_column: None,
+            to_table: target.to_owned(),
+            to_column: "*".to_owned(),
+            transform: "unknown".to_owned(),
+            partial: true,
+            reason: Some(reason.to_owned()),
+        }]
+    }
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-13 1, SHOULD-FIX DATA-13 2
+fn map_statement_or_unmappable(
+    sql: &str,
+    target: &str,
+    known: &HashMap<String, Vec<String>>,
+) -> Vec<NewMapping> {
+    if sql.len() > MAX_BUILD_QUERY_CHARS {
+        unmappable_rows(target, "the statement exceeds 20,000 characters", known)
+    } else {
+        match sql_lineage::map_select(sql, &ClickHouseDialect {}, known) {
+            Ok(lineage) => {
+                if let Some(probed) = known.get(target).filter(|p| !p.is_empty()) {
+                    rows_for_probed(&lineage, probed, target)
+                } else {
+                    rows_for(&lineage, target)
+                }
+            }
+            Err(unmappable) => unmappable_rows(target, &unmappable.to_string(), known),
+        }
+    }
+}
+
 pub(crate) async fn record_pipeline_run(state: &AppState, pool: &PgPool, pipeline_id: &str) {
     let sql = match column_lineage::get_pending(pool, pipeline_id).await {
         Ok(Some(sql)) => sql,
@@ -551,23 +605,8 @@ pub(crate) async fn record_pipeline_run(state: &AppState, pool: &PgPool, pipelin
     let known = cache
         .known_for(state, &sql, std::slice::from_ref(&target))
         .await;
-    let rows = match sql_lineage::map_select(&sql, &ClickHouseDialect {}, &known) {
-        Ok(lineage) => {
-            // PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star into probed target columns
-            if let Some(probed) = known.get(&target).filter(|p| !p.is_empty()) {
-                rows_for_probed(&lineage, probed, &target)
-            } else {
-                rows_for(&lineage, &target)
-            }
-        }
-        Err(unmappable) => {
-            // The statement cannot be read, so its outputs cannot even be
-            // named: write no rows, and drop the earlier ones so a stale
-            // mapping is not shown for a statement that no longer produces it.
-            tracing::info!(pipeline = pipeline_id, reason = %unmappable, "column lineage: the pipeline's SQL cannot be mapped");
-            Vec::new()
-        }
-    };
+    // PR #106 review R1 SHOULD-FIX DATA-13 2: statement over 20,000 chars or unmappable leaves partial rows with reason
+    let rows = map_statement_or_unmappable(&sql, &target, &known);
     if let Err(err) =
         column_lineage::replace_producer(pool, "pipeline", pipeline_id, pipeline.tenant_id, &rows)
             .await
@@ -603,7 +642,6 @@ fn builds_sql(after_ms: i64) -> String {
          WHERE type = 'QueryFinish' AND is_initial_query = 1 \
            AND query_kind IN ('Create', 'Insert') AND length(tables) > 1 \
            AND hasAny(databases, ['silver', 'serving']) \
-           AND length(query) <= {MAX_BUILD_QUERY_CHARS} \
            AND event_date >= toDate(fromUnixTimestamp64Milli({after_ms})) \
            AND event_time_microseconds > fromUnixTimestamp64Milli({after_ms}) \
          ORDER BY event_time_microseconds LIMIT {BUILD_BATCH}"
@@ -695,20 +733,8 @@ pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
         let known = cache
             .known_for(state, &query, std::slice::from_ref(&target))
             .await;
-        let rows = match sql_lineage::map_select(&query, &ClickHouseDialect {}, &known) {
-            Ok(lineage) => {
-                // PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star into probed target columns
-                if let Some(probed) = known.get(&target).filter(|p| !p.is_empty()) {
-                    rows_for_probed(&lineage, probed, &target)
-                } else {
-                    rows_for(&lineage, &target)
-                }
-            }
-            Err(unmappable) => {
-                tracing::info!(table = %target, reason = %unmappable, "column lineage: a build cannot be mapped");
-                Vec::new()
-            }
-        };
+        // PR #106 review R1 SHOULD-FIX DATA-13 2: statement over 20,000 chars or unmappable leaves partial rows with reason
+        let rows = map_statement_or_unmappable(&query, &target, &known);
         latest.insert(target, rows);
     }
     let mut written = 0;
@@ -1001,6 +1027,42 @@ mod tests {
             let cols: Vec<String> = mart.iter().map(|r| r.to_column.clone()).collect();
             assert_eq!(cols, vec!["id", "name"]);
             assert!(mart.iter().all(|r| r.partial));
+        }
+
+        // PR #106 review R1 SHOULD-FIX DATA-13 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_unmappable_or_overlong_build_stores_partial_rows_with_reason(
+            pool: sqlx::PgPool,
+        ) {
+            let ch = MockServer::start().await;
+            mount_columns(&ch).await;
+            let long_query = format!(
+                "INSERT INTO serving.mart SELECT id, name FROM silver.users WHERE '{}' = 'x'",
+                "a".repeat(20_001)
+            );
+            mount_log(
+                &ch,
+                &[
+                    (
+                        "1760000000000",
+                        "INSERT INTO serving.mart SELECT 1 FROM (SELECT count() FROM silver.users UNION ALL SELECT 2)",
+                    ),
+                    ("1760000001000", &long_query),
+                ],
+            )
+            .await;
+            let state = state_for(&pool, &ch.uri());
+            let written = run_builds_pass(&state, &pool).await;
+            assert_eq!(written, 1);
+            let mart = touching_table(&pool, "serving.mart", everything())
+                .await
+                .expect("read");
+            assert_eq!(mart.len(), 2);
+            assert!(mart.iter().all(|r| r.partial));
+            assert!(
+                mart.iter()
+                    .all(|r| r.reason.as_deref() == Some("the statement exceeds 20,000 characters"))
+            );
         }
 
         #[sqlx::test(migrations = "../../migrations")]
