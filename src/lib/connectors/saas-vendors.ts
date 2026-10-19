@@ -167,7 +167,14 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
         "crm.objects.contacts.read",
         "crm.objects.deals.read",
         "crm.objects.owners.read",
-        "tickets"
+        "crm.objects.quotes.read",
+        "crm.schemas.companies.read",
+        "crm.schemas.contacts.read",
+        "crm.schemas.deals.read",
+        "crm.schemas.quotes.read",
+        "tickets",
+        "e-commerce",
+        "oauth"
       ],
       "clientAuth": "post"
     },

@@ -35,6 +35,9 @@ class Reply:
     def json(self) -> Any:
         return self._body
 
+    def raise_for_status(self) -> None:
+        assert self.status_code < 400
+
 
 def iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
@@ -256,3 +259,58 @@ def test_a_second_run_reads_only_the_changed_deal_and_the_table_has_no_duplicate
     # also returned deals 1 and 3; the incremental merge loaded only the two that differ.
     assert api.searched == ["1", "3", "2", "4"] and second.rows == 2
     assert len(lab.rows("deals")) == 4
+
+
+# ---- V-HubSpot.3: sign-in, both ways (decision 3) -----------------------------------------------
+
+OAUTH_DIAL = {"vendor": "hubspot", "account": "123456", "auth": {"type": "oauth2_authorization_code", "clientId": "app-1"}}
+OAUTH_SECRETS = {"clientSecret": "client-secret-1", "refreshToken": "refresh-1"}
+
+
+class TokenEndpoint:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.calls: list[dict] = []
+
+    def __call__(self, url: str, **kw: Any) -> Reply:
+        self.calls.append({"url": url, **kw})
+        if self.status != 200:
+            # HubSpot's documented refusal body (developers.hubspot.com ... manage OAuth tokens).
+            return Reply(self.status, {"status": "BAD_REFRESH_TOKEN", "message": "refresh token is invalid, expired or revoked"})
+        return Reply(200, {"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 1800, "token_type": "bearer"})
+
+
+def test_the_browser_sign_in_asks_hubspots_token_address_with_the_client_in_the_form(api: FakeHubspot, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = TokenEndpoint()
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", token)
+    api.put(api.deals, "1", 1_000_000, dealname="x")
+    module, _v, parts, session = saas_adapter.open_session(
+        OAUTH_DIAL, OAUTH_SECRETS, resolve_checked=resolver, http_get=api.get, http_post=api.post, sleep=lambda _s: None
+    )
+    list(module.read(session, parts, OAUTH_DIAL, module.declaration(session, parts, OAUTH_DIAL, "deals"), since=None))
+    assert len(token.calls) == 1, "one token for the whole read"
+    call = token.calls[0]
+    assert call["url"] == "https://api.hubapi.com/oauth/v1/token", "the address is the table's, not the dial's"
+    assert call["data"]["grant_type"] == "refresh_token" and call["data"]["client_id"] == "app-1"
+    assert call["data"]["client_secret"] == "client-secret-1" and "headers" not in call, "client_secret_post, as HubSpot documents"
+    assert {h["Authorization"] for h in api.headers} == {"Bearer access-1"}
+
+
+def test_a_revoked_sign_in_is_the_fixed_sign_in_again_failure_without_hubspots_words(api: FakeHubspot, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dispar_orchestrate import ingest_errors
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", TokenEndpoint(status=400))
+    module, _v, parts, session = saas_adapter.open_session(
+        OAUTH_DIAL, OAUTH_SECRETS, resolve_checked=resolver, http_get=api.get, http_post=api.post, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception) as raised:
+        list(module.read(session, parts, OAUTH_DIAL, module.declaration(session, parts, OAUTH_DIAL, "owners"), since=None))
+    assert ingest_errors.classify(raised.value).error_class == "sign_in_refused"
+    assert "BAD_REFRESH_TOKEN" not in str(raised.value) and "revoked" not in str(raised.value)
+    assert api.headers == [], "no API request was sent without a token"
+
+
+def test_the_private_app_token_is_sent_as_a_bearer_and_nothing_else(api: FakeHubspot) -> None:
+    api.put(api.deals, "1", 1_000_000, dealname="x")
+    read(api, "deals")
+    assert {tuple(h.items()) for h in api.headers} == {(("Authorization", "Bearer not-a-real-token"),)}
