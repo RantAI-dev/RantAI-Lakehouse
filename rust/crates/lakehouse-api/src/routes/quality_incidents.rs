@@ -19,6 +19,7 @@
 
 use axum::Extension;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::governance::QualityRule;
@@ -127,10 +128,10 @@ pub(crate) async fn resolve_for_deleted_rule(
 pub struct IncidentsQuery {
     /// `open` (the default), `resolved` or `all`.
     #[serde(default)]
-    status: Option<String>,
+    pub status: Option<String>,
     /// Narrow to one table.
     #[serde(default)]
-    asset: Option<String>,
+    pub asset: Option<String>,
 }
 
 /// `GET /api/governance/quality/incidents?status=&asset=` — incidents,
@@ -143,8 +144,16 @@ pub struct IncidentsQuery {
 /// `503`/`500` on a store failure.
 pub async fn list_incidents(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Query(query): Query<IncidentsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let status = match query.status.as_deref() {
         None | Some("") => StatusFilter::Open,
         Some(other) => StatusFilter::parse(other).ok_or_else(|| {

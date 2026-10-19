@@ -38,7 +38,10 @@
 //! Everything here is bookkeeping around a load or a tick: a failure is logged
 //! and never fails the event that started it.
 
+use axum::Extension;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::quality::{self, IncidentKind, LoadSummary, TableLoad};
 use serde_json::{Value, json};
@@ -365,8 +368,16 @@ pub(crate) async fn tick(state: &AppState) {
 /// name; `503`/`500` on a store failure.
 pub async fn learning_status(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(asset): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let key = table_key(&asset).ok_or_else(|| {
         ApiError::BadRequest(
             "Name the table as bronze.<table>, silver.<table> or serving.<table>.".to_owned(),

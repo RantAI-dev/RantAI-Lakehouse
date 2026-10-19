@@ -46,6 +46,7 @@ use std::collections::HashMap;
 
 use axum::Extension;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
@@ -580,16 +581,24 @@ fn null_verdict(cmp: Cmp, limit: NullLimit, n: i64, k: i64) -> Verdict {
 /// A `min`/`max`/`avg` judged against the aggregate `row`. The aggregate
 /// came back as text; a column that is not numeric has a minimum or
 /// maximum, but not one a bound can judge.
+// PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: never return raw cell values in lastValue, run history, or incident detail
 fn stat_verdict(stat: Stat, bounds: &[(Cmp, f64)], row: &Map<String, Value>) -> Verdict {
     let measured = str_col(row, "v")
         .parse::<f64>()
         .ok()
         .filter(|v| v.is_finite());
     match measured {
-        Some(v) => Verdict {
-            status: passed_or_failed(bounds.iter().all(|(cmp, b)| cmp.holds_f64(v, *b))),
-            value: format!("{} is {v}", stat.sql()),
-        },
+        Some(v) => {
+            let passed = bounds.iter().all(|(cmp, b)| cmp.holds_f64(v, *b));
+            Verdict {
+                status: passed_or_failed(passed),
+                value: if passed {
+                    format!("{} within bounds", stat.sql())
+                } else {
+                    format!("{} outside bounds", stat.sql())
+                },
+            }
+        }
         None => Verdict {
             status: "warning",
             value: format!("the {} of the column is not a number", stat.sql()),
@@ -847,8 +856,16 @@ struct RunRecord {
 /// cannot be read (the cause is logged, not returned).
 pub async fn rule_runs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let rules = lakehouse_store::governance::list_quality_rules(pool(&state)?).await?;
     let rule = rules
         .iter()
@@ -2250,11 +2267,12 @@ mod tests {
             r.insert("v".to_owned(), json!(v));
             verdict_of(t, r)
         };
+        // PR #106 review R1 SHOULD-FIX DATA-14 1
         assert_eq!(
             stat("min(amount) >= 0", "0"),
             Verdict {
                 status: "passed",
-                value: "min is 0".to_owned()
+                value: "min within bounds".to_owned()
             }
         );
         assert_eq!(stat("min(amount) >= 0", "-2.5").status, "failed");
@@ -2282,5 +2300,107 @@ mod tests {
         assert_eq!(human_seconds(60), "1m");
         assert_eq!(human_seconds(3_600 + 5 * 60), "1h 5m");
         assert_eq!(human_seconds(2 * 86_400 + 4 * 3_600), "2d 4h");
+    }
+
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn quality_read_routes_refuse_caller_outside_catalog_tenant(
+        pool: lakehouse_store::PgPool,
+    ) {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, 'T1', 't1', 'Standard', 'US'), ($2, 'T2', 't2', 'Standard', 'US')")
+            .bind(t1)
+            .bind(t2)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let options = pool.connect_options();
+        let mut env = HashMap::new();
+        env.insert(
+            "DATABASE_URL".to_owned(),
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options.get_database().expect("a named database"),
+            ),
+        );
+        env.insert("CATALOG_TENANT_ID".to_owned(), t1.to_string());
+        let state =
+            AppState::new(crate::config::Config::from_map(&env).expect("a valid test Config"));
+
+        let outside_caller = Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: vec![t2],
+            display_name: "Outsider".to_owned(),
+            permissions: PermissionSet::parse("catalog:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        // 1. rule_runs
+        let err = rule_runs(
+            State(state.clone()),
+            Extension(outside_caller.clone()),
+            HeaderMap::new(),
+            Path("r1".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ApiRejection(ApiError::PermissionDenied(_))
+        ));
+
+        // 2. list_incidents
+        let err = crate::routes::quality_incidents::list_incidents(
+            State(state.clone()),
+            Extension(outside_caller.clone()),
+            HeaderMap::new(),
+            axum::extract::Query(crate::routes::quality_incidents::IncidentsQuery {
+                status: None,
+                asset: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ApiRejection(ApiError::PermissionDenied(_))
+        ));
+
+        // 3. list_schedules
+        let err = crate::routes::quality_schedules::list_schedules(
+            State(state.clone()),
+            Extension(outside_caller.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ApiRejection(ApiError::PermissionDenied(_))
+        ));
+
+        // 4. learning_status
+        let err = crate::routes::quality_anomaly::learning_status(
+            State(state),
+            Extension(outside_caller),
+            HeaderMap::new(),
+            Path("silver.orders".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ApiRejection(ApiError::PermissionDenied(_))
+        ));
     }
 }

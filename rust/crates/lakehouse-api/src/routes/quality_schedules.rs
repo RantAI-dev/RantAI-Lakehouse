@@ -14,6 +14,7 @@
 
 use axum::Extension;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
@@ -45,7 +46,17 @@ pub(super) fn table_key(asset: &str) -> Option<String> {
 /// # Errors
 ///
 /// `503`/`500` on a store failure.
-pub async fn list_schedules(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+pub async fn list_schedules(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let schedules = quality::list_schedules(pool(&state)?).await?;
     Ok(ApiJson(json!({
         "schedules": schedules,
