@@ -41,16 +41,9 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     let Some(pg) = state.pg.as_deref() else {
         return;
     };
-    // PR #106 review R1 SHOULD-FIX DATA-14 2: read alert rules before committing incident row (SRC-17 F2)
-    let rules = match crate::routes::load_alerts::read_rules(state).await {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!(?err, rule = %rule.name, "quality: alert rules unavailable, deferring incident commit");
-            return;
-        }
-    };
+    // PR #106 review R2 BLOCKER 9: commit incident first (never lost when rule store is down)
     let detail = format!("{} — {measured} (threshold: {})", rule.name, rule.threshold);
-    match quality::record_failure(
+    let recorded = match quality::record_failure(
         pg,
         &rule.asset,
         Some(&rule.id),
@@ -59,43 +52,60 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
     )
     .await
     {
-        Ok(recorded) => {
-            // DATA-14 review BLOCKER 1: an incident that OPENS is delivered to
-            // the `quality_incident` rules, as `open_anomaly` does; one seen
-            // again (`opened` false) is the same incident and sends nothing.
-            if recorded.opened {
-                notify_opened(state, &rule.asset, &detail, rules);
-            }
-            tracing::debug!(rule = %rule.name, opened = recorded.opened, "quality: incident recorded");
-        }
+        Ok(rec) => rec,
         Err(err) => {
             tracing::warn!(?err, rule = %rule.name, "quality: the incident could not be recorded");
+            return;
         }
-    }
+    };
+    tracing::debug!(rule = %rule.name, opened = recorded.opened, "quality: incident recorded");
+    deliver_incident_alert(state, pg, &recorded.id, &rule.asset, &detail).await;
 }
 
-/// Hands an incident that just OPENED to the `quality_incident` alert rules
-/// (`DATA-14`, F6), in the background so a webhook that is slow to answer
-/// never holds up the run, load or tick that found it. Only an opening
-/// delivers: an incident seen again is the same incident. The message is the
-/// table, what was found and a relative link; the rules' webhook and email
-/// channels and silences are SRC-7's.
-fn notify_opened(
+// PR #106 review R2 BLOCKER 9: retriable incident alert delivery (SRC-17 F2).
+// Rules are read first; if the rule store is down, the incident is already open
+// in Postgres, leaving the handover marker absent so a later pass/retry delivers.
+// When rules are read, the marker is written to pipeline_run_event and delivery is awaited.
+async fn deliver_incident_alert(
     state: &AppState,
+    pool: &lakehouse_store::PgPool,
+    incident_id: &str,
     asset: &str,
     detail: &str,
-    rules: Vec<lakehouse_alerts::AlertRule>,
 ) {
-    let (state, asset) = (state.clone(), asset.to_owned());
-    let text = format!("{asset}: {detail}. View: /governance/data-quality");
-    tokio::spawn(async move {
-        if let Some(pg) = state.pg.as_deref() {
-            crate::routes::load_alerts::deliver_quality_incident_with_rules(
-                &state, pg, &rules, &asset, &text,
-            )
-            .await;
+    let rules = match crate::routes::load_alerts::read_rules(state).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, %asset, incident = incident_id, "quality: alert rules unavailable, leaving incident open for later delivery");
+            return;
         }
-    });
+    };
+    let handed_over = match lakehouse_store::pipelines::record_pipeline_run_event(
+        pool,
+        incident_id,
+        asset,
+        "quality_incident_alerted",
+    )
+    .await
+    {
+        Ok(inserted) => inserted,
+        Err(err) => {
+            tracing::warn!(?err, %asset, incident = incident_id, "quality: could not record incident alert marker");
+            return;
+        }
+    };
+    if !handed_over {
+        tracing::debug!(
+            incident = incident_id,
+            "quality: incident already alerted; skipping delivery"
+        );
+        return;
+    }
+    let text = format!("{asset}: {detail}. View: /governance/data-quality");
+    crate::routes::load_alerts::deliver_quality_incident_with_rules(
+        state, pool, &rules, asset, &text,
+    )
+    .await;
 }
 
 /// Opens the incident of an anomaly (`DATA-14`, F5) for `asset`, or moves the
@@ -109,26 +119,16 @@ pub(crate) async fn open_anomaly(
     detail: &str,
 ) -> Option<String> {
     let pg = state.pg.as_deref()?;
-    // PR #106 review R1 SHOULD-FIX DATA-14 2: read alert rules before committing incident row (SRC-17 F2)
-    let rules = match crate::routes::load_alerts::read_rules(state).await {
-        Ok(r) => r,
+    // PR #106 review R2 BLOCKER 9: commit incident first (never lost when rule store is down)
+    let recorded = match quality::record_failure(pg, asset, None, kind, detail).await {
+        Ok(rec) => rec,
         Err(err) => {
-            tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: alert rules unavailable, deferring anomaly incident commit");
+            tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: the anomaly could not be recorded");
             return None;
         }
     };
-    match quality::record_failure(pg, asset, None, kind, detail).await {
-        Ok(recorded) => {
-            if recorded.opened {
-                notify_opened(state, asset, detail, rules);
-            }
-            recorded.opened.then_some(recorded.id)
-        }
-        Err(err) => {
-            tracing::warn!(?err, %asset, kind = kind.as_str(), "quality: the anomaly could not be recorded");
-            None
-        }
-    }
+    deliver_incident_alert(state, pg, &recorded.id, asset, detail).await;
+    recorded.opened.then_some(recorded.id)
 }
 
 /// Resolves the open incidents of a rule that was just deleted.
@@ -482,9 +482,11 @@ mod tests {
         assert_eq!(open.len(), 1);
     }
 
-    // PR #106 review R1 SHOULD-FIX DATA-14 2
+    // PR #106 review R2 BLOCKER 9: rule-store failure commits incident row and leaves marker absent for retry
     #[sqlx::test(migrations = "../../migrations")]
-    async fn a_rule_store_failure_does_not_commit_incident_row(pool: sqlx::PgPool) {
+    async fn a_rule_store_failure_commits_incident_row_and_retries_on_next_pass(
+        pool: sqlx::PgPool,
+    ) {
         let ch = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string("clickhouse down"))
@@ -510,9 +512,20 @@ mod tests {
         let open_incidents = quality::list(&pool, StatusFilter::Open, None)
             .await
             .unwrap();
-        assert!(
-            open_incidents.is_empty(),
-            "incident row must not be committed when reading alert rules fails"
+        assert_eq!(
+            open_incidents.len(),
+            1,
+            "incident row must be committed even when reading alert rules fails"
+        );
+        let alerted: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pipeline_run_event WHERE kind = 'quality_incident_alerted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            alerted, 0,
+            "handover marker must not be written when reading alert rules fails"
         );
     }
 }
