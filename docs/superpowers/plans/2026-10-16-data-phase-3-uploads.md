@@ -452,4 +452,39 @@ Environment: `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target`,
 
 ## 12. Review
 
-(Planner, per slice: findings tagged `BLOCKER` or `SHOULD-FIX`.)
+### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
+
+**Re-run by the reviewer** (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target`, crates touched first):
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -j 4 -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-store --test uploads` | 51 passed |
+| `cargo test -p lakehouse-api --lib -- upload_ config::` | 223 passed, 1 ignored (the live-RustFS test) |
+| `cargo test -p lakehouse-api --test upload_routes -- --test-threads=2` | 108 passed |
+| `cargo test -p lakehouse-api --test route_auth` | 44 passed |
+| `bun test` on the queue, `src/lib/uploads`, the uploads client and `src/features/connectors/` | 404 passed |
+| `bun run typecheck` | **not verified by the reviewer.** 8 errors, all in `src/features/landing/scene/*`: `three` is missing from the borrowed `node_modules` (a stale install of the main checkout), which is not this diff. The developer reports a clean run; CI decides |
+
+**Reading:**
+
+- The `{id}` routes sit in `per_upload`, behind `require_upload_in_tenants`.
+- All four routes are in `POLICY_TABLE` with `connector:manage` and are asserted in `route_auth.rs`.
+- The piece route has its own 8 MiB + 64 KiB body limit and takes the `SEC-17` place before it reads the body.
+- `multipart_id` is never serialised.
+- Parts complete in `part_number` order.
+- The migration's why-header covers the CHECK swap and the cascade.
+- The console goes through `apiFetch`, with at most 4 pieces in flight; it honours `Retry-After` and resumes on `online`.
+- The plan/code differences 1–3 and 5–6 in the handoff are accepted: no file hash for a file never held whole, the sweep in its own module, the 300 s timeout per piece, files start when picked, and `complete` opens a workbook or Parquet file whole up to 50 MiB until slice 2.
+
+No `BLOCKER`.
+
+**`SHOULD-FIX`, to land with slice 2:**
+
+1. **Cap open sessions per user.** A user can open any number of `receiving` sessions before the 24 h sweep. Refuse a new session past 20 open ones per user with a 429 and a fixed sentence; decision 5 needs 10.
+2. **`complete` must recover from its own half-success.** When S3's complete succeeded but the database write after it failed, a retry answers 503 until the sweep removes the file. On retry, when the multipart upload is gone and the object exists with the declared size, carry on from the sniff.
+3. **The stale "Upload a CSV or TSV" text in `connector-create-page.tsx`** (the developer's note).
+4. **`UPLOAD_SESSION_TTL_HOURS` passthrough** in `docker-compose.yml` (`${UPLOAD_SESSION_TTL_HOURS:-}`, with a comment) and `.env.example` (no value). The g9 CI job's `compose up` proves it (rule 8).
+
+**Noted:** the one combined run with 6 failures did not recur in the reviewer's runs. Watch for it in CI.
