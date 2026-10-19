@@ -1964,9 +1964,22 @@ async fn delete_session_writes_an_audit_event() {
 /// then answers 400/404 for the body or key) and a refusal stores nothing.
 #[tokio::test]
 async fn tag_key_routes_are_gated_in_both_directions() {
-    let TestApp { router, pool } = spin_up().await;
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
     let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
 
     let writes = [
         ("POST", "/api/governance/tag-keys"),
@@ -2000,30 +2013,19 @@ async fn tag_key_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "governance:write alone must NOT be enough to list the tag keys"
     );
+    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertions with catalog-tenant caller
     for (method, path) in writes {
         let resp = request_with_cookie(&router, method, path, &admin_cookie).await;
-        // PR #106 review R1 BLOCKER 1: governance:write passes the permission
-        // middleware; the tenant gate answers 403 on this multi-tenant test app.
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "governance:write must be enough to {method} {path}"
+        );
         assert_ne!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "governance:write must be authenticated"
         );
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read body");
-        if status == StatusCode::FORBIDDEN {
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-            let error = body
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            assert!(
-                error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
-                "governance:write must not be denied by permission middleware: {error}"
-            );
-        }
     }
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
@@ -2042,9 +2044,22 @@ async fn tag_key_routes_are_gated_in_both_directions() {
 /// (the unknown incident then answers 404, not 401/403).
 #[tokio::test]
 async fn quality_incident_routes_are_gated_in_both_directions() {
-    let TestApp { router, pool } = spin_up().await;
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
     let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
     let resolve = "/api/governance/quality/incidents/00000000-0000-4000-8000-000000000000/resolve";
 
     let reader_cookie = session_cookie_for_user(&pool, reader).await;
@@ -2055,24 +2070,13 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
-    // middleware; tenant gate answers 403 on multi-tenant test app
+    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
+    assert_ne!(
+        listed.status(),
+        StatusCode::FORBIDDEN,
+        "any login may list incidents"
+    );
     assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
-    let status = listed.status();
-    let bytes = to_bytes(listed.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    if status == StatusCode::FORBIDDEN {
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
-            "must not be denied by permission middleware: {error}"
-        );
-    }
     let refused = request_with_cookie(&router, "POST", resolve, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2108,9 +2112,22 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
 /// stored; one with it is past the gate (an empty body then answers 400).
 #[tokio::test]
 async fn quality_schedule_routes_are_gated_in_both_directions() {
-    let TestApp { router, pool } = spin_up().await;
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
     let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
     let set = "/api/governance/quality/schedules/silver.orders";
 
     let reader_cookie = session_cookie_for_user(&pool, reader).await;
@@ -2121,24 +2138,13 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
-    // middleware; tenant gate answers 403 on multi-tenant test app
+    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
+    assert_ne!(
+        listed.status(),
+        StatusCode::FORBIDDEN,
+        "any login may read schedules"
+    );
     assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
-    let status = listed.status();
-    let bytes = to_bytes(listed.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    if status == StatusCode::FORBIDDEN {
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
-            "must not be denied by permission middleware: {error}"
-        );
-    }
     let refused = request_with_cookie(&router, "PUT", set, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2166,29 +2172,25 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
 /// caller is refused.
 #[tokio::test]
 async fn the_learning_state_is_readable_by_any_login_and_not_anonymously() {
-    let TestApp { router, pool } = spin_up().await;
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
     let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .execute(&pool)
+        .await
+        .expect("associate test user with catalog tenant");
     let cookie = session_cookie_for_user(&pool, reader).await;
     let path = "/api/governance/quality/learning/silver.orders";
     let read = request_with_cookie(&router, "GET", path, &cookie).await;
-    // PR #106 review R1 SHOULD-FIX DATA-14 1 / D4: any login passes permission
-    // middleware; tenant gate answers 403 on multi-tenant test app
-    assert_ne!(read.status(), StatusCode::UNAUTHORIZED);
-    let status = read.status();
-    let bytes = to_bytes(read.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    if status == StatusCode::FORBIDDEN {
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
-            "must not be denied by permission middleware: {error}"
-        );
-    }
+    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
+    assert_eq!(read.status(), StatusCode::OK);
     let anonymous = router
         .clone()
         .oneshot(
