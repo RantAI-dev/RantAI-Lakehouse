@@ -273,7 +273,6 @@ parity), built after it.
 | `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
-| `DATA-17` | Building | `SEC-22` (Phase 3 slices 2 and 4: files the load job reads natively, the 2 GB cap) | — |
 | `DATA-13` | Planned | — | `BI-14` (column part) |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
@@ -281,7 +280,6 @@ parity), built after it.
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-22` | Todo | — | `DATA-17` (Phase 3 slices 2 and 4) |
 | `SEC-20` | Todo | — | `QS-3` |
 | `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |

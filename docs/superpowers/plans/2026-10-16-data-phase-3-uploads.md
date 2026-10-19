@@ -9,7 +9,7 @@
 | Branch | `feat/data-phase-3-uploads`, worktree `/home/hv/lakehouse-phase3-uploads`. One branch, one PR for the phase, opened as a draft on the first push |
 | Specs | `docs/core/specs/data-17.md`, `data-18.md` ("Today" corrected in this commit), `data-19.md` |
 | Feature pages | `docs/core/features/upload-big-files-and-more-formats.md` (`DATA-17`), `upload-column-types.md` (`DATA-18`): decisions signed 2026-10-16 (every default) |
-| State | Decisions signed 2026-10-16: the product owner chose every default on both pages, and `SEC-22` as its own PR to `main` first (slice 0). Ready to build |
+| State | Decisions signed 2026-10-16: the product owner chose every default on both pages. 2026-10-19: the product owner limited this work to the roadmap's Phase 3 items; `SEC-22` belongs to another team and is not part of this plan. Ready to build |
 
 ## 1. Scope, and what is already done
 
@@ -18,11 +18,12 @@
 | `DATA-19` | Uploaded tables feed pipelines | **Merged in #165** (2026-10-15), In Acceptance. AC1–AC7 on `uploads-feed-pipelines.md` not run; that page still says "Planned" | No code. The planner corrects the page's status; the product owner runs its checklist |
 | `DATA-17` | More formats, more files, bigger files | Building: Excel and Parquet merged in #76 (2026-10-08). The rest is missing (section 2) | Slices 1, 2, 4, 5, 6 |
 | `DATA-18` | Column types on upload | Planned, nothing built | Slice 3 |
-| `SEC-22` | Workbook and Parquet conversion can exhaust the API's memory (P0, Todo) | Open at the code (delivery review, 2026-10-12) | **Prerequisite**, section 6, slice 0 |
+| `SEC-22` | Workbook and Parquet conversion can exhaust the API's memory (P0) | Another team's item | **Not in this plan** (product owner, 2026-10-19). This plan adds no workbook reading and does not depend on it |
 
 `DATA-19` needs nothing from this branch, so Phase 3 is `DATA-17` + `DATA-18`,
-with `SEC-22` in front: it is the same code path, and a 2 GB upload must not
-inherit an open P0 memory hole.
+and nothing else. `SEC-22` (workbook and Parquet conversion in the API) is another
+team's; this plan leaves the workbook path as it is and takes Parquet out of
+the API by its own design (AD2), without waiting for it.
 
 ## 2. Spec rows against the code
 
@@ -83,7 +84,7 @@ The design has to change at every hop, which is what AD1 and AD2 do.
 ## 4. Architecture decisions (planner)
 
 - **AD1. Chunked, resumable upload through the API into S3 multipart.** The browser asks for an upload session, sends the file in 8 MiB pieces (`PUT /api/uploads/{id}/parts/{n}`), and completes it. The API writes each piece as an S3 multipart part through `object_store::multipart::MultipartStore` and records the multipart id and each part's ETag and SHA-256 in Postgres, so any API process can take the next piece and a restart loses nothing. Rejected: presigned browser-to-storage upload (ADR 0014's "next step"). The storage endpoint is not published to browsers, it needs CORS, and the API would no longer see each piece for the tenant and permission checks. Each 8 MiB piece passes the existing 51 MiB proxy limit untouched. 2 GiB is 256 pieces, far below S3's 10,000.
-- **AD2. The job is the only reader of a whole file, and it streams. The API reads only bounded samples.** The preview and the type guess read a bounded prefix with range reads: the Parquet footer plus the first row group, the first Avro blocks, the first lines of JSON Lines, a gzip stream's first bytes, a zip's central directory. The job reads every format natively, in batches, and hands Arrow record batches to the sink. **Parquet stops being converted in the API.** Excel keeps its conversion in the API, at 50 MiB, bounded by `SEC-22`: a workbook must be opened whole to list its sheets, so a streamed path would not help.
+- **AD2. The job is the only reader of a whole file, and it streams. The API reads only bounded samples.** The preview and the type guess read a bounded prefix with range reads: the Parquet footer plus the first row group, the first Avro blocks, the first lines of JSON Lines, a gzip stream's first bytes, a zip's central directory. The job reads every format natively, in batches, and hands Arrow record batches to the sink. **Parquet stops being converted in the API.** Excel keeps its conversion in the API, at 50 MiB, unchanged by this plan (its memory bounds are `SEC-22`, another team's): a workbook must be opened whole to list its sheets, so a streamed path would not help.
 - **AD3. One column-spec contract, detected in the API and applied in the job.** `columns: [{source, name, type, dateFormat?}]` plus `onBadValue: "null" | "stop"`. The API (Rust) guesses types on the sample and validates what the user sends; the job (Python) casts the whole file. Both follow the same rules, proven by one shared fixture set in `ops/fixtures/uploads/types/` that both test suites read (the ADR 0014 decision 3 pattern). The job casts with vectorised `pyarrow.compute`, and goes row by row only to collect the first 100 failures.
 - **AD4. A load of several files is one ingest call, with no batch object.** `POST /api/uploads/{id}/ingest` names a primary upload and up to nine more (`alsoUploads`). That makes one Dagster run and one table. Each file stays its own `file_upload` row (listed, deleted and duplicate-checked as today) with `loaded_with` = the primary. The Settler settles them all from the one `ingest_run` row, which is keyed by the primary.
 - **AD5. The run config grows; the `DATA-19` path does not move.** New fields: `format`, `storage_keys` (the primary first), `columns`, `on_bad_value`. `bronze_table_name` stays where `authored_factory.py:912` reads it. The config stays closed, with every field required, and the API always sends it whole.
@@ -126,7 +127,6 @@ They are on the two feature pages, each with the planner's default. In short:
 
 | Slice | Item | Content | Migration |
 | --- | --- | --- | --- |
-| 0 | `SEC-22` | Bounded workbook and Parquet reading in the API (own plan) | none expected |
 | 1 | `DATA-17` | Chunked, resumable transport; 10 files picked at once; progress per file | `0090` |
 | 2 | `DATA-17` | The job streams; Parquet read natively by the job; the large-file harness | none |
 | 3 | `DATA-18` | Column types end to end | `0091` |
@@ -142,7 +142,7 @@ Why this order:
 - **Several files after formats.** The mismatch check compares columns and types, which slices 3 and 4 define.
 - **The measurement last.** It must measure the code that ships.
 
-**Slice 0, `SEC-22`: its own small PR to `main` first (the product owner's choice, 2026-10-16).** It is P0 and already public in `BACKLOG.md`, and this phase will take weeks. Its fix (workbook reading that cannot end the API process, bounded footer sizes, a limit on conversions at once, no full re-conversion per preview) is the base slices 2 and 4 build on. It gets its own plan. If the product owner prefers it inside the phase PR, it becomes that PR's first commits, and nothing else in this plan changes.
+**No slice 0.** `SEC-22` is another team's item (product owner, 2026-10-19). Slices 2 and 4 do not wait for it: slice 2 takes Parquet reading out of the API altogether, and nothing here touches the workbook conversion.
 
 ## 7. Tasks
 
@@ -232,7 +232,7 @@ its handoff.
 - **T2.2 Parquet read by the job.**
   - `pyarrow.parquet.ParquetFile(...).iter_batches()`. Until slice 3, every column is cast to the same text the API's converter wrote today (a shared fixture proves the two agree), so behaviour does not change.
   - Binary and nested columns are refused as today.
-  - In the API, `ingest` launches with `format: "parquet"` and the original key, and writes no `.converted.csv` for Parquet. The preview reads the footer and the first row group by range, with the size checks `SEC-22` adds (or adds here, citing `SEC-22`, if slice 0 has not merged).
+  - In the API, `ingest` launches with `format: "parquet"` and the original key, and writes no `.converted.csv` for Parquet. The preview reads the footer and the first row group by range, with its own bounds on what the footer declares (footer length and row-group sizes no larger than the file).
   - Check: the Rust and Python scoped checks for the touched crate and files.
 - **T2.3 The large-file harness.**
   - `ops/g9/large_upload.py` generates files at run time: a 2 GiB CSV, 10 Parquet files totalling 1.9 GiB, and a gzipped CSV once slice 4 exists.

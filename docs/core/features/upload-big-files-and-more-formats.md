@@ -63,7 +63,7 @@ Each default was the planner's recommendation.
 | 6 | What "in parallel" means | All files progress together, with up to 4 pieces in flight per user: the `SEC-17` per-user limit (`UPLOAD_MAX_CONCURRENT_PER_USER`, 4) stays as signed | 2026-10-16, product owner: the default |
 | 7 | How far resuming goes | Automatic while the page stays open: a dropped connection or an API restart pauses the file and it continues on its own. After a page reload the file is uploaded again | 2026-10-16, product owner: the default |
 | 8 | Unfinished uploads | Removed with their pieces after 24 hours *(proposed)* | 2026-10-16, product owner: the default |
-| 9 | Excel size | Stays at 50 MB per workbook. A workbook is read whole to list its sheets, and `SEC-22` bounds that reading; Databricks' upload does not take Excel at all | 2026-10-16, product owner: the default |
+| 9 | Excel size | Stays at 50 MB per workbook. A workbook is read whole to list its sheets, as today; Databricks' upload does not take Excel at all | 2026-10-16, product owner: the default |
 | 10 | The 2,000,000-row cap | Removed once the measurement shows memory flat in row count; otherwise it stays and the reason is written down | 2026-10-16, product owner: the default |
 | 11 | JSON shapes | A top-level array of objects (`.json`) or one object per line (`.jsonl`, `.ndjson`). Object keys become columns; a key missing from a row is empty (null). A nested object or array is kept as JSON text in one column; no child tables | 2026-10-16, product owner: the default |
 | 12 | Avro | Object container files (`.avro`). Records, arrays and maps are kept as JSON text; a union with null is a column that may be empty | 2026-10-16, product owner: the default |
