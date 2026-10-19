@@ -345,6 +345,70 @@ decisions (`SRC-3 decision N`, `AD-N`) at the code that carries them.
 (Developer, per slice: commits, the exact commands with their counts, what
 was not verified and why.)
 
+### Handoff: slice 1 (developer, 2026-10-19)
+
+Commits, in order (branch `feat/data-phase-4-connectors`, base `2ea0f377`):
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T1.1 | `832a5ed9` | SRC-3 feat(migrations): saas adapter and the ten business-app connector types, unsupported |
+| T1.2 | `d9a7d72f` | SRC-3 feat(store): saas vendor table and Dial::Saas |
+| T1.3 | `52d2a4a2` | SRC-3 feat(store): incremental loads and column choice for saas objects |
+| T1.4 | `c0ea41d0` | SRC-3 feat(api): connection test for saas connectors |
+| T1.5 | `2443e156` | SRC-3 feat(api): OAuth sign-in for saas connectors, with client_secret_basic |
+| T1.6 | `e3b9d2b4` | SRC-3 test(api): saas listing and column preview go to the orchestrator |
+| T1.7 | `fabbe751` | SRC-3 feat(ai): the assistant's connector tools know the saas adapter |
+| T1.8 | `2e97023c` | SRC-3 feat(dagster): SaasSession, vendor registry and object declarations |
+| fix (PR #214 CI) | `1988a26f` | SRC-3 test(store): connector_type tests know the ten saas types |
+| T1.9 | `34120026` | SRC-3 feat(dagster): the saas load path, with a describe hook and incremental loads |
+| T1.10 (Rust half) | `8d9d601d` | SRC-3 feat(store): discovery lists a business-app object with how it loads |
+| T1.10 | `1e19ae75` | SRC-3 feat(dagster): discovery reads a saas connector through its vendor module |
+| T1.11 | `00393bd2` | SRC-3 feat(frontend): business apps in the connector picker and forms |
+| T1.12 | `c2e7a263` | SRC-3 ci(gate): the g6-saas job skeleton and the mock vendor server |
+
+Commands run on the final tree, with counts:
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` (shared `CARGO_TARGET_DIR`, `-j 2`, crate sources touched first): finished, 0 warnings. (Only these two crates changed Rust.)
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, loader tests included, venv `~/.cache/rantai-dagster-venv`, dlt 1.30.0): **1746 passed, 0 failed** (16m08s).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: all OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun run typecheck`: 8 errors, all `Cannot find module 'three'` / its follow-on under `src/features/landing/scene` (the checkout has no `node_modules` of its own; it uses the main checkout's through a symlink that is not committed, and that install lacks `three`); 0 errors anywhere else. `bun run lint`: 0 errors, 6 warnings, none in files of this slice.
+- `bun test src/features/connectors`: 338 pass, 0 fail. `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/services`: 85 pass, 0 fail.
+- `bash scripts/ci/tests/test_required_gate.sh`: 52 passed, 0 failed.
+- `docker compose --profile g6-saas config --quiet` (with the g6 override) and `--profile '*' config --quiet`: OK (fake `.env` values).
+
+**Not verified, and why**
+
+- **No Rust test was run** (`cargo test` is forbidden on this machine). Every Rust unit and integration test added or changed (`saas_vendors.rs`, `ingest_spec.rs` saas tests, `connector_probe/saas.rs`, `routes/connector_oauth.rs`, `connector_oauth.rs`, `tests/connector_oauth_flow.rs`, `tests/connector_discovery.rs`, `tests/connector_type.rs`, `tool_schemas_snapshot_is_byte_identical`) compiled under clippy `--all-targets` and was read, but did not run. `tests/fixtures/tool_schemas.json` was edited by hand to what the registry should print (two strings, one enum value), not regenerated. PR #214 CI's first run of T1.1 to T1.4 found the three `connector_type.rs` failures fixed in `1988a26f`; nothing of T1.5 onward has run in CI yet.
+- **The `g6-saas` job and `g6_saas_test.py` have not run.** The job is copied from `g6-discovery-scale` and `g6-oauth`; the stub was started locally and answers `/health` and 404; the gate script was not executed against an API.
+- **The Rust and Python account rules are separate code**, compared only through the vendor table fixture and each side's own tests; the shared fixture covers the table, not the account-validation functions. The near-miss lists in both languages' tests are the same on purpose.
+- **Brand marks were not added** (T1.11): the current Simple Icons release could not be checked from this machine, which `brand-marks.ts:21-29` requires. All ten types show the generic icon.
+- Nothing was shown in a browser.
+
+**Plan items decided or found false (section 8)**
+
+- Item 3 (dlt `rest_api` links): true by reading dlt 1.30.0; `RESTClient` takes a caller-supplied session and paginators set `request.url` to the next link, so a `Session.send` override can apply AD3. Not run with a vendor (slice 4).
+- Item 4 (upsert merge on vendor keys, `_apply_cursor`): verified by running, in `test_adapters_saas.py` against a local Iceberg catalog with a real dlt resource: the second incremental run read only the newer rows, the merge left no duplicate, and `sink._apply_cursor` accepted the saas resource, so `sink.py` is unchanged.
+- Item 5 (SRC-9 lint grammar): true; `0095` is in the shapes the lint replays and the lint needed no change.
+- Items 1, 2, 6, 7: not reached in slice 1.
+
+**Plan mismatches found (the planner decides)**
+
+1. **Paths.** `ingest_spec.rs` is in `rust/crates/lakehouse-store/src`, not `lakehouse-api`. Because `Dial::parse` validates the account against the vendor table and the API crate depends on the store, `saas_vendors.rs` is in the store too (T1.2 said `A/saas_vendors.rs`).
+2. **T1.9 asks `ingest_errors.classify` to gain `permission_missing` and `rate_limited`.** The run-report classes are a closed list enforced by `connector_run.rs` and by `CHECK connector_run_attempt_class_check` (`0072`); two new classes need a migration, and `0095`/`0096` are taken. Provisional mapping, in the code and the commit: `SaasSignInRefused` and `SaasPermissionMissing` classify as `sign_in_refused` (not retried), `SaasRateLimited` as `source_busy` (retried). Decision 7 of the feature page ("a permission is missing", "the vendor limits the rate" in plain words) is therefore NOT met for run reports until the classes exist. Discovery already has `no_permission`, and uses it.
+3. **T1.10 and T1.11 assume the discovery result can list a business-app object and say how it loads.** `ObjectKind` is closed and `ListedObject` denies unknown fields, so a saas listing would have been refused. Added `ObjectKind::Object` and an optional `load` text (`8d9d601d`, additive, validated). This is Rust work outside the task text; revert it if the planner wants another carrier.
+4. **`connector_type.rs` tests (`1988a26f`).** `unsupported_rows_have_no_adapter` guards "an unsupported type without a `Dial::parse` shape has no adapter"; the exceptions are named (`0062` Sheets, `0066` the two CDC types) because those types keep their adapter so existing connectors open in the edit page. The ten saas types are the same case, so they were added to the named list (not a wildcard), the count became 26, and a new test pins adapter `saas` plus the reason for each. AD10 is unchanged. If the planner prefers `adapter = NULL` until `0096`, `0095` must change instead (not applied, so no deployed database has it).
+5. **Confluence.** With browser sign-in the Atlassian API host is `api.atlassian.com/ex/confluence/<cloud id>`, not `<site>.atlassian.net`. The table row uses the site host (right for an API token); slice 4 must add the cloud-id step.
+6. **Dynamics and SharePoint client credentials need a Microsoft tenant id**, which no slot or dial field carries yet; slice 5.
+7. **The vendor scopes and revocation addresses in the table are from the developer's knowledge of each vendor's documentation, not checked against it from this machine** (no network). Slices 2 to 6 check each when the vendor is built.
+
+**Other**
+
+- `rest.py` changed only to add `client_secret_basic` to the token request (AD8); a `rest` connector's request is unchanged (a `rest` test failed while `headers=` was always passed; fixed to pass it only when asked).
+- Not changed: `rest.py`'s rule Z5, `sink.py`, `POLICY_TABLE` and `tests/route_auth.rs` (no route was added or widened).
+- `src/features/connectors/connector-ingest-panel.test.tsx` has one expected sentence updated with the copy it checks ("SQL sources and business apps only").
+
+
 ## 12. Review
 
 (Planner, per slice: findings tagged `BLOCKER` or `SHOULD-FIX`.)
