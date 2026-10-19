@@ -14,7 +14,7 @@
 //! # What this slice tests
 //!
 //! A browser sign-in (refresh token, then an access token from the vendor's
-//! token endpoint) and an integration credential that is a single token. An
+//! token endpoint, the client authenticating as the vendor table says) and an integration credential that is a single token. An
 //! integration credential of another shape (a pair, a key file) answers
 //! `supported: false` with a reason until its vendor's own task teaches this
 //! module the vendor's scheme (plan Vn.3): "unsupported, honestly".
@@ -125,15 +125,6 @@ async fn access_token(
 ) -> Result<Access, Outcome> {
     match request.auth {
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
-            if request.vendor.oauth.client_auth == ClientAuth::Basic {
-                // `SRC-3` T1.5 adds the token request with the client's
-                // credentials in an `Authorization: Basic` header; until then
-                // this vendor's sign-in cannot be tested from here.
-                return Err(Outcome::not_testable_with(format!(
-                    "This build cannot test {}'s sign-in from the console yet.",
-                    request.vendor.label
-                )));
-            }
             let client_secret = resolve(secrets.resolver, secrets.primary).await?;
             // No refresh token means nobody has signed in: nothing is wrong
             // with the connector, so this is `supported: false` with the
@@ -150,18 +141,38 @@ async fn access_token(
                 ));
             };
             let started = Instant::now();
-            let tokens = connector_oauth::token_request(
-                &request.token_url,
-                &[
-                    ("grant_type", "refresh_token"),
-                    ("refresh_token", refresh_token.expose_secret()),
-                    ("client_id", client_id),
-                    ("client_secret", client_secret.expose_secret()),
-                ],
-                internal_hosts,
-                oauth,
-            )
-            .await
+            let form = [
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.expose_secret()),
+            ];
+            let tokens = match request.vendor.oauth.client_auth {
+                ClientAuth::Post => {
+                    connector_oauth::token_request(
+                        &request.token_url,
+                        &[
+                            form[0],
+                            form[1],
+                            ("client_id", client_id),
+                            ("client_secret", client_secret.expose_secret()),
+                        ],
+                        internal_hosts,
+                        oauth,
+                    )
+                    .await
+                }
+                // `SRC-3` AD8: the client is in the header, not the body.
+                ClientAuth::Basic => {
+                    connector_oauth::token_request_basic(
+                        &request.token_url,
+                        &form,
+                        client_id,
+                        client_secret.expose_secret(),
+                        internal_hosts,
+                        oauth,
+                    )
+                    .await
+                }
+            }
             .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
             Ok(Access {
                 token: tokens.access_token,
@@ -519,6 +530,55 @@ mod tests {
             outcome.rotated_refresh_token.unwrap().expose_secret(),
             "refresh-2"
         );
+    }
+
+    /// `SRC-3` AD8: a vendor that takes the client in a Basic header (`NetSuite`)
+    /// is tested with exactly that, and the body carries no client secret.
+    #[tokio::test]
+    async fn a_basic_client_vendor_is_tested_with_the_client_in_the_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("authorization", "Basic YXBwOmNsaWVudC1zZWNyZXQ="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "netsuite",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+            .into_owned();
+        assert!(!body.contains("client_secret"), "{body}");
     }
 
     #[tokio::test]

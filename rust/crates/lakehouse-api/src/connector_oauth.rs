@@ -30,14 +30,17 @@
 //!   (`connector_secret_store`).
 //!
 //! The client authenticates in the request body (`client_secret_post`, RFC
-//! 6749 section 2.3.1). A provider that accepts only HTTP Basic client
-//! authentication is not supported by this build; the connection test says
-//! the token request was refused rather than guessing.
+//! 6749 section 2.3.1) unless the caller asks for HTTP Basic
+//! (`client_secret_basic`, section 2.3.1 too): `SRC-3` AD8 added it for the
+//! business-app vendors that accept nothing else (`token_request_basic`,
+//! [`revoke_request`]'s `client_auth`). The vendor table says which a vendor
+//! needs (`saas_vendors::ClientAuth`); a `rest` connector always uses the body.
 
 use std::time::Duration;
 
 use base64::Engine as _;
 use lakehouse_core::secret::SecretValue;
+use lakehouse_store::saas_vendors::ClientAuth;
 use serde::Deserialize;
 use sha2::Digest as _;
 
@@ -237,23 +240,54 @@ async fn read_capped(mut response: reqwest::Response) -> Option<Vec<u8>> {
     }
 }
 
-/// POST `form` to `url` and classify the status.
+/// `text` as RFC 6749 appendix B asks for a client id or secret that goes into
+/// a Basic header: every byte outside `A-Za-z0-9-._~` is percent-encoded.
+fn form_encode(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// The `Authorization` header value of `client_secret_basic` (RFC 6749 2.3.1).
+fn basic_header(client_id: &str, client_secret: &str) -> String {
+    let pair = format!("{}:{}", form_encode(client_id), form_encode(client_secret));
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(pair)
+    )
+}
+
+/// POST `form` to `url` and classify the status. `basic` is the client's id
+/// and secret for `client_secret_basic`; with `None` the caller has put them
+/// in `form` (or the request carries none).
 async fn post_form(
     url: &str,
     form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<reqwest::Response, TokenFailure> {
     let client = client_for(url, internal_hosts, settings).await?;
-    let sent = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        client
-            .post(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .form(form)
-            .send(),
-    )
-    .await;
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(form);
+    if let Some((client_id, client_secret)) = basic {
+        // The header carries the secret: it is built here, used once, and
+        // dropped with the request, never logged.
+        request = request.header(
+            reqwest::header::AUTHORIZATION,
+            basic_header(client_id, client_secret),
+        );
+    }
+    let sent = tokio::time::timeout(REQUEST_TIMEOUT, request.send()).await;
     let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
@@ -315,7 +349,42 @@ pub async fn token_request(
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<Tokens, TokenFailure> {
-    let response = post_form(url, form, internal_hosts, settings).await?;
+    token_request_inner(url, form, None, internal_hosts, settings).await
+}
+
+/// [`token_request`] with the client authenticating by HTTP Basic
+/// (`client_secret_basic`, `SRC-3` AD8): `form` must not carry `client_id` or
+/// `client_secret`; they go in the `Authorization` header.
+///
+/// # Errors
+///
+/// As [`token_request`].
+pub async fn token_request_basic(
+    url: &str,
+    form: &[(&str, &str)],
+    client_id: &str,
+    client_secret: &str,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    token_request_inner(
+        url,
+        form,
+        Some((client_id, client_secret)),
+        internal_hosts,
+        settings,
+    )
+    .await
+}
+
+async fn token_request_inner(
+    url: &str,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    let response = post_form(url, form, basic, internal_hosts, settings).await?;
     let Some(bytes) = read_capped(response).await else {
         tracing::warn!("OAuth token answer was too long or could not be read");
         return Err(TokenFailure::Unavailable);
@@ -347,26 +416,48 @@ pub async fn token_request(
 ///
 /// As [`token_request`]. A provider answers 200 for a token it does not
 /// know, so a `Refused` here means the client credentials were refused.
+/// `client_auth` is how the client proves itself: in the body or by HTTP
+/// Basic (`SRC-3` AD8).
 pub async fn revoke_request(
     url: &str,
     token: &SecretValue,
     client_id: &str,
     client_secret: &SecretValue,
+    client_auth: ClientAuth,
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<(), TokenFailure> {
-    post_form(
-        url,
-        &[
-            ("token", token.expose_secret()),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", client_id),
-            ("client_secret", client_secret.expose_secret()),
-        ],
-        internal_hosts,
-        settings,
-    )
-    .await
+    let token_fields = [
+        ("token", token.expose_secret()),
+        ("token_type_hint", "refresh_token"),
+    ];
+    match client_auth {
+        ClientAuth::Post => {
+            post_form(
+                url,
+                &[
+                    token_fields[0],
+                    token_fields[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                None,
+                internal_hosts,
+                settings,
+            )
+            .await
+        }
+        ClientAuth::Basic => {
+            post_form(
+                url,
+                &token_fields,
+                Some((client_id, client_secret.expose_secret())),
+                internal_hosts,
+                settings,
+            )
+            .await
+        }
+    }
     .map(|_| ())
 }
 
@@ -586,6 +677,7 @@ mod tests {
             &SecretValue::new("refresh-1"),
             "app",
             &SecretValue::new("s3cret"),
+            ClientAuth::Post,
             &InternalHosts::ALL,
             HTTP,
         )
@@ -605,11 +697,81 @@ mod tests {
             &SecretValue::new("refresh-1"),
             "app",
             &SecretValue::new("s3cret"),
+            ClientAuth::Post,
             &InternalHosts::ALL,
             HTTP,
         )
         .await
         .unwrap_err();
         assert_eq!(err, TokenFailure::Unavailable);
+    }
+
+    /// `SRC-3` AD8: `client_secret_basic` puts the client in the header, never
+    /// in the body, and encodes it as RFC 6749 appendix B asks.
+    #[tokio::test]
+    async fn basic_client_authentication_sends_the_client_in_the_header_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        token_request_basic(
+            &format!("{}/token", server.uri()),
+            &[("grant_type", "refresh_token"), ("refresh_token", "r")],
+            "app id",
+            "s3cret:+",
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        let seen = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(
+            !body.contains("client_id") && !body.contains("client_secret"),
+            "{body}"
+        );
+        let header = seen[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "app%20id:s3cret%3A%2B");
+    }
+
+    #[tokio::test]
+    async fn basic_revocation_sends_the_client_in_the_header_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(body_string_contains("token=refresh-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        revoke_request(
+            &format!("{}/revoke", server.uri()),
+            &SecretValue::new("refresh-1"),
+            "app",
+            &SecretValue::new("s3cret"),
+            ClientAuth::Basic,
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        let seen = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(!body.contains("client_secret"), "{body}");
+        assert!(seen[0].headers.get("authorization").is_some());
     }
 }

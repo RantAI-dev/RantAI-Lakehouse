@@ -1,6 +1,14 @@
-//! Sign in to a REST connector with `OAuth2` (`SRC-12` part C, decisions 6 to
-//! 8, 11 and 12): the sign-in, the provider's callback, the orchestrator's
-//! report of a rotated refresh token, and sign-out.
+//! Sign in to a REST or business-app (`saas`) connector with `OAuth2`
+//! (`SRC-12` part C, decisions 6 to 8, 11 and 12; `SRC-3` AD8): the sign-in,
+//! the provider's callback, the orchestrator's report of a rotated refresh
+//! token, and sign-out.
+//!
+//! A `rest` connector names its own sign-in, token and revocation addresses
+//! in its dial. A `saas` connector names none: they come from the vendor table
+//! (`lakehouse_store::saas_vendors`), built from its `account`, so a dial
+//! cannot send the client secret or the refresh token anywhere the table does
+//! not (its parser refuses an unknown field). The vendor table also says how
+//! the client authenticates at the token endpoint.
 //!
 //! # The routes
 //!
@@ -53,7 +61,8 @@ use lakehouse_core::ApiError;
 use lakehouse_store::audit as store_audit;
 use lakehouse_store::connector_oauth as store_oauth;
 use lakehouse_store::connectors::{self, ConnectorDialInfo};
-use lakehouse_store::ingest_spec::{Dial, RestAuth};
+use lakehouse_store::ingest_spec::{Dial, RestAuth, SaasAuth};
+use lakehouse_store::saas_vendors::{ClientAuth, SaasVendor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -87,14 +96,51 @@ struct App {
     token_url: String,
     revocation_url: Option<String>,
     scopes: Vec<String>,
+    /// How the client proves itself at the token endpoint. Always the body
+    /// for a `rest` connector; the vendor table's choice for a `saas` one.
+    client_auth: ClientAuth,
 }
 
 /// The authorization-code settings of `info`, or `None` for a connector that
-/// is not a REST one with that auth kind.
+/// is not a REST or business-app one with that auth kind.
 fn app_of(info: &ConnectorDialInfo) -> Option<App> {
-    if info.adapter.as_deref() != Some("rest") {
-        return None;
+    match info.adapter.as_deref() {
+        Some("rest") => rest_app_of(info),
+        Some("saas") => saas_app_of(info),
+        _ => None,
     }
+}
+
+/// The settings of a `saas` connector that signs in in the browser, from the
+/// vendor table (`SRC-3` AD8). `None` for a dial that does not parse, one that
+/// uses the vendor's integration credential, or a vendor not in the table.
+fn saas_app_of(info: &ConnectorDialInfo) -> Option<App> {
+    let Ok(Dial::Saas(dial)) = Dial::parse("saas", &info.dial) else {
+        return None;
+    };
+    let SaasAuth::Oauth2AuthorizationCode { client_id } = dial.auth else {
+        return None;
+    };
+    let vendor = lakehouse_store::saas_vendors::vendor(&dial.vendor)?;
+    let parts = vendor.validate_account(&dial.account).ok()?;
+    let render = |template: &str| SaasVendor::render(template, &parts);
+    Some(App {
+        client_id,
+        authorize_url: render(vendor.oauth.authorize_url),
+        token_url: render(vendor.oauth.token_url),
+        revocation_url: vendor.oauth.revocation_url.map(render),
+        scopes: vendor
+            .oauth
+            .scopes
+            .iter()
+            .map(|scope| render(scope))
+            .collect(),
+        client_auth: vendor.oauth.client_auth,
+    })
+}
+
+/// The authorization-code settings of a `rest` connector.
+fn rest_app_of(info: &ConnectorDialInfo) -> Option<App> {
     let Ok(Dial::Rest(dial)) = Dial::parse("rest", &info.dial) else {
         return None;
     };
@@ -111,6 +157,7 @@ fn app_of(info: &ConnectorDialInfo) -> Option<App> {
             token_url,
             revocation_url,
             scopes,
+            client_auth: ClientAuth::Post,
         }),
         _ => None,
     }
@@ -402,20 +449,39 @@ async fn finish_sign_in(
         .await
         .map_err(|_| Refusal::ClientSecret)?;
 
-    let tokens = connector_oauth::token_request(
-        &app.token_url,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", &pending.code_verifier),
-            ("client_id", &app.client_id),
-            ("client_secret", client_secret.expose_secret()),
-        ],
-        &state.config.connector_internal_hosts(),
-        state.config.oauth_settings(),
-    )
-    .await
+    let exchange = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", pending.code_verifier.as_str()),
+    ];
+    let internal_hosts = state.config.connector_internal_hosts();
+    let tokens = match app.client_auth {
+        ClientAuth::Post => {
+            let mut form = exchange.to_vec();
+            form.push(("client_id", app.client_id.as_str()));
+            form.push(("client_secret", client_secret.expose_secret()));
+            connector_oauth::token_request(
+                &app.token_url,
+                &form,
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
+        // `SRC-3` AD8: the client is in the header, not the body.
+        ClientAuth::Basic => {
+            connector_oauth::token_request_basic(
+                &app.token_url,
+                &exchange,
+                &app.client_id,
+                client_secret.expose_secret(),
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
+    }
     .map_err(Refusal::Provider)?;
     // The access token ends here: it is not needed to sign in and is never
     // stored.
@@ -598,6 +664,7 @@ pub(super) async fn revoke_stored_token(state: &AppState, info: &ConnectorDialIn
         &token,
         &app.client_id,
         &client_secret,
+        app.client_auth,
         &state.config.connector_internal_hosts(),
         state.config.oauth_settings(),
     )
@@ -672,5 +739,107 @@ async fn audit(
         && let Err(err) = store_audit::insert(pool, event).await
     {
         tracing::warn!(%err, connector_id = %connector_id, action, "failed to record an OAuth audit event");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn info(adapter: &str, dial: serde_json::Value) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: "Zendesk".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some(adapter.to_owned()),
+            dial,
+        }
+    }
+
+    fn oauth_dial(vendor: &str, account: &str) -> serde_json::Value {
+        json!({
+            "vendor": vendor, "account": account,
+            "auth": {"type": "oauth2_authorization_code", "clientId": "app-1"}
+        })
+    }
+
+    #[test]
+    fn a_saas_connectors_addresses_and_scopes_come_from_the_vendor_table() {
+        let app = app_of(&info("saas", oauth_dial("zendesk", "Acme"))).unwrap();
+        assert_eq!(app.client_id, "app-1");
+        assert_eq!(
+            app.authorize_url,
+            "https://acme.zendesk.com/oauth/authorizations/new"
+        );
+        assert_eq!(app.token_url, "https://acme.zendesk.com/oauth/tokens");
+        assert_eq!(app.revocation_url, None);
+        assert_eq!(app.scopes, ["read"]);
+        assert_eq!(app.client_auth, ClientAuth::Post);
+
+        let sf = app_of(&info("saas", oauth_dial("salesforce", "acme"))).unwrap();
+        assert_eq!(
+            sf.revocation_url.as_deref(),
+            Some("https://acme.my.salesforce.com/services/oauth2/revoke")
+        );
+        let ns = app_of(&info("saas", oauth_dial("netsuite", "1234567_SB1"))).unwrap();
+        assert_eq!(ns.client_auth, ClientAuth::Basic);
+        assert_eq!(
+            ns.token_url,
+            "https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token"
+        );
+        let dyn365 = app_of(&info(
+            "saas",
+            oauth_dial("dynamics365", "org.crm4.dynamics.com"),
+        ))
+        .unwrap();
+        assert_eq!(
+            dyn365.scopes,
+            [
+                "https://org.crm4.dynamics.com/user_impersonation",
+                "offline_access"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saas_dial_cannot_override_a_vendor_address() {
+        let mut dial = oauth_dial("zendesk", "acme");
+        dial["auth"]["tokenUrl"] = json!("https://evil.example.invalid/token");
+        assert!(app_of(&info("saas", dial)).is_none());
+        let mut dial = oauth_dial("zendesk", "acme");
+        dial["auth"]["authorizeUrl"] = json!("https://evil.example.invalid/authorize");
+        assert!(app_of(&info("saas", dial)).is_none());
+        // The account cannot carry a host either.
+        assert!(app_of(&info("saas", oauth_dial("zendesk", "evil.example.invalid"))).is_none());
+    }
+
+    #[test]
+    fn an_integration_credential_or_another_adapter_is_not_a_sign_in() {
+        let token = json!({"vendor": "hubspot", "account": "123", "auth": {"type": "integration"}});
+        assert!(app_of(&info("saas", token)).is_none());
+        assert!(app_of(&info("sql", oauth_dial("zendesk", "acme"))).is_none());
+    }
+
+    #[test]
+    fn the_sign_in_address_of_a_saas_connector_is_built_from_its_app() {
+        let app = app_of(&info("saas", oauth_dial("confluence", "acme"))).unwrap();
+        let url = connector_oauth::authorize_url(
+            &app.authorize_url,
+            &app.client_id,
+            "https://console.example.invalid/api/connectors/oauth/callback",
+            &app.scopes,
+            "state-1",
+            "challenge-1",
+        )
+        .unwrap();
+        assert!(
+            url.starts_with("https://auth.atlassian.com/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("offline_access"));
     }
 }
