@@ -121,9 +121,10 @@ def _real_get(url: str, *, headers: dict, params: dict | None, timeout: float) -
 class SaasSession:
     """One vendor's HTTP reads under the link and rate-limit rules above.
 
-    `auth_headers` returns the headers of the next request (an `Authorization`
-    for a token the caller refreshes itself); it is called once per request,
-    after the address was checked.
+    `auth_headers` returns the headers of the next request; it is called once
+    per request, after the address was checked. `refresh_auth`, when given,
+    forgets the access token so the next call of `auth_headers` gets a new one;
+    it is called once when a request is answered 401.
     """
 
     def __init__(
@@ -133,6 +134,7 @@ class SaasSession:
         *,
         adopt_suffixes: tuple[str, ...] = (),
         http_get: Callable[..., Any] | None = None,
+        refresh_auth: Callable[[], None] | None = None,
         resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
         sleep: Callable[[float], None] = time.sleep,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -141,6 +143,7 @@ class SaasSession:
         self._origin = _origin_of(origin_url)
         self._auth_headers = auth_headers
         self._adopt_suffixes = adopt_suffixes
+        self._refresh_auth = refresh_auth
         self._http_get = http_get or _real_get
         self._resolve_checked = resolve_checked
         self._sleep = sleep
@@ -199,7 +202,9 @@ class SaasSession:
         """
         url = self._target(target)
         _scheme, host, port = _origin_of(url)
-        for attempt in range(self._max_attempts):
+        refreshed = False
+        attempt = 0
+        while True:
             resolved = self._resolve_checked(host, port)
             headers = self._auth_headers()
             with ssrf_guard.pinned_resolution(host, resolved):
@@ -208,6 +213,12 @@ class SaasSession:
             if 300 <= status < 400:
                 raise ssrf_guard.SsrfBlocked("the vendor answered with a redirect; not followed")
             if status == 401:
+                # An access token can expire between requests: ask for a new
+                # one once. A second 401 is the credential, not the token.
+                if self._refresh_auth is not None and not refreshed:
+                    refreshed = True
+                    self._refresh_auth()
+                    continue
                 raise SaasSignInRefused()
             if status == 403:
                 raise SaasPermissionMissing()
@@ -217,8 +228,8 @@ class SaasSession:
                 wait = self._wait_for(response, attempt)
                 logger.info("a vendor limited the rate; waiting %.0f s (attempt %d of %d)", wait, attempt + 1, self._max_attempts)
                 self._sleep(wait)
+                attempt += 1
                 continue
             if status >= 400:
                 raise requests.HTTPError(f"HTTP {status}", response=response)
             return response.json()
-        raise SaasRateLimited()  # unreachable: the last attempt raises above

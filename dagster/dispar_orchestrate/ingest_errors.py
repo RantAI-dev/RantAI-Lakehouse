@@ -64,8 +64,11 @@ from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
+from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters.sink import UnsupportedLoadMode
 from dispar_orchestrate.column_gate import UnsupportedColumnType
+from dispar_orchestrate.saas import session as saas_session
+from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 logger = logging.getLogger(__name__)
@@ -313,7 +316,7 @@ def _is_permission_element(exc: BaseException) -> bool:
         return bool(_class_names(exc) & _KAFKA_NOT_AUTHORIZED)
     # An SFTP server's "permission denied" arrives as `IOError(EACCES)`, which
     # Python builds as `PermissionError`.
-    return isinstance(exc, PermissionError)
+    return isinstance(exc, (PermissionError, saas_session.SaasPermissionMissing))
 
 
 def is_permission_refusal(exc: BaseException) -> bool:
@@ -418,9 +421,26 @@ def _classify_one(exc: BaseException) -> str | None:
     # connector page offers Sign in.
     if isinstance(exc, rest_adapter.OAuthSignInRefused):
         return SIGN_IN_REFUSED
+    # SRC-3 (business-app vendors). The run-report classes are a CLOSED list the
+    # API and a database CHECK enforce, and `permission_missing` and
+    # `rate_limited` are not in it (plan T1.9 assumed they could be added; that
+    # needs a migration, see the slice 1 handoff). Until the planner decides:
+    # a refused credential and a missing permission are both "sign_in_refused"
+    # (not retried; both need a person at the vendor), and a rate limit that
+    # outlasted the bounded waits is "source_busy" (retried by the run's policy).
+    if isinstance(exc, (saas_session.SaasSignInRefused, saas_session.SaasPermissionMissing)):
+        return SIGN_IN_REFUSED
+    if isinstance(exc, saas_session.SaasRateLimited):
+        return SOURCE_BUSY
     if isinstance(
         exc,
-        (UnsupportedColumnType, UnsupportedLoadMode, dedup_adapter.DedupRefused, UnsupportedKafkaAuth),
+        (
+            UnsupportedColumnType,
+            UnsupportedLoadMode,
+            dedup_adapter.DedupRefused,
+            UnsupportedKafkaAuth,
+            saas_vendors.UnsupportedVendor,
+        ),
     ):
         return UNSUPPORTED
     if isinstance(
@@ -431,6 +451,7 @@ def _classify_one(exc: BaseException) -> str | None:
             oracle_adapter.OracleTlsConfigError,
             ssrf_guard_sftp_module.HostKeyMismatch,
             ssrf_guard_mongo_module.MongoConfigRejected,
+            saas_adapter.SaasSetupRefused,
         ),
     ):
         return SETTING_REJECTED

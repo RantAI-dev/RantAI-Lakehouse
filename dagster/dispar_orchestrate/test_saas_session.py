@@ -219,3 +219,49 @@ def test_an_object_without_a_cursor_must_say_why_it_is_re_read_in_full() -> None
         ObjectDecl(name="x", primary_key=("id",), cursor="u", full_reason="r")
     with pytest.raises(ValueError, match="primary key"):
         ObjectDecl(name="x", primary_key=(), cursor="u")
+
+
+def test_a_401_asks_for_a_new_token_once_and_a_second_401_is_the_credential() -> None:
+    refreshed: list[str] = []
+    http = Recorder(Reply(401), Reply(body={"ok": 1}))
+    session, _ = make(http, refresh_auth=lambda: refreshed.append("new token"))
+    assert session.get_json("/api") == {"ok": 1}
+    assert refreshed == ["new token"]
+    twice = Recorder(Reply(401), Reply(401))
+    session, _ = make(twice, refresh_auth=lambda: None)
+    with pytest.raises(SaasSignInRefused):
+        session.get_json("/api")
+    assert len(twice.urls) == 2
+
+
+def test_a_token_request_for_a_basic_client_carries_the_client_in_the_header_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    from dispar_orchestrate.adapters import rest
+
+    seen: dict = {}
+
+    class Answer:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"access_token": "a"}
+
+    def post(url: str, **kw: object) -> Answer:
+        seen.update(kw)
+        return Answer()
+
+    monkeypatch.setattr(rest.requests, "post", post)
+    body = rest._token_request(
+        "https://login.example.invalid/token",
+        {"grant_type": "refresh_token", "refresh_token": "r"},
+        resolve_checked=resolver,
+        basic=("app id", "s3cret:+"),
+    )
+    assert body["access_token"] == "a"
+    assert "client_id" not in seen["data"] and "client_secret" not in seen["data"]
+    sent = seen["headers"]["Authorization"].removeprefix("Basic ")
+    assert base64.b64decode(sent).decode() == "app%20id:s3cret%3A%2B"
