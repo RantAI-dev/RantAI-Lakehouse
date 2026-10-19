@@ -31,6 +31,29 @@
 //! one place. It does not use `AppState::connector_secret_resolver`, which
 //! refuses those refs by design.
 //!
+//! # Chunked uploads: S3 multipart through `MultipartStore` (`DATA-17`)
+//!
+//! A large file is not one request. [`UploadStore::create_multipart`] opens an
+//! S3 multipart upload at the file's key, [`UploadStore::put_part`] stores one
+//! piece (the API receives pieces of 8 MiB, `routes::uploads::PART_SIZE`),
+//! [`UploadStore::complete_multipart`] assembles them and
+//! [`UploadStore::abort_multipart`] throws them away. This is
+//! `object_store::multipart::MultipartStore`, the low-level interface that
+//! leaves the multipart id and each part's `ETag` with the CALLER, which is what
+//! lets the API keep them in Postgres (`lakehouse_store::uploads`,
+//! `0090_upload_parts.sql`) so that any process can take the next piece and a
+//! restart loses nothing (plan AD1). `ObjectStore::put_multipart`, the
+//! high-level call, keeps that state inside one process and is not used.
+//!
+//! The API numbers pieces from 1, as S3 does; `object_store` indexes them from
+//! 0, and [`UploadStore::put_part`] does the shift in this one place. Every
+//! piece except the last must be at least 5 MiB for S3 to complete the upload
+//! (checked against `RustFS` 1.0.0-rc.4: a 1 MiB piece before the last was
+//! refused with `EntityTooSmall`), and a piece sent again under the same number
+//! replaces the earlier one (also checked), so a retry is safe.
+//! [`UploadStore::get_range`] reads a bounded slice of a stored object, so the
+//! API never needs to read a large file whole.
+//!
 //! # Errors: two fixed sentences
 //!
 //! Whatever goes wrong, a caller gets one of two messages, both `503`
@@ -50,11 +73,12 @@
 //! accident.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use lakehouse_core::ApiError;
-use object_store::aws::AmazonS3;
-use object_store::{ObjectStoreExt, PutPayload, path::Path as ObjectPath};
+use object_store::multipart::{MultipartStore, PartId};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectPath};
 
 use crate::config::Config;
 use crate::connector_probe::classify_object_store_error;
@@ -112,13 +136,25 @@ fn user_error(operation: &'static str, key: &str, failure: &Failure<'_>) -> Uplo
     }
 }
 
+/// What [`UploadStore`] needs of a store: whole-object calls and the
+/// low-level multipart calls. `AmazonS3` is the one used in production;
+/// `InMemory` implements both too, which is how the unit tests below run
+/// without a network.
+trait Backend: ObjectStore + MultipartStore {}
+impl<T: ObjectStore + MultipartStore> Backend for T {}
+
+/// The most a single [`UploadStore::get_range`] call reads, whatever the
+/// caller asks: a bound so that a range read can never become a whole-file
+/// read of a multi-gigabyte object by a mistake in a caller.
+pub const MAX_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// A handle on the `uploads/` prefix of the warehouse bucket.
 ///
 /// Cheap to clone (the client inside is reference-counted) and opens no
 /// connection until a request is made.
 #[derive(Clone)]
 pub struct UploadStore {
-    store: AmazonS3,
+    store: Arc<dyn Backend>,
 }
 
 /// `Debug` prints the type name only, by hand: a derived impl would print
@@ -146,7 +182,9 @@ impl UploadStore {
         let store = rustfs_client::build_client(config)
             .await
             .map_err(|err| user_error("connect", "", &Failure::Client(&err)))?;
-        Ok(Self { store })
+        Ok(Self {
+            store: Arc::new(store),
+        })
     }
 
     /// [`Self::connect`] with the source of the credential values injected,
@@ -164,7 +202,15 @@ impl UploadStore {
         let store = rustfs_client::build_client_with(config, source)
             .await
             .map_err(|err| user_error("connect", "", &Failure::Client(&err)))?;
-        Ok(Self { store })
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    /// A store over any backend, for tests that need no network.
+    #[cfg(test)]
+    fn with_backend(store: Arc<dyn Backend>) -> Self {
+        Self { store }
     }
 
     /// Store `bytes` at `key` (which must already be inside [`PREFIX`] —
@@ -193,6 +239,28 @@ impl UploadStore {
     /// [`UploadStoreError::Unavailable`] when the object is missing (the
     /// reason is `not found`) or the read fails.
     pub async fn head_bytes(&self, key: &str, max_bytes: usize) -> Result<Bytes, UploadStoreError> {
+        self.get_range(key, 0, u64::try_from(max_bytes).unwrap_or(u64::MAX))
+            .await
+    }
+
+    /// Read at most `len` bytes of `key` from byte `start`: fewer when the
+    /// object ends first, none when `start` is at or past its end.
+    ///
+    /// `len` is capped at [`MAX_RANGE_BYTES`] and the range is clamped to the
+    /// object's size (one `HEAD`, so a range past the end is never sent).
+    /// This is what lets the API read a Parquet footer, a zip's central
+    /// directory or the first 64 KiB of a file without reading the file.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the object is missing (the
+    /// reason is `not found`) or the read fails.
+    pub async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, UploadStoreError> {
         let path = ObjectPath::from(key);
         let size = self
             .store
@@ -200,11 +268,11 @@ impl UploadStore {
             .await
             .map_err(|err| user_error("head", key, &Failure::Store(&err)))?
             .size;
-        let end = u64::try_from(max_bytes).unwrap_or(u64::MAX).min(size);
-        if end == 0 {
+        let end = start.saturating_add(len.min(MAX_RANGE_BYTES)).min(size);
+        if start >= end {
             return Ok(Bytes::new());
         }
-        let range = Range { start: 0, end };
+        let range = Range { start, end };
         self.store
             .get_range(&path, range)
             .await
@@ -251,6 +319,118 @@ impl UploadStore {
         match self.store.delete(&ObjectPath::from(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(err) => Err(user_error("delete", key, &Failure::Store(&err))),
+        }
+    }
+
+    /// Open a multipart upload at `key` and return S3's id for it. Nothing
+    /// is stored at `key` until [`Self::complete_multipart`].
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
+    /// reached.
+    #[allow(
+        dead_code,
+        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
+    )]
+    pub async fn create_multipart(&self, key: &str) -> Result<String, UploadStoreError> {
+        self.store
+            .create_multipart(&ObjectPath::from(key))
+            .await
+            .map_err(|err| user_error("create_multipart", key, &Failure::Store(&err)))
+    }
+
+    /// Store piece `part_number` (counted from 1, as S3 counts) of the
+    /// multipart upload `id` at `key`, and return the `ETag` S3 gave it. A
+    /// piece sent again under the same number replaces the earlier copy.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the write fails, or when
+    /// `part_number` is 0 (a caller bug, answered as a failure rather than a
+    /// panic: S3 numbers pieces from 1).
+    #[allow(
+        dead_code,
+        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
+    )]
+    pub async fn put_part(
+        &self,
+        key: &str,
+        id: &str,
+        part_number: u32,
+        bytes: Bytes,
+    ) -> Result<String, UploadStoreError> {
+        let Some(index) = part_number.checked_sub(1) else {
+            tracing::warn!(key, "a multipart piece was numbered 0");
+            return Err(UploadStoreError::Unavailable("not supported"));
+        };
+        let id = id.to_owned();
+        let part = self
+            .store
+            .put_part(
+                &ObjectPath::from(key),
+                &id,
+                usize::try_from(index).unwrap_or(usize::MAX),
+                PutPayload::from_bytes(bytes),
+            )
+            .await
+            .map_err(|err| user_error("put_part", key, &Failure::Store(&err)))?;
+        Ok(part.content_id)
+    }
+
+    /// Assemble the multipart upload `id` into the object at `key`.
+    /// `etags` are the pieces' `ETag` values in part-number order, from 1 with no gap
+    /// (the caller has checked that every piece is there).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the store refuses (a missing
+    /// piece, a piece under 5 MiB that is not the last) or cannot be reached.
+    #[allow(
+        dead_code,
+        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
+    )]
+    pub async fn complete_multipart(
+        &self,
+        key: &str,
+        id: &str,
+        etags: &[String],
+    ) -> Result<(), UploadStoreError> {
+        let parts = etags
+            .iter()
+            .map(|etag| PartId {
+                content_id: etag.clone(),
+            })
+            .collect();
+        let id = id.to_owned();
+        self.store
+            .complete_multipart(&ObjectPath::from(key), &id, parts)
+            .await
+            .map_err(|err| user_error("complete_multipart", key, &Failure::Store(&err)))?;
+        Ok(())
+    }
+
+    /// Throw the multipart upload `id` away, with its pieces. An upload the
+    /// store no longer knows is success, like [`Self::delete`]: the caller
+    /// wants it gone, and the sweep may meet one that already is.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the abort fails for any other
+    /// reason.
+    #[allow(
+        dead_code,
+        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
+    )]
+    pub async fn abort_multipart(&self, key: &str, id: &str) -> Result<(), UploadStoreError> {
+        let id = id.to_owned();
+        match self
+            .store
+            .abort_multipart(&ObjectPath::from(key), &id)
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(user_error("abort_multipart", key, &Failure::Store(&err))),
         }
     }
 }
@@ -670,5 +850,209 @@ mod tests {
             err.to_string(),
             "Upload storage is unavailable (not found)."
         );
+    }
+
+    // ── multipart and ranges, against `InMemory` (DATA-17 T1.2) ────────────
+    //
+    // `InMemory` implements `MultipartStore`, so these run the same calls the
+    // routes make without a network. That it also behaves like S3 and `RustFS`
+    // is NOT shown here: `InMemory` ignores part ETags and does not enforce the
+    // 5 MiB minimum. That is what the `#[ignore]`d `rustfs_*` test below is for,
+    // and the T1.2 handoff quotes its run.
+
+    fn in_memory() -> UploadStore {
+        UploadStore::with_backend(Arc::new(object_store::memory::InMemory::new()))
+    }
+
+    #[tokio::test]
+    async fn pieces_sent_out_of_order_and_again_assemble_into_the_last_copies() {
+        let store = in_memory();
+        let id = store.create_multipart(KEY).await.unwrap();
+        let second = store
+            .put_part(KEY, &id, 2, Bytes::from_static(b"-world"))
+            .await
+            .unwrap();
+        store
+            .put_part(KEY, &id, 1, Bytes::from_static(b"wrong"))
+            .await
+            .unwrap();
+        // Part 1 again: the last copy is the one kept.
+        let first = store
+            .put_part(KEY, &id, 1, Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        // Nothing is stored until the upload completes.
+        assert_eq!(
+            store.head_bytes(KEY, 100).await.unwrap_err(),
+            UploadStoreError::Unavailable("not found")
+        );
+        store
+            .complete_multipart(KEY, &id, &[first, second])
+            .await
+            .unwrap();
+        assert_eq!(&store.get_all(KEY).await.unwrap()[..], b"hello-world");
+    }
+
+    #[tokio::test]
+    async fn completing_with_a_piece_never_sent_is_refused_with_a_fixed_sentence() {
+        let store = in_memory();
+        let id = store.create_multipart(KEY).await.unwrap();
+        let only = store
+            .put_part(KEY, &id, 2, Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+        let err = store
+            .complete_multipart(KEY, &id, &[only.clone(), only])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UploadStoreError::Unavailable(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("Upload storage is unavailable (")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_upload_stores_nothing_and_takes_no_more_pieces() {
+        let store = in_memory();
+        let id = store.create_multipart(KEY).await.unwrap();
+        store
+            .put_part(KEY, &id, 1, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        store.abort_multipart(KEY, &id).await.unwrap();
+        // (A second abort is NOT asserted here: `InMemory` answers it with a
+        // generic error where S3 and `RustFS` answer `NoSuchUpload`; the
+        // `rustfs_*` test below covers the real stores.)
+        assert!(store.get_all(KEY).await.is_err());
+        // And a piece for it is refused.
+        assert!(
+            store
+                .put_part(KEY, &id, 1, Bytes::from_static(b"a"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn piece_number_zero_is_refused_not_a_panic() {
+        let store = in_memory();
+        let id = store.create_multipart(KEY).await.unwrap();
+        let err = store
+            .put_part(KEY, &id, 0, Bytes::from_static(b"a"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UploadStoreError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn get_range_reads_a_slice_clamps_to_the_object_and_reads_nothing_past_the_end() {
+        let store = in_memory();
+        store
+            .put(KEY, Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        assert_eq!(&store.get_range(KEY, 2, 4).await.unwrap()[..], b"2345");
+        assert_eq!(&store.get_range(KEY, 8, 100).await.unwrap()[..], b"89");
+        assert!(store.get_range(KEY, 10, 5).await.unwrap().is_empty());
+        assert!(store.get_range(KEY, 99, 5).await.unwrap().is_empty());
+        assert!(store.get_range(KEY, 0, 0).await.unwrap().is_empty());
+        assert_eq!(&store.head_bytes(KEY, 3).await.unwrap()[..], b"012");
+        assert_eq!(
+            store.get_range("uploads/none", 0, 1).await.unwrap_err(),
+            UploadStoreError::Unavailable("not found")
+        );
+    }
+
+    /// The same sequence as `docs/superpowers/plans/2026-10-16-data-phase-3-
+    /// uploads.md` section 8, item 1, but through `UploadStore`, against a real
+    /// `RustFS` (or any S3 store) named by the environment. Ignored by default:
+    /// it needs a store with the bucket `lakehouse-warehouse`. Run with
+    /// `UPLOAD_PROOF_ENDPOINT`, `UPLOAD_PROOF_ACCESS` and `UPLOAD_PROOF_SECRET`
+    /// set (never written down anywhere) and `cargo test -p lakehouse-api
+    /// --lib rustfs_multipart -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs a live S3 store: see the doc comment"]
+    async fn rustfs_multipart_keeps_the_last_copy_of_a_piece_and_aborts_cleanly() {
+        let var = |name: &str| std::env::var(name).unwrap();
+        let s3 = object_store::aws::AmazonS3Builder::new()
+            .with_endpoint(var("UPLOAD_PROOF_ENDPOINT"))
+            .with_allow_http(true)
+            .with_bucket_name("lakehouse-warehouse")
+            .with_region("us-east-1")
+            .with_access_key_id(var("UPLOAD_PROOF_ACCESS"))
+            .with_secret_access_key(var("UPLOAD_PROOF_SECRET"))
+            .with_virtual_hosted_style_request(false)
+            .build()
+            .unwrap();
+        let store = UploadStore::with_backend(Arc::new(s3));
+        let key = "uploads/proof/up-proof.bin";
+        let mib = 1024 * 1024;
+        let piece = |byte: u8, len: usize| Bytes::from(vec![byte; len]);
+
+        // Create, then pieces 2, 1 and 1 again (different bytes), 8 MiB + 3 MiB.
+        let id = store.create_multipart(key).await.unwrap();
+        let two = store
+            .put_part(key, &id, 2, piece(b'b', 3 * mib))
+            .await
+            .unwrap();
+        let _ = store
+            .put_part(key, &id, 1, piece(b'x', 8 * mib))
+            .await
+            .unwrap();
+        let one = store
+            .put_part(key, &id, 1, piece(b'a', 8 * mib))
+            .await
+            .unwrap();
+        store
+            .complete_multipart(key, &id, &[one, two])
+            .await
+            .unwrap();
+
+        let all = store.get_range(key, 0, 11 * mib as u64).await.unwrap();
+        assert_eq!(all.len(), 11 * mib);
+        assert!(
+            all[..8 * mib].iter().all(|b| *b == b'a'),
+            "the LAST copy of piece 1"
+        );
+        assert!(all[8 * mib..].iter().all(|b| *b == b'b'));
+        // A bounded range read of the middle.
+        let mid = store.get_range(key, 8 * mib as u64 - 2, 4).await.unwrap();
+        assert_eq!(&mid[..], b"aabb");
+
+        // Abort: nothing is stored, and a second abort is still success.
+        let key2 = "uploads/proof/up-proof-2.bin";
+        let id2 = store.create_multipart(key2).await.unwrap();
+        store
+            .put_part(key2, &id2, 1, piece(b'z', 6 * mib))
+            .await
+            .unwrap();
+        store.abort_multipart(key2, &id2).await.unwrap();
+        store.abort_multipart(key2, &id2).await.unwrap();
+        assert_eq!(
+            store.head_bytes(key2, 1).await.unwrap_err(),
+            UploadStoreError::Unavailable("not found")
+        );
+
+        // A piece under 5 MiB that is not the last is refused at completion.
+        let key3 = "uploads/proof/up-proof-3.bin";
+        let id3 = store.create_multipart(key3).await.unwrap();
+        let small = store
+            .put_part(key3, &id3, 1, piece(b'1', mib))
+            .await
+            .unwrap();
+        let last = store
+            .put_part(key3, &id3, 2, piece(b'2', mib))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .complete_multipart(key3, &id3, &[small, last])
+                .await
+                .is_err()
+        );
+        store.abort_multipart(key3, &id3).await.unwrap();
+
+        store.delete(key).await.unwrap();
     }
 }
