@@ -32,10 +32,11 @@
 //! held until the handler returns, so "four per user, sixteen in all" bounds
 //! the memory of this route as it bounds `POST /api/uploads`. Opening a
 //! session reads no file, and completing a text file reads 64 KiB. Completing a
-//! workbook or a Parquet file reads the whole object, as `POST /api/uploads`
-//! does today (they must be opened whole), so that path takes a place too and is
-//! refused above [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature
-//! page, decision 9).
+//! Parquet file reads its footer, by range (`upload_parquet_range`), never the
+//! file. Completing a workbook reads the whole object, as `POST /api/uploads`
+//! does (it must be opened whole), so that path takes a place too and is refused
+//! above [`super::MAX_UPLOAD_BYTES`]: a workbook stays at 50 MB (feature page,
+//! decision 9).
 //!
 //! # Posture
 //!
@@ -71,6 +72,7 @@ use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet;
+use crate::upload_parquet_range::RangeReader;
 use crate::upload_store::{UploadStore, UploadStoreError};
 use crate::upload_workbook;
 
@@ -575,12 +577,12 @@ struct WholeFacts {
 }
 
 /// Open a workbook or a Parquet file, the way `POST /api/uploads` does before
-/// it stores one: both must be read whole. A text file is not read at all.
-///
-/// The read takes a `SEC-17` place (it holds up to [`MAX_UPLOAD_BYTES`] in
-/// memory), and a file above that size is refused with the existing sentence.
-/// This is where a workbook's 50 MB limit stays when sessions accept more
-/// (feature page, decision 9).
+/// it stores one. A workbook must be read whole: the read takes a `SEC-17`
+/// place (it holds up to [`MAX_UPLOAD_BYTES`] in memory), and a workbook above
+/// that size is refused with the existing sentence; this is where a workbook's
+/// 50 MB limit stays when sessions accept more (feature page, decision 9). A
+/// Parquet file's footer is read by range and checked (`DATA-17` T2.2), and the
+/// file is not held. A text file is not read at all.
 async fn open_whole(
     state: &AppState,
     store: &UploadStore,
@@ -592,6 +594,16 @@ async fn open_whole(
         return Ok(WholeFacts {
             workbook: None,
             parquet: None,
+        });
+    }
+    if accepted == Accepted::Parquet {
+        // `DATA-17` T2.2: only the footer is read, by range. The file is never
+        // held, so it has no size cap here (the job's row cap bounds a load).
+        let reader = RangeReader::open(store, &row.storage_key).await?;
+        let opened = blocking(move || upload_parquet::inspect(&reader)).await?;
+        return Ok(WholeFacts {
+            workbook: None,
+            parquet: Some(opened),
         });
     }
     if declared > u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX) {
@@ -610,14 +622,7 @@ async fn open_whole(
                 parquet: None,
             })
         }
-        Accepted::Parquet => {
-            let opened = blocking(move || upload_parquet::inspect(&bytes)).await?;
-            Ok(WholeFacts {
-                workbook: None,
-                parquet: Some(opened),
-            })
-        }
-        Accepted::Text => Ok(WholeFacts {
+        Accepted::Parquet | Accepted::Text => Ok(WholeFacts {
             workbook: None,
             parquet: None,
         }),

@@ -4387,13 +4387,6 @@ fn orders_columns() -> Value {
     ])
 }
 
-/// What `orders.parquet` converts to: the file's column names, then its rows as
-/// text (a decimal keeps its scale, a date is ISO).
-const ORDERS_CSV: &str = "sku,name,qty,price,received\n\
-     A-100,\"Bolt, hex M6\",10,1.50,2025-09-24\n\
-     A-200,Washer,250,0.05,2025-09-25\n\
-     A-300,Flange DN50 \u{2013} steel,4,12.00,2025-10-01\n";
-
 /// The ingest body of a Parquet file: no encoding, no delimiter, no header
 /// row, no sheet.
 fn parquet_ingest_body(table: &str) -> Value {
@@ -4593,7 +4586,7 @@ async fn a_text_file_named_like_a_parquet_file_previews_and_loads_as_text() {
 }
 
 #[tokio::test]
-async fn a_parquet_ingest_stores_the_converted_text_beside_the_original_and_launches_on_it() {
+async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_as_parquet() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     mount_free_table(&stack.ch).await;
@@ -4616,17 +4609,17 @@ async fn a_parquet_ingest_stores_the_converted_text_beside_the_original_and_laun
         json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 }),
         "no sheet"
     );
+    // `DATA-17` T2.2: the API converts nothing; the job reads the file itself.
     let original = format!("uploads/{GROUP}/{id}.parquet");
-    let converted = format!("{original}.converted.csv");
-    assert_eq!(stack.bucket.keys(), [original.clone(), converted.clone()]);
+    assert_eq!(
+        stack.bucket.keys(),
+        std::slice::from_ref(&original),
+        "no converted text"
+    );
     assert_eq!(
         stack.bucket.get(&original).unwrap(),
         bytes,
         "the original is untouched"
-    );
-    assert_eq!(
-        String::from_utf8(stack.bucket.get(&converted).unwrap()).unwrap(),
-        ORDERS_CSV
     );
 
     let launches = requests_containing(&stack.dagster, "launchRun").await;
@@ -4635,15 +4628,15 @@ async fn a_parquet_ingest_stores_the_converted_text_beside_the_original_and_laun
         launches[0]["variables"]["cfg"],
         json!({ "ops": { "ingest_uploaded_file": { "config": {
             "upload_id": id,
-            "storage_keys": [converted],
-            "format": "delimited",
+            "storage_keys": [original],
+            "format": "parquet",
             "bronze_table_name": "orders_raw",
             "load_mode": "replace",
             "encoding": "utf-8",
             "delimiter": ",",
             "header_row": 0,
         } } } }),
-        "the job's own configuration, the converted object and the fixed dialect"
+        "the job's own configuration: the original object, read as Parquet"
     );
     let audit = stack.audit_actions().await;
     let ingest = audit.iter().find(|a| a.0 == "upload.ingest").unwrap();
@@ -4684,12 +4677,13 @@ async fn a_parquet_ingest_that_cannot_convert_claims_nothing_and_launches_nothin
 }
 
 #[tokio::test]
-async fn deleting_a_parquet_upload_removes_the_original_and_the_converted_text() {
+async fn deleting_a_parquet_upload_removes_the_original() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     mount_free_table(&stack.ch).await;
-    // The launch is refused, which settles the claim as failed and leaves the
-    // converted object in place: the state a delete must clean up.
+    // The launch is refused, which settles the claim as failed: the state a
+    // delete must clean up. (Nothing is converted any more, so only the
+    // original is stored.)
     mount_launch_refused(&stack.dagster).await;
     let upload = stack
         .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
@@ -4704,7 +4698,7 @@ async fn deleting_a_parquet_upload_removes_the_original_and_the_converted_text()
         "{}",
         reply.text
     );
-    assert_eq!(stack.bucket.keys().len(), 2);
+    assert_eq!(stack.bucket.keys().len(), 1);
 
     let gone = stack
         .send(

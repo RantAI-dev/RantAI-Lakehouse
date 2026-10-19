@@ -47,6 +47,15 @@ been made. The one failure that can only be found mid-stream is the row cap
 runs before anything is normalized or loaded, so nothing is written (measured:
 `test_a_failure_while_dlt_extracts_leaves_the_destination_untouched`).
 
+# Parquet is read here too (`DATA-17` T2.2)
+
+With `format: parquet` the object is a Parquet file, opened for reading by ranges
+(`pyarrow.parquet.ParquetFile` over the store's file object) and read in batches
+of `BATCH_ROWS`. `parquet_ingest.py` writes every value as the text the API's
+converter used to write, so the table is what it was when the API converted the
+file; the same row, column and cell caps apply, and a binary or nested column is
+refused (`UNREADABLE`, the API having refused the same file at upload).
+
 # Every column is text, and dlt has to be told
 
 Decision 6 of the feature page says every column is text. Plain rows do not
@@ -101,6 +110,7 @@ from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult, l
 from dispar_orchestrate.bronze_catalog import record_ingest_run
 from dispar_orchestrate.connector_catalog import register_loaded_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
+from dispar_orchestrate.parquet_ingest import UnsupportedColumn, check_types, column_names_of, open_parquet, text_batches
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 JOB_NAME = "file_ingest_job"
@@ -157,8 +167,9 @@ TABLE_NAME = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
 # from the API, and fails closed.
 LOAD_MODES = ("replace", "append")
 # What the stored objects are: delimited text (a CSV or TSV, or the text the API
-# converted a workbook to) or, from T2.2, a Parquet file.
-FORMATS = ("delimited",)
+# converted a workbook to), or a Parquet file, which the job reads natively
+# (`DATA-17` T2.2, `parquet_ingest.py`).
+FORMATS = ("delimited", "parquet")
 ENCODINGS = ("utf-8", "utf-16")
 DELIMITERS = (",", ";", "\t", "|")
 
@@ -265,7 +276,7 @@ CONFIG_SCHEMA = {
     "storage_keys": Field(
         [str], description="Object keys inside the warehouse bucket, under `uploads/`; the primary file first."
     ),
-    "format": Field(str, description="What the objects are: `delimited`."),
+    "format": Field(str, description="What the objects are: `delimited` or `parquet`."),
     "bronze_table_name": Field(str, description="The raw table to load into."),
     "load_mode": Field(str, description="`replace` or `append`."),
     "encoding": Field(str, description="`utf-8` or `utf-16`."),
@@ -532,6 +543,69 @@ def open_table(source: str | Iterable[str], delimiter: str, header_row: int) -> 
     return TableStream(columns=_column_names(header), first=first, records=records)
 
 
+@dataclass
+class ParquetStream:
+    """A Parquet file read in batches, with the interface of `TableStream`:
+    `columns` (cleaned as a header would be), `batches()`, `row_count` and
+    `failure`. The text of every value is `parquet_ingest`'s."""
+
+    parquet_file: Any
+    columns: list[str]
+    row_count: int = 0
+    failure: LoadFailure | None = field(default=None, repr=False)
+
+    def batches(self) -> Iterator[pa.Table]:
+        """The rows as tables of `string` columns, at most `BATCH_ROWS` each.
+
+        # Errors
+
+        Raises `LoadFailure(TOO_MANY_ROWS)` (also kept in `failure`) before the
+        batch that would pass `MAX_ROWS`, and `LoadFailure(UNREADABLE)` when the
+        store or the file fails while it is read.
+        """
+        try:
+            for batch in text_batches(self.parquet_file, BATCH_ROWS):
+                if self.row_count + batch.num_rows > MAX_ROWS:
+                    self.failure = LoadFailure(TOO_MANY_ROWS)
+                    raise self.failure
+                self.row_count += batch.num_rows
+                yield batch.rename_columns(self.columns)
+        except LoadFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the store or a page failed mid-read; the detail is the cause
+            self.failure = LoadFailure(UNREADABLE)
+            self.failure.__cause__ = exc
+            raise self.failure from exc
+
+
+def open_parquet_stream(handle: Any) -> ParquetStream:
+    """Open a Parquet file as far as its footer, writing nothing.
+
+    # Errors
+
+    Raises `LoadFailure` with `UNREADABLE` (the file does not open, or a column
+    has no text form: binary or nested), `HEADER_NO_COLUMNS` (no columns),
+    `TOO_MANY_COLUMNS` or `NO_ROWS`.
+    """
+    try:
+        parquet_file = open_parquet(handle)
+        names = column_names_of(parquet_file)
+        rows = parquet_file.metadata.num_rows
+    except Exception as exc:  # noqa: BLE001 -- not Parquet, cut short, encrypted or damaged
+        raise LoadFailure(UNREADABLE) from exc
+    if not names:
+        raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("the file has no columns")
+    if len(names) > MAX_COLUMNS:
+        raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(f"the file has {len(names)} columns, more than {MAX_COLUMNS}")
+    try:
+        check_types(parquet_file)
+    except UnsupportedColumn as exc:
+        raise LoadFailure(UNREADABLE) from exc
+    if rows == 0:
+        raise LoadFailure(NO_ROWS)
+    return ParquetStream(parquet_file=parquet_file, columns=_column_names(names))
+
+
 def _checked_key(storage_key: str) -> str:
     """The key, if it is inside the uploads prefix and cannot climb out of it.
 
@@ -585,7 +659,7 @@ def _unbounded_csv_fields() -> Iterator[None]:
 # ── Writing it ───────────────────────────────────────────────────────────
 
 
-def _text_resource(stream: TableStream, table: str) -> DltResource:
+def _text_resource(stream: TableStream | ParquetStream, table: str) -> DltResource:
     """The record batches as a dlt resource with every column declared `text`,
     for `load_via_sink` (which takes an already configured resource).
 
@@ -686,7 +760,7 @@ def _now() -> str:
 
 
 def _write(
-    stream: TableStream,
+    stream: TableStream | ParquetStream,
     params: FileIngestParams,
     sink_config: SinkConfig,
     load: Callable[..., SinkResult],
@@ -747,8 +821,11 @@ def _load(
             raise LoadFailure(UNREADABLE) from exc
         with handle:
             try:
-                lines = _lines(_text_chunks(_blocks(handle), params.encoding))
-                stream = open_table(lines, params.delimiter, params.header_row)
+                if params.format == "parquet":
+                    stream = open_parquet_stream(handle)
+                else:
+                    lines = _lines(_text_chunks(_blocks(handle), params.encoding))
+                    stream = open_table(lines, params.delimiter, params.header_row)
             except LoadFailure:
                 raise
             except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause

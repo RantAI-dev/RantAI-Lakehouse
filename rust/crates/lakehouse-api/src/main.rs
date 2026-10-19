@@ -46,6 +46,7 @@ mod tenant_scope;
 mod transform_grammar;
 mod upload_limits;
 mod upload_parquet;
+mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;
 mod upload_sweep;

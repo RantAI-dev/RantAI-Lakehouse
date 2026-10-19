@@ -207,6 +207,12 @@ impl UploadStore {
         })
     }
 
+    /// A store over `object_store`'s in-memory backend, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self::with_backend(Arc::new(object_store::memory::InMemory::new()))
+    }
+
     /// A store over any backend, for tests that need no network.
     #[cfg(test)]
     fn with_backend(store: Arc<dyn Backend>) -> Self {
@@ -225,6 +231,39 @@ impl UploadStore {
             .await
             .map_err(|err| user_error("put", key, &Failure::Store(&err)))?;
         Ok(())
+    }
+
+    /// Read exactly `len` bytes of `key` from byte `start`, with no `HEAD`: the
+    /// caller knows the object's size and has checked that the range lies inside
+    /// it (`upload_parquet_range`, which reads a file by pieces it asks for as it
+    /// goes). `len` is capped at [`MAX_RANGE_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the object is missing, the range is
+    /// refused or `len` is over the cap.
+    pub async fn read_range(
+        &self,
+        key: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Bytes, UploadStoreError> {
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        if len > MAX_RANGE_BYTES {
+            return Err(UploadStoreError::Unavailable("not supported"));
+        }
+        self.store
+            .get_range(
+                &ObjectPath::from(key),
+                Range {
+                    start,
+                    end: start.saturating_add(len),
+                },
+            )
+            .await
+            .map_err(|err| user_error("get_range", key, &Failure::Store(&err)))
     }
 
     /// The size of the object at `key`, or `None` when there is none. One

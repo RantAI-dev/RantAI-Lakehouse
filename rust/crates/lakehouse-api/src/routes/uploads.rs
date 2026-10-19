@@ -141,6 +141,7 @@ use crate::json::ApiJson;
 use crate::state::AppState;
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet::{self, ParquetInfo};
+use crate::upload_parquet_range::RangeReader;
 use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
@@ -1301,9 +1302,11 @@ async fn workbook_preview(
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
 async fn parquet_preview(store: &UploadStore, row: &Upload) -> Result<PreviewResponse, ApiError> {
-    let bytes = store.get_all(&row.storage_key).await?;
+    // `DATA-17` T2.2: the footer and the first row group, read by range; the file
+    // is never held (`RangeReader`), and what the footer declares is bounded.
+    let reader = RangeReader::open(store, &row.storage_key).await?;
     let converted =
-        blocking(move || upload_parquet::convert(&bytes, Some(PARQUET_PREVIEW_ROWS))).await?;
+        blocking(move || upload_parquet::convert(&reader, Some(PARQUET_PREVIEW_ROWS))).await?;
     let cut = converted.info.rows > u64::try_from(PARQUET_PREVIEW_ROWS).unwrap_or(u64::MAX);
     let overrides = Overrides {
         encoding: Some(Encoding::Utf8),
@@ -1656,12 +1659,13 @@ async fn launch(
     claimed: &Upload,
     request: &IngestRequest,
     load_key: &str,
+    format: &str,
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_key, "delimited"),
+            &run_config(&claimed.id, request, load_key, format),
         )
         .await
     {
@@ -1696,6 +1700,29 @@ struct Converted {
 /// Convert a workbook upload's chosen sheet, or a Parquet upload's table, and
 /// store the text as a CSV beside the original. The object is written again by
 /// the next load of the same upload, and removed with the upload ([`delete`]).
+/// The checks the Parquet conversion used to make at ingest, now made on the
+/// footer alone (`DATA-17` T2.2): the file opens, has rows, and has no more
+/// columns than a table may. Nothing is decoded and the file is not held.
+///
+/// # Errors
+///
+/// 400 with the reader's own sentence for a file that no longer opens, is
+/// encrypted, has a binary or nested column, or is over the cell cap; with
+/// [`EMPTY_PARQUET`] for a file with no rows and [`JOB_TOO_MANY_COLUMNS`] for
+/// one with more than 1,000 columns; 503 when the object store is unavailable.
+async fn check_parquet_footer(state: &AppState, row: &Upload) -> Result<(), ApiError> {
+    let store = UploadStore::connect(&state.config).await?;
+    let reader = RangeReader::open(&store, &row.storage_key).await?;
+    let info = blocking(move || upload_parquet::inspect(&reader)).await?;
+    if info.rows == 0 {
+        return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
+    }
+    if info.columns.len() > upload_parse::MAX_COLUMNS {
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
+    }
+    Ok(())
+}
+
 async fn convert_upload(
     state: &AppState,
     row: &Upload,
@@ -1721,13 +1748,9 @@ async fn convert_upload(
             }
             (Some(name), csv)
         }
-        Conversion::Parquet => {
-            let converted = blocking(move || upload_parquet::convert(&bytes, None)).await?;
-            if converted.info.rows == 0 {
-                return Err(ApiError::BadRequest(EMPTY_PARQUET.to_owned()));
-            }
-            (None, converted.csv)
-        }
+        // A Parquet file is not converted: the job reads it natively (`DATA-17`
+        // T2.2), and `ingest` checks its footer.
+        Conversion::Parquet => return Err(ApiError::Internal(CONVERSION_FAILED.to_owned())),
     };
     let key = converted_key(&row.storage_key);
     store.put(&key, Bytes::from(csv)).await?;
@@ -1816,12 +1839,26 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
     }
     let converted = match conversion {
-        Some(kind) => Some(convert_upload(&state, &row, kind, request.sheet.as_deref()).await?),
+        Some(Conversion::Workbook) => Some(
+            convert_upload(&state, &row, Conversion::Workbook, request.sheet.as_deref()).await?,
+        ),
+        // `DATA-17` T2.2: a Parquet file is read by the job as it is. Its footer
+        // is checked here, as the conversion used to check it, so a refusal
+        // claims no table name.
+        Some(Conversion::Parquet) => {
+            check_parquet_footer(&state, &row).await?;
+            None
+        }
         None => None,
     };
     let load_key = converted
         .as_ref()
         .map_or(row.storage_key.as_str(), |done| done.key.as_str());
+    let format = if conversion == Some(Conversion::Parquet) {
+        "parquet"
+    } else {
+        "delimited"
+    };
     // Review finding B4: the name is claimed here, in one statement the
     // database arbitrates, and not before. `false` is a tenant that took the
     // name between the checks above and now, or one whose claim was always
@@ -1869,7 +1906,7 @@ pub async fn ingest(
         }
     };
 
-    let run_id = launch(&state, pool, &claimed, &request, load_key).await?;
+    let run_id = launch(&state, pool, &claimed, &request, load_key, format).await?;
     let attached = finish_launch_and_audit(
         pool,
         &principal,
@@ -1929,7 +1966,7 @@ async fn finish_launch_and_audit(
             ) => {
                 map.insert("sheet".to_owned(), json!(sheet));
             }
-            (Some(_), Some(Conversion::Parquet)) => {
+            (_, Some(Conversion::Parquet)) => {
                 map.insert("format".to_owned(), json!("parquet"));
             }
             _ => {}
