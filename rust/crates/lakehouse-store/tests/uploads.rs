@@ -34,10 +34,14 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    ClaimedTable, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload, attach_run,
-    claim_table, delete, find_by_sha256, get, get_by_run_id, insert, list, list_claims,
-    loads_under_limits, mark_finished, mark_ingesting, mark_ingesting_within_limits,
+    ClaimedTable, LoadLimits, LoadMode, MarkOutcome, NewReceiving, NewUpload, TableClaim, Upload,
+    UploadPart, attach_run, claim_table, delete, find_by_sha256, get, get_by_run_id, insert, list,
+    list_claims, loads_under_limits, mark_finished, mark_ingesting, mark_ingesting_within_limits,
     table_being_loaded, table_claim, table_claimed, upload_in_tenants,
+};
+use lakehouse_store::uploads::{
+    find_by_parts_digest, finish_receiving, insert_receiving, list_parts, record_part,
+    stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -1527,7 +1531,9 @@ async fn migration_0058_applies_on_a_database_that_has_0057_and_no_rows(
     assert!(before.contains(&"tenant".to_owned()));
     assert!(!before.contains(&"tenant_id".to_owned()));
 
-    MIGRATOR.run(&pool).await.unwrap();
+    // Up to 0058 only: later migrations (`0090`, DATA-17) add their own
+    // columns, and this test pins what 0058 alone adds and drops.
+    migrations_up_to(58).run(&pool).await.unwrap();
 
     // Exactly what `0058` adds to `file_upload` and exactly what it drops. T5a
     // added a column here that T6a took out again (review finding B4); asking
@@ -1982,6 +1988,341 @@ async fn list_claims_shows_only_the_caller_s_tenant_and_names_the_upload_when_it
             ("orphan_raw", "up-orphan", Some("stock.csv")),
         ],
         "a deleted upload leaves its claim, with no file name to show"
+    );
+    Ok(())
+}
+
+// ── chunked uploads (DATA-17 T1.1, `0090_upload_parts.sql`) ─────────────
+
+/// Open a session of `tenant_id` the way the sessions route does.
+async fn open_session(pool: &PgPool, id: &str, tenant_id: Uuid) -> Upload {
+    let key = format!("uploads/{tenant_id}/{id}.csv");
+    insert_receiving(
+        pool,
+        &NewReceiving {
+            id,
+            original_filename: "big.csv",
+            storage_key: &key,
+            content_type: "text/csv",
+            declared_size: 20_000_000,
+            multipart_id: "mp-secret-id",
+            uploaded_by: "Test User",
+            tenant_id,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn part(number: i32, size: i64, etag: &str) -> UploadPart {
+    UploadPart {
+        part_number: number,
+        size_bytes: size,
+        etag: etag.to_owned(),
+        sha256: format!("sha-{number}-{etag}"),
+    }
+}
+
+/// A session is a `receiving` row with its declared size and multipart id;
+/// the multipart id and digest never reach the wire.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_is_a_receiving_row_whose_multipart_id_never_reaches_the_wire(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session").await;
+    let row = open_session(&pool, "up-s1", tenant_a).await;
+    assert_eq!(row.status, "receiving");
+    assert_eq!(row.declared_size, Some(20_000_000));
+    assert_eq!(row.multipart_id.as_deref(), Some("mp-secret-id"));
+    assert_eq!(row.size_bytes, 0, "no byte is stored yet");
+
+    let wire = serde_json::to_value(&row).unwrap();
+    assert_eq!(wire["status"], "receiving");
+    assert_eq!(wire["declaredSize"], 20_000_000);
+    assert!(wire.get("multipartId").is_none(), "{wire}");
+    assert!(wire.get("multipart_id").is_none(), "{wire}");
+    assert!(wire.get("partsDigest").is_none(), "{wire}");
+    assert!(!wire.to_string().contains("mp-secret-id"));
+
+    // A file that arrived in one request has no declared size on the wire.
+    let plain = add(&pool, "up-plain", tenant_a, "").await;
+    assert_eq!(plain.declared_size, None);
+    assert!(
+        serde_json::to_value(&plain)
+            .unwrap()
+            .get("declaredSize")
+            .is_none()
+    );
+    // The tenant rule is the same as for any upload.
+    assert!(
+        upload_in_tenants(&pool, "up-s1", &[tenant_a])
+            .await
+            .unwrap()
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_database_refuses_a_session_declaring_no_bytes(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session-zero").await;
+    let err = insert_receiving(
+        &pool,
+        &NewReceiving {
+            id: "up-zero",
+            original_filename: "empty.csv",
+            storage_key: "uploads/x/up-zero.csv",
+            content_type: "text/csv",
+            declared_size: 0,
+            multipart_id: "mp",
+            uploaded_by: "Test User",
+            tenant_id: tenant_a,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Database(_)), "{err:?}");
+    // And a repeated id is the usual conflict.
+    open_session(&pool, "up-dup", tenant_a).await;
+    let err = insert_receiving(
+        &pool,
+        &NewReceiving {
+            id: "up-dup",
+            original_filename: "big.csv",
+            storage_key: "uploads/x/other.csv",
+            content_type: "text/csv",
+            declared_size: 5,
+            multipart_id: "mp",
+            uploaded_by: "Test User",
+            tenant_id: tenant_a,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "{err:?}");
+    Ok(())
+}
+
+/// Pieces may arrive in any order; the list is by part number; a piece sent
+/// again replaces the earlier record instead of adding a second.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pieces_are_listed_by_number_and_a_piece_sent_again_replaces_the_earlier_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-parts").await;
+    open_session(&pool, "up-p1", tenant_a).await;
+    assert!(list_parts(&pool, "up-p1").await.unwrap().is_empty());
+
+    for p in [
+        part(3, 100, "c"),
+        part(1, 8_388_608, "a"),
+        part(2, 8_388_608, "b"),
+    ] {
+        assert!(record_part(&pool, "up-p1", &p).await.unwrap());
+    }
+    let listed = list_parts(&pool, "up-p1").await.unwrap();
+    assert_eq!(
+        listed.iter().map(|p| p.part_number).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+
+    // Part 2 again, with other bytes: one row, the last copy.
+    assert!(
+        record_part(&pool, "up-p1", &part(2, 8_388_608, "b2"))
+            .await
+            .unwrap()
+    );
+    let listed = list_parts(&pool, "up-p1").await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[1], part(2, 8_388_608, "b2"));
+    Ok(())
+}
+
+/// Only a `receiving` upload takes a piece, and the rows are bounded by the
+/// table's own checks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_receiving_upload_takes_a_piece_and_the_table_bounds_the_numbers(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-parts-state").await;
+    add(&pool, "up-whole", tenant_a, "").await;
+    assert!(
+        !record_part(&pool, "up-whole", &part(1, 10, "a"))
+            .await
+            .unwrap(),
+        "an uploaded file takes no piece"
+    );
+    assert!(
+        !record_part(&pool, "up-missing", &part(1, 10, "a"))
+            .await
+            .unwrap()
+    );
+
+    open_session(&pool, "up-p2", tenant_a).await;
+    for bad in [part(0, 10, "a"), part(10_001, 10, "a"), part(1, 0, "a")] {
+        let err = record_part(&pool, "up-p2", &bad).await.unwrap_err();
+        assert!(matches!(err, StoreError::Database(_)), "{bad:?}: {err:?}");
+    }
+    assert!(
+        record_part(&pool, "up-p2", &part(10_000, 10, "z"))
+            .await
+            .unwrap()
+    );
+    Ok(())
+}
+
+/// Completing moves the row to `uploaded`, records what the store assembled,
+/// clears the multipart id and drops the piece records; it happens once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn finishing_a_session_makes_an_uploaded_file_and_forgets_its_pieces(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-finish").await;
+    open_session(&pool, "up-f1", tenant_a).await;
+    record_part(&pool, "up-f1", &part(1, 10, "a"))
+        .await
+        .unwrap();
+
+    let digest = [7u8; 32];
+    let done = finish_receiving(&pool, "up-f1", 10, "ab12", &digest)
+        .await
+        .unwrap()
+        .expect("a receiving upload finishes");
+    assert_eq!(done.status, "uploaded");
+    assert_eq!(done.size_bytes, 10);
+    assert_eq!(done.multipart_id, None);
+    assert_eq!(done.parts_digest.as_deref(), Some(&digest[..]));
+    assert!(list_parts(&pool, "up-f1").await.unwrap().is_empty());
+    // A late piece is refused: the file is assembled.
+    assert!(
+        !record_part(&pool, "up-f1", &part(1, 10, "a"))
+            .await
+            .unwrap()
+    );
+    // And it finishes only once.
+    assert!(
+        finish_receiving(&pool, "up-f1", 10, "ab12", &digest)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Deleting a session removes its piece records with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_a_session_removes_its_pieces(pool: PgPool) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-session-delete").await;
+    open_session(&pool, "up-d1", tenant_a).await;
+    record_part(&pool, "up-d1", &part(1, 10, "a"))
+        .await
+        .unwrap();
+    assert!(delete(&pool, "up-d1").await.unwrap());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload_part")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(left, 0);
+    Ok(())
+}
+
+/// The sweep's query: only `receiving` rows, only past the age, oldest first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stale_receiving_finds_only_old_unfinished_sessions_oldest_first(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-stale").await;
+    open_session(&pool, "up-new", tenant_a).await;
+    open_session(&pool, "up-old", tenant_a).await;
+    open_session(&pool, "up-older", tenant_a).await;
+    set_created_at(&pool, "up-old", 25).await;
+    set_created_at(&pool, "up-older", 48).await;
+    // An old file that is not a session is never swept.
+    add(&pool, "up-whole-old", tenant_a, "").await;
+    set_created_at(&pool, "up-whole-old", 100).await;
+
+    let stale = stale_receiving(&pool, 24, 100).await.unwrap();
+    assert_eq!(
+        stale.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        ["up-older", "up-old"]
+    );
+    assert_eq!(stale[0].multipart_id.as_deref(), Some("mp-secret-id"));
+    assert_eq!(stale_receiving(&pool, 24, 1).await.unwrap().len(), 1);
+    assert!(stale_receiving(&pool, 72, 100).await.unwrap().is_empty());
+    Ok(())
+}
+
+/// The duplicate check for files never held whole: same tenant, same
+/// digest, never the asker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_parts_digest_sees_only_its_own_tenant_and_never_the_excluded_upload(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-digest-a").await;
+    let tenant_b = tenant(&pool, "uploads-digest-b").await;
+    let digest = [9u8; 32];
+    for (id, owner) in [
+        ("up-g1", tenant_a),
+        ("up-g2", tenant_a),
+        ("up-g3", tenant_b),
+    ] {
+        open_session(&pool, id, owner).await;
+        finish_receiving(&pool, id, 10, "hex", &digest)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let found = find_by_parts_digest(&pool, tenant_a, &digest, "up-g2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "up-g1");
+    assert!(
+        find_by_parts_digest(&pool, tenant_a, &digest, "up-g1")
+            .await
+            .unwrap()
+            .is_some_and(|u| u.id == "up-g2")
+    );
+    assert!(
+        find_by_parts_digest(&pool, tenant_a, &[1u8; 32], "none")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// `0090` applies on a database that already holds an upload, leaves it as
+/// it was, and the new columns are NULL for it.
+#[sqlx::test(migrations = false)]
+async fn migration_0090_leaves_an_earlier_upload_as_it_was(pool: PgPool) -> sqlx::Result<()> {
+    migrations_up_to(84).run(&pool).await.unwrap();
+    let tenant_a = tenant(&pool, "uploads-0090").await;
+    // Raw SQL: `insert` returns the new columns, which do not exist yet.
+    sqlx::query(
+        "INSERT INTO file_upload (id, original_filename, storage_key, sha256, tenant_id) \
+         VALUES ('up-before', 'old.csv', 'uploads/before/up-before.csv', 'abc', $1)",
+    )
+    .bind(tenant_a)
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let row = get(&pool, "up-before").await.unwrap().unwrap();
+    assert_eq!(row.status, "uploaded");
+    assert_eq!(row.sha256, "abc");
+    assert_eq!(row.declared_size, None);
+    assert_eq!(row.multipart_id, None);
+    assert_eq!(row.parts_digest, None);
+    assert_eq!(
+        table_columns(&pool, "file_upload_part").await,
+        [
+            "upload_id",
+            "part_number",
+            "size_bytes",
+            "etag",
+            "sha256",
+            "received_at"
+        ]
     );
     Ok(())
 }
