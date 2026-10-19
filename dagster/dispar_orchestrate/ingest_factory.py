@@ -342,7 +342,7 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
         # SRC-3 AD2: the key the vendor table resolves: the browser sign-in's tag,
         # or `integration:<vendor>`. An unknown vendor is a rejected setting
         # (`secret_field_names` raises `ValueError`, classified setting_rejected).
-        auth_type = _saas_auth_type(dial)
+        auth_type = saas_vendors.auth_type_of(dial)
     fields = secret_field_names(adapter_name, auth_type)
     if not fields:
         # ("kafka", "none"): a PLAINTEXT broker needs no secret at all --
@@ -363,18 +363,6 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
             # rejected setting. The reason is not carried (decision 12).
             raise rest_adapter.OAuthSignInRefused() from None
     return dict(zip(fields, values))
-
-
-def _saas_auth_type(dial: dict) -> str | None:
-    """The `secret_map` key of a `saas` dial: `oauth2_authorization_code`, or
-    `integration:<vendor id>` (`None` when the dial has no such sign-in)."""
-    kind = (dial.get("auth") or {}).get("type")
-    if kind == saas_vendors.OAUTH_AUTH_TYPE:
-        return kind
-    if kind == "integration":
-        found = saas_vendors.VENDORS.get(str(dial.get("vendor", "")))
-        return found.secret_key(oauth=False) if found else None
-    return None
 
 
 def _register_in_catalog(connector_id: str, obj: dict) -> None:

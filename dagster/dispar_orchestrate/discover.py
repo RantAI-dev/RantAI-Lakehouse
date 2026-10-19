@@ -18,7 +18,7 @@ never writes to the source.
 # The wire (what the API accepts; closed lists, no free text)
 
     list, done     {"requestId", "kind": "list", "state": "done",
-                    "objects": [{"name", "kind", "size"?, "modifiedAt"?}],
+                    "objects": [{"name", "kind", "size"?, "modifiedAt"?, "load"?}],
                     "truncated": bool}
     preview, done  {"requestId", "kind": "preview", "state": "done",
                     "columns": [{"name", "typeName", "inferred"}],
@@ -95,9 +95,12 @@ from dispar_orchestrate.adapters import kafka as kafka_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
+from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters import sftp as sftp_adapter
 from dispar_orchestrate.ingest_factory import IngestFactoryConfig, _fetch_one_connector, kafka_security_kwargs
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
+from dispar_orchestrate.saas import session as saas_session
+from dispar_orchestrate.saas import vendors as saas_vendors
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +178,7 @@ def classify_discovery(exc: BaseException) -> str:
         # well as for a refused address; only the second is the address check's
         # doing. The product's own sentence is read for its start, never emitted.
         return UNREACHABLE
-    if ingest_errors.is_authentication_refusal(exc):
+    if ingest_errors.is_authentication_refusal(exc) or isinstance(exc, saas_session.SaasSignInRefused):
         return SIGN_IN_REFUSED
     if ingest_errors.is_permission_refusal(exc):
         return NO_PERMISSION
@@ -234,9 +237,14 @@ def valid_name(name: object) -> bool:
     )
 
 
-def listed(name: str, kind: str, *, size: int | None = None, modified_at: str | None = None) -> dict[str, Any]:
-    """One entry of a list answer; `size` and `modifiedAt` only when known."""
+def listed(
+    name: str, kind: str, *, size: int | None = None, modified_at: str | None = None, load: str | None = None
+) -> dict[str, Any]:
+    """One entry of a list answer; `size`, `modifiedAt` and `load` (SRC-3: how a
+    business-app object loads) only when known."""
     entry: dict[str, Any] = {"name": name, "kind": kind}
+    if load is not None:
+        entry["load"] = load
     if size is not None:
         entry["size"] = size
     if modified_at is not None:
@@ -507,6 +515,7 @@ class Backends:
     sftp_session: Callable = _real_sftp_session
     oracle_engine: Callable = _real_oracle_engine
     rest_first_page: Callable = rest_adapter.first_page_records
+    saas_open: Callable = saas_adapter.open_session
     clock: Callable[[], float] = time.monotonic
 
 
@@ -697,6 +706,25 @@ def _rest(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> d
     return preview(columns_from_records(records))
 
 
+# --- business apps (SRC-3 T1.10): the vendor module lists, the session reads ------------------------
+
+
+def _saas(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> dict[str, Any]:
+    module, _vendor, parts, session = b.saas_open(
+        dial, secrets, connector_id=request.connector_id, resolve_checked=b.resolve_checked
+    )
+    if request.kind == "list":
+        declared = [d for d in module.list_objects(session, parts, dial) if contains_ignore_case(d.name, request.search)]
+        declared.sort(key=lambda d: d.name)
+        return listing((listed(d.name, "object", load=d.load_description()) for d in declared), request.limit)
+    describe = getattr(module, "describe", None)
+    if describe is None:
+        raise NotSupported("this vendor does not describe its fields before a load")
+    decl = module.declaration(session, parts, dial, request.object)
+    fields = describe(session, parts, dial, request.object)
+    return preview([column(f.name, f.type_name, inferred=False) for f in fields], list(decl.primary_key))
+
+
 # --- the dispatch ------------------------------------------------------------------------------
 
 
@@ -704,7 +732,7 @@ def _reader_for(connector: dict) -> Callable[[dict, dict, DiscoverRequest, Backe
     adapter, dial = connector["adapter"], connector["dial"]
     if adapter == "sql" and dial.get("driver") == "oracle":
         return _oracle
-    readers = {"mongodb": _mongo, "kafka": _kafka, "sftp": _sftp, "rest": _rest}
+    readers = {"mongodb": _mongo, "kafka": _kafka, "sftp": _sftp, "rest": _rest, "saas": _saas}
     reader = readers.get(adapter)
     if reader is None:
         raise NotSupported("the orchestrator does not read this connector type")
@@ -725,7 +753,8 @@ def discover(connector: dict, request: DiscoverRequest, *, backends: Backends | 
     dial = connector["dial"]
     secrets = secret_resolver.resolve_secrets(
         connector["adapter"],
-        (dial.get("auth") or {}).get("type"),
+        # SRC-3: a saas dial's key is resolved by the vendor table.
+        saas_vendors.auth_type_of(dial) if connector["adapter"] == "saas" else (dial.get("auth") or {}).get("type"),
         connector.get("secretRef"),
         connector.get("secretRefSecondary"),
     )

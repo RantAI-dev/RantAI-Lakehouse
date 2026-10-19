@@ -313,6 +313,19 @@ def vendor(vendor_id: str) -> Vendor:
     return found
 
 
+def auth_type_of(dial: dict) -> str | None:
+    """The `secret_map` key of a `saas` dial: `oauth2_authorization_code`, or
+    `integration:<vendor id>`; `None` when the dial has no sign-in of that kind
+    (or the vendor has no integration credential)."""
+    kind = (dial.get("auth") or {}).get("type")
+    if kind == OAUTH_AUTH_TYPE:
+        return kind
+    if kind == "integration":
+        found = VENDORS.get(str(dial.get("vendor", "")))
+        return found.secret_key(oauth=False) if found else None
+    return None
+
+
 def secret_fields_for(auth_type: str) -> tuple[str, ...] | None:
     """The secret fields behind a `saas` `auth_type` key (the sign-in's, or a
     vendor's integration credential's); `None` for a key no vendor has.

@@ -207,4 +207,4 @@ def test_the_factory_resolves_saas_secrets_through_the_vendor_table(monkeypatch:
         {"vendor": "zendesk", "account": "x", "auth": {"type": "oauth2_authorization_code", "clientId": "c"}},
     )
     assert two == {"clientSecret": "value-of-env:A", "refreshToken": "value-of-env:B"}
-    assert f._saas_auth_type({"vendor": "nobody", "auth": {"type": "integration"}}) is None
+    assert vendors.auth_type_of({"vendor": "nobody", "auth": {"type": "integration"}}) is None
