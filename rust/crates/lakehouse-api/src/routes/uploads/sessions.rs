@@ -504,9 +504,23 @@ pub async fn complete(
 
     let store = UploadStore::connect(&state.config).await?;
     let etags: Vec<String> = parts.iter().map(|part| part.etag.clone()).collect();
-    store
+    if let Err(err) = store
         .complete_multipart(&row.storage_key, multipart_id, &etags)
-        .await?;
+        .await
+    {
+        // Phase 3 slice 1 review SHOULD-FIX 2: a completion that went through
+        // whose rows did not (the database failed after it, or its answer was
+        // lost) leaves the upload gone from S3 and the object in place. On the
+        // retry, an object of exactly the declared size at this session's own
+        // key IS the assembled file (the key is server-made and unique), so
+        // carry on from the sniff. Anything else is the original failure.
+        match store.object_size(&row.storage_key).await {
+            Ok(Some(size)) if size == declared => {
+                tracing::warn!(upload_id = %id, "completing an upload that was already assembled");
+            }
+            _ => return Err(err.into()),
+        }
+    }
 
     let head = store
         .get_range(&row.storage_key, 0, COMPLETE_SNIFF_BYTES)

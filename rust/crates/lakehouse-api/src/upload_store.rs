@@ -227,6 +227,22 @@ impl UploadStore {
         Ok(())
     }
 
+    /// The size of the object at `key`, or `None` when there is none. One
+    /// `HEAD`. Used to tell that a multipart upload whose completion is being
+    /// retried had already been assembled (Phase 3 slice 1 review SHOULD-FIX 2).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadStoreError::Unavailable`] when the request fails for any reason
+    /// but the object being absent.
+    pub async fn object_size(&self, key: &str) -> Result<Option<u64>, UploadStoreError> {
+        match self.store.head(&ObjectPath::from(key)).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(user_error("head", key, &Failure::Store(&err))),
+        }
+    }
+
     /// Read at most `max_bytes` from the start of `key`.
     ///
     /// A RANGE read, not a full fetch: a preview needs the first few
@@ -927,6 +943,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UploadStoreError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn object_size_is_the_size_when_there_is_an_object_and_none_when_there_is_not() {
+        let store = in_memory();
+        assert_eq!(store.object_size(KEY).await.unwrap(), None);
+        store
+            .put(KEY, Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        assert_eq!(store.object_size(KEY).await.unwrap(), Some(10));
     }
 
     #[tokio::test]

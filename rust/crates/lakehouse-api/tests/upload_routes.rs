@@ -5507,3 +5507,53 @@ async fn a_twenty_first_open_session_of_one_user_is_429_and_opens_nothing() {
     assert_eq!(stack.complete(&bayu, &ids[1]).await.status, StatusCode::OK);
     stack.session(&bayu, "after-complete.csv", 10).await;
 }
+
+/// Phase 3 slice 1 review SHOULD-FIX 2: S3 completed the upload but the row
+/// never left `receiving` (the database failed after it). The retry of
+/// `complete` finds the multipart upload gone and the object in place at the
+/// declared size, and finishes the upload; an object of another size is not
+/// taken for the file.
+#[tokio::test]
+async fn complete_recovers_when_s3_assembled_the_file_but_the_row_was_not_updated() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = b"id,name\n1,a\n2,b\n".to_vec();
+
+    let id = stack.session(&bayu, "half.csv", bytes.len()).await;
+    stack.put_part(&bayu, &id, "1", &bytes).await;
+    // What S3 did on the first, half-successful attempt: the object is there and
+    // the multipart upload is gone.
+    let (key,): (String,) = sqlx::query_as("SELECT storage_key FROM file_upload WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&stack.app.pool)
+        .await
+        .unwrap();
+    stack.bucket.put(&key, &bytes);
+    stack.bucket.1.0.lock().unwrap().clear();
+
+    let done = stack.complete(&bayu, &id).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+    assert_eq!(done.json["status"], "uploaded");
+    assert_eq!(done.json["sizeBytes"], bytes.len());
+    assert_eq!(stack.bucket.get(&key).unwrap(), bytes);
+
+    // An object of the wrong size at the key is no proof: the failure stands.
+    let other = stack.session(&bayu, "wrong.csv", bytes.len()).await;
+    stack.put_part(&bayu, &other, "1", &bytes).await;
+    let (other_key,): (String,) =
+        sqlx::query_as("SELECT storage_key FROM file_upload WHERE id = $1")
+            .bind(&other)
+            .fetch_one(&stack.app.pool)
+            .await
+            .unwrap();
+    stack.bucket.put(&other_key, b"short");
+    stack.bucket.1.0.lock().unwrap().clear();
+    let refused = stack.complete(&bayu, &other).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.text
+    );
+    assert_eq!(stack.status_of(&other).await.0, "receiving");
+}
