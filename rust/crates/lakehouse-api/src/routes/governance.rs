@@ -10,7 +10,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -1620,8 +1620,15 @@ pub struct CreateTagKeyBody {
 pub async fn create_tag_key(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let body: CreateTagKeyBody = parse_body(&body)?;
     let created_by: String = principal
         .display_name
@@ -1674,8 +1681,15 @@ pub async fn update_tag_key(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let body: UpdateTagKeyBody = parse_body(&body)?;
     let row =
         lakehouse_store::governed_tag::update_key_values(pool(&state)?, &key, &body.allowed_values)
@@ -1708,7 +1722,14 @@ pub async fn delete_tag_key(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<ApiJson<Value>> {
+    // PR #106 review R1 BLOCKER 1
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     lakehouse_store::governed_tag::delete_key(pool(&state)?, &key)
         .await
         .map_err(|err| match err {
@@ -2218,6 +2239,7 @@ mod tests {
                 create_tag_key(
                     State(state.clone()),
                     Extension(admin()),
+                    HeaderMap::new(),
                     Bytes::copy_from_slice(body.as_bytes()),
                 )
                 .await,
@@ -2231,6 +2253,7 @@ mod tests {
                     State(state.clone()),
                     Extension(admin()),
                     Path(key.to_owned()),
+                    HeaderMap::new(),
                     Bytes::copy_from_slice(body.as_bytes()),
                 )
                 .await,
@@ -2244,6 +2267,7 @@ mod tests {
                     State(state.clone()),
                     Extension(admin()),
                     Path(key.to_owned()),
+                    HeaderMap::new(),
                 )
                 .await,
             )
@@ -2399,6 +2423,98 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(kept, vec!["finance", "ops"], "a refusal changes nothing");
+        }
+
+        // PR #106 review R1 BLOCKER 1
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_caller_outside_the_catalog_tenant_is_refused_every_tag_key_write(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let t1 = Uuid::new_v4();
+            let t2 = Uuid::new_v4();
+            sqlx::query("INSERT INTO tenant (id, name, slug, plan, residency) VALUES ($1, 'T1', 't1', 'Standard', 'US'), ($2, 'T2', 't2', 'Standard', 'US')")
+                .bind(t1)
+                .bind(t2)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            env.insert("CATALOG_TENANT_ID".to_owned(), t1.to_string());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![t2],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("governance:write"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let (status, resp) = answer(
+                create_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"key":"outside_key","allowedValues":["v1"]}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let (status, resp) = answer(
+                update_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    Path("outside_key".to_owned()),
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"allowedValues":["v1","v2"]}"#),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let (status, resp) = answer(
+                delete_tag_key(
+                    State(state.clone()),
+                    Extension(outside_caller),
+                    Path("outside_key".to_owned()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
+
+            let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(stored, 0);
         }
     }
 }

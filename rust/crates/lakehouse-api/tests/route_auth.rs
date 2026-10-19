@@ -2002,12 +2002,28 @@ async fn tag_key_routes_are_gated_in_both_directions() {
     );
     for (method, path) in writes {
         let resp = request_with_cookie(&router, method, path, &admin_cookie).await;
+        // PR #106 review R1 BLOCKER 1: governance:write passes the permission
+        // middleware; the tenant gate answers 403 on this multi-tenant test app.
         assert_ne!(
             resp.status(),
-            StatusCode::FORBIDDEN,
-            "governance:write must be enough to {method} {path}"
+            StatusCode::UNAUTHORIZED,
+            "governance:write must be authenticated"
         );
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        if status == StatusCode::FORBIDDEN {
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            let error = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                error.starts_with("permission_denied: per-dataset tenant ownership is not tracked"),
+                "governance:write must not be denied by permission middleware: {error}"
+            );
+        }
     }
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
