@@ -157,6 +157,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import dlt
+import pyarrow as pa
 from dlt.destinations import filesystem
 from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
 from dlt.extract.incremental import IncrementalResourceWrapper
@@ -291,7 +292,7 @@ class LoadPlan:
         )
 
 
-def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
+def _stamp_ingested_at(record: Any) -> Any:
     """Bronze's system ingestion-time column (ADR 0004's
     `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) --
     stamped here, the ONE place any Bronze row this sink writes gets it,
@@ -299,7 +300,19 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     (e.g. a Kafka payload that happens to carry a same-named field) is
     OVERWRITTEN, not preserved, so partitioning never depends on a
     source-provided timestamp existing, being non-null, or meaning what
-    this column means."""
+    this column means.
+
+    `record` is a row (a dict) or, since the upload job streams in batches
+    (`DATA-17` T2.1), an Arrow table or record batch: every row of the batch gets
+    the one moment the batch was stamped, in a `timestamp[us, UTC]` column that
+    replaces a column of the same name the batch brought."""
+    if isinstance(record, (pa.Table, pa.RecordBatch)):
+        stamp = pa.array([datetime.now(timezone.utc)] * record.num_rows, type=pa.timestamp("us", tz="UTC"))
+        if isinstance(record, pa.RecordBatch):
+            record = pa.Table.from_batches([record])
+        if "_ingested_at" in record.schema.names:
+            record = record.drop_columns(["_ingested_at"])
+        return record.append_column("_ingested_at", stamp)
     record["_ingested_at"] = datetime.now(timezone.utc)
     return record
 

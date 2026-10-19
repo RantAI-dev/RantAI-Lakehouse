@@ -33,6 +33,11 @@ dependencies = [
     # a future dlt version bump cannot silently drop or change it
     # without this file's own dependency list saying so.
     "s3fs==2026.7.0",
+    # `file_ingest.py` builds Arrow record batches and (from DATA-17 T2.2) reads
+    # Parquet with `pyarrow.parquet`, so it imports pyarrow directly. Already
+    # installed transitively by `pyiceberg` (25.0.1 in this project's venv on
+    # 2026-10-19); named here so a pyiceberg bump cannot silently drop or move it.
+    "pyarrow==25.0.1",
     # Tier 2 ingestion adapters (mongodb, oracle, kafka stream micro-batch,
     # sftp). Verified installable for this image's interpreter
     # (python:3.12-slim, dagster/Dockerfile) via

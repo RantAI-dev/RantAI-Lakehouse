@@ -1784,7 +1784,8 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
         launches[0]["variables"]["cfg"],
         json!({ "ops": { "ingest_uploaded_file": { "config": {
             "upload_id": id,
-            "storage_key": format!("uploads/{GROUP}/{id}.xls"),
+            "storage_keys": [format!("uploads/{GROUP}/{id}.xls")],
+            "format": "delimited",
             "bronze_table_name": "sap_stock",
             "load_mode": "append",
             "encoding": "utf-16",
@@ -4211,7 +4212,8 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
         launches[0]["variables"]["cfg"],
         json!({ "ops": { "ingest_uploaded_file": { "config": {
             "upload_id": id,
-            "storage_key": converted,
+            "storage_keys": [converted],
+            "format": "delimited",
             "bronze_table_name": "quirks_raw",
             "load_mode": "replace",
             "encoding": "utf-8",
@@ -4318,8 +4320,8 @@ async fn a_text_file_named_like_a_workbook_is_loaded_as_text() {
     );
     let launches = requests_containing(&stack.dagster, "launchRun").await;
     assert_eq!(
-        launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"]["storage_key"],
-        format!("uploads/{GROUP}/{id}.xlsx")
+        launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"]["storage_keys"],
+        json!([format!("uploads/{GROUP}/{id}.xlsx")])
     );
     assert_eq!(stack.bucket.keys().len(), 1, "nothing was converted");
     // And a text upload still needs its dialect.
@@ -4633,7 +4635,8 @@ async fn a_parquet_ingest_stores_the_converted_text_beside_the_original_and_laun
         launches[0]["variables"]["cfg"],
         json!({ "ops": { "ingest_uploaded_file": { "config": {
             "upload_id": id,
-            "storage_key": converted,
+            "storage_keys": [converted],
+            "format": "delimited",
             "bronze_table_name": "orders_raw",
             "load_mode": "replace",
             "encoding": "utf-8",

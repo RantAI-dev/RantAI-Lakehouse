@@ -1582,13 +1582,14 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here.
-fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str) -> Value {
+fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str, format: &str) -> Value {
     json!({
         "ops": {
             "ingest_uploaded_file": {
                 "config": {
                     "upload_id": upload_id,
-                    "storage_key": load_key,
+                    "storage_keys": [load_key],
+                    "format": format,
                     "bronze_table_name": request.table,
                     "load_mode": request.mode.as_str(),
                     "encoding": request.encoding.as_str(),
@@ -1658,7 +1659,10 @@ async fn launch(
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
-        .launch_run_with_config(FILE_INGEST_JOB, &run_config(&claimed.id, request, load_key))
+        .launch_run_with_config(
+            FILE_INGEST_JOB,
+            &run_config(&claimed.id, request, load_key, "delimited"),
+        )
         .await
     {
         Ok(launched) => {
@@ -2546,10 +2550,19 @@ mod tests {
             Some(Conversion::Workbook),
         )
         .unwrap();
-        let config = run_config("up-1", &request, "uploads/t/up-1.xlsx.converted.csv");
+        let config = run_config(
+            "up-1",
+            &request,
+            "uploads/t/up-1.xlsx.converted.csv",
+            "delimited",
+        );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");
-        assert_eq!(job["storage_key"], "uploads/t/up-1.xlsx.converted.csv");
+        assert_eq!(
+            job["storage_keys"],
+            json!(["uploads/t/up-1.xlsx.converted.csv"])
+        );
+        assert_eq!(job["format"], "delimited");
         assert_eq!(job["encoding"], "utf-8");
         assert_eq!(job["delimiter"], ",");
         assert_eq!(job["header_row"], 1);

@@ -1503,7 +1503,8 @@ def _file_ingest_run(
                 "ingest_uploaded_file": {
                     "config": {
                         "upload_id": "up-1",
-                        "storage_key": "uploads/tenant/up-1.csv",
+                        "storage_keys": ["uploads/tenant/up-1.csv"],
+                        "format": "delimited",
                         "bronze_table_name": table,
                         "load_mode": "replace",
                         "encoding": "utf-8",
@@ -2346,7 +2347,8 @@ class TestFileIngestRunConfigReader:
                 "ingest_uploaded_file": {
                     "config": {
                         "upload_id": "up-1",
-                        "storage_key": "uploads/t/up-1.csv",
+                        "storage_keys": ["uploads/t/up-1.csv"],
+                        "format": "delimited",
                         "bronze_table_name": "stock_raw",
                         "load_mode": "replace",
                         "encoding": "utf-8",

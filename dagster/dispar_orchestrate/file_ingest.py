@@ -24,7 +24,28 @@ value. Whitespace only decides whether a record is blank (skipped below the
 header) and how a column is named. A row shorter than the header is padded
 with empty strings and a longer one is cut to the header's length, which
 drops its extra cells. And the row cap (`MAX_ROWS`) is a failure, never a
-truncation: rows are counted in a first pass, before anything is written.
+truncation: the load that passes it fails, and nothing is written.
+
+# The file is streamed, never held whole (`DATA-17` T2.1, plan AD2)
+
+The job is the only reader of a whole file, and it reads it in 8 MiB blocks
+(`READ_BLOCK`): bytes go through an incremental decoder, text through a line
+splitter that cuts where `io.StringIO(newline="")` cuts (a lone `\r`, a `\n` or
+a `\r\n`, with a `\r` at the end of a block held back until the next block shows
+whether a `\n` follows), and the lines through `csv.reader`. Rows are counted
+as they pass and leave in Arrow record batches of `BATCH_ROWS` (50,000) rows, so
+the memory of a load is a few batches and not the file; `test_file_ingest.py`
+measures that with `tracemalloc` on a 200 MB generated file. A single line with
+no line break at all (one 2 GB record) would still be held whole: nothing real
+produces one, and the column and cell rules would refuse it later.
+
+Because the file is read once, the first data row is read BEFORE dlt is asked
+to write anything, so a header past the end, a header with no cells, one with
+too many, and a file with no rows below it all fail without a pipeline having
+been made. The one failure that can only be found mid-stream is the row cap
+(`MAX_ROWS`): the batch generator raises it from inside dlt's extract step, which
+runs before anything is normalized or loaded, so nothing is written (measured:
+`test_a_failure_while_dlt_extracts_leaves_the_destination_untouched`).
 
 # Every column is text, and dlt has to be told
 
@@ -58,17 +79,20 @@ starts a new run.
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
+import itertools
 import re
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, BinaryIO
 
 import dlt
+import pyarrow as pa
 import s3fs
 from dagster import Failure, Field, job, op
 from dlt.extract.resource import DltResource
@@ -108,6 +132,11 @@ MAX_ROWS = 2_000_000
 # through those routes.
 MAX_COLUMNS = 1_000
 
+# How the file is read and handed on (`DATA-17` T2.1): blocks of 8 MiB from the
+# store, Arrow record batches of 50,000 rows to the sink.
+READ_BLOCK = 8 * 1024 * 1024
+BATCH_ROWS = 50_000
+
 # The API's own bound on a table name (`routes::uploads::MAX_TABLE_NAME_CHARS`).
 MAX_TABLE_NAME_CHARS = 128
 
@@ -127,6 +156,9 @@ TABLE_NAME = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
 # what this job accepts: a value outside these is a launch that did not come
 # from the API, and fails closed.
 LOAD_MODES = ("replace", "append")
+# What the stored objects are: delimited text (a CSV or TSV, or the text the API
+# converted a workbook to) or, from T2.2, a Parquet file.
+FORMATS = ("delimited",)
 ENCODINGS = ("utf-8", "utf-16")
 DELIMITERS = (",", ";", "\t", "|")
 
@@ -197,9 +229,12 @@ class FileIngestParams:
 
     #: `file_upload.id`. The outcome is filed under `upload:<id>`.
     upload_id: str
-    #: Object key in the warehouse bucket, `uploads/<tenant id>/<upload id>[.<ext>]`,
-    #: built by the API from server-generated parts only.
-    storage_key: str
+    #: Object keys in the warehouse bucket, `uploads/<tenant id>/<upload id>[.<ext>]`,
+    #: built by the API from server-generated parts only; the primary file first.
+    #: One key until a load can take several files (a later slice of `DATA-17`).
+    storage_keys: tuple[str, ...]
+    #: What the objects are: one of `FORMATS`.
+    format: str
     #: The raw table. The API checks the naming rule; `_check_settings` checks it again.
     bronze_table_name: str
     #: `replace` or `append`.
@@ -216,7 +251,9 @@ class FileIngestParams:
     def from_op_config(cls, config: Mapping[str, Any]) -> FileIngestParams:
         """The params out of a run's `op_config`, which Dagster has already
         validated against `CONFIG_SCHEMA`."""
-        return cls(**{name: config[name] for name in CONFIG_SCHEMA})
+        values = {name: config[name] for name in CONFIG_SCHEMA}
+        values["storage_keys"] = tuple(values["storage_keys"])
+        return cls(**values)
 
 
 # Why the op declares its config this way and not as a `dagster.Config`
@@ -225,7 +262,10 @@ class FileIngestParams:
 # `agent_runs.py` use the same `config_schema` form.
 CONFIG_SCHEMA = {
     "upload_id": Field(str, description="`file_upload.id`; the outcome is recorded under `upload:<id>`."),
-    "storage_key": Field(str, description="Object key inside the warehouse bucket, under `uploads/`."),
+    "storage_keys": Field(
+        [str], description="Object keys inside the warehouse bucket, under `uploads/`; the primary file first."
+    ),
+    "format": Field(str, description="What the objects are: `delimited`."),
     "bronze_table_name": Field(str, description="The raw table to load into."),
     "load_mode": Field(str, description="`replace` or `append`."),
     "encoding": Field(str, description="`utf-8` or `utf-16`."),
@@ -251,24 +291,83 @@ class LoadSummary:
 # ── Reading the file ─────────────────────────────────────────────────────
 
 
-def _decode(raw: bytes, encoding: str) -> str:
-    """Decode as `upload_parse::decode` does, so the table holds what the
-    preview showed. UTF-8: a byte order mark is dropped (left in place it
-    turns the quotes of a quoted first cell into literal characters). UTF-16:
-    the byte order mark picks the byte order, and without one it is little
-    endian on every platform. A trailing odd byte is dropped, as the preview
-    drops it. A byte that does not belong becomes U+FFFD, visible in the
-    table and never fatal, so one bad byte does not fail a 35,000-row export.
+def _text_chunks(chunks: Iterable[bytes], encoding: str) -> Iterator[str]:
+    """Decode blocks of bytes as `upload_parse::decode` does, one block at a
+    time, so the table holds what the preview showed. UTF-8: a byte order mark is
+    dropped (left in place it turns the quotes of a quoted first cell into
+    literal characters). UTF-16: the byte order mark picks the byte order, and
+    without one it is little endian on every platform. A trailing odd byte is
+    dropped, as the preview drops it (a block of odd length keeps its last byte
+    for the next block, so a unit is never split). A byte that does not belong
+    becomes U+FFFD, visible in the table and never fatal, so one bad byte does
+    not fail a 35,000-row export. An incremental decoder keeps a character or a
+    surrogate pair that straddles two blocks whole.
     """
     if encoding == "utf-16":
-        if raw.startswith(b"\xff\xfe"):
-            codec, body = "utf-16-le", raw[2:]
-        elif raw.startswith(b"\xfe\xff"):
-            codec, body = "utf-16-be", raw[2:]
-        else:
-            codec, body = "utf-16-le", raw
-        return body[: len(body) - len(body) % 2].decode(codec, errors="replace")
-    return raw.decode("utf-8-sig", errors="replace")
+        decoder: codecs.IncrementalDecoder | None = None
+        carry = b""
+        for chunk in chunks:
+            data = carry + chunk
+            if decoder is None:
+                if len(data) < 2:
+                    carry = data
+                    continue
+                if data.startswith(b"\xff\xfe"):
+                    codec, data = "utf-16-le", data[2:]
+                elif data.startswith(b"\xfe\xff"):
+                    codec, data = "utf-16-be", data[2:]
+                else:
+                    codec = "utf-16-le"
+                decoder = codecs.getincrementaldecoder(codec)(errors="replace")
+            usable = len(data) - len(data) % 2
+            carry = data[usable:]
+            text = decoder.decode(data[:usable])
+            if text:
+                yield text
+        # `carry` is a trailing odd byte, or a lone byte of a one-byte file:
+        # dropped. A pending half of a surrogate pair is a bad unit.
+        if decoder is not None:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
+        return
+    utf8 = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
+    for chunk in chunks:
+        text = utf8.decode(chunk)
+        if text:
+            yield text
+    tail = utf8.decode(b"", final=True)
+    if tail:
+        yield tail
+
+
+_LINE = re.compile(r"[^\r\n]*(?:\r\n|\n|\r)")
+
+
+def _lines(texts: Iterable[str]) -> Iterator[str]:
+    """Cut text that arrives in blocks into lines, line breaks kept, exactly
+    where `io.StringIO(text, newline="")` cuts: at `\r\n`, `\n` or a lone `\r`
+    (and nowhere else: `str.splitlines` also cuts at form feeds and U+2028, which
+    the csv reader reads as data). A `\r` at the very end of what is buffered is
+    held until the next block shows whether a `\n` follows, so a `\r\n` split
+    between two blocks is not read as two line breaks.
+    """
+    buffer = ""
+    for text in texts:
+        buffer += text
+        end = 0
+        for match in _LINE.finditer(buffer):
+            if match.end() == len(buffer) and buffer.endswith("\r"):
+                break
+            yield match.group()
+            end = match.end()
+        buffer = buffer[end:]
+    if buffer:
+        for match in _LINE.finditer(buffer):
+            yield match.group()
+        rest = _LINE.sub("", buffer, count=0)
+        if rest:
+            yield rest
 
 
 def _is_blank(record: list[str]) -> bool:
@@ -277,9 +376,12 @@ def _is_blank(record: list[str]) -> bool:
     return all(not cell or cell.isspace() for cell in record)
 
 
-def read_table(text: str, delimiter: str, header_row: int) -> tuple[list[str], Iterator[list[str]]]:
+def read_table(
+    source: str | Iterable[str], delimiter: str, header_row: int
+) -> tuple[list[str], Iterator[list[str]]]:
     """The header record and the records below it that are not blank, as the
-    dialect reads them: raw cells, not padded, not cut, not trimmed.
+    dialect reads them: raw cells, not padded, not cut, not trimmed. `source` is
+    the text, or its lines with their line breaks (`_lines`).
 
     `header_row` is a zero-based index of a RECORD, blank ones included, which
     is what `ops/fixtures/uploads/*.expected.json` calls `headerRow`.
@@ -289,7 +391,8 @@ def read_table(text: str, delimiter: str, header_row: int) -> tuple[list[str], I
     Raises `LoadFailure(HEADER_PAST_END)` when the text has no record at that
     index.
     """
-    records = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+    lines = io.StringIO(source, newline="") if isinstance(source, str) else source
+    records = csv.reader(lines, delimiter=delimiter)
     for index, record in enumerate(records):
         if index == header_row:
             return record, (row for row in records if not _is_blank(row))
@@ -347,30 +450,62 @@ def _shape(record: list[str], width: int) -> list[str]:
     return record + [""] * (width - len(record))
 
 
-@dataclass(frozen=True)
-class ParsedFile:
-    """A file that was read once, to check and count it, and is read again,
-    lazily, to load it. It holds the text and never the rows, so even a file
-    at the row cap is not in memory as rows; and `rows()` is the only
-    producer of rows, so what was counted is what is loaded."""
+@dataclass
+class TableStream:
+    """A file read once, from its first data row to its last, handed on in
+    Arrow record batches. It holds the columns and the row in hand, never the
+    rows: `batches()` is the only producer of rows and counts them as they pass.
 
-    text: str
-    delimiter: str
-    header_row: int
+    `failure` is set when the stream itself ends the load (the row cap, or the
+    store failing mid-read) so that `_write` can tell that from a failure of
+    dlt, whose exception wraps whatever the generator raised.
+    """
+
     columns: list[str]
-    row_count: int
+    first: list[str]
+    records: Iterator[list[str]]
+    row_count: int = 0
+    failure: LoadFailure | None = field(default=None, repr=False)
 
-    def rows(self) -> Iterator[dict[str, str]]:
-        """The data rows, one dict per row, every value the text it is. A fresh
-        pass over the text on each call."""
-        _, records = read_table(self.text, self.delimiter, self.header_row)
+    def _table(self, cells: list[list[str]]) -> pa.Table:
+        return pa.table({name: pa.array(values, type=pa.string()) for name, values in zip(self.columns, cells)})
+
+    def batches(self) -> Iterator[pa.Table]:
+        """The data rows as Arrow tables of at most `BATCH_ROWS` rows, every
+        column `string` and every value the text it is.
+
+        # Errors
+
+        Raises `LoadFailure(TOO_MANY_ROWS)` (also kept in `failure`) at the row
+        after `MAX_ROWS`, before it is added to a batch: a file over the cap is
+        a failure and never a truncation. Raises `LoadFailure(UNREADABLE)` when
+        the store fails while the file is read.
+        """
         width = len(self.columns)
-        for record in records:
-            yield dict(zip(self.columns, _shape(record, width)))
+        cells: list[list[str]] = [[] for _ in range(width)]
+        try:
+            for record in itertools.chain([self.first], self.records):
+                self.row_count += 1
+                if self.row_count > MAX_ROWS:
+                    self.failure = LoadFailure(TOO_MANY_ROWS)
+                    raise self.failure
+                for column, value in zip(cells, _shape(record, width)):
+                    column.append(value)
+                if len(cells[0]) >= BATCH_ROWS:
+                    yield self._table(cells)
+                    cells = [[] for _ in range(width)]
+        except LoadFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the store or the decoder failed mid-read; the detail is the cause
+            self.failure = LoadFailure(UNREADABLE)
+            self.failure.__cause__ = exc
+            raise self.failure from exc
+        if cells[0]:
+            yield self._table(cells)
 
 
-def parse_file(text: str, delimiter: str, header_row: int) -> ParsedFile:
-    """Check a decoded file and count its rows, writing nothing.
+def open_table(source: str | Iterable[str], delimiter: str, header_row: int) -> TableStream:
+    """Read a file as far as its first data row, writing nothing.
 
     # Errors
 
@@ -378,11 +513,11 @@ def parse_file(text: str, delimiter: str, header_row: int) -> ParsedFile:
     `HEADER_NO_COLUMNS` (a record there, with no cells at all: an empty line;
     the preview reports it and the case above alike as an empty `columns`, and
     the two have a sentence each since review finding C2), `NO_ROWS` (nothing
-    below the header that is not blank) or `TOO_MANY_ROWS` (more than
-    `MAX_ROWS`, found while counting, so nothing was cut) or `TOO_MANY_COLUMNS`
-    (a header of more than `MAX_COLUMNS` cells, found before any row is read).
+    below the header that is not blank) or `TOO_MANY_COLUMNS` (a header of more
+    than `MAX_COLUMNS` cells, found before any row is read). The row cap is
+    found later, by `TableStream.batches`.
     """
-    header, records = read_table(text, delimiter, header_row)
+    header, records = read_table(source, delimiter, header_row)
     if not header:
         raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("the header record has no cells")
     # `SEC-17`: before the first row is read, so a file that cannot load costs
@@ -391,16 +526,10 @@ def parse_file(text: str, delimiter: str, header_row: int) -> ParsedFile:
         raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(
             f"the header record has {len(header)} cells, more than {MAX_COLUMNS}"
         )
-    count = 0
-    for _ in records:
-        count += 1
-        if count > MAX_ROWS:
-            raise LoadFailure(TOO_MANY_ROWS)
-    if count == 0:
+    first = next(records, None)
+    if first is None:
         raise LoadFailure(NO_ROWS)
-    return ParsedFile(
-        text=text, delimiter=delimiter, header_row=header_row, columns=_column_names(header), row_count=count
-    )
+    return TableStream(columns=_column_names(header), first=first, records=records)
 
 
 def _checked_key(storage_key: str) -> str:
@@ -417,19 +546,28 @@ def _checked_key(storage_key: str) -> str:
     return storage_key
 
 
-def read_stored_object(
+def open_stored_object(
     config: SinkConfig, key: str, *, filesystem_factory: Callable[..., Any] | None = None
-) -> bytes:
-    """The object's bytes, read from the warehouse bucket with the sink's own
-    credentials. `key` has passed `_checked_key`. The API caps a file at
-    50 MiB, so reading it whole is bounded; this does not cap it again."""
+) -> BinaryIO:
+    """The object, opened for streaming from the warehouse bucket with the
+    sink's own credentials. `key` has passed `_checked_key`. Nothing is read
+    here: the caller reads it in `READ_BLOCK` blocks and closes it."""
     make_fs = filesystem_factory or s3fs.S3FileSystem
     fs = make_fs(
         key=config.rustfs_access_key,
         secret=config.rustfs_secret_key,
         client_kwargs={"endpoint_url": config.rustfs_endpoint},
     )
-    return fs.cat_file(f"{config.warehouse_bucket}/{key}")
+    return fs.open(f"{config.warehouse_bucket}/{key}", "rb", block_size=READ_BLOCK)
+
+
+def _blocks(handle: BinaryIO) -> Iterator[bytes]:
+    """The object in blocks of `READ_BLOCK` bytes, until it ends."""
+    while True:
+        block = handle.read(READ_BLOCK)
+        if not block:
+            return
+        yield block
 
 
 @contextmanager
@@ -447,9 +585,9 @@ def _unbounded_csv_fields() -> Iterator[None]:
 # ── Writing it ───────────────────────────────────────────────────────────
 
 
-def _text_resource(parsed: ParsedFile, table: str) -> DltResource:
-    """The rows as a dlt resource with every column declared `text`, for
-    `load_via_sink` (which takes an already configured resource).
+def _text_resource(stream: TableStream, table: str) -> DltResource:
+    """The record batches as a dlt resource with every column declared `text`,
+    for `load_via_sink` (which takes an already configured resource).
 
     Plain rows would let dlt type what it recognises. Measured with dlt 1.30.0
     on 2026-10-02 through `load_via_sink` against a local filesystem bucket
@@ -457,10 +595,13 @@ def _text_resource(parsed: ParsedFile, table: str) -> DltResource:
     back `timestamptz`, and when other values of that column were not
     timestamps dlt put them in a new `<column>__v_text` column and left NULLs
     behind. With `data_type: text` declared, every value came back exactly as
-    written. `ops/g9/upload_test.py` checks the types on a deployed stack.
+    written. The batches are Arrow tables whose columns are `string`, which
+    carries the same declaration; the hint stays so the intent is written where
+    the reader looks. `ops/g9/upload_test.py` checks the types on a deployed
+    stack.
     """
-    resource = dlt.resource(parsed.rows(), name=table)
-    resource.apply_hints(columns=[{"name": name, "data_type": "text"} for name in parsed.columns])
+    resource = dlt.resource(stream.batches(), name=table)
+    resource.apply_hints(columns=[{"name": name, "data_type": "text"} for name in stream.columns])
     return resource
 
 
@@ -509,6 +650,10 @@ def _check_settings(params: FileIngestParams) -> None:
         problems.append(f"delimiter {params.delimiter!r} is not one of {DELIMITERS!r}")
     if params.header_row < 0:
         problems.append(f"header_row {params.header_row} is negative")
+    if params.format not in FORMATS:
+        problems.append(f"format {params.format!r} is not one of {', '.join(FORMATS)}")
+    if len(params.storage_keys) != 1:
+        problems.append(f"storage_keys holds {len(params.storage_keys)} keys; this version loads exactly one file")
     table = params.bronze_table_name
     # Review finding C1: the upload rule first, the same one the API refuses
     # with; dlt is asked only about a name that passed it. The SQL that
@@ -540,34 +685,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _read_and_parse(
-    params: FileIngestParams,
-    sink_config: SinkConfig,
-    key: str,
-    read_object: Callable[[SinkConfig, str], bytes],
-) -> ParsedFile:
-    try:
-        raw = read_object(sink_config, key)
-        text = _decode(raw, params.encoding)
-        del raw  # the second pass needs the text, not the bytes
-        return parse_file(text, params.delimiter, params.header_row)
-    except LoadFailure:
-        raise
-    except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause
-        raise LoadFailure(UNREADABLE) from exc
-
-
 def _write(
-    parsed: ParsedFile,
+    stream: TableStream,
     params: FileIngestParams,
     sink_config: SinkConfig,
     load: Callable[..., SinkResult],
 ) -> SinkResult:
     table = params.bronze_table_name
     try:
-        result = load(_text_resource(parsed, table), table, sink_config, LoadPlan(mode=params.load_mode))
+        result = load(_text_resource(stream, table), table, sink_config, LoadPlan(mode=params.load_mode))
     except Exception as exc:  # noqa: BLE001 -- whatever dlt or the catalog raised is the cause, never the reason
+        # dlt wraps what the generator raised: the stream knows if it was the
+        # row cap or the store, and that is the reason, not "the load failed".
+        if stream.failure is not None:
+            raise stream.failure  # its own cause (the store's error) is kept
         raise LoadFailure(LOAD_FAILED) from exc
+    if stream.failure is not None:
+        raise stream.failure
     if result.has_failed_jobs:
         # `load_info_str` can carry a file path: it goes to the cause, which is
         # the run log, and never into the recorded reason.
@@ -596,30 +730,42 @@ def _load(
     params: FileIngestParams,
     log: Any,
     load_config: Callable[[], SinkConfig],
-    read_object: Callable[[SinkConfig, str], bytes],
+    open_object: Callable[[SinkConfig, str], BinaryIO],
     load: Callable[..., SinkResult],
     register: Callable[..., int],
 ) -> LoadSummary:
     _check_settings(params)
-    key = _checked_key(params.storage_key)
+    key = _checked_key(params.storage_keys[0])
     try:
         sink_config = load_config()
     except Exception as exc:  # noqa: BLE001 -- e.g. an unreadable token file; nothing was read or written
         raise LoadFailure(LOAD_FAILED) from exc
     with _unbounded_csv_fields():
-        parsed = _read_and_parse(params, sink_config, key, read_object)
-        log.info(f"upload {params.upload_id}: {parsed.row_count} rows x {len(parsed.columns)} columns to load")
-        result = _write(parsed, params, sink_config, load)
-    if result.rows is not None and result.rows != parsed.row_count:
+        try:
+            handle = open_object(sink_config, key)
+        except Exception as exc:  # noqa: BLE001 -- no such object, or no way to reach the store
+            raise LoadFailure(UNREADABLE) from exc
+        with handle:
+            try:
+                lines = _lines(_text_chunks(_blocks(handle), params.encoding))
+                stream = open_table(lines, params.delimiter, params.header_row)
+            except LoadFailure:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause
+                raise LoadFailure(UNREADABLE) from exc
+            log.info(f"upload {params.upload_id}: {len(stream.columns)} columns to load, streaming")
+            result = _write(stream, params, sink_config, load)
+    log.info(f"upload {params.upload_id}: {stream.row_count} rows read")
+    if result.rows is not None and result.rows != stream.row_count:
         log.warning(
-            f"upload {params.upload_id}: the file held {parsed.row_count} rows and the sink measured {result.rows}"
+            f"upload {params.upload_id}: the file held {stream.row_count} rows and the sink measured {result.rows}"
         )
     total = _register(params, result, register)
     return LoadSummary(
         table=params.bronze_table_name,
         rows=result.rows,
-        parsed_rows=parsed.row_count,
-        columns=len(parsed.columns),
+        parsed_rows=stream.row_count,
+        columns=len(stream.columns),
         table_total=total,
     )
 
@@ -629,7 +775,7 @@ def run_file_load(
     *,
     log: Any,
     load_config: Callable[[], SinkConfig] = _sink_config_from_env,
-    read_object: Callable[[SinkConfig, str], bytes] = read_stored_object,
+    open_object: Callable[[SinkConfig, str], BinaryIO] = open_stored_object,
     load: Callable[..., SinkResult] = load_via_sink,
     register: Callable[..., int] = register_loaded_table,
     record: Callable[..., None] = record_ingest_run,
@@ -638,7 +784,7 @@ def run_file_load(
     """Load one uploaded file and record exactly one `ingest_run` row for it.
 
     Everything that touches a network is a parameter, so a test drives this
-    with fakes. The row is written once, after the outcome is known, and is
+    with fakes. `open_object` returns the stored object as a binary file. The row is written once, after the outcome is known, and is
     never retried: a second attempt after a failed insert could leave two
     rows for one run.
 
@@ -651,7 +797,7 @@ def run_file_load(
     failure: LoadFailure | None = None
     summary: LoadSummary | None = None
     try:
-        summary = _load(params, log, load_config, read_object, load, register)
+        summary = _load(params, log, load_config, open_object, load, register)
     except LoadFailure as caught:
         failure = caught
     except Exception as exc:  # noqa: BLE001 -- a bug in this module; the run still gets its one row
@@ -704,8 +850,8 @@ def _failure_description(exc: Exception) -> str:
     ),
 )
 def ingest_uploaded_file(context) -> dict:
-    """Read the uploaded object, check and count it, write the Bronze table,
-    register it, and record the outcome. See the module docstring."""
+    """Stream the uploaded object into the Bronze table, register it, and
+    record the outcome. See the module docstring."""
     try:
         summary = run_file_load(FileIngestParams.from_op_config(context.op_config), log=context.log)
     except Exception as exc:  # noqa: BLE001 -- every failure leaves as one non-retryable Failure (module docstring)

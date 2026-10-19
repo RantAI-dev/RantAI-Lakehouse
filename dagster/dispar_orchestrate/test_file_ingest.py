@@ -21,17 +21,24 @@ import csv
 import dataclasses
 import inspect
 import itertools
+import glob
+import io
 import json
+import os
 import random
+import re
+import tracemalloc
+import types
 from pathlib import Path
 
 import dlt
+import pyarrow as pa
 import pytest
 from dagster import DagsterInvalidConfigError
 
 from dispar_orchestrate import file_ingest
 from dispar_orchestrate.adapters import sink as sink_module
-from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult
+from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult, _stamp_ingested_at
 from dispar_orchestrate.definitions import defs
 from dispar_orchestrate.file_ingest import (
     CONFIG_SCHEMA,
@@ -50,11 +57,13 @@ from dispar_orchestrate.file_ingest import (
     OutcomeNotRecorded,
     _checked_key,
     _column_names,
-    _decode,
+    _blocks,
     _dlt_keeps_table_name,
+    _lines,
+    _text_chunks,
     file_ingest_job,
-    parse_file,
-    read_stored_object,
+    open_stored_object,
+    open_table,
     read_table,
     run_file_load,
 )
@@ -97,7 +106,8 @@ FIXTURE_IDS = [name for name, _, _ in FIXTURE_CASES]
 def _params(**overrides) -> FileIngestParams:
     base = FileIngestParams(
         upload_id="u-1",
-        storage_key=KEY,
+        storage_keys=(KEY,),
+        format="delimited",
         bronze_table_name="g9_orders",
         load_mode="replace",
         encoding="utf-8",
@@ -105,6 +115,28 @@ def _params(**overrides) -> FileIngestParams:
         header_row=0,
     )
     return dataclasses.replace(base, **overrides)
+
+
+def _chunked(raw: bytes, size: int | None) -> list[bytes]:
+    """`raw` in blocks of `size` bytes (the whole of it when `size` is None)."""
+    if size is None:
+        return [raw]
+    return [raw[i : i + size] for i in range(0, len(raw), size)] or [b""]
+
+
+def _decode(raw: bytes, encoding: str, block: int | None = None) -> str:
+    """The text the job's decoder makes of `raw`, read `block` bytes at a time."""
+    return "".join(_text_chunks(_chunked(raw, block), encoding))
+
+
+def parse_file(text: str, delimiter: str, header_row: int):
+    """Open the table and drain it, as a load does: the columns, the number of
+    rows and the rows as dicts. Raises what `open_table` or the batches raise."""
+    stream = open_table(text, delimiter, header_row)
+    rows = [dict(zip(stream.columns, record)) for batch in stream.batches() for record in zip(*batch.to_pydict().values())]
+    return types.SimpleNamespace(
+        columns=stream.columns, row_count=stream.row_count, rows=lambda: iter(rows), stream=stream
+    )
 
 
 class _Log:
@@ -157,17 +189,22 @@ class _Harness:
             raise self.config_error
         return SINK_CONFIG
 
-    def read(self, config: SinkConfig, key: str) -> bytes:
+    def read(self, config: SinkConfig, key: str):
         self.reads.append(key)
         if self.read_error:
             raise self.read_error
-        return self.raw
+        return io.BytesIO(self.raw)
 
     def load(self, resource, table: str, config: SinkConfig, plan: LoadPlan) -> SinkResult:
         # The rows are consumed here, as dlt would, so a generator that is
         # read after the call returns would show up as an empty list.
         self.loads.append(
-            {"table": table, "plan": plan, "columns": dict(resource.columns), "rows": list(resource)}
+            {
+                "table": table,
+                "plan": plan,
+                "columns": dict(resource.columns),
+                "rows": [row for batch in resource for row in batch.to_pylist()],
+            }
         )
         if self.load_error:
             raise self.load_error
@@ -193,7 +230,7 @@ class _Harness:
             params or _params(),
             log=self.log,
             load_config=self.load_config,
-            read_object=self.read,
+            open_object=self.read,
             load=self.load,
             register=self.register,
             record=self.record,
@@ -288,6 +325,253 @@ def test_a_trailing_odd_byte_of_utf16_is_dropped_as_the_preview_drops_it():
 def test_a_utf8_byte_order_mark_is_dropped_and_a_bad_byte_becomes_a_replacement_character():
     assert _decode(b"\xef\xbb\xbf" + b'"id",x', "utf-8") == '"id",x'
     assert _decode(b"Ren\xe9,x", "utf-8") == "Ren�,x"
+
+
+# ── Streaming (DATA-17 T2.1): blocks, lines, batches ─────────────────────
+
+STREAM_TEXT = 'id,name,note\r\n1,"a\r\nb",x\r\n2,"é, ö",y\r\n3,c,\u2028z\n4,d,\r5,e,f\n'
+
+
+@pytest.mark.parametrize("block", [1, 2, 3, 5, 7, 64])
+def test_utf8_split_across_blocks_decodes_to_the_same_text(block):
+    raw = STREAM_TEXT.encode("utf-8")
+    assert _decode(raw, "utf-8", block) == STREAM_TEXT
+    # A byte order mark in a block of its own, and a bad byte, are still handled.
+    assert _decode(b"\xef\xbb\xbf" + raw, "utf-8", block) == STREAM_TEXT
+    assert _decode(b"Ren\xe9,x", "utf-8", block) == "Ren�,x"
+
+
+@pytest.mark.parametrize("block", [1, 2, 3, 5, 7, 64])
+def test_utf16_split_across_blocks_decodes_to_the_same_text_with_or_without_a_mark(block):
+    text = STREAM_TEXT + "\U0001F600\n"  # a surrogate pair, which a block boundary can split
+    assert _decode(b"\xff\xfe" + text.encode("utf-16-le"), "utf-16", block) == text
+    assert _decode(b"\xfe\xff" + text.encode("utf-16-be"), "utf-16", block) == text
+    assert _decode(text.encode("utf-16-le"), "utf-16", block) == text
+    # A trailing odd byte is dropped, whatever the block size.
+    assert _decode(b"\xff\xfe" + "ab".encode("utf-16-le") + b"A", "utf-16", block) == "ab"
+    assert _decode(b"", "utf-16", block) == ""
+    assert _decode(b"\xff", "utf-16", block) == ""
+
+
+@pytest.mark.parametrize("block", [1, 2, 3, 4, 5, 8, 100])
+def test_lines_are_cut_where_stringio_cuts_whatever_the_block_size(block):
+    reference = list(io.StringIO(STREAM_TEXT, newline=""))
+    pieces = [STREAM_TEXT[i : i + block] for i in range(0, len(STREAM_TEXT), block)]
+    assert list(_lines(pieces)) == reference
+    # A carriage return at the end of one block and a line feed at the start of the next are one break.
+    assert list(_lines(["a\r", "\nb\r", "\r", "c"])) == ["a\r\n", "b\r", "\r", "c"]
+    assert list(_lines(["a\r"])) == ["a\r"]
+    assert list(_lines([])) == []
+
+
+@pytest.mark.parametrize("block", [1, 3, 11, 4096])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_every_fixture_streams_to_its_expected_json_in_blocks_of_any_size(block, encoding, ):
+    # The same fixtures the preview reads, through the streaming path, cut into
+    # tiny blocks: what is loaded does not depend on where a block ends.
+    for name, data_path, expected in FIXTURE_CASES:
+        if expected["encoding"] != encoding:
+            continue
+        lines = _lines(_text_chunks(_chunked(data_path.read_bytes(), block), encoding))
+        stream = open_table(lines, expected["delimiter"], expected["headerRow"])
+        got = [list(r) for batch in stream.batches() for r in zip(*batch.to_pydict().values())]
+        assert got == [(row + [""] * len(stream.columns))[: len(stream.columns)] for row in expected["rows"]], name
+
+
+@pytest.mark.parametrize("delimiter", [",", ";", "\t", "|"])
+def test_each_delimiter_streams_through_the_whole_job(delimiter):
+    raw = f"id{delimiter}name\n1{delimiter}a\n2{delimiter}b\n".encode()
+    harness = _Harness(raw=raw)
+    harness.run(_params(delimiter=delimiter))
+    assert harness.loads[0]["rows"] == [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}]
+
+
+def test_a_file_is_read_in_blocks_of_the_read_block_size():
+    sizes: list[int] = []
+
+    class Counting(io.BytesIO):
+        def read(self, size=-1):
+            sizes.append(size)
+            return super().read(size)
+
+    list(_blocks(Counting(b"x" * 10)))
+    assert sizes == [8 * 1024 * 1024, 8 * 1024 * 1024]
+
+
+def test_the_first_row_is_read_before_the_sink_is_asked_for_anything():
+    harness = _Harness(raw=b"a,b\n")  # a header and nothing below it
+    _fails_with(harness, NO_ROWS)
+    assert harness.loads == []
+    assert harness.registered == []
+
+
+def test_the_row_cap_fails_the_run_from_inside_the_load_and_the_reason_is_not_the_loads(monkeypatch):
+    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
+    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 2)
+    harness = _Harness(raw=b"a\n1\n2\n3\n4\n")
+    # The fake load reads the resource as dlt would; the generator raises mid-way and the
+    # fake wraps it as dlt does, so only the stream's own record of it tells the reason.
+    original = harness.load
+
+    def wrapping(resource, table, config, plan):
+        try:
+            return original(resource, table, config, plan)
+        except LoadFailure as exc:
+            raise RuntimeError("PipelineStepFailed") from exc
+
+    harness.load = wrapping
+    failure = _fails_with(harness, TOO_MANY_ROWS)
+    assert failure.rows is None
+    assert harness.registered == []
+    assert [row["error"] for row in harness.recorded] == [TOO_MANY_ROWS]
+
+
+def test_a_store_that_fails_while_the_file_is_read_is_unreadable_and_not_a_failed_load():
+    class Dying(io.BytesIO):
+        calls = 0
+
+        def read(self, size=-1):
+            Dying.calls += 1
+            if Dying.calls > 1:
+                raise OSError("connection reset by peer")
+            return b"a,b\n" + b"1,2\n" * 10
+
+    harness = _Harness()
+    harness.read = lambda config, key: Dying()
+    original = harness.load
+
+    def wrapping(resource, table, config, plan):
+        try:
+            return original(resource, table, config, plan)
+        except LoadFailure as exc:
+            raise RuntimeError("PipelineStepFailed") from exc
+
+    harness.load = wrapping
+    failure = _fails_with(harness, UNREADABLE)
+    assert isinstance(failure.__cause__, OSError)  # the store's own error, for the run log
+
+
+def _local_pipeline_load(directory: str):
+    """A `load` that runs the resource through a real dlt pipeline into a
+    local filesystem destination, stamped as the sink stamps it. Not Iceberg:
+    it proves what dlt does with a generator that raises, which is dlt's."""
+
+    def load(resource, table, config, plan):
+        pipeline = dlt.pipeline(
+            "v4", destination=dlt.destinations.filesystem(bucket_url=directory), dataset_name="ds",
+            pipelines_dir=os.path.join(directory, "_pipelines"),
+        )
+        resource.add_map(_stamp_ingested_at)
+        pipeline.run(resource, table_name=table, write_disposition=plan.mode, loader_file_format="parquet")
+        return SinkResult(rows=None, has_failed_jobs=False, load_info_str="")
+
+    return load
+
+
+def test_a_failure_while_dlt_extracts_leaves_the_destination_untouched_and_the_next_run_starts_clean(
+    tmp_path, monkeypatch
+):
+    # V4 of the plan, measured with dlt 1.30.0: the row cap raises inside the
+    # generator, which is dlt's extract step, before anything is normalized or loaded.
+    directory = str(tmp_path)
+    ok = _Harness(raw=b"a\n1\n2\n")
+    ok.load = _local_pipeline_load(directory)
+    ok.run()
+    before = sorted(glob.glob(os.path.join(directory, "ds", "g9_orders", "*")))
+    assert len(before) == 1
+
+    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
+    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 1)
+    over = _Harness(raw=b"a\n1\n2\n3\n4\n5\n")
+    over.load = _local_pipeline_load(directory)
+    _fails_with(over, TOO_MANY_ROWS)
+    assert sorted(glob.glob(os.path.join(directory, "ds", "g9_orders", "*"))) == before
+
+    monkeypatch.undo()
+    again = _Harness(raw=b"a\n7\n8\n9\n")
+    again.load = _local_pipeline_load(directory)
+    again.run()
+    [after] = glob.glob(os.path.join(directory, "ds", "g9_orders", "*.parquet"))
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(after)
+    assert table.column("a").to_pylist() == ["7", "8", "9"]  # replaced, nothing of the failed run
+    assert table.schema.field("_ingested_at").type.tz == "UTC"
+
+
+class _GeneratedCsv:
+    """A CSV of about `target` bytes, made as it is read: the test never holds it."""
+
+    def __init__(self, target: int) -> None:
+        self.target, self.sent, self.n = target, 0, 0
+        self.pending = b"id,name,city,amount,note,code\n"
+
+    def read(self, size: int) -> bytes:
+        parts, have = [], 0
+        if self.pending:
+            parts.append(self.pending)
+            have, self.pending = len(self.pending), b""
+        while have < size and self.sent + have < self.target:
+            self.n += 1
+            row = (
+                f"{self.n},customer name {self.n},Jakarta Selatan,{self.n * 3}.50,"
+                f"a note that is a bit long to fill the row {self.n},C{self.n:09d}\n"
+            ).encode()
+            parts.append(row)
+            have += len(row)
+        data = b"".join(parts)
+        self.sent += len(data)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _peak_traced_bytes(target_bytes: int) -> tuple[int, int]:
+    """(peak traced memory, rows) of streaming a generated file of this size."""
+    source = _GeneratedCsv(target_bytes)
+    tracemalloc.start()
+    try:
+        stream = open_table(_lines(_text_chunks(_blocks(source), "utf-8")), ",", 0)
+        rows = sum(batch.num_rows for batch in stream.batches())
+        return tracemalloc.get_traced_memory()[1], rows
+    finally:
+        tracemalloc.stop()
+
+
+def test_peak_memory_does_not_grow_with_the_size_of_the_file(monkeypatch):
+    # Smaller blocks and batches than production's, so the steady state is reached
+    # within a file that is quick to read under tracemalloc; the 200 MB test below
+    # runs the production sizes.
+    monkeypatch.setattr(file_ingest, "READ_BLOCK", 1024 * 1024)
+    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 5_000)
+    small, small_rows = _peak_traced_bytes(6 * 1024 * 1024)
+    large, large_rows = _peak_traced_bytes(24 * 1024 * 1024)
+    assert large_rows > 3 * small_rows  # the large file really is about four times the small one
+    assert large < 16 * 1024 * 1024  # a fixed bound, far below the 24 MB file
+    assert large < small * 1.3  # ... that the larger file does not move
+
+
+@pytest.mark.skipif(not os.environ.get("FILE_INGEST_LARGE"), reason="200 MB under tracemalloc takes over a minute; set FILE_INGEST_LARGE=1")
+def test_a_200_mb_generated_file_streams_in_a_fixed_bound():
+    peak, rows = _peak_traced_bytes(200 * 1024 * 1024)
+    assert rows > 1_500_000  # about 200 MB of rows, under the 2,000,000-row cap
+    assert peak < 128 * 1024 * 1024
+
+
+def test_the_sink_stamps_an_arrow_table_and_a_record_batch_and_replaces_a_column_of_the_same_name():
+    table = pa.table({"a": pa.array(["1", "2"], pa.string()), "_ingested_at": pa.array(["old", "old"], pa.string())})
+    stamped = _stamp_ingested_at(table)
+    assert stamped.column_names == ["a", "_ingested_at"]
+    assert stamped.schema.field("_ingested_at").type == pa.timestamp("us", tz="UTC")
+    assert stamped.num_rows == 2 and stamped.column("a").to_pylist() == ["1", "2"]
+    from_batch = _stamp_ingested_at(pa.record_batch({"a": pa.array(["x"], pa.string())}))
+    assert from_batch.column_names == ["a", "_ingested_at"] and from_batch.num_rows == 1
+    # A row (a dict) is stamped as before.
+    assert _stamp_ingested_at({"a": "1"})["_ingested_at"].tzinfo is not None
 
 
 # ── What the load does on top of the dialect ─────────────────────────────
@@ -401,10 +685,17 @@ def test_the_row_cap_is_a_failure_found_while_counting_and_a_file_at_the_cap_pas
     assert caught.value.reason == TOO_MANY_ROWS
 
 
-def test_rows_are_a_lazy_pass_over_the_text_and_not_a_list_held_in_memory():
-    parsed = parse_file("a\n1\n2\n", ",", 0)
-    assert inspect.isgenerator(parsed.rows())
-    assert list(parsed.rows()) == list(parsed.rows())
+def test_rows_leave_as_arrow_batches_of_at_most_the_batch_size_and_not_as_a_list_held_in_memory(monkeypatch):
+    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 2)
+    stream = open_table("a,b\n1,x\n2,y\n3,z\n4,w\n5,v\n", ",", 0)
+    batches = stream.batches()
+    assert inspect.isgenerator(batches)
+    first = next(batches)
+    assert first.num_rows == 2 and first.schema.types == [pa.string(), pa.string()]
+    assert stream.row_count == 2  # counted as they pass, not before
+    rest = list(batches)
+    assert [b.num_rows for b in rest] == [2, 1]
+    assert stream.row_count == 5
 
 
 # ── Column names ─────────────────────────────────────────────────────────
@@ -489,7 +780,7 @@ def test_every_derived_name_survives_dlts_own_naming_unchanged_and_no_two_collid
 )
 def test_a_key_outside_the_uploads_prefix_or_climbing_out_of_it_is_never_read(key):
     harness = _Harness()
-    _fails_with(harness, UNREADABLE, _params(storage_key=key))
+    _fails_with(harness, UNREADABLE, _params(storage_keys=(key,)))
     assert harness.reads == []
     assert harness.loads == []
     assert [row["error"] for row in harness.recorded] == [UNREADABLE]
@@ -500,19 +791,21 @@ def test_a_key_the_api_builds_passes_the_guard():
     assert _checked_key(f"uploads/{TENANT}/u-1") == f"uploads/{TENANT}/u-1"
 
 
-def test_the_object_is_read_from_the_warehouse_bucket_with_the_sinks_credentials():
+def test_the_object_is_opened_for_streaming_from_the_warehouse_bucket_with_the_sinks_credentials():
     seen: dict = {}
 
     class FakeFilesystem:
         def __init__(self, **kwargs) -> None:
             seen["kwargs"] = kwargs
 
-        def cat_file(self, path: str) -> bytes:
-            seen["path"] = path
-            return b"bytes"
+        def open(self, path: str, mode: str, **kwargs):
+            seen.update(path=path, mode=mode, open_kwargs=kwargs)
+            return io.BytesIO(b"bytes")
 
-    assert read_stored_object(SINK_CONFIG, KEY, filesystem_factory=FakeFilesystem) == b"bytes"
+    assert open_stored_object(SINK_CONFIG, KEY, filesystem_factory=FakeFilesystem).read() == b"bytes"
     assert seen["path"] == f"lakehouse-warehouse/{KEY}"
+    assert seen["mode"] == "rb"
+    assert seen["open_kwargs"] == {"block_size": 8 * 1024 * 1024}
     assert seen["kwargs"] == {
         "key": "k",
         "secret": "s",
@@ -895,6 +1188,7 @@ class _FakePipeline:
         self.table_name = None
         self.write_disposition = None
         self.materialized_rows: list[dict] = []
+        self.run_batches: list = []
 
     def sync_destination(self) -> None:
         pass
@@ -903,7 +1197,9 @@ class _FakePipeline:
         self.run_source = source
         self.table_name = table_name
         self.write_disposition = write_disposition
-        self.materialized_rows = list(source)
+        # The job hands over Arrow batches, stamped by the sink: flatten to rows.
+        self.run_batches = list(source)
+        self.materialized_rows = [row for batch in self.run_batches for row in batch.to_pylist()]
         return _FakeLoadInfo()
 
 
@@ -923,7 +1219,7 @@ def test_the_real_sink_replaces_or_appends_text_rows_that_the_job_hands_it(monke
         _params(load_mode=mode),
         log=harness.log,
         load_config=harness.load_config,
-        read_object=harness.read,
+        open_object=harness.read,
         register=harness.register,
         record=harness.record,
         now=harness.now,
@@ -937,6 +1233,7 @@ def test_the_real_sink_replaces_or_appends_text_rows_that_the_job_hands_it(monke
     for row in pipeline.materialized_rows:
         assert set(row) == {"id", "when", "_ingested_at"}  # the sink stamps Bronze's own column
         assert row["_ingested_at"].tzinfo is not None
+    assert all(table.schema.field("_ingested_at").type.tz == "UTC" for table in pipeline.run_batches)
     assert pipeline.materialized_rows[0]["when"] == "2025-02-07T10:00:00Z"
     # The fake pipeline has no trace, so the sink measured nothing: not the 2 the file held.
     assert summary.rows is None and harness.recorded[0]["rows"] is None
@@ -949,7 +1246,8 @@ RUN_CONFIG = {
         "ingest_uploaded_file": {
             "config": {
                 "upload_id": "u-1",
-                "storage_key": KEY,
+                "storage_keys": [KEY],
+                "format": "delimited",
                 "bronze_table_name": "g9_orders",
                 "load_mode": "append",
                 "encoding": "utf-16",
@@ -982,7 +1280,8 @@ def test_the_run_config_the_api_sends_reaches_the_load_as_the_same_settings(monk
     assert seen == [
         FileIngestParams(
             upload_id="u-1",
-            storage_key=KEY,
+            storage_keys=(KEY,),
+            format="delimited",
             bronze_table_name="g9_orders",
             load_mode="append",
             encoding="utf-16",
