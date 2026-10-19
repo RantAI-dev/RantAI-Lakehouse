@@ -1038,7 +1038,8 @@ async fn oauth_routes_need_connector_manage_the_report_needs_ingest_read_and_the
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The six upload routes (ADR 0014, decision 6) are gated by the existing
+/// The upload routes (ADR 0014, decision 6; `DATA-17` added the four of a
+/// chunked upload) are gated by the existing
 /// `connector:manage`, with no new permission: a seeded Data Engineer
 /// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst
 /// (`sari@meridian.example`, no `connector:manage`) always is. The two
@@ -1061,6 +1062,12 @@ async fn a_data_engineer_is_not_refused_and_an_analyst_is_on_every_upload_route(
         ("DELETE", "/api/uploads/x"),
         ("GET", "/api/uploads/x/preview"),
         ("POST", "/api/uploads/x/ingest"),
+        // DATA-17: the chunked upload. `sessions` belongs to no upload; the
+        // other three answer 404 for an upload that does not exist.
+        ("POST", "/api/uploads/sessions"),
+        ("PUT", "/api/uploads/x/parts/1"),
+        ("GET", "/api/uploads/x/parts"),
+        ("POST", "/api/uploads/x/complete"),
     ] {
         let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
         let resp = request_with_cookie(&router, method, path, &engineer).await;

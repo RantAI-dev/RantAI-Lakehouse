@@ -64,6 +64,7 @@ pub mod upload_limits;
 pub mod upload_parquet;
 pub mod upload_parse;
 pub mod upload_store;
+pub mod upload_sweep;
 pub mod upload_workbook;
 pub mod upstream_error;
 pub mod webhook_guard;

@@ -112,9 +112,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 const OBJECT_PATH: &str = r"^/lakehouse-warehouse/uploads/.+";
 
-/// What the fake bucket holds, by object key.
+/// The multipart uploads a fake bucket has open: S3's `uploadId` to the key
+/// and the pieces received so far, by part number (`DATA-17`).
+type OpenMultipart = (String, std::collections::BTreeMap<u32, Vec<u8>>);
+
 #[derive(Clone, Default)]
-struct Bucket(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+struct Multiparts(Arc<Mutex<HashMap<String, OpenMultipart>>>);
+
+/// What the fake bucket holds, by object key, and the multipart uploads it has
+/// open.
+#[derive(Clone, Default)]
+struct Bucket(Arc<Mutex<HashMap<String, Vec<u8>>>>, Multiparts);
 
 impl Bucket {
     fn keys(&self) -> Vec<String> {
@@ -125,6 +133,21 @@ impl Bucket {
 
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.0.lock().unwrap().get(key).cloned()
+    }
+
+    /// The keys of the multipart uploads that are open (created, neither
+    /// completed nor aborted).
+    fn open_multiparts(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .1
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys
     }
 
     fn put(&self, key: &str, bytes: &[u8]) {
@@ -218,7 +241,156 @@ impl Respond for BulkDelete {
     }
 }
 
+/// S3's multipart calls on an object key, as `object_store` sends them:
+/// `POST ?uploads` creates, `PUT ?partNumber&uploadId` stores a piece (the
+/// `ETag` is a hash of its bytes, so a piece sent again with other bytes gets
+/// another one), `POST ?uploadId` assembles the pieces the body lists, and
+/// `DELETE ?uploadId` aborts. Like the real store, completion refuses a piece
+/// whose `ETag` is not the one it holds, and a piece never sent.
+struct CreateMultipart(Bucket);
+impl Respond for CreateMultipart {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let key = key_of(request);
+        let mut open = self.0.1.0.lock().unwrap();
+        let upload_id = format!(
+            "mp-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        open.insert(
+            upload_id.clone(),
+            (key.clone(), std::collections::BTreeMap::new()),
+        );
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>lakehouse-warehouse</Bucket><Key>{key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"#
+        ))
+    }
+}
+
+/// A matcher for a request that carries the query parameter `name`, whatever
+/// its value (`wiremock` has `query_param` for a value and no "exists").
+fn has_query(name: &'static str) -> impl Fn(&MockRequest) -> bool + Send + Sync + 'static {
+    move |request: &MockRequest| request.url.query_pairs().any(|(key, _)| key == name)
+}
+
+fn query_of(request: &MockRequest, name: &str) -> Option<String> {
+    request
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.into_owned())
+}
+
+struct PutPart(Bucket);
+impl Respond for PutPart {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let (Some(id), Some(number)) = (
+            query_of(request, "uploadId"),
+            query_of(request, "partNumber").and_then(|n| n.parse::<u32>().ok()),
+        ) else {
+            return ResponseTemplate::new(400);
+        };
+        let mut open = self.0.1.0.lock().unwrap();
+        let Some((_, parts)) = open.get_mut(&id) else {
+            return ResponseTemplate::new(404)
+                .set_body_string("<Error><Code>NoSuchUpload</Code></Error>");
+        };
+        parts.insert(number, request.body.clone());
+        ResponseTemplate::new(200)
+            .insert_header("ETag", format!("\"{}\"", &sha256_hex(&request.body)[..32]))
+    }
+}
+
+struct CompleteMultipart(Bucket);
+impl Respond for CompleteMultipart {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let Some(id) = query_of(request, "uploadId") else {
+            return ResponseTemplate::new(400);
+        };
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        let mut listed = Vec::new();
+        for part in body.split("<Part>").skip(1) {
+            let number = part
+                .split("<PartNumber>")
+                .nth(1)
+                .and_then(|s| s.split("</PartNumber>").next())
+                .and_then(|s| s.parse::<u32>().ok());
+            let etag = part
+                .split("<ETag>")
+                .nth(1)
+                .and_then(|s| s.split("</ETag>").next())
+                .map(|s| s.replace("&quot;", "\"").trim_matches('"').to_owned());
+            if let (Some(number), Some(etag)) = (number, etag) {
+                listed.push((number, etag));
+            }
+        }
+        let mut open = self.0.1.0.lock().unwrap();
+        let Some((key, parts)) = open.get(&id).cloned() else {
+            return ResponseTemplate::new(404)
+                .set_body_string("<Error><Code>NoSuchUpload</Code></Error>");
+        };
+        let mut object = Vec::new();
+        for (number, etag) in &listed {
+            match parts.get(number) {
+                Some(bytes) if &sha256_hex(bytes)[..32] == etag => object.extend_from_slice(bytes),
+                _ => {
+                    return ResponseTemplate::new(400)
+                        .set_body_string("<Error><Code>InvalidPart</Code></Error>");
+                }
+            }
+        }
+        open.remove(&id);
+        self.0.put(&key, &object);
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>x</Location><Bucket>lakehouse-warehouse</Bucket><Key>{key}</Key><ETag>"done"</ETag></CompleteMultipartUploadResult>"#
+        ))
+    }
+}
+
+struct AbortMultipart(Bucket);
+impl Respond for AbortMultipart {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        let removed =
+            query_of(request, "uploadId").and_then(|id| self.0.1.0.lock().unwrap().remove(&id));
+        match removed {
+            Some(_) => ResponseTemplate::new(204),
+            None => ResponseTemplate::new(404)
+                .set_body_string("<Error><Code>NoSuchUpload</Code></Error>"),
+        }
+    }
+}
+
 async fn mount_bucket(server: &MockServer, bucket: &Bucket) {
+    // Priority 2 beats the whole-object mocks below (default 5) for a request
+    // that carries the multipart query.
+    Mock::given(method("POST"))
+        .and(path_regex(OBJECT_PATH))
+        .and(has_query("uploads"))
+        .respond_with(CreateMultipart(bucket.clone()))
+        .with_priority(2)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(OBJECT_PATH))
+        .and(has_query("uploadId"))
+        .respond_with(PutPart(bucket.clone()))
+        .with_priority(2)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(OBJECT_PATH))
+        .and(has_query("uploadId"))
+        .respond_with(CompleteMultipart(bucket.clone()))
+        .with_priority(2)
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path_regex(OBJECT_PATH))
+        .and(has_query("uploadId"))
+        .respond_with(AbortMultipart(bucket.clone()))
+        .with_priority(2)
+        .mount(server)
+        .await;
     Mock::given(method("PUT"))
         .and(path_regex(OBJECT_PATH))
         .respond_with(PutObject(bucket.clone()))
@@ -4542,4 +4714,742 @@ async fn deleting_a_parquet_upload_removes_the_original_and_the_converted_text()
 
     assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.text);
     assert!(stack.bucket.keys().is_empty(), "{:?}", stack.bucket.keys());
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Chunked, resumable uploads (DATA-17 T1.3)
+// ════════════════════════════════════════════════════════════════════════
+
+const MIB: usize = 1024 * 1024;
+const STILL_RECEIVING: &str = "This upload is still being received, so it cannot be used yet.";
+const NOT_RECEIVING: &str = "This upload is not receiving pieces.";
+const EMPTY_FILE: &str = "The file is empty.";
+const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
+const OTHER_BINARY: &str = "This is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.";
+
+/// A piece that takes 1.5 s to store, so requests sent together overlap.
+struct SlowPart(Bucket);
+impl Respond for SlowPart {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        PutPart(self.0.clone())
+            .respond(request)
+            .set_delay(Duration::from_millis(1_500))
+    }
+}
+
+impl Stack {
+    async fn open_session(&self, who: &Caller, name: &str, size: usize) -> Reply {
+        self.send(
+            who,
+            "POST",
+            "/api/uploads/sessions",
+            Payload::Json(json!({ "filename": name, "sizeBytes": size })),
+        )
+        .await
+    }
+
+    /// Open a session; the answer must be 201. Returns the upload's id.
+    async fn session(&self, who: &Caller, name: &str, size: usize) -> String {
+        let reply = self.open_session(who, name, size).await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text);
+        reply.json["upload"]["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn put_part(&self, who: &Caller, id: &str, number: &str, bytes: &[u8]) -> Reply {
+        self.send(
+            who,
+            "PUT",
+            &format!("/api/uploads/{id}/parts/{number}"),
+            Payload::Raw("application/octet-stream", bytes.to_vec()),
+        )
+        .await
+    }
+
+    async fn complete(&self, who: &Caller, id: &str) -> Reply {
+        self.send(
+            who,
+            "POST",
+            &format!("/api/uploads/{id}/complete"),
+            Payload::None,
+        )
+        .await
+    }
+
+    /// Open a session for `bytes`, send every piece in order and complete it;
+    /// the answer must be 200. Returns the completed upload's JSON.
+    async fn upload_in_pieces(&self, who: &Caller, name: &str, bytes: &[u8]) -> Value {
+        let id = self.session(who, name, bytes.len()).await;
+        for (index, piece) in bytes.chunks(8 * MIB).enumerate() {
+            let sent = self
+                .put_part(who, &id, &(index + 1).to_string(), piece)
+                .await;
+            assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+        }
+        let done = self.complete(who, &id).await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+        done.json
+    }
+
+    async fn received(&self, who: &Caller, id: &str) -> Value {
+        let reply = self.get(who, &format!("/api/uploads/{id}/parts")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+        reply.json["received"].clone()
+    }
+
+    /// The store the sweep runs against: the same fake bucket.
+    async fn upload_store(&self) -> lakehouse_api::upload_store::UploadStore {
+        let config = lakehouse_api::config::Config::from_map(&HashMap::from([
+            ("RUSTFS_S3_ENDPOINT".to_owned(), self.s3.uri()),
+            (
+                "RUSTFS_ACCESS_KEY_SECRET_REF".to_owned(),
+                "env:CARGO_PKG_NAME".to_owned(),
+            ),
+            (
+                "RUSTFS_SECRET_KEY_SECRET_REF".to_owned(),
+                "env:CARGO_PKG_VERSION".to_owned(),
+            ),
+        ]))
+        .unwrap();
+        lakehouse_api::upload_store::UploadStore::connect(&config)
+            .await
+            .unwrap()
+    }
+
+    async fn row_count(&self, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.app.pool)
+            .await
+            .unwrap()
+    }
+}
+
+/// A file of three pieces (8 MiB, 8 MiB, the rest) sent out of order arrives
+/// whole, and the answer has the shape of `POST /api/uploads`: the upload,
+/// `uploaded`, with none of the server-only fields.
+#[tokio::test]
+async fn a_file_sent_in_pieces_out_of_order_is_assembled_and_answered_like_a_whole_upload() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = csv_of_size(17 * MIB);
+
+    let opened = stack
+        .open_session(&bayu, "big stock.csv", bytes.len())
+        .await;
+    assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.text);
+    assert_eq!(opened.json["partSize"], 8 * MIB);
+    assert_eq!(opened.json["partCount"], 3);
+    let upload = &opened.json["upload"];
+    let id = id_of(upload);
+    assert_eq!(upload["status"], "receiving");
+    assert_eq!(upload["declaredSize"], bytes.len());
+    assert_eq!(upload["originalFilename"], "big stock.csv");
+    for hidden in [
+        "storageKey",
+        "multipartId",
+        "partsDigest",
+        "sha256",
+        "tenantId",
+    ] {
+        assert!(upload.get(hidden).is_none(), "{hidden} leaked: {upload}");
+    }
+    assert_eq!(stack.bucket.open_multiparts().len(), 1);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "nothing is stored before completion"
+    );
+
+    for number in [3_usize, 1, 2] {
+        let piece = &bytes[(number - 1) * 8 * MIB..(number * 8 * MIB).min(bytes.len())];
+        let sent = stack.put_part(&bayu, &id, &number.to_string(), piece).await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+        assert_eq!(sent.json["partNumber"], number);
+        assert_eq!(sent.json["sizeBytes"], piece.len());
+    }
+    assert_eq!(stack.received(&bayu, &id).await, json!([1, 2, 3]));
+
+    let done = stack.complete(&bayu, &id).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+    assert_eq!(done.json["id"], id.as_str());
+    assert_eq!(done.json["status"], "uploaded");
+    assert_eq!(done.json["sizeBytes"], bytes.len());
+    for hidden in [
+        "storageKey",
+        "multipartId",
+        "partsDigest",
+        "sha256",
+        "tenantId",
+    ] {
+        assert!(
+            done.json.get(hidden).is_none(),
+            "{hidden} leaked: {}",
+            done.json
+        );
+    }
+    assert!(done.json.get("duplicateOf").is_none());
+
+    let keys = stack.bucket.keys();
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    assert!(
+        keys[0].starts_with("uploads/")
+            && std::path::Path::new(&keys[0])
+                .extension()
+                .is_some_and(|e| e == "csv"),
+        "{keys:?}"
+    );
+    assert!(
+        stack.bucket.get(&keys[0]).unwrap() == bytes,
+        "the object is the file, byte for byte"
+    );
+    assert!(stack.bucket.open_multiparts().is_empty());
+    let (digest, multipart, sha, pieces): (Option<Vec<u8>>, Option<String>, String, i64) =
+        sqlx::query_as(
+            "SELECT parts_digest, multipart_id, sha256, \
+             (SELECT count(*) FROM file_upload_part WHERE upload_id = $1) \
+             FROM file_upload WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&stack.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(digest.map(|d| d.len()), Some(32));
+    assert_eq!(multipart, None);
+    assert_eq!(
+        sha, "",
+        "no hash of the whole bytes exists and none is made up"
+    );
+    assert_eq!(pieces, 0, "the piece records are gone");
+
+    // A completed upload is an ordinary one: it previews.
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    let audit = stack.audit_actions().await;
+    assert!(
+        audit
+            .iter()
+            .any(|(action, _, resource, args)| action == "upload.create"
+                && resource.as_deref() == Some(id.as_str())
+                && args["chunked"] == true),
+        "{audit:?}"
+    );
+}
+
+/// A piece sent again replaces the earlier copy: the object holds the last.
+#[tokio::test]
+async fn a_piece_sent_again_replaces_the_earlier_copy() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let right = b"id,name\n1,right\n".to_vec();
+    let wrong = b"id,name\n1,wrong\n".to_vec();
+    assert_eq!(right.len(), wrong.len());
+
+    let id = stack.session(&bayu, "again.csv", right.len()).await;
+    for bytes in [&wrong, &right] {
+        let sent = stack.put_part(&bayu, &id, "1", bytes).await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+    }
+    assert_eq!(
+        stack.received(&bayu, &id).await,
+        json!([1]),
+        "one record, not two"
+    );
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT sha256 FROM file_upload_part WHERE upload_id = $1")
+            .bind(&id)
+            .fetch_all(&stack.app.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, [(sha256_hex(&right),)]);
+    let done = stack.complete(&bayu, &id).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+    let keys = stack.bucket.keys();
+    assert_eq!(stack.bucket.get(&keys[0]).unwrap(), right);
+}
+
+/// Completing with a piece missing is a 409 that names the numbers; the
+/// upload stays open, and sending the rest lets it complete.
+#[tokio::test]
+async fn completing_with_a_piece_missing_is_409_listing_it_and_the_upload_stays_open() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = csv_of_size(17 * MIB);
+    let id = stack.session(&bayu, "gap.csv", bytes.len()).await;
+    for number in [1_usize, 3] {
+        let piece = &bytes[(number - 1) * 8 * MIB..(number * 8 * MIB).min(bytes.len())];
+        stack.put_part(&bayu, &id, &number.to_string(), piece).await;
+    }
+
+    let refused = stack.complete(&bayu, &id).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.text);
+    assert_eq!(refused.json["error"], "Some pieces have not arrived: 2.");
+    assert_eq!(stack.status_of(&id).await.0, "receiving");
+    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.bucket.open_multiparts().len(), 1);
+
+    let sent = stack
+        .put_part(&bayu, &id, "2", &bytes[8 * MIB..16 * MIB])
+        .await;
+    assert_eq!(sent.status, StatusCode::OK, "{}", sent.text);
+    let done = stack.complete(&bayu, &id).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+    // And it completes once: the upload is no longer receiving.
+    let again = stack.complete(&bayu, &id).await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+    assert_eq!(again.json["error"], NOT_RECEIVING);
+    let late = stack.put_part(&bayu, &id, "1", &bytes[..8 * MIB]).await;
+    assert_eq!(late.status, StatusCode::CONFLICT);
+    assert_eq!(late.json["error"], NOT_RECEIVING);
+}
+
+/// A piece of the wrong size, or with a number outside the upload, or a body
+/// past the route's limit, is a 400 with a fixed sentence and records nothing.
+#[tokio::test]
+async fn a_piece_of_the_wrong_size_or_number_is_refused_and_records_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = stack.session(&bayu, "sizes.csv", 17 * MIB).await;
+
+    let size_rule = format!(
+        "Every piece must be exactly {} bytes, except the last, which holds the rest of the file.",
+        8 * MIB
+    );
+    for (number, len) in [("1", MIB), ("2", 8 * MIB + 1), ("3", 2 * MIB), ("3", 0)] {
+        let reply = stack.put_part(&bayu, &id, number, &vec![b'a'; len]).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{number}/{len}: {}",
+            reply.text
+        );
+        assert_eq!(reply.json["error"], size_rule.as_str(), "{number}/{len}");
+    }
+    for number in ["0", "4", "-1", "abc", "1.5", "99999999999999999999"] {
+        let reply = stack
+            .put_part(&bayu, &id, number, &vec![b'a'; 8 * MIB])
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{number}: {}",
+            reply.text
+        );
+        assert_eq!(
+            reply.json["error"], "That piece number is outside this upload.",
+            "{number}"
+        );
+    }
+    // Past the route's own limit (a piece plus 64 KiB): refused unread.
+    let reply = stack
+        .put_part(&bayu, &id, "1", &vec![b'a'; 8 * MIB + 128 * 1024])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], "The piece could not be read.");
+
+    assert_eq!(stack.received(&bayu, &id).await, json!([]));
+    let stored_parts = stack
+        .bucket
+        .1
+        .0
+        .lock()
+        .unwrap()
+        .values()
+        .map(|(_, parts)| parts.len())
+        .sum::<usize>();
+    assert_eq!(stored_parts, 0, "no refused piece reached the bucket");
+}
+
+/// A session is refused for no bytes, for more than the cap, and for a body
+/// that is not `{filename, sizeBytes}`; nothing is opened in the bucket or
+/// recorded. Exactly the cap is accepted.
+#[tokio::test]
+async fn a_session_over_the_cap_or_with_no_bytes_or_a_bad_body_is_refused_and_opens_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+
+    let empty = stack.open_session(&bayu, "a.csv", 0).await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty.json["error"], EMPTY_FILE);
+    let big = stack.open_session(&bayu, "a.csv", CAP + 1).await;
+    assert_eq!(big.status, StatusCode::BAD_REQUEST);
+    assert_eq!(big.json["error"], TOO_LARGE);
+    let huge = stack.open_session(&bayu, "a.csv", usize::MAX).await;
+    assert_eq!(huge.status, StatusCode::BAD_REQUEST);
+    for body in [
+        Payload::Json(json!({})),
+        Payload::Json(json!({ "filename": "a.csv" })),
+        Payload::Json(json!({ "filename": "a.csv", "sizeBytes": -5 })),
+        Payload::Json(json!({ "filename": "a.csv", "sizeBytes": "10" })),
+        Payload::Json(json!([1, 2])),
+        Payload::Raw("application/json", b"not json".to_vec()),
+        Payload::None,
+    ] {
+        let reply = stack
+            .send(&bayu, "POST", "/api/uploads/sessions", body)
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+        assert_eq!(
+            reply.json["error"],
+            "The request body must be a JSON object with a filename and a sizeBytes (a whole number)."
+        );
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload")
+        .fetch_one(&stack.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert!(stack.bucket.open_multiparts().is_empty());
+
+    let at_cap = stack.open_session(&bayu, "a.csv", CAP).await;
+    assert_eq!(at_cap.status, StatusCode::CREATED, "{}", at_cap.text);
+    assert_eq!(at_cap.json["partCount"], 7);
+}
+
+/// Another tenant's session answers the 404 an unknown id gets, on every
+/// route, and nothing of it is touched; an Analyst (no `connector:manage`)
+/// cannot open one.
+#[tokio::test]
+async fn another_tenants_session_is_404_on_every_route_and_an_analyst_cannot_open_one() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    let id = stack.session(&bayu, "mine.csv", 10).await;
+
+    for (method, uri) in [
+        ("PUT", format!("/api/uploads/{id}/parts/1")),
+        ("GET", format!("/api/uploads/{id}/parts")),
+        ("POST", format!("/api/uploads/{id}/complete")),
+        ("DELETE", format!("/api/uploads/{id}")),
+    ] {
+        let payload = Payload::Raw("application/octet-stream", b"a,b\n1,2\n3\n".to_vec());
+        let reply = stack.send(&andi, method, &uri, payload).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}: {}",
+            reply.text
+        );
+        assert_eq!(reply.json["error"], "Upload not found.");
+    }
+    assert_eq!(stack.status_of(&id).await.0, "receiving");
+    assert_eq!(stack.received(&bayu, &id).await, json!([]));
+    assert_eq!(stack.bucket.open_multiparts().len(), 1);
+
+    let sari = stack.caller("sari@meridian.example", Some(RETAIL)).await;
+    let reply = stack.open_session(&sari, "x.csv", 10).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text);
+    assert_eq!(
+        stack.bucket.open_multiparts().len(),
+        1,
+        "the refusal opened nothing"
+    );
+}
+
+/// A session cannot be previewed or loaded until it is complete; it is listed
+/// and readable like any upload, with its declared size.
+#[tokio::test]
+async fn an_upload_still_being_received_cannot_be_previewed_or_loaded() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = stack.session(&bayu, "later.csv", 12).await;
+
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::CONFLICT, "{}", preview.text);
+    assert_eq!(preview.json["error"], STILL_RECEIVING);
+    let ingest = stack.ingest(&bayu, &id, ingest_body("later_raw")).await;
+    assert_eq!(ingest.status, StatusCode::CONFLICT, "{}", ingest.text);
+    assert_eq!(ingest.json["error"], STILL_RECEIVING);
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(
+        stack.claims().await.is_empty(),
+        "a refused load claims no table"
+    );
+
+    let one = stack.get(&bayu, &format!("/api/uploads/{id}")).await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json["status"], "receiving");
+    assert_eq!(one.json["declaredSize"], 12);
+    let listed = stack.get(&bayu, "/api/uploads").await;
+    assert!(
+        listed
+            .json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == id.as_str()),
+        "{}",
+        listed.text
+    );
+}
+
+/// Deleting a session aborts its multipart upload, and the pieces go with the
+/// row.
+#[tokio::test]
+async fn deleting_a_session_aborts_its_multipart_upload() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = stack.session(&bayu, "drop.csv", 10).await;
+    stack.put_part(&bayu, &id, "1", b"a,b\n1,2\n3\n").await;
+    assert_eq!(stack.bucket.open_multiparts().len(), 1);
+
+    let reply = stack
+        .send(
+            &bayu,
+            "DELETE",
+            &format!("/api/uploads/{id}"),
+            Payload::None,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text);
+    assert!(stack.bucket.open_multiparts().is_empty());
+    assert!(stack.bucket.keys().is_empty());
+    assert_eq!(stack.row_count(&id).await, 0);
+    let late = stack.put_part(&bayu, &id, "1", b"a,b\n1,2\n3\n").await;
+    assert_eq!(late.status, StatusCode::NOT_FOUND);
+}
+
+/// A file the rules of `POST /api/uploads` refuse is refused at completion
+/// with the same sentence, and removed: object and row.
+#[tokio::test]
+async fn a_binary_that_is_not_a_supported_file_is_refused_at_completion_and_removed() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes: Vec<u8> = (0..3000_u32)
+        .map(|n| u8::try_from(n % 251).unwrap())
+        .collect();
+    let id = stack.session(&bayu, "data.bin", bytes.len()).await;
+    stack.put_part(&bayu, &id, "1", &bytes).await;
+
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], OTHER_BINARY);
+    assert!(
+        stack.bucket.keys().is_empty(),
+        "the refused file was removed"
+    );
+    assert_eq!(stack.row_count(&id).await, 0);
+}
+
+/// A workbook and a Parquet file complete with their facts, as they do through
+/// `POST /api/uploads`.
+#[tokio::test]
+async fn a_workbook_and_a_parquet_file_complete_with_their_facts() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+
+    let sheet = stack
+        .upload_in_pieces(&bayu, "stock.xlsx", &workbook("stock.xlsx"))
+        .await;
+    assert_eq!(sheet["workbook"]["defaultSheet"], "Stock", "{sheet}");
+    assert!(sheet.get("parquet").is_none());
+
+    let table = stack
+        .upload_in_pieces(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+        .await;
+    assert!(
+        table["parquet"]["columns"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "{table}"
+    );
+    assert!(table.get("workbook").is_none());
+
+    // Not named for what it is: refused with the whole-upload sentence.
+    let id = stack
+        .session(&bayu, "orders.csv", parquet_file("orders.parquet").len())
+        .await;
+    stack
+        .put_part(&bayu, &id, "1", &parquet_file("orders.parquet"))
+        .await;
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert!(
+        reply.json["error"].as_str().unwrap().contains("Parquet"),
+        "{}",
+        reply.text
+    );
+    assert_eq!(stack.row_count(&id).await, 0);
+}
+
+/// The same pieces uploaded twice: the second completion names the first.
+#[tokio::test]
+async fn the_same_pieces_uploaded_twice_are_reported_as_a_duplicate() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    let bytes = csv_of_size(9 * MIB);
+
+    let first = stack.upload_in_pieces(&bayu, "one.csv", &bytes).await;
+    assert!(first.get("duplicateOf").is_none());
+    let second = stack.upload_in_pieces(&bayu, "two.csv", &bytes).await;
+    assert_eq!(second["duplicateOf"]["id"], first["id"], "{second}");
+    // Another tenant's identical file is not reported to this one.
+    let other = stack.upload_in_pieces(&andi, "three.csv", &bytes).await;
+    assert!(other.get("duplicateOf").is_none(), "{other}");
+}
+
+/// `SEC-17` on the piece route: with four pieces of one user being received,
+/// a fifth is a 429 with `Retry-After`, nothing of it is stored, and the
+/// places are given back.
+#[tokio::test]
+async fn a_fifth_simultaneous_piece_of_one_user_is_429_with_retry_after() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let bytes = b"a,b\n1,2\n".to_vec();
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        ids.push(
+            stack
+                .session(&bayu, &format!("f{n}.csv"), bytes.len())
+                .await,
+        );
+    }
+    // (A piece that takes 1.5 s to store, so the five overlap: `SlowPart`.)
+    Mock::given(method("PUT"))
+        .and(path_regex(OBJECT_PATH))
+        .and(has_query("uploadId"))
+        .respond_with(SlowPart(stack.bucket.clone()))
+        .with_priority(1)
+        .mount(&stack.s3)
+        .await;
+
+    let replies = tokio::join!(
+        stack.put_part(&bayu, &ids[0], "1", &bytes),
+        stack.put_part(&bayu, &ids[1], "1", &bytes),
+        stack.put_part(&bayu, &ids[2], "1", &bytes),
+        stack.put_part(&bayu, &ids[3], "1", &bytes),
+        stack.put_part(&bayu, &ids[4], "1", &bytes),
+    );
+    let replies = [replies.0, replies.1, replies.2, replies.3, replies.4];
+    let accepted = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::OK)
+        .count();
+    let refused: Vec<&Reply> = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::TOO_MANY_REQUESTS)
+        .collect();
+    assert_eq!(
+        accepted,
+        4,
+        "{:?}",
+        replies.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].json["error"], TOO_MANY_UPLOADS);
+    assert_eq!(refused[0].retry_after.as_deref(), Some("5"));
+
+    // The places were given back: the refused piece goes through now.
+    let index = replies
+        .iter()
+        .position(|r| r.status == StatusCode::TOO_MANY_REQUESTS)
+        .unwrap();
+    let again = stack.put_part(&bayu, &ids[index], "1", &bytes).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+}
+
+/// A store that refuses answers a fixed sentence: nothing of its body reaches
+/// the response, and nothing is recorded as received.
+#[tokio::test]
+async fn a_refusing_store_surfaces_a_fixed_sentence_on_every_chunked_route() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = stack.session(&bayu, "down.csv", 10).await;
+    break_bucket(&stack.s3).await;
+
+    let part = stack.put_part(&bayu, &id, "1", b"a,b\n1,2\n3\n").await;
+    assert_eq!(
+        part.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        part.text
+    );
+    assert_eq!(
+        part.json["error"],
+        "Upload storage is unavailable (permission denied)."
+    );
+    let opened = stack.open_session(&bayu, "also.csv", 12).await;
+    assert_eq!(
+        opened.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        opened.text
+    );
+    for text in [&part.text, &opened.text] {
+        assert!(!text.contains(MARKER), "{text}");
+    }
+    assert_eq!(stack.received(&bayu, &id).await, json!([]));
+    assert_eq!(
+        stack.row_count(&id).await,
+        1,
+        "the refused session opened no second row"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload")
+        .fetch_one(&stack.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// The sweep aborts and removes sessions older than the lifetime and leaves
+/// the rest, and a session whose storage fails is left for the next pass.
+#[tokio::test]
+async fn the_sweep_aborts_and_removes_old_sessions_and_leaves_the_rest() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let old = stack.session(&bayu, "old.csv", 10).await;
+    let fresh = stack.session(&bayu, "fresh.csv", 10).await;
+    let finished = stack
+        .upload_in_pieces(&bayu, "done.csv", b"a,b\n1,2\n3\n")
+        .await;
+    stack.put_part(&bayu, &old, "1", b"a,b\n1,2\n3\n").await;
+    sqlx::query(
+        "UPDATE file_upload SET created_at = now() - interval '25 hours' WHERE id = ANY($1)",
+    )
+    .bind(vec![old.clone(), id_of(&finished)])
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    assert_eq!(stack.bucket.open_multiparts().len(), 2);
+    let store = stack.upload_store().await;
+
+    let outcome = lakehouse_api::upload_sweep::sweep_stale_sessions(&stack.app.pool, &store, 24)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.failed, 0);
+    assert_eq!(stack.row_count(&old).await, 0);
+    assert_eq!(stack.row_count(&fresh).await, 1, "a young session is kept");
+    assert_eq!(
+        stack.row_count(&id_of(&finished)).await,
+        1,
+        "a finished upload is never swept"
+    );
+    assert_eq!(
+        stack.bucket.open_multiparts().len(),
+        1,
+        "only the old one was aborted"
+    );
+    assert_eq!(
+        stack.bucket.keys().len(),
+        1,
+        "the finished file is still there"
+    );
+
+    // Storage down: the old session stays, counted as failed, for the next pass.
+    sqlx::query("UPDATE file_upload SET created_at = now() - interval '30 hours' WHERE id = $1")
+        .bind(&fresh)
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    break_bucket(&stack.s3).await;
+    let outcome = lakehouse_api::upload_sweep::sweep_stale_sessions(&stack.app.pool, &store, 24)
+        .await
+        .unwrap();
+    assert_eq!((outcome.removed, outcome.failed), (0, 1));
+    assert_eq!(stack.row_count(&fresh).await, 1);
 }

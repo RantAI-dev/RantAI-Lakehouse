@@ -407,10 +407,15 @@ pub async fn list_parts(pool: &PgPool, upload_id: &str) -> Result<Vec<UploadPart
 }
 
 /// Settle a chunked upload that the store has assembled: `receiving` becomes
-/// `uploaded`, with the stored object's size, the hex digest used by the
-/// duplicate check (`sha256`), the raw `parts_digest`, and `multipart_id`
-/// cleared. The piece records are removed: they describe an upload that no
-/// longer exists.
+/// `uploaded`, with the stored object's size and the `parts_digest`, and
+/// `multipart_id` cleared. The piece records are removed: they describe an
+/// upload that no longer exists.
+///
+/// `sha256` stays empty on purpose. It is "the SHA-256 of the stored bytes",
+/// and a file that was never held whole has no such hash; filling it with the
+/// digest of the pieces would be a different quantity under the same name.
+/// The duplicate check for these files reads `parts_digest`
+/// ([`find_by_parts_digest`]).
 ///
 /// Returns `None` when no row changed: no such upload, or it is not
 /// `receiving`.
@@ -422,19 +427,17 @@ pub async fn finish_receiving(
     pool: &PgPool,
     id: &str,
     size_bytes: i64,
-    sha256: &str,
     parts_digest: &[u8],
 ) -> Result<Option<Upload>, StoreError> {
     let mut tx = pool.begin().await?;
     let sql = format!(
-        "UPDATE file_upload SET status = 'uploaded', size_bytes = $2, sha256 = $3, \
-         parts_digest = $4, multipart_id = NULL, updated_at = now() \
+        "UPDATE file_upload SET status = 'uploaded', size_bytes = $2, \
+         parts_digest = $3, multipart_id = NULL, updated_at = now() \
          WHERE id = $1 AND status = 'receiving' RETURNING {COLS}"
     );
     let row: Option<Upload> = sqlx::query_as(&sql)
         .bind(id)
         .bind(size_bytes)
-        .bind(sha256)
         .bind(parts_digest)
         .fetch_optional(&mut *tx)
         .await?;
@@ -471,6 +474,25 @@ pub async fn stale_receiving(
         .bind(limit.clamp(1, 500))
         .fetch_all(pool)
         .await?)
+}
+
+/// Delete upload `id` only while it is still `receiving`: the sweep's and
+/// the abort path's delete. Unlike [`delete`] it cannot remove a file that
+/// was finished (or is loading) in the moment between the caller reading the
+/// row and deleting it. The piece records go with the row (`ON DELETE
+/// CASCADE`).
+///
+/// Returns whether a row was deleted.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn delete_receiving(pool: &PgPool, id: &str) -> Result<bool, StoreError> {
+    let done = sqlx::query("DELETE FROM file_upload WHERE id = $1 AND status = 'receiving'")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// The most recent chunked upload of `tenant_id` whose pieces hashed to

@@ -126,6 +126,8 @@ use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
+pub(super) mod sessions;
+
 /// Largest file this endpoint accepts, in bytes.
 ///
 /// The body is buffered in memory to hash and store it, so this is a memory
@@ -249,6 +251,9 @@ const LAUNCH_UNREACHABLE: &str =
 const LAUNCH_REFUSED: &str = "The orchestrator refused to start the load.";
 const NOT_RECORDED: &str = "The load was started but could not be recorded.";
 const DELETE_WHILE_LOADING: &str = "This upload is being loaded, so it cannot be deleted yet.";
+/// A chunked upload (`DATA-17`) whose pieces are still arriving can be
+/// neither previewed nor loaded: its object does not exist yet.
+const STILL_RECEIVING: &str = "This upload is still being received, so it cannot be used yet.";
 
 // What the row records when a load ends without the job's own reason.
 
@@ -657,11 +662,19 @@ fn check_file(bytes: &[u8], filename: &str) -> Result<Accepted, ApiError> {
     if bytes.len() > MAX_UPLOAD_BYTES {
         return Err(ApiError::BadRequest(TOO_LARGE.to_owned()));
     }
-    if has_parquet_name(filename) && upload_parquet::has_encrypted_magic(bytes) {
+    classify_head(bytes, filename)
+}
+
+/// What a file is, from its first bytes and its name: the kind rules of
+/// [`check_file`] without its size rules. A chunked upload (`sessions`) has
+/// had its size checked when the session opened and is classified from its
+/// first 64 KiB, so both paths refuse with the same sentences.
+fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
+    if has_parquet_name(filename) && upload_parquet::has_encrypted_magic(head) {
         // Not a magic `sniff` knows; the reader names the real reason.
         return Ok(Accepted::Parquet);
     }
-    let message = match upload_parse::sniff(bytes) {
+    let message = match upload_parse::sniff(head) {
         Kind::DelimitedText => return Ok(Accepted::Text),
         Kind::Workbook if has_workbook_name(filename) => return Ok(Accepted::Workbook),
         Kind::Workbook => WORKBOOK,
@@ -1189,8 +1202,8 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// does not have or a sheet or file over the cell limit (each with its own
 /// fixed sentence), and for a text file with a header of more than 1,000
 /// columns (`SEC-17`); 404
-/// for an unknown upload or another tenant's; 503 when Postgres or the object
-/// store is unavailable.
+/// for an unknown upload or another tenant's; 409 for an upload still being
+/// received (`DATA-17`); 503 when Postgres or the object store is unavailable.
 pub async fn preview(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1204,6 +1217,9 @@ pub async fn preview(
     let row = uploads::get(pool(&state)?, &id)
         .await?
         .ok_or_else(not_found)?;
+    if row.status == "receiving" {
+        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()).into());
+    }
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     match conversion_of_head(&row.storage_key, &head) {
@@ -1739,8 +1755,8 @@ async fn convert_upload(
 /// have, a sheet or file over the cell limit, an empty sheet or a Parquet
 /// file with no rows, and for a header with more than 1,000 columns under the
 /// confirmed reading (`SEC-17`, checked before any claim); 404
-/// for an unknown upload or another tenant's; 409 when this upload is already
-/// loading, another is loading into that table, a connector loads it, or the
+/// for an unknown upload or another tenant's; 409 when this upload is still
+/// being received (`DATA-17`), is already loading, another is loading into that table, a connector loads it, or the
 /// name cannot be used ([`TABLE_NOT_FREE`]: another tenant's connector loads
 /// it, another tenant holds the claim, the table exists and nobody claimed it,
 /// or another tenant won the claim a moment ago); 422 when the orchestrator
@@ -1758,6 +1774,9 @@ pub async fn ingest(
     };
     let pool = pool(&state)?;
     let row = uploads::get(pool, &id).await?.ok_or_else(not_found)?;
+    if row.status == "receiving" {
+        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()).into());
+    }
     // The row first: what the body must carry depends on what the upload is.
     let conversion = conversion_of(&state, &row).await?;
     let request = parse_ingest_request(&body, conversion)?;
@@ -1901,7 +1920,8 @@ async fn finish_launch_and_audit(
 // ── Delete ───────────────────────────────────────────────────────────────
 
 /// `DELETE /api/uploads/{id}` — remove the object (and the converted text of a
-/// workbook or Parquet file), then the row. 204. The
+/// workbook or Parquet file), then the row. 204. For an upload still being
+/// received (`DATA-17`) it aborts the multipart upload first. The
 /// table the upload became is not touched, and neither is the claim on its
 /// name: that is a record of its own ([`uploads::claim_table`]) and is never
 /// released, so a later upload of the tenant can still load into the table and
@@ -1931,7 +1951,14 @@ pub async fn delete(
         return Err(ApiError::Conflict(DELETE_WHILE_LOADING.to_owned()).into());
     }
     let store = UploadStore::connect(&state.config).await?;
-    if conversion_for_name(&row.storage_key).is_some() {
+    if row.status == "receiving" {
+        // A session has no converted text and maybe no object: abort the
+        // multipart upload (its pieces are bytes S3 keeps and bills for), then
+        // remove whatever sits at the key. (A session that completed between
+        // the read above and this call is simply deleted whole, which is what
+        // the caller asked for.)
+        sessions::abort_session(&store, &row).await?;
+    } else if conversion_for_name(&row.storage_key).is_some() {
         // The converted text of a workbook or a Parquet file, if a load wrote
         // one: derived data goes first, and a key that is not there is
         // success. A text file named `.xls` or `.parquet` has none, and

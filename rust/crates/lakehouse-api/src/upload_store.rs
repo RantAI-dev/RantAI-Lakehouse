@@ -329,10 +329,6 @@ impl UploadStore {
     ///
     /// [`UploadStoreError::Unavailable`] when the store refuses or cannot be
     /// reached.
-    #[allow(
-        dead_code,
-        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
-    )]
     pub async fn create_multipart(&self, key: &str) -> Result<String, UploadStoreError> {
         self.store
             .create_multipart(&ObjectPath::from(key))
@@ -349,10 +345,6 @@ impl UploadStore {
     /// [`UploadStoreError::Unavailable`] when the write fails, or when
     /// `part_number` is 0 (a caller bug, answered as a failure rather than a
     /// panic: S3 numbers pieces from 1).
-    #[allow(
-        dead_code,
-        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
-    )]
     pub async fn put_part(
         &self,
         key: &str,
@@ -386,10 +378,6 @@ impl UploadStore {
     ///
     /// [`UploadStoreError::Unavailable`] when the store refuses (a missing
     /// piece, a piece under 5 MiB that is not the last) or cannot be reached.
-    #[allow(
-        dead_code,
-        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
-    )]
     pub async fn complete_multipart(
         &self,
         key: &str,
@@ -418,10 +406,6 @@ impl UploadStore {
     ///
     /// [`UploadStoreError::Unavailable`] when the abort fails for any other
     /// reason.
-    #[allow(
-        dead_code,
-        reason = "the chunked-upload routes call it in DATA-17 T1.3; the allow goes with that commit"
-    )]
     pub async fn abort_multipart(&self, key: &str, id: &str) -> Result<(), UploadStoreError> {
         let id = id.to_owned();
         match self

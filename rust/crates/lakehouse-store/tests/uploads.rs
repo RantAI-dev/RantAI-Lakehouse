@@ -2183,13 +2183,17 @@ async fn finishing_a_session_makes_an_uploaded_file_and_forgets_its_pieces(
         .unwrap();
 
     let digest = [7u8; 32];
-    let done = finish_receiving(&pool, "up-f1", 10, "ab12", &digest)
+    let done = finish_receiving(&pool, "up-f1", 10, &digest)
         .await
         .unwrap()
         .expect("a receiving upload finishes");
     assert_eq!(done.status, "uploaded");
     assert_eq!(done.size_bytes, 10);
     assert_eq!(done.multipart_id, None);
+    assert_eq!(
+        done.sha256, "",
+        "no hash of the whole bytes exists, and none is made up"
+    );
     assert_eq!(done.parts_digest.as_deref(), Some(&digest[..]));
     assert!(list_parts(&pool, "up-f1").await.unwrap().is_empty());
     // A late piece is refused: the file is assembled.
@@ -2200,7 +2204,7 @@ async fn finishing_a_session_makes_an_uploaded_file_and_forgets_its_pieces(
     );
     // And it finishes only once.
     assert!(
-        finish_receiving(&pool, "up-f1", 10, "ab12", &digest)
+        finish_receiving(&pool, "up-f1", 10, &digest)
             .await
             .unwrap()
             .is_none()
@@ -2265,7 +2269,7 @@ async fn find_by_parts_digest_sees_only_its_own_tenant_and_never_the_excluded_up
         ("up-g3", tenant_b),
     ] {
         open_session(&pool, id, owner).await;
-        finish_receiving(&pool, id, 10, "hex", &digest)
+        finish_receiving(&pool, id, 10, &digest)
             .await
             .unwrap()
             .unwrap();
