@@ -79,15 +79,15 @@ them with the decisions above.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-15-AC1` | Open a table's preview and page through it | Up to 1,000 rows reachable; masked columns masked at every page | Not run |
-| `DATA-15-AC2` | Open a table's usage with 30 days of history | Queries, frequent users, frequent queries, joined tables for 30 days; column popularity as recorded, or "not recorded" | Not run |
-| `DATA-15-AC3` | As `access:approve`, grant a user access from the table's Access tab | The grantee can read the table; the grant expires in 30 days; the audit trail names both | Not run |
-| `DATA-15-AC4` | Revoke that grant | The grantee loses access at once | Not run |
-| `DATA-15-AC5` | Without `access:approve`, open the Access tab | No grant or revoke controls | Not run |
-| `DATA-15-AC6` | Drop an Iceberg table, then restore it from its page within the window | The table is back and readable | Not run |
-| `DATA-15-AC7` | Try to restore a table dropped before the window, or a ClickHouse table | An honest refusal with the reason | Not run |
-| `DATA-15-AC8` | Load a table through the pipeline, then read its history | The new version names the pipeline principal as author; an old version says "unknown" | Not run |
-| `DATA-15-AC9` | As a user without the permission, call the restore route | 403; nothing changes | Not run |
+| `DATA-15-AC1` | Open a table's preview and page through it | Up to 1,000 rows reachable; masked columns masked at every page | Pass 2026-10-19 (product owner, QA instance of #106) |
+| `DATA-15-AC2` | Open a table's usage with 30 days of history | Queries, frequent users, frequent queries, joined tables for 30 days; column popularity as recorded, or "not recorded" | Not run: the QA instance has no 30 days of query history; the card and its figures were seen empty |
+| `DATA-15-AC3` | As `access:approve`, grant a user access from the table's Access tab | The grantee can read the table; the grant expires in 30 days; the audit trail names both | Pass 2026-10-19 (product owner, QA instance of #106) |
+| `DATA-15-AC4` | Revoke that grant | The grantee loses access at once | Pass 2026-10-19 (product owner, QA instance of #106) |
+| `DATA-15-AC5` | Without `access:approve`, open the Access tab | No grant or revoke controls | Not run: needs a user without `access:approve`; covered by `tests/route_auth.rs` in CI |
+| `DATA-15-AC6` | Drop an Iceberg table, then restore it from its page within the window | The table is back and readable | Not run in the console: the QA instance has no Lakekeeper admin token; the `g3a` gate step drops and restores a table in CI |
+| `DATA-15-AC7` | Try to restore a table dropped before the window, or a ClickHouse table | An honest refusal with the reason | Not run: as AC6 |
+| `DATA-15-AC8` | Load a table through the pipeline, then read its history | The new version names the pipeline principal as author; an old version says "unknown" | Not run: no load through the product's own commits on the QA instance |
+| `DATA-15-AC9` | As a user without the permission, call the restore route | 403; nothing changes | Not run: covered by `tests/route_auth.rs` in CI |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
 

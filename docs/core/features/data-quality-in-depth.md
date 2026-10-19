@@ -62,11 +62,11 @@ A step not performed is never Pass. Rows follow the spec's four.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-14-AC1` | Add a no-nulls check on a column with nulls and run it. | The run fails and an incident opens. | |
-| `DATA-14-AC2` | Load a table at 10% of its usual rows with 14+ days of history. | It is flagged as a volume anomaly. | |
-| `DATA-14-AC3` | Open the quality page. | The incident is listed by table until a person resolves it; the rule's past runs survive an edit. | |
-| `DATA-14-AC4` | Define a rule and resolve an incident as a user without `governance:write`; force a failure. | Refused; a failure shows an honest message (principles 2 and 4). | |
-| `DATA-14-AC5` | Set a table's checks to on-every-load and load it. | Checks run after the load commits; a check failure does not fail the load. | |
+| `DATA-14-AC1` | Add a no-nulls check on a column with nulls and run it. | The run fails and an incident opens. | Pass 2026-10-19 (product owner, QA instance of #106) |
+| `DATA-14-AC2` | Load a table at 10% of its usual rows with 14+ days of history. | It is flagged as a volume anomaly. | Not run: needs 14 days and 5 loads of history recorded from this release on |
+| `DATA-14-AC3` | Open the quality page. | The incident is listed by table until a person resolves it; the rule's past runs survive an edit. | Pass 2026-10-19 (product owner, QA instance of #106) |
+| `DATA-14-AC4` | Define a rule and resolve an incident as a user without `governance:write`; force a failure. | Refused; a failure shows an honest message (principles 2 and 4). | Not run: covered by `tests/route_auth.rs` in CI |
+| `DATA-14-AC5` | Set a table's checks to on-every-load and load it. | Checks run after the load commits; a check failure does not fail the load. | Not run: no load ran on the QA instance |
 
 ## Asking the assistant
 

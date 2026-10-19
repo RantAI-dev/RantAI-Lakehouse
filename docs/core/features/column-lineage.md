@@ -60,10 +60,10 @@ A step not performed is never Pass. Rows follow the spec's three.
 
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
-| `DATA-13-AC1` | Open a Gold column's lineage. | It names the Bronze source columns, from persisted mappings of the run that built it. | |
-| `DATA-13-AC2` | Open a Bronze column's downstream impact. | It lists downstream columns and, chart by chart, the dashboards that read them. | |
-| `DATA-13-AC3` | Read lineage as a user without the permission; force a lineage failure. | Refused like the table-level tab; a failure shows an honest message (principles 2 and 4). | |
-| `DATA-13-AC4` | Run the g3a lineage gate against a project with `build` links. | The gate passes with `build` listed, not fails on the unknown kind. | |
+| `DATA-13-AC1` | Open a Gold column's lineage. | It names the Bronze source columns, from persisted mappings of the run that built it. | Not run: no pipeline run, build or SQL-source save on the QA instance since the release, so no mappings exist yet; the `g7` gate step proves Silver columns map back to Bronze in CI |
+| `DATA-13-AC2` | Open a Bronze column's downstream impact. | It lists downstream columns and, chart by chart, the dashboards that read them. | Not run: as AC1 |
+| `DATA-13-AC3` | Read lineage as a user without the permission; force a lineage failure. | Refused like the table-level tab; a failure shows an honest message (principles 2 and 4). | Not run: covered by the column route's tests in CI |
+| `DATA-13-AC4` | Run the g3a lineage gate against a project with `build` links. | The gate passes with `build` listed, not fails on the unknown kind. | Pass in CI: the `g3a` gate accepts the `build` and `upload` kinds |
 
 ## Asking the assistant
 
