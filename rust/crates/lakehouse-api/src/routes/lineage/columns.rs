@@ -568,18 +568,27 @@ fn unmappable_rows(
     }
 }
 
-// PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star row into probed target columns
+// PR #106 review R2 SHOULD-FIX 5: expand every '*' row, not just the first
 fn expand_star_rows(
-    mut rows: Vec<NewMapping>,
+    rows: Vec<NewMapping>,
     probed: Option<&Vec<String>>,
     target: &str,
 ) -> Vec<NewMapping> {
-    if let Some(star_idx) = rows.iter().position(|r| r.to_column == "*") {
-        let star = rows.remove(star_idx);
-        if let Some(columns) = probed.filter(|c| !c.is_empty()) {
+    let (star_rows, mut non_star_rows): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(|r| r.to_column == "*");
+    if star_rows.is_empty() {
+        return non_star_rows;
+    }
+    if let Some(columns) = probed.filter(|c| !c.is_empty()) {
+        for star in star_rows {
             for col in columns {
-                if !rows.iter().any(|r| &r.to_column == col) {
-                    rows.push(NewMapping {
+                if !non_star_rows.iter().any(|r| {
+                    r.to_column == *col
+                        && r.from_table == star.from_table
+                        && r.from_column == star.from_column
+                        && r.reason == star.reason
+                }) {
+                    non_star_rows.push(NewMapping {
                         from_table: star.from_table.clone(),
                         from_column: star.from_column.clone(),
                         to_table: target.to_owned(),
@@ -590,11 +599,11 @@ fn expand_star_rows(
                     });
                 }
             }
-        } else {
-            rows.push(star);
         }
+    } else {
+        non_star_rows.extend(star_rows);
     }
-    rows
+    non_star_rows
 }
 
 // PR #106 review R1 SHOULD-FIX DATA-13 1, SHOULD-FIX DATA-13 2
@@ -1156,6 +1165,42 @@ mod tests {
                 mart.iter()
                     .all(|r| r.reason.as_deref() == Some("the statement exceeds 20,000 characters"))
             );
+        }
+
+        // PR #106 review R2 SHOULD-FIX 5
+        #[test]
+        fn expand_star_rows_handles_every_star_row() {
+            let star1 = NewMapping {
+                from_table: Some("silver.t1".to_owned()),
+                from_column: None,
+                to_table: "silver.target".to_owned(),
+                to_column: "*".to_owned(),
+                transform: "unknown".to_owned(),
+                partial: true,
+                reason: Some("unknown t1".to_owned()),
+            };
+            let star2 = NewMapping {
+                from_table: Some("silver.t2".to_owned()),
+                from_column: None,
+                to_table: "silver.target".to_owned(),
+                to_column: "*".to_owned(),
+                transform: "unknown".to_owned(),
+                partial: true,
+                reason: Some("unknown t2".to_owned()),
+            };
+
+            let probed = vec!["id".to_owned(), "name".to_owned()];
+            let expanded = expand_star_rows(
+                vec![star1.clone(), star2.clone()],
+                Some(&probed),
+                "silver.target",
+            );
+            assert!(!expanded.iter().any(|r| r.to_column == "*"));
+            assert_eq!(expanded.len(), 4);
+
+            let unprobed = expand_star_rows(vec![star1, star2], None, "silver.target");
+            assert_eq!(unprobed.len(), 2);
+            assert_eq!(unprobed.iter().filter(|r| r.to_column == "*").count(), 2);
         }
 
         // PR #106 review R2 SHOULD-FIX 4
