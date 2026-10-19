@@ -547,9 +547,19 @@ pub(crate) async fn record_pipeline_run(state: &AppState, pool: &PgPool, pipelin
         );
         return;
     };
-    let known = ColumnCache::default().known_for(state, &sql, &[]).await;
+    let mut cache = ColumnCache::default();
+    let known = cache
+        .known_for(state, &sql, std::slice::from_ref(&target))
+        .await;
     let rows = match sql_lineage::map_select(&sql, &ClickHouseDialect {}, &known) {
-        Ok(lineage) => rows_for(&lineage, &target),
+        Ok(lineage) => {
+            // PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star into probed target columns
+            if let Some(probed) = known.get(&target).filter(|p| !p.is_empty()) {
+                rows_for_probed(&lineage, probed, &target)
+            } else {
+                rows_for(&lineage, &target)
+            }
+        }
         Err(unmappable) => {
             // The statement cannot be read, so its outputs cannot even be
             // named: write no rows, and drop the earlier ones so a stale
@@ -686,7 +696,14 @@ pub(crate) async fn run_builds_pass(state: &AppState, pool: &PgPool) -> usize {
             .known_for(state, &query, std::slice::from_ref(&target))
             .await;
         let rows = match sql_lineage::map_select(&query, &ClickHouseDialect {}, &known) {
-            Ok(lineage) => rows_for(&lineage, &target),
+            Ok(lineage) => {
+                // PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star into probed target columns
+                if let Some(probed) = known.get(&target).filter(|p| !p.is_empty()) {
+                    rows_for_probed(&lineage, probed, &target)
+                } else {
+                    rows_for(&lineage, &target)
+                }
+            }
             Err(unmappable) => {
                 tracing::info!(table = %target, reason = %unmappable, "column lineage: a build cannot be mapped");
                 Vec::new()
@@ -931,6 +948,59 @@ mod tests {
             )
             .await
             .expect("seed the pipeline");
+        }
+
+        // PR #106 review R1 SHOULD-FIX DATA-13 1
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_build_with_star_over_unknown_columns_stores_partial_for_probed_columns(
+            pool: sqlx::PgPool,
+        ) {
+            let ch = MockServer::start().await;
+            // mount_columns answers columns for serving.mart, but unmounted_table is not mounted
+            Mock::given(method("POST"))
+                .and(body_string_contains("mart"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "name", "type": "String"},
+                        {"name": "default_kind", "type": "String"},
+                        {"name": "default_expression", "type": "String"}
+                    ],
+                    "data": [
+                        {"name": "id", "default_kind": "", "default_expression": ""},
+                        {"name": "name", "default_kind": "", "default_expression": ""},
+                    ],
+                    "rows": 2,
+                })))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("unmounted_table"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "data": [], "rows": 0
+                })))
+                .mount(&ch)
+                .await;
+            mount_log(
+                &ch,
+                &[(
+                    "1760000000000",
+                    "CREATE TABLE serving.mart AS SELECT * FROM silver.unmounted_table",
+                )],
+            )
+            .await;
+            let state = state_for(&pool, &ch.uri());
+            let written = run_builds_pass(&state, &pool).await;
+            assert_eq!(written, 1);
+            let mart = touching_table(&pool, "serving.mart", everything())
+                .await
+                .expect("read");
+            assert!(
+                !mart.iter().any(|r| r.to_column == "*"),
+                "to_column = '*' must not be stored"
+            );
+            let cols: Vec<String> = mart.iter().map(|r| r.to_column.clone()).collect();
+            assert_eq!(cols, vec!["id", "name"]);
+            assert!(mart.iter().all(|r| r.partial));
         }
 
         #[sqlx::test(migrations = "../../migrations")]
