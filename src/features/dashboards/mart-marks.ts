@@ -9,7 +9,12 @@ import type { ChartSourceChoice } from "@/lib/chart-source"
  */
 export type Mart = { name: string; rows: number } & Pick<
   Asset,
-  "certification" | "certificationNote" | "replacementAssetId" | "replacementName"
+  | "certification"
+  | "certificationNote"
+  | "replacementAssetId"
+  | "replacementName"
+  | "tags"
+  | "governedTags"
 >
 
 /** The mart a data-source choice names, or `undefined` for a SQL source or no choice. */

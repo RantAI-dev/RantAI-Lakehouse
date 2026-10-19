@@ -619,7 +619,19 @@ pub(super) async fn get_quality(ch: &ChClient) -> Value {
 /// `DATA-12` task 10: the assistant's mart description carries each
 /// mart's certification fields, so it can tell a user that a mart it is
 /// about to build a chart on is deprecated, and name the replacement.
-pub(super) async fn describe_mart(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn describe_mart(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let allowed = match principal {
+        Some(p) => matches!(
+            crate::routes::catalog::catalog_tenant_refusal(state, p, &axum::http::HeaderMap::new())
+                .await,
+            Ok(None)
+        ),
+        None => true,
+    };
     let ch = &state.clickhouse;
     let mart = strip_non_ident(&arg_str(args, "mart"));
     if mart.is_empty() {
@@ -645,7 +657,9 @@ pub(super) async fn describe_mart(state: &AppState, args: &Map<String, Value>) -
                 json!({ "mart": r.get("name"), "rows": rows_n })
             })
             .collect();
-        apply_serving_certification(state, &mut marts, "mart").await;
+        if allowed {
+            apply_serving_certification(state, &mut marts, "mart").await;
+        }
         return json!({ "marts": marts });
     }
     let Ok(cols) = ch
@@ -688,7 +702,9 @@ pub(super) async fn describe_mart(state: &AppState, args: &Map<String, Value>) -
     let mut described = vec![
         json!({ "mart": mart, "dimensions": dimensions, "measures": measures, "columns": columns }),
     ];
-    apply_serving_certification(state, &mut described, "mart").await;
+    if allowed {
+        apply_serving_certification(state, &mut described, "mart").await;
+    }
     described.remove(0)
 }
 
@@ -1252,7 +1268,7 @@ mod describe_mart_marks {
         )
         .await;
         let state = state_for(&pool, &server);
-        let result = describe_mart(&state, &Map::new()).await;
+        let result = describe_mart(&state, None, &Map::new()).await;
         let marts = result["marts"].as_array().expect("marts array");
         let old = marts
             .iter()
@@ -1292,7 +1308,7 @@ mod describe_mart_marks {
         let state = state_for(&pool, &server);
         let mut args = Map::new();
         args.insert("mart".to_owned(), json!("mart_old"));
-        let result = describe_mart(&state, &args).await;
+        let result = describe_mart(&state, None, &args).await;
         assert_eq!(result["mart"], json!("mart_old"));
         assert_eq!(result["dimensions"], json!(["customer_id"]));
         assert_eq!(result["measures"], json!(["amount"]));

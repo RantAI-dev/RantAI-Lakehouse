@@ -1546,7 +1546,8 @@ pub(crate) async fn certification_marks(
         }
     };
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    annotations
+    // PR #106 review R1 BLOCKER 2: include certification marks and free tags
+    let mut by_id: HashMap<String, serde_json::Map<String, Value>> = annotations
         .iter()
         .filter(|row| wanted.contains(row.asset_id.as_str()))
         .filter_map(|row| {
@@ -1557,9 +1558,32 @@ pub(crate) async fn certification_marks(
                 .and_then(|r| names.get(r.trim()))
                 .map(String::as_str);
             insert_certification_fields(&mut fields, row, replacement_name);
+            if !row.tags.is_empty() {
+                fields.insert("tags".to_owned(), json!(row.tags));
+            }
             (!fields.is_empty()).then(|| (row.asset_id.clone(), fields))
         })
-        .collect()
+        .collect();
+
+    // PR #106 review R1 BLOCKER 2: include governed tags
+    let governed_rows = lakehouse_store::governed_tag::list_for_assets(pool, ids)
+        .await
+        .unwrap_or_default();
+    let mut governed_by_asset: HashMap<&str, serde_json::Map<String, Value>> = HashMap::new();
+    for row in &governed_rows {
+        governed_by_asset
+            .entry(row.asset_id.as_str())
+            .or_default()
+            .insert(row.tag_key.clone(), json!(row.value));
+    }
+    for (asset_id, gov_map) in governed_by_asset {
+        if wanted.contains(asset_id) && !gov_map.is_empty() {
+            let entry = by_id.entry(asset_id.to_owned()).or_default();
+            entry.insert("governedTags".to_owned(), Value::Object(gov_map));
+        }
+    }
+
+    by_id
 }
 
 /// `DATA-12` task 10: the same certification fields on entries read from

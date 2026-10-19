@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
@@ -1292,7 +1292,12 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
-pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+pub async fn fields(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Query(q): Query<FieldsQuery>,
+) -> Response {
     if let Some(id) = q.source.as_deref() {
         return match source_fields_body(&state.clickhouse, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
@@ -1311,7 +1316,14 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
         Ok(mut body) => {
             if q.mart.is_none() {
-                mark_marts(&state, &mut body).await;
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+                // Only decorate marts if catalog_tenant_refusal allows it:
+                if let Ok(None) =
+                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+                        .await
+                {
+                    mark_marts(&state, &mut body).await;
+                }
             }
             (StatusCode::OK, ApiJson(body)).into_response()
         }

@@ -1,3 +1,5 @@
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+import { Pill } from "@/components/patterns/status-badge"
 "use client";
 
 import * as React from "react";
@@ -1165,13 +1167,29 @@ export function ChartBuilder({
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
-                  {marts.map((m) => (
-                    <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
-                      {m.name} · {m.rows.toLocaleString("id-ID")}
-                      {/* DATA-12 part 3: the mark of a certified or deprecated mart. */}
-                      <CertificationBadge certification={m.certification} className="ml-1.5" />
-                    </SelectItem>
-                  ))}
+                  {marts.map((m) => {
+                    const governed = governedPairLabels(m.governedTags)
+                    const tags = m.tags ?? []
+                    return (
+                      <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                        <span className="flex items-center gap-1.5 flex-wrap">
+                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
+                          <CertificationBadge certification={m.certification} />
+                          {governed.map((pair) => (
+                            <Pill key={`governed:${pair}`} tone="info" className="text-[10px]">
+                              {pair}
+                            </Pill>
+                          ))}
+                          {tags.map((tag) => (
+                            <Pill key={tag} tone="neutral" className="text-[10px]">
+                              {tag}
+                            </Pill>
+                          ))}
+                        </span>
+                      </SelectItem>
+                    )
+                  })}
                 </SelectGroup>
                 {sqlSources.length ? (
                   <SelectGroup>

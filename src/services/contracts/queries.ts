@@ -82,7 +82,12 @@ export type QueryEstimate = {
     string,
     Pick<
       Asset,
-      "certification" | "certificationNote" | "replacementAssetId" | "replacementName"
+      | "certification"
+      | "certificationNote"
+      | "replacementAssetId"
+      | "replacementName"
+      | "tags"
+      | "governedTags"
     >
   >
   /**

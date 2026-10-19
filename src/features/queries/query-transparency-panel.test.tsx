@@ -60,4 +60,18 @@ describe("QueryTransparencyPanel sources", () => {
     expect(screen.queryByText("Certified")).toBeNull()
     expect(screen.queryByText("Deprecated")).toBeNull()
   })
+
+  it("renders governed and free tags for a source that carries them (PR #106 review R1 BLOCKER 2)", () => {
+    panel({
+      ...BASE,
+      sourceMarks: {
+        "silver.orders": {
+          tags: ["pii"],
+          governedTags: { data_domain: "finance" },
+        },
+      },
+    })
+    expect(screen.getByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("pii")).toBeTruthy()
+  })
 })

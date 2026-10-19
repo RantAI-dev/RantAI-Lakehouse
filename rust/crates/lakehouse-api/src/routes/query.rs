@@ -9,7 +9,7 @@ use std::time::Instant;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -818,6 +818,7 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
@@ -883,12 +884,18 @@ pub async fn estimate(
     // marked source gets an entry, and `sourceMarks` is absent when none is.
     // This route estimates ClickHouse queries only; a Trino query is not
     // estimated here and has no sources to mark.
-    let names = std::collections::HashMap::new();
-    let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
-    if !marks.is_empty()
-        && let Some(o) = result.as_object_mut()
+    // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+    // Only decorate with sourceMarks if catalog_tenant_refusal allows it:
+    if let Ok(None) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
     {
-        o.insert("sourceMarks".to_owned(), json!(marks));
+        let names = std::collections::HashMap::new();
+        let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
+        if !marks.is_empty()
+            && let Some(o) = result.as_object_mut()
+        {
+            o.insert("sourceMarks".to_owned(), json!(marks));
+        }
     }
     Ok(ApiJson(result))
 }
@@ -1651,7 +1658,7 @@ mod tests {
     fn fixture_user_principal() -> Principal {
         Principal {
             id: PrincipalId::User(Uuid::from_u128(1)),
-            tenant_ids: Vec::new(),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("query:read"),
             provider: "session".to_owned(),
@@ -1946,6 +1953,10 @@ mod tests {
                 ),
             );
             env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert(
+                "CATALOG_TENANT_ID".to_owned(),
+                "11111111-1111-4111-8111-000000000001".to_owned(),
+            );
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
@@ -1964,11 +1975,18 @@ mod tests {
         }
 
         async fn estimate_of(state: AppState) -> Value {
-            // The estimate now explains the statement rewritten for the
-            // caller's roles (main's change), so the call carries a principal.
+            estimate_of_caller(state, fixture_user_principal(), HeaderMap::new()).await
+        }
+
+        async fn estimate_of_caller(
+            state: AppState,
+            principal: Principal,
+            headers: HeaderMap,
+        ) -> Value {
             let result = estimate(
                 State(state),
-                Extension(fixture_user_principal()),
+                Extension(principal),
+                headers,
                 Bytes::from_static(br#"{"sql":"SELECT * FROM t"}"#),
             )
             .await;
@@ -2007,6 +2025,87 @@ mod tests {
             assert_eq!(mark["certification"], json!("deprecated"));
             assert_eq!(mark["certificationNote"], json!("Use silver.orders_v2"));
             assert_eq!(mark["replacementAssetId"], json!("silver.orders_v2"));
+        }
+
+        // PR #106 review R1 BLOCKER 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_a_table_with_tags_carries_them_in_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::upsert_annotation(
+                &pool,
+                &lakehouse_store::annotation::AnnotationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    owner: None,
+                    steward: None,
+                    description: None,
+                    tags: vec!["pii".to_owned()],
+                },
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::create_key(
+                &pool,
+                "data_domain",
+                &["finance".to_owned()],
+                "admin",
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::set_asset_tags(
+                &pool,
+                "silver.orders",
+                &[("data_domain".to_owned(), "finance".to_owned())],
+                "admin",
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("silver", "orders").await;
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+            let mark = &body["sourceMarks"]["silver.orders"];
+            assert_eq!(mark["tags"], json!(["pii"]));
+            assert_eq!(mark["governedTags"], json!({ "data_domain": "finance" }));
+        }
+
+        // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn caller_outside_catalog_tenant_receives_no_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "certified".to_owned(),
+                    note: None,
+                    replacement_asset_id: None,
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("silver", "orders").await;
+            let state = state_for(&pool, &ch.uri());
+
+            // A caller who belongs to retail (not meridian-group catalog tenant):
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let body = estimate_of_caller(state, outside_caller, HeaderMap::new()).await;
+            assert_eq!(body["sources"], json!(["silver.orders"]));
+            assert!(
+                body.get("sourceMarks").is_none(),
+                "marks must be omitted for caller outside catalog tenant"
+            );
         }
 
         #[sqlx::test(migrations = "../../migrations")]

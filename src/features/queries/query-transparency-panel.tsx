@@ -1,3 +1,4 @@
+import { governedPairLabels } from "@/features/catalog/governed-tags"
 "use client"
 
 import type { ReactNode } from "react"
@@ -36,15 +37,31 @@ function SourcesList({
   return (
     <>
       <ul className="space-y-0.5">
-        {sources.map((source) => (
-          <li key={source} className="font-mono text-xs">
-            {source}
-            <CertificationBadge
-              certification={marks?.[source]?.certification}
-              className="ml-1.5 align-middle font-sans"
-            />
-          </li>
-        ))}
+        {sources.map((source) => {
+          const mark = marks?.[source]
+          const governed = governedPairLabels(mark?.governedTags)
+          const tags = mark?.tags ?? []
+          return (
+            <li key={source} className="font-mono text-xs flex items-center flex-wrap gap-1">
+              <span>{source}</span>
+              {/* PR #106 review R1 BLOCKER 2: mark, governed tags, free tags */}
+              <CertificationBadge
+                certification={mark?.certification}
+                className="align-middle font-sans"
+              />
+              {governed.map((pair) => (
+                <Pill key={`governed:${pair}`} tone="info" className="align-middle font-sans text-[10px]">
+                  {pair}
+                </Pill>
+              ))}
+              {tags.map((tag) => (
+                <Pill key={tag} tone="neutral" className="align-middle font-sans text-[10px]">
+                  {tag}
+                </Pill>
+              ))}
+            </li>
+          )
+        })}
       </ul>
       <div className="mt-2 space-y-1.5">
         {sources.map((source) => {
