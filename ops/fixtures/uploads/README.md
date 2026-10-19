@@ -97,3 +97,11 @@ converter's output: quotes, an embedded line break, padding, empty cells. Its
 `.expected.json` was written by hand from the conversion rules in that
 module's doc. The workbooks and how to regenerate them are described in
 `ops/fixtures/workbooks/make_workbooks.py`.
+
+## `types/` (DATA-18)
+
+`guess.json`, `cast.json` and `names.json` are the shared cases for column types.
+The Rust side (`rust/crates/lakehouse-api/src/upload_types.rs`) and the job
+(`dagster/dispar_orchestrate/upload_types.py`) each have a test that reads them, so
+the guess in the preview and the cast in the load follow one set of rules
+(ADR 0014 decision 3, extended to types). Their `_about` fields say what each holds.
