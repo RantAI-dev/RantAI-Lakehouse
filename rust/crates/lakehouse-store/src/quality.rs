@@ -150,11 +150,12 @@ pub async fn record_failure(
     // `xmax = 0` is true only for a row this statement inserted; the
     // conflicting row comes back through the `DO UPDATE` with its
     // transaction id set.
+    // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
     let (id, opened): (Uuid, bool) = sqlx::query_as(
         "INSERT INTO quality_incident (asset, rule_id, kind, detail) \
          VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (asset, (COALESCE(rule_id, kind))) WHERE status = 'open' \
-         DO UPDATE SET last_seen_at = now(), detail = EXCLUDED.detail \
+         ON CONFLICT (asset, (COALESCE(rule_id, kind))) WHERE status IN ('open', 'stale') \
+         DO UPDATE SET last_seen_at = now(), detail = EXCLUDED.detail, status = 'open' \
          RETURNING id, (xmax = 0) AS opened",
     )
     .bind(asset.trim().to_lowercase())
@@ -209,9 +210,12 @@ pub async fn list(
         StatusFilter::Resolved => Some("resolved"),
         StatusFilter::All => None,
     };
+    // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: 'open' filter includes 'stale'
     let sql = format!(
         "SELECT {} {JOINS} \
-         WHERE ($1::text IS NULL OR i.status = $1) \
+         WHERE ($1::text IS NULL \
+                OR ($1 = 'open' AND i.status IN ('open', 'stale')) \
+                OR i.status = $1) \
            AND ($2::text IS NULL OR i.asset = $2) \
          ORDER BY i.opened_at DESC, i.id LIMIT {MAX_INCIDENTS}",
         columns()
@@ -261,10 +265,11 @@ pub async fn resolve(
     let Ok(id) = Uuid::parse_str(id) else {
         return Ok(Resolution::NotFound);
     };
+    // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
     let updated = sqlx::query(
         "UPDATE quality_incident \
          SET status = 'resolved', resolved_at = now(), resolved_by_user_id = $2, resolution = $3 \
-         WHERE id = $1 AND status = 'open'",
+         WHERE id = $1 AND status IN ('open', 'stale')",
     )
     .bind(id)
     .bind(by)
@@ -295,10 +300,11 @@ pub async fn resolve_for_rule(
     by: Uuid,
     resolution: &str,
 ) -> Result<u64, StoreError> {
+    // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
     let done = sqlx::query(
         "UPDATE quality_incident \
          SET status = 'resolved', resolved_at = now(), resolved_by_user_id = $2, resolution = $3 \
-         WHERE rule_id = $1 AND status = 'open'",
+         WHERE rule_id = $1 AND status IN ('open', 'stale')",
     )
     .bind(rule_id)
     .bind(by)
@@ -574,6 +580,24 @@ pub async fn freshness_resolved_since(
     .bind(since)
     .fetch_one(pool)
     .await?)
+}
+
+/// Marks any open incident for `rule_id` as stale because a subsequent run passed.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] if the update fails.
+// PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: a passing run marks any open incident for this rule stale
+pub async fn mark_stale_for_rule(pool: &PgPool, rule_id: &str) -> Result<u64, StoreError> {
+    let done = sqlx::query(
+        "UPDATE quality_incident \
+         SET status = 'stale' \
+         WHERE rule_id = $1 AND status = 'open'",
+    )
+    .bind(rule_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 #[cfg(test)]

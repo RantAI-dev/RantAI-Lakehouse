@@ -147,6 +147,16 @@ pub(crate) async fn resolve_for_deleted_rule(
     }
 }
 
+// PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: a passing run marks any open incident for this rule stale
+pub(crate) async fn mark_stale_for_passed_run(state: &AppState, rule: &QualityRule) {
+    let Some(pg) = state.pg.as_deref() else {
+        return;
+    };
+    if let Err(err) = quality::mark_stale_for_rule(pg, &rule.id).await {
+        tracing::warn!(?err, rule = %rule.name, "quality: could not mark open incident stale");
+    }
+}
+
 /// The `GET /api/governance/quality/incidents` query.
 #[derive(Debug, serde::Deserialize)]
 pub struct IncidentsQuery {

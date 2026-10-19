@@ -80,7 +80,8 @@ export type QualityIncident = {
   /** When a run or a pass last found it still broken. */
   lastSeenAt: string
   detail: string
-  status: "open" | "resolved" | string
+  // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
+  status: "open" | "stale" | "resolved" | string
   resolvedAt: string | null
   resolvedBy: string | null
   resolution: string | null

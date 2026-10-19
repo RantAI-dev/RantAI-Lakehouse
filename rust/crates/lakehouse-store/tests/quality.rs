@@ -11,8 +11,8 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::quality::{
     IncidentKind, Resolution, ScheduleMode, StatusFilter, freshness_resolved_since, list,
-    list_schedules, load_summaries, load_summary, purge_loads, put_schedule, recent_loads,
-    record_failure, record_load, resolve, resolve_for_rule,
+    list_schedules, load_summaries, load_summary, mark_stale_for_rule, purge_loads, put_schedule,
+    recent_loads, record_failure, record_load, resolve, resolve_for_rule,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -478,5 +478,76 @@ async fn a_resolved_freshness_incident_after_the_last_load_is_remembered(
             .await
             .unwrap()
     );
+    Ok(())
+}
+
+// PR #106 review R1 SHOULD-FIX DATA-14 3 / D2
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_passing_run_marks_open_incident_stale_and_a_person_resolves(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let opened = record_failure(
+        &pool,
+        "silver.orders",
+        Some("r1"),
+        IncidentKind::Check,
+        "failed",
+    )
+    .await
+    .unwrap();
+    assert!(opened.opened);
+
+    let list_open = list(&pool, StatusFilter::Open, None).await.unwrap();
+    assert_eq!(list_open[0].status, "open");
+
+    // Passing run marks it stale:
+    let affected = mark_stale_for_rule(&pool, "r1").await.unwrap();
+    assert_eq!(affected, 1);
+
+    let list_stale = list(&pool, StatusFilter::Open, None).await.unwrap();
+    assert_eq!(list_stale[0].status, "stale");
+    assert!(list_stale[0].resolved_at.is_none());
+
+    // If it fails again while stale, it updates the existing incident back to open:
+    let refailed = record_failure(
+        &pool,
+        "silver.orders",
+        Some("r1"),
+        IncidentKind::Check,
+        "failed while stale",
+    )
+    .await
+    .unwrap();
+    assert!(!refailed.opened);
+    assert_eq!(refailed.id, opened.id);
+    let list_reopened = list(&pool, StatusFilter::Open, None).await.unwrap();
+    assert_eq!(list_reopened[0].status, "open");
+
+    // Pass again to mark stale:
+    mark_stale_for_rule(&pool, "r1").await.unwrap();
+
+    // Only a person resolves:
+    let res = resolve(&pool, &opened.id, USER, "fixed in source")
+        .await
+        .unwrap();
+    assert!(matches!(res, Resolution::Resolved(_)));
+
+    let list_after = list(&pool, StatusFilter::Resolved, None).await.unwrap();
+    assert_eq!(list_after[0].status, "resolved");
+    assert_eq!(list_after[0].resolution.as_deref(), Some("fixed in source"));
+
+    // If it fails after resolution, it opens a brand new incident:
+    let reopened = record_failure(
+        &pool,
+        "silver.orders",
+        Some("r1"),
+        IncidentKind::Check,
+        "failed again",
+    )
+    .await
+    .unwrap();
+    assert!(reopened.opened);
+    assert_ne!(reopened.id, opened.id);
+
     Ok(())
 }

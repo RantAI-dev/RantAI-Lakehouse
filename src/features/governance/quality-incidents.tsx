@@ -137,6 +137,8 @@ function IncidentRow({
           <Pill tone={incident.kind === "check" ? "destructive" : "warning"}>
             {INCIDENT_KIND_LABEL[incident.kind] ?? incident.kind}
           </Pill>
+          {/* PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: show stale badge on incidents page */}
+          {incident.status === "stale" ? <Pill tone="neutral">stale</Pill> : null}
           {incident.ruleName ? (
             <span className="font-mono text-xs text-muted-foreground">{incident.ruleName}</span>
           ) : null}
@@ -154,7 +156,7 @@ function IncidentRow({
           ) : null}
         </p>
       </div>
-      {onResolve && incident.status === "open" ? (
+      {onResolve && (incident.status === "open" || incident.status === "stale") ? (
         <Button size="sm" variant="outline" onClick={() => onResolve(incident)}>
           Resolve
         </Button>

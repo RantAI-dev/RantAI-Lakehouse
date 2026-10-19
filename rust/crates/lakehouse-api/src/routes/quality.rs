@@ -1005,6 +1005,9 @@ async fn evaluate(state: &AppState, rule: &QualityRule, run_by: &str) -> Result<
         // person resolves it. Bookkeeping after the verdict is saved: if it
         // fails the run still succeeded, and the next failed run tries again.
         crate::routes::quality_incidents::open_for_failed_run(state, rule, &verdict.value).await;
+    } else if verdict.status == "passed" {
+        // PR #106 review R1 SHOULD-FIX DATA-14 3 / D2: a passing run marks any open incident for this rule stale
+        crate::routes::quality_incidents::mark_stale_for_passed_run(state, rule).await;
     }
     Ok(verdict)
 }
