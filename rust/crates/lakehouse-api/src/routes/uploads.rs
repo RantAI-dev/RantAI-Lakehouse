@@ -19,12 +19,31 @@
 //! 3. `POST /api/uploads/{id}/ingest` hands the file to `file_ingest_job` with
 //!    what the user confirmed. The job writes Bronze through the shared sink.
 //!    This module never writes Iceberg.
+//!    A large file, or several, takes the chunked route instead (`DATA-17`,
+//!    [`sessions`]): `POST /api/uploads/sessions`, `PUT .../parts/{n}`,
+//!    `GET .../parts`, `POST .../complete`. It ends in the same state, an
+//!    `uploaded` file, after the same checks and the same sentences, so every
+//!    step below works on either.
 //! 4. `GET /api/uploads` and `GET /api/uploads/{id}` report the outcome. The
 //!    job writes nothing to Postgres (ADR 0014, decision 5): the API reads its
 //!    result back from `lake.bronze_meta.ingest_run` and settles the row when
 //!    it is read ([`Settler`]).
 //! 5. `DELETE /api/uploads/{id}` removes the object and the row. The table the
 //!    upload became stays, and so does the claim on its name.
+//!
+//! # Chunked uploads (`DATA-17`, plan AD1)
+//!
+//! `POST /api/uploads` reads the whole file in one request, and the proxy in
+//! front of the API cuts a body past 51 MiB, so it stays at 50 MiB for API
+//! callers and scripts (feature page decision 14). The console uses the
+//! chunked route: the file arrives as 8 MiB pieces, each stored as one part of
+//! an S3 multipart upload, with the multipart id and every piece's `ETag` and
+//! SHA-256 in Postgres (`file_upload_part`, migration `0090`), so a restart
+//! loses nothing and any API process can take the next piece. The file is
+//! `receiving` until it completes; preview and ingest refuse it (409) and
+//! delete aborts it. The protocol, its memory bound and the limit it shares
+//! with `POST /api/uploads` are written at the top of [`sessions`]; the
+//! hourly sweep that removes unfinished sessions is `crate::upload_sweep`.
 //!
 //! # Posture
 //!

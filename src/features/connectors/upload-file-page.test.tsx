@@ -1102,7 +1102,7 @@ describe("UploadFilePage, with ?id=", () => {
     render(<UploadFilePage />)
     expect(await screen.findByText("Not found")).toBeDefined()
     expect(screen.getByText(/Upload not found\./)).toBeDefined()
-    expect(screen.queryByLabelText("Choose a file")).toBeNull()
+    expect(screen.queryByLabelText("Choose files")).toBeNull()
   })
 
   it("opens an upload that is loading on its status", async () => {
