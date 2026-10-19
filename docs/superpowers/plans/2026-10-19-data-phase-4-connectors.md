@@ -601,3 +601,45 @@ regenerate it with the repository's generator and commit any difference.
 Not verified by the developer and still open: every Rust test (CI),
 the `g6-saas` job (CI), a browser look (end of phase), brand marks
 (slice 7, against the current Simple Icons release).
+
+After the fix round: CI on `dc3373ae` green, 38 of 38 checks (the hand-edited
+`tool_schemas.json` passes the byte-identical snapshot, so `SHOULD-FIX 2` is
+closed; `0097` and its test pass).
+
+### Review of slice 2 (planner, 2026-10-19, head `9df9103a`)
+
+Read: the handoff, `UPSTREAM.md` of both copies, the Zendesk duplicate fix
+and its test, the HubSpot search cursor, the gate override. CI on this head
+runs with the push of this review.
+
+- `BLOCKER 3` (Zendesk browser sign-in). Decision 3 says a sign-in that
+  `SRC-12` cannot serve as it stands is extended, not dropped. Add a third
+  client authentication, `client_secret_post_json` (client id and secret in
+  a JSON body), to the vendor table, the Rust token, refresh and probe
+  calls, Python `rest._token_request`, the fixture and the console mirror;
+  Zendesk's row uses it; remove the strict `xfail`; the gate's sign-in step
+  runs. Cite the Zendesk documentation page in the commit.
+- `BLOCKER 4` (the gate proves the vendor code, not the product). AD9 and
+  the SRC-9 registry ask for connect, discover, load and reload steps that
+  are `real`, which means through the product: create the connector through
+  the API (the type being unsupported does not refuse it, as the developer
+  found), the API's connection test, discovery through the orchestrator,
+  a load and an incremental reload through `ingest_job` into Bronze
+  Iceberg, checked by reading the table. Build this once for both vendors
+  so later slices add only their steps; keep the vendor-only steps. The job
+  needs the Dagster services, so record its time; if it cannot fit the
+  20-minute budget, report it rather than cutting steps.
+- Gate host override (`rebase_for_gate`): accepted, because it only acts
+  under the existing gate-only switch `CONNECTOR_OAUTH_ALLOW_HTTP=true`,
+  names a vendor and takes a bare origin. `SHOULD-FIX 5`: a test that it is
+  ignored when the switch is off, and the Rust side gets the same rule
+  under the same switch (the API's probe and sign-in must reach the mock
+  for `BLOCKER 4`), with the same test.
+- HubSpot `/crm/v3/` paths: accepted for now; `SHOULD-FIX 6`: record in
+  `UPSTREAM.md` that the date-versioned API exists and v3 has no announced
+  end date as of 2026-10-19, with the page read.
+- Registry by path and `describe` answering `None`: accepted.
+- HubSpot deletes not claimed, Zendesk deletes marked not removed: matches
+  decision 7 ("applied where the vendor reports deletes"); the connector
+  page must say a deleted Zendesk ticket stays with `status = deleted`.
+  `SHOULD-FIX 7` if the page text does not say so today.
