@@ -118,6 +118,10 @@ def _real_get(url: str, *, headers: dict, params: dict | None, timeout: float) -
     return requests.get(url, headers=headers, params=params, timeout=timeout, allow_redirects=False)
 
 
+def _real_post(url: str, *, headers: dict, json: Any, timeout: float) -> Any:
+    return requests.post(url, headers=headers, json=json, timeout=timeout, allow_redirects=False)
+
+
 class SaasSession:
     """One vendor's HTTP reads under the link and rate-limit rules above.
 
@@ -134,6 +138,7 @@ class SaasSession:
         *,
         adopt_suffixes: tuple[str, ...] = (),
         http_get: Callable[..., Any] | None = None,
+        http_post: Callable[..., Any] | None = None,
         refresh_auth: Callable[[], None] | None = None,
         resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
         sleep: Callable[[float], None] = time.sleep,
@@ -145,6 +150,7 @@ class SaasSession:
         self._adopt_suffixes = adopt_suffixes
         self._refresh_auth = refresh_auth
         self._http_get = http_get or _real_get
+        self._http_post = http_post or _real_post
         self._resolve_checked = resolve_checked
         self._sleep = sleep
         self._max_attempts = max(1, max_attempts)
@@ -195,6 +201,27 @@ class SaasSession:
 
         # Errors
 
+        See `_send`: the same for `post_json`.
+        """
+        return self._send("GET", target, params, None)
+
+    def post_json(self, target: str, body: Any) -> Any:
+        """POST `body` as JSON to `target` (same rules as `get_json`) and return
+        the answer's JSON. For the vendors whose change filter is a search
+        request and not a query string (HubSpot's CRM search, `SRC-3` V-HubSpot.1).
+        The request is a read: a vendor module posts only to a search endpoint.
+
+        # Errors
+
+        See `_send`.
+        """
+        return self._send("POST", target, None, body)
+
+    def _send(self, method: str, target: str, params: dict | None, body: Any) -> Any:
+        """One request under the link, address and rate-limit rules.
+
+        # Errors
+
         `ssrf_guard.SsrfBlocked` (another host, a blocked address, a redirect),
         `SaasSignInRefused`, `SaasPermissionMissing`, `SaasRateLimited`,
         `requests.HTTPError` for another error status, and whatever `requests`
@@ -208,7 +235,10 @@ class SaasSession:
             resolved = self._resolve_checked(host, port)
             headers = self._auth_headers()
             with ssrf_guard.pinned_resolution(host, resolved):
-                response = self._http_get(url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT_SECONDS)
+                if method == "POST":
+                    response = self._http_post(url, headers=headers, json=body, timeout=_REQUEST_TIMEOUT_SECONDS)
+                else:
+                    response = self._http_get(url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT_SECONDS)
             status = response.status_code
             if 300 <= status < 400:
                 raise ssrf_guard.SsrfBlocked("the vendor answered with a redirect; not followed")

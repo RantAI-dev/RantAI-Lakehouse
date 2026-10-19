@@ -265,3 +265,32 @@ def test_a_token_request_for_a_basic_client_carries_the_client_in_the_header_onl
     assert "client_id" not in seen["data"] and "client_secret" not in seen["data"]
     sent = seen["headers"]["Authorization"].removeprefix("Basic ")
     assert base64.b64decode(sent).decode() == "app%20id:s3cret%3A%2B"
+
+
+class PostRecorder:
+    """An injected `http_post`: keeps the url, the headers and the JSON body."""
+
+    def __init__(self, *replies: Reply) -> None:
+        self.replies = list(replies)
+        self.calls: list[tuple[str, dict, object]] = []
+
+    def __call__(self, url: str, *, headers: dict, json: object, timeout: float) -> Reply:
+        self.calls.append((url, headers, json))
+        return self.replies.pop(0) if self.replies else Reply()
+
+
+def test_a_post_runs_under_the_same_rules_as_a_get() -> None:
+    """SRC-3 V-HubSpot.1: the CRM search is a POST; it must not be a way round the link rule."""
+    post = PostRecorder(Reply(429, headers={"Retry-After": "2"}), Reply(body={"results": []}))
+    slept: list[float] = []
+    session, asked = make(Recorder(), http_post=post, sleep=slept.append)
+    assert session.post_json("/crm/v3/objects/deals/search", {"limit": 1}) == {"results": []}
+    assert slept == [2.0] and [c[0] for c in post.calls] == [f"{ORIGIN}/crm/v3/objects/deals/search"] * 2
+    assert post.calls[0][2] == {"limit": 1} and asked == ["asked", "asked"]
+    with pytest.raises(ssrf_guard.SsrfBlocked):
+        session.post_json("https://evil.example.invalid/search", {})
+    assert len(post.calls) == 2, "another host: nothing was sent"
+    redirect = PostRecorder(Reply(307, headers={"Location": "http://169.254.169.254/"}))
+    session, _ = make(Recorder(), http_post=redirect)
+    with pytest.raises(ssrf_guard.SsrfBlocked):
+        session.post_json("/search", {})

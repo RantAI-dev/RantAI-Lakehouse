@@ -32,7 +32,7 @@ never an address to dial.
 
 # The invariant the session keeps for the module
 
-`SaasSession.get_json` is the only HTTP call a module makes. A vendor module
+`SaasSession.get_json` / `post_json` are the only HTTP calls a module makes. A vendor module
 that imports `requests` itself would go round the link rule; the SRC-9-style
 lint of slice 7 is the place to forbid that (plan section 8).
 """
@@ -143,6 +143,7 @@ def open_session(
     connector_id: str | None = None,
     resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
     http_get: Callable[..., Any] | None = None,
+    http_post: Callable[..., Any] | None = None,
     report_refresh_token: Callable[[str], None] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> tuple[Any, vendors.Vendor, vendors.AccountParts, SaasSession]:
@@ -176,6 +177,7 @@ def open_session(
         headers,
         adopt_suffixes=tuple(getattr(module, "adopt_suffixes", ())),
         http_get=http_get,
+        http_post=http_post,
         refresh_auth=refresh,
         resolve_checked=resolve_checked,
         **extra,
@@ -209,6 +211,7 @@ def build_source(
     gate: Callable[[schema_observer.ReflectedTable], schema_observer.Decision] | None = None,
     resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
     http_get: Callable[..., Any] | None = None,
+    http_post: Callable[..., Any] | None = None,
     report_refresh_token: Callable[[str], None] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> AdapterBuildResult | None:
@@ -229,6 +232,7 @@ def build_source(
         connector_id=connector_id,
         resolve_checked=resolve_checked,
         http_get=http_get,
+        http_post=http_post,
         report_refresh_token=report_refresh_token,
         sleep=sleep,
     )
