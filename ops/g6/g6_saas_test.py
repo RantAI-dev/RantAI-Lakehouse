@@ -229,9 +229,90 @@ def step_hubspot() -> None:
     admin("hubspot", action="revoke", on=False)
 
 
+def _zendesk(secrets: dict | None = None):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import zendesk as _module  # noqa: F401 -- imported for its registration
+
+    dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "integration"}}
+    secrets = secrets or {"email": "agent@example.invalid", "apiToken": "stub-api-token"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_zendesk() -> None:
+    """Zendesk (V-Zendesk.4): connect (email + API token), discover, load (no ticket twice
+    at a page boundary: upstream #659), reload (cursor export; a change, a new ticket, a
+    deleted one), a new field, rate limit, revoked and forbidden sign-in."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("zendesk", action="reset")
+
+    module, vendor, parts, session, dial = _zendesk()
+    who = session.get_json(vendor.whoami["path"])
+    _expect(who["user"]["id"] == 7, f"zendesk connect: the account it reached is {who!r}")
+    _log("zendesk connect: the email and API token reach user 7")
+    _log("zendesk connect (browser sign-in): NOT RUN. Zendesk's token request must be JSON and the product's is form-encoded (plan section 11, slice 2 handoff); the mock has no OAuth either")
+
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect({"tickets", "users", "ticket_events", "organizations", "groups"} <= set(declared), "zendesk discover: the objects are not listed")
+    _expect(declared["tickets"].deletes and declared["tickets"].load_description() == "incremental", "zendesk discover: tickets")
+    _expect(declared["groups"].load_description().startswith("re-read in full: "), "zendesk discover: groups")
+    _log(f"zendesk discover: {len(declared)} objects; tickets incremental and reporting deletes, groups re-read in full")
+
+    # The mock must still send the duplicate of upstream #659, or the check below proves nothing.
+    raw = []
+    link = f"/api/v2/incremental/tickets.json?start_time={int(time.time()) - 2 * 86_400}&per_page=3"
+    while link:
+        page = session.get_json(link)
+        raw += [t["id"] for t in page["tickets"]]
+        link = None if page["end_of_stream"] else page["next_page"]
+    _expect(len(raw) > len(set(raw)), f"zendesk load: the mock's time-based export repeated nothing ({raw}); it must, to model Zendesk")
+    first = _read(module, parts, session, dial, "tickets")
+    _expect(sorted(t["id"] for t in first) == [1, 2, 3, 4, 5, 6], f"zendesk load: read {[t['id'] for t in first]}, expected each of 6 tickets once")
+    _log(f"zendesk load: the time-based export sends {raw} (duplicates at the page boundaries); the connector reads each of the 6 tickets once")
+
+    cursor = max(t["updated_at"] for t in first)
+    admin("zendesk", action="put", id=2, fields={"subject": "ticket 2 changed"})
+    admin("zendesk", action="put", id=7, fields={"subject": "ticket 7 new"})
+    admin("zendesk", action="delete", id=3)
+    admin("zendesk", action="clear_log")
+    again = _read(module, parts, session, dial, "tickets", since=cursor)
+    got = {t["id"]: t["status"] for t in again}
+    _expect(set(got) == {2, 3, 6, 7}, f"zendesk reload: read {sorted(got)}, expected the changed (2), the deleted (3), the new (7) and the cursor's own (6)")
+    _expect(got[3] == "deleted" and declared["tickets"].deletes, "zendesk reload: the deleted ticket does not say deleted")
+    _expect(all("/cursor.json" in line for line in mock_log("zendesk") if "incremental" in line), "zendesk reload: a time-based export was used for tickets")
+    _log("zendesk reload: the changed, the new and the deleted ticket (status deleted) came back, and the cursor's own; nothing older, nothing twice")
+
+    admin("zendesk", action="add_field", name="priority_note")
+    changed = _read(module, parts, session, dial, "tickets", since=cursor)
+    _expect(any("priority_note" in t for t in changed), "zendesk schema change: the new field is not in the records")
+    _log("zendesk schema change: the new field arrives in the records; Zendesk has no describe, so the observer reports it after the load (decision 9)")
+
+    admin("zendesk", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, "groups")) == 7, "zendesk rate limit: the groups did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "zendesk rate limit: the Retry-After was not waited")
+    admin("zendesk", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, "groups"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "zendesk rate limit: the run report class")
+    admin("zendesk", action="rate_limit", count=0)
+    _log("zendesk rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("zendesk", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "groups"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "zendesk forbidden: the run report class")
+    admin("zendesk", action="forbid", on=False)
+    admin("zendesk", action="revoke", on=True)
+    exc = _raises("SaasSignInRefused", lambda: _read(module, parts, session, dial, "groups"))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "zendesk revoked: the run report class")
+    admin("zendesk", action="revoke", on=False)
+    _log("zendesk forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def run_vendors() -> None:
     _setup_vendor_environment()
     step_hubspot()
+    step_zendesk()
 
 
 def run() -> None:
