@@ -3250,7 +3250,9 @@ fn validate_certification(
 /// # Errors
 /// The tenant gate runs first and answers [`ApiError::PermissionDenied`]
 /// (`403`) with a fixed reason, exactly as [`put_annotation`] does, before
-/// the body is read and with nothing written. Then `400` with a fixed
+/// the body is read and with nothing written. Then `404` (`Asset not found.`)
+/// when the catalog holds no asset of that id and `503` when it cannot be asked
+/// ([`ensure_asset_exists`]); then `400` with a fixed
 /// sentence for each refusal of [`validate_certification`], for a
 /// replacement that is not an asset in the catalog, and for a replacement
 /// that is itself deprecated. [`ApiError::Unavailable`] without a Postgres
@@ -3268,6 +3270,8 @@ pub async fn put_certification(
         return Err(ApiError::PermissionDenied(reason.to_owned()).into());
     }
     validate_annotation_id(&id)?;
+    // PR #106 review R1 SHOULD-FIX DATA-12 1: ensure asset exists before mutating certification mark
+    ensure_asset_exists(&state, &id).await?;
     let parsed: CertificationBody = serde_json::from_slice(&body).map_err(|_| {
         ApiError::BadRequest("body must be JSON with a \"status\" field".to_owned())
     })?;
@@ -4992,7 +4996,8 @@ mod tests {
         async fn each_certification_refusal_has_its_sentence_and_writes_nothing(
             pool: lakehouse_store::PgPool,
         ) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             // A deprecated asset, to be refused as a replacement.
             put_mark(
                 &state,
@@ -5051,13 +5056,50 @@ mod tests {
             assert_eq!(err.0, StatusCode::BAD_REQUEST);
         }
 
+        // PR #106 review R1 SHOULD-FIX DATA-12 1
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_certification_refuses_a_nonexistent_asset(pool: lakehouse_store::PgPool) {
+            let ch = mock_clickhouse().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
+            let err = put_mark(
+                &state,
+                governor(TENANT_A),
+                "serving.no_such_table",
+                r#"{"status":"certified"}"#,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::NOT_FOUND);
+            assert_eq!(err.1, "Asset not found.");
+        }
+
         #[sqlx::test(migrations = "../../migrations")]
         async fn a_replacement_is_refused_with_503_when_the_catalog_cannot_be_read(
             pool: lakehouse_store::PgPool,
         ) {
-            // No search copy seeded and no ClickHouse behind the mock: the
-            // replacement cannot be checked, so nothing is stored.
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            // ClickHouse confirms the target asset exists, but reading the catalog
+            // to check the replacement fails (500), so nothing is stored.
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains("system.columns"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        { "name": "name", "type": "String" },
+                        { "name": "type", "type": "String" },
+                    ],
+                    "data": [{ "name": "id", "type": "UInt64" }],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(500)
+                        .set_body_string("Code: 47. Database unavailable"),
+                )
+                .mount(&server)
+                .await;
+            let state = state_for(&pool, &server.uri(), Some(TENANT_A));
             let err = put_mark(
                 &state,
                 governor(TENANT_A),
@@ -5080,7 +5122,8 @@ mod tests {
         async fn a_member_certifies_with_their_display_name_and_clears_it(
             pool: lakehouse_store::PgPool,
         ) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             put_mark(
                 &state,
                 governor(TENANT_A),
@@ -5116,7 +5159,8 @@ mod tests {
 
         #[sqlx::test(migrations = "../../migrations")]
         async fn a_deprecation_stores_its_note_and_replacement(pool: lakehouse_store::PgPool) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             prime_search_copy_with(&state, &["serving.mart_x", "serving.mart_y"]).await;
             put_mark(
                 &state,
@@ -5157,7 +5201,8 @@ mod tests {
         async fn a_certification_write_drops_the_search_copy_and_a_refusal_keeps_it(
             pool: lakehouse_store::PgPool,
         ) {
-            let state = state_for(&pool, "http://127.0.0.1:0", Some(TENANT_A));
+            let ch = mock_clickhouse_with_table().await;
+            let state = state_for(&pool, &ch.uri(), Some(TENANT_A));
             prime_search_copy(&state).await;
             put_mark(
                 &state,
