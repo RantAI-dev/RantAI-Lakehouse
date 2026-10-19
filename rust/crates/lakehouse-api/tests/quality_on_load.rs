@@ -388,6 +388,77 @@ async fn a_connector_runs_success_runs_the_rules_of_every_table_it_loads() {
     );
 }
 
+// PR #106 review R1 BLOCKER 3
+#[tokio::test]
+async fn a_paused_connector_run_follows_up_no_tables() {
+    let app = app().await;
+    sqlx::query(
+        "UPDATE connector SET adapter = 'sql', ingest_mode = 'batch', dial = '{}'::jsonb, \
+         source_objects = '[{\"name\":\"orders\",\"target\":\"orders_raw\"}]'::jsonb WHERE id = $1",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO connector_run (run_id, connector_id, trigger_kind, status, started_at) \
+         VALUES ('run-paused', $1, 'schedule', 'paused', now())",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    app.knows_run(
+        "run-paused",
+        json!({ "ops": { "run_ingest": { "config": { "connector_id": CONNECTOR } } } }),
+        "SUCCESS",
+    )
+    .await;
+    app.failing_rule("orders_rows", "bronze.orders_raw").await;
+    app.schedule("bronze.orders_raw", ScheduleMode::OnLoad)
+        .await;
+
+    let (status, body) = app.run_finished("run-paused", "ingest_job").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    App::settle().await;
+    assert_eq!(app.followups_recorded().await, 0);
+    assert!(app.incident_assets().await.is_empty());
+}
+
+// PR #106 review R1 BLOCKER 3
+#[tokio::test]
+async fn a_one_table_connector_run_follows_up_only_that_object() {
+    let app = app().await;
+    sqlx::query(
+        "UPDATE connector SET adapter = 'sql', ingest_mode = 'batch', dial = '{}'::jsonb, \
+         source_objects = '[{\"name\":\"orders\",\"target\":\"orders_raw\"},\
+         {\"name\":\"items\",\"target\":\"items_raw\"}]'::jsonb WHERE id = $1",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    app.knows_run(
+        "run-one-table",
+        json!({ "ops": { "run_ingest": { "config": { "connector_id": CONNECTOR, "object": "orders", "action": "refresh" } } } }),
+        "SUCCESS",
+    )
+    .await;
+    for (name, asset) in [
+        ("orders_rows", "bronze.orders_raw"),
+        ("items_rows", "bronze.items_raw"),
+    ] {
+        app.failing_rule(name, asset).await;
+        app.schedule(asset, ScheduleMode::OnLoad).await;
+    }
+
+    let (status, body) = app.run_finished("run-one-table", "ingest_job").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    app.wait_for_incident("bronze.orders_raw").await;
+    App::settle().await;
+    assert_eq!(app.incident_assets().await, vec!["bronze.orders_raw"]);
+}
+
 /// A connector run that failed is refused by the event and follows nothing up.
 #[tokio::test]
 async fn a_failed_connector_run_triggers_nothing() {

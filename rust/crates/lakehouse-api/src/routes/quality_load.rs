@@ -45,11 +45,20 @@ fn pipeline_table(target: &str) -> Option<String> {
 }
 
 /// The Bronze tables a connector's ingest spec loads.
-fn connector_tables(source_objects: &Value) -> Vec<String> {
+// PR #106 review R1 BLOCKER 3: filter by object when run was scoped to a single object
+fn connector_tables(source_objects: &Value, object_filter: Option<&str>) -> Vec<String> {
     source_objects
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|object| {
+            let Some(filter) = object_filter else {
+                return true;
+            };
+            let name = object.get("name").and_then(Value::as_str);
+            let target = object.get("target").and_then(Value::as_str);
+            name == Some(filter) || target == Some(filter)
+        })
         .filter_map(|object| object.get("target").and_then(Value::as_str))
         .filter(|target| !target.trim().is_empty())
         .map(|target| format!("bronze.{}", target.trim().to_lowercase()))
@@ -116,10 +125,33 @@ async fn connector_loaded(state: &AppState, pool: &PgPool, run_id: &str) -> Opti
             return None;
         }
     };
+    // PR #106 review R1 BLOCKER 3: skip clear and filter scoped object
+    let config = match state.dagster.run_config(run_id).await {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            tracing::warn!(run = run_id, "quality load: run not found in Dagster");
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(%err, run = run_id, "quality load: Dagster run config could not be read");
+            return None;
+        }
+    };
+    if config
+        .pointer("/ops/run_ingest/config/action")
+        .and_then(Value::as_str)
+        == Some("clear")
+    {
+        return None;
+    }
+    let object_filter = config
+        .pointer("/ops/run_ingest/config/object")
+        .and_then(Value::as_str);
+
     match connectors::get_ingest_spec(pool, &connector.id).await {
         Ok(Some(spec)) => Some((
             format!("connector:{}", connector.id),
-            connector_tables(&spec.source_objects),
+            connector_tables(&spec.source_objects, object_filter),
         )),
         Ok(None) => None,
         Err(err) => {
@@ -190,7 +222,10 @@ pub(super) async fn connector_success(
     req: &RunFailedBody,
 ) -> Result<Value, ApiError> {
     let handled = load_alerts::connector_run_event(state, pool, req, Outcome::Success).await?;
-    spawn_connector(state, req);
+    // PR #106 review R1 BLOCKER 3: follow up only when the event counted a load (not skipped)
+    if handled.get("reason").is_none() {
+        spawn_connector(state, req);
+    }
     Ok(handled)
 }
 
