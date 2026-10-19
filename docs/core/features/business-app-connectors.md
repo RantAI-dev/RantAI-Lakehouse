@@ -128,8 +128,12 @@ Reported, not lowered (`AGENTS.md`, step 0):
 To be confirmed when the plan is built. Expected from the defaults:
 
 - Google Analytics loads reports you define, not raw events.
-- Records deleted at the vendor are removed only for Salesforce, Zendesk,
-  SharePoint and Dynamics 365.
+- Records deleted at the vendor are marked or removed only for Salesforce,
+  Zendesk, SharePoint and Dynamics 365. A deleted Zendesk ticket is not removed
+  from Bronze: it stays, and its row says `status = deleted` (Zendesk keeps it in
+  its export with that status, scrubs its content after 30 days and drops it from
+  exports 90 days after a permanent deletion). HubSpot reports no deletes in the
+  same read, so a record archived there stays until a full reload.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.
 - SharePoint and Confluence files and attachments are not loaded.

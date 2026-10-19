@@ -41,3 +41,12 @@ directory; `git diff` against it shows exactly what follows.
    so this path reports no deletes. Associations are not read (the search
    response has none; the list path of upstream still can). Tests:
    `test_saas_vendored_hubspot.py`.
+
+## API version (SHOULD-FIX 6 of the slice 2 review)
+
+This copy, like upstream, calls the `/crm/v3/...` paths. HubSpot's reference now
+documents date-versioned paths (`/crm/objects/2026-09/...`,
+https://developers.hubspot.com/docs/api/overview and the CRM search page). On
+2026-10-19 those pages were read and announce no end date for `v3`; the v3 paths
+are therefore kept. Moving to a dated version is a separate, reviewed change; a
+HubSpot sunset notice for `v3` is the trigger to make it.
