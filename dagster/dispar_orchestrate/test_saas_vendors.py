@@ -69,7 +69,7 @@ def test_an_unknown_vendor_and_a_vendor_without_a_module_are_unsupported() -> No
     with pytest.raises(vendors.UnsupportedVendor):
         vendors.vendor("nobody")
     with pytest.raises(vendors.UnsupportedVendor):
-        vendors.module_for("zendesk")
+        vendors.module_for("netsuite")  # no module until slice 6
     with pytest.raises(vendors.UnsupportedVendor):
         vendors.register("nobody", object())
 

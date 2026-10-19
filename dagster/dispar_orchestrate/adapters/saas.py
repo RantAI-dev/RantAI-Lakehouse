@@ -21,8 +21,9 @@ modules, and the tests' fake vendor is a small class):
     declaration(session, parts, dial, name)  -> ObjectDecl for one object
     read(session, parts, dial, decl, since)  -> iterator of dict records; `since` is
                                                 the cursor's last value, or None
-    describe(session, parts, dial, name)     optional -> list[Field]; a vendor that
-                                                describes its fields (decision 9)
+    describe(session, parts, dial, name)     optional -> list[Field] or None; a vendor that
+                                                describes its fields (decision 9); None for
+                                                an object it cannot describe
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
 
@@ -251,12 +252,14 @@ def build_source(
     columns: list[str] | None = None
     observed_before = False
     describe = getattr(module, "describe", None)
-    if describe is not None and gate is not None:
-        # AD7, decision 9: the fields are shown to the API BEFORE the load, so
-        # "ask first" and "pause" can hold the table back (the same gate the SQL
-        # sources use). `loaded_name` is the name itself: a vendor field is
-        # already the name the Bronze table will have.
-        fields: list[Field] = describe(session, parts, dial, name)
+    # AD7, decision 9: the fields are shown to the API BEFORE the load, so "ask
+    # first" and "pause" can hold the table back (the same gate the SQL sources
+    # use). `loaded_name` is the name itself: a vendor field is already the name
+    # the Bronze table will have. A vendor that describes some objects only
+    # (HubSpot: no properties API for owners) answers `None` for the others,
+    # which then take the after-load path.
+    fields: list[Field] | None = describe(session, parts, dial, name) if describe is not None and gate is not None else None
+    if fields is not None and gate is not None:
         reflected = schema_observer.ReflectedTable(
             columns=tuple(schema_observer.ReflectedColumn(f.name, f.type_name, f.nullable, loaded_name=f.name) for f in fields),
             primary_key=tuple(decl.primary_key),

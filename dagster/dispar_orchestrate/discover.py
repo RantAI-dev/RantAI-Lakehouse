@@ -722,6 +722,8 @@ def _saas(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> d
         raise NotSupported("this vendor does not describe its fields before a load")
     decl = module.declaration(session, parts, dial, request.object)
     fields = describe(session, parts, dial, request.object)
+    if fields is None:
+        raise NotSupported("this vendor does not describe the fields of this object before a load")
     return preview([column(f.name, f.type_name, inferred=False) for f in fields], list(decl.primary_key))
 
 

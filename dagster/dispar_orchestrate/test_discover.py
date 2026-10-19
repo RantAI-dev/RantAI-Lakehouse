@@ -1002,7 +1002,7 @@ class _FakeSaasModule:
 _SAAS = {
     "id": "conn-1",
     "adapter": "saas",
-    "dial": {"vendor": "zendesk", "account": "acme", "auth": {"type": "integration"}},
+    "dial": {"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}},  # a vendor with no module yet
     "secretRef": "env:CONNECTOR_SAAS_TOKEN",
 }
 
@@ -1056,3 +1056,10 @@ def test_a_saas_vendor_with_no_module_is_not_supported_through_the_real_opener()
     with pytest.raises(Exception) as raised:
         discover.discover(_SAAS, _request("list"), backends=_backends())
     assert discover.classify_discovery(raised.value) == discover.NOT_SUPPORTED
+
+
+def test_a_saas_object_the_vendor_cannot_describe_has_no_preview() -> None:
+    module = _FakeSaasModule()
+    module.describe = lambda session, parts, dial, name: None  # type: ignore[method-assign]
+    with pytest.raises(discover.NotSupported):
+        discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(module))

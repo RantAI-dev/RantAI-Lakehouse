@@ -17,13 +17,16 @@ table. A vendor module never receives an address typed by a person.
 
 # The registry
 
-A vendor module (slices 2 to 6) calls `register(vendor_id, module)`. Until it
-does, `module_for` raises `UnsupportedVendor`, which the ingest classifies as
-`unsupported`: slice 1 ships the adapter with no vendor behind it, honestly.
+A vendor module (slices 2 to 6) is named in `MODULE_PATHS`; `module_for` imports
+it on first use, so a vendor that has no module yet (and a vendor id nobody
+registered) raises `UnsupportedVendor`, which the ingest classifies as
+`unsupported`: honest, never a guess. `register(vendor_id, module)` is the
+other way in, for a test's fake vendor; it takes precedence over the path.
 """
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -342,6 +345,13 @@ def secret_fields_for(auth_type: str) -> tuple[str, ...] | None:
 
 _MODULES: dict[str, Any] = {}
 
+# The vendors that have a module, by import path. A vendor's slice adds its line
+# (SRC-3 plan section 5); nothing else imports a vendor module, so the
+# orchestrator loads only what a connector uses.
+MODULE_PATHS: dict[str, str] = {
+    "hubspot": "dispar_orchestrate.saas.vendors.hubspot",
+}
+
 
 def register(vendor_id: str, module: Any) -> None:
     """Make `module` the implementation of vendor `vendor_id`.
@@ -368,6 +378,9 @@ def module_for(vendor_id: str) -> Any:
     `UnsupportedVendor` when none is registered.
     """
     module = _MODULES.get(vendor_id)
+    if module is None and vendor_id in MODULE_PATHS:
+        module = importlib.import_module(MODULE_PATHS[vendor_id])
+        _MODULES[vendor_id] = module
     if module is None:
         raise UnsupportedVendor()
     return module

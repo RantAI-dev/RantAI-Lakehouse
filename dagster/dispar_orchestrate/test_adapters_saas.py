@@ -170,8 +170,8 @@ def test_the_factory_offers_incremental_modes_to_saas_and_sql_but_not_to_rest() 
 
 
 def test_a_vendor_without_a_module_is_unsupported_and_not_retried() -> None:
-    with pytest.raises(vendors.UnsupportedVendor) as raised:
-        build(obj())
+    with pytest.raises(vendors.UnsupportedVendor) as raised:  # NetSuite has no module until slice 6
+        saas_adapter.build_source({"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}}, SECRETS, [obj()])
     assert ingest_errors.classify(raised.value) == ingest_errors.Classified(ingest_errors.UNSUPPORTED, retried=False)
 
 
@@ -209,3 +209,16 @@ def test_the_factory_resolves_saas_secrets_through_the_vendor_table(monkeypatch:
     )
     assert two == {"clientSecret": "value-of-env:A", "refreshToken": "value-of-env:B"}
     assert vendors.auth_type_of({"vendor": "nobody", "auth": {"type": "integration"}}) is None
+
+
+def test_an_object_the_vendor_cannot_describe_takes_the_after_load_path(vendor: FakeVendor) -> None:
+    """HubSpot has no properties API for owners: `describe` answers None (V-HubSpot.2)."""
+    vendor.describe = lambda session, parts, dial, name: None  # type: ignore[method-assign]
+    asked: list[object] = []
+
+    def never(reflected: schema_observer.ReflectedTable) -> schema_observer.Decision:
+        asked.append(reflected)
+        return accept_all(reflected)
+
+    result = build(obj(), gate=never)
+    assert result is not None and result.observed_before_load is False and asked == []
