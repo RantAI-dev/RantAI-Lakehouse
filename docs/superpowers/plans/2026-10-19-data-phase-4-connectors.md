@@ -416,6 +416,154 @@ Commands run on the final tree, with counts:
   - **Not verified:** the new Rust test `the_two_saas_classes_are_stored_worded_and_retried_only_for_the_rate_limit` (DB round trip, and that a made-up word is still refused by the CHECK) compiled but did not run; nor did `0097` itself against a database.
 - **SHOULD-FIX 2** not changed, and *not verified*: the repository's generator is the ignored Rust test `routes::ai::registry::tests::write_tool_schema_fixture` (`cargo test -p lakehouse-api --lib write_tool_schema_fixture -- --ignored`), a `cargo test` run that this machine may not do. The hand edit stays (one enum value, one description string, both in `registry.rs` and in the fixture); `tool_schemas_snapshot_is_byte_identical` in CI is the check. If it fails, run the generator on a machine that can and commit the difference.
 
+### Handoff: slice 2 (developer, 2026-10-19)
+
+HubSpot, then Zendesk (V-HubSpot.1 to .4, V-Zendesk.1 to .4), one task per commit, in
+that order. Base: `dc3373ae` (the slice 1 fix round).
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-HubSpot.1 | `62c21ac3` | HubSpot verified source, copied unchanged |
+| V-HubSpot.1 | `3e4fda0e` | `SaasSession` can POST a search request |
+| V-HubSpot.1 | `1feaee7b` | vendored HubSpot reads only through `SaasSession` (local change 1) |
+| V-HubSpot.1 | `f0f8ab7a` | HubSpot loads incrementally by last-modified time through the search API (local change 2) |
+| V-HubSpot.2 | `00700ef5` | HubSpot objects, properties-API describe and reads |
+| V-HubSpot.3 | `87a919bb` | HubSpot sign-in, both ways, and the checked vendor row (scopes) |
+| V-HubSpot.4 | `9472fc0b` | mock HubSpot and the HubSpot steps of `g6-saas` |
+| V-Zendesk.1 | `0a51a40a` | Zendesk verified source, copied unchanged |
+| V-Zendesk.1 | `2d735595` | vendored Zendesk without Talk and Chat (local change 1) |
+| V-Zendesk.1 | `1dabfe4b` | vendored Zendesk reads only through `SaasSession` (local change 2) |
+| V-Zendesk.1 | `6bf27c37` | the duplicate of upstream #659 found and fixed (local change 3) |
+| V-Zendesk.2 | `659d7979` | Zendesk objects, incremental reads and deletes |
+| V-Zendesk.3 | `2510b78b` | Zendesk email + API token sign-in; browser sign-in blocked (below) |
+| V-Zendesk.4 | `1a810245` | mock Zendesk and the Zendesk steps of `g6-saas` |
+
+Both sources are copied from `dlt-hub/verified-sources` at one commit,
+`3957506893a7da821dbcc6acd51c7ca4475d1f53` (2026-07-03), into
+`dagster/dispar_orchestrate/saas/vendored/{hubspot,zendesk}/`, each with `UPSTREAM.md`
+(repo, commit, date, every local change with its reason) and the Apache-2.0 licence.
+The copy is its own commit and byte-identical. No new Python library: both sources use
+only `dlt` (pinned) and the standard library, so no pin, note or licence entry was added
+to `dagster/pyproject.toml`. `NOTICE` is not touched (slice 7, T7.3).
+
+**What was found, per vendor**
+
+- *The vendored code can be given our session* (the stop condition): both sources fetch
+  through `dlt.sources.helpers.requests` in a few functions (`helpers.py`;
+  `ZendeskAPIClient.get_pages`). Local change 1 of each replaces that by
+  `SaasSession.get_json` (the `api_key` / credentials parameters became the session; a
+  test fails if a vendored module imports an HTTP library). `SaasSession` gained
+  `post_json` for HubSpot's search, with the same address, link, redirect and 429 rules.
+- *HubSpot incremental* (`helpers.search_data_since`): the CRM search API, `GTE` on
+  `hs_lastmodifieddate` (`lastmodifieddate` for contacts), ascending, `after` paging. PR
+  #662 was read, not copied; differences, each for a limit HubSpot documents
+  (developers.hubspot.com/docs/api/crm/search): the 10,000-result cap restarts from the
+  newest time seen and raises `SearchOutOfBoundsException` (the module then reads the
+  object in full) when 10,000 records share one instant; properties beyond the
+  3,000-character body are batch-read by id; a 60 s lag before the cursor because HubSpot
+  says an update can take "a few moments" to be searchable. First run lists, later runs search.
+- *HubSpot deletes (decision 7)*: HubSpot's documentation says archived records "won't
+  appear in any search results"; the archived listing (`archived=true`) is a separate full
+  read. So no HubSpot object claims `deletes`, and a record archived at HubSpot stays in Bronze
+  until a full reload. The feature page's "Limits" list (deletes only for Salesforce,
+  Zendesk, SharePoint, Dynamics) is therefore right and needs no change.
+- *HubSpot describe (decision 9)*: the properties API, before the load; `None` for owners and
+  pipelines, which have no such API (the adapter and discovery take the after-load path).
+- *Zendesk duplicate (#659), cause*: `ticket_table` read the time-based export; such a page
+  ends at the `generated_timestamp` of its last item and the next page starts AT that time,
+  so the tickets sharing it are sent again (Zendesk documents it). In `ticket_events`
+  (`append` + primary key) the repeat is a stored row. *Fix*: tickets and users use the
+  cursor-based export (no repeat within an export); ticket events and organizations have only
+  the time-based one, so `get_pages(distinct_by=...)` drops an item with an already-seen
+  `id` + `created_at` / `updated_at`, Zendesk's own documented rule. The test shows
+  `[1, 2, 3, 3, 4, 5, 5, 6]` on the vendor's time-based endpoint and `[1, 2, 3, 4, 5, 6]` after.
+- *Zendesk deletes*: a deleted ticket stays in the export with `status = "deleted"`; only
+  tickets say `deletes` (the row is marked, not removed: Zendesk scrubs content after 30 days
+  and drops the record 90 days after a permanent deletion).
+- *Zendesk objects*: tickets, users, organizations, ticket events, ticket metric events
+  incremental; the verified source's other Support objects (31 in all) re-read in full with
+  the reason on the page. Custom fields are not pivoted (a pivot names columns after titles an
+  admin can rename and needs the source's state); `tags` and `custom_fields` are one JSON text.
+- *Vendor-table rows checked against vendor documentation (review item 5)*, URLs in the commit
+  bodies of `87a919bb` (HubSpot) and `2510b78b` (Zendesk). HubSpot's scopes were incomplete
+  (only `crm.objects.*.read` and `tickets`); corrected in Rust, the fixture, Python and the
+  console to add `crm.objects.quotes.read`, `crm.schemas.{companies,contacts,deals,quotes}.read`,
+  `e-commerce` and `oauth`. The scope names were read on HubSpot's reference pages; which
+  endpoint needs which is read from those pages, not tried on an account.
+
+**Plan mismatches found (the planner decides)**
+
+1. **Zendesk's browser sign-in cannot work with SRC-12's token request.** `POST /oauth/tokens`
+   "must be formatted as JSON" (developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/);
+   the product's token request (Rust `connector_oauth::token_request` for the callback and the
+   probe, `rest._token_request` in Python) is form-encoded, and the vendor table's `clientAuth`
+   (`post` / `basic`) cannot say "JSON". Zendesk's refresh token also rotates (handled by the
+   existing rotated-token report). Not built, as instructed: the fix is a third method
+   (`post_json`) in three Rust call sites (`routes/connector_oauth.rs`, `connector_oauth.rs`,
+   `connector_probe/saas.rs`), `rest._token_request`, the fixture, the Python and Rust tables and
+   the console mirror, which this machine cannot test (no `cargo test`). The email + API token way
+   is built. A strict `xfail` test (`test_the_browser_sign_in_sends_zendesks_token_request_as_json`)
+   records the gap and turns red when it is fixed; the gate logs "NOT RUN" with the reason.
+   Decision 3 ("extended for that vendor, not dropped") needs the planner to schedule that Rust work.
+2. **The vendor hosts are fixed, so a gate cannot point a vendor at the mock.** Added
+   `rebase_for_gate` (`saas/vendors/__init__.py`): a gate-only `SAAS_GATE_ORIGINS` that does nothing
+   unless `CONNECTOR_OAUTH_ALLOW_HTTP=true`, names the vendor, and holds a bare `http(s)://host:port`
+   (tested, falls back to the real host on anything else). It goes round "hosts come only from the
+   table" (AD2), so it is commented as such at the site; the planner should confirm that is acceptable.
+   The mock gives each vendor its own port and serves the vendor's real paths.
+3. **Gate and unsupported types.** Nothing refused a connector of an unsupported type (the API
+   lists and creates them; the SRC-9 lint reads migrations only). The vendor steps do not create a
+   connector at all: they drive the vendor module and `SaasSession` in the runner (the Dagster image)
+   against the mock. So the gate proves the vendor code over HTTP; it does not go through the API's
+   connector routes (the Rust connection test has wiremock tests) or the Iceberg sink (pytest `loader`
+   tests do that). The API step still asserts the ten types are `supported: false`.
+4. **Small changes outside the task text, all in Python:** the registry now imports a vendor module
+   by path on first use (`MODULE_PATHS`; the "no module" tests use NetSuite); `describe` may answer
+   `None` (adapter and discovery handle it); `ObjectDecl`/adapter unchanged otherwise.
+5. **HubSpot API version.** The code uses `/crm/v3/...` as the vendored source does. HubSpot's current
+   documentation shows date-versioned paths (`/crm/objects/2026-09/...`) and I did not find a sunset
+   date for `v3`; not verified.
+
+**Commands run, with counts**
+
+- `cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q` (whole suite,
+  loader tests included, on the final tree): **1795 passed, 1 xfailed, 0 failed** (16m23s). The one
+  xfail is the strict Zendesk browser sign-in test above. New files: `test_saas_vendored_hubspot.py` (8),
+  `test_saas_hubspot.py` (15), `test_saas_vendored_zendesk.py` (7), `test_saas_zendesk.py` (15 + 1 xfail);
+  `test_saas_session.py` +1, `test_saas_vendors.py` +1, `test_adapters_saas.py` +1, `test_discover.py` +1.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`,
+  `check_connector_gate_coverage.py`: all OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK.
+- The gate's vendor steps, run for real against the stub (`python3 ops/g6/saas_stub.py` on this machine,
+  then `python g6_saas_test.py --vendors-only` with the checkout's `dispar_orchestrate` first on
+  `PYTHONPATH`): 15 `[saas]` lines then `PASS (11 s)` (HubSpot 7 lines, Zendesk 8 lines, one of them the
+  recorded "NOT RUN").
+- The stub image built and run: `docker build -f ops/g6/Dockerfile.saas_stub` then `docker run`; `/health`
+  answered `{"status": "ok", "vendors": ["hubspot", "zendesk"]}` and a HubSpot route answered 200.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+  --profile g6-saas config --quiet`: OK (the runner now carries the two gate-only switches).
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+  `bun x eslint src/lib/connectors/saas-vendors.ts`: clean. `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+
+- **No Rust was compiled or tested.** The only Rust change is the HubSpot scope list in
+  `lakehouse-store/src/saas_vendors.rs` (a string array). `cargo clippy -p lakehouse-store` did not run:
+  another session had `cargo test` running and `df -h /` showed 6.2 GB free (below the 8 GB rule). `cargo fmt --check`
+  passed. The Rust vendor-table test that compares with `ops/fixtures/saas_vendors.json` (CI) is the check that the
+  Rust and the fixture scopes agree; the Python (`test_saas_vendors.py`) and console (`saas-vendors.test.ts`)
+  comparisons passed.
+- **The `g6-saas` job in CI has not run** with these steps: the steps ran against the stub on this machine, not in the
+  compose stack with the API, and its time against the 20-minute budget is unmeasured.
+- **No real HubSpot or Zendesk account** (decision 11): every vendor shape is from the vendor's documentation, modelled in
+  the mock. In particular the exact scope-to-endpoint mapping for HubSpot, that Zendesk's cursor export accepts
+  `per_page`, and Zendesk's behaviour when more items share one timestamp than a page holds, are from documentation
+  and not tried.
+- **Zendesk browser sign-in** and the HubSpot revoke call (`DELETE /oauth/v1/refresh-tokens/{token}`, not RFC 7009) are
+  not exercised; the table keeps no revocation address for either.
+- The unit tests of the Rust `Dial::Saas` account rules and the probe are unchanged and were not run.
+- Nothing was shown in a browser.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
