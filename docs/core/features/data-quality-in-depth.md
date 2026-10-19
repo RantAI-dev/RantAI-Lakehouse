@@ -1,19 +1,21 @@
 # Data quality in depth
 
+<!-- PR #106 review R1 SHOULD-FIX DATA-14 4 -->
+
 | | |
 | --- | --- |
 | Module | Data |
 | Backlog | `DATA-14` |
 | Spec | `docs/core/specs/data-14.md` |
 | Kind | Feature |
-| Status | Decisions **signed by the product owner (2026-10-15, all)** — plan is next |
+| Status | In review (Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
-| Started | Not yet |
+| Started | 2026-10-14 |
 | Shipped | Not yet |
 | Evidence | The Phase 2 pull request (#106) |
-| Plan | Not yet written; follows the signature |
+| Plan | `docs/superpowers/plans/2026-10-16-data-14-data-quality-in-depth.md` |
 
 ## Problem
 
@@ -40,7 +42,7 @@ reported, not quietly lowered.
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | The check library in this item. | The spec's named set, all of it: null count and percent, duplicate count, row count, freshness, accepted values, min/max/average, unique count — the four existing checks fold in, no check is removed. | 2026-10-15 |
-| 2 | Threshold levels. | Two levels stay, as today: **warning** (recorded, feeds nothing) and **failure** (feeds the asset's health and opens an incident). A check configures each level separately. | 2026-10-15 |
+| 2 | Threshold levels. | One threshold level per check, following the spec's Target row (breaking it opens an incident); the proposed separate warning level is not built in this phase (the product owner decided on 2026-10-16 that phase 2 follows the spec). | 2026-10-15 (updated 2026-10-16) |
 | 3 | Incident lifecycle. | A failure opens an incident; it is **resolved by a person**, with actor and reason recorded; the next passing run marks it stale but does not auto-resolve it. Editing a rule **keeps** its past runs — today's delete-on-edit goes away. | 2026-10-15 |
 | 4 | Schedules. | Per table: on every load, or on an interval of 1 hour to 1 day (the spec's range). On-load checks run **after** the load commits and never block or fail it; a schedule change takes effect at the next tick. | 2026-10-15 |
 | 5 | Anomaly detection. | Volume and freshness anomalies are learned per table from at least **14 days** of history (the spec's proposed number). Before that, the page says "not learned yet — collecting history" and detects nothing, rather than guessing. A volume anomaly is a load far under the recent median; a freshness anomaly is a load later than the learned interval allows. Alerts go through SRC-7's channels. | 2026-10-15 |
@@ -54,6 +56,17 @@ reported, not quietly lowered.
   load itself stays committed.
 - Alerts need SRC-7's channels configured; without them an incident still
   opens, only nothing is sent.
+
+## Spec rows
+
+| Spec row | Status |
+| --- | --- |
+| Ready checks | **Met** |
+| Expectations | **Met** |
+| Schedules | **Met** |
+| Anomaly detection | **Partly met** (volume and freshness anomalies learned from at least 14 days and 5 loads of history; the product records loads only from deploy onward, so no table is learned yet and the page says "learning: N days and M loads so far") |
+| Overview | **Met** |
+| Alerts | **Met** |
 
 ## Acceptance checklist
 
