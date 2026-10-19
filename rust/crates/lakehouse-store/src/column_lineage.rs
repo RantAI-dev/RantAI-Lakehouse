@@ -34,8 +34,9 @@ use crate::{PgPool, StoreError};
 pub const MAX_HOPS: i32 = 10;
 /// Most rows one walk returns, so a hub column cannot return the warehouse.
 pub const MAX_WALK_ROWS: i64 = 2000;
+// PR #106 review R1 SHOULD-FIX DATA-13 4
 /// Most rows one producer may hold; a statement with more output columns
-/// than this is refused by the caller before it reaches the store.
+/// than this is refused by the store before it writes any row.
 pub const MAX_ROWS_PER_PRODUCER: usize = 5000;
 /// How long a row is kept, in days (the spec's retention).
 pub const RETENTION_DAYS: i32 = 365;

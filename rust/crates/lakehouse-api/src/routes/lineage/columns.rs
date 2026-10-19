@@ -226,6 +226,19 @@ pub(crate) async fn forget_sql_source(state: &AppState, id: &str) {
     }
 }
 
+// PR #106 review R1 SHOULD-FIX DATA-13 4: forget a deleted pipeline's column mappings and pending SQL
+pub(crate) async fn forget_pipeline(state: &AppState, id: &str) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    if let Err(err) = column_lineage::delete_producer(pool, "pipeline", id).await {
+        tracing::warn!(%err, pipeline = id, "column lineage: a pipeline's mappings could not be removed");
+    }
+    if let Err(err) = column_lineage::clear_pending(pool, id).await {
+        tracing::warn!(%err, pipeline = id, "column lineage: a pipeline's pending SQL could not be cleared");
+    }
+}
+
 // ── Reading ────────────────────────────────────────────────────────────
 
 /// Longest table key or column name accepted in a query.

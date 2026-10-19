@@ -1666,6 +1666,8 @@ pub async fn delete(
     }
     match pipelines::delete_pipeline(pool, &id, Some(principal.id.uuid())).await {
         Ok(true) => {
+            // PR #106 review R1 SHOULD-FIX DATA-13 4: forget column lineage when pipeline is deleted
+            crate::routes::lineage::columns::forget_pipeline(&state, &id).await;
             record_pipeline_audit(&state, &principal, "pipeline.delete", &id, Value::Null).await;
             let reloaded = reload_orchestrator(&state).await;
             (
@@ -4344,6 +4346,54 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .expect("detail has a downstream array");
             assert!(downstream.is_empty(), "downstream must be empty");
+        }
+
+        // PR #106 review R1 SHOULD-FIX DATA-13 4
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn delete_pipeline_removes_column_lineage_mappings(pool: sqlx::PgPool) {
+            let pl =
+                pipelines::create_pipeline(&pool, &create_input("pl-col", Vec::new(), None), None)
+                    .await
+                    .expect("create pl-col");
+
+            lakehouse_store::column_lineage::replace_producer(
+                &pool,
+                "pipeline",
+                &pl.id,
+                None,
+                &[lakehouse_store::column_lineage::NewMapping {
+                    from_table: Some("bronze.raw".to_owned()),
+                    from_column: Some("x".to_owned()),
+                    to_table: "silver.out".to_owned(),
+                    to_column: "x".to_owned(),
+                    transform: "copy".to_owned(),
+                    partial: false,
+                    reason: None,
+                }],
+            )
+            .await
+            .expect("write mappings");
+
+            let response = delete(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(pl.id.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let remaining: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM column_lineage WHERE producer_kind = 'pipeline' AND producer_ref = $1",
+            )
+            .bind(&pl.id)
+            .fetch_one(&pool)
+            .await
+            .expect("query count");
+            assert_eq!(
+                remaining.0, 0,
+                "column lineage rows must be deleted when pipeline is deleted"
+            );
         }
     }
 
