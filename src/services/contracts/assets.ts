@@ -276,19 +276,20 @@ export type AssetDetail = Asset & {
   upstream: { id: string; name: string }[]
   downstream: { id: string; name: string }[]
   /**
-   * WS1 task 1.9 — the API no longer emits this field (it named a policy
-   * that exists nowhere). Kept optional only because the dead in-browser
-   * fixture `src/services/mock/assets.ts` still sets it.
+   * WS1 task 1.9 — the API no longer emits this field (catalog.rs:2619, 4217;
+   * it named a policy that exists nowhere). Optional because catalog detail
+   * responses from the server never emit it.
    */
+  // PR #106 review R2 SHOULD-FIX 6: re-justified against current code (mock is deleted)
   lifecyclePolicy?: string
   /**
    * WS2 §4 — the registry's own `table_name` for a Bronze asset, used to
    * try loading Iceberg snapshots for it (see `isIcebergCandidate` in
-   * `@/lib/lakehouse-view`). The real API always sends this field (a
-   * `string` or `null`) on the Bronze detail route; it is optional here
-   * only because the dead in-browser fixture `src/services/mock/assets.ts`
-   * does not set it. Consumers must treat `undefined` exactly like `null`.
+   * `@/lib/lakehouse-view`). Optional because only Bronze assets emit it;
+   * Silver and Gold asset details omit this field (catalog.rs:4221-4223).
+   * Consumers must treat `undefined` exactly like `null`.
    */
+  // PR #106 review R2 SHOULD-FIX 6: re-justified against current code (mock is deleted)
   tableName?: string | null
   /**
    * The asset's annotation exactly as stored — what the edit form holds —
@@ -517,25 +518,27 @@ export interface AssetService {
   getAsset(id: string, signal?: AbortSignal): Promise<AssetDetail>
   /**
    * `GET /api/catalog/{id}/profile` — per-column stats. Needs `query:read`,
-   * since the stats are read from the data itself. Optional for the same
-   * dead-fixture reason as `requestAccess` below.
+   * since the stats are read from the data itself.
    */
-  getAssetProfile?(id: string, signal?: AbortSignal): Promise<AssetProfile>
+  // PR #106 review R2 SHOULD-FIX 6: required method on AssetService
+  getAssetProfile(id: string, signal?: AbortSignal): Promise<AssetProfile>
   /**
    * `GET /api/catalog/{id}/sample?limit=N` — more sample rows than the
    * detail body's five (the API caps the limit), masked and row-filtered
    * like any query the caller runs. Needs `query:read`.
    */
-  getAssetSample?(
+  // PR #106 review R2 SHOULD-FIX 6: required method on AssetService
+  getAssetSample(
     id: string,
     limit: number,
     signal?: AbortSignal
   ): Promise<Record<string, string | null>[]>
   /**
    * `PUT /api/catalog/{id}/annotation` — replace the asset's annotation
-   * (needs `catalog:write`). Optional for the same dead-fixture reason.
+   * (needs `catalog:write`).
    */
-  updateAnnotation?(id: string, input: AssetAnnotation, signal?: AbortSignal): Promise<void>
+  // PR #106 review R2 SHOULD-FIX 6: required method on AssetService
+  updateAnnotation(id: string, input: AssetAnnotation, signal?: AbortSignal): Promise<void>
   /**
    * `PUT /api/catalog/{id}/certification` — set, change or clear the
    * certified / deprecated mark (needs `governance:write`, not the
@@ -555,17 +558,9 @@ export interface AssetService {
    * `input.permission`, so the caller must only ever offer permissions
    * `hasPermission` has already excluded (see `requestableAccessPermissions`
    * in `@/lib/access-requests`).
-   *
-   * Optional (unlike this interface's other three methods) because
-   * `src/services/mock/assets.ts` — a dead in-browser fixture this task
-   * must not touch (see that file's own "dead fixture" comment
-   * elsewhere in this module) — implements only the original three;
-   * making this required would break that file's `: AssetService`
-   * annotation for a fixture nothing wires up (`services/index.ts` never
-   * assigns `assetService = mockAssetService`, only `clickhouseAssetService`
-   * does). The real (ClickHouse-backed) client always implements it.
    */
-  requestAccess?(
+  // PR #106 review R2 SHOULD-FIX 6: required method on AssetService
+  requestAccess(
     catalogId: string,
     input: RequestAccessInput,
     signal?: AbortSignal
@@ -577,10 +572,9 @@ export interface AssetService {
    * `403` (surfaced as a `ServiceError` with code `"permission_denied"`)
    * when the deciding principal is the same person who requested this
    * access (`routes::catalog::decide_access_request`, WS7 item E3).
-   *
-   * Optional for the same reason as `requestAccess` above.
    */
-  decideAccessRequest?(
+  // PR #106 review R2 SHOULD-FIX 6: required method on AssetService
+  decideAccessRequest(
     approvalId: string,
     decision: "approved" | "rejected",
     comment: string | undefined,

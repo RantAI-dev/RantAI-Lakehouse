@@ -1282,7 +1282,7 @@ describe("Sample tab", () => {
   it("shows the rows the page carries, with no size to choose, where the deployment cannot fetch more", () => {
     const fetchSpy = stubApi()
     const fetchMore = assetService.getAssetSample
-    assetService.getAssetSample = undefined
+    ;(assetService as Partial<typeof assetService>).getAssetSample = undefined
     try {
       url.search = "tab=sample"
       renderTabs()

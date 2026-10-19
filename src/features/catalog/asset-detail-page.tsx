@@ -74,15 +74,7 @@ export function AssetDetailPage() {
   const [reason, setReason] = React.useState("")
   const [submitted, setSubmitted] = React.useState(false)
   const request = useServiceAction((signal, catalogId: string, input: RequestAccessInput) => {
-    // `requestAccess` is optional on `AssetService` only so the dead
-    // `mock/assets.ts` fixture (never wired to `assetService`, see that
-    // contract's own doc comment) still satisfies the interface — the
-    // real (ClickHouse-backed) client this page always talks to
-    // implements it. Fail closed rather than silently no-op if that
-    // assumption is ever wrong.
-    if (!assetService.requestAccess) {
-      return Promise.reject(new Error("This deployment cannot request catalog access."))
-    }
+    // PR #106 review R2 SHOULD-FIX 6: requestAccess is required on AssetService
     return assetService.requestAccess(catalogId, input, signal)
   })
 
