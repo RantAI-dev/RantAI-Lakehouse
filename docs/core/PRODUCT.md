@@ -348,7 +348,7 @@ an order in its roadmap phase.
 | Item | Why later |
 | --- | --- |
 | Run on several servers | A stated goal; larger work |
-| Business-app connectors (`SRC-3`): Databricks' ten generally available ones first | Large; waits for the reuse decision `DEC-9` |
+| Business-app connectors (`SRC-3`): Databricks' ten generally available ones first | Large; `DEC-9` decided 2026-10-19, feature page `features/business-app-connectors.md` awaits its decisions |
 | Parameters, snippets and charts from SQL results (`QS-5`) | The bridge from Query Studio to dashboards, after the basics |
 | Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
 | Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
@@ -379,7 +379,7 @@ the single list the base mirrors. The table here is the summary.
 | 5 | What happens to the old documents | Decided 2026-10-15 (`DOC-1`, product owner's instruction): all archived in `docs/archive/`; section 2 of this file is the coverage table, so `FEATURE_COVERAGE.md` was archived rather than rewritten |
 | 6 | Rewrite the sales playbook around the new positioning | Yes; it leads with on-premises, which is no longer the main message |
 | 7 | Which assistant actions need human approval (`DEC-8`) | Also making a dashboard public or embeddable, changing who can see it, and email outside the company |
-| 8 | How to get business-app connectors (`DEC-9`) | Reuse dlt verified sources first; our loader already runs on dlt |
+| 8 | How to get business-app connectors (`DEC-9`) | Decided 2026-10-19: dlt verified sources where one exists (four of the ten), dlt's `rest_api` source for the rest; all on our dlt loader |
 | 9 | Data and Query Studio edge cases (`DEC-10`) | Drop or defer all six |
 | 10 | The four login defaults (5 failures in 15 minutes, 5-minute lock, 30-day retention, no off switch) | Keep them |
 | 11 | Every target marked *(proposed)* in `specs/` | Confirm or change on each feature page before its plan is written |
