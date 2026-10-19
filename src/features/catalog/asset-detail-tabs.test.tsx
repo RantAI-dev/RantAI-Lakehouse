@@ -224,6 +224,8 @@ function stubApi({
   grantRefusal,
   tableMissing = false,
   snapshotAuthor = null,
+  restoreRefusal,
+  revokeRefusal,
   restore = { restorable: false, reason: "no dropped copy of this table is kept" },
   incidents = [],
   schedules = [],
@@ -245,6 +247,10 @@ function stubApi({
   tableMissing?: boolean
   /** The author the table's one snapshot recorded (`DATA-15`); `null` when it recorded none. */
   snapshotAuthor?: string | null
+  /** When set, `POST .../restore` is refused with this status and sentence. */
+  restoreRefusal?: { status: number; error: string }
+  /** When set, `DELETE .../grants` is refused with this status and sentence. */
+  revokeRefusal?: { status: number; error: string }
   /** What `GET .../restore` answers. */
   restore?: unknown
   /** The quality incidents `GET /api/governance/quality/incidents` answers. */
@@ -260,13 +266,19 @@ function stubApi({
     if (method === "PUT" && path.endsWith("/annotation")) {
       return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
     }
-    if (path.endsWith("/restore")) return method === "GET" ? json(restore) : json({ ok: true })
+    if (path.endsWith("/restore")) {
+      if (method === "GET") return json(restore)
+      if (restoreRefusal) return json({ error: restoreRefusal.error }, restoreRefusal.status)
+      return json({ ok: true })
+    }
     if (path.includes("/grants")) {
       if (method === "GET") return json({ grants })
       if (method === "POST") {
         return grantRefusal ? json({ error: grantRefusal.error }, grantRefusal.status) : json({ ok: true, id: "grant-new" })
       }
-      if (method === "DELETE") return json({ ok: true })
+      if (method === "DELETE") {
+        return revokeRefusal ? json({ error: revokeRefusal.error }, revokeRefusal.status) : json({ ok: true })
+      }
     }
     if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
     // DATA-14: the Quality tab's incidents, schedule and learning state.
@@ -1815,6 +1827,23 @@ describe("Activity tab: a dropped table", () => {
     expect(await screen.findByText("no dropped copy of this table is kept")).toBeTruthy()
     expect(screen.queryByRole("button", { name: /^Restore/ })).toBeNull()
   })
+
+  // PR #106 review R1 SHOULD-FIX DATA-15 1
+  it("toasts the server's refusal sentence when restore fails", async () => {
+    stubApi({
+      tableMissing: true,
+      restore: DROPPED,
+      restoreRefusal: { status: 410, error: "A dropped copy of this table has expired and cannot be restored." },
+    })
+    const toasts = spyOn(toast, "error").mockImplementation(() => 1)
+    url.search = "tab=activity"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Restore (until October 23, 2026)" }))
+    await waitFor(() => expect(toasts).toHaveBeenCalled())
+    expect(toasts.mock.calls[0][0]).toBe("Failed to restore the table")
+    expect(toasts.mock.calls[0][1]?.description).toContain("A dropped copy of this table has expired and cannot be restored.")
+  })
 })
 
 describe("Access tab: grants", () => {
@@ -1883,6 +1912,23 @@ describe("Access tab: grants", () => {
     await waitFor(() =>
       expect(writes(fetchSpy).some((w) => w[0] === "DELETE" && w[1] === "/api/catalog/demo-orders/grants/grant-1")).toBe(true)
     )
+  })
+
+  // PR #106 review R1 SHOULD-FIX DATA-15 1
+  it("toasts the server's refusal sentence when revoke fails", async () => {
+    stubApi({
+      grants: [GRANT],
+      revokeRefusal: { status: 409, error: "The grant has already been revoked." },
+    })
+    const toasts = spyOn(toast, "error").mockImplementation(() => 1)
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke query:read from Bayu Pratama" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }))
+    await waitFor(() => expect(toasts).toHaveBeenCalled())
+    expect(toasts.mock.calls[0][0]).toBe("Failed to revoke the grant")
+    expect(toasts.mock.calls[0][1]?.description).toContain("The grant has already been revoked.")
   })
 
   it("shows no Grants card, and asks for no grants, to a reader without access:approve", async () => {

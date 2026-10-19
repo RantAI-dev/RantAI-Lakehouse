@@ -13,7 +13,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDate } from "@/lib/format"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
 import { assetService } from "@/services"
 import type { AssetDetail, AssetGrant } from "@/services/contracts/assets"
 
@@ -52,10 +52,16 @@ export function AssetGrants({ asset: a }: { asset: AssetDetail }) {
     if (!assetService.grantAccess) return Promise.reject(new Error("This deployment cannot grant access."))
     return assetService.grantAccess(a.id, input, signal)
   })
-  const revoke = useServiceAction((signal, grantId: string) => {
-    if (!assetService.revokeGrant) return Promise.reject(new Error("This deployment cannot revoke a grant."))
-    return assetService.revokeGrant(a.id, grantId, signal)
-  })
+  // PR #106 review R1 SHOULD-FIX DATA-15 1: withNotify delivers error toast with real error
+  const revoke = useServiceAction(
+    withNotify(
+      { success: "Grant revoked", error: "Failed to revoke the grant" },
+      (signal, grantId: string) => {
+        if (!assetService.revokeGrant) return Promise.reject(new Error("This deployment cannot revoke a grant."))
+        return assetService.revokeGrant(a.id, grantId, signal)
+      }
+    )
+  )
 
   if (!allowed) return null
 
@@ -69,11 +75,8 @@ export function AssetGrants({ asset: a }: { asset: AssetDetail }) {
 
   async function confirmRevoke() {
     if (!revoking) return
-    if ((await revoke.run(revoking.id)) === null) {
-      notifyError("Failed to revoke the grant", revoke.error)
-      return
-    }
-    notifySuccess("Grant revoked")
+    // PR #106 review R1 SHOULD-FIX DATA-15 1
+    if ((await revoke.run(revoking.id)) === null) return
     setRevoking(null)
     grants.reload()
   }

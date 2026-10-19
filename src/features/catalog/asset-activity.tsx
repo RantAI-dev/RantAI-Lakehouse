@@ -47,7 +47,7 @@ import {
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured, type Measured } from "@/lib/measured"
-import { notifyError, notifySuccess } from "@/lib/notify"
+import { notifyError, notifySuccess, withNotify } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
 import { assetService, governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -122,10 +122,16 @@ function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored
     (s) => (assetService.getRestoreStatus ? assetService.getRestoreStatus(a.id, s) : Promise.resolve(null)),
     [a.id]
   )
-  const restore = useServiceAction((signal) => {
-    if (!assetService.restoreTable) return Promise.reject(new Error("This deployment cannot restore a table."))
-    return assetService.restoreTable(a.id, signal)
-  })
+  // PR #106 review R1 SHOULD-FIX DATA-15 1: withNotify delivers error toast with real error
+  const restore = useServiceAction(
+    withNotify(
+      { success: "Table restored", error: "Failed to restore the table" },
+      (signal) => {
+        if (!assetService.restoreTable) return Promise.reject(new Error("This deployment cannot restore a table."))
+        return assetService.restoreTable(a.id, signal)
+      }
+    )
+  )
   const restorable = status.status === "success" && status.data && status.data.supported === undefined && status.data.restorable
     ? status.data
     : null
@@ -135,11 +141,8 @@ function DroppedTable({ asset: a, onRestored }: { asset: AssetDetail; onRestored
       : undefined
 
   async function run() {
-    if ((await restore.run()) === null) {
-      notifyError("Failed to restore the table", restore.error)
-      return
-    }
-    notifySuccess("Table restored")
+    // PR #106 review R1 SHOULD-FIX DATA-15 1
+    if ((await restore.run()) === null) return
     onRestored()
   }
 
