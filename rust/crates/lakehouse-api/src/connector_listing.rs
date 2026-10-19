@@ -1382,6 +1382,21 @@ mod tests {
             serde_json::json!({"hosts": ["m.example:27017"], "database": "d",
                 "username": "u", "directConnection": true}),
         );
+        // `SRC-3` T1.6: a business-app connector is listed by its vendor's
+        // module in the orchestrator, for both lists and column previews.
+        let saas = info(
+            "saas",
+            serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        );
+        for kind in [Kind::List, Kind::Preview] {
+            assert!(matches!(
+                dispatch(kind, &saas, &request, &resolver, &InternalHosts::NONE).await,
+                Dispatch::Orchestrator
+            ));
+        }
         for connector in [&oracle, &mongo] {
             let out = dispatch(
                 Kind::List,
