@@ -509,5 +509,34 @@
     "forbid": [
       "approvals"
     ]
+  },
+  {
+    "id": "set_pipeline_target_lag",
+    "note": "not run in CI",
+    "mode": "build",
+    "turns": [
+      "keep silver.orders_clean at most 10 minutes behind"
+    ],
+    "expect_tool": {
+      "name": "set_pipeline_target_lag",
+      "args_contains": {
+        "pipeline": "orders_clean",
+        "targetLag.kind": "lag",
+        "targetLag.minutes": 10
+      }
+    },
+    "forbid": [
+      "approvals"
+    ]
+  },
+  {
+    "id": "how_far_behind_pipeline",
+    "note": "not run in CI",
+    "turns": [
+      "how far behind is silver.orders_clean?"
+    ],
+    "expect_tool": {
+      "name": "get_pipeline"
+    }
   }
 ]

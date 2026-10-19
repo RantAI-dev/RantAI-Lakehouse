@@ -128,6 +128,7 @@ impl App {
                 connector_id: None,
                 id: None,
                 run_as: None,
+                target_lag: None,
             },
             None,
         )

@@ -2167,6 +2167,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       # Not a credential -- a retention window -- so a dev default is fine
       # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
@@ -2179,6 +2181,12 @@ services:
       LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
       OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # OPS-7 E6: warehouse source endpoint/bucket and ClickHouse connection (non-secret).
+      BACKUP_WAREHOUSE_ENDPOINT: ${BACKUP_WAREHOUSE_ENDPOINT:-${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}}
+      BACKUP_WAREHOUSE_BUCKET: ${BACKUP_WAREHOUSE_BUCKET:-${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
     command: ["python", "-m", "dispar_orchestrate.backup_job"]
     restart: "no"
 
@@ -2286,6 +2294,14 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    # BLD-4 (`ops/g7/g7_pipeline_test.py`): the second SMALLEST table a
+    # connector-shaped gate needs to load one table and NOT another (a
+    # `ingest_job` run of one table) and so prove that a chain after
+    # `ingest_job` fires only for the table it reads. It is a fixture, not a
+    # product schema: the seeded `conn-pg-lakehouse` row is NOT edited to
+    # load it (0034's seed is applied, never edited) and the only code path
+    # that loads it is that gate's own ingest-spec PUT, against this stack's
+    # own instance.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -2301,6 +2317,16 @@ services:
         SELECT 'customer_' || (g % 500), (g % 1000)::numeric + 0.5
         FROM generate_series(1, 2000) AS g
         WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.orders);
+        CREATE TABLE IF NOT EXISTS ingest_demo.customers (
+          id bigserial PRIMARY KEY,
+          name text NOT NULL,
+          email text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        );
+        INSERT INTO ingest_demo.customers (name, email)
+        SELECT 'customer_' || g, 'customer_' || g || '@example.invalid'
+        FROM generate_series(1, 20) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.customers);
         "
     restart: "no"
 
@@ -2381,7 +2407,15 @@ services:
   #   docker compose -p <project> --profile dagster run --rm g7-test-runner
   g7-test-runner:
     profiles: ["dagster"]
-    image: python:3.12-slim
+    # BLD-2 review R1 BLOCKER 8: the gate's dependencies are pinned in
+    # `ops/g7/Dockerfile` and baked into the image, the same way
+    # `ops/oidc-mock/Dockerfile` pins its own. Build it once with
+    # `docker compose -p <project> --profile dagster build g7-test-runner`
+    # (the `g3a-dagster` CI job does) instead of installing a driver at
+    # run time, so what the gate depends on is fixed by this file.
+    build:
+      context: ./ops/g7
+    image: ${G7_TEST_RUNNER_IMAGE:-rantai-g7-test-runner:local}
     working_dir: /work
     volumes:
       - ./ops/g7:/work:ro
@@ -2412,6 +2446,20 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # BLD-4: the two Bronze tables the dependency-chain half proves
+      # itself against, each loaded by a run of ONE table on the stack's
+      # own `conn-pg-lakehouse` connector. `orders` (the G3a fixture's
+      # source table) is the chain's OWN table; `customers` is the
+      # smallest second table `g3a-source-init` creates for this. Both
+      # Bronze names are fresh on purpose: a chain that already had a
+      # qualifying anchor would pass the "fires after its own table"
+      # assertion without this job loading anything.
+      G7_INGEST_CONNECTOR_ID: ${G7_INGEST_CONNECTOR_ID:-conn-pg-lakehouse}
+      G7_INGEST_OBJECT_A: ${G7_INGEST_OBJECT_A:-ingest_demo.orders}
+      G7_INGEST_BRONZE_TABLE_A: ${G7_INGEST_BRONZE_TABLE_A:-g7_dep_orders}
+      G7_INGEST_OBJECT_B: ${G7_INGEST_OBJECT_B:-ingest_demo.customers}
+      G7_INGEST_BRONZE_TABLE_B: ${G7_INGEST_BRONZE_TABLE_B:-g7_dep_customers}
+      G7_CHAIN_SILVER_TABLE: ${G7_CHAIN_SILVER_TABLE:-g7_dep_ingest_chain_out}
       # What the source step asserts (BLD-3 review BLOCKER 1): `required`
       # (the default, and what a real deployment wants) makes the gate
       # demand the op's real source text, which needs images carrying a
@@ -2426,21 +2474,28 @@ services:
       # setting needs this pair.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # BLD-2 review R1 BLOCKER 8 / R2 SHOULD-FIX 8: pass Postgres credentials to g7-test-runner (hard-coded host/port in compose network, drop duplicate POSTGRES_* pairs)
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (PostgreSQL password; run ops/init-env.sh or see docs/OPERATIONS.md)}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
       PYTHONDONTWRITEBYTECODE: "1"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "pip install -q requests && python g7_pipeline_test.py"
+    # BLD-2 review R1 BLOCKER 8: no `pip install` at run time — both
+    # dependencies come from the image (see `ops/g7/Dockerfile`).
+    command: ["python", "g7_pipeline_test.py"]
     restart: "no"
 
   # BLD-1 acceptance — `ops/g7/bld1_pipeline_author_test.py`: an authored
   # pipeline reads as its author, proven on the ROWS it writes. Its own
   # service rather than a second command on `g7-test-runner`, because that
   # one's `command` is fixed to the G7 script and `docker compose run`
-  # REPLACES a command -- running this through it would drop the
-  # `pip install requests` its `entrypoint` relies on, and the script would
-  # exit on `import requests` having proved nothing. Same image, same
-  # read-only `./ops/g7` mount, same bootstrap-admin credential from the
-  # operator's `.env`.
+  # REPLACES a command, and the two services no longer share an image.
+  # BLD-2 review R3 SHOULD-FIX 9: `g7-test-runner` now builds
+  # `ops/g7/Dockerfile` (its dependencies are baked in); this service stays
+  # on `python:3.12-slim` and installs `requests` in its own `command`.
+  # Same read-only `./ops/g7` mount, same bootstrap-admin credential from
+  # the operator's `.env`.
   #
   # `BLD1_NO_AUTHOR_PIPELINE_ID` is the third case's fixture (a pipeline
   # whose `run_as` was cleared, which is what a service identity's create

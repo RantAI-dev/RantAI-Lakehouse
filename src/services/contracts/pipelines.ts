@@ -4,6 +4,20 @@ import type { EntityStatus } from "@/lib/status"
 /** The kinds a pipeline can be authored as. */
 export type PipelineKind = "batch" | "incremental"
 
+/** Target lag setting (BLD-2 D2, widened with | string). */
+export type TargetLag =
+  | { kind: "lag"; minutes: number }
+  | { kind: "downstream" }
+  | { kind: string; minutes?: number }
+
+/** Measured freshness lag status (BLD-2 D8, widened with | string). */
+export type PipelineLag = {
+  status: "met" | "behind" | "not_measured" | string
+  lagSeconds: number | null
+  lastCheckAt: string | null
+  reason: string | null
+}
+
 export type Pipeline = {
   id: string
   name: string
@@ -31,6 +45,8 @@ export type Pipeline = {
   incrementalColumn?: string
   transforms?: string[]
   fbicEnabled?: boolean
+  targetLag?: TargetLag | null
+  lag?: PipelineLag | null
   /**
    * BLD-1 / D1 (`pipeline_definition.run_as`): the id of the user this
    * pipeline reads as. Every statement it runs is rewritten for that
@@ -243,9 +259,11 @@ export type CreatePipelineInput = {
    * (migration `0052`). `"file_ingest_job"` is accepted only for a
    * `bronze` source and means "re-upload of this table runs me again";
    * the server refuses it otherwise
-   * (`routes::authored_pipelines::validate_file_ingest_upstream`).
+   * (`routes::authored_pipelines::validate_per_table_upstream`).
    */
   dependsOn?: string[]
+  /** BLD-2: the freshness promise this pipeline is created with, if any. */
+  targetLag?: TargetLag | null
 }
 
 /**
@@ -340,6 +358,8 @@ export interface PipelineService {
   deletePipeline(id: string, signal?: AbortSignal): Promise<void>
   /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
   getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
+  /** `PUT /api/pipelines/{id}/target-lag` — set or clear an authored pipeline's target lag (BLD-2 D8). */
+  setTargetLag(id: string, targetLag: TargetLag | null, signal?: AbortSignal): Promise<Pipeline>
   /**
    * `PUT /api/pipelines/{id}/run-as` — assign the user this pipeline reads
    * as (BLD-1 / D2). The only way `runAs` changes after create, and it is

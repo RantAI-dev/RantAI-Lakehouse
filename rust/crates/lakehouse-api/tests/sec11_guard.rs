@@ -284,6 +284,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "serde error over the model's own tool arguments",
     ),
     (
+        "ai/tools/pipelines.rs",
+        "invalid targetLag: {err}",
+        "serde error over the model's own tool arguments, the same class as dashboards.rs above: it tells the model which of its `targetLag` fields is wrong, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
         "ai/tools/data.rs",
         "err.to_string().contains(\"UNKNOWN_DATABASE\")",
         "classification only: picks the supported:false answer",
@@ -297,6 +302,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/gold.rs",
         ".map_err(|err| json!({ \"error\": err.to_string() }))?;",
         "read_catalog_token's ApiError text, written in this repository",
+    ),
+    // The tool's own decode of the model's arguments: serde reporting a
+    // shape it cannot parse out of `filters`, which the caller supplied.
+    // Same class as the `invalid JSON: {err}` entries above -- our own
+    // schema describing the caller's input, never an upstream payload.
+    (
+        "ai/tools/boards.rs",
+        "format!(\"filters: {err}\")",
+        "serde error over the caller's own tool arguments",
     ),
 ];
 

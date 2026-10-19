@@ -192,6 +192,9 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             // pipeline" the connector's reverse-lookup assertion uses,
             // not a write where the route mints an id in advance.
             id: None,
+            // BLD-2: this fixture is about the connector's dependent
+            // pipelines, not about a refresh policy.
+            target_lag: None,
             // BLD-1 / D1: no author; this fixture only exists to be found
             // by the connector's reverse lookup.
             run_as: None,

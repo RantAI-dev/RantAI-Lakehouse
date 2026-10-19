@@ -135,7 +135,7 @@ no admin account is created and you'll need to seed one directly in
 Postgres.
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for what's in/out of the
-compose stack, what `/health` actually checks, the Postgres backup/restore
+compose stack, what `/health` actually checks, the Lakehouse backup and restore
 procedure, and the biggest operational trap in this codebase (Postgres
 being down fails quietly, not loudly).
 

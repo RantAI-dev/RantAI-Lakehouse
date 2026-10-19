@@ -38,6 +38,7 @@ export const RULE_KIND_LABEL: Record<string, string> = {
   alert: "Threshold alert",
   digest: "Dashboard digest",
   freshness: "Dataset freshness",
+  pipeline_behind_target: "Pipeline behind target lag",
   connector_failure: "Connector run failed",
   connector_repeated_failure: "Connector failed 3 runs in a row",
   connector_disabled: "Connector disabled",
@@ -68,11 +69,14 @@ export function isQualityAlertKind(type: string): boolean {
  * cannot list is not given a made-up name). `null` for every other kind.
  */
 export function ruleScope(
-  rule: Pick<AlertRule, "type" | "connector"> & { asset?: string },
+  rule: Pick<AlertRule, "type" | "connector"> & { asset?: string; pipeline?: string },
   connectors: readonly { id: string; name: string }[]
 ): string | null {
   // A quality incident rule is scoped to a table, or to every table.
   if (isQualityAlertKind(rule.type)) return rule.asset === "*" ? "All tables" : (rule.asset ?? null)
+  if (rule.type === "pipeline_behind_target") {
+    return !rule.pipeline || rule.pipeline === "*" ? "All pipelines" : rule.pipeline
+  }
   if (!isLoadAlertKind(rule.type)) return null
   if (rule.type === "upload_failure") return "Uploads"
   if (!rule.connector) return null

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs the standard set of dashboard requests against a throwaway local stack
 # and says pass or fail. The stack belongs to this script: its own compose
-# project name, its own host ports, and it is always torn down, including on
-# an error or an interrupt.
+# project name, its own host ports, its own api image, and it is always torn
+# down, including on an error or an interrupt.
 #
 # This is a person's run, not CI's (owner, 2026-10-15). Run it on every change
 # to an assistant tool or prompt and put the numbers in that PR's review; the
@@ -20,6 +20,20 @@
 #   API_HOST_PORT   default 27080; CH_HTTP_HOST_PORT 27123;
 #   CH_NATIVE_HOST_PORT 27900; POSTGRES_HOST_PORT 27432
 # Any AI_* variable (AI_EVAL_TIMEOUT_S and so on) is passed to the harness.
+#
+# What the run sets up and removes:
+#   - Every variable docker-compose.yml marks `${NAME:?...}` gets a random
+#     value made for this run and never printed. They outrank a .env, so the
+#     run needs none and uses nothing of the dev stack.
+#   - Without --image, the api image is built from the working tree
+#     (up --build) under the tag ai-eval-<epoch>:local, so the run never
+#     measures a stale image, and that tag is removed at teardown. With
+#     --image, that image is used as it is and is not removed.
+#   - Teardown acts on this run's compose project only (down -v --rmi local).
+#     It never touches another project and never prunes.
+#
+# Exit code: 0 the set passes, 1 it fails, 2 the run could not start (no key,
+# a port in use, the stack did not come up, no seed, no login).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +41,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 usage() {
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # The header: from line 2 up to the first line that is not a comment.
+    awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 BASELINE=""
@@ -88,10 +103,53 @@ CH_USER="ai_eval"
 CH_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d '/+=')"
 COOKIE_JAR=""
 
+# Names compose refuses to start without: every ${NAME:?...} outside a comment
+# (a comment can mention the syntax, as docker-compose.yml does). Read from the
+# file so a new required variable is picked up without editing this script.
+required_compose_vars() {
+    grep -vE '^[[:space:]]*#' docker-compose.yml \
+        | grep -oE '\$\{[A-Z_]+:\?' \
+        | sed -e 's/^[$][{]//' -e 's/:?$//' \
+        | sort -u
+}
+random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# A throwaway value for each of them, in the shape ops/init-env.sh gives it:
+# base64 of 32 bytes for the connector key, hex for the rest (hex is safe inside
+# the connection strings compose builds from them). An exported variable
+# outranks .env, so nothing of the dev stack is borrowed and a checkout with no
+# .env still starts. Values are never printed.
+for name in $(required_compose_vars); do
+    case "$name" in
+        CONNECTOR_SECRETS_KEY) value="$(head -c 32 /dev/urandom | base64 | tr -d '\n')" ;;
+        *) value="$(random_hex 24)" ;;
+    esac
+    export "$name=$value"
+done
+unset name value
+
+# The api image. Without --image the run builds its own, so it never measures
+# an image left by an earlier build, and removes it at teardown. With --image
+# the caller's image is used and left alone.
+OWN_IMAGE=0
+if [ -z "$IMAGE" ]; then
+    IMAGE="$PROJECT:local"
+    OWN_IMAGE=1
+fi
+export LAKEHOUSE_API_IMAGE="$IMAGE"
+
 cleanup() {
     local code=$?
     echo "run_dashboard_eval: tearing down $PROJECT" >&2
-    COMPOSE_PROJECT_NAME="$PROJECT" docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
+    # --rmi local removes the images this project built for itself (the ones
+    # compose names after the project), never a pulled or tagged one.
+    COMPOSE_PROJECT_NAME="$PROJECT" docker compose -p "$PROJECT" down -v --remove-orphans --rmi local >/dev/null 2>&1 || true
+    if [ "$OWN_IMAGE" -eq 1 ] && ! docker rmi "$IMAGE" >/dev/null 2>&1; then
+        # An image that is already gone is fine; one that is still there is a leak.
+        if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "run_dashboard_eval: warning: could not remove the image $IMAGE; remove it with: docker rmi $IMAGE" >&2
+        fi
+    fi
     if [ -n "$COOKIE_JAR" ]; then rm -f "$COOKIE_JAR"; fi
     exit "$code"
 }
@@ -110,10 +168,16 @@ if [ -n "${LLM_MODEL:-}" ]; then export LLM_MODEL; fi
 export LLM_KEY
 
 echo "run_dashboard_eval: starting $PROJECT (api :$API_HOST_PORT)" >&2
-if [ -n "$IMAGE" ]; then
-    LAKEHOUSE_API_IMAGE="$IMAGE" dc up -d --wait postgres clickhouse oidc-mock lakehouse-api
-else
-    dc up -d --wait postgres clickhouse oidc-mock lakehouse-api
+up_args=(up -d --wait)
+# With --image the tag must already exist: compose would otherwise build the
+# api service (it has a build: block) under the caller's tag, so forbid that and
+# let a wrong tag fail the up.
+if [ "$OWN_IMAGE" -eq 1 ]; then up_args+=(--build); else up_args+=(--no-build); fi
+# A stack that did not come up is a setup error (2), not a failed set (1), which
+# is what compose's own exit code would say.
+if ! dc "${up_args[@]}" postgres clickhouse oidc-mock lakehouse-api; then
+    echo "run_dashboard_eval: the stack did not come up; nothing to score" >&2
+    exit 2
 fi
 
 # Compose's ClickHouse healthcheck pings HTTP :8123, but the seed script connects

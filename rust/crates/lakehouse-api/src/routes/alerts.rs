@@ -665,6 +665,7 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::PipelineSlow => "Pipeline SLA: duration",
         AlertKind::PipelineLate => "Pipeline SLA: late",
         AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
+        AlertKind::PipelineBehindTarget => "Pipeline target lag: behind",
         // `SRC-7`: connector and upload rules fire from the run event
         // routes (`routes::pipelines`), which persist their own instance
         // with the source label; `run_rules` skips them, so these labels
@@ -718,6 +719,7 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         AlertKind::PipelineVolumeDrop => {
             "pipeline run processed fewer than half the median rows of prior runs".to_owned()
         }
+        AlertKind::PipelineBehindTarget => "pipeline is behind its target lag".to_owned(),
         // `SRC-7`: never reached from `run_rules` (it skips these kinds);
         // the event routes write their own detail.
         AlertKind::ConnectorFailure

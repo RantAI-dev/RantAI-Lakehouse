@@ -195,6 +195,97 @@ fn uses_past_version_clause(sql: &str) -> bool {
         .any(|w| (w[0] == "VERSION" || w[0] == "TIMESTAMP") && w[1] == "AS" && w[2] == "OF")
 }
 
+/// The one answer to a statement the settings rule refuses. It names no word
+/// of the statement and no upstream text (`AGENTS.md` principle 4).
+const SETTINGS_REFUSAL_MESSAGE: &str =
+    "Query Studio accepts only iceberg_snapshot_id in SETTINGS; the server sets the others.";
+
+/// The one setting a statement may name: the version picker's
+/// (`src/lib/snapshot-picker.ts`, `DATA-16`).
+const ALLOWED_SETTING: &str = "iceberg_snapshot_id";
+
+/// Finds a `SETTINGS` clause other than [`ALLOWED_SETTING`] anywhere in a
+/// parsed statement. The `Visitor` below reaches every `Query` (a
+/// subquery, a CTE, a derived table, an expression subquery, the query
+/// inside `EXPLAIN`), every table function's own argument list and every
+/// `INSERT`, which are the three places `sqlparser` keeps settings. The
+/// derived `Visit` covers every node kind, so a kind added by a later
+/// `sqlparser` is reached too.
+struct SettingsFinder;
+
+impl SettingsFinder {
+    fn refuses(settings: Option<&[sqlparser::ast::Setting]>) -> std::ops::ControlFlow<()> {
+        match settings {
+            Some(list) if list.iter().any(|s| s.key.value != ALLOWED_SETTING) => {
+                std::ops::ControlFlow::Break(())
+            }
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for SettingsFinder {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        Self::refuses(query.settings.as_deref())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<()> {
+        match table_factor {
+            sqlparser::ast::TableFactor::Table {
+                args: Some(args), ..
+            } => Self::refuses(args.settings.as_deref()),
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+
+    fn pre_visit_statement(
+        &mut self,
+        statement: &sqlparser::ast::Statement,
+    ) -> std::ops::ControlFlow<()> {
+        match statement {
+            sqlparser::ast::Statement::Insert(insert) => Self::refuses(insert.settings.as_deref()),
+            _ => std::ops::ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// SEC-21: a statement may name one setting, `iceberg_snapshot_id`. Any
+/// other `SETTINGS` entry would override the request-level settings the run
+/// sends (`ChClient::query_limited`): `SETTINGS max_result_rows = 0`
+/// measured 500,000 of 500,000 rows past the cap on `ClickHouse` 26.8, and
+/// `readonly = 1` is not an option because it also refuses the picker's
+/// setting.
+///
+/// `sql` is the statement that goes to the engine (the rewritten one), so
+/// what is checked is what `ClickHouse` reads. It is parsed with
+/// `ClickHouseDialect`; a statement that does not parse, or that is not
+/// exactly one statement, is refused with the same message, because a text
+/// this check cannot read is a text it cannot vouch for. Names are compared
+/// case-sensitively, so `ICEBERG_SNAPSHOT_ID` is refused.
+///
+/// # Errors
+/// 422 [`ApiError::Unprocessable`] with [`SETTINGS_REFUSAL_MESSAGE`] when
+/// the statement names another setting, does not parse, or is more than one
+/// statement. The parser's own message is dropped.
+fn refuse_unlisted_settings(sql: &str) -> Result<(), ApiError> {
+    let refusal = || ApiError::Unprocessable(SETTINGS_REFUSAL_MESSAGE.to_owned());
+    let statements =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::ClickHouseDialect {}, sql)
+            .map_err(|_| refusal())?;
+    if statements.len() != 1 {
+        return Err(refusal());
+    }
+    match sqlparser::ast::Visit::visit(&statements, &mut SettingsFinder) {
+        std::ops::ControlFlow::Break(()) => Err(refusal()),
+        std::ops::ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
 /// Runs the already-rewritten `sql` against whichever engine `engine`
 /// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
 /// out of [`run`] purely to keep that function under
@@ -223,9 +314,13 @@ async fn execute_query_against_engine(
         // text is logged under the reference. An unreachable engine or a
         // non-query failure stays the fixed message. See
         // `upstream_error::ch_error_for_author`.
+        //
+        // SEC-21: the engine stops producing rows past the cap, so a huge
+        // result never reaches this process. One row more than the route
+        // keeps is asked for, so `truncated` stays honest.
         let result = state
             .clickhouse
-            .query(sql, None)
+            .query_limited(sql, MAX_RESULT_ROWS + 1, None)
             .await
             .map_err(|e| upstream_error::ch_error_for_author(&upstream_error::DATABASE, &e))?;
 
@@ -274,6 +369,8 @@ async fn execute_query_against_engine(
 ///   read statements can be proposed.
 /// - A statement the policy refuses: the policy's own non-leaking message,
 ///   from [`rewrite_sql_for_principal`].
+/// - A statement that names a setting other than `iceberg_snapshot_id`: the
+///   settings rule's fixed sentence (`SEC-21`).
 /// - A statement `ClickHouse` cannot plan: its own SQL error text, which is
 ///   the author's to see, the same text `run_sql` already treats as such.
 /// - `engine` `"trino"`: a fixed "not supported yet" sentence. Plan 16
@@ -295,6 +392,10 @@ pub(crate) async fn check_statement_would_run(
     if is_trino_engine(engine) {
         return Err("Checking a Trino statement is not supported yet.".to_owned());
     }
+    // SEC-21: the check sends the statement to the engine, so the proposal
+    // must meet the settings rule a run applies, or the user would be shown a
+    // fix that `run` then refuses.
+    refuse_unlisted_settings(&rewritten).map_err(|err| err.to_string())?;
     let query = format!("EXPLAIN PLAN {}", strip_trailing_semicolon(&rewritten));
     state
         .clickhouse
@@ -311,10 +412,15 @@ pub(crate) async fn check_statement_would_run(
 /// The most rows one run hands back to the browser.
 ///
 /// The console renders every row it receives, so an unbounded `SELECT *`
-/// used to be enough to freeze the tab. `ClickHouse`/`Trino` still compute
-/// the whole result — this caps what crosses the wire, and the response
-/// says when it did (`truncated`), so nobody reads a partial answer as the
-/// whole one.
+/// used to be enough to freeze the tab. The response says when the cap
+/// applied (`truncated`), so nobody reads a partial answer as the whole one.
+///
+/// `ClickHouse` is asked to stop at the cap (`ChClient::query_limited`), so
+/// a huge result does not fill this process's memory before `truncate`
+/// runs (SEC-21). `result_overflow_mode = 'break'` stops at a block
+/// boundary, so up to one block (`max_block_size`, about 65,000 rows by
+/// default) beyond the cap can still arrive; the route keeps
+/// `MAX_RESULT_ROWS` of them. `Trino`'s client bounds its own result.
 const MAX_RESULT_ROWS: usize = 2_000;
 
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
@@ -350,7 +456,8 @@ const MAX_RESULT_ROWS: usize = 2_000;
 ///   (WS7 item C2 — a table function, a sensitive `system.*` read, a
 ///   `dictGet`/`joinGet`-family call, a view over a governed table, or an
 ///   authored-but-unenforceable policy condition, WS7 plan Hard
-///   Requirement 1).
+///   Requirement 1), or, on `ClickHouse`, when the statement names a setting
+///   other than `iceberg_snapshot_id` (`SEC-21`).
 /// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
 pub async fn run(
     State(state): State<AppState>,
@@ -358,11 +465,11 @@ pub async fn run(
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
-    let sql = match parsed.sql {
+    let statement = match parsed.sql {
         Some(s) if !s.is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
-    if !is_read_only(&sql) {
+    if !is_read_only(&statement) {
         return Err(ApiError::Unprocessable(
             "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
@@ -380,7 +487,7 @@ pub async fn run(
     let user_id = p.id.uuid().to_string();
 
     let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
-    if engine == "trino" && !is_trino_safe(&sql) {
+    if engine == "trino" && !is_trino_safe(&statement) {
         return Err(ApiError::Unprocessable(
             "This statement is not permitted against Trino (write, session, or procedure \
              keyword detected)."
@@ -395,18 +502,29 @@ pub async fn run(
     // before `started`/`Instant::now()` below so the elapsed time recorded
     // for `policyDecisionP95Ms` covers exactly the rewrite step, nothing
     // else.
-    let sql = rewrite_sql_for_principal(&state, &sql, &engine, &p).await?;
+    //
+    // `statement` stays what the user wrote: query history records it (and
+    // `download` re-rewrites it for the caller's roles at that time), while
+    // `rewritten` is what the engine runs and the audit event records
+    // (`SEC-21`, `SEC-33`).
+    let rewritten = rewrite_sql_for_principal(&state, &statement, &engine, &p).await?;
+    // SEC-21: a statement's own `SETTINGS` would override the cap the run
+    // sends with the request. Trino has no such settings in its client.
+    if !is_trino_engine(&engine) {
+        refuse_unlisted_settings(&rewritten)?;
+    }
 
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
     let (columns, mut rows, duration_ms, scanned_bytes) =
-        execute_query_against_engine(&state, &engine, &sql, &user_id, started).await?;
+        execute_query_against_engine(&state, &engine, &rewritten, &user_id, started).await?;
 
     // The console renders every row it receives, so an unbounded `SELECT *`
     // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
-    // comment. `ClickHouse`/`Trino` still compute the whole result; only
-    // what crosses the wire is capped, and the response says when it did.
+    // comment. The engines stop at the cap (`ClickHouse` inside the engine,
+    // `Trino` in its client); this keeps exactly `MAX_RESULT_ROWS` of what
+    // arrived, and the response says when it did.
     let total_rows = rows.len();
     let truncated = total_rows > MAX_RESULT_ROWS;
     rows.truncate(MAX_RESULT_ROWS);
@@ -425,7 +543,7 @@ pub async fn run(
     // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
     // resolves on read (WS5 Phase D preamble).
     if let Some(pool) = state.pg.as_deref() {
-        let event = query_run_audit_event(&p, &id, &sql);
+        let event = query_run_audit_event(&p, &id, &rewritten);
         if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
             tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
         }
@@ -449,7 +567,7 @@ pub async fn run(
         )]
         let input = RecordHistoryInput {
             id: &id,
-            sql: &sql,
+            sql: &statement,
             user: &user_id,
             owner_id: Some(p.id.uuid()),
             status: "completed",
@@ -689,11 +807,14 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 /// # Errors
 ///
 /// Returns 400 [`ApiError::BadRequest`] on an unparseable body or a
-/// missing/blank `sql`. An `EXPLAIN ESTIMATE` failure (e.g. non-`SELECT`
-/// input) still answers 200 — the console shows the estimate panel either
-/// way — but `estimatedBytes`/costs are `null` and the `ClickHouse` message
-/// is carried in `error`, rather than a zeroed estimate that looked
-/// identical to "this query reads nothing".
+/// missing/blank `sql`, and 422 [`ApiError::Unprocessable`] when `sql` fails
+/// [`is_read_only`], the rewrite refuses it, or it names a setting other than
+/// `iceberg_snapshot_id` (`SEC-21`), as [`run`] does. An `EXPLAIN
+/// ESTIMATE` failure (e.g. an unknown column) still answers 200 — the
+/// console shows the estimate panel either way — but `estimatedBytes`/costs
+/// are `null` and the `ClickHouse` message is carried in `error`, rather
+/// than a zeroed estimate that looked identical to "this query reads
+/// nothing".
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -704,6 +825,17 @@ pub async fn estimate(
         Some(s) if !s.trim().is_empty() => s,
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
+    // SEC-19: the estimate refuses what the run refuses, with the run's
+    // status and message, and does so before the rewrite below, whose policy
+    // prefetch already queries the engine. `EXPLAIN ESTIMATE` is the only
+    // statement this route may send, so a non-read never reaches it.
+    if !is_read_only(&sql) {
+        return Err(ApiError::Unprocessable(
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
+                .to_owned(),
+        )
+        .into());
+    }
 
     // A failed EXPLAIN is reported, not swallowed. It used to come back as
     // a zeroed estimate, so "this query cannot even be planned" and "this
@@ -718,6 +850,9 @@ pub async fn estimate(
     // reports the tables the statement reads, which the rewrite does not
     // change, so the sources shown are what the run would show.
     let rewritten = rewrite_sql_for_principal(&state, &sql, "clickhouse", &principal).await?;
+    // SEC-21: the same settings rule as the run, on the statement the engine
+    // is sent.
+    refuse_unlisted_settings(&rewritten)?;
     let estimated = estimate_body(&state.clickhouse, &rewritten).await;
     let (estimated_bytes, sources, estimate_error) = match estimated {
         Ok((bytes, sources)) => (Some(bytes), sources, None),
@@ -1118,6 +1253,13 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// original run changes what comes back. The statement is rewritten for the
 /// caller's current roles first, exactly as the run route does.
 ///
+/// The stored statement is the one the user wrote ([`run`] records it, not
+/// the rewritten form), so today's policy is applied to it once. A row
+/// recorded before that change holds the rewritten form: an old mask or row
+/// filter sits inside it and today's policy applies on top, which only adds
+/// restriction (it fails closed). Those rows are left as they are (`SEC-21`,
+/// `SEC-33`).
+///
 /// Only rows whose `engine` is `"clickhouse"` or the legacy `"hot-store"`
 /// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
 /// be re-run through this route at all.
@@ -1139,7 +1281,9 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 ///   one does but its recorded owner is not the calling principal
 ///   (including every legacy `"anonymous"` row — see this doc comment).
 /// - 422 [`ApiError::Unprocessable`] when the policy rewrite refuses the
-///   statement (the run route's fixed message), when the row's `engine` is not
+///   statement (the run route's fixed message), when the statement names a
+///   setting other than `iceberg_snapshot_id` (`SEC-21`; the cap this route
+///   appends afterwards is not subject to that rule), when the row's `engine` is not
 ///   downloadable, when its stored `SQL` fails [`is_read_only`] (defense
 ///   in depth: `routes::query::run` already gated this at insert time),
 ///   or when `ClickHouse` rejects the re-run.
@@ -1201,6 +1345,9 @@ pub async fn download(
         return Err(ApiError::NotFound("query run not found".to_owned()).into());
     };
     let rewritten = rewrite_sql_for_principal(&state, &item.sql, &item.engine, caller).await?;
+    // SEC-21: the stored statement may carry a setting recorded before the
+    // rule. The cap added below is appended after this check and stays.
+    refuse_unlisted_settings(&rewritten)?;
     let capped_sql = build_capped_statement(&rewritten, format_clause);
     let bytes = state
         .clickhouse
@@ -1264,6 +1411,230 @@ fn scheduling_capability_body() -> Value {
 /// This handler never fails — it reports a fixed, static capability.
 pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     Ok(ApiJson(scheduling_capability_body()))
+}
+
+/// The SEC-21 settings rule, tested on its own. A separate module from
+/// `tests` so the two do not share a hunk.
+#[cfg(test)]
+mod settings_rule_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::{MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::Config;
+
+    /// Statements the parser reads as one statement and that name a setting
+    /// other than `iceberg_snapshot_id`, in every place a setting can sit.
+    /// (`SELECT 1 SETTINGS ..` is not here: the parser reads `SETTINGS` as
+    /// the alias of `1`, so it is in [`UNREADABLE`].)
+    const REFUSED_FOR_A_SETTING: &[&str] = &[
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS max_execution_time = 0",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1, max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0, iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t SETTINGS max_result_rows = 0 FORMAT JSON",
+        "SELECT n FROM serving.t SETTINGS /* a comment */ max_result_rows = 0",
+        "SELECT n FROM serving.t SETTINGS \"max_result_rows\" = 0",
+        // Case-sensitive: the picker writes the lower-case name.
+        "SELECT n FROM serving.t SETTINGS ICEBERG_SNAPSHOT_ID = 1",
+        "SELECT n FROM serving.t SETTINGS Iceberg_Snapshot_Id = 1",
+        // Every place a query can sit.
+        "SELECT * FROM (SELECT n FROM serving.t SETTINGS max_result_rows = 0)",
+        "WITH c AS (SELECT n FROM serving.t SETTINGS max_result_rows = 0) SELECT * FROM c",
+        "SELECT (SELECT n FROM serving.t SETTINGS max_result_rows = 0) AS x",
+        "SELECT n FROM serving.t WHERE n IN (SELECT n FROM serving.u SETTINGS max_result_rows = 0)",
+        "SELECT n FROM serving.t WHERE EXISTS (SELECT n FROM serving.u SETTINGS max_result_rows = 0)",
+        "SELECT n FROM serving.t UNION ALL SELECT n FROM serving.u SETTINGS max_result_rows = 0",
+        "(SELECT n FROM serving.t SETTINGS max_result_rows = 0) UNION ALL SELECT n FROM serving.u",
+        "SELECT a.n FROM serving.t a JOIN (SELECT n FROM serving.u SETTINGS max_result_rows = 0) b ON a.n = b.n",
+        "EXPLAIN SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "EXPLAIN SELECT * FROM (SELECT n FROM serving.t SETTINGS max_result_rows = 0)",
+        "EXPLAIN ESTIMATE SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        // After each clause the setting can follow.
+        "SELECT n FROM serving.t FINAL SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t ARRAY JOIN arr SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t GROUP BY n WITH ROLLUP SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t LIMIT 10 OFFSET 2 SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t\n-- a comment\nSETTINGS max_result_rows = 0",
+        // A setting that is not on a query.
+        "SELECT * FROM executable('x.py', TabSeparated, 'a UInt8', SETTINGS pool_size = 16)",
+        "INSERT INTO t SETTINGS async_insert = 1 FORMAT JSONEachRow",
+    ];
+
+    /// Statements the rule refuses because it cannot read them as exactly one
+    /// statement. The engine would not see a different statement for these,
+    /// and the rewrite refuses most of them first.
+    const UNREADABLE: &[&str] = &[
+        "SELECT 1 SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t; SELECT n FROM serving.u",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1; SELECT 2",
+        "SET max_result_rows = 0; SELECT n FROM serving.t",
+        "SELECT n FROM serving.t FORMAT JSON SETTINGS max_result_rows = 0",
+        "SELEC n FROM serving.t",
+        "SELECT n FROM serving.t SETTINGS",
+        // Statement kinds that can carry no setting in the parser's tree, so
+        // the parser must not accept them with one.
+        "SHOW TABLES SETTINGS max_result_rows = 0",
+        "DESCRIBE serving.t SETTINGS max_result_rows = 0",
+        "EXPLAIN AST SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+        "SELECT n FROM serving.t INTO OUTFILE 'x' SETTINGS max_result_rows = 0",
+        "",
+    ];
+
+    /// The picker's output shapes (`src/lib/snapshot-picker.ts`) and
+    /// statements with no setting at all.
+    const ALLOWED: &[&str] = &[
+        "SELECT 1",
+        "SELECT 1;",
+        "SELECT n FROM serving.t WHERE n > 1 LIMIT 10",
+        "-- a comment\nSELECT 1",
+        "SELECT 'SETTINGS max_result_rows = 0' AS note",
+        "SELECT 1 AS settings",
+        "EXPLAIN SELECT 1",
+        "SHOW TABLES",
+        "DESCRIBE serving.t",
+        "SELECT n FROM serving.t\nSETTINGS iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t\nSETTINGS iceberg_snapshot_id = 4733245589251823498",
+        "SELECT n FROM serving.t LIMIT 5\nSETTINGS iceberg_snapshot_id = 1;",
+        "SELECT * FROM (SELECT n FROM serving.t) SETTINGS iceberg_snapshot_id = 1",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1 FORMAT JSON",
+        "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1, iceberg_snapshot_id = 2",
+        "EXPLAIN SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1",
+    ];
+
+    fn refusal(sql: &str) -> ApiError {
+        refuse_unlisted_settings(sql).expect_err(&format!("expected a refusal: {sql:?}"))
+    }
+
+    #[test]
+    fn a_statement_with_any_other_setting_is_refused_with_one_fixed_message() {
+        for sql in REFUSED_FOR_A_SETTING.iter().chain(UNREADABLE) {
+            match refusal(sql) {
+                ApiError::Unprocessable(message) => {
+                    assert_eq!(message, SETTINGS_REFUSAL_MESSAGE, "{sql:?}");
+                }
+                other => panic!("expected 422 for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Without this, a refusal above could come from the parser failing and
+    /// not from the rule, and removing the rule would leave the test green.
+    #[test]
+    fn every_statement_refused_for_a_setting_parses_as_one_statement() {
+        for sql in REFUSED_FOR_A_SETTING {
+            let parsed = sqlparser::parser::Parser::parse_sql(
+                &sqlparser::dialect::ClickHouseDialect {},
+                sql,
+            );
+            assert_eq!(parsed.map(|statements| statements.len()), Ok(1), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_pickers_setting_and_a_statement_without_settings_pass() {
+        for sql in ALLOWED {
+            assert!(
+                refuse_unlisted_settings(sql).is_ok(),
+                "expected allowed: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_nothing_about_the_statement() {
+        let message = SETTINGS_REFUSAL_MESSAGE;
+        for sql in [
+            "SELECT secret_column FROM salary SETTINGS salary_total = 0",
+            "SELEC salary",
+        ] {
+            let ApiError::Unprocessable(shown) = refusal(sql) else {
+                panic!("expected 422 for {sql:?}");
+            };
+            assert_eq!(shown, message);
+            assert!(!shown.contains("salary") && !shown.contains("secret_column"));
+        }
+    }
+
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    fn analyst() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "alice".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        }
+    }
+
+    /// The Fix-with-AI check sends the statement to the engine inside an
+    /// `EXPLAIN PLAN`, so it applies the rule too.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_proposal_check_refuses_another_setting_before_the_engine_is_asked(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [], "data": [], "rows": 0,
+            })))
+            .mount(&server)
+            .await;
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let refused = check_statement_would_run(
+            &state,
+            &analyst(),
+            "SELECT n FROM serving.t SETTINGS max_result_rows = 0",
+            "clickhouse",
+        )
+        .await;
+        assert_eq!(refused, Err(SETTINGS_REFUSAL_MESSAGE.to_owned()));
+
+        let leaked: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("mock server records requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| !b.contains("system."))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "nothing may reach the engine: {leaked:?}"
+        );
+
+        let allowed = check_statement_would_run(
+            &state,
+            &analyst(),
+            "SELECT n FROM serving.t SETTINGS iceberg_snapshot_id = 1",
+            "clickhouse",
+        )
+        .await;
+        assert_eq!(allowed, Ok(()));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

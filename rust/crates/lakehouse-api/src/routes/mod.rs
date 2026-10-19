@@ -9,7 +9,11 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
-mod authored_pipelines;
+// `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
+// `authored_pipelines::job_name` to name the job a lag run launches, and
+// re-deriving the `authored__<id>` mapping in a second place is exactly
+// the drift the one definition exists to prevent.
+pub(crate) mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
@@ -65,7 +69,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -257,11 +261,14 @@ fn pipelines_router() -> Router<AppState> {
                 .put(authored_pipelines::update)
                 .delete(authored_pipelines::delete),
         )
+        .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route(
             "/api/pipelines/{id}/schedule-ticks",
             get(authored_pipelines::schedule_ticks),
         )
-        .route("/api/pipelines/{id}/source", get(pipelines::source))
+        // BLD-2: the two target-lag routes live in `target_lag_routes`,
+        // merged in above.
+        .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         // Plan R4 2b: definition version history. Static under
         // `{id}/versions`, so it is registered BEFORE
@@ -379,6 +386,31 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/volume",
             axum::routing::get(pipelines::volume),
+        )
+}
+
+/// BLD-2 (plan D6/D8): the target lag's own two routes, merged into the
+/// pipeline sub-router. They sit together because they are one feature's
+/// two doors — the orchestrator asks [`authored_pipelines::lag_check`] and
+/// a user sets the target through
+/// [`authored_pipelines::set_target_lag`] — and splitting them from
+/// [`pipelines_router`] is also what keeps that function under
+/// `clippy::too_many_lines`.
+///
+/// `lag-check` is under `/runnable/` because only the orchestrator may ask
+/// (the same gate as `runnable` itself), not because it lists anything.
+/// `target-lag` is its own route rather than a field on
+/// `PUT /api/pipelines/{id}`: clearing the lag (`AC8`) is a value that
+/// route's "absent means unchanged" body cannot express.
+fn target_lag_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/pipelines/runnable/{id}/lag-check",
+            post(authored_pipelines::lag_check),
+        )
+        .route(
+            "/api/pipelines/{id}/target-lag",
+            put(authored_pipelines::set_target_lag),
         )
 }
 

@@ -41,7 +41,11 @@ export const CAPABILITIES: Capability[] = [
       // BI-11: parameters.
       "list_parameters", "create_parameter", "update_parameter", "delete_parameter",
       // BI-2 / AI-7: reusable metrics (a tool missing here never reaches the model, see BI-8 R1 above).
-      "list_metrics", "describe_metric", "query_metric", "create_metric", "update_metric", "delete_metric"],
+      "list_metrics", "describe_metric", "query_metric", "create_metric", "update_metric", "delete_metric",
+      // AI-1 / AI-2 / AI-20 (plan 20): rename and delete the board, move tiles,
+      // move a chart to another board, set the view's filters (read-only, so
+      // Ask mode can offer it too) and save the board's default filters.
+      "rename_board", "delete_board", "arrange_board", "move_chart", "set_board_view_filters", "save_board_filters"],
   },
   {
     key: "pipeline",

@@ -112,6 +112,7 @@ async fn seed_pipeline(pool: &PgPool, run_as: Option<Uuid>) -> String {
             connector_id: None,
             id: None,
             run_as,
+            target_lag: None,
         },
         run_as,
     )

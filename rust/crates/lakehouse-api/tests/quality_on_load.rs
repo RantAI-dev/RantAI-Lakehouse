@@ -243,6 +243,7 @@ async fn seed_pipeline(pool: &PgPool, target_zone: &str, target_table: &str) -> 
             connector_id: None,
             id: None,
             run_as: None,
+            target_lag: None,
         },
         None,
     )

@@ -14,7 +14,7 @@
  * `<namespace>.<table>` target and the backend clears
  * `measure`/`agg`/`threshold`/`board` for that kind (WS5 item E3).
  */
-export type AlertRuleKind = "alert" | "digest" | "freshness" | string
+export type AlertRuleKind = "alert" | "digest" | "freshness" | "pipeline_behind_target" | string
 
 /**
  * The six rule kinds for connector and upload loads (`SRC-7`). The first five
@@ -91,6 +91,8 @@ export type AlertRule = {
    * rule (`DATA-14`). Omitted from the wire body when unset, like `connector`.
    */
   asset?: string
+  /** Pipeline id or `*` for pipeline rules. */
+  pipeline?: string
 }
 
 /**
@@ -118,6 +120,7 @@ export type SaveAlertRuleInput = {
   connector?: string
   /** Table or `*`; see [`AlertRule.asset`]. */
   asset?: string
+  pipeline?: string
 }
 
 /** Body of `GET /api/alerts/status`. */

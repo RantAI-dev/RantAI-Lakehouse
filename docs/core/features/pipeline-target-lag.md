@@ -51,7 +51,7 @@ The AI team reviews that part.
 
 ## Limits to tell a customer
 
-- The smallest lag is the measured one recorded in the result file; 1 minute is the target.
+- The smallest lag is 1 minute, the target, and it was measured: in the final 1-minute gate run every sample was within 60 s (worst 32.70 s, average 25.64 s; `docs/plans/BLD-2-TARGET-LAG-RESULT.md`, run on `29d889340b1a`).
 - Each refresh rebuilds the whole output table.
 
 ## Acceptance checklist

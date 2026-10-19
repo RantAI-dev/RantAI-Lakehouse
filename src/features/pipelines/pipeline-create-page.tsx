@@ -615,7 +615,7 @@ export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
         {step === 3 ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Schedule" className="sm:col-span-2">
-              <PipelineScheduleField value={schedule} onChange={setSchedule} />
+              <PipelineScheduleField value={schedule} onChange={setSchedule} hasTargetLag={Boolean(existing?.targetLag)} />
             </Field>
           </div>
         ) : null}

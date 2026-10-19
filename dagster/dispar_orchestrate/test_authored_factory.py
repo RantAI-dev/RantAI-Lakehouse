@@ -28,11 +28,14 @@ from __future__ import annotations
 import contextlib
 import os
 import unittest
-from typing import Any, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterator, Sequence
 from unittest import mock
 
 import requests
 from dagster import (
+    AssetKey,
+    AssetMaterialization,
     Backoff,
     DagsterRunStatus,
     DefaultScheduleStatus,
@@ -769,6 +772,16 @@ class AuthoredScheduleTest(unittest.TestCase):
         schedule = authored_factory.build_authored_schedule(pipeline, self._job(pipeline))
         self.assertEqual(schedule.default_status, DefaultScheduleStatus.STOPPED)
 
+    def test_pipeline_with_target_lag_builds_no_schedule(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no schedule,
+        even when its schedule is a valid cron expression. Removing the lag
+        returns the pipeline to the schedule."""
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": lag}
+            self.assertIsNone(authored_factory.build_authored_schedule(pipeline, self._job(pipeline)))
+        restored = {**_ready_pipeline(), "schedule": "0 2 * * *", "targetLag": None}
+        self.assertIsNotNone(authored_factory.build_authored_schedule(restored, self._job(restored)))
+
     def test_an_on_demand_pipeline_gets_no_schedule(self) -> None:
         for label in ("manual", "On demand", "", None):
             pipeline = {**_ready_pipeline(), "schedule": label}
@@ -857,20 +870,53 @@ class _FakeRunRecord:
         self.end_time = run.end_time
 
 
+class _FakeMaterialization:
+    """Drop-in for `dagster._core.events.log.EventLogRecord` -- the element
+    `DagsterInstance.fetch_materializations` returns inside its
+    `EventRecordsResult`. Only the four properties the sensor's per-table
+    filter reads are carried (`run_id`, `timestamp`, `asset_key`, and the
+    `asset_materialization` event itself), because the real call filters by
+    asset key ONLY: it has no `job_name` and no status field, which is why
+    the run's status has to come from the run side (`authored_factory`
+    `_latest_record_for_ingest_table`)."""
+
+    def __init__(self, run_id: str, timestamp: float, asset_key: AssetKey) -> None:
+        self.run_id = run_id
+        self.timestamp = timestamp
+        self.asset_key = asset_key
+
+
+class _FakeEventRecordsResult:
+    """The `EventRecordsResult` shape: one `records` attribute, newest
+    first, because `fetch_materializations` defaults to `ascending=False`
+    (verified in the plan's section 5.1)."""
+
+    def __init__(self, records: Sequence[_FakeMaterialization]) -> None:
+        self.records = list(records)
+
+
 class _StubInstance:
     """Drop-in for `context.instance`. Records every `(filter, limit)`
     pair the sensor asks for and returns the record list the test set up
     for that pair, newest first, honouring the `limit` the sensor chose.
     Indexed by `RunsFilter.job_name` so the sensor's per-upstream query
-    and per-downstream query can be answered independently.
+    and per-downstream query can be answered independently, and by asset
+    key path for `fetch_materializations`.
 
-    Only `get_run_records` exists here on purpose: a sensor that went
-    back to `get_runs` would raise `AttributeError` in every test rather
-    than quietly reading times off an object that no longer has them."""
+    Only `get_run_records` and `fetch_materializations` exist here on
+    purpose: a sensor that went back to `get_runs` would raise
+    `AttributeError` in every test rather than quietly reading times off
+    an object that no longer has them."""
 
-    def __init__(self, runs_by_job: dict[str, list[_FakeDagsterRun]]) -> None:
+    def __init__(
+        self,
+        runs_by_job: dict[str, list[_FakeDagsterRun]],
+        materializations: dict[tuple[str, ...], list[_FakeMaterialization]] | None = None,
+    ) -> None:
         self._runs_by_job = runs_by_job
+        self._materializations = materializations or {}
         self.calls: list[tuple[RunsFilter | None, int | None]] = []
+        self.materialization_calls: list[tuple[Any, int]] = []
 
     def get_run_records(
         self,
@@ -881,11 +927,44 @@ class _StubInstance:
         ascending: bool = False,
     ) -> Sequence[_FakeRunRecord]:
         self.calls.append((filters, limit))
-        job_name = filters.job_name if filters else None
-        runs = list(self._runs_by_job.get(job_name, []))
+        if filters and filters.job_name:
+            runs = list(self._runs_by_job.get(filters.job_name, []))
+        else:
+            runs = [r for job_runs in self._runs_by_job.values() for r in job_runs]
+        if filters and filters.run_ids:
+            # BLD-4 review R1 BLOCKER 1 / SHOULD-FIX 5
+            run_ids_set = set(filters.run_ids)
+            runs = [r for r in runs if r.run_id in run_ids_set]
+        if filters and filters.statuses:
+            # BLD-4 review R1 SHOULD-FIX 5
+            statuses_set = set(filters.statuses)
+            runs = [r for r in runs if r.status in statuses_set]
         if limit is not None:
             runs = runs[:limit]
         return [_FakeRunRecord(run) for run in runs]
+
+    def fetch_materializations(
+        self,
+        records_filter: Any,
+        limit: int,
+        cursor: Any = None,
+        ascending: bool = False,
+    ) -> _FakeEventRecordsResult:
+        self.materialization_calls.append((records_filter, limit))
+        key = self._asset_key_path(records_filter)
+        records = list(self._materializations.get(key, []))
+        if limit is not None:
+            records = records[:limit]
+        return _FakeEventRecordsResult(records)
+
+    @staticmethod
+    def _asset_key_path(records_filter: Any) -> tuple[str, ...]:
+        """The asset key a filter names, as a tuple. A plain `AssetKey` and
+        an `AssetRecordsFilter` (whose key is its `asset_key` attribute) are
+        both accepted, so a test stays honest about which one the sensor
+        build passes."""
+        asset_key = getattr(records_filter, "asset_key", None) or records_filter
+        return tuple(asset_key.path)
 
 
 class _StubContext:
@@ -939,6 +1018,18 @@ class TestDependencySensor:
     """Sensor-body tests for R3 plan 2a. Plain pytest class (no
     `unittest.TestCase`) so the per-test asserts render with pytest's
     own introspection instead of `self.assertEqual`'s."""
+
+    def test_returns_none_when_target_lag_is_set(self) -> None:
+        """BLD-2 D3: a pipeline with targetLag (either kind) builds no dependency sensor,
+        even when dependsOn is populated. Removing target lag restores the sensor."""
+        @job(name="authored__pl_lag_dep")
+        def _job() -> None:
+            return None
+        for lag in ({"kind": "lag", "minutes": 10}, {"kind": "downstream"}):
+            pipeline = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": lag}
+            assert build_authored_dependency_sensor(pipeline, _job) is None
+        restored = {**_dep_pipeline("pl-lag-dep", ["pl-up-a"]), "targetLag": None}
+        assert build_authored_dependency_sensor(restored, _job) is not None
 
     def test_returns_none_when_depends_on_is_empty(self) -> None:
         """A pipeline with `depends_on=[]` produces NO `run_status_sensor`:
@@ -1219,7 +1310,19 @@ class TestDependencySensor:
         verbatim -- Dagster itself resolves the selector to a job that is
         not in this code location, which is the whole point of
         `JobSelector(job_name=id)` (vs the authored branch, which goes
-        through `_dagster_safe_name`)."""
+        through `_dagster_safe_name`).
+
+        The pipeline built here reads `silver.orders`, which after BLD-4 / D2
+        a `ingest_job` upstream can never feed: that job writes Bronze, so a
+        non-Bronze source has no table to match and the chain waits instead
+        of firing. This test used to assert the tick yielded a `RunRequest`
+        on the unchanged silver pipeline; that was the behaviour the feature
+        removes, so the assertion is the D2 fail-closed skip
+        (`AGENTS.md` rule 2: the test was wrong about what should happen, and
+        says why it changed). The firing half of this pair lives in
+        `TestIngestUpstreamIsFilteredByTable`;
+        `test_upstream_job_selector_passes_a_dagster_native_id_through_verbatim`
+        pins the selector itself."""
         upstream_run = _FakeDagsterRun(
             job_name="ingest_job",
             run_id="ingest-1",
@@ -1245,8 +1348,9 @@ class TestDependencySensor:
         body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
         out = list(body(_StubContext(upstream_run, instance)))
         assert len(out) == 1
-        assert isinstance(out[0], RunRequest)
-        assert out[0].run_key == "authored-deps:ingest-1"
+        assert not isinstance(out[0], RunRequest)
+        assert "ingest_job" in out[0].skip_message
+        assert "connector load" in out[0].skip_message
 
     def test_first_downstream_run_does_not_fire_when_one_upstream_never_succeeded(self) -> None:
         """F1.3 (#57): on the chain's first-ever tick (the downstream has
@@ -1527,7 +1631,7 @@ class TestFileIngestUpstreamIsFilteredByTable:
 
     def test_a_pipeline_whose_source_is_not_bronze_never_fires_on_an_upload(self) -> None:
         """A stored row can predate the API's refusal
-        (`routes::authored_pipelines::validate_file_ingest_upstream`). A
+        (`routes::authored_pipelines::validate_per_table_upstream`). A
         non-Bronze source has no Bronze table to match, so the filter
         matches nothing and the chain waits: unsupported, honestly, never
         "works, approximately" by firing on every upload."""
@@ -1553,7 +1657,7 @@ class TestFileIngestUpstreamIsFilteredByTable:
         _tick(sensor, instance, _file_ingest_run("tick", "orders"))
 
         limits = [limit for filters, limit in instance.calls if filters and filters.job_name == "file_ingest_job"]
-        assert limits == [authored_factory.FILE_INGEST_SCAN_LIMIT]
+        assert limits == [authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT]
 
     def test_the_all_upstreams_rule_holds_with_a_filtered_and_an_authored_upstream(self) -> None:
         """Section 6, question 2: mixing a per-table `file_ingest_job`
@@ -1610,6 +1714,558 @@ class TestFileIngestUpstreamIsFilteredByTable:
         assert len(behind) == 1
         assert not isinstance(behind[0], RunRequest)
         assert "pl-up-a" in behind[0].skip_message
+
+
+def _ingest_run(
+    run_id: str,
+    end_time: float = 200.0,
+    start_time: float = 180.0,
+    status: DagsterRunStatus = DagsterRunStatus.SUCCESS,
+) -> _FakeDagsterRun:
+    """An `ingest_job` run: ONE static job for every connector, launched
+    with the `connector_id` of the connector it loads
+    (`ingest_factory._ingest_run_config`), so its config names the
+    CONNECTOR and never the tables the load wrote. That is exactly why the
+    per-table filter for this job reads materializations, not the config."""
+    return _FakeDagsterRun(
+        job_name="ingest_job",
+        run_id=run_id,
+        status=status,
+        start_time=start_time,
+        end_time=end_time,
+        run_config={"ops": {"run_ingest": {"config": {"connector_id": "conn-1"}}}},
+    )
+
+
+def _materialized(run_id: str, table: str, timestamp: float = 250.0) -> _FakeMaterialization:
+    """A materialization event logged inside run `run_id` for the Bronze
+    table `table`, shaped as `ingest_factory.ingest_source_object` logs it
+    (`AssetMaterialization(asset_key=f"bronze.{obj['target']}")`). The asset
+    key is built through `authored_factory._bronze_asset_key` so the test
+    cannot disagree with the filter about the key's shape."""
+    return _FakeMaterialization(
+        run_id=run_id,
+        timestamp=timestamp,
+        asset_key=authored_factory._bronze_asset_key(table),
+    )
+
+
+class TestIngestUpstreamIsFilteredByTable:
+    """BLD-4 / D1: `ingest_job` is ONE job for every connector, so ANY
+    connector's successful load fires every pipeline that names it, whatever
+    table the pipeline reads. The anchor is instead the newest SUCCESS run
+    that materialized the pipeline's own Bronze source table, read from the
+    run's own materialization (`_latest_record_for_ingest_table`)."""
+
+    def _instance(
+        self,
+        materializations: list[_FakeMaterialization],
+        runs: list[_FakeDagsterRun] | None = None,
+    ) -> _StubInstance:
+        """The stub instance one tick of this chain sees: the downstream's
+        own most-recent run, `ingest_job`'s SUCCESS runs, and the
+        materializations `materializations` names -- indexed by each
+        event's OWN asset key, exactly as the real event log is, so a
+        materialization of `bronze.invoices` is never found under a query
+        for `bronze.orders`. `runs` defaults to the one run
+        `materializations` say loaded the table."""
+        by_key: dict[tuple[str, ...], list[_FakeMaterialization]] = {}
+        for materialization in materializations:
+            by_key.setdefault(tuple(materialization.asset_key.path), []).append(
+                materialization
+            )
+        return _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                "ingest_job": runs if runs is not None else [],
+            },
+            materializations=by_key,
+        )
+
+    def _sensor(self, depends_on: list[str], source_zone: str = "bronze", source_table: str = "orders"):
+        return _build_bronze_dep_sensor(
+            "pl-down-1", depends_on, source_zone, source_table
+        )
+
+    def test_a_load_of_the_source_table_triggers_the_pipeline(self) -> None:
+        """The whole point of the feature: the run that materialized the
+        pipeline's own table is a fresh SUCCESS run, so the chain fires with
+        a run_key naming THAT run."""
+        ours = _ingest_run("ours")
+        instance = self._instance([_materialized("ours", "orders")], runs=[ours])
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_a_load_of_another_table_does_not_trigger_the_pipeline(self) -> None:
+        """A newer SUCCESS run of `ingest_job` that loaded a DIFFERENT table
+        (same connector, other objects) is not a run of this chain. The
+        unfiltered rule -- newest run of the job wins -- is what fired on
+        every connector load in the deployment."""
+        ours = _ingest_run("ours", end_time=200.0)
+        other = _ingest_run("other-new", end_time=250.0)
+        instance = self._instance(
+            [
+                _materialized("ours", "orders"),
+                # The newer run really did load -- and did load
+                # `invoices`, which is the whole point: one connector,
+                # several objects, one run.
+                _materialized("other-new", "invoices"),
+            ],
+            runs=[other, ours],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        # It did NOT skip: its own table's load IS fresh, so the chain is
+        # allowed to run -- and the run_key names THAT run, never the other
+        # table's.
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_a_run_that_materialized_the_table_and_failed_does_not_trigger(self) -> None:
+        """The anchor is the RUN's status, not the event's existence: the
+        event log is append-only per step, so a run whose mapped step
+        loaded the table and whose LATER step failed still carries the
+        materialization (proven on a real instance in
+        `TestIngestMaterializationKeyTest`). Such a run is not a load this
+        chain may follow, so the tick looks past it to the SUCCESS run."""
+        ours = _ingest_run("ours", end_time=200.0)
+        # BLD-4 review R1 SHOULD-FIX 5: feed the failed run to the stub
+        broken = _ingest_run("broken", end_time=250.0, status=DagsterRunStatus.FAILURE)
+        instance = self._instance(
+            [
+                _materialized("broken", "orders", timestamp=260.0),
+                _materialized("ours", "orders", timestamp=200.0),
+            ],
+            runs=[broken, ours],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_only_failed_loads_of_the_table_inside_the_window_skip(self) -> None:
+        """When every materialization in the window belongs to a run that
+        FAILED, the chain waits and says why: the table's last load did not
+        succeed, which is a different fact from "never loaded"."""
+        # BLD-4 review R1 SHOULD-FIX 5: feed the failed run to the stub
+        broken = _ingest_run("broken", end_time=250.0, status=DagsterRunStatus.FAILURE)
+        instance = self._instance(
+            [_materialized("broken", "orders", timestamp=260.0)],
+            runs=[broken],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+        assert "orders" in out[0].skip_message
+        assert "ingest_job" in out[0].skip_message
+
+    def test_more_than_twenty_success_runs_of_other_tables_after_own_run_still_triggers(self) -> None:
+        """BLD-4 review R1 BLOCKER 1: The SUCCESS-run window is keyed on the
+        table's materializations, not the deployment's newest runs. More than 20
+        SUCCESS runs of other tables after this table's own SUCCESS run must
+        still find this table's run and trigger the pipeline. Under the old
+        deployment-wide window, 20 newer runs of other tables pushed ours out
+        of the window, falsely skipping."""
+        ours = _ingest_run("ours", end_time=200.0)
+        other_runs = [
+            _ingest_run(f"other-{i}", end_time=210.0 + i)
+            for i in range(25)
+        ]
+        other_materializations = [
+            _materialized(f"other-{i}", "invoices", timestamp=210.0 + i)
+            for i in range(25)
+        ]
+        all_runs = list(reversed(other_runs)) + [ours]
+        instance = self._instance(
+            [_materialized("ours", "orders", timestamp=200.0)] + other_materializations,
+            runs=all_runs,
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ours"
+
+    def test_stale_anchor_skip_names_the_table_when_per_table_upstream_is_behind(self) -> None:
+        """BLD-4 review R1 SHOULD-FIX 1: When a per-table upstream's latest
+        SUCCESS run for this table is behind the downstream's start, the skip
+        reason must name the table (D4) rather than falsely claiming the job
+        itself has no SUCCESS run after the downstream start when other tables
+        have loaded."""
+        ours = _ingest_run("ours", end_time=50.0)
+        other = _ingest_run("other-new", end_time=200.0)
+        instance = self._instance(
+            [
+                _materialized("ours", "orders", timestamp=50.0),
+                _materialized("other-new", "invoices", timestamp=200.0),
+            ],
+            runs=[other, ours],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, other)
+
+        assert len(out) == 1
+        assert not isinstance(out[0], RunRequest)
+        assert "orders" in out[0].skip_message
+        assert "ingest_job" in out[0].skip_message
+        assert "stale" in out[0].skip_message
+
+    def test_nothing_inside_the_window_skips_with_the_table_named(self) -> None:
+        """D4: the reason names the table, the job and the window size,
+        because "waiting on ingest_job" alone reads as "no connector load
+        has run yet" when the real answer is "loads of other tables
+        have"."""
+        other = _ingest_run("other-1", end_time=250.0)
+        instance = self._instance(
+            [_materialized("other-1", "invoices", timestamp=260.0)],
+            runs=[other],
+        )
+        out = _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "orders" in reason.skip_message
+        assert "ingest_job" in reason.skip_message
+        assert f"in its last {authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT} loads" in reason.skip_message
+        assert "a load of another table never triggers this pipeline" in reason.skip_message
+
+    def test_a_pipeline_whose_source_is_not_bronze_never_fires_on_a_connector_load(self) -> None:
+        """D2, stored row that predates the API's refusal: a non-Bronze
+        source has no Bronze table to match, so the filter matches nothing
+        and the chain waits. Unsupported, honestly, never "works,
+        approximately" by firing on every connector load."""
+        ours = _ingest_run("ours")
+        instance = self._instance(
+            [_materialized("ours", "orders")], runs=[ours]
+        )
+        out = _tick(
+            self._sensor(["ingest_job"], source_zone="silver", source_table="orders_clean"),
+            instance,
+            _ingest_run("tick"),
+        )
+
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        assert "silver" in reason.skip_message or "orders_clean" in reason.skip_message
+        assert "no connector load can trigger it" in reason.skip_message
+
+    def test_the_filtered_upstream_asks_a_bounded_window_of_both_kinds(self) -> None:
+        """One window for the whole filter (`AGENTS.md` rule 4: one window,
+        not two): the materialization query and the SUCCESS-run query both
+        use `PER_TABLE_UPSTREAM_SCAN_LIMIT`, and the SKIP-side query is made
+        only when the asset key has materializations at all."""
+        ours = _ingest_run("ours")
+        instance = self._instance([_materialized("ours", "orders")], runs=[ours])
+        _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(instance.materialization_calls) == 1
+        records_filter, limit = instance.materialization_calls[0]
+        # The asset key the filter asks for: TWO components, never the
+        # one-component `bronze.orders` string (see
+        # `TestIngestMaterializationKeyTest`).
+        assert tuple(records_filter.path) == ("bronze", "orders")
+        assert limit == authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT
+        # BLD-4 review R1 BLOCKER 1: run lookup is keyed on materializations' run_ids
+        run_calls = [
+            (filters, limit)
+            for filters, limit in instance.calls
+            if filters and filters.run_ids == ["ours"]
+        ]
+        assert run_calls == [
+            (
+                RunsFilter(
+                    run_ids=["ours"],
+                    statuses=[DagsterRunStatus.SUCCESS],
+                ),
+                authored_factory.PER_TABLE_UPSTREAM_SCAN_LIMIT,
+            )
+        ]
+
+    def test_an_asset_key_that_was_never_loaded_makes_no_run_query(self) -> None:
+        """A table nobody ever loaded is one instance call for THIS upstream,
+        not two: no materialization means no SUCCESS-run query to join
+        against."""
+        instance = self._instance([])
+        _tick(self._sensor(["ingest_job"]), instance, _ingest_run("tick"))
+
+        assert len(instance.materialization_calls) == 1
+        # BLD-4 review R1 BLOCKER 1
+        ingest_run_calls = [
+            (filters, limit)
+            for filters, limit in instance.calls
+            if filters and (filters.job_name == "ingest_job" or filters.run_ids is not None)
+        ]
+        assert ingest_run_calls == []
+
+    def test_the_all_upstreams_rule_holds_with_an_ingest_and_an_authored_upstream(self) -> None:
+        """Mixing a per-table `ingest_job` with an authored pipeline changes
+        WHICH run of the first one counts, not the ALL rule: every upstream
+        must be fresh, the first stale one ends the tick with its own
+        reason, and one round of successes asks for one downstream run keyed
+        on both."""
+        ours = _ingest_run("ours")
+        other = _ingest_run("other-new", end_time=250.0)
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                "ingest_job": [other, ours],
+                "authored__pl_up_a": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_up_a",
+                        run_id="upstream-a-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=180.0,
+                        end_time=210.0,
+                    )
+                ],
+            },
+            materializations={
+                ("bronze", "orders"): [_materialized("ours", "orders")],
+            },
+        )
+        sensor = self._sensor(["ingest_job", "pl-up-a"])
+
+        fired = _tick(sensor, instance, _ingest_run("tick"))
+        assert len(fired) == 1
+        assert fired[0].run_key == "authored-deps:ours,upstream-a-1"
+
+        # The same graph with the AUTHORED upstream behind: the tick ends on
+        # that upstream, by name, and asks for nothing.
+        instance._runs_by_job["authored__pl_up_a"] = [
+            _FakeDagsterRun(
+                job_name="authored__pl_up_a",
+                run_id="upstream-a-1",
+                status=DagsterRunStatus.SUCCESS,
+                start_time=40.0,
+                end_time=50.0,
+            )
+        ]
+        behind = _tick(sensor, instance, _ingest_run("tick"))
+        assert len(behind) == 1
+        assert not isinstance(behind[0], RunRequest)
+        assert "pl-up-a" in behind[0].skip_message
+
+    def test_a_file_ingest_upstream_behaves_exactly_as_before(self) -> None:
+        """BLD-4 / D3: nothing else changes. A `file_ingest_job` upstream on
+        the same Bronze pipeline keeps DATA-19's rule -- its own run config
+        says which table it loaded -- and the two per-table upstreams carry
+        the same D4 sentence shape for a chain that names both."""
+        ours = _file_ingest_run("ours", "orders")
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    )
+                ],
+                "file_ingest_job": [ours],
+                "ingest_job": [_ingest_run("ingest-ours")],
+            },
+            materializations={
+                ("bronze", "orders"): [_materialized("ingest-ours", "orders")],
+            },
+        )
+        out = _tick(
+            self._sensor(["file_ingest_job", "ingest_job"]),
+            instance,
+            _file_ingest_run("tick", "orders"),
+        )
+
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "authored-deps:ingest-ours,ours"
+
+
+class TestIngestMaterializationKeyTest:
+    """The assumptions D1 rests on, proven on the REAL dagster 1.13.20
+    classes and a REAL event log instead of on a stub -- the shape of the
+    bug that hid from `R3 plan 2a`'s unit tests and surfaced on
+    `ops/g9`'s step 10.
+
+    Every test here builds the job the same way `ingest_factory.ingest_job`
+    does: a fan-out op whose `.map(...)` step logs one
+    `AssetMaterialization(asset_key="bronze.<table>")` inside the run that
+    loaded it."""
+
+    @staticmethod
+    def _job(fail_after: bool):
+        """A job shaped like `ingest_job`: `run_ingest` yields one DynamicOutput
+        per selected object and `ingest_source_object` (mapped) logs the
+        Bronze materialization. With `fail_after`, a final step raises, so
+        the run FAILS after the load's own event is already in the log."""
+        from dagster import DynamicOut, DynamicOutput
+
+        @op(out=DynamicOut())
+        def run_ingest():
+            for target in ("orders",):
+                yield DynamicOutput(target, mapping_key=target)
+
+        @op(name="ingest_source_object")
+        def ingest_source_object(context, target: str):
+            context.log_event(
+                AssetMaterialization(asset_key=f"bronze.{target}", metadata={"rows": 3})
+            )
+            return target
+
+        @op
+        def boom(context, _targets):
+            raise RuntimeError("a later step of the same run fails")
+
+        @job(name="ingest_job")
+        def _ingest_job() -> None:
+            if fail_after:
+                boom(run_ingest().map(ingest_source_object).collect())
+            else:
+                run_ingest().map(ingest_source_object).collect()
+
+        return _ingest_job
+
+    @contextmanager
+    def _materialized_run(self, fail_after: bool) -> Iterator[Any]:
+        """A REAL event log with one `ingest_job`-shaped run in it: yields
+        `(instance, run_result)` and closes the instance when the test is
+        done. No network and no ClickHouse -- this is the part of an ingest
+        that produces the materialization and nothing else."""
+        from dagster._core.test_utils import instance_for_test
+
+        with instance_for_test() as instance:
+            run = self._job(fail_after).execute_in_process(
+                instance=instance, raise_on_error=False
+            )
+            yield instance, run
+
+    def test_the_job_name_is_the_one_the_factory_filters_by(self) -> None:
+        """The literal in `authored_factory` cannot drift from the job
+        itself: `ingest_factory` has no `JOB_NAME` constant to import
+        (`file_ingest.JOB_NAME` is the one that exists), so this pins the
+        two names against each other instead."""
+        from dispar_orchestrate.ingest_factory import ingest_job
+
+        assert authored_factory.INGEST_JOB == ingest_job.name == "ingest_job"
+
+    def test_an_asset_materialization_string_is_a_two_component_key(self) -> None:
+        """`AssetMaterialization(asset_key="bronze.orders")` parses the
+        string on the PERIOD, so the key is `['bronze', 'orders']`. The
+        filter is built from that: the one-component
+        `AssetKey(["bronze.orders"])` is a DIFFERENT key that matches
+        nothing, which would leave every chain waiting forever."""
+        key = AssetMaterialization(asset_key="bronze.orders").asset_key
+        assert key.path == ["bronze", "orders"]
+        assert key.to_string() == '["bronze", "orders"]'
+        assert key.to_user_string() == "bronze/orders"
+        # The filter's own key, and the two shapes it must not be.
+        assert authored_factory._bronze_asset_key("orders").path == ["bronze", "orders"]
+        assert AssetKey(["bronze.orders"]) != authored_factory._bronze_asset_key("orders")
+        assert AssetKey(["bronze.orders"]).path == ["bronze.orders"]
+
+    def test_the_real_event_log_holds_only_the_two_component_key(self) -> None:
+        """The same fact from the storage side: a REAL run's materialization
+        is stored under `['bronze', 'orders']`, so `fetch_materializations`
+        answers the filter's key and NOT the one-component spelling. This is
+        the assertion the plan's 5.2 asks for -- against the real class and
+        a real event log, not a stub."""
+        from dagster._core.test_utils import instance_for_test
+
+        with self._materialized_run(fail_after=False) as (instance, run):
+            assert run.success
+            two_component = instance.fetch_materializations(
+                authored_factory._bronze_asset_key("orders"), limit=5
+            )
+            assert [record.run_id for record in two_component.records] == [
+                run.dagster_run.run_id
+            ]
+            assert two_component.records[0].asset_key.path == ["bronze", "orders"]
+            one_component = instance.fetch_materializations(
+                AssetKey(["bronze.orders"]), limit=5
+            )
+            assert one_component.records == []
+
+    def test_a_materialization_survives_a_later_step_failure_but_is_not_an_anchor(self) -> None:
+        """5.3, on the real classes: the run whose FIRST mapped step loaded
+        the table and whose LATER step failed still has the materialization
+        in the event log -- the log is append-only per step -- so the filter
+        must read the RUN's status rather than trusting the event. The run is
+        FAILURE, `get_run_records(statuses=[SUCCESS])` is empty, and the
+        anchor for the chain is `None`."""
+        with self._materialized_run(fail_after=True) as (instance, run):
+            assert not run.success
+            assert run.dagster_run.status == DagsterRunStatus.FAILURE
+            records = instance.fetch_materializations(
+                authored_factory._bronze_asset_key("orders"), limit=5
+            )
+            assert [record.run_id for record in records.records] == [run.dagster_run.run_id]
+            assert (
+                authored_factory._latest_record_for_ingest_table(
+                    instance, "orders"
+                )
+                is None
+            ), "a FAILED run's materialization must not anchor the chain"
+            assert authored_factory._latest_record_for_ingest_table(instance, "") is None
+            assert authored_factory._latest_record_for_ingest_table(instance, "invoices") is None
+
+    def test_the_anchor_is_the_newest_success_run_that_materialized_the_table(self) -> None:
+        """The whole filter, on a real event log: two SUCCESS runs (one of
+        this table, one of `invoices`) and one FAILED run of this table. The
+        anchor is the SUCCESS run of this table -- not the failed run's newer
+        event, not the other table's newer run."""
+        from dagster._core.test_utils import instance_for_test
+
+        with instance_for_test() as instance:
+            ours = self._job(fail_after=False).execute_in_process(instance=instance)
+            assert ours.success
+            broken = self._job(fail_after=True).execute_in_process(
+                instance=instance, raise_on_error=False
+            )
+            assert not broken.success
+
+            anchor = authored_factory._latest_record_for_ingest_table(instance, "orders")
+            assert anchor is not None
+            assert anchor.dagster_run.run_id == ours.dagster_run.run_id
+            assert anchor.dagster_run.status == DagsterRunStatus.SUCCESS
+            assert anchor.end_time is not None
+            # And the run it picked is the one whose materialization the
+            # event log holds for this table, not for the other one.
+            materializations = instance.fetch_materializations(
+                authored_factory._bronze_asset_key("orders"), limit=20
+            )
+            assert anchor.dagster_run.run_id in {
+                record.run_id for record in materializations.records
+            }
+
+    def test_a_table_nobody_loaded_has_no_anchor(self) -> None:
+        """A table with no materialization at all answers `None` from ONE
+        instance call, so a chain waiting on an unloaded table costs the
+        sensor nothing extra per tick."""
+        with self._materialized_run(fail_after=False) as (instance, run):
+            assert authored_factory._latest_record_for_ingest_table(instance, "") is None
+            assert authored_factory._latest_record_for_ingest_table(instance, "invoices") is None
 
 
 class TestFileIngestRunConfigReader:
@@ -1740,6 +2396,350 @@ class TestFileIngestRunConfigReader:
                 authored_factory._latest_record_for_table([record], "invoices_raw")
                 is None
             )
+
+
+class TestLagSensor:
+    """BLD-2 D3 + D6: target-lag sensor tests."""
+
+    @job(name="authored__pl_lag_order")
+    def _order_job() -> None:
+        return None
+
+    def test_returns_none_when_target_lag_is_absent_or_not_lag_kind(self) -> None:
+        """Pipelines without targetLag or with kind='downstream' build no lag sensor."""
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-none", "targetLag": None}, self._order_job) is None
+        assert authored_factory.build_authored_lag_sensor({"id": "pl-down", "targetLag": {"kind": "downstream"}}, self._order_job) is None
+
+    def test_returns_none_when_pipeline_is_paused(self) -> None:
+        """A paused pipeline gets no lag sensor."""
+        pipeline = {
+            "id": "pl-paused",
+            "status": "paused",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        assert authored_factory.build_authored_lag_sensor(pipeline, self._order_job) is None
+
+    def test_builds_running_sensor_with_30s_interval_when_ready(self) -> None:
+        """A ready pipeline with kind='lag' gets a sensor named authored__<safe_id>_lag with 30s interval."""
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job)
+        assert sensor is not None
+        assert sensor.name == "authored__pl_lag_order_lag"
+        assert sensor.minimum_interval_seconds == 30
+        assert sensor.default_status == authored_factory.DefaultSensorStatus.RUNNING
+        assert sensor.job.name == "authored__pl_lag_order"
+
+    def _eval_sensor(self, response_mock: Any) -> list[Any]:
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        with mock.patch.object(authored_factory.requests, "post", response_mock):
+            return list(sensor(build_sensor_context()))
+
+    def test_sensor_yields_one_run_request_on_run_decision(self) -> None:
+        """Decision 'run' yields one RunRequest with the given run key and job."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__pl_lag_order",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-abc"
+        assert req.job_name == "authored__pl_lag_order"
+
+    def test_sensor_yields_nothing_on_wait_decision(self) -> None:
+        """Decision 'wait' yields nothing."""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "wait",
+            "reason": "inputs unchanged",
+        }
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_4xx_without_raising(self) -> None:
+        """4xx is logged and skipped, yields nothing, never raises."""
+        resp = mock.Mock(status_code=404, text="Pipeline not found")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_5xx_without_raising(self) -> None:
+        """5xx is skipped for this tick, yields nothing, never raises."""
+        resp = mock.Mock(status_code=503, text="Service Unavailable")
+        requests_ = self._eval_sensor(mock.Mock(return_value=resp))
+        assert len(requests_) == 0
+
+    def test_sensor_skips_on_transport_error_without_raising(self) -> None:
+        """Transport error is skipped for this tick, yields nothing, never raises."""
+        requests_ = self._eval_sensor(mock.Mock(side_effect=requests.ConnectionError("unreachable")))
+        assert len(requests_) == 0
+
+
+    @job(name="authored__pl_u")
+    def _upstream_job() -> None:
+        return None
+
+    def test_sensor_yields_run_request_with_different_allowed_job_name(self) -> None:
+        """BLD-2 review R1 BLOCKER 2: sensor can launch upstream job when API directs."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(
+            pipeline,
+            self._order_job,
+            allowed_jobs=[self._order_job, self._upstream_job],
+            cfg=cfg,
+        )
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-upstream",
+            "jobName": "authored__pl_u",
+        }
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            requests_ = list(sensor(build_sensor_context()))
+        assert len(requests_) == 1
+        req = requests_[0]
+        assert req.run_key == "lag-run-key-upstream"
+        assert req.job_name == "authored__pl_u"
+
+    def test_sensor_skips_when_job_name_not_allowed(self) -> None:
+        """BLD-2 review R1 BLOCKER 2 / R2 SHOULD-FIX 7: unexpected jobName is logged and skipped."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "runKey": "lag-run-key-abc",
+            "jobName": "authored__unknown_job",
+        }
+        ctx = build_sensor_context()
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            with mock.patch.object(ctx.log, "warning") as mock_warn:
+                requests_ = list(sensor(ctx))
+        assert len(requests_) == 0
+        mock_warn.assert_called_once()
+        assert "unexpected jobName 'authored__unknown_job'" in mock_warn.call_args[0][0]
+
+    def test_sensor_skips_when_run_key_missing(self) -> None:
+        """BLD-2 review R1 BLOCKER 2 / R2 SHOULD-FIX 7: missing runKey is logged and skipped."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="test-token",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {
+            "decision": "run",
+            "jobName": "authored__pl_lag_order",
+        }
+        ctx = build_sensor_context()
+        with mock.patch.object(authored_factory.requests, "post", mock.Mock(return_value=resp)):
+            with mock.patch.object(ctx.log, "warning") as mock_warn:
+                requests_ = list(sensor(ctx))
+        assert len(requests_) == 0
+        mock_warn.assert_called_once()
+        assert "without runKey" in mock_warn.call_args[0][0]
+
+    def test_sensor_logs_warning_when_run_token_unset(self) -> None:
+        """BLD-2 review R1 SHOULD-FIX 17 / R2 SHOULD-FIX 12: sensor logs warning once when run_token is unset."""
+        from dagster import build_sensor_context
+        pipeline = {
+            "id": "pl-lag-order",
+            "status": "ready",
+            "targetLag": {"kind": "lag", "minutes": 15},
+        }
+        cfg = authored_factory.AuthoredPipelineConfig(
+            api_url="http://fake-api:8080",
+            run_token="",
+        )
+        sensor = authored_factory.build_authored_lag_sensor(pipeline, self._order_job, cfg=cfg)
+        assert sensor is not None
+        ctx = build_sensor_context()
+        with mock.patch.object(ctx.log, "warning") as mock_warn:
+            reqs = list(sensor(ctx))
+        assert len(reqs) == 0
+        mock_warn.assert_called_once()
+        assert "DISPAR_RUN_TOKEN is unset" in mock_warn.call_args[0][0]
+
+        # Second evaluation with the same cursor must NOT log again
+        ctx2 = build_sensor_context(cursor=ctx.cursor)
+        with mock.patch.object(ctx2.log, "warning") as mock_warn2:
+            reqs2 = list(sensor(ctx2))
+        assert len(reqs2) == 0
+        mock_warn2.assert_not_called()
+
+    def test_build_authored_lag_sensors_attaches_only_read_downstream_jobs(self) -> None:
+        """BLD-2 review R2 SHOULD-FIX 7: lag sensor attaches only jobs of downstream pipelines it actually reads."""
+        # P: reads silver.u1, tenant t1
+        p_pipe = {
+            "id": "pl-p",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "silver.u1",
+            "target": "gold.p",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        # U1: reads bronze.u2, produces silver.u1, downstream, tenant t1
+        u1_pipe = {
+            "id": "pl-u1",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.u2",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U2: reads bronze.orders, produces bronze.u2, downstream, tenant t1 (transitive upstream of P)
+        u2_pipe = {
+            "id": "pl-u2",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.orders",
+            "target": "bronze.u2",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U3: downstream, tenant t1, but produces silver.unrelated (nobody reads it)
+        u3_pipe = {
+            "id": "pl-u3",
+            "status": "ready",
+            "tenantId": "t1",
+            "source": "bronze.other",
+            "target": "silver.unrelated",
+            "targetLag": {"kind": "downstream"},
+        }
+        # U4: downstream, produces silver.u1, but tenant t2 (different tenant!)
+        u4_pipe = {
+            "id": "pl-u4",
+            "status": "ready",
+            "tenantId": "t2",
+            "source": "bronze.orders",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_p")
+        def j_p() -> None:
+            pass
+
+        @job(name="authored__pl_u1")
+        def j_u1() -> None:
+            pass
+
+        @job(name="authored__pl_u2")
+        def j_u2() -> None:
+            pass
+
+        @job(name="authored__pl_u3")
+        def j_u3() -> None:
+            pass
+
+        @job(name="authored__pl_u4")
+        def j_u4() -> None:
+            pass
+
+        pipeline_jobs = [
+            (p_pipe, j_p),
+            (u1_pipe, j_u1),
+            (u2_pipe, j_u2),
+            (u3_pipe, j_u3),
+            (u4_pipe, j_u4),
+        ]
+        sensors = authored_factory.build_authored_lag_sensors(pipeline_jobs)
+        # Exactly one sensor built (for P; downstream pipelines get no lag sensor)
+        assert len(sensors) == 1
+        p_sensor = sensors[0]
+        # Inspect jobs attached to P sensor
+        attached_job_names = {j.name for j in p_sensor.jobs}
+        assert "authored__pl_p" in attached_job_names
+        assert "authored__pl_u1" in attached_job_names, "Direct downstream upstream must be attached"
+        assert "authored__pl_u2" in attached_job_names, "Transitive downstream upstream must be attached"
+        assert "authored__pl_u3" not in attached_job_names, "Unrelated downstream must NOT be attached"
+        assert "authored__pl_u4" not in attached_job_names, "Different tenant downstream must NOT be attached"
+
+    def test_an_unassigned_lag_pipeline_links_no_downstream_even_to_another_unassigned_pipeline(
+        self,
+    ) -> None:
+        """BLD-2 review R4 SHOULD-FIX 2: an unassigned pipeline's runtime
+        `tenantId` is None, and per R3 a NULL tenant matches no membership —
+        so an unassigned lag pipeline has no reader edge at all, not even to
+        another unassigned pipeline, and it must attach nothing beyond its
+        own job. The R3 text claimed two unassigned pipelines match each
+        other; this test pins that they cannot."""
+        # Reading pipeline with no tenant at all.
+        p_pipe = {
+            "id": "pl-p-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "silver.u1",
+            "target": "gold.p",
+            "targetLag": {"kind": "lag", "minutes": 10},
+        }
+        # Unassigned downstream pipeline producing silver.u1 — the tenant
+        # filter would pair them under the old None == None rule.
+        u_pipe = {
+            "id": "pl-u-unassigned",
+            "status": "ready",
+            # No "tenantId" key: unassigned.
+            "source": "bronze.x",
+            "target": "silver.u1",
+            "targetLag": {"kind": "downstream"},
+        }
+
+        @job(name="authored__pl_p_unassigned")
+        def j_p() -> None:
+            pass
+
+        @job(name="authored__pl_u_unassigned")
+        def j_u() -> None:
+            pass
+
+        sensors = authored_factory.build_authored_lag_sensors([(p_pipe, j_p), (u_pipe, j_u)])
+        assert len(sensors) == 1
+        attached_job_names = {j.name for j in sensors[0].jobs}
+        assert attached_job_names == {"authored__pl_p_unassigned"}, (
+            "an unassigned lag pipeline links nothing: only its own job is attached"
+        )
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):
