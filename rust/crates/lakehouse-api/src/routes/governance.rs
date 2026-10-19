@@ -1594,7 +1594,17 @@ async fn audit_tag_key(state: &AppState, actor: &Principal, key: &str, action: &
 ///
 /// 503 if no pool is configured; 500 (classified, never database text) on a
 /// database failure.
-pub async fn list_tag_keys(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<Value>>> {
+pub async fn list_tag_keys(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<Value>>> {
+    // PR #106 review R2 SHOULD-FIX 2: gate list_tag_keys with catalog_tenant_refusal
+    if let Some(reason) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await?
+    {
+        return Err(ApiError::PermissionDenied(reason.to_owned()).into());
+    }
     let rows = lakehouse_store::governed_tag::list_keys(pool(&state)?).await?;
     Ok(ApiJson(rows.iter().map(tag_key_json).collect()))
 }
@@ -2291,7 +2301,10 @@ mod tests {
             assert_eq!(made["allowedValues"], json!(["finance", "ops"]));
             assert_eq!(made["createdBy"], json!("Rina Admin"));
 
-            let (_, listed) = answer(list_tag_keys(State(state.clone())).await).await;
+            let (_, listed) = answer(
+                list_tag_keys(State(state.clone()), Extension(admin()), HeaderMap::new()).await,
+            )
+            .await;
             assert_eq!(listed.as_array().unwrap().len(), 1);
             assert_eq!(listed[0]["allowedValues"], json!(["finance", "ops"]));
 
@@ -2465,6 +2478,21 @@ mod tests {
                 must_change_password: false,
                 role_names: Vec::new(),
             };
+
+            // PR #106 review R2 SHOULD-FIX 2: list_tag_keys is refused for outside caller
+            let (status, resp) = answer(
+                list_tag_keys(
+                    State(state.clone()),
+                    Extension(outside_caller.clone()),
+                    HeaderMap::new(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(resp["error"].as_str().unwrap().contains(
+                "this deployment's shared catalog is owned by the tenant named in CATALOG_TENANT_ID"
+            ));
 
             let (status, resp) = answer(
                 create_tag_key(
