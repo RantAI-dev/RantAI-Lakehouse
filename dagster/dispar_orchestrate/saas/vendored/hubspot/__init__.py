@@ -70,7 +70,7 @@ THubspotObjectType = Literal["company", "contact", "deal", "ticket", "product", 
 
 def fetch_data_for_properties(
     props: List[str],
-    api_key: str,
+    session: Any,
     object_type: str,
     soft_delete: bool,
 ) -> Iterator[TDataItems]:
@@ -79,7 +79,7 @@ def fetch_data_for_properties(
 
     Args:
         props (List[str]): List of property names to fetch.
-        api_key (str): HubSpot API key for authentication.
+        session (SaasSession): the session to read through.
         object_type (str): The type of HubSpot object (e.g., 'company', 'contact').
         soft_delete (bool): Flag to fetch soft-deleted (archived) records.
 
@@ -94,12 +94,12 @@ def fetch_data_for_properties(
     )
 
     yield from fetch_data(
-        CRM_OBJECT_ENDPOINTS[object_type], api_key, params=params, context=context
+        CRM_OBJECT_ENDPOINTS[object_type], session, params=params, context=context
     )
     if soft_delete:
         yield from fetch_data(
             CRM_OBJECT_ENDPOINTS[object_type],
-            api_key,
+            session,
             params={**params, **ARCHIVED_PARAM},
             context={SOFT_DELETE_KEY: True},
         )
@@ -107,7 +107,7 @@ def fetch_data_for_properties(
 
 def crm_objects(
     object_type: str,
-    api_key: str,
+    session: Any,
     props: List[str],
     include_custom_props: bool = True,
     archived: bool = False,
@@ -117,7 +117,7 @@ def crm_objects(
 
     Args:
         object_type (str): Type of HubSpot object (e.g., 'company', 'contact').
-        api_key (str): API key for HubSpot authentication.
+        session (SaasSession): the session to read through.
         props (List[str]): List of properties to retrieve.
         include_custom_props (bool, optional): Include custom properties in the result. Defaults to True.
         archived (bool, optional): Fetch archived (soft-deleted) objects. Defaults to False.
@@ -126,7 +126,7 @@ def crm_objects(
         Iterator[TDataItems]: Data items retrieved from the API.
     """
     props_to_type = fetch_props_with_types(
-        object_type, api_key, props, include_custom_props
+        object_type, session, props, include_custom_props
     )
     # We need column hints so that dlt can correctly set data types
     # This is especially relevant for columns of type "number" in Hubspot
@@ -136,14 +136,14 @@ def crm_objects(
         for prop, hb_type in props_to_type.items()
     }
     for batch in fetch_data_for_properties(
-        list(props_to_type.keys()), api_key, object_type, archived
+        list(props_to_type.keys()), session, object_type, archived
     ):
         yield dlt.mark.with_hints(batch, dlt.mark.make_hints(columns=col_type_hints))
 
 
 def crm_object_history(
     object_type: str,
-    api_key: str,
+    session: Any,
     props: List[str] = None,
     include_custom_props: bool = True,
 ) -> Iterator[TDataItems]:
@@ -152,7 +152,7 @@ def crm_object_history(
 
     Args:
         object_type (str): Type of HubSpot object (e.g., 'company', 'contact').
-        api_key (str): API key for HubSpot authentication.
+        session (SaasSession): the session to read through.
         props (List[str]): List of properties to retrieve. Defaults to None.
         include_custom_props (bool): Include custom properties in the result. Defaults to True.
 
@@ -165,7 +165,7 @@ def crm_object_history(
 
     # Fetch the properties with the option to include custom properties
     props_to_type = fetch_props_with_types(
-        object_type, api_key, props_entry, include_custom_props
+        object_type, session, props_entry, include_custom_props
     )
     col_type_hints = {
         prop: _to_dlt_columns_schema({prop: hb_type})
@@ -177,7 +177,7 @@ def crm_object_history(
     # that are returned as strings by the API
     for batch in fetch_property_history(
         CRM_OBJECT_ENDPOINTS[object_type],
-        api_key,
+        session,
         ",".join(sorted(props_to_type.keys())),
     ):
         yield dlt.mark.with_hints(batch, dlt.mark.make_hints(columns=col_type_hints))
@@ -221,7 +221,7 @@ def pivot_stages_properties(
 
 def stages_timing(
     object_type: str,
-    api_key: str,
+    session: Any,
     soft_delete: bool = False,
 ) -> Iterator[TDataItems]:
     """
@@ -231,14 +231,14 @@ def stages_timing(
 
     Args:
         object_type (str): Type of HubSpot object (e.g., 'deal', 'ticket').
-        api_key (str, optional): HubSpot API key for authentication.
+        session (SaasSession): the session to read through.
         soft_delete (bool, optional): Fetch soft-deleted (archived) records. Defaults to False.
 
     Yields:
         Iterator[TDataItems]: Stage timing data.
     """
     all_properties: List[str] = list(
-        _get_property_names_types(api_key, object_type).keys()
+        _get_property_names_types(session, object_type).keys()
     )
     date_entered_properties: List[str] = [
         prop for prop in all_properties if prop.startswith(STAGE_PROPERTY_PREFIX)
@@ -248,13 +248,13 @@ def stages_timing(
     # data for the whole properties list. Therefore, in the following lines we request
     # data iteratively for chunks of the properties list.
     for chunk in chunk_properties(date_entered_properties, MAX_PROPS_LENGTH):
-        for data in fetch_data_for_properties(chunk, api_key, object_type, soft_delete):
+        for data in fetch_data_for_properties(chunk, session, object_type, soft_delete):
             yield pivot_stages_properties(data)
 
 
 @dlt.source(name="hubspot")
 def hubspot(
-    api_key: str = dlt.secrets.value,
+    session: Any,
     include_history: bool = False,
     soft_delete: bool = False,
     include_custom_props: bool = True,
@@ -270,9 +270,8 @@ def hubspot(
     each endpoint.
 
     Args:
-        api_key (Optional[str]):
-            The API key used to authenticate with the HubSpot API. Defaults
-            to dlt.secrets.value.
+        session (SaasSession):
+            The session every request goes through (`SRC-3` local change 1).
         include_history (Optional[bool]):
             Whether to load history of property changes along with entities.
             The history entries are loaded to separate tables.
@@ -291,19 +290,19 @@ def hubspot(
     Notes:
         This function uses the `fetch_data` function to retrieve data from the
         HubSpot CRM API. The API key is passed to `fetch_data` as the
-        `api_key` argument.
+        `session` argument.
     """
     properties = properties or ENTITY_PROPERTIES
 
     @dlt.resource(name="owners", write_disposition="merge", primary_key="id")
     def owners(
-        api_key: str = api_key, soft_delete: bool = soft_delete
+        session: Any = session, soft_delete: bool = soft_delete
     ) -> Iterator[TDataItems]:
         """Fetch HubSpot owners data. The owners resource implemented separately,
         because it doesn't have endpoint for properties requesting
 
         Args:
-            api_key (str): HubSpot API key for authentication.
+            session (SaasSession): the session to read through.
             soft_delete (bool, optional): Fetch soft-deleted (archived) owners. Defaults to False.
 
         Yields:
@@ -311,7 +310,7 @@ def hubspot(
         """
 
         # Fetch data for owners
-        for page in fetch_data(endpoint=CRM_OBJECT_ENDPOINTS["owner"], api_key=api_key):
+        for page in fetch_data(endpoint=CRM_OBJECT_ENDPOINTS["owner"], session=session):
             yield page
 
         # Fetch soft-deleted owners if requested
@@ -319,18 +318,18 @@ def hubspot(
             for page in fetch_data(
                 endpoint=CRM_OBJECT_ENDPOINTS["owner"],
                 params=ARCHIVED_PARAM,
-                api_key=api_key,
+                session=session,
                 context={SOFT_DELETE_KEY: True},
             ):
                 yield page
 
     @dlt.resource(name="properties", write_disposition="replace")
-    def properties_custom_labels(api_key: str = api_key) -> Iterator[TDataItems]:
+    def properties_custom_labels(session: Any = session) -> Iterator[TDataItems]:
         """
         A dlt resource that retrieves custom labels for given list of properties.
 
         Args:
-            api_key (str, optional): HubSpot API key for authentication.
+            session (SaasSession): the session to read through.
 
         Yields:
             DltResource: A dlt resource containing properties for HubSpot objects.
@@ -342,7 +341,7 @@ def hubspot(
             """Fetch properties."""
             for property_info in properties_list_inner:
                 yield from get_properties_labels(
-                    api_key=api_key,
+                    session=session,
                     object_type=property_info["object_type"],
                     property_name=property_info["property_name"],
                 )
@@ -354,7 +353,7 @@ def hubspot(
 
     def pipelines_for_objects(
         pipelines_objects: List[str],
-        api_key_inner: str = api_key,
+        session_inner: Any = session,
     ) -> Iterator[DltResource]:
         """
         Function that yields all resources for HubSpot objects, which have pipelines.
@@ -362,7 +361,7 @@ def hubspot(
 
         Args:
             pipelines_objects (list of strings): The list of objects, which have pipelines.
-            api_key_inner (str, optional): The API key used to authenticate with the HubSpot API. Defaults to dlt.secrets.value.
+            session_inner (SaasSession): the session to read through.
 
         Yields:
             Iterator[DltResource]: dlt resources for pipelines and stages.
@@ -371,7 +370,7 @@ def hubspot(
         def get_pipelines(object_type: str) -> Iterator[TDataItems]:
             yield from fetch_data(
                 CRM_PIPELINES_ENDPOINT.format(objectType=object_type),
-                api_key=api_key_inner,
+                session=session_inner,
             )
 
         # get the pipelines data
@@ -396,7 +395,7 @@ def hubspot(
                     primary_key=["id", "stage"],
                 )(
                     OBJECT_TYPE_SINGULAR[obj_type],
-                    api_key=api_key,
+                    session=session,
                     soft_delete=soft_delete,
                 )
 
@@ -409,7 +408,7 @@ def hubspot(
             primary_key="id",
         )(
             object_type=obj,
-            api_key=api_key,
+            session=session,
             props=properties.get(obj),
             include_custom_props=include_custom_props,
             archived=soft_delete,
@@ -424,7 +423,7 @@ def hubspot(
                 write_disposition="append",
             )(
                 object_type=obj,
-                api_key=api_key,
+                session=session,
                 props=properties.get(obj),
                 include_custom_props=include_custom_props,
             )
@@ -433,7 +432,7 @@ def hubspot(
     yield owners
 
     # pipelines resources
-    yield from pipelines_for_objects(PIPELINES_OBJECTS, api_key)
+    yield from pipelines_for_objects(PIPELINES_OBJECTS, session)
 
     # custom properties labels resource
     yield properties_custom_labels
@@ -441,7 +440,7 @@ def hubspot(
 
 def fetch_props_with_types(
     object_type: str,
-    api_key: str,
+    session: Any,
     props: List[str],
     include_custom_props: bool = True,
 ) -> Dict[str, str]:
@@ -450,7 +449,7 @@ def fetch_props_with_types(
 
     Args:
         object_type (str): Type of HubSpot object (e.g., 'company', 'contact').
-        api_key (str): HubSpot API key for authentication.
+        session (SaasSession): the session to read through.
         props (List[str]): List of properties to fetch.
         include_custom_props (bool, optional): Include custom properties in the result. Defaults to True.
 
@@ -458,7 +457,7 @@ def fetch_props_with_types(
         Dict[str, str]: Mapping of property to type.
     """
     unique_props = set(props)
-    props_to_type = _get_property_names_types(api_key, object_type)
+    props_to_type = _get_property_names_types(session, object_type)
     all_props = set(props_to_type.keys())
 
     all_custom = {prop for prop in all_props if not prop.startswith("hs_")}
@@ -485,7 +484,7 @@ def fetch_props_with_types(
 def hubspot_events_for_objects(
     object_type: THubspotObjectType,
     object_ids: List[str],
-    api_key: str = dlt.secrets.value,
+    session: Any,
     start_date: pendulum.DateTime = STARTDATE,
 ) -> DltResource:
     """
@@ -494,7 +493,7 @@ def hubspot_events_for_objects(
     Args:
         object_type (THubspotObjectType): One of the hubspot object types see definition of THubspotObjectType literal.
         object_ids (List[str]): List of object ids to track events.
-        api_key (str, optional): The API key used to authenticate with the HubSpot API. Defaults to dlt.secrets.value.
+        session (SaasSession): the session to read through.
         start_date (pendulum.DateTime, optional): The initial date time from which start getting events, default to STARTDATE.
 
     Returns:
@@ -524,7 +523,7 @@ def hubspot_events_for_objects(
                     occurredAfter=quote(occurred_at.last_value),
                     occurredBefore=quote(end_date),
                 ),
-                api_key=api_key,
+                session=session,
             )
 
     return dlt.resource(

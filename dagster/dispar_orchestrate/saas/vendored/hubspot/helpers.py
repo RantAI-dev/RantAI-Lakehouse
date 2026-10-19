@@ -2,48 +2,28 @@
 
 from typing import Union
 
-import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional
 
 from dlt.common.schema.typing import TColumnSchema
-from dlt.sources.helpers import requests
 
 from .settings import OBJECT_TYPE_PLURAL, HS_TO_DLT_TYPE
 
-BASE_URL = "https://api.hubapi.com/"
+# SRC-3 AD3/AD4 (local change 1): upstream called `dlt.sources.helpers.requests`
+# with `BASE_URL`, a bearer header built from an API key, and the next-page link
+# taken from the answer. All of that is now `saas.session.SaasSession`: it
+# builds the host from the vendor table, asks the connector's sign-in for the
+# headers only after the address check, follows a link only on the same host,
+# and waits out a 429. The `session` argument below is that object (upstream
+# passed an `api_key` string); endpoints stay paths on the session's origin.
 
 
-def get_url(endpoint: str) -> str:
-    """Get absolute hubspot endpoint URL"""
-    return urllib.parse.urljoin(BASE_URL, endpoint)
-
-
-def _get_headers(api_key: str) -> Dict[str, str]:
-    """
-    Return a dictionary of HTTP headers to use for API requests, including the specified API key.
-
-    Args:
-        api_key (str): The API key to use for authentication, as a string.
-
-    Returns:
-        dict: A dictionary of HTTP headers to include in API requests, with the `Authorization` header
-            set to the specified API key in the format `Bearer {api_key}`.
-
-    """
-    # Construct the dictionary of HTTP headers to use for API requests
-    return dict(authorization=f"Bearer {api_key}")
-
-
-def pagination(
-    _data: Dict[str, Any], headers: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
+def pagination(_data: Dict[str, Any], session: Any) -> Optional[Dict[str, Any]]:
     _next = _data.get("paging", {}).get("next", None)
     # _next = False
     if _next:
         next_url = _next["link"]
-        # Get the next page response
-        r = requests.get(next_url, headers=headers)
-        return r.json()  # type: ignore
+        # Get the next page response (the session refuses a link to another host)
+        return session.get_json(next_url)  # type: ignore
     else:
         return None
 
@@ -52,7 +32,7 @@ def extract_association_data(
     _obj: Dict[str, Any],
     data: Dict[str, Any],
     association: str,
-    headers: Dict[str, Any],
+    session: Any,
 ) -> List[Dict[str, Any]]:
     values = []
 
@@ -64,7 +44,7 @@ def extract_association_data(
                     f"{association}_id": r["id"],
                 }
             )
-        data = pagination(data, headers)
+        data = pagination(data, session)
     return values
 
 
@@ -83,7 +63,7 @@ def extract_property_history(objects: List[Dict[str, Any]]) -> Iterator[Dict[str
 
 def fetch_property_history(
     endpoint: str,
-    api_key: str,
+    session: Any,
     props: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Iterator[List[Dict[str, Any]]]:
@@ -91,26 +71,18 @@ def fetch_property_history(
 
     Args:
         endpoint: The endpoint to fetch data from, as a string.
-        api_key: The API key to use for authentication, as a string.
+        session: The `SaasSession` to read through.
         props: A comma separated list of properties to retrieve the history for
         params: Optional dict of query params to include in the request
 
     Yields:
          List of property history entries (dicts)
     """
-    # Construct the URL and headers for the API request
-    url = get_url(endpoint)
-    headers = _get_headers(api_key)
-
     params = dict(params or {})
     params["propertiesWithHistory"] = props
     params["limit"] = 50
-    # Make the API request
-    r = requests.get(url, headers=headers, params=params)
-    # Parse the API response and yield the properties of each result
-
-    # Parse the response JSON data
-    _data = r.json()
+    # Make the API request and parse the response JSON data
+    _data = session.get_json(endpoint, params)
     while _data is not None:
         if "results" in _data:
             yield list(extract_property_history(_data["results"]))
@@ -120,15 +92,14 @@ def fetch_property_history(
         if _next:
             next_url = _next["link"]
             # Get the next page response
-            r = requests.get(next_url, headers=headers)
-            _data = r.json()
+            _data = session.get_json(next_url)
         else:
             _data = None
 
 
 def fetch_data(
     endpoint: str,
-    api_key: str,
+    session: Any,
     params: Optional[Dict[str, Any]] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> Iterator[List[Dict[str, Any]]]:
@@ -138,7 +109,7 @@ def fetch_data(
 
     Args:
         endpoint (str): The endpoint to fetch data from, as a string.
-        api_key (str): The API key to use for authentication, as a string.
+        session (SaasSession): The session to read through.
         params: Optional dict of query params to include in the request.
         context (Optional[Dict[str, Any]]): Additional data which need to be added in the resulting page.
 
@@ -146,28 +117,15 @@ def fetch_data(
         A List of CRM object dicts
 
     Raises:
-        requests.exceptions.HTTPError: If the API returns an HTTP error status code.
+        The session's failures; see Notes.
 
     Notes:
-        This function uses the `requests` library to make a GET request to the specified endpoint, with
-        the API key included in the headers. If the API returns a non-successful HTTP status code (e.g.
-        404 Not Found), a `requests.exceptions.HTTPError` exception will be raised.
-
-        The `endpoint` argument should be a relative URL, which will be appended to the base URL for the
-        API. The `params` argument is used to pass additional query parameters to the request.
-
-        This function also includes a retry decorator that will automatically retry the API call up to
-        3 times with a 5-second delay between retries, using an exponential backoff strategy.
+        The request is `session.get_json(endpoint, params)`: the session raises its own failures
+        (sign-in refused, permission missing, rate limited) or `requests.HTTPError` for another
+        error status. The `endpoint` argument is a path on the session's origin.
     """
-    # Construct the URL and headers for the API request
-    url = get_url(endpoint)
-    headers = _get_headers(api_key)
-
-    # Make the API request
-    r = requests.get(url, headers=headers, params=params)
-    # Parse the API response and yield the properties of each result
-    # Parse the response JSON data
-    _data = r.json()
+    # Make the API request and parse the response JSON data
+    _data = session.get_json(endpoint, params)
     # Yield the properties of each result in the API response
     while _data is not None:
         if "results" in _data:
@@ -182,7 +140,7 @@ def fetch_data(
                         __data = _result["associations"][association]
 
                         __values = extract_association_data(
-                            _obj, __data, association, headers
+                            _obj, __data, association, session
                         )
 
                         # remove duplicates from list of dicts
@@ -197,11 +155,11 @@ def fetch_data(
             yield _objects
 
         # Follow pagination links if they exist
-        _data = pagination(_data, headers)
+        _data = pagination(_data, session)
 
 
 def _get_property_names_types(
-    api_key: str, object_type: str
+    session: Any, object_type: str
 ) -> Dict[str, Union[str, None]]:
     """
     Retrieve property names and their types if present for a given entity from the HubSpot API.
@@ -218,7 +176,7 @@ def _get_property_names_types(
     props_to_type: Dict[str, str] = {}
     endpoint = f"/crm/v3/properties/{OBJECT_TYPE_PLURAL[object_type]}"
 
-    for page in fetch_data(endpoint, api_key):
+    for page in fetch_data(endpoint, session):
         for prop in page:
             props_to_type[prop["name"]] = prop.get("type", None)
 
@@ -226,16 +184,13 @@ def _get_property_names_types(
 
 
 def get_properties_labels(
-    api_key: str, object_type: str, property_name: str
+    session: Any, object_type: str, property_name: str
 ) -> Iterator[Dict[str, Any]]:
     endpoint = f"/crm/v3/properties/{object_type}/{property_name}"
-    url = get_url(endpoint)
-    headers = _get_headers(api_key)
-    r = requests.get(url, headers=headers)
-    _data: Optional[Dict[str, Any]] = r.json()
+    _data: Optional[Dict[str, Any]] = session.get_json(endpoint)
     while _data is not None:
         yield _data
-        _data = pagination(_data, headers)
+        _data = pagination(_data, session)
 
 
 def _to_dlt_columns_schema(col: Dict[str, str]) -> TColumnSchema:
