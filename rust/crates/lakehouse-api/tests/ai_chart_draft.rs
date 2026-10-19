@@ -319,3 +319,85 @@ async fn the_chat_loop_refuses_a_draft_on_a_mart_that_does_not_exist() {
     );
     assert!(!has_insert(&statements(&ch).await), "nothing was written");
 }
+
+/// The step of a chat body's tool trace that ran `tool`.
+fn traced_step<'a>(body: &'a Value, tool: &str) -> &'a Value {
+    body["toolTrace"]
+        .as_array()
+        .expect("trace is a list")
+        .iter()
+        .find(|s| s["tool"] == tool)
+        .unwrap_or_else(|| panic!("the {tool} step is traced: {body}"))
+}
+
+#[tokio::test]
+async fn the_chat_loop_does_not_run_create_chart_on_the_models_own_confirmed_true() {
+    let args = chart_args_with(COLUMN, "confirmed", json!(true));
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", &args)]),
+        model_round(Some("The chart waits for the Confirm button."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Make a table chart of the mart.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_chart");
+    assert_eq!(step["result"]["needs_confirmation"], json!(true), "{body}");
+    assert!(
+        !has_insert(&statements(&ch).await),
+        "the model's own confirmation wrote a chart"
+    );
+}
+
+#[tokio::test]
+async fn the_chat_loop_does_not_run_create_board_on_the_models_own_confirmed_true() {
+    let args = json!({ "name": "Overview", "confirmed": true }).to_string();
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_board", &args)]),
+        model_round(Some("The board waits for the Confirm button."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Create a board called Overview.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_board");
+    assert_eq!(step["result"]["needs_confirmation"], json!(true), "{body}");
+    assert!(
+        !has_insert(&statements(&ch).await),
+        "the model's own confirmation wrote a board"
+    );
+}
+
+/// A `confirmed` flag of any value is removed from the offered draft's args,
+/// so the Confirm button resends a clean call. The model sends `false` here:
+/// the gate offers the draft either way, so only the removal can fail this.
+#[tokio::test]
+async fn the_chat_loop_removes_a_confirmed_flag_of_any_value_from_the_offered_draft() {
+    let args = chart_args_with(COLUMN, "confirmed", json!(false));
+    let llm = mock_model(vec![
+        model_round(None, &[("call_1", "create_chart", &args)]),
+        model_round(Some("The chart waits for the Confirm button."), &[]),
+    ])
+    .await;
+    let ch = mock_clickhouse(true).await;
+
+    let (status, body) = chat(&llm, &ch, "Make a table chart of the mart.").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = traced_step(&body, "create_chart");
+    assert_eq!(step["result"]["needs_confirmation"], json!(true), "{body}");
+    assert!(
+        step["result"]["args"].get("confirmed").is_none(),
+        "the Confirm button would resend the model's flag: {body}"
+    );
+    assert!(
+        step["args"].get("confirmed").is_none(),
+        "the traced args keep the model's flag: {body}"
+    );
+    assert_eq!(step["result"]["args"]["mart"], MART, "{body}");
+    assert!(!has_insert(&statements(&ch).await), "nothing was written");
+}

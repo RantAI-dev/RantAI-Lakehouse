@@ -6,6 +6,7 @@
 import { describe, expect, it } from "bun:test"
 import {
   FILE_INGEST_JOB,
+  INGEST_JOB,
   reuploadTriggerOn,
   showsReuploadSwitch,
   withReuploadTrigger,
@@ -76,8 +77,28 @@ describe("turning the switch on and off changes only that one upstream", () => {
     expect(withReuploadTrigger(turnedOn, "bronze", false)).toEqual(stored)
   })
 
+  it("drops ingest_job for a source that is not Bronze, but keeps it on Bronze (BLD-4 review R1)", () => {
+    // BLD-4 review R1 / Decision R1, asserted through the exported
+    // constant so the assertion follows the value the filter compares
+    // against rather than a second literal that could drift from it:
+    // a Silver source with ["ingest_job", "pl-a"] saves ["pl-a"]
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "silver", true)).toEqual(["pl-a"])
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "silver", false)).toEqual(["pl-a"])
+
+    // a Bronze source keeps ingest_job
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "bronze", false)).toEqual([
+      INGEST_JOB,
+      "pl-a",
+    ])
+    expect(withReuploadTrigger([INGEST_JOB, "pl-a"], "bronze", true)).toEqual([
+      FILE_INGEST_JOB,
+      INGEST_JOB,
+      "pl-a",
+    ])
+  })
+
   it("drops the upload job for a source that is not Bronze, which the server refuses", () => {
-    // `validate_file_ingest_upstream` answers 400 for this chain, and the
+    // `validate_per_table_upstream` answers 400 for this chain, and the
     // user has no switch to fix it with on a `silver` source — so the
     // console must not send it back unchanged.
     expect(withReuploadTrigger([FILE_INGEST_JOB, "pl-upstream"], "silver", true)).toEqual([

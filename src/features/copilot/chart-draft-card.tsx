@@ -11,15 +11,22 @@ import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { BinDef, GridDef } from "@/lib/chart-bins";
 import type { JoinDef } from "@/lib/chart-joins";
 import type { LayerDef } from "@/lib/chart-layers";
-import type { Grouping, MeasureEntry, SortSpec, StepDef } from "@/lib/chart-shape";
-import type { FilterDef } from "@/services/clients/bi-store";
+import { columnRef, metricColumn, type Grouping, type MeasureEntry, type SortSpec, type StepDef } from "@/lib/chart-shape";
+import type { RefLineDef } from "@/lib/params";
+import type { ColumnSetting, KpiCompare, PivotValue } from "@/lib/table-types";
+import type { ChartClick, FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 import type { TileFailure } from "@/services/contracts/dashboards";
 
 type Preview = {
   spec: ChartRenderSpec & { text?: string; caption?: string };
-  result: { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
+  // `metricLabels` is on the result, and only when the chart has saved metrics with labels.
+  result: { columns: string[]; rows: Record<string, unknown>[]; metricLabels?: Record<string, string> } | TileFailure;
 };
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
 
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() ? v : undefined;
@@ -29,6 +36,11 @@ function str(v: unknown): string | undefined {
  * `create_chart` arguments as a chart definition — the manual builder's own
  * shape, so the same draft can be previewed, saved, or opened in the builder.
  * The model sometimes leaves `title` empty and puts the name in `caption`.
+ *
+ * The preview must be built from the same fields Confirm sends: Confirm posts
+ * the model's raw arguments, so a field this function drops makes the preview
+ * and "Edit in builder" show a different chart from the one that is saved.
+ * Every field of `ChartDef` the server accepts is passed through as sent.
  */
 export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
   // BI-6: a measure is a column name, or a column with its own aggregate.
@@ -40,7 +52,7 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
         (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
   return {
-    title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? "",
+    title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? str(args.text) ?? "",
     subtitle: str(args.subtitle),
     mart: str(args.mart),
     // A chart on a dashboard SQL source carries this instead of `mart`;
@@ -59,7 +71,10 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     text: str(args.text),
     caption: str(args.caption),
     target: typeof args.target === "number" ? args.target : undefined,
-    limit: typeof args.limit === "number" ? args.limit : undefined,
+    // A number, or a number parameter held as { param }.
+    limit: typeof args.limit === "number" ? args.limit : isObject(args.limit) && typeof args.limit.param === "string" ? (args.limit as { param: string }) : undefined,
+    order: str(args.order) as ChartDef["order"],
+    grain: str(args.grain),
     // BI-6: the chart's own filters, sort, "Other" and groupings travel to the builder as the model sent them.
     filters: Array.isArray(args.filters) ? (args.filters as FilterDef[]) : undefined,
     sort: typeof args.sort === "object" && args.sort !== null ? (args.sort as SortSpec) : undefined,
@@ -76,7 +91,39 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     layers: Array.isArray(args.layers) ? (args.layers as LayerDef[]) : undefined,
     draw: args.draw === "bar" || args.draw === "line" ? args.draw : undefined,
     axis: args.axis === "left" || args.axis === "right" ? args.axis : undefined,
+    // BI-16: raw tables, pivots and the KPI comparison travel to the builder as the model sent them.
+    tableMode: str(args.tableMode) as ChartDef["tableMode"],
+    columns: Array.isArray(args.columns) ? (args.columns as string[]) : undefined,
+    rows: Array.isArray(args.rows) ? (args.rows as string[]) : undefined,
+    values: Array.isArray(args.values) ? (args.values as PivotValue[]) : undefined,
+    totals: str(args.totals) as ChartDef["totals"],
+    sortColumn: str(args.sortColumn),
+    sortDir: str(args.sortDir) as ChartDef["sortDir"],
+    columnSettings: isObject(args.columnSettings) ? (args.columnSettings as Record<string, ColumnSetting>) : undefined,
+    compare: isObject(args.compare) ? (args.compare as KpiCompare) : undefined,
+    goodDirection: str(args.goodDirection) as ChartDef["goodDirection"],
+    // BI-11 and BI-18: the value-axis lines and what a click does.
+    referenceLines: Array.isArray(args.referenceLines) ? (args.referenceLines as RefLineDef[]) : undefined,
+    click: isObject(args.click) ? (args.click as ChartClick) : undefined,
   };
+}
+
+/**
+ * The footer's measure text for a draft. A saved metric reads by its label
+ * (its name until the preview has answered) and carries no aggregate, because
+ * the metric defines its own; a measure with its own aggregate shows that one;
+ * a plain column takes the chart's aggregate, `sum` when it sets none.
+ */
+export function draftMeasureLabel(def: ChartDef, metricLabels: Readonly<Record<string, string>> | undefined): string {
+  if (!def.measures?.length) return "";
+  const text = def.measures
+    .map((m) => {
+      if (typeof m === "string") return `${def.aggregate ?? "sum"}(${m})`;
+      if ("metric" in m) return columnRef(metricColumn(m.metric), { metricLabels }).text;
+      return `${m.aggregate}(${m.column})`;
+    })
+    .join(", ");
+  return def.grain ? `${text} per ${def.grain}` : text;
 }
 
 /**
@@ -130,6 +177,9 @@ export function ChartDraftCard({
     return () => controller.abort();
   }, [def]);
 
+  const metricLabels = preview && "metricLabels" in preview.result ? preview.result.metricLabels : undefined;
+  const measureLabel = draftMeasureLabel(def, metricLabels);
+
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card text-xs shadow-xs">
       <div className="flex items-start gap-2 border-b border-border px-3 py-2">
@@ -170,9 +220,7 @@ export function ChartDraftCard({
           <span className="font-mono text-[10px]">{def.mart}</span>
         ) : null}
         {def.dimension ? <span>by {def.dimension}</span> : null}
-        {def.measures?.length ? (
-          <span>· {def.aggregate ?? "sum"}({def.measures.map((m) => (typeof m === "string" ? m : "metric" in m ? m.metric : m.column)).join(", ")})</span>
-        ) : null}
+        {measureLabel ? <span>· {measureLabel}</span> : null}
       </div>
 
       <div className="flex flex-wrap items-center gap-2 border-t border-border px-3 py-2">
