@@ -403,7 +403,8 @@ async fn probe_dial(
         | Dial::Sheets(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => {
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => {
             return Outcome::misconfigured(format!(
                 "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
             ));

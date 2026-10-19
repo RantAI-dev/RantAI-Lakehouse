@@ -615,7 +615,8 @@ pub async fn discover(
                 | Dial::Sheets(_)
                 | Dial::Mongo(_)
                 | Dial::Kafka(_)
-                | Dial::Sftp(_) => {
+                | Dial::Sftp(_)
+                | Dial::Saas(_) => {
                     return Err(DiscoverError::Blocked(format!(
                         "connector is misconfigured: its dial does not match its own adapter \
                          {adapter:?}"

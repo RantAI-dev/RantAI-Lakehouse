@@ -1,0 +1,305 @@
+{
+  "_about": "Source of truth for the SaaS vendor table shared by lakehouse-store (saas_vendors.rs), the orchestrator (saas/vendors) and the console. Each side has a test that compares its own table with this file (SRC-3 AD2). Placeholders: {account}, {host}, {tenant}.",
+  "vendors": [
+    {
+      "id": "salesforce",
+      "label": "Salesforce",
+      "connectorType": "Salesforce",
+      "account": {
+        "kind": "label"
+      },
+      "accountLabel": "My Domain name (the part before .my.salesforce.com)",
+      "apiBase": "https://{account}.my.salesforce.com",
+      "oauth": {
+        "authorizeUrl": "https://{account}.my.salesforce.com/services/oauth2/authorize",
+        "tokenUrl": "https://{account}.my.salesforce.com/services/oauth2/token",
+        "revocationUrl": "https://{account}.my.salesforce.com/services/oauth2/revoke",
+        "scopes": [
+          "api",
+          "refresh_token"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": null,
+      "whoami": {
+        "method": "GET",
+        "path": "/services/oauth2/userinfo"
+      }
+    },
+    {
+      "id": "servicenow",
+      "label": "ServiceNow",
+      "connectorType": "ServiceNow",
+      "account": {
+        "kind": "label"
+      },
+      "accountLabel": "Instance name (the part before .service-now.com)",
+      "apiBase": "https://{account}.service-now.com",
+      "oauth": {
+        "authorizeUrl": "https://{account}.service-now.com/oauth_auth.do",
+        "tokenUrl": "https://{account}.service-now.com/oauth_token.do",
+        "revocationUrl": "https://{account}.service-now.com/oauth_revoke_token.do",
+        "scopes": [],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:servicenow",
+        "secretFields": [
+          "clientId",
+          "clientSecret"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/api/now/table/sys_user?sysparm_limit=1&sysparm_fields=sys_id"
+      }
+    },
+    {
+      "id": "workday",
+      "label": "Workday Reports",
+      "connectorType": "Workday Reports",
+      "account": {
+        "kind": "host_tenant",
+        "suffixes": [
+          ".workday.com",
+          ".myworkday.com"
+        ]
+      },
+      "accountLabel": "Workday host and tenant, as host/tenant",
+      "apiBase": "https://{host}",
+      "oauth": {
+        "authorizeUrl": "https://{host}/{tenant}/authorize",
+        "tokenUrl": "https://{host}/ccx/oauth2/{tenant}/token",
+        "revocationUrl": null,
+        "scopes": [],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:workday",
+        "secretFields": [
+          "username",
+          "password"
+        ]
+      },
+      "whoami": null
+    },
+    {
+      "id": "ga4",
+      "label": "Google Analytics 4",
+      "connectorType": "Google Analytics 4",
+      "account": {
+        "kind": "digits"
+      },
+      "accountLabel": "GA4 property id (digits)",
+      "apiBase": "https://analyticsdata.googleapis.com",
+      "oauth": {
+        "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "revocationUrl": "https://oauth2.googleapis.com/revoke",
+        "scopes": [
+          "https://www.googleapis.com/auth/analytics.readonly"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:ga4",
+        "secretFields": [
+          "serviceAccountJson"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/v1beta/properties/{account}/metadata"
+      }
+    },
+    {
+      "id": "hubspot",
+      "label": "HubSpot",
+      "connectorType": "HubSpot",
+      "account": {
+        "kind": "digits"
+      },
+      "accountLabel": "HubSpot account id (digits)",
+      "apiBase": "https://api.hubapi.com",
+      "oauth": {
+        "authorizeUrl": "https://app.hubspot.com/oauth/authorize",
+        "tokenUrl": "https://api.hubapi.com/oauth/v1/token",
+        "revocationUrl": null,
+        "scopes": [
+          "crm.objects.companies.read",
+          "crm.objects.contacts.read",
+          "crm.objects.deals.read",
+          "crm.objects.owners.read",
+          "tickets"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:hubspot",
+        "secretFields": [
+          "token"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/account-info/v3/details"
+      }
+    },
+    {
+      "id": "zendesk",
+      "label": "Zendesk",
+      "connectorType": "Zendesk",
+      "account": {
+        "kind": "label"
+      },
+      "accountLabel": "Subdomain (the part before .zendesk.com)",
+      "apiBase": "https://{account}.zendesk.com",
+      "oauth": {
+        "authorizeUrl": "https://{account}.zendesk.com/oauth/authorizations/new",
+        "tokenUrl": "https://{account}.zendesk.com/oauth/tokens",
+        "revocationUrl": null,
+        "scopes": [
+          "read"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:zendesk",
+        "secretFields": [
+          "email",
+          "apiToken"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/api/v2/users/me.json"
+      }
+    },
+    {
+      "id": "confluence",
+      "label": "Confluence",
+      "connectorType": "Confluence",
+      "account": {
+        "kind": "label"
+      },
+      "accountLabel": "Site name (the part before .atlassian.net)",
+      "apiBase": "https://{account}.atlassian.net",
+      "oauth": {
+        "authorizeUrl": "https://auth.atlassian.com/authorize",
+        "tokenUrl": "https://auth.atlassian.com/oauth/token",
+        "revocationUrl": null,
+        "scopes": [
+          "read:page:confluence",
+          "read:space:confluence",
+          "read:comment:confluence",
+          "read:blogpost:confluence",
+          "offline_access"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:confluence",
+        "secretFields": [
+          "email",
+          "apiToken"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/wiki/api/v2/spaces?limit=1"
+      }
+    },
+    {
+      "id": "dynamics365",
+      "label": "Dynamics 365",
+      "connectorType": "Dynamics 365",
+      "account": {
+        "kind": "dataverse_host"
+      },
+      "accountLabel": "Environment address, as org.crm4.dynamics.com",
+      "apiBase": "https://{account}",
+      "oauth": {
+        "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+        "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+        "revocationUrl": null,
+        "scopes": [
+          "https://{account}/user_impersonation",
+          "offline_access"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:dynamics365",
+        "secretFields": [
+          "clientId",
+          "clientSecret"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/api/data/v9.2/WhoAmI"
+      }
+    },
+    {
+      "id": "netsuite",
+      "label": "NetSuite",
+      "connectorType": "NetSuite",
+      "account": {
+        "kind": "account_id"
+      },
+      "accountLabel": "Account id (for example 1234567 or 1234567_SB1)",
+      "apiBase": "https://{account}.suitetalk.api.netsuite.com",
+      "oauth": {
+        "authorizeUrl": "https://{account}.app.netsuite.com/app/login/oauth2/authorize.nl",
+        "tokenUrl": "https://{account}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token",
+        "revocationUrl": "https://{account}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/revoke",
+        "scopes": [
+          "rest_webservices"
+        ],
+        "clientAuth": "basic"
+      },
+      "integration": {
+        "secretKey": "integration:netsuite",
+        "secretFields": [
+          "clientId",
+          "privateKey"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/services/rest/record/v1/employee?limit=1"
+      }
+    },
+    {
+      "id": "sharepoint",
+      "label": "SharePoint",
+      "connectorType": "SharePoint",
+      "account": {
+        "kind": "label"
+      },
+      "accountLabel": "Tenant name (the part before .sharepoint.com)",
+      "apiBase": "https://graph.microsoft.com",
+      "oauth": {
+        "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+        "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+        "revocationUrl": null,
+        "scopes": [
+          "https://graph.microsoft.com/Sites.Read.All",
+          "offline_access"
+        ],
+        "clientAuth": "post"
+      },
+      "integration": {
+        "secretKey": "integration:sharepoint",
+        "secretFields": [
+          "clientId",
+          "clientSecret"
+        ]
+      },
+      "whoami": {
+        "method": "GET",
+        "path": "/v1.0/sites/{account}.sharepoint.com"
+      }
+    }
+  ]
+}

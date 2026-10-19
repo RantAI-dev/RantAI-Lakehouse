@@ -1125,12 +1125,15 @@ pub async fn dispatch(
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
         // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
+        // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => return Dispatch::Orchestrator,
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
     Dispatch::Done(answer)
 }

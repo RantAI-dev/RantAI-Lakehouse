@@ -1631,12 +1631,14 @@ fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
 
 /// Whether a connector can have a second credential: an S3-shaped `files`
 /// connector (access key + secret key) or a `rest` one (basic auth's
-/// username + password, an `OAuth2` client id + secret). Every other adapter
+/// username + password, an `OAuth2` client id + secret) or a `saas` one (a
+/// browser sign-in's client secret + refresh token, `SRC-3`; a vendor's
+/// integration credential may fill one slot or two). Every other adapter
 /// reads exactly one (`secret_field_names`). A pre-WS3 row with no adapter
 /// keeps whatever slots it already has.
 fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
     match dial_info.adapter.as_deref() {
-        Some("files" | "rest") => true,
+        Some("files" | "rest" | "saas") => true,
         Some(_) => false,
         None => dial_info.secret_ref_secondary.is_some(),
     }
@@ -2471,7 +2473,8 @@ fn resolve_debezium_source_target(
                 | Dial::Sheets(_)
                 | Dial::Mongo(_)
                 | Dial::Kafka(_)
-                | Dial::Sftp(_) => {
+                | Dial::Sftp(_)
+                | Dial::Saas(_) => {
                     return Err(ApiError::BadRequest(format!(
                         "connector {id} is registered with adapter {adapter:?} but its parsed \
                          dial is not a sql/cdc shape"
@@ -3325,7 +3328,8 @@ pub struct IngestCredentialBody {
 /// when `dial.endpoint` is set — a `files` dial with no endpoint override
 /// has no caller-supplied host to check) and `rest` (`dial.baseUrl`,
 /// parsed the same way [`connector_probe::probe_s3`] parses an S3
-/// endpoint) against [`connector_probe::resolve_checked`], gated the SAME
+/// endpoint) and `saas` (the vendor table's API and token addresses, built
+/// from `dial.account`) against [`connector_probe::resolve_checked`], gated the SAME
 /// way [`connector_probe::probe`] already is by
 /// `&state.config.connector_internal_hosts()`. Never checks
 /// `sheets`: its dial names a spreadsheet id, not a caller-chosen host —
@@ -3342,6 +3346,13 @@ async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
 ) -> Result<(), ApiError> {
+    // `SRC-3` AD2: a `saas` dial dials the API host and the token host the
+    // vendor table builds from `account`; both are checked, since they can
+    // differ (a vendor's sign-in service is not its API).
+    let saas_urls: Vec<String> = match dial {
+        Dial::Saas(saas) => saas_dialled_urls(saas),
+        _ => Vec::new(),
+    };
     let host_port: Option<(&str, u16)> = match dial {
         Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
         Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
@@ -3362,8 +3373,16 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) | Dial::Saas(_) => None,
     };
+    for url in &saas_urls {
+        if let Some((host, port)) = connector_probe::parse_endpoint_host_port(url) {
+            connector_probe::resolve_checked(host, port, internal_hosts)
+                .await
+                .map(|_approved| ())
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     let Some((host, port)) = host_port else {
         return Ok(());
     };
@@ -3373,6 +3392,24 @@ async fn check_dial_ssrf(
         .await
         .map(|_approved| ())
         .map_err(ApiError::BadRequest)
+}
+
+/// The addresses a `saas` dial makes the product dial: the vendor's API base
+/// and token endpoint, built from the vendor table and the account
+/// (`SRC-3` AD2). Empty for a dial whose vendor or account no longer
+/// validates ([`Dial::parse`] has refused both before this runs).
+fn saas_dialled_urls(saas: &lakehouse_store::ingest_spec::SaasDial) -> Vec<String> {
+    use lakehouse_store::saas_vendors::{SaasVendor, vendor};
+    let Some(vendor) = vendor(&saas.vendor) else {
+        return Vec::new();
+    };
+    let Ok(parts) = vendor.validate_account(&saas.account) else {
+        return Vec::new();
+    };
+    vec![
+        SaasVendor::render(vendor.api_base, &parts),
+        SaasVendor::render(vendor.oauth.token_url, &parts),
+    ]
 }
 
 /// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will

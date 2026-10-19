@@ -55,6 +55,7 @@ pub mod overview;
 pub mod pipelines;
 pub mod queries;
 pub mod reporting_settings;
+pub mod saas_vendors;
 pub mod schema_change;
 pub mod schema_diff;
 pub mod semantic;
