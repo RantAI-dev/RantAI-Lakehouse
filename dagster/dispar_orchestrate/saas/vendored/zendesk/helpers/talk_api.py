@@ -1,14 +1,15 @@
 from enum import Enum
-from typing import Dict, Iterator, Optional, Tuple, Any
-from dlt.common.typing import DictStrStr, TDataItems, TSecretValue
-from dlt.sources.helpers.requests import client
+from typing import Any, Dict, Iterator, Optional
+from dlt.common.typing import TDataItems
 from .. import settings
-from .credentials import (
-    ZendeskCredentialsEmailPass,
-    ZendeskCredentialsOAuth,
-    ZendeskCredentialsToken,
-    TZendeskCredentials,
-)
+
+# SRC-3 AD3/AD4 (local change 2): upstream built the host from a subdomain, took
+# credentials (OAuth token, API token or email and password) and fetched with
+# `dlt.sources.helpers.requests`, following the `next_page` link of every
+# answer unchecked. All of that is now `saas.session.SaasSession`: the host comes
+# from the vendor table, the sign-in's headers are asked for only after the
+# address check, a link is followed only on the same host, no redirect is
+# followed and a 429 is waited out within a bound. The client holds the session.
 
 
 class PaginationType(Enum):
@@ -23,42 +24,14 @@ class ZendeskAPIClient:
     API client used to make requests to Zendesk talk, support and chat API
     """
 
-    subdomain: str = ""
-    url: str = ""
-    headers: Optional[DictStrStr]
-    auth: Optional[Tuple[str, TSecretValue]]
+    session: Any
 
-    def __init__(
-        self, credentials: TZendeskCredentials, url_prefix: Optional[str] = None
-    ) -> None:
+    def __init__(self, session: Any) -> None:
         """
-        Initializer for the API client which is then used to make API calls to the ZendeskAPI
-
         Args:
-            credentials: ZendeskCredentials object which contains the necessary credentials to authenticate to ZendeskAPI
+            session: the `SaasSession` of the connector. Endpoints are paths on its origin.
         """
-        # oauth token is the preferred way to authenticate, followed by api token and then email + password combo
-        # fill headers and auth for every possibility of credentials given, raise error if credentials are of incorrect type
-        if isinstance(credentials, ZendeskCredentialsOAuth):
-            self.headers = {"Authorization": f"Bearer {credentials.oauth_token}"}
-            self.auth = None
-        elif isinstance(credentials, ZendeskCredentialsToken):
-            self.headers = None
-            self.auth = (f"{credentials.email}/token", credentials.token)
-        elif isinstance(credentials, ZendeskCredentialsEmailPass):
-            self.auth = (credentials.email, credentials.password)
-            self.headers = None
-        else:
-            raise TypeError(
-                "Wrong credentials type provided to ZendeskAPIClient. The credentials need to be of type: ZendeskCredentialsOAuth, ZendeskCredentialsToken or ZendeskCredentialsEmailPass"
-            )
-
-        # If url_prefix is set it overrides the default API URL (e.g. chat api uses zopim.com domain)
-        if url_prefix:
-            self.url = url_prefix
-        else:
-            self.subdomain = credentials.subdomain
-            self.url = f"https://{self.subdomain}.zendesk.com"
+        self.session = session
 
     def get_pages(
         self,
@@ -89,13 +62,9 @@ class ZendeskAPIClient:
             params["limit"] = settings.INCREMENTAL_PAGE_SIZE
 
         # make request and keep looping until there is no next page
-        get_url = f"{self.url}{endpoint}"
+        get_url: Optional[str] = endpoint
         while get_url:
-            response = client.get(
-                get_url, headers=self.headers, auth=self.auth, params=params
-            )
-            response.raise_for_status()
-            response_json = response.json()
+            response_json = self.session.get_json(get_url, params or None)
             result = response_json[data_point_name]
             yield result
 

@@ -21,3 +21,14 @@ directory; `git diff` against it shows exactly what follows.
    dials (hosts come only from the vendor table, AD2), so the code could not run
    through the session of the next change anyway. `zendesk_support` is
    untouched by this commit.
+2. **All HTTP goes through `SaasSession`** (`helpers/talk_api.py`,
+   `__init__.py`, `helpers/credentials.py` deleted; `SRC-3` AD3, AD4). Upstream's
+   `ZendeskAPIClient` built the host from a subdomain, took one of three credential
+   classes (OAuth token, API token, email and password) and fetched with
+   `dlt.sources.helpers.requests`, following the `next_page` / `links.next` link of
+   every answer unchecked. That would go round the link rule (same host only), the
+   address check before any credential, the no-redirect rule and the bounded 429
+   wait. `ZendeskAPIClient(session)` now calls `session.get_json`; `zendesk_support`
+   takes the session in place of `credentials`; the credential classes are gone
+   (the connector's sign-in builds the headers, see `saas/vendors/zendesk.py`).
+   Nothing else in `get_pages` changed: the same four pagination types.

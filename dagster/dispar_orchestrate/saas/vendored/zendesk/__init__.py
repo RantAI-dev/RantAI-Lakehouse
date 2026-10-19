@@ -6,7 +6,7 @@ here. They are removed (decision 5: Chat and Talk are not offered; Chat is
 served from another host, `www.zopim.com`, that the connector never dials).
 """
 
-from typing import Iterator, Optional, Iterable
+from typing import Any, Iterator, Optional, Iterable
 from itertools import chain
 
 import dlt
@@ -17,7 +17,6 @@ from dlt.sources import DltResource
 
 from .helpers.api_helpers import process_ticket, process_ticket_field
 from .helpers.talk_api import PaginationType, ZendeskAPIClient
-from .helpers.credentials import TZendeskCredentials
 from .helpers import make_date_ranges
 
 from .settings import (
@@ -30,7 +29,7 @@ from .settings import (
 
 @dlt.source(max_table_nesting=2)
 def zendesk_support(
-    credentials: TZendeskCredentials = dlt.secrets.value,
+    session: Any,
     load_all: bool = True,
     pivot_ticket_fields: bool = True,
     start_date: Optional[TAnyDateTime] = DEFAULT_START_DATE,
@@ -45,7 +44,7 @@ def zendesk_support(
     All resources opt-in to use Airflow scheduler if run as Airflow task
 
     Args:
-        credentials: The credentials for authentication. Defaults to the value in the `dlt.secrets` object.
+        session: The `SaasSession` every request goes through (SRC-3 local change 2).
         load_all: Whether to load extra resources for the API. Defaults to True.
         pivot_ticket_fields: Whether to pivot the custom fields in tickets. Defaults to True.
         start_date: The start time of the range for which to load. Defaults to January 1st 2000.
@@ -222,7 +221,7 @@ def zendesk_support(
     )(ticket_fields_table)
 
     # Authenticate
-    zendesk_client = ZendeskAPIClient(credentials)
+    zendesk_client = ZendeskAPIClient(session)
 
     # loading base tables
     resource_list = [
