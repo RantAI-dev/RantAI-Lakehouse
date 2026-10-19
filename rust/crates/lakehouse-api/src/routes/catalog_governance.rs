@@ -20,7 +20,7 @@
 //! No lookup here can fail the detail page: a store or `ClickHouse` error
 //! is logged and reads as "none", like the sample and the parts stats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lakehouse_auth::Principal;
 use lakehouse_store::governance::{self as store, ClassificationRule, Policy, QualityRule};
@@ -331,10 +331,25 @@ fn frequent_users(reads: &[Read<'_>]) -> Vec<Value> {
 /// Runs per literal-free form, and how many reads could not be given one
 /// (`DATA-15` F2). Rows are newest first, so the first `at` kept for a form
 /// is its latest run.
-fn frequent_queries(reads: &[Read<'_>]) -> (Vec<Value>, u32) {
+// PR #106 review R1 BLOCKER 6
+fn frequent_queries(reads: &[Read<'_>], known: &HashSet<String>) -> (Vec<Value>, u32) {
     let mut by_form: HashMap<String, (u32, String)> = HashMap::new();
     let mut unparsed = 0_u32;
-    for (m, _) in reads {
+    for (m, names) in reads {
+        if m.status != "completed" {
+            continue;
+        }
+        let mut stmt_known = known.clone();
+        for name in names {
+            stmt_known.insert(name.to_ascii_lowercase());
+            stmt_known.insert(bare_name(name).to_ascii_lowercase());
+            for part in name.split('.') {
+                stmt_known.insert(part.to_ascii_lowercase());
+            }
+        }
+        if crate::sql_rewrite::has_unknown_quoted_identifier(&m.sql, &stmt_known) {
+            continue;
+        }
         let form = crate::sql_rewrite::literal_free_form(&m.sql, &ClickHouseDialect {})
             .or_else(|| crate::sql_rewrite::literal_free_form(&m.sql, &GenericDialect {}));
         match form {
@@ -461,8 +476,21 @@ fn summarize_usage(
         completed.iter().sum::<i64>() / i64::try_from(completed.len()).unwrap_or(1)
     };
 
+    let mut known: HashSet<String> = HashSet::new();
+    for t in tables {
+        known.insert(t.to_ascii_lowercase());
+        known.insert(bare_name(t).to_ascii_lowercase());
+        for part in t.split('.') {
+            known.insert(part.to_ascii_lowercase());
+        }
+    }
+    for col in columns {
+        known.insert(col.to_ascii_lowercase());
+    }
+
     let frequent_users = frequent_users(&reads);
-    let (frequent_queries, unparsed) = frequent_queries(&reads);
+    // PR #106 review R1 BLOCKER 6
+    let (frequent_queries, unparsed) = frequent_queries(&reads, &known);
     let joined_tables = joined_tables(&reads, tables);
     let (column_list, skipped) = column_popularity(&reads, tables, columns);
     let columns_note = format!(
@@ -1604,6 +1632,54 @@ mod tests {
         let text = usage["frequentQueries"].to_string();
         assert!(!text.contains("Rina") && !text.contains("Budi"));
         assert_eq!(usage["unparsed"], 0);
+    }
+
+    // PR #106 review R1 BLOCKER 6
+    #[test]
+    fn frequent_queries_counts_only_completed_and_drops_unknown_quoted_identifiers() {
+        let caller = uuid::Uuid::from_u128(1);
+        let mentions = [
+            // A failed query must NOT be counted in frequent queries
+            mention(
+                "q-failed",
+                "SELECT id FROM silver.orders WHERE email = 'failed@corp.example'",
+                caller,
+                "failed",
+                10,
+            ),
+            // A query with a quoted identifier that is not a known table or column must be dropped
+            mention(
+                "q-quoted-literal",
+                r#"SELECT id FROM silver.orders WHERE email = "jane@corp.example""#,
+                caller,
+                "completed",
+                10,
+            ),
+            // A valid completed query with known column
+            mention(
+                "q-ok",
+                "SELECT id FROM silver.orders WHERE id = 100",
+                caller,
+                "completed",
+                10,
+            ),
+        ];
+        let (usage, _) = summarize_usage(
+            &mentions,
+            &tables(&["silver.orders"]),
+            &["id".to_owned(), "email".to_owned()],
+            caller,
+            false,
+        );
+        let frequent = usage["frequentQueries"].as_array().expect("a list");
+        assert_eq!(frequent.len(), 1);
+        assert_eq!(
+            frequent[0]["sql"],
+            "SELECT id FROM silver.orders WHERE id = ?"
+        );
+        let text = usage["frequentQueries"].to_string();
+        assert!(!text.contains("jane@corp.example"));
+        assert!(!text.contains("failed@corp.example"));
     }
 
     /// `DATA-15` F2: frequent users are counted per person, most active

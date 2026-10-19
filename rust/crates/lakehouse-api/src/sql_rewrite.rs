@@ -225,6 +225,48 @@ pub fn identifiers_used(sql: &str, dialect: &dyn Dialect) -> Option<HashSet<Stri
     Some(collector.found)
 }
 
+struct QuotedIdentChecker<'a, S> {
+    known: &'a HashSet<String, S>,
+    has_unknown: bool,
+}
+
+impl<S: std::hash::BuildHasher> Visitor for QuotedIdentChecker<'_, S> {
+    type Break = ();
+
+    fn pre_visit_ident(&mut self, ident: &sqlparser::ast::Ident) -> ControlFlow<Self::Break> {
+        if ident.quote_style.is_some() && !self.known.contains(&ident.value.to_ascii_lowercase()) {
+            self.has_unknown = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Checks whether `sql` contains any quoted identifier whose name is not in `known`.
+// PR #106 review R1 BLOCKER 6
+#[must_use]
+pub fn has_unknown_quoted_identifier<S: std::hash::BuildHasher>(
+    sql: &str,
+    known: &HashSet<String, S>,
+) -> bool {
+    use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
+    let check = |dialect: &dyn Dialect| {
+        if let Ok(statements) = Parser::parse_sql(dialect, sql) {
+            let mut checker = QuotedIdentChecker {
+                known,
+                has_unknown: false,
+            };
+            for stmt in &statements {
+                if stmt.visit(&mut checker).is_break() {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    check(&ClickHouseDialect {}) || check(&GenericDialect {})
+}
+
 /// `query.body`'s own top-level `FROM` clause, unwrapping a
 /// parenthesized `SetExpr::Query` (`(SELECT ... )` around a whole
 /// query body, distinct from a derived-table subquery — both cases are
