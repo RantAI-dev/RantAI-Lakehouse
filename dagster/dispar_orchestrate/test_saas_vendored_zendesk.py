@@ -11,6 +11,7 @@ hands back an `after_url` and repeats nothing within a run."""
 from __future__ import annotations
 
 import ast
+import copy
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -29,7 +30,7 @@ ORIGIN = "https://acme.zendesk.com"
 class Reply:
     def __init__(self, status: int = 200, body: Any = None, headers: dict | None = None) -> None:
         self.status_code = status
-        self._body = body if body is not None else {}
+        self._body = copy.deepcopy(body) if body is not None else {}  # as over the wire: the caller may change what it got
         self.headers = headers or {}
 
     def json(self) -> Any:

@@ -392,6 +392,7 @@ _MODULES: dict[str, Any] = {}
 # orchestrator loads only what a connector uses.
 MODULE_PATHS: dict[str, str] = {
     "hubspot": "dispar_orchestrate.saas.vendors.hubspot",
+    "zendesk": "dispar_orchestrate.saas.vendors.zendesk",
 }
 
 
