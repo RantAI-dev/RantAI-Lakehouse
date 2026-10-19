@@ -2208,12 +2208,14 @@ mod tests {
             AppState::new(Config::from_map(&env).expect("a valid test Config"))
         }
 
+        // PR #106 review R2 BLOCKER 8: happy-path tests use an unrestricted (*:*) caller
+        // so the fail-closed catalog_tenant_refusal gate allows tag key writes.
         fn admin() -> Principal {
             Principal {
                 id: PrincipalId::User(Uuid::new_v4()),
                 tenant_ids: Vec::new(),
                 display_name: "Rina Admin".to_owned(),
-                permissions: PermissionSet::parse("governance:write"),
+                permissions: PermissionSet::parse("governance:write,*:*"),
                 provider: "session".to_owned(),
                 must_change_password: false,
                 role_names: Vec::new(),
