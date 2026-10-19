@@ -1390,7 +1390,8 @@ pub enum InvalidLoadMode {
     /// `incremental` or `incremental_dedup` for an adapter the ingest job
     /// does not run it for.
     #[error(
-        "source object {name:?} asks for an incremental loadMode, which only SQL connectors support"
+        "source object {name:?} asks for an incremental loadMode, which only SQL and business-app \
+         connectors support"
     )]
     NotForAdapter {
         /// The source object's name.
@@ -1474,7 +1475,7 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 /// # Errors
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
-/// `loadMode`, with an incremental mode on a non-`sql` adapter or without a
+/// `loadMode`, with an incremental mode on an adapter other than `sql` and `saas` or without a
 /// cursor column that is a plain name of sensible length, with a
 /// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
 /// not a usable key.
@@ -1543,7 +1544,12 @@ pub fn validate_load_modes(
         if !mode.is_incremental() {
             continue;
         }
-        if adapter != "sql" {
+        // `SRC-3` AD6: a `saas` object may load incrementally too. Whether the
+        // vendor's API can filter that object by the cursor is declared per
+        // object in the orchestrator's vendor module (`saas/objects.py`); an
+        // object without a cursor there is saved without `incrementalKey`
+        // and so still stops at `NoCursor` below.
+        if !matches!(adapter, "sql" | "saas") {
             return Err(InvalidLoadMode::NotForAdapter { name });
         }
         let cursor = object
@@ -1611,8 +1617,10 @@ pub enum InvalidExcludedColumns {
 
 /// Whether the dial's source can list its columns before loading, so that
 /// column choice is offered for it (`SRC-11` decision D9): the `sql` adapter
-/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver. Oracle
-/// follows with `SRC-13`; change-capture and every other adapter are out.
+/// with the `PostgreSQL`, `MySQL`/`MariaDB` or SQL Server driver, and the
+/// `saas` adapter (`SRC-3` AD6: each vendor module lists an object's fields
+/// before the load). Oracle follows with `SRC-13`; change-capture and every
+/// other adapter are out.
 #[must_use]
 pub const fn supports_column_choice(dial: &Dial) -> bool {
     matches!(
@@ -1620,7 +1628,7 @@ pub const fn supports_column_choice(dial: &Dial) -> bool {
         Dial::Sql(SqlDial {
             driver: SqlDriver::Postgres | SqlDriver::Mysql | SqlDriver::Mssql,
             ..
-        })
+        }) | Dial::Saas(_)
     )
 }
 
@@ -2979,8 +2987,8 @@ mod target_identity_tests {
     use serde_json::{Value, json};
 
     use super::{
-        Dial, InvalidExcludedColumns, SourceObject, inactive_exclusions, is_repoint,
-        supports_column_choice, validate_excluded_columns,
+        Dial, InvalidExcludedColumns, InvalidLoadMode, SourceObject, inactive_exclusions,
+        is_repoint, supports_column_choice, validate_excluded_columns, validate_load_modes,
     };
 
     fn parse(adapter: &str, dial: &Value) -> Dial {
@@ -3457,6 +3465,52 @@ mod target_identity_tests {
         assert_eq!(validate_excluded_columns(&cdc, &objects), refused);
         assert!(supports_column_choice(&sql_dial_of("postgres")));
         assert!(!supports_column_choice(&cdc));
+    }
+
+    /// `SRC-3` T1.3, AD6: a `saas` object takes incremental modes and column
+    /// choice when it has a cursor; without one it is still refused, with the
+    /// same message as a SQL object. `rest` is still refused.
+    #[test]
+    fn saas_objects_take_incremental_loads_and_column_choice_only_with_a_cursor() {
+        let incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(validate_load_modes("saas", &incremental), Ok(()));
+        let no_cursor = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental"
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &no_cursor),
+            Err(InvalidLoadMode::NoCursor {
+                name: "tickets".to_owned()
+            })
+        );
+        assert!(matches!(
+            validate_load_modes("rest", &incremental),
+            Err(InvalidLoadMode::NotForAdapter { .. })
+        ));
+        let saas = Dial::parse(
+            "saas",
+            &serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        )
+        .expect("valid saas dial");
+        assert!(supports_column_choice(&saas));
+        let left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "excludedColumns": ["subject"]
+        }]);
+        assert_eq!(validate_excluded_columns(&saas, &left_out), Ok(()));
+        let cursor_left_out = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "excludedColumns": ["updated_at"]
+        }]);
+        assert!(matches!(
+            validate_excluded_columns(&saas, &cursor_left_out),
+            Err(InvalidExcludedColumns::NamesCursorColumn { .. })
+        ));
     }
 
     /// An object that leaves nothing out is fine for every source: the field
