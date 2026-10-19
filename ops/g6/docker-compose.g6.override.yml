@@ -442,6 +442,39 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests psycopg2-binary && python src13_discovery_scale_test.py"]
 
+  # SRC-3 (T1.12, AD9): the runner of `ops/g6/g6_saas_test.py`, the gate of the business-app
+  # connectors. A job of its own (`g6-saas`, profile `g6-saas`), so no existing connector gate
+  # grows past its 20 minutes. Slice 1 needs only the API (and what it depends on) and the mock
+  # vendor server; Dagster joins the profile when the first vendor's load steps do. The shared
+  # Dagster image only because it already holds `requests` and the `images` job has built it;
+  # same `image:` key and `GIT_SHA` arg as `g6-ops-test-runner`.
+  g6-saas-test-runner:
+    profiles: ["g6-saas"]
+    image: ${LAKEHOUSE_DAGSTER_IMAGE:-rantai-lakehouse-dagster:local}
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work:ro
+      - ./ops/gates:/opt/gates:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      saas-stub-g6:
+        condition: service_started
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      SAAS_STUB_URL: http://saas-stub-g6:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      PYTHONPATH: /opt/gates
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python g6_saas_test.py"]
+
 # PR #105 CI fix (SEC-10): a fixed subnet for the project's default network,
 # so `WEBHOOK_ALLOWED_CIDRS` on `lakehouse-api` can name exactly the network
 # the `g6-alerts` receiver lives on instead of a broad private range. The

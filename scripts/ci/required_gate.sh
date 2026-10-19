@@ -40,6 +40,7 @@
 #   G6_SECRET_MANAGERS_RESULT result of `g6-secret-managers` job (SRC-12 part B, Vault and AWS)
 #   G6_OAUTH_RESULT       result of `g6-oauth` job (SRC-12 part C, OAuth sign-in against the gate's own provider)
 #   G6_DISCOVERY_SCALE_RESULT result of `g6-discovery-scale` job (SRC-13, 10,000 tables listed and searched)
+#   G6_SAAS_RESULT        result of `g6-saas` job (SRC-3, business-app connectors against the mock vendor server)
 #   GOLD_EXPORT_RESULT    result of `gold-export` job
 #   G8_GOVERNANCE_RESULT  result of `g8-governance` job
 #   G8_TIME_TRAVEL_RESULT result of `g8-time-travel` job
@@ -156,6 +157,7 @@ run_gate() {
   check_job "g6-secret-managers" "${G6_SECRET_MANAGERS_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-oauth" "${G6_OAUTH_RESULT:-skipped}" "$req_acceptance"
   check_job "g6-discovery-scale" "${G6_DISCOVERY_SCALE_RESULT:-skipped}" "$req_acceptance"
+  check_job "g6-saas" "${G6_SAAS_RESULT:-skipped}" "$req_acceptance"
   check_job "gold-export" "${GOLD_EXPORT_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-governance" "${G8_GOVERNANCE_RESULT:-skipped}" "$req_acceptance"
   check_job "g8-time-travel" "${G8_TIME_TRAVEL_RESULT:-skipped}" "$req_acceptance"
