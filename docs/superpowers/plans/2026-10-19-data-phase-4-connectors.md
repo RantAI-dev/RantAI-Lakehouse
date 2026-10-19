@@ -10,7 +10,7 @@
 | Spec | `docs/core/specs/src-3.md` |
 | Feature page | `docs/core/features/business-app-connectors.md`: fifteen decisions, signed 2026-10-19 (every default; decision 3 corrected to the spec's "OAuth where offered" before signing) |
 | `SRC-4` | **Not in this plan.** Blocked by `SEC-14` (part B waits for `SEC-41`, which waits for `REL-9`). It gets its own plan on this branch once `SEC-14` merges (product owner, 2026-10-19) |
-| Migrations | `0095` and `0096` reserved by this plan (free on main and in every open branch's plan on 2026-10-19: #106 holds 0078–0083, BI phases 3–4 0085–0088, data phase 3 0090–0094) |
+| Migrations | `0095`, `0096` and `0097` (added at the slice 1 review) reserved by this plan (free on main and in every open branch's plan on 2026-10-19: #106 holds 0078–0083, BI phases 3–4 0085–0088, data phase 3 0090–0094) |
 
 ## 1. Scope
 
@@ -411,4 +411,38 @@ Commands run on the final tree, with counts:
 
 ## 12. Review
 
-(Planner, per slice: findings tagged `BLOCKER` or `SHOULD-FIX`.)
+### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
+
+Read: the migration, the vendor table, `SaasSession`, the probe's order
+(address check before any credential), the developer's five reported
+mismatches. CI on `c0ea41d0` (T1.1–T1.4): 35 of 37 checks green; the three
+`connector_type.rs` failures are fixed in `1988a26f`. The rest of the slice
+has its first CI run on the push of this review.
+
+Decisions on the reported mismatches:
+
+1. **Run-report classes (T1.9).** `BLOCKER 1`: decision 13 asks for "the
+   vendor limited the rate" and the page's item 7 for a plain message when
+   a permission is missing; mapping them to `source_busy` and
+   `sign_in_refused` does not say that. Add migration `0097` (reserved
+   here) widening the run-report class CHECK of `0072` with
+   `permission_missing` (not retried) and `rate_limited` (retried as
+   `source_busy` is), the Rust enum and its fixed texts, the Python classes,
+   and the console's wording; tests both ways.
+2. **`ObjectKind::Object` and the `load` text** (`8d9d601d`): accepted, an
+   additive, validated carrier; the plan's T1.10 is read to include it.
+3. **`connector_type.rs`:** accepted. The ten types join the named
+   exceptions as Sheets and the CDC types did, for the same reason (an
+   existing connector opens in its edit page); no wildcard; AD10 unchanged.
+4. **`saas_vendors.rs` in `lakehouse-store`:** accepted (that is where
+   `ingest_spec.rs` lives).
+5. **Confluence cloud id, Microsoft tenant id, scopes and revocation
+   addresses:** each vendor's slice checks its row against the vendor's
+   documentation and records the source in the commit (Vn.3).
+
+`SHOULD-FIX 2`: `tests/fixtures/tool_schemas.json` was edited by hand;
+regenerate it with the repository's generator and commit any difference.
+
+Not verified by the developer and still open: every Rust test (CI),
+the `g6-saas` job (CI), a browser look (end of phase), brand marks
+(slice 7, against the current Simple Icons release).
