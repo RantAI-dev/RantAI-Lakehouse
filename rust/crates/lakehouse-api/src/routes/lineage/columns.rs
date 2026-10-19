@@ -568,6 +568,35 @@ fn unmappable_rows(
     }
 }
 
+// PR #106 review R1 SHOULD-FIX DATA-13 1: expand partial star row into probed target columns
+fn expand_star_rows(
+    mut rows: Vec<NewMapping>,
+    probed: Option<&Vec<String>>,
+    target: &str,
+) -> Vec<NewMapping> {
+    if let Some(star_idx) = rows.iter().position(|r| r.to_column == "*") {
+        let star = rows.remove(star_idx);
+        if let Some(columns) = probed.filter(|c| !c.is_empty()) {
+            for col in columns {
+                if !rows.iter().any(|r| &r.to_column == col) {
+                    rows.push(NewMapping {
+                        from_table: star.from_table.clone(),
+                        from_column: star.from_column.clone(),
+                        to_table: target.to_owned(),
+                        to_column: col.clone(),
+                        transform: star.transform.clone(),
+                        partial: star.partial,
+                        reason: star.reason.clone(),
+                    });
+                }
+            }
+        } else {
+            rows.push(star);
+        }
+    }
+    rows
+}
+
 // PR #106 review R1 SHOULD-FIX DATA-13 1, SHOULD-FIX DATA-13 2
 fn map_statement_or_unmappable(
     sql: &str,
@@ -579,11 +608,8 @@ fn map_statement_or_unmappable(
     } else {
         match sql_lineage::map_select(sql, &ClickHouseDialect {}, known) {
             Ok(lineage) => {
-                if let Some(probed) = known.get(target).filter(|p| !p.is_empty()) {
-                    rows_for_probed(&lineage, probed, target)
-                } else {
-                    rows_for(&lineage, target)
-                }
+                let rows = rows_for(&lineage, target);
+                expand_star_rows(rows, known.get(target), target)
             }
             Err(unmappable) => unmappable_rows(target, &unmappable.to_string(), known),
         }
