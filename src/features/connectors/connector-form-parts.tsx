@@ -190,7 +190,8 @@ const SAAS_FIELD_SLOTS: Record<string, CredentialSlot> = {
     kind: "private_key",
     label: "Private key",
     multiline: true,
-    placeholder: "-----BEGIN PRIVATE KEY-----",
+    // PR #214 CI gitleaks: no PEM header literal here; a second one beside the OpenSSH placeholder made the text between them match as one key.
+    placeholder: "Paste the PEM private key, starting with BEGIN PRIVATE KEY",
   },
   serviceAccountJson: {
     kind: "password",
