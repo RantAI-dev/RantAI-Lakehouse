@@ -329,3 +329,39 @@ async fn without_access_approve_every_grant_route_is_refused_by_the_permission_g
         assert_eq!(body["error"], json!("permission_denied: access:approve"));
     }
 }
+
+// PR #106 review R1 BLOCKER 4
+#[tokio::test]
+async fn a_granter_cannot_give_a_permission_they_do_not_hold() {
+    let mut overrides = std::collections::HashMap::new();
+    let tenant_id = "11111111-1111-4111-8111-000000000002";
+    overrides.insert("CATALOG_TENANT_ID".to_owned(), tenant_id.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&overrides).await;
+
+    // Approver holds access:approve but NOT catalog:write
+    let approver = create_principal_with_permissions(&pool, "access:approve").await;
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(approver)
+        .bind(tenant_id.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cookie = session_cookie_for_user(&pool, approver).await;
+
+    let grantee = create_zero_permission_principal(&pool).await;
+    let email = email_of(&pool, grantee).await;
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &grants_path(),
+        &cookie,
+        &json!({"email": email, "permission": "catalog:write"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: you cannot grant a permission you do not hold")
+    );
+}

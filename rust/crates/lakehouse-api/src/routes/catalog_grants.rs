@@ -111,6 +111,7 @@ pub async fn list(
 /// - `400` for a body that is not JSON, an e-mail that is empty or too
 ///   long, or a `permission` that is not one of [`GRANTABLE`].
 /// - `404` "no user with that email".
+/// - `403` when the granter does not hold the permission themselves.
 /// - `403` when the grantee is the caller (as approving one's own request
 ///   is refused).
 /// - `409` when the user already holds the permission, through a role or a
@@ -138,6 +139,13 @@ pub async fn create(
     if !GRANTABLE.contains(&permission) {
         return Err(ApiError::BadRequest(
             "permission must be catalog:write, lineage:read or query:read".to_owned(),
+        )
+        .into());
+    }
+    // PR #106 review R1 BLOCKER 4: a granter can only give permissions they themselves hold
+    if !principal.has(permission) {
+        return Err(ApiError::PermissionDenied(
+            "you cannot grant a permission you do not hold".to_owned(),
         )
         .into());
     }
