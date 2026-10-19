@@ -1,19 +1,21 @@
 # Deeper asset page: preview, usage, access, restore, history
 
+<!-- PR #106 review R1 SHOULD-FIX DATA-15 3 -->
+
 | | |
 | --- | --- |
 | Module | Data |
 | Backlog | `DATA-15` |
 | Spec | `docs/core/specs/data-15.md` |
 | Kind | Feature |
-| Status | Decisions **signed by the product owner (2026-10-14, all six)** — plan is next |
+| Status | In review (Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
-| Started | Not yet |
+| Started | 2026-10-14 |
 | Shipped | Not yet |
 | Evidence | The Phase 2 pull request (#106) |
-| Plan | Not yet written; follows the signature |
+| Plan | `docs/superpowers/plans/2026-10-16-data-15-asset-page-depth.md` |
 
 ## Problem
 
@@ -70,6 +72,16 @@ reported, not quietly lowered.
 - A grant expires after 30 days, like a decided request.
 - Restore works only for Iceberg tables, only within the retention window.
 - A version's author is shown only where the committer was recorded.
+
+## Spec rows
+
+| Spec row | Status |
+| --- | --- |
+| Preview up to 1,000 rows | **Met** |
+| Usage: 30 days | **Met in code** |
+| Access: grant and revoke from the asset | **Met in code** |
+| Restore: dropped table within 7 days | **Partly met** (soft delete on every warehouse and undrop route built; only drops after soft-delete profile applied; Bronze Iceberg only) |
+| History: version time, operation and author | **Partly met** (author is read and shown; versions written through dlt say "unknown") |
 
 ## Acceptance checklist
 

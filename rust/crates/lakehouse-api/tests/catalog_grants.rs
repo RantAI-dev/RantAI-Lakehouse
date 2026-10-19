@@ -178,7 +178,11 @@ async fn a_grant_and_a_revoke_are_audited_and_named_in_the_assets_history() {
     .await
     .unwrap();
     assert_eq!(args["permission"], json!("lineage:read"));
-    assert_eq!(args["grantee"], json!("Zero Perm Test User"));
+    // PR #106 review R1 SHOULD-FIX DATA-15 3
+    assert_eq!(
+        args["grantee"],
+        json!(format!("Zero Perm Test User <{email}>"))
+    );
     assert!(args["expiresAt"].is_string());
 }
 

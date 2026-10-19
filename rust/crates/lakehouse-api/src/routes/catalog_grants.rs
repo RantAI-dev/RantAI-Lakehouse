@@ -200,12 +200,17 @@ pub async fn create(
         GRANT_DAYS,
     )
     .await?;
+    // PR #106 review R1 SHOULD-FIX DATA-15 3: name grantee by display name + email
     audit(
         pool,
         &principal,
         "catalog.grant",
         &id,
-        json!({ "permission": permission, "grantee": target.name, "expiresAt": grant.expires_at }),
+        json!({
+            "permission": permission,
+            "grantee": format!("{} <{}>", target.name, email),
+            "expiresAt": grant.expires_at,
+        }),
     )
     .await;
     Ok(ApiJson(json!({
