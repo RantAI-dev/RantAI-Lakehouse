@@ -720,24 +720,34 @@ fn grant_summary<'a>(action: &str, arg: impl Fn(&str) -> Option<&'a str>) -> Str
     }
 }
 
+// PR #106 review R1 SHOULD-FIX DATA-12 3: format governedTags as "governed tags"
+fn annotate_summary(args: &Value) -> String {
+    let fields: Vec<&str> = args
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|f| {
+            f.iter()
+                .filter_map(Value::as_str)
+                .map(|name| match name {
+                    "governedTags" => "governed tags",
+                    other => other,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fields.is_empty() {
+        "Edited the asset's details".to_owned()
+    } else {
+        format!("Edited {}", fields.join(", "))
+    }
+}
+
 /// One audit event about a catalog asset, as a `changeHistory` entry: who,
 /// when, and one line saying what they did.
 fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
     let arg = |key: &str| event.args.get(key).and_then(Value::as_str);
     let summary = match event.action.as_str() {
-        "catalog.annotate" => {
-            let fields: Vec<&str> = event
-                .args
-                .get("fields")
-                .and_then(Value::as_array)
-                .map(|f| f.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            if fields.is_empty() {
-                "Edited the asset's details".to_owned()
-            } else {
-                format!("Edited {}", fields.join(", "))
-            }
-        }
+        "catalog.annotate" => annotate_summary(&event.args),
         "catalog.access_request" => arg("permission").map_or_else(
             || "Requested access".to_owned(),
             |permission| format!("Requested {permission}"),
@@ -1839,6 +1849,16 @@ mod tests {
         ));
         assert_eq!(revoke["actor"], "Rina");
         assert_eq!(revoke["summary"], "Revoked query:read from Bayu");
+    }
+
+    // PR #106 review R1 SHOULD-FIX DATA-12 3
+    #[test]
+    fn change_entries_format_governed_tags_in_plain_words() {
+        let gov_edit = change_entry(&audit_event(
+            "catalog.annotate",
+            json!({ "fields": ["description", "governedTags"] }),
+        ));
+        assert_eq!(gov_edit["summary"], "Edited description, governed tags");
     }
 
     /// The history line says what was done in plain words, from the
