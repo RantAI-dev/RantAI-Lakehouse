@@ -10,6 +10,14 @@
 
 ## Local changes
 
-None yet: this commit is the copy exactly as upstream has it (`__init__.py`,
-`settings.py`, `README.md`, `requirements.txt`, `helpers/`). Each change below
-is its own commit and names the plan item and the reason.
+Each is its own commit. The unchanged copy is the first commit of this
+directory; `git diff` against it shows exactly what follows.
+
+1. **Zendesk Talk and Zendesk Chat removed** (`__init__.py`: `zendesk_talk`,
+   `talk_resource`, `talk_incremental_resource`, `zendesk_chat`,
+   `chats_table_resource`; `settings.py`: `TALK_ENDPOINTS`,
+   `INCREMENTAL_TALK_ENDPOINTS`; `SRC-3` decision 5). Chat and Talk are not
+   offered, and Chat is served from `www.zopim.com`, a host the connector never
+   dials (hosts come only from the vendor table, AD2), so the code could not run
+   through the session of the next change anyway. `zendesk_support` is
+   untouched by this commit.

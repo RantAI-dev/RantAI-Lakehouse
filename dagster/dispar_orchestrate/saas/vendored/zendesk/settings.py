@@ -46,25 +46,5 @@ SUPPORT_EXTRA_ENDPOINTS = [
     ("tags", "/api/v2/tags.json", None, True),
 ]
 
-TALK_ENDPOINTS = [
-    ("calls", "/api/v2/channels/voice/calls", None, False),
-    ("addresses", "/api/v2/channels/voice/addresses", None, False),
-    ("greeting_categories", "/api/v2/channels/voice/greeting_categories", None, False),
-    ("greetings", "/api/v2/channels/voice/greetings", None, False),
-    ("ivrs", "/api/v2/channels/voice/ivr", None, False),
-    ("phone_numbers", "/api/v2/channels/voice/phone_numbers", None, False),
-    ("settings", "/api/v2/channels/voice/settings", None, False),
-    ("lines", "/api/v2/channels/voice/lines", None, False),
-    ("agents_activity", "/api/v2/channels/voice/stats/agents_activity", None, False),
-    (
-        "current_queue_activity",
-        "/api/v2/channels/voice/stats/current_queue_activity",
-        None,
-        False,
-    ),
-]
-
-INCREMENTAL_TALK_ENDPOINTS = {
-    "calls": "/api/v2/channels/voice/stats/incremental/calls.json",
-    "legs": "/api/v2/channels/voice/stats/incremental/legs.json",
-}
+# SRC-3 local change 1: upstream's TALK_ENDPOINTS and INCREMENTAL_TALK_ENDPOINTS
+# (Zendesk Talk) are removed with `zendesk_talk`; see UPSTREAM.md.
