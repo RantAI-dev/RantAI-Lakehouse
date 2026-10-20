@@ -593,6 +593,61 @@ async fn an_unknown_dagster_connector_run_fails_closed_and_does_not_silently_ski
     );
 }
 
+// PR #106 review R3 SHOULD-FIX 12
+#[tokio::test]
+async fn a_dagster_failure_during_connector_load_follow_up_fails_closed() {
+    let app = app().await;
+    sqlx::query(
+        "UPDATE connector SET adapter = 'sql', ingest_mode = 'batch', dial = '{}'::jsonb, \
+         source_objects = '[{\"name\":\"orders\",\"target\":\"orders_raw\"}]'::jsonb WHERE id = $1",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    // First run_config lookup for find_connector in load_alerts succeeds
+    Mock::given(method("POST"))
+        .and(body_string_contains("runOrError"))
+        .and(body_string_contains("run-flaky"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "runOrError": { "__typename": "Run", "runConfig": {
+                "ops": { "run_ingest": { "config": { "connector_id": CONNECTOR } } }
+            } } }
+        })))
+        .up_to_n_times(1)
+        .mount(&app.dagster)
+        .await;
+
+    // Run status lookup succeeds
+    Mock::given(method("POST"))
+        .and(body_string_contains("pipelineRunOrError"))
+        .and(body_string_contains("run-flaky"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "pipelineRunOrError": {
+                "__typename": "Run", "status": "SUCCESS",
+                "startTime": 1000.0, "endTime": 1010.0, "stepStats": []
+            } }
+        })))
+        .mount(&app.dagster)
+        .await;
+
+    // Second run_config lookup (inside connector_loaded) fails
+    Mock::given(method("POST"))
+        .and(body_string_contains("runOrError"))
+        .and(body_string_contains("run-flaky"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal server error"))
+        .mount(&app.dagster)
+        .await;
+
+    let (status, body) = app.run_finished("run-flaky", "ingest_job").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a follow-up Dagster failure must fail closed with 503: {body}"
+    );
+}
+
 // PR #106 review R3 SHOULD-FIX 11
 #[tokio::test]
 async fn a_connector_sensor_retry_follows_the_load_up_once() {
