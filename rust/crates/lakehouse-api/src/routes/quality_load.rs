@@ -127,25 +127,17 @@ async fn connector_loaded(
         Found::Skip(_) => return Ok(None),
     };
     // PR #106 review R1 BLOCKER 3: skip clear and filter scoped object
-    // PR #106 review R3 BLOCKER 10: classify before surfacing; return fixed message with reference id
-    let config = state
-        .dagster
-        .run_config(run_id)
-        .await
-        .map_err(|err| load_alerts::unavailable(load_alerts::ORCHESTRATOR_UNAVAILABLE, err))?;
-    let Some(config) = config else {
-        return Err(ApiError::NotFound(format!(
-            "run {run_id} not found in Dagster"
-        )));
-    };
-    if config
+    // PR #106 review R3 SHOULD-FIX 13: pass the config through from find_connector instead of re-fetching
+    if connector
+        .config
         .pointer("/ops/run_ingest/config/action")
         .and_then(Value::as_str)
         == Some("clear")
     {
         return Ok(None);
     }
-    let object_filter = config
+    let object_filter = connector
+        .config
         .pointer("/ops/run_ingest/config/object")
         .and_then(Value::as_str);
 

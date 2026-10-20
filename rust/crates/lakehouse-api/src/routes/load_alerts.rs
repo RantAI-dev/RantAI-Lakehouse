@@ -137,6 +137,8 @@ impl Outcome {
 pub(super) struct ConnectorRef {
     pub(super) id: String,
     pub(super) name: String,
+    // PR #106 review R3 SHOULD-FIX 13: pass the config through
+    pub(super) config: Value,
 }
 
 /// What looking for the thing a run belongs to found.
@@ -213,6 +215,7 @@ pub(super) async fn find_connector(
         Some(detail) => Ok(Found::This(ConnectorRef {
             id: detail.connector.id,
             name: detail.connector.name,
+            config,
         })),
         None => Ok(Found::Skip("run config names an unknown connector")),
     }
