@@ -592,3 +592,95 @@ async fn an_unknown_dagster_connector_run_fails_closed_and_does_not_silently_ski
         "an unknown dagster run must not return 200: {body}"
     );
 }
+
+// PR #106 review R3 SHOULD-FIX 11
+#[tokio::test]
+async fn a_connector_sensor_retry_follows_the_load_up_once() {
+    let app = app().await;
+    sqlx::query(
+        "UPDATE connector SET adapter = 'sql', ingest_mode = 'batch', dial = '{}'::jsonb, \
+         source_objects = '[{\"name\":\"orders\",\"target\":\"orders_raw\"}]'::jsonb WHERE id = $1",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    app.knows_run(
+        "run-c-retry",
+        json!({ "ops": { "run_ingest": { "config": { "connector_id": CONNECTOR } } } }),
+        "SUCCESS",
+    )
+    .await;
+    app.failing_rule("orders_rows", "bronze.orders_raw").await;
+    app.schedule("bronze.orders_raw", ScheduleMode::OnLoad)
+        .await;
+
+    let (status1, _) = app.run_finished("run-c-retry", "ingest_job").await;
+    assert_eq!(status1, StatusCode::OK);
+    app.wait_for_incident("bronze.orders_raw").await;
+
+    let (status2, body2) = app.run_finished("run-c-retry", "ingest_job").await;
+    assert_eq!(status2, StatusCode::OK, "{body2}");
+    assert_eq!(
+        body2.get("reason").and_then(Value::as_str),
+        Some("run already recorded; sensor retry ignored")
+    );
+
+    App::settle().await;
+    assert_eq!(app.followups_recorded().await, 1);
+    assert_eq!(app.count_checks().await, 1);
+    assert_eq!(app.incident_assets().await, vec!["bronze.orders_raw"]);
+}
+
+// PR #106 review R3 SHOULD-FIX 11
+#[tokio::test]
+async fn a_connector_sensor_retry_after_partial_commit_runs_follow_up() {
+    let app = app().await;
+    sqlx::query(
+        "UPDATE connector SET adapter = 'sql', ingest_mode = 'batch', dial = '{}'::jsonb, \
+         source_objects = '[{\"name\":\"orders\",\"target\":\"orders_raw\"}]'::jsonb WHERE id = $1",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO connector_run (run_id, connector_id, trigger_kind, status, started_at) \
+         VALUES ('run-c-partial', $1, 'schedule', 'succeeded', now())",
+    )
+    .bind(CONNECTOR)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+         VALUES ('run-c-partial', $1, 'success_alerted')",
+    )
+    .bind(format!("connector:{CONNECTOR}"))
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    app.knows_run(
+        "run-c-partial",
+        json!({ "ops": { "run_ingest": { "config": { "connector_id": CONNECTOR } } } }),
+        "SUCCESS",
+    )
+    .await;
+    app.failing_rule("orders_rows", "bronze.orders_raw").await;
+    app.schedule("bronze.orders_raw", ScheduleMode::OnLoad)
+        .await;
+
+    let (status, body) = app.run_finished("run-c-partial", "ingest_job").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.get("reason").and_then(Value::as_str),
+        Some("run already recorded; sensor retry ignored"),
+        "actual body: {body}"
+    );
+    app.wait_for_incident("bronze.orders_raw").await;
+    App::settle().await;
+    assert_eq!(app.followups_recorded().await, 1);
+    assert_eq!(app.count_checks().await, 1);
+    assert_eq!(app.incident_assets().await, vec!["bronze.orders_raw"]);
+}

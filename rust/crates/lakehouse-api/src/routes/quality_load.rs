@@ -220,7 +220,13 @@ pub(super) async fn connector_success(
 ) -> Result<Value, ApiError> {
     let handled = load_alerts::connector_run_event(state, pool, req, Outcome::Success).await?;
     // PR #106 review R1 BLOCKER 3: follow up only when the event counted a load (not skipped)
-    if handled.get("reason").is_none() {
+    // PR #106 review R3 SHOULD-FIX 11: a sensor retry is a real load whose follow-up must run
+    // once across retries; follow_up dedupes on (run_id, DEDUPE_KIND).
+    let should_follow_up = match handled.get("reason").and_then(Value::as_str) {
+        None | Some("run already recorded; sensor retry ignored") => true,
+        Some(_) => false,
+    };
+    if should_follow_up {
         // PR #106 review R2 SHOULD-FIX 3: surface Dagster run inspection failures fail-closed
         let loaded = connector_loaded(state, pool, &req.run_id).await?;
         if let Some(loaded) = loaded {
