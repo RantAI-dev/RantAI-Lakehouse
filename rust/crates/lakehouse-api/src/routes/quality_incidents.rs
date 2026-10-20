@@ -63,8 +63,10 @@ pub(crate) async fn open_for_failed_run(state: &AppState, rule: &QualityRule, me
 }
 
 // PR #106 review R2 BLOCKER 9: retriable incident alert delivery (SRC-17 F2).
-// Rules are read first; if the rule store is down, the incident is already open
-// in Postgres, leaving the handover marker absent so a later pass/retry delivers.
+// PR #106 review R3 SHOULD-FIX 17: incident is committed first; rules are read before writing marker.
+// The incident is committed first in Postgres so the failure is never lost.
+// Rules are then read; if the rule store is down, delivery aborts, leaving
+// the handover marker absent so a later pass/retry delivers.
 // When rules are read, the marker is written to pipeline_run_event and delivery is awaited.
 async fn deliver_incident_alert(
     state: &AppState,
@@ -342,7 +344,8 @@ mod tests {
                 .collect()
         }
 
-        /// The delivery runs in the background: wait for `count` posts.
+        // PR #106 review R3 SHOULD-FIX 17: delivery is awaited inline; wait_for_posts verifies receipt.
+        /// Wait for `count` posts to be received by the webhook mock.
         async fn wait_for_posts(&self, rule_id: &str, count: usize) {
             for _ in 0..100 {
                 if self.posts_to(rule_id).await.len() >= count {

@@ -16,12 +16,12 @@
 //!   run is confirmed `SUCCESS` with the orchestrator first, as a connector
 //!   run is, because the upload row may not be settled yet.
 //!
-//! What this never does: fail the event. Everything here runs in a spawned
-//! task after the event's own checks; a lookup that fails is logged and the
-//! load is simply not followed up (the table's interval still covers it). A
-//! sensor retry is deduplicated on `(run_id, "quality_load")` in
-//! `pipeline_run_event`, the table the other run events dedupe on, so a
-//! retried report follows the load up once.
+//! What this does on failure: orchestrator lookup errors fail closed (503/404)
+//! to reject bad run reports and let sensors retry (PR #106 review R3 SHOULD-FIX 17).
+//! Once the run is confirmed with the orchestrator, freshness advance and quality rules
+//! run in a spawned background task (`follow_up`). A sensor retry is deduplicated on
+//! `(run_id, "quality_load")` in `pipeline_run_event`, the table the other run
+//! events dedupe on, so a retried report follows the load up once.
 
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
