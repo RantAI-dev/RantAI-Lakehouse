@@ -276,13 +276,6 @@ export type AssetDetail = Asset & {
   upstream: { id: string; name: string }[]
   downstream: { id: string; name: string }[]
   /**
-   * WS1 task 1.9 — the API no longer emits this field (catalog.rs:2619, 4217;
-   * it named a policy that exists nowhere). Optional because catalog detail
-   * responses from the server never emit it.
-   */
-  // PR #106 review R2 SHOULD-FIX 6: re-justified against current code (mock is deleted)
-  lifecyclePolicy?: string
-  /**
    * WS2 §4 — the registry's own `table_name` for a Bronze asset, used to
    * try loading Iceberg snapshots for it (see `isIcebergCandidate` in
    * `@/lib/lakehouse-view`). Optional because only Bronze assets emit it;
