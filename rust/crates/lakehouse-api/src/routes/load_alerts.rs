@@ -83,7 +83,9 @@ use crate::routes::{connectors as connector_routes, uploads as upload_routes};
 use crate::state::AppState;
 
 /// Shown for any orchestrator failure; the cause is logged, not returned.
-const ORCHESTRATOR_UNAVAILABLE: &str = "the orchestrator could not be asked about this run";
+// PR #106 review R3 BLOCKER 10: shared with quality_load
+pub(super) const ORCHESTRATOR_UNAVAILABLE: &str =
+    "the orchestrator could not be asked about this run";
 /// Shown when the alert rules could not be read or delivered to.
 const RULES_UNAVAILABLE: &str = "the alert rules could not be read";
 
@@ -145,9 +147,14 @@ pub(super) enum Found<T> {
     Skip(&'static str),
 }
 
-fn unavailable(what: &'static str, err: impl std::fmt::Display) -> ApiError {
-    tracing::warn!(%err, what, "a run-event dependency failed");
-    ApiError::Unavailable(what.to_owned())
+// PR #106 review R3 BLOCKER 10: classify before surfacing; return fixed message with reference id
+pub(super) fn unavailable(what: &'static str, err: impl std::fmt::Display) -> ApiError {
+    crate::upstream_error::report(
+        &crate::upstream_error::Context::new("run-event dependency", what, what),
+        crate::upstream_error::Class::Unavailable,
+        &err,
+    )
+    .into_api_error(crate::upstream_error::FailedAs::ServiceUnavailable)
 }
 
 fn skipped(reason: &str) -> Value {
