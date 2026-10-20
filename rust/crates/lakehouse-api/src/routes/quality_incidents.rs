@@ -483,6 +483,7 @@ mod tests {
     }
 
     // PR #106 review R2 BLOCKER 9: rule-store failure commits incident row and leaves marker absent for retry
+    // PR #106 review R3 SHOULD-FIX 16: prove retry on re-sighting when rule store recovers
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_rule_store_failure_commits_incident_row_and_retries_on_next_pass(
         pool: sqlx::PgPool,
@@ -505,7 +506,8 @@ mod tests {
             ),
         );
         env.insert("CH_URL".to_owned(), ch.uri());
-        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let mut state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        state.webhook_sender_override = Some(lakehouse_notify::MappedResolver::new().into_sender());
 
         open_for_failed_run(&state, &rule("silver.orders"), "90%").await;
 
@@ -527,5 +529,52 @@ mod tests {
             alerted, 0,
             "handover marker must not be written when reading alert rules fails"
         );
+
+        // Second pass: ClickHouse recovers; re-sighting the failure delivers and records marker.
+        ch.reset().await;
+        let webhook = MockServer::start().await;
+        let data = vec![json!({
+            "id": "r1", "name": "Rule r1", "type": "quality_incident",
+            "mart": "", "measure": "", "agg": "sum", "op": ">", "threshold": "0",
+            "board": "", "channel": "webhook",
+            "target": format!("{}/r1", webhook.uri()),
+            "enabled": "1",
+            "created_at": "", "severity": "high", "pipeline": "", "connector": "",
+            "asset": "silver.orders",
+        })];
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.alert_rule"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "rows": data.len(), "data": data })),
+            )
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ch)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&webhook)
+            .await;
+
+        open_for_failed_run(&state, &rule("silver.orders"), "90%").await;
+
+        let alerted_retry: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pipeline_run_event WHERE kind = 'quality_incident_alerted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            alerted_retry, 1,
+            "handover marker must be written when reading alert rules succeeds on retry"
+        );
+
+        let requests = webhook.received_requests().await.expect("request log");
+        assert_eq!(requests.len(), 1, "webhook must receive alert on retry");
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(body.contains("silver.orders"));
     }
 }
