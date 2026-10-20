@@ -1982,21 +1982,29 @@ async fn tag_key_routes_are_gated_in_both_directions() {
         .expect("associate test users with catalog tenant");
 
     let writes = [
-        ("POST", "/api/governance/tag-keys"),
-        ("PUT", "/api/governance/tag-keys/data_domain"),
-        ("DELETE", "/api/governance/tag-keys/data_domain"),
+        ("POST", "/api/governance/tag-keys", StatusCode::BAD_REQUEST),
+        (
+            "PUT",
+            "/api/governance/tag-keys/data_domain",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "DELETE",
+            "/api/governance/tag-keys/data_domain",
+            StatusCode::NOT_FOUND,
+        ),
     ];
 
     let reader_cookie = session_cookie_for_user(&pool, reader).await;
     let listed =
         request_with_cookie(&router, "GET", "/api/governance/tag-keys", &reader_cookie).await;
-    assert_ne!(
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertions
+    assert_eq!(
         listed.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::OK,
         "catalog:read alone must be enough to list the tag keys"
     );
-    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
-    for (method, path) in writes {
+    for (method, path, _) in writes {
         let resp = request_with_cookie(&router, method, path, &reader_cookie).await;
         assert_eq!(
             resp.status(),
@@ -2013,18 +2021,13 @@ async fn tag_key_routes_are_gated_in_both_directions() {
         StatusCode::FORBIDDEN,
         "governance:write alone must NOT be enough to list the tag keys"
     );
-    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertions with catalog-tenant caller
-    for (method, path) in writes {
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertions with exact handler status
+    for (method, path, expected) in writes {
         let resp = request_with_cookie(&router, method, path, &admin_cookie).await;
-        assert_ne!(
+        assert_eq!(
             resp.status(),
-            StatusCode::FORBIDDEN,
-            "governance:write must be enough to {method} {path}"
-        );
-        assert_ne!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "governance:write must be authenticated"
+            expected,
+            "governance:write must reach handler for {method} {path} (answering {expected})"
         );
     }
 
@@ -2070,13 +2073,12 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
-    assert_ne!(
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertion
+    assert_eq!(
         listed.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::OK,
         "any login may list incidents"
     );
-    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
     let refused = request_with_cookie(&router, "POST", resolve, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2086,12 +2088,12 @@ async fn quality_incident_routes_are_gated_in_both_directions() {
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "POST", resolve, &admin_cookie).await;
-    assert_ne!(
+    // PR #106 review R3 SHOULD-FIX 15: empty body answers 400
+    assert_eq!(
         allowed.status(),
-        StatusCode::FORBIDDEN,
-        "governance:write must be enough to resolve an incident"
+        StatusCode::BAD_REQUEST,
+        "governance:write must be enough to reach resolve handler which answers 400 on empty body"
     );
-    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
 
     let anonymous = router
         .clone()
@@ -2138,13 +2140,12 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
         &reader_cookie,
     )
     .await;
-    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
-    assert_ne!(
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertion
+    assert_eq!(
         listed.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::OK,
         "any login may read schedules"
     );
-    assert_ne!(listed.status(), StatusCode::UNAUTHORIZED);
     let refused = request_with_cookie(&router, "PUT", set, &reader_cookie).await;
     assert_eq!(
         refused.status(),
@@ -2154,12 +2155,12 @@ async fn quality_schedule_routes_are_gated_in_both_directions() {
 
     let admin_cookie = session_cookie_for_user(&pool, admin).await;
     let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
-    assert_ne!(
+    // PR #106 review R3 SHOULD-FIX 15: empty body answers 400
+    assert_eq!(
         allowed.status(),
-        StatusCode::FORBIDDEN,
-        "governance:write must be enough to set a schedule"
+        StatusCode::BAD_REQUEST,
+        "governance:write must be enough to reach set handler which answers 400 on empty body"
     );
-    assert_ne!(allowed.status(), StatusCode::UNAUTHORIZED);
 
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
         .fetch_one(&pool)
