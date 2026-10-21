@@ -1300,6 +1300,21 @@ class DashboardCasesTests(unittest.TestCase):
             self.assertIs(case.get("confirm"), True, case["id"])
             self.assertIn("expect_state", case, case["id"])
 
+    def test_a_case_that_checks_a_tab_confirms_the_write_that_creates_it(self) -> None:
+        # A tab is written only when the harness confirms the assistant's
+        # draft, so a case that checks for a tab the assistant creates needs
+        # `confirm`: without it the tab is never written and the case can
+        # never pass (`PR #199 review O BLOCKER 3`).
+        cases = json.loads((HERE / "dashboard_cases.json").read_text())
+        for case in cases:
+            checks_a_tab = any(
+                "tabs[]" in json.dumps(check.get("where", {}))
+                for check in case.get("expect_state", [])
+            )
+            if not checks_a_tab:
+                continue
+            self.assertIs(case.get("confirm"), True, case["id"])
+
     def test_the_two_chained_write_cases_ask_for_the_chart_in_a_second_turn(self) -> None:
         # One message cannot carry both writes: the board or the field waits
         # for its own Confirm, so the chart has nothing to name in that turn.

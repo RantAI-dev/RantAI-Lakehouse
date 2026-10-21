@@ -539,6 +539,7 @@
   {
     "id": "dash_delete_tab_approval",
     "mode": "build",
+    "confirm": true,
     "setup": [
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Delete Tab Board"}, "id_at": "board.id"}
     ],
