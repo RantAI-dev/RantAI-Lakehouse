@@ -714,3 +714,5 @@ The branch is pushed for that CI run, with this `BLOCKER` open. It must not merg
 
 No open `BLOCKER`. The branch is pushed, and g9 is to be read on the PR.
 
+
+**Slice 3 closed, 2026-10-21:** `BLOCKER` 3 (the reasons test expected 8; fixed in `3e304b5d`). `main` merged in as `724fd45d`. PR #186 CI on `724fd45d` is green, the `g9-upload` typed steps included. No open `BLOCKER`.
