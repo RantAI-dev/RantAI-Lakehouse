@@ -35,7 +35,8 @@ import json
 import os
 import sys
 import time
-from urllib.parse import urlparse
+from datetime import timedelta
+from urllib.parse import unquote_plus, urlparse
 
 import g6_ingest_matrix_test as matrix
 import requests
@@ -558,6 +559,87 @@ def step_ga4() -> None:
 # entry to `PRODUCT_VENDORS` and its mock. The browser sign-in cannot be driven without a browser, so
 # it stays a vendor-level step above; these steps sign in with the vendor's integration credential.
 
+def _servicenow(auth: str = "integration"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import servicenow as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "servicenow", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": "stub-refresh-token"}
+    else:
+        dial = {"vendor": "servicenow", "account": "acme", "auth": {"type": "integration"}}
+        secrets = {"clientId": "snow-client", "clientSecret": "snow-secret"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_servicenow() -> None:
+    """ServiceNow (V-ServiceNow.4): connect (client credentials and the browser sign-in), discover
+    (suggested tables, how a table loads, the dictionary's fields), load (paged by the Link header),
+    reload (incremental by sys_updated_on), a new field, rate limit, forbidden and revoked sign-in."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("servicenow", action="reset")
+
+    for auth in ("integration", "oauth"):
+        _m, vendor, _parts, session, _dial = _servicenow(auth)
+        who = session.get_json(vendor.whoami["path"])
+        _expect(len(who.get("result") or []) == 1, f"servicenow connect ({auth}): who-am-i answered {who!r}")
+    _log("servicenow connect: the client-credentials grant and the browser sign-in (refresh grant) both reach the instance")
+
+    module, _vendor, parts, session, dial = _servicenow()
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect({"incident", "change_request", "problem", "sys_user", "cmdb_ci"} <= set(declared), "servicenow discover: the suggested tables are not listed")
+    _expect(module.declaration(session, parts, dial, "incident").load_description() == "incremental", "servicenow discover: incident should load incrementally")
+    fields = {f.name: f.type_name for f in module.describe(session, parts, dial, "incident")}
+    _expect({"number", "short_description", "sys_id", "state"} <= set(fields) and fields["sys_updated_on"] == "timestamp", f"servicenow discover: the dictionary fields are {fields}")
+    _log(f"servicenow discover: {len(declared)} suggested tables, incident described with {len(fields)} fields (its parent table's included)")
+
+    admin("servicenow", action="clear_log")
+    first = _read(module, parts, session, dial, "incident")
+    _expect([r["number"] for r in first] == ["INC0000001", "INC0000002", "INC0000003"], f"servicenow load: first run read {[r['number'] for r in first]}")
+    _expect(sum(1 for line in mock_log("servicenow") if line.startswith("GET /api/now/table/incident")) >= 3, "servicenow load: the Link header was not followed (the sample plus two pages)")
+    _log("servicenow load: 3 incidents read over 2 pages followed by the Link header")
+
+    cursor = max(r["sys_updated_on"] for r in first) - timedelta(seconds=1)  # the lag is applied by dlt; here the cursor is given as is
+    admin("servicenow", action="put", id=2, fields={"short_description": "incident 2 changed"})
+    admin("servicenow", action="put", id=4)
+    admin("servicenow", action="clear_log")
+    again = _read(module, parts, session, dial, "incident", since=cursor)
+    ids = sorted(r["number"] for r in again)
+    _expect(ids == ["INC0000002", "INC0000003", "INC0000004"], f"servicenow reload: read {ids}, expected the changed (2), the cursor's own (3) and the new (4)")
+    _expect(any("sys_updated_on>=" in unquote_plus(line) for line in mock_log("servicenow")), "servicenow reload: no filtered request")
+    _expect(not declared["incident"].deletes, "servicenow reload: a delete is claimed")
+    _log("servicenow reload: only the changed, the new and the cursor record came back (sys_updated_on filter); no delete is claimed")
+
+    before = set(fields)
+    admin("servicenow", action="add_field", name="u_region")
+    after = {f.name for f in module.describe(session, parts, dial, "incident")}
+    _expect(after - before == {"u_region"}, f"servicenow schema change: describe differs by {after - before}")
+    _log("servicenow schema change: the new field shows in describe before any load (the dictionary)")
+
+    admin("servicenow", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, "sys_user")) == 1, "servicenow rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "servicenow rate limit: the Retry-After was not waited")
+    admin("servicenow", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, "sys_user"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "servicenow rate limit: the run report class")
+    admin("servicenow", action="rate_limit", count=0)
+    _log("servicenow rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("servicenow", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "sys_user"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "servicenow forbidden: the run report class")
+    _expect(module.describe(session, parts, dial, "incident") is None, "servicenow forbidden: describe should fall back to the after-load path")
+    admin("servicenow", action="forbid", on=False)
+    admin("servicenow", action="revoke", on=True)
+    exc = _raises("OAuthSignInRefused", lambda: _read(module, parts, session, dial, "sys_user"))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "servicenow revoked: the run report class")
+    admin("servicenow", action="revoke", on=False)
+    _log("servicenow forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def _ga4_row_ids() -> set[str]:
     """`country|date` of every row the mock holds, read from the mock when the step needs it."""
     days = admin("ga4", action="days")["days"]
@@ -581,6 +663,25 @@ PRODUCT_VENDORS: dict[str, dict] = {
         # Zendesk does not describe its fields before a read, so its preview is honestly unsupported
         "preview_columns": None,
         "first_ids": {"1", "2", "3", "4", "5", "6"}, "reload_ids": {"1", "2", "3", "4", "5", "6", "7"},
+    },
+    # ServiceNow: the client-credentials way (the API's connection test exchanges them for a token); the browser
+    # sign-in is covered by the vendor-level step. Incident ids are ServiceNow's 32-character sys_id.
+    "servicenow": {
+        "type": "ServiceNow", "host": "acme.service-now.com", "account": "acme", "label": "ServiceNow",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "snow-client", "secondary": "snow-secret"},
+        "object": "incident", "target": "saas_gate_servicenow_incident", "cursor": "sys_updated_on", "text": "short_description", "key": "sys_id",
+        "columns": "sys_id, short_description, sys_updated_on", "order": "sys_id",
+        "row_id": lambda r: str(r["sys_id"]),
+        # the dictionary describes the table (parents included) before the load (decision 9)
+        "preview_columns": {"sys_id", "number", "short_description"},
+        "first_ids": {f"snow{i:028d}" for i in (1, 2, 3)}, "reload_ids": {f"snow{i:028d}" for i in (1, 2, 3, 4)},
+        "changed_id": f"snow{2:028d}",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"short_description": "incident 2 changed"}},
+            {"action": "put", "id": 4},
+        ],
+        "reads_marker": ("%3E%3D",),  # the url-encoded `>=` of the sys_updated_on filter
     },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
@@ -770,7 +871,7 @@ def step_product(vendor_id: str) -> None:
     _expect(len(ids) == len(set(ids)), f"{vendor_id} reload: a key is in Bronze twice: {ids}")
     by_id = {row_id(r): r for r in after}
     if vendor_id != "ga4":
-        changed_id = "001STUB002" if vendor_id == "salesforce" else "2"
+        changed_id = spec.get("changed_id") or ("001STUB002" if vendor_id == "salesforce" else "2")
         _expect("changed" in str(by_id[changed_id][text]), f"{vendor_id} reload: record {changed_id} was not updated")
     if vendor_id == "ga4":
         days = admin("ga4", action="days")["days"]
@@ -782,6 +883,8 @@ def step_product(vendor_id: str) -> None:
     elif vendor_id == "salesforce":
         _expect(by_id["001STUB003"]["is_deleted"] in (True, 1, "true"), "salesforce reload: the deleted account does not say is_deleted in Bronze")
         _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
+    elif vendor_id == "servicenow":
+        _expect(len(by_id) == 4, "servicenow reload: an incident was lost or stored twice")
     elif vendor_id == "zendesk":
         _expect(by_id["3"]["status"] == "deleted", "zendesk reload: the deleted ticket does not say status = deleted in Bronze")
         _expect(len(by_id) == 7, "zendesk reload: a ticket was lost")
@@ -795,6 +898,7 @@ def step_product(vendor_id: str) -> None:
          + {
              "zendesk": "the changed and the new record merged on the key, no duplicate; the deleted ticket says status = deleted",
              "salesforce": "the changed and the new record merged on the key, no duplicate; the deleted account says is_deleted (queryAll)",
+             "servicenow": "the changed and the new incident merged on sys_id, no duplicate (no delete is claimed)",
              "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
          }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
 
@@ -818,6 +922,7 @@ def run_vendors() -> None:
     step_zendesk()
     step_salesforce()
     step_ga4()
+    step_servicenow()
 
 
 def run() -> None:
