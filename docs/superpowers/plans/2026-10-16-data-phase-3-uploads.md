@@ -575,6 +575,83 @@ ignored; `cargo fmt --check -p lakehouse-api` clean; `pytest dispar_orchestrate/
 `cargo test --workspace` and the full pytest and `bun test` (whole-suite runs are not possible on this machine);
 the `g9-upload` job `timeout-minutes: 25` (may need a measured raise); browser QA of the wizard.
 
+### Slice 4
+
+Developer (Claude Sonnet 5.5), branch `feat/data-phase-3-uploads`, `DATA-17` T4.1 to T4.4 (JSON, JSON Lines,
+Avro, gzip, zip). Started at `929af2fb` (slice 3 closed, `main` merged by the planner).
+
+**Commits.** `6181e29d` T4.2 job readers; `b32f33ce` T4.1 API preview; `e337c3e4` T4.3 console; `d0730b78`
+T4.4 gate; this entry. T4.2 was committed before T4.1 on purpose: the job's text rules (what a number, a
+boolean, a nested value and an Avro timestamp become) define the shared fixtures the API's preview reads, and
+the closed run config needed `compression` and `max_bytes` in the API in the same commit to keep every commit
+green.
+
+**What was built.**
+- *Job* (`upload_formats.py`, `file_ingest.py`): `format` is `delimited`, `parquet`, `json`, `jsonl` or `avro`;
+  new run-config fields `compression` (`none`, `gzip`, `zip`) and `max_bytes` (the API sends its own cap, so the
+  constant lives once per language, AD9). JSON is read twice (keys of all objects, then rows: bounded memory,
+  and a bad or oversized file is found before anything is written); numbers keep the digits the source wrote
+  (`ijson` and `json.loads` hand `Decimal`). All feed the slice-3 caster as text columns.
+- *The uncompressed counter*: `Budget` in the job (every decoded byte of every pass; a zip is also refused by
+  its declared size); `count_unpacked_gzip/zip` in the API, run when the file arrives (POST and the completion
+  of a session), refusing and removing a bomb. The API's preview reads at most 16 MiB (gzip prefix) or 256 KiB
+  per later zip file, far under the cap, so it can never decode a bomb past it. A bomb fails with a tenth
+  failure reason, "The file is larger than the upload limit once unpacked." (fixture, job, `JOB_FAILURE_REASONS`).
+- *API* (`upload_formats.rs`, `routes/uploads.rs`): readers, `sniff` for gzip and Avro, name AND bytes for every
+  new kind, the preview answers `layout` and (zip) `archive`, ingest sends `format` and `compression`, a zip
+  whose files differ in columns is refused (`ZIP_COLUMNS_DIFFER`). `RangeReader` gained `sequential()` and
+  `seekable()`. `apache-avro`, `flate2` and `zip` are direct dependencies at the locked versions
+  (0.21.0, 1.1.10, 8.6.0) with the features already unified: `Cargo.lock` gains three dependency edges and no
+  crate; `cargo check/clippy --locked` pass. Python: `fastavro==1.13.1` and `ijson==3.6.0`, a comment each.
+- *Console*: accept list, facts, refusal lists and sentences; no dialect controls for JSON/JSON Lines/Avro; gzip
+  notice; a zip's files as a list with "Different columns" and Next off; Review names the format.
+- *Gate*: five loads and two bombs (see the commit).
+
+**Deviations and choices, for the planner.**
+1. *Zip of Parquet files is not supported* (decision 13 says "one supported format other than Excel", which
+   would include Parquet). The API cannot read a Parquet footer inside a deflated zip entry by range, and the
+   job would re-decompress an entry for every seek; the refusal is the "files of one supported format" sentence.
+   Say if it is wanted; it is a slice of its own.
+2. *Avro codecs*: only `null` and `deflate` (both sides refuse the rest with a fixed sentence); `snappy` and
+   `zstandard` need packages the image does not carry.
+3. *Preview versus load*: a number is shown in `serde_json`'s shortest form (`1.5` for `1.50`); the load keeps
+   `1.50`. An Avro map's keys are sorted in the preview and in file order in the load. Only these differ.
+4. A JSON file's columns are the keys of ALL objects in the load but of the 10,000 sampled in the preview; a key
+   that first appears later is a column the preview did not show (said in the module docs). A column list from
+   the preview then fails the load with the generic reason (the list is shorter than the file's columns).
+5. `__MACOSX/` entries of a zip are ignored along with folders (macOS archives would otherwise never load).
+6. A `.gz` with no inner name (`data.gz`) is classed by its first decoded byte (`[`, `{`, else text).
+7. A file named `.json`, `.jsonl`, `.avro`, `.gz` or `.zip` is now checked by those readers; a text file with such
+   a name used to be accepted as CSV.
+8. `max_bytes` is `MAX_UPLOAD_BYTES` (50 MiB): slice 6 changes the one constant.
+9. A zip's several files are loaded as one stream by the job (columns matched by name); the several-files page and
+   `alsoUploads` stay slice 5. The preview of a zip shows its first file.
+
+**Commands run, with counts** (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target`, `-j 4`):
+- `cargo fmt --check` (workspace) clean; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` clean.
+- `cargo test -p lakehouse-api -j 4 --lib` (unfiltered, rule 1): 2318 passed, 15 ignored, 0 failed.
+- `cargo test -p lakehouse-api --test upload_routes -- --test-threads=2`: 125 passed. `--test route_auth`: 54 passed.
+- `cargo test --workspace --locked`: *not verified*. The run stopped at link time with "No space left on device" (the disk
+  went from 22 GB to 0 while about thirty `lakehouse-api` test binaries linked four at a time, with other sessions
+  writing too); I trimmed our own large test executables afterwards. The api crate's three suites above ran one at a
+  time; no other crate changed (`Cargo.lock` gains edges only). `cargo check --workspace --all-targets --locked` passed.
+- `pytest dispar_orchestrate -m "not loader"` (whole, rule 3): 1485 passed, 1 skipped. `-m loader` on
+  `test_file_ingest.py`, `test_typed_load.py`, `test_upload_formats.py`: 5 passed (no new test runs a real dlt
+  pipeline, so none needed the mark; the existing ones keep their isolation).
+- `bun test` on `upload-queue`, `uploads`, the client and `src/features/connectors`: 428 passed;
+  `bun run typecheck` clean; `bun run lint` 0 errors.
+- `python3 ops/lint/check_intra_package_imports.py` and `check_bare_iceberg_count.py`: OK; `py_compile` on the gate.
+
+**Not verified.** The gate against a real stack (CI's `g9-upload` took 7 min 28 s on `929af2fb` against 25 min; the
+seven new requests should add a few minutes); a 2 GiB load (slice 6); `cargo audit` and `cargo deny` (no new crate,
+three dependency edges); browser QA of the new Check step; zip of Parquet (deviation 1).
+
+**Incidents.** (1) While checking for other cargo jobs I used `pgrep -f` in a wait loop that matched itself, then
+killed the parent of the first `sleep` I found: it was another session's `bash` (PID 8883), not mine. It has
+exited; whoever owned it may need to re-run what it was doing. My own loop (PID 1373143) was the one to kill.
+(2) A bad index in a Python edit cut `tests/upload_routes.rs` to 1,133 lines in the working tree; it was restored
+from `HEAD` and the slice's edits re-applied before any commit, so no commit holds the damage.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
