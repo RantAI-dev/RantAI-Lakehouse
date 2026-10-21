@@ -1145,7 +1145,8 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` answers with a non-2xx status, or
     /// [`DgError::Server`] when the response body isn't valid `JSON` or
     /// carries a GraphQL `errors` array.
     pub async fn find_run_by_run_key(&self, run_key: &str) -> Result<Option<DgRun>, DgError> {
@@ -2226,7 +2227,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn pipeline_run_pipeline_name(
         &self,
         run_id: &str,
@@ -2267,7 +2271,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn pipeline_run_status(
         &self,
         run_id: &str,
@@ -2341,7 +2348,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn run_steps(&self, run_id: &str) -> Result<Vec<RunStep>, DgError> {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { stepStats { stepKey status startTime endTime \
@@ -2380,7 +2390,10 @@ impl DgClient {
     /// # Errors
     ///
     /// Returns [`DgError::Transport`] on a network-level failure, or
-    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    /// [`DgError::Server`] when the response body isn't valid `JSON`. The
+    /// HTTP status is not inspected here — the body is read whatever it is —
+    /// so a non-2xx answer is a `Server` error when it does not parse and
+    /// whatever the body says otherwise. (PR #201 review F SHOULD-FIX 6.)
     pub async fn run_config(&self, run_id: &str) -> Result<Option<Value>, DgError> {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { runConfig } } }";
@@ -2416,7 +2429,8 @@ impl DgClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// Returns [`DgError::Transport`] on a network-level failure,
+    /// [`DgError::Status`] when `Dagster` answers with a non-2xx status, or
     /// [`DgError::Server`] when the response body isn't valid `JSON` or
     /// `logsForRun.__typename` isn't `EventConnection` (`RunNotFoundError`,
     /// `PythonError`).
