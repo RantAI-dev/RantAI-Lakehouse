@@ -57,7 +57,13 @@ pub(super) async fn create_chart(
     // chart in a deployment with a company palette draws with it. A palette
     // the model chose is kept, and a chart that already exists keeps what it
     // has (that is `update_chart`, which does not come here).
+    //
+    // `PR #199 review O BLOCKER 2`: only a kind that takes colours gets one.
+    // The style check refuses colours on a table, a KPI or a static tile, so
+    // setting the palette on every kind made the assistant unable to create
+    // any of them in a deployment with a company palette.
     if time.company_palette().len() >= 2
+        && lakehouse_bi::style::is_chart(input.kind)
         && input
             .style
             .colors
@@ -699,6 +705,43 @@ mod tests {
             stored.iter().any(|w| w.contains("\"palette\":\"muted\"")),
             "{stored:#?}"
         );
+    }
+
+    /// `PR #199 review O BLOCKER 2`: a kind that takes no colours must not be
+    /// given the company palette — the style check refuses colours on a
+    /// table, a KPI or a static tile, so the assistant could create none of
+    /// them in a deployment with a company palette.
+    #[tokio::test]
+    async fn a_kind_that_takes_no_colours_is_created_even_with_a_company_palette() {
+        let time = lakehouse_bi::grain::TimeContext::default()
+            .with_company_palette(vec!["#112233".to_owned(), "#445566".to_owned()]);
+        for (kind, extra) in [
+            (
+                "table",
+                json!({ "mart": "mart_x", "dimension": "province", "measures": ["visitors"] }),
+            ),
+            (
+                "kpi",
+                json!({ "mart": "mart_x", "measures": ["visitors"], "aggregate": "sum" }),
+            ),
+            ("text", json!({ "text": "Hello" })),
+        ] {
+            let mut body = json!({ "title": "Tile", "kind": kind });
+            let fields = body.as_object_mut().expect("an object");
+            for (name, value) in extra.as_object().expect("an object") {
+                fields.insert(name.clone(), value.clone());
+            }
+            let server = mart_server().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let created = create_chart(&ch, None, &arguments(body), None, &time).await;
+            assert_eq!(created["created"], json!(true), "{kind}: {created}");
+            let all = sent(&server).await;
+            let stored = writes(&all);
+            assert!(
+                !stored.iter().any(|w| w.contains("\"palette\":\"company\"")),
+                "{kind}: a kind that takes no colours is given no palette: {stored:#?}"
+            );
+        }
     }
 
     /// AI-5: "Show a progress bar of visitors against a goal of 1,000,000".

@@ -572,7 +572,12 @@ fn takes_colour_by_value(kind: ChartKind) -> bool {
 }
 
 /// Kinds drawn as a chart (not a table, a number tile or a static tile).
-fn is_chart(kind: ChartKind) -> bool {
+///
+/// Public so that a writer outside this crate can ask the same question the
+/// style check asks: a kind that takes no colours must not be given a
+/// palette (`PR #199 review O BLOCKER 2`).
+#[must_use]
+pub fn is_chart(kind: ChartKind) -> bool {
     !kind.is_static()
         && !matches!(
             kind,
