@@ -263,6 +263,11 @@ pub enum ObjectKind {
     /// An object of a business-app (`saas`) vendor: a Salesforce object, a
     /// Zendesk resource, a Dataverse table (`SRC-3`).
     Object,
+    /// A dimension a Google Analytics report can be built from (`SRC-3` slice 3
+    /// review BLOCKER 9): listed by the property's own metadata, with `schema: "fields"`.
+    Dimension,
+    /// A metric a Google Analytics report can be built from (same listing).
+    Metric,
 }
 
 /// One listed object. `name` is what a source object's `name` is in the ingest

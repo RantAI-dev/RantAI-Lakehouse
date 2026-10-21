@@ -704,6 +704,12 @@ def step_product(vendor_id: str) -> None:
         _expect(preview.get("state") == "done" and spec["preview_columns"] <= names, f"{vendor_id} discover: the preview shows {sorted(names)[:12]}")
         detail = f"previewed {len(names)} columns"
     _log(f"{vendor_id} discover: {len(listing['objects'])} objects listed by the orchestrator, {obj} loads incrementally; {detail}")
+    if vendor_id == "ga4":
+        # Slice 3 review BLOCKER 9: the console's report editor lists the property's own dimensions and metrics.
+        fields = matrix.discovery_answer(cid, "list", {"schema": "fields"})
+        kinds = {(o.get("name"), o.get("kind")) for o in fields.get("objects") or []}
+        _expect(fields.get("state") == "done" and {("country", "dimension"), ("date", "dimension"), ("sessions", "metric")} <= kinds, f"ga4 discover: the fields list is {fields.get('state')!r} {sorted(kinds)[:8]}")
+        _log(f"ga4 discover: {len(kinds)} dimensions and metrics of the property listed through discovery for the report editor")
 
     # load: ingest_job into Bronze Iceberg, read back.
     _run_and_wait(cid, f"{vendor_id} load")

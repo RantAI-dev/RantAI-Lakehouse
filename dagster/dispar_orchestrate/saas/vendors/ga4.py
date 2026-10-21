@@ -138,6 +138,16 @@ def list_objects(session: Any, parts: Any, dial: dict) -> list[ObjectDecl]:
     return [declaration(session, parts, dial, name) for name in dial.get("objects") or []]
 
 
+def list_fields(session: Any, parts: Any, dial: dict) -> list[dict[str, str]]:
+    """The dimensions and metrics the property accepts, from `getMetadata` (slice 3 review
+    BLOCKER 9): what the console offers to build a report from, instead of names typed blind.
+    Names only (`apiName`, the form a report is written in); each is `{"name", "kind"}` with
+    kind `dimension` or `metric`."""
+    meta = get_metadata(session, int(parts.account))
+    out = [{"name": d["apiName"], "kind": "dimension"} for d in meta.get("dimensions") or []]
+    return out + [{"name": m["apiName"], "kind": "metric"} for m in meta.get("metrics") or []]
+
+
 def describe(session: Any, parts: Any, dial: dict, name: str) -> list[Field] | None:
     """The report's columns as the property's metadata types them, before the load
     (decision 9). A dimension or metric the property does not have is a rejected setting."""

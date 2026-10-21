@@ -1027,6 +1027,25 @@ def test_a_saas_list_names_each_object_with_how_it_loads_and_honours_search() ->
     assert [o["name"] for o in found["objects"]] == ["Users"]
 
 
+def test_a_saas_fields_list_gives_the_vendors_dimensions_and_metrics_to_build_a_report_from() -> None:
+    """Slice 3 review BLOCKER 9: `schema = "fields"` lists what an object can be defined from."""
+
+    class WithFields(_FakeSaasModule):
+        def list_fields(self, session, parts, dial):
+            return [{"name": "sessions", "kind": "metric"}, {"name": "country", "kind": "dimension"}, {"name": "countryId", "kind": "dimension"}]
+
+    result = discover.discover(_SAAS, _request("list", schema="fields"), backends=_saas_backends(WithFields()))
+    assert result["objects"] == [
+        {"name": "country", "kind": "dimension"},
+        {"name": "countryId", "kind": "dimension"},
+        {"name": "sessions", "kind": "metric"},
+    ]
+    found = discover.discover(_SAAS, _request("list", schema="fields", search="ID"), backends=_saas_backends(WithFields()))
+    assert [o["name"] for o in found["objects"]] == ["countryId"]
+    with pytest.raises(discover.NotSupported):
+        discover.discover(_SAAS, _request("list", schema="fields"), backends=_saas_backends(_FakeSaasModule()))
+
+
 def test_a_saas_preview_gives_the_vendors_fields_and_the_declared_key() -> None:
     result = discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(_FakeSaasModule()))
     assert result["columns"] == [

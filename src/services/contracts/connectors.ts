@@ -809,7 +809,7 @@ export type DiscoveryErrorClass =
   | "failed"
   | string
 
-/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection or a business-app object. */
+/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection, a business-app object, or (a GA4 property's fields, `schema: "fields"`) a dimension or a metric. */
 export type DiscoveryObjectKind =
   | "schema"
   | "table"
@@ -818,6 +818,8 @@ export type DiscoveryObjectKind =
   | "topic"
   | "collection"
   | "object"
+  | "dimension"
+  | "metric"
   | string
 
 /**

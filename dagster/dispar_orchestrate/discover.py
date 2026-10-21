@@ -713,6 +713,17 @@ def _saas(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> d
     module, _vendor, parts, session = b.saas_open(
         dial, secrets, connector_id=request.connector_id, resolve_checked=b.resolve_checked
     )
+    if request.kind == "list" and request.schema == "fields":
+        # Slice 3 review BLOCKER 9: a vendor whose objects the person DEFINES from the vendor's own
+        # fields (Google Analytics: a report is dimensions and metrics) lists those fields, so the
+        # console offers them instead of asking to type them. `schema` is unused by a business app
+        # otherwise; the kinds are `dimension` and `metric`.
+        fields_of = getattr(module, "list_fields", None)
+        if fields_of is None:
+            raise NotSupported("this vendor has no fields to build an object from")
+        found = [f for f in fields_of(session, parts, dial) if contains_ignore_case(f["name"], request.search)]
+        found.sort(key=lambda f: (f["kind"], f["name"]))
+        return listing((listed(f["name"], f["kind"]) for f in found), request.limit)
     if request.kind == "list":
         declared = [d for d in module.list_objects(session, parts, dial) if contains_ignore_case(d.name, request.search)]
         declared.sort(key=lambda d: d.name)

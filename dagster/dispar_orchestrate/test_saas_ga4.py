@@ -75,6 +75,13 @@ def test_describe_types_the_columns_from_the_properties_metadata_and_refuses_a_n
         ga4.describe(session, PARTS, DIAL, "t = country | nosuchmetric")
 
 
+def test_the_fields_a_report_can_be_built_from_are_the_properties_dimensions_and_metrics() -> None:
+    """Slice 3 review BLOCKER 9: what the console offers, from getMetadata."""
+    fields = ga4.list_fields(session_over(FakeGa4()), PARTS, DIAL)
+    assert {"name": "country", "kind": "dimension"} in fields and {"name": "sessions", "kind": "metric"} in fields
+    assert {f["kind"] for f in fields} == {"dimension", "metric"}
+
+
 def test_a_first_run_reads_from_the_start_of_analytics_and_a_later_one_from_the_lagged_cursor() -> None:
     fake = FakeGa4([(days_ago(n), "ID", 10 - n, float(n)) for n in range(6)])
     session = session_over(fake)

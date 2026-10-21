@@ -27,6 +27,7 @@ import { notifySuccess, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import { TableActionsMenu } from "./connector-table-actions"
+import { Ga4ReportEditor } from "./ga4-report-editor"
 import { FINDER_WORDS, finderKind, TableFinder } from "./table-finder"
 import { useColumnPreviews, type PreviewEntry } from "./use-discovery"
 import type {
@@ -381,7 +382,14 @@ function IngestEditor({
   const finder = finderKind(adapter, spec.dial)
   // Typed names stay possible next to a list that is cut or incomplete (and are the only way for a type
   // that cannot list); a SQL source and Kafka take no typed name.
-  const manualAdd = finder !== "sql" && finder !== "kafka"
+  // Slice 3 review BLOCKER 9: a Google Analytics connector has no tables to type or tick; the person defines reports.
+  const isGa4 = adapter === "saas" && spec.dial.vendor === "ga4"
+  const manualAdd = finder !== "sql" && finder !== "kafka" && !isGa4
+  const savedReports = React.useMemo(
+    () => (Array.isArray(spec.dial.objects) ? spec.dial.objects.filter((o: unknown): o is string => typeof o === "string") : []),
+    [spec.dial]
+  )
+  const [reports, setReports] = React.useState<string[]>(savedReports)
   const previews = useColumnPreviews(connectorId)
   const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
@@ -406,7 +414,7 @@ function IngestEditor({
         {
           adapter,
           ingestMode: spec.ingestMode ?? "batch",
-          dial: spec.dial,
+          dial: isGa4 ? { ...spec.dial, objects: reports } : spec.dial,
           sourceObjects: toSourceObjects(selection, !isCdc),
           ...(cron && !isCdc ? { scheduleCron: cron } : {}),
         },
@@ -426,7 +434,8 @@ function IngestEditor({
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
-    (!isCdc && cron !== savedCron)
+    (!isCdc && cron !== savedCron) ||
+    (isGa4 && JSON.stringify(reports) !== JSON.stringify(savedReports))
   const canSave =
     dirty && problems.every((p) => p === null) && modeProblems.every((p) => p === null) && scheduleProblem === null
 
@@ -495,6 +504,22 @@ function IngestEditor({
         return next
       })
     )
+  }
+
+  /** A report defined in the editor: kept in the dial's `objects` and ticked as an object that continues from its date. */
+  function addReport(text: string, cursor: string, key: string[]) {
+    setReports((current) => (current.includes(text) ? current : [...current, text]))
+    const label = text.slice(0, text.indexOf("=")).trim()
+    setSelection((current) =>
+      current.some((s) => s.name === text)
+        ? current
+        : [...current, { ...newTable(text), target: defaultTarget(connectorName, label), loadMode: "incremental_dedup", incrementalKey: cursor, primaryKey: key }]
+    )
+  }
+
+  function removeReport(text: string) {
+    setReports((current) => current.filter((r) => r !== text))
+    setSelection((current) => current.filter((s) => s.name !== text))
   }
 
   function addManual() {
@@ -647,6 +672,9 @@ function IngestEditor({
           onSetMany={setMany}
           wide={page}
         />
+      ) : null}
+      {isGa4 ? (
+        <Ga4ReportEditor connectorId={connectorId} reports={reports} onAdd={addReport} onRemove={removeReport} />
       ) : null}
       {manualAdd ? (
         <div className="space-y-1.5">
