@@ -1,17 +1,14 @@
 """
 Defines all the sources and resources needed for Google Analytics V4
 """
-from typing import Iterator, List, Optional, Union
+from typing import Any, Iterator, List, Optional
 
 import dlt
 from dlt.common.typing import DictStrAny, TDataItem
 from dlt.sources import DltResource
-from dlt.sources.credentials import GcpOAuthCredentials, GcpServiceAccountCredentials
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import GetMetadataRequest, Metadata
 
 from .helpers import basic_report
-from .helpers.data_processing import to_dict
+from .helpers.data_processing import get_metadata as fetch_metadata
 from .settings import START_DATE
 
 TIME_DIMENSIONS = {
@@ -26,9 +23,7 @@ TIME_DIMENSIONS = {
 
 @dlt.source(max_table_nesting=2)
 def google_analytics(
-    credentials: Union[
-        GcpOAuthCredentials, GcpServiceAccountCredentials
-    ] = dlt.secrets.value,
+    session: Any,
     property_id: int = dlt.config.value,
     queries: List[DictStrAny] = dlt.config.value,
     start_date: Optional[str] = START_DATE,
@@ -38,7 +33,8 @@ def google_analytics(
     The DLT source for Google Analytics. Loads basic Analytics info to the pipeline.
 
     Args:
-        credentials: Credentials to the Google Analytics Account.
+        session: The `SaasSession` of the connector (SRC-3 V-GA4.1, local change 1: it replaces
+            upstream's credentials and gRPC client).
         property_id: A numeric Google Analytics property id.
             More info: https://developers.google.com/analytics/devguides/reporting/data/v1/property-id.
         queries: List containing info on all the reports being requested with all the dimensions and metrics per report.
@@ -67,14 +63,8 @@ def google_analytics(
         )
     if not rows_per_page:
         raise ValueError("Rows per page cannot be 0")
-    # generate access token for credentials if we are using OAuth2.0
-    if isinstance(credentials, GcpOAuthCredentials):
-        credentials.auth("https://www.googleapis.com/auth/analytics.readonly")
-
-    # Build the service object for Google Analytics api.
-    client = BetaAnalyticsDataClient(credentials=credentials.to_native_credentials())
     # get metadata needed for some resources
-    metadata = get_metadata(client=client, property_id=property_id)
+    metadata = get_metadata(session=session, property_id=property_id)
     resource_list = [metadata | metrics_table, metadata | dimensions_table]
     for query in queries:
         # always add "date" to dimensions so we are able to track the last day of a report
@@ -88,7 +78,7 @@ def google_analytics(
         resource_name = query["resource_name"]
         resource_list.append(
             dlt.resource(basic_report, name=resource_name, write_disposition="append")(
-                client=client,
+                session=session,
                 rows_per_page=rows_per_page,
                 property_id=property_id,
                 dimensions=dimensions,
@@ -104,50 +94,46 @@ def google_analytics(
 
 
 @dlt.resource(selected=False)
-def get_metadata(
-    client: BetaAnalyticsDataClient, property_id: int
-) -> Iterator[Metadata]:
+def get_metadata(session: Any, property_id: int) -> Iterator[DictStrAny]:
     """
     Get all the metrics and dimensions for a report.
 
     Args:
-        client: The Google Analytics client used to make requests.
+        session: The `SaasSession` of the connector, used to make requests.
         property_id: A reference to the Google Analytics project.
             More info: https://developers.google.com/analytics/devguides/reporting/data/v1/property-id
 
     Yields:
-        Metadata objects. Only 1 is expected but yield is used as dlt resources require yield to be used.
+        The metadata object. Only 1 is expected but yield is used as dlt resources require yield to be used.
     """
-    request = GetMetadataRequest(name=f"properties/{property_id}/metadata")
-    metadata: Metadata = client.get_metadata(request)
-    yield metadata
+    yield fetch_metadata(session, property_id)
 
 
 @dlt.transformer(data_from=get_metadata, write_disposition="replace", name="metrics")
-def metrics_table(metadata: Metadata) -> Iterator[TDataItem]:
+def metrics_table(metadata: DictStrAny) -> Iterator[TDataItem]:
     """
     Loads data for metrics.
 
     Args:
-        metadata: Metadata class object which contains all the information stored in the GA4 metadata.
+        metadata: The metadata object, which contains all the information stored in the GA4 metadata.
 
     Yields:
         Generator of dicts, 1 metric at a time.
     """
-    for metric in metadata.metrics:
-        yield to_dict(metric)
+    for metric in metadata.get("metrics") or []:
+        yield metric
 
 
 @dlt.transformer(data_from=get_metadata, write_disposition="replace", name="dimensions")
-def dimensions_table(metadata: Metadata) -> Iterator[TDataItem]:
+def dimensions_table(metadata: DictStrAny) -> Iterator[TDataItem]:
     """
     Loads data for dimensions.
 
     Args:
-        metadata: Metadata class object which contains all the information stored in the GA4 metadata.
+        metadata: The metadata object, which contains all the information stored in the GA4 metadata.
 
     Yields:
         Generator of dicts, 1 dimension at a time.
     """
-    for dimension in metadata.dimensions:
-        yield to_dict(dimension)
+    for dimension in metadata.get("dimensions") or []:
+        yield dimension

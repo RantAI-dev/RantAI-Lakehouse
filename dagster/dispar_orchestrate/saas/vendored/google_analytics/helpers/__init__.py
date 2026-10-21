@@ -1,6 +1,6 @@
 """Google analytics source helpers"""
 
-from typing import Iterator, List
+from typing import Any, Iterator, List
 from pendulum.datetime import DateTime
 
 import dlt
@@ -9,15 +9,10 @@ from dlt.common.typing import TDataItem
 
 from ..settings import START_DATE
 from .data_processing import get_report
-from google.analytics.data_v1beta.types import (
-    Dimension,
-    Metric,
-)
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
 
 
 def basic_report(
-    client: BetaAnalyticsDataClient,
+    session: Any,
     rows_per_page: int,
     dimensions: List[str],
     metrics: List[str],
@@ -30,7 +25,7 @@ def basic_report(
     Retrieves the data for a report given dimensions, metrics, and filters required for the report.
 
     Args:
-        client: The Google Analytics client used to make requests.
+        session: The `SaasSession` of the connector, used to make requests.
         dimensions: Dimensions for the report. See metadata for the full list of dimensions.
         metrics: Metrics for the report. See metadata for the full list of metrics.
         property_id: A reference to the Google Analytics project.
@@ -59,11 +54,10 @@ def basic_report(
         start_date = start_date or START_DATE
 
     processed_response = get_report(
-        client=client,
+        session=session,
         property_id=property_id,
-        # fill dimensions and metrics with the proper api client objects
-        dimension_list=[Dimension(name=dimension) for dimension in dimensions],
-        metric_list=[Metric(name=metric) for metric in metrics],
+        dimension_list=list(dimensions),
+        metric_list=list(metrics),
         limit=rows_per_page,
         start_date=start_date,
         # configure end_date to yesterday as a date string
