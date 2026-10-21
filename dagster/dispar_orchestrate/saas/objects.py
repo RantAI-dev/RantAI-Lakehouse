@@ -29,6 +29,9 @@ class ObjectDecl:
     deletes: bool = False
     full_reason: str | None = None
     lag_seconds: int = 0
+    # A name for a person where `name` is an id (SharePoint: `Site / List`, slice 5 review BLOCKER 14). Shown by
+    # discovery only; the ingest spec keys the object by `name`.
+    label: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():

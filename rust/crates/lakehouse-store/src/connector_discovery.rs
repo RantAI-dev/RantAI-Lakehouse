@@ -268,6 +268,9 @@ pub enum ObjectKind {
     Dimension,
     /// A metric a Google Analytics report can be built from (same listing).
     Metric,
+    /// A SharePoint site the person can pick (`SRC-3` slice 5 review BLOCKER 14): listed with
+    /// `schema: "fields"`, its `name` the Graph site id and its `label` the site's title.
+    Site,
 }
 
 /// One listed object. `name` is what a source object's `name` is in the ingest
@@ -292,6 +295,11 @@ pub struct ListedObject {
     /// listing carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<String>,
+    /// A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a SharePoint
+    /// list is `<site id>/<list id>`, shown as `Site / List`). The vendor module's own text, bounded
+    /// like a name; the ingest spec still keys the object by `name`, so a rename changes nothing stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl ListedObject {
@@ -304,6 +312,7 @@ impl ListedObject {
             size: None,
             modified_at: None,
             load: None,
+            label: None,
         }
     }
 }
@@ -383,7 +392,7 @@ impl Listing {
     /// # Errors
     ///
     /// [`StoreError::Validation`] for more than [`MAX_OBJECTS`] objects, a blank,
-    /// oversize or control-character name, a negative size, a `modifiedAt` that is
+    /// oversize or control-character name or label, a negative size, a `modifiedAt` that is
     /// not RFC 3339, or a result past [`MAX_RESULT_BYTES`].
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.objects.len() > MAX_OBJECTS {
@@ -400,6 +409,9 @@ impl Listing {
             }
             if let Some(load) = object.load.as_deref() {
                 check_name("a load description", load, MAX_LOAD_CHARS)?;
+            }
+            if let Some(label) = object.label.as_deref() {
+                check_name("an object label", label, MAX_NAME_CHARS)?;
             }
             if object
                 .modified_at

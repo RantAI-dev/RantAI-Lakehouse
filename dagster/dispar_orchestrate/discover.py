@@ -238,13 +238,22 @@ def valid_name(name: object) -> bool:
 
 
 def listed(
-    name: str, kind: str, *, size: int | None = None, modified_at: str | None = None, load: str | None = None
+    name: str,
+    kind: str,
+    *,
+    size: int | None = None,
+    modified_at: str | None = None,
+    load: str | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
-    """One entry of a list answer; `size`, `modifiedAt` and `load` (SRC-3: how a
-    business-app object loads) only when known."""
+    """One entry of a list answer; `size`, `modifiedAt`, `load` (SRC-3: how a
+    business-app object loads) and `label` (a name for a person where `name` is an id, slice 5 review
+    BLOCKER 14) only when known."""
     entry: dict[str, Any] = {"name": name, "kind": kind}
     if load is not None:
         entry["load"] = load
+    if label is not None:
+        entry["label"] = label
     if size is not None:
         entry["size"] = size
     if modified_at is not None:
@@ -721,13 +730,21 @@ def _saas(dial: dict, secrets: dict, request: DiscoverRequest, b: Backends) -> d
         fields_of = getattr(module, "list_fields", None)
         if fields_of is None:
             raise NotSupported("this vendor has no fields to build an object from")
-        found = [f for f in fields_of(session, parts, dial) if contains_ignore_case(f["name"], request.search)]
-        found.sort(key=lambda f: (f["kind"], f["name"]))
-        return listing((listed(f["name"], f["kind"]) for f in found), request.limit)
+        found = [
+            f
+            for f in fields_of(session, parts, dial)
+            if contains_ignore_case(f["name"], request.search) or contains_ignore_case(f.get("label") or "", request.search)
+        ]
+        found.sort(key=lambda f: (f["kind"], f.get("label") or f["name"], f["name"]))
+        return listing((listed(f["name"], f["kind"], label=f.get("label")) for f in found), request.limit)
     if request.kind == "list":
-        declared = [d for d in module.list_objects(session, parts, dial) if contains_ignore_case(d.name, request.search)]
-        declared.sort(key=lambda d: d.name)
-        return listing((listed(d.name, "object", load=d.load_description()) for d in declared), request.limit)
+        declared = [
+            d
+            for d in module.list_objects(session, parts, dial)
+            if contains_ignore_case(d.name, request.search) or contains_ignore_case(d.label or "", request.search)
+        ]
+        declared.sort(key=lambda d: (d.label or d.name, d.name))
+        return listing((listed(d.name, "object", load=d.load_description(), label=d.label) for d in declared), request.limit)
     describe = getattr(module, "describe", None)
     if describe is None:
         raise NotSupported("this vendor does not describe its fields before a load")

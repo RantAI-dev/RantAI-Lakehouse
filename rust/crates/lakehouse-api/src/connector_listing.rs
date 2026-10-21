@@ -971,6 +971,7 @@ async fn list_s3(
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ),
             load: None,
+            label: None,
         });
     }
     Ok(Listing { objects, truncated })

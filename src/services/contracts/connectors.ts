@@ -809,7 +809,7 @@ export type DiscoveryErrorClass =
   | "failed"
   | string
 
-/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection, a business-app object, or (a GA4 property's fields, `schema: "fields"`) a dimension or a metric. */
+/** What a listed object is: a schema, a table, a file, a REST endpoint, a Kafka topic, a MongoDB collection, a business-app object, or (a GA4 property's fields, `schema: "fields"`) a dimension or a metric, or (a SharePoint tenant's sites, same request) a site. */
 export type DiscoveryObjectKind =
   | "schema"
   | "table"
@@ -820,6 +820,7 @@ export type DiscoveryObjectKind =
   | "object"
   | "dimension"
   | "metric"
+  | "site"
   | string
 
 /**
@@ -837,6 +838,12 @@ export type DiscoveryObject = {
    * `re-read in full: <reason>`. Fixed text from the vendor module's declaration.
    */
   load?: string
+  /**
+   * A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a SharePoint list is
+   * `<site id>/<list id>`, labelled `Site / List`). The ingest spec keys the object by `name`, so a rename
+   * at the source changes nothing stored.
+   */
+  label?: string
 }
 
 /** One column of a preview; `inferred` is true when `typeName` was guessed from a sample (D6). */
