@@ -176,6 +176,31 @@ To be confirmed when the plan is built. Expected from the defaults:
   table to have deletes applied. A table without a `modifiedon` column is re-read in full. Fields are described
   before the load; a lookup column is loaded as `_<name>_value`. Client credentials need the app to be added to
   the environment as an application user with a security role.
+- Workday Reports: each custom report is named by its owner and its name (two fields on the connector
+  page; Workday cannot list reports). The report is read through its web service address with
+  `?format=json`, in one response, and every run reads it again in full and replaces the table, because a
+  report cannot be filtered by when a row changed; a row deleted at Workday is simply gone from the next
+  table. A report is read into memory and Workday ends one that runs longer than 30 minutes, so keep
+  reports to the columns and rows the lakehouse needs; the connector waits up to 10 minutes for one. The
+  integration system user is written `user@tenant` and sent as HTTP Basic; the browser sign-in needs an API
+  client registered in the tenant. The connection test runs the first named report and reads only the
+  status. The account is the Workday host and the tenant (`host/tenant`) and the host must be one label
+  under `workday.com` or `myworkday.com`. Workday's documentation is behind a login and could not be read,
+  so the response shape (`Report_Entry`), the token address and the Basic client authentication are the
+  documented pattern as third parties and the developer know it, **not verified** on a tenant. A changed
+  column is seen after the load.
+- NetSuite: any record type SuiteQL can read, by name (customer, vendor, employee, item, transaction,
+  account, subsidiary and contact are suggested). A record type with a `lastmodifieddate` column loads
+  incrementally and merges on `id`; one without it is read in full, by key. Each run reads again the last
+  day before the previous run's newest change, because the time zone of the column is not stated in the
+  documentation read. A record deleted at NetSuite stays until a full reload (SuiteQL reports no deletes).
+  A changed column is seen after the load: SuiteQL's columns cannot be listed through any call found in
+  the documentation, so NetSuite is **not** described before the load, unlike decision 9 says. The
+  account is the NetSuite account id (`1234567` or `1234567_SB1`, a sandbox written with a hyphen in the
+  address). Client credentials need a certificate uploaded in NetSuite's OAuth 2.0 Client Credentials
+  (M2M) setup: enter its certificate ID on the connector, and the client ID and the private key (RSA or
+  P-256, PEM) as the credential; NetSuite does not accept `RS256`, so the assertion is signed `PS256`
+  (RSA) or `ES256` (P-256). None of the SuiteQL functions the connector writes was run against an account.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.
 - SharePoint and Confluence files and attachments are not loaded.
