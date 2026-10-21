@@ -443,6 +443,7 @@ MODULE_PATHS: dict[str, str] = {
     "ga4": "dispar_orchestrate.saas.vendors.ga4",
     "servicenow": "dispar_orchestrate.saas.vendors.servicenow",
     "confluence": "dispar_orchestrate.saas.vendors.confluence",
+    "sharepoint": "dispar_orchestrate.saas.vendors.sharepoint",
 }
 
 

@@ -27,6 +27,10 @@ modules, and the tests' fake vendor is a small class):
     resolve_base_path(vendor, parts, session) optional -> str; required when the vendor table gives
                                                 a browser sign-in its own `oauth.apiBase`: the
                                                 path prefix after sign-in (Atlassian's cloud id)
+    uses_state                               optional bool; True when `read` also takes `state=`, the
+                                                resource's dlt state (a dict that survives between runs and
+                                                is committed only with the load that carried the rows read):
+                                                Graph's and Dataverse's delta links live there (`SRC-3` AD5)
     is_quota_exhausted(body)                 optional -> bool; whether a 403 body says the API quota is used up
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
@@ -309,8 +313,11 @@ def build_source(
     excluded = frozenset(n for n in (obj.get("excludedColumns") or []) if isinstance(n, str))
     shape = _shaper(columns, excluded)
 
-    def _records(since: Any) -> Iterator[dict]:
-        for record in module.read(session, parts, dial, decl, since=since):
+    uses_state = bool(getattr(module, "uses_state", False))
+
+    def _records(since: Any, state: Any = None) -> Iterator[dict]:
+        extra = {"state": state} if uses_state else {}
+        for record in module.read(session, parts, dial, decl, since=since, **extra):
             yield shape(record)
 
     resource_name = str(obj.get("target") or name)
@@ -318,7 +325,10 @@ def build_source(
 
         @dlt.resource(name=resource_name)
         def rows(cursor: dlt.sources.incremental = dlt.sources.incremental(decl.cursor, lag=decl.lag_seconds or None)):  # noqa: B008 -- dlt's own pattern
-            yield from _records(cursor.last_value)
+            # Plan AD5, section 8 item 6: a vendor that continues from a delta link keeps it in the
+            # resource's dlt state, which dlt writes with the load of the rows read and
+            # `sink._abort_pending` restores after a failed one.
+            yield from _records(cursor.last_value, dlt.current.resource_state() if uses_state else None)
 
         # `sink._apply_cursor` re-applies the cursor and reads this to keep the lag.
         rows.cursor_lag_seconds = decl.lag_seconds or None
