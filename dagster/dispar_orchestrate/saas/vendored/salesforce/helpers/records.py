@@ -73,6 +73,7 @@ def get_records(
     sobject: str,
     last_state: Optional[str] = None,
     replication_key: Optional[str] = None,
+    include_deleted: bool = False,
 ) -> Iterable[TDataItem]:
     """
     Retrieves records from Salesforce for a specified sObject.
@@ -84,6 +85,8 @@ def get_records(
         sobject (str): The name of the sObject to retrieve records from.
         last_state (str, optional): The last known state for incremental loading. Defaults to None.
         replication_key (str, optional): The replication key for incremental loading. Defaults to None.
+        include_deleted (bool): Read through `queryAll`, which also returns the records in the
+            recycle bin with `IsDeleted = true` (SRC-3 decision 7, local change 3).
 
     Yields:
         Dict[TDataItem]: A dictionary representing a record from the Salesforce sObject.
@@ -118,10 +121,13 @@ def get_records(
         if not _API_NAME.match(replication_key):
             raise ValueError("not a Salesforce field name")
         if last_state:
+            # `>=`, not upstream's `>`: Salesforce stamps a millisecond, so another
+            # record may carry the very time of the last one read; the merge on `Id`
+            # removes the repeat of the cursor's own record (local change 3).
             # The value is parsed and written back in Salesforce's own literal form:
             # nothing the caller passed is spliced into the query as it came.
             literal = cast(pendulum.DateTime, pendulum.parse(str(last_state))).in_timezone("UTC")
-            predicate = f"WHERE {replication_key} > {literal.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
+            predicate = f"WHERE {replication_key} >= {literal.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
         order_by = f"ORDER BY {replication_key} ASC"
     query = f"SELECT {', '.join(fields)} FROM {sobject} {predicate} {order_by}"
     if not IS_PRODUCTION:
@@ -131,7 +137,8 @@ def get_records(
 
     # Standard REST query. The next page is `nextRecordsUrl`, a path on the same
     # host, which the session follows under its same-origin rule.
-    result = session.get_json(f"/services/data/v{API_VERSION}/query", {"q": query})
+    endpoint = "queryAll" if include_deleted else "query"
+    result = session.get_json(f"/services/data/v{API_VERSION}/{endpoint}", {"q": query})
     while True:
         for record in result["records"]:
             processed_record = _process_record(record, date_fields, api_type="standard")

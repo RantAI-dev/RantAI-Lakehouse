@@ -49,6 +49,7 @@ class FakeSalesforce:
         self.log: list[str] = []
         self.queries: list[str] = []
         self.headers: list[dict] = []
+        self.deleted_visible = False
 
     def get(self, url: str, *, headers: dict, params: dict | None, timeout: float) -> Reply:
         self.headers.append(headers)
@@ -56,17 +57,20 @@ class FakeSalesforce:
         self.log.append(parsed.path)
         if parsed.path.endswith("/describe"):
             return Reply(body={"name": parsed.path.split("/")[-2], "fields": self.fields})
-        if parsed.path == f"/services/data/v{V}/query":
+        if parsed.path in (f"/services/data/v{V}/query", f"/services/data/v{V}/queryAll"):
             self.queries.append((params or {})["q"])
+            self.deleted_visible = parsed.path.endswith("queryAll")
             return self._page(0)
         if parsed.path == f"/services/data/v{V}/query/01gxx-batches":
             return self._page(int(parse_qs(parsed.query)["start"][0]))
         return Reply(404)
 
     def _page(self, start: int) -> Reply:
-        page = self.rows[start : start + self.page_size]
+        # `query` hides the recycle bin; `queryAll` shows it (Salesforce's documented difference)
+        rows = [r for r in self.rows if self.deleted_visible or not r["IsDeleted"]]
+        page = rows[start : start + self.page_size]
         end = start + len(page)
-        body: dict[str, Any] = {"totalSize": len(self.rows), "done": end >= len(self.rows), "records": page}
+        body: dict[str, Any] = {"totalSize": len(rows), "done": end >= len(rows), "records": page}
         if not body["done"]:
             body["nextRecordsUrl"] = f"/services/data/v{V}/query/01gxx-batches?start={end}"
         return Reply(body=body)
@@ -118,7 +122,7 @@ def test_dates_are_written_in_one_form_and_the_cursor_is_a_literal_salesforce_re
     fake = FakeSalesforce([account(1, "2024-05-01T10:20:30.000+0000")])
     got = list(records.get_records(session_over(fake), "Account", "2024-05-01T10:20:30.123456Z", "SystemModstamp"))
     assert got[0]["SystemModstamp"] == "2024-05-01T10:20:30.000000Z"
-    assert "WHERE SystemModstamp > 2024-05-01T10:20:30.123Z ORDER BY SystemModstamp ASC" in fake.queries[0]
+    assert "WHERE SystemModstamp >= 2024-05-01T10:20:30.123Z ORDER BY SystemModstamp ASC" in fake.queries[0]
 
 
 @pytest.mark.parametrize("bad", ["Account; DELETE", "Account Where", "../x", "a-b", ""])
@@ -175,3 +179,17 @@ def test_every_resource_of_the_source_declares_id_as_its_primary_key() -> None:
         assert resource._hints.get("primary_key") == "Id", resource.name
     merging = {r.name for r in resources if r.write_disposition == "merge"}
     assert merging >= {"account", "opportunity", "task", "event"}
+
+
+# ---- local change 3: deletes through queryAll, and `>=` on the cursor (decision 7, decision 6) ----
+
+
+def test_a_record_in_the_recycle_bin_arrives_with_is_deleted_only_through_query_all() -> None:
+    rows = [account(1), account(2, IsDeleted=True), account(3)]
+    plain = FakeSalesforce(rows)
+    assert [r["Id"] for r in records.get_records(session_over(plain), "Account")] == ["001001", "001003"]
+    assert f"/services/data/v{V}/queryAll" not in plain.log
+    every = FakeSalesforce(rows)
+    got = list(records.get_records(session_over(every), "Account", include_deleted=True))
+    assert {r["Id"]: r["IsDeleted"] for r in got} == {"001001": False, "001002": True, "001003": False}
+    assert f"/services/data/v{V}/queryAll" in every.log and f"/services/data/v{V}/query" not in every.log

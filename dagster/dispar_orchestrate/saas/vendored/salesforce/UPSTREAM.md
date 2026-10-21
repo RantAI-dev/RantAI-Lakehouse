@@ -41,3 +41,14 @@
    merge on and a changed record was stored again next to the old one. Every sObject of
    Salesforce has an `Id`, so all fifteen resources, the full-read ones too, declare it.
    Test: `test_saas_vendored_salesforce.py`.
+3. **Deletes through `queryAll`, and `>=` on the cursor** (`helpers/records.py`
+   `get_records(include_deleted=...)`; `SRC-3` decisions 7 and 6). `query` never returns
+   a record that is in the recycle bin; `queryAll` does, with `IsDeleted = true`
+   (also merged records and archived tasks and events), so the same incremental read that
+   carries a change carries the delete and the row says so. It is a mark, not a removal
+   (the row stays in Bronze with `IsDeleted` true). A record purged from the recycle bin
+   (or deleted with a hard delete) is not reported by either call. Upstream's
+   `SystemModstamp > cursor` became `>=`: Salesforce stamps a millisecond, so a second
+   record may carry the very time of the last one read; the merge on `Id` removes the repeat.
+   The sources that have no `IsDeleted` field (for example `User`) must not use `queryAll`
+   for deletes; the vendor module decides per object from `describe`.
