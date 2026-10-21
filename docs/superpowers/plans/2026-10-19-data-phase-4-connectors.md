@@ -832,3 +832,48 @@ caused by this PR and not ours to fix (another team's dependency work); it
 needs a backlog item from that team before this PR can merge, because a PR
 touching dependencies may not merge with a dependency check red, and this
 one does not touch them.
+
+### Review of slice 3 (planner, 2026-10-21, head `a583fc96`)
+
+Read: the handoff, both `UPSTREAM.md`, the Salesforce query and `queryAll`
+path, the GA4 REST calls, the `_apply_cursor` lag change, the Google
+authorise address. Plan section 8 items 1 and 2 answered by the developer:
+both libraries could be given a session, but neither under `SaasSession`'s
+rules (redirects, pinning, `Retry-After`); calling the vendors' REST
+endpoints through `SaasSession` and adding neither library is the right
+choice under AD3 and is accepted. The `instance_url` adoption goes through
+`adopt_origin` only: accepted. The Google `access_type=offline` and
+`prompt=consent` fix: accepted (without it no load could run). The shared
+`_apply_cursor` lag (`ObjectDecl.lag_seconds`): accepted, `sql_database`
+resources unchanged and their tests pass.
+
+- `BLOCKER 8` (decision 13). Salesforce reports an exhausted API quota as
+  HTTP 403 with `errorCode` `REQUEST_LIMIT_EXCEEDED`; `SaasSession` reads
+  every 403 as a missing permission. Give a vendor module a way to classify
+  a 403 body (Salesforce: that code → `SaasRateLimited`, not retried within
+  the run since the quota is per 24 hours, run class `rate_limited`), with a
+  mock route and a vendor-level gate step. Cite the Salesforce limits page
+  if it can be read; otherwise say so.
+- `BLOCKER 9` (spec "table and column choice", `SRC-3-AC3`). A GA4
+  connector cannot be set up in the console: there is no way to define a
+  report. Add the report editor to the GA4 form: name, dimensions and
+  metrics chosen from the property's `getMetadata` (through discovery, not
+  typed blind), the date dimension fixed as the cursor; saved into
+  `dial.objects` as the API already accepts. Tests for the form.
+- `BLOCKER 10` (decision 3, `SRC-3-AC1`). The API's connection test answers
+  `supported: false` for GA4's service-account key, one of the two signed
+  ways. Implement the JWT-bearer exchange in the probe with the workspace's
+  `jsonwebtoken` (RS256, already a dependency of `lakehouse-api`; no new
+  crate), the key as a `SecretValue`; add the service-account way to the
+  GA4 product steps of `g6-saas`.
+- `SHOULD-FIX 11`. GA4's "yesterday" is computed in UTC while GA4 dates are
+  in the property's time zone: read the property's time zone (Admin API
+  `properties.get`, scope already granted? check) and use it; if that needs
+  a scope the row does not ask for, keep UTC, widen the lookback by one day
+  and state the limit on the connector page.
+- `SHOULD-FIX 12`. The connector page states the two Salesforce limits
+  (an object whose query exceeds the address length fails with a fixed
+  message; API version 62.0) under "Limits to tell a customer".
+- Salesforce row not checked against the vendor's documentation (pages
+  refused from this machine): recorded; `SRC-3-AC1` on a real org is the
+  proof. The "who am I" path `/services/data/v62.0/limits` is accepted.
