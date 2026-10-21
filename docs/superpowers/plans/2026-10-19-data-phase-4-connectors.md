@@ -982,3 +982,28 @@ resources unchanged and their tests pass.
 - Salesforce row not checked against the vendor's documentation (pages
   refused from this machine): recorded; `SRC-3-AC1` on a real org is the
   proof. The "who am I" path `/services/data/v62.0/limits` is accepted.
+
+### Review of slice 4 (planner, 2026-10-21, head `7dc268ff`)
+
+Before it: CI on `7ddb2be8` (main merged, #106 and SEC-46) green, 38 of 38.
+
+Read: the handoff, the two vendor modules, the vendor rows (fixture), the
+`get_json_with_next` link handling, the Confluence cloud-id path. Accepted:
+calling both vendors through `SaasSession` rather than a dlt `rest_api`
+source (plan section 8 item 3: dlt's client could take a session, but not
+one carrying `SaasSession`'s rules; same reasoning as slice 3); the four
+Confluence row corrections and the ServiceNow revocation removal, each with
+its documentation; ServiceNow's sign-in ways as the signed page names them
+(browser sign-in and client credentials; user + password is not on the
+corrected decision 3); `Link` paging; the one-day and 300-second lags as
+margins, stated as ours; newest-first Confluence reads stopping at the
+cursor (sound because the sort field is the cursor); no deletes claimed.
+
+- `BLOCKER 13` (decision 3, `SRC-3-AC1`). The API's connection test answers
+  `supported: false` for Confluence's browser sign-in, one of the two signed
+  ways (same finding as `BLOCKER 10` for GA4). Add the `accessible-resources`
+  call to the Rust probe after the token refresh: match the site, validate
+  the cloud id as a UUID, then "who am I" on the fixed gateway host from
+  the vendor table; add a product step for the browser way.
+- Not verified and open for CI: the Rust of this slice, the two vendors'
+  product steps, and the job time.
