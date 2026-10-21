@@ -183,9 +183,10 @@ To be confirmed when the plan is built. Expected from the defaults:
   table. A report is read into memory and Workday ends one that runs longer than 30 minutes, so keep
   reports to the columns and rows the lakehouse needs; the connector waits up to 10 minutes for one. The
   integration system user is written `user@tenant` and sent as HTTP Basic; the browser sign-in needs an API
-  client registered in the tenant. The connection test runs the first named report and reads only the
-  status. The account is the Workday host and the tenant (`host/tenant`) and the host must be one label
-  under `workday.com` or `myworkday.com`. Workday's documentation is behind a login and could not be read,
+  client registered in the tenant. **The connection test runs the first named report once at Workday**
+  (so it uses one report run in the customer's tenant each time) and reads only the status; with no report
+  named it cannot test. The account is the Workday host and the tenant (`host/tenant`) and the host must be one to three
+  labels under `workday.com` or `myworkday.com`. Workday's documentation is behind a login and could not be read,
   so the response shape (`Report_Entry`), the token address and the Basic client authentication are the
   documented pattern as third parties and the developer know it, **not verified** on a tenant. A changed
   column is seen after the load.
