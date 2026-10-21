@@ -158,13 +158,15 @@ To be confirmed when the plan is built. Expected from the defaults:
   limited the rate". With the browser sign-in the connection test first asks Atlassian which sites the sign-in reaches and
   needs one with this connector's name. Email + API token and
   the browser sign-in both read the same objects.
-- SharePoint: the lists of the sites (document libraries and hidden lists are not offered; files are not
-  loaded). Objects are named by site id and list id (`<site id>/<list id>`); the list's display name is not part
-  of the name. Sites are found with a Graph search, the first 100, or the site ids named in the connector's
-  object list. Each run reads Graph's delta feed from the link the last run kept and merges on `id`. A deleted
-  item stays in Bronze with `is_deleted = true` and only its id; when Graph no longer serves the saved link
-  (`410 Gone`) the list is read again in full, and items deleted while the link was stale stay until a full
-  reload. A changed column is seen after the load (SharePoint does not describe its columns).
+- SharePoint: the lists of the sites you pick (document libraries and hidden lists are not offered; files are
+  not loaded). Find sites on the connector page, tick the ones to read and save; then the list shows their
+  lists as "Site / List" and a ticked list lands in a Bronze table named from that label. Behind the label the
+  object is kept by the site id and list id, so renaming a list or a site at SharePoint changes neither the
+  object nor the table already created (a rename only shows in the label). With no site picked, the first 100
+  sites a search finds are used. Each run reads Graph's delta feed from the link the last run kept and merges on
+  `id`. A deleted item stays in Bronze with `is_deleted = true` and only its id; when Graph no longer serves the
+  saved link (`410 Gone`) the list is read again in full, and items deleted while the link was stale stay until
+  a full reload. A changed column is seen after the load (SharePoint does not describe its columns).
 - Dynamics 365: any Dataverse table. The account is the environment address and the tenant, as
   `org.crm4.dynamics.com/<tenant id or domain>`; the same tenant is used for the token. A table with change
   tracking is read by its change-tracking delta link and a deleted row stays with `is_deleted = true`; Dataverse
