@@ -42,7 +42,7 @@ pub enum AccountRule {
     /// A Dataverse environment address `<org>.crm<N>.dynamics.com`, where
     /// `<N>` is zero to two digits (the vendor's region number).
     DataverseHost,
-    /// SharePoint (slice 5): `<label>/<tenant>`, a [`Self::Label`] and the customer's Microsoft
+    /// `SharePoint` (slice 5): `<label>/<tenant>`, a [`Self::Label`] and the customer's Microsoft
     /// Entra tenant (see [`is_entra_tenant`]). The tenant forms the token address.
     LabelTenant,
     /// Dynamics 365 (slice 5): `<org>.crm<N>.dynamics.com/<tenant>`, a [`Self::DataverseHost`]

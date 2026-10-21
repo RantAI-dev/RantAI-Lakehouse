@@ -47,6 +47,9 @@ struct Request<'a> {
     /// [`CLOUD_ID_PLACEHOLDER`] where the site's id goes.
     lookup_url: Option<String>,
     token_url: String,
+    /// The `scope` of a client-credentials request, rendered from the vendor row (Microsoft Entra
+    /// wants the resource's `/.default`, slice 5); `None` for a vendor whose row names none.
+    scope: Option<String>,
     auth: &'a SaasAuth,
 }
 
@@ -121,6 +124,10 @@ pub(super) async fn probe_saas_info(
             )))
         }),
         token_url: rebase(&SaasVendor::render(vendor.oauth.token_url, &parts)),
+        scope: vendor
+            .integration
+            .and_then(|integration| integration.scope)
+            .map(|scope| SaasVendor::render(scope, &parts)),
         auth: &dial.auth,
     };
     let secrets = Secrets {
@@ -296,8 +303,11 @@ async fn integration_access(
             basic: true,
         });
     }
-    // Slice 4 (V-ServiceNow.3, decision 3): ServiceNow's client credentials are exchanged for a token.
-    if request.vendor.id == "servicenow" && fields == ["clientId", "clientSecret"] {
+    // Slice 4 (V-ServiceNow.3, decision 3): ServiceNow's client credentials are exchanged for a token;
+    // slice 5 (V-SharePoint.3, V-Dynamics.3): so are Microsoft Entra's, with the row's `.default` scope.
+    if (request.vendor.id == "servicenow" || request.scope.is_some())
+        && fields == ["clientId", "clientSecret"]
+    {
         return client_credentials_access(request, secrets, internal_hosts, oauth).await;
     }
     // Slice 3 review BLOCKER 10 (decision 3): Google's service-account key is exchanged for a token.
@@ -318,9 +328,13 @@ async fn integration_access(
     })
 }
 
-/// `ServiceNow`'s client-credentials grant (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>):
+/// The client-credentials grant of `ServiceNow`
+/// (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>),
+/// `SharePoint` and `Dynamics 365` (Microsoft Entra,
+/// <https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow>):
 /// the client id and secret are resolved only now (after the address check) and sent in the
-/// form body of the token request, the address being the vendor table's for this instance.
+/// form body of the token request, the address being the vendor table's for this account (for
+/// Entra it holds the validated tenant), with the row's `scope` when it has one.
 async fn client_credentials_access(
     request: &Request<'_>,
     secrets: &Secrets<'_>,
@@ -336,11 +350,14 @@ async fn client_credentials_access(
     };
     let client_secret = resolve(secrets.resolver, secondary).await?;
     let started = Instant::now();
-    let form = [
+    let mut form = vec![
         ("grant_type", "client_credentials"),
         ("client_id", client_id.expose_secret()),
         ("client_secret", client_secret.expose_secret()),
     ];
+    if let Some(scope) = request.scope.as_deref() {
+        form.push(("scope", scope));
+    }
     let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
         .await
         .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
@@ -674,13 +691,28 @@ mod tests {
         token_url: String,
         auth: &'a SaasAuth,
     ) -> Request<'a> {
+        let row = saas_vendors::vendor(vendor).unwrap();
+        let parts = row.validate_account(sample_account(vendor)).unwrap();
         Request {
-            vendor: saas_vendors::vendor(vendor).unwrap(),
+            vendor: row,
             account: "acme",
             url,
             lookup_url: None,
             token_url,
+            scope: row
+                .integration
+                .and_then(|integration| integration.scope)
+                .map(|scope| SaasVendor::render(scope, &parts)),
             auth,
+        }
+    }
+
+    /// An account in the shape each vendor's row accepts (slice 5: the Microsoft ones carry a tenant).
+    fn sample_account(vendor: &str) -> &'static str {
+        match vendor {
+            "sharepoint" => "acme/00000000-0000-0000-0000-000000000001",
+            "dynamics365" => "acme.crm4.dynamics.com/00000000-0000-0000-0000-000000000001",
+            _ => "acme",
         }
     }
 
@@ -1104,6 +1136,176 @@ mod tests {
             .into_owned();
         assert!(body.contains("grant_type=client_credentials"), "{body}");
         assert!(!outcome.message.contains("sn-secret"));
+    }
+
+    /// Slice 5 (V-SharePoint.3, V-Dynamics.3, lesson of BLOCKERs 10 and 13): both signed ways of
+    /// both Microsoft vendors are tested. Client credentials: the form body carries the vendor's
+    /// `.default` scope (Entra: "of all the direct application permissions ... the ones associated
+    /// with the resource") and the token is the bearer of the who-am-i request.
+    #[tokio::test]
+    async fn microsofts_client_credentials_are_exchanged_with_the_default_scope_of_the_resource() {
+        for (vendor, scope) in [
+            ("sharepoint", "https%3A%2F%2Fgraph.microsoft.com%2F.default"),
+            (
+                "dynamics365",
+                "https%3A%2F%2Facme.crm4.dynamics.com%2F.default",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "access-1", "expires_in": 3599
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/who"))
+                .and(header("authorization", "Bearer access-1"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut map = HashMap::new();
+            map.insert("MS_ID".to_owned(), "app-id".to_owned());
+            map.insert("MS_SECRET".to_owned(), "ms-secret".to_owned());
+            let resolver = EnvSecretResolver::with_map(map);
+            let auth = SaasAuth::Integration;
+            let outcome = probe_saas_at(
+                &request(
+                    vendor,
+                    format!("{}/who", server.uri()),
+                    format!("{}/token", server.uri()),
+                    &auth,
+                ),
+                &Secrets {
+                    primary: "env:MS_ID",
+                    secondary: Some("env:MS_SECRET"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(
+                outcome.ok && outcome.supported,
+                "{vendor}: {}",
+                outcome.message
+            );
+            let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+                .into_owned();
+            assert!(body.contains("grant_type=client_credentials"), "{body}");
+            assert!(body.contains(&format!("scope={scope}")), "{vendor}: {body}");
+            assert!(!outcome.message.contains("ms-secret"));
+        }
+    }
+
+    /// The browser sign-in of both Microsoft vendors: the refresh token is exchanged at the tenant's
+    /// token address, the client secret in the body, and Entra's new refresh token is handed back.
+    #[tokio::test]
+    async fn microsofts_browser_sign_in_is_tested_by_refreshing_and_hands_back_the_new_refresh_token()
+     {
+        for vendor in ["sharepoint", "dynamics365"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "access-1", "refresh_token": "refresh-2"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/who"))
+                .and(header("authorization", "Bearer access-1"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut map = HashMap::new();
+            map.insert("S".to_owned(), "client-secret".to_owned());
+            map.insert("R".to_owned(), "refresh-1".to_owned());
+            let resolver = EnvSecretResolver::with_map(map);
+            let auth = SaasAuth::Oauth2AuthorizationCode {
+                client_id: "app".to_owned(),
+            };
+            let outcome = probe_saas_at(
+                &request(
+                    vendor,
+                    format!("{}/who", server.uri()),
+                    format!("{}/token", server.uri()),
+                    &auth,
+                ),
+                &Secrets {
+                    primary: "env:S",
+                    secondary: Some("env:R"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(
+                outcome.ok && outcome.supported,
+                "{vendor}: {}",
+                outcome.message
+            );
+            assert_eq!(
+                outcome
+                    .rotated_refresh_token
+                    .as_ref()
+                    .map(SecretValue::expose_secret),
+                Some("refresh-2")
+            );
+            let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+                .into_owned();
+            assert!(body.contains("grant_type=refresh_token"), "{body}");
+            assert!(body.contains("client_id=app"), "{body}");
+            assert!(!body.contains("scope="), "{body}");
+        }
+    }
+
+    /// Entra's refusal of a client secret is the fixed sign-in message, none of Microsoft's words.
+    #[tokio::test]
+    async fn a_refused_microsoft_client_secret_is_a_fixed_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_client", "error_description": "AADSTS7000215 vendor secret text"
+            })))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("MS_ID".to_owned(), "app-id".to_owned());
+        map.insert("MS_SECRET".to_owned(), "ms-secret".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "sharepoint",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:MS_ID",
+                secondary: Some("env:MS_SECRET"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(
+            !outcome.message.contains("vendor secret text")
+                && !outcome.message.contains("AADSTS")
+                && !outcome.message.contains("ms-secret"),
+            "{}",
+            outcome.message
+        );
     }
 
     const CLOUD: &str = "0f1e2d3c-4b5a-4968-8776-655443322110";
