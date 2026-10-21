@@ -324,6 +324,92 @@ def step_zendesk() -> None:
     _log("zendesk forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+def _salesforce(instance_check: bool = True):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import salesforce as _module  # noqa: F401 -- imported for its registration
+
+    dial = {"vendor": "salesforce", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+    secrets = {"clientSecret": "stub-client-secret", "refreshToken": "stub-refresh-token"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_salesforce() -> None:
+    """Salesforce (V-Salesforce.4): connect (browser sign-in; the returned host adopted
+    through the .salesforce.com rule), discover (custom objects, describe), load (paged by
+    nextRecordsUrl), reload (queryAll: a change, a new record, a delete), a new field, rate
+    limit, forbidden, revoked sign-in, and a returned host outside the rule."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("salesforce", action="reset")
+    module, vendor, parts, session, dial = _salesforce()
+    host = urlparse(STUB_URL).hostname
+    _expect(session.origin == f"http://{host}:{saas_stub.VENDOR_PORTS['salesforce']}", f"salesforce connect: the session dials {session.origin}")
+    who = session.get_json(vendor.whoami["path"])
+    _expect("DailyApiRequests" in who, f"salesforce connect: the limits call answered {who!r}")
+    _expect(any(line == "POST /services/oauth2/token" for line in mock_log("salesforce")), "salesforce connect: no refresh-token grant reached the mock")
+    _log("salesforce connect: the refresh token was exchanged at the table's token path and the instance_url (a .salesforce.com host) adopted; the limits call is answered")
+
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect(set(declared) == {"Account", "Region__c"}, f"salesforce discover: the objects are {sorted(declared)}")
+    _expect(declared["Account"].load_description() == "incremental", "salesforce discover: Account")
+    _expect(declared["Region__c"].load_description().startswith("re-read in full: "), "salesforce discover: the custom object Region__c")
+    fields = {f.name: f.type_name for f in module.describe(session, parts, dial, "Account")}
+    _expect(fields.get("Id") and fields.get("IsDeleted") == "bool" and fields.get("AnnualRevenue") == "double", f"salesforce discover: the describe fields are {fields}")
+    _log(f"salesforce discover: {len(declared)} objects (the custom Region__c re-read in full), Account described with {len(fields)} fields")
+
+    admin("salesforce", action="clear_log")
+    first = _read(module, parts, session, dial, "Account")
+    _expect(sorted(r["Id"] for r in first) == ["001STUB001", "001STUB002", "001STUB003"], f"salesforce load: first run read {[r['Id'] for r in first]}")
+    log = mock_log("salesforce")
+    _expect(any("/query/01gSTUB" in line for line in log), f"salesforce load: no nextRecordsUrl was followed ({log})")
+    _log("salesforce load: 3 accounts read over 2 batches, the second by nextRecordsUrl")
+
+    cursor = max(r["SystemModstamp"] for r in first)
+    admin("salesforce", action="put", id=2, fields={"Name": "account 2 changed"})
+    admin("salesforce", action="put", id=4, fields={"Name": "account 4 new"})
+    admin("salesforce", action="delete", id=3)
+    admin("salesforce", action="clear_log")
+    again = _read(module, parts, session, dial, "Account", since=cursor)
+    got = {r["Id"]: r["IsDeleted"] for r in again}
+    _expect(got == {"001STUB002": False, "001STUB003": True, "001STUB004": False}, f"salesforce reload: read {got}, expected the changed (2), the deleted (3) marked IsDeleted and the new (4)")
+    _expect(any(line == "GET /services/data/v62.0/queryAll" for line in mock_log("salesforce")) and module.declaration(session, parts, dial, "Account").deletes, "salesforce reload: queryAll was not used")
+    _log("salesforce reload: the changed, the new and the deleted record (IsDeleted true) came back through queryAll; the unchanged one did not")
+
+    admin("salesforce", action="add_field", name="Rating__c")
+    after = {f.name for f in module.describe(session, parts, dial, "Account")}
+    _expect("Rating__c" in after and "Rating__c" not in fields, "salesforce schema change: the new custom field is not in describe")
+    _log("salesforce schema change: the new custom field shows in describe before any load")
+
+    admin("salesforce", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, "Region__c")) == 3, "salesforce rate limit: Region__c did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "salesforce rate limit: the Retry-After was not waited")
+    admin("salesforce", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, "Region__c"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "salesforce rate limit: the run report class")
+    admin("salesforce", action="rate_limit", count=0)
+    _log("salesforce rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("salesforce", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "Region__c"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "salesforce forbidden: the run report class")
+    admin("salesforce", action="forbid", on=False)
+
+    admin("salesforce", action="revoke", on=True)
+    exc = _raises("OAuthSignInRefused", _salesforce)
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "salesforce revoked: the run report class")
+    admin("salesforce", action="revoke", on=False)
+    _log("salesforce forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+    admin("salesforce", action="evil_instance", on=True)
+    admin("salesforce", action="clear_log")
+    _raises("SsrfBlocked", _salesforce)
+    _expect(mock_log("salesforce") == ["POST /services/oauth2/token"], f"salesforce instance_url: something was asked of the mock after the token ({mock_log('salesforce')})")
+    admin("salesforce", action="evil_instance", on=False)
+    _log("salesforce instance_url: a returned host outside .salesforce.com / .force.com stops the run before any read")
+
+
 # ---- the product steps (slice 2 review BLOCKER 4) ------------------------------------------------
 #
 # AD9 and the SRC-9 registry want connect, discover, load and reload to be `real`, which means
@@ -351,6 +437,25 @@ PRODUCT_VENDORS: dict[str, dict] = {
         # Zendesk does not describe its fields before a read, so its preview is honestly unsupported
         "preview_columns": None,
         "first_ids": {"1", "2", "3", "4", "5", "6"}, "reload_ids": {"1", "2", "3", "4", "5", "6", "7"},
+    },
+    # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
+    # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
+    "salesforce": {
+        "type": "Salesforce", "host": "acme.my.salesforce.com", "account": "acme", "label": "Salesforce",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-refresh-token"},
+        "object": "Account", "target": "saas_gate_salesforce_account", "cursor": "SystemModstamp", "text": "name", "key": "Id",
+        "columns": "id, name, is_deleted",
+        "preview_columns": {"Id", "Name", "IsDeleted"},
+        "first_ids": {"001STUB001", "001STUB002", "001STUB003"},
+        "reload_ids": {"001STUB001", "001STUB002", "001STUB003", "001STUB004"},
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"Name": "account 2 changed"}},
+            {"action": "put", "id": 4, "fields": {"Name": "account 4 new"}},
+            {"action": "delete", "id": 3},
+        ],
+        "reads_marker": ("queryAll",),
     },
 }
 
@@ -404,8 +509,8 @@ def step_product(vendor_id: str) -> None:
         f"{matrix.API_URL}/api/connectors/{cid}/ingest-spec",
         json={
             "adapter": "saas", "ingestMode": "batch",
-            "dial": {"vendor": vendor_id, "account": spec["account"], "auth": {"type": "integration"}},
-            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": ["id"]}],
+            "dial": {"vendor": vendor_id, "account": spec["account"], "auth": spec.get("auth", {"type": "integration"})},
+            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": [spec.get("key", "id")]}],
         },
         timeout=15,
     )
@@ -437,7 +542,7 @@ def step_product(vendor_id: str) -> None:
 
     # load: ingest_job into Bronze Iceberg, read back.
     _run_and_wait(cid, f"{vendor_id} load")
-    columns = f"id, {text}" + (", status" if vendor_id == "zendesk" else "")
+    columns = spec.get("columns") or f"id, {text}" + (", status" if vendor_id == "zendesk" else "")
     rows = _poll(f"{vendor_id} load: Bronze {target}", lambda: _bronze_rows(target, columns), lambda r: len(r) == len(spec["first_ids"]))
     _expect({str(r["id"]) for r in rows} == spec["first_ids"], f"{vendor_id} load: Bronze holds ids {[r['id'] for r in rows]}")
     _log(f"{vendor_id} load: {len(rows)} rows in Bronze {target}, read back through ClickHouse, each once")
@@ -447,6 +552,9 @@ def step_product(vendor_id: str) -> None:
         admin("hubspot", action="put", object="deals", id=2, properties={"dealname": "deal 2 changed"})
         admin("hubspot", action="put", object="deals", id=4, properties={"dealname": "deal 4 new"})
         admin("hubspot", action="archive", object="deals", id=1)
+    elif "changes" in spec:
+        for change in spec["changes"]:
+            admin(vendor_id, **change)
     else:
         admin("zendesk", action="put", id=2, fields={"subject": "ticket 2 changed"})
         admin("zendesk", action="put", id=7, fields={"subject": "ticket 7 new"})
@@ -460,18 +568,22 @@ def step_product(vendor_id: str) -> None:
     ids = [str(r["id"]) for r in after]
     _expect(len(ids) == len(set(ids)), f"{vendor_id} reload: a key is in Bronze twice: {ids}")
     by_id = {str(r["id"]): r for r in after}
-    _expect("changed" in str(by_id["2"][text]), f"{vendor_id} reload: ticket/deal 2 was not updated")
-    if vendor_id == "zendesk":
+    changed_id = "001STUB002" if vendor_id == "salesforce" else "2"
+    _expect("changed" in str(by_id[changed_id][text]), f"{vendor_id} reload: record {changed_id} was not updated")
+    if vendor_id == "salesforce":
+        _expect(by_id["001STUB003"]["is_deleted"] in (True, 1, "true"), "salesforce reload: the deleted account does not say is_deleted in Bronze")
+        _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
+    elif vendor_id == "zendesk":
         _expect(by_id["3"]["status"] == "deleted", "zendesk reload: the deleted ticket does not say status = deleted in Bronze")
         _expect(len(by_id) == 7, "zendesk reload: a ticket was lost")
     else:
         _expect("1" in by_id, "hubspot reload: the archived deal vanished; no delete is claimed, so it must stay")
     seen = mock_log(vendor_id)
-    reads = [line for line in seen if "/search" in line or "cursor" in line or "incremental" in line]
+    reads = [line for line in seen if any(m in line for m in spec.get("reads_marker", ("/search", "cursor", "incremental")))]
     _expect(reads, f"{vendor_id} reload: the mock saw no incremental request ({seen})")
     _expect(not any(line == "GET /crm/v3/objects/deals" for line in seen), f"{vendor_id} reload: it listed every deal again")
     _log(f"{vendor_id} reload: the changed and the new record merged on the key, no duplicate; "
-         + ("the deleted ticket says status = deleted" if vendor_id == "zendesk" else "the archived deal stays (HubSpot reports no deletes)"))
+         + {"zendesk": "the deleted ticket says status = deleted", "salesforce": "the deleted account says is_deleted (queryAll)"}.get(vendor_id, "the archived deal stays (HubSpot reports no deletes)"))
 
     # revoked sign-in, through the API's test and a run.
     admin(vendor_id, action="revoke", on=True)
@@ -491,6 +603,7 @@ def run_vendors() -> None:
     _setup_vendor_environment()
     step_hubspot()
     step_zendesk()
+    step_salesforce()
 
 
 def run() -> None:
