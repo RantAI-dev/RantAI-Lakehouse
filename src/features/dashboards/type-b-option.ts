@@ -44,16 +44,22 @@ export type HistogramInput = {
 };
 
 export type HistogramDrawn =
-  | { option: EChartsOption; ranges: number; /** Rows with no value in the binned column: they are not drawn, and the tile says so. */ withoutValue: number }
+  | { option: EChartsOption; ranges: number; /** The rows with no value in the binned column: they are not drawn, and the tile says how many there are. */ withoutValue: number }
   | { message: string };
 
 export function histogramOption(i: HistogramInput): HistogramDrawn {
   const all = i.rows.map((r) => ({ lower: num(r[i.column]), count: num(r[i.countColumn]) ?? 0 }));
   const counted = all.filter((r): r is { lower: number; count: number } => r.lower !== null);
   // A row with no value in the binned column has no range to be counted in,
-  // so it is not drawn; the tile says how many were left out
+  // so it is not drawn; the tile says how many rows were left out
   // (`PR #199 review M SHOULD-FIX BI-16 5`).
-  const withoutValue = all.length - counted.length;
+  //
+  // The rows without a value are the bin with no range, and their number is
+  // that bin's count — not the number of such bins in the result
+  // (`PR #199 review O SHOULD-FIX 5`).
+  const withoutValue = all
+    .filter((r) => r.lower === null)
+    .reduce((sum, r) => sum + r.count, 0);
   if (!counted.length) return { message: "No data" };
   const filled = i.width ? fillRanges(counted, i.width) : [...counted].sort((a, b) => a.lower - b.lower);
   if (filled === null) {
