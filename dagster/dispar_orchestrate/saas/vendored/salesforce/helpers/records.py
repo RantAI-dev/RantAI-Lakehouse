@@ -1,19 +1,33 @@
 """Salesforce source helpers"""
 
+import re
+
 import pendulum
 
 from typing import Optional, Iterable, Dict, Set, Any, cast
 
-from simple_salesforce.exceptions import SalesforceMalformedRequest
-from simple_salesforce import Salesforce
 from dlt.common.typing import TDataItem
 
 
-from ..settings import IS_PRODUCTION
+from ..settings import API_VERSION, IS_PRODUCTION
+
+# SRC-3 V-Salesforce.1 (local change 1): an sObject or field name is spliced into
+# the SOQL text, so it must be a plain API name (letters, digits, underscores).
+_API_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+# A GET carries the whole query in its address; Salesforce refuses an address of
+# more than 16,384 bytes. Stay well under it (the host and the headers count too).
+_MAX_QUERY_CHARS = 12_000
+
+
+class QueryTooLongError(Exception):
+    """An sObject with so many fields that its query does not fit one request."""
+
+    def __init__(self) -> None:
+        super().__init__("this Salesforce object has too many fields to read in one query")
 
 
 def _process_record(
-    record: Dict[str, Any], date_fields: Set[str], api_type: str
+    record: Dict[str, Any], date_fields: Set[str], api_type: str = "standard"
 ) -> Dict[str, Any]:
     """
     Process a single Salesforce record by removing attributes and converting date fields.
@@ -47,8 +61,15 @@ def _process_record(
     return record
 
 
+def describe_sobject(session: Any, sobject: str) -> Dict[str, Any]:
+    """The sObject's describe result (`GET .../sobjects/<name>/describe`)."""
+    if not _API_NAME.match(sobject):
+        raise ValueError("not a Salesforce object name")
+    return session.get_json(f"/services/data/v{API_VERSION}/sobjects/{sobject}/describe")
+
+
 def get_records(
-    sf: Salesforce,
+    session: Any,
     sobject: str,
     last_state: Optional[str] = None,
     replication_key: Optional[str] = None,
@@ -57,7 +78,9 @@ def get_records(
     Retrieves records from Salesforce for a specified sObject.
 
     Args:
-        sf (Salesforce): An instance of the Salesforce API client.
+        session: The `SaasSession` of the connector. Upstream took a `simple_salesforce`
+            client; that library (and its Bulk API) dials the host itself, outside the
+            link, address and rate-limit rules of `SaasSession` (SRC-3 AD3, AD4).
         sobject (str): The name of the sObject to retrieve records from.
         last_state (str, optional): The last known state for incremental loading. Defaults to None.
         replication_key (str, optional): The replication key for incremental loading. Defaults to None.
@@ -66,7 +89,7 @@ def get_records(
         Dict[TDataItem]: A dictionary representing a record from the Salesforce sObject.
     """
     # Get all fields for the sobject
-    desc = getattr(sf, sobject).describe()
+    desc = describe_sobject(session, sobject)
     # Salesforce returns compound fields as separate fields, so we need to filter them out
     compound_fields = {
         f["compoundFieldName"]
@@ -74,48 +97,48 @@ def get_records(
         if f["compoundFieldName"] is not None
     } - {"Name"}
 
-    # Fields of type "datetime" (Bulk API returns them as timestamps,
-    # Standard API returns ISO strings). We normalize them later.
+    # Fields of type "datetime" (Standard API returns ISO strings).
+    # We normalize them later.
     date_fields = {
         f["name"] for f in desc["fields"] if f["type"] in ("datetime",) and f["name"]
     }
 
-    # If no fields are specified, use all fields except compound fields
-    fields = [f["name"] for f in desc["fields"] if f["name"] not in compound_fields]
+    # If no fields are specified, use all fields except compound fields. A
+    # `base64` field (a file's body) is left out too: Salesforce returns it as an
+    # address of its own, one record per batch, never inline.
+    fields = [
+        f["name"]
+        for f in desc["fields"]
+        if f["name"] not in compound_fields and f["type"] != "base64"
+    ]
 
     # Generate a predicate to filter records by the replication key
     predicate, order_by, n_records = "", "", 0
     if replication_key:
+        if not _API_NAME.match(replication_key):
+            raise ValueError("not a Salesforce field name")
         if last_state:
-            predicate = f"WHERE {replication_key} > {last_state}"
+            # The value is parsed and written back in Salesforce's own literal form:
+            # nothing the caller passed is spliced into the query as it came.
+            literal = cast(pendulum.DateTime, pendulum.parse(str(last_state))).in_timezone("UTC")
+            predicate = f"WHERE {replication_key} > {literal.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
         order_by = f"ORDER BY {replication_key} ASC"
     query = f"SELECT {', '.join(fields)} FROM {sobject} {predicate} {order_by}"
     if not IS_PRODUCTION:
         query += " LIMIT 100"
+    if len(query) > _MAX_QUERY_CHARS:
+        raise QueryTooLongError()
 
-    # Try Bulk API first, fallback to standard SOQL if not available
-    try:
-        for page in getattr(sf.bulk, sobject).query_all(query, lazy_operation=True):
-            processed_page = [
-                _process_record(record, date_fields, api_type="bulk") for record in page
-            ]
-            yield from processed_page
-            n_records += len(processed_page)
-    except SalesforceMalformedRequest as e:
-        if "FeatureNotEnabled" in str(e) and "Async API not enabled" in str(e):
-            # Fallback to standard SOQL API
-            result = sf.query(query)
-            while True:
-                for record in result["records"]:
-                    processed_record = _process_record(
-                        record, date_fields, api_type="standard"
-                    )
-                    yield processed_record
-                    n_records += 1
+    # Standard REST query. The next page is `nextRecordsUrl`, a path on the same
+    # host, which the session follows under its same-origin rule.
+    result = session.get_json(f"/services/data/v{API_VERSION}/query", {"q": query})
+    while True:
+        for record in result["records"]:
+            processed_record = _process_record(record, date_fields, api_type="standard")
+            yield processed_record
+            n_records += 1
 
-                # Check if there are more records to fetch
-                if result["done"]:
-                    break
-                result = sf.query_more(result["nextRecordsUrl"])
-        else:
-            raise
+        # Check if there are more records to fetch
+        if result["done"]:
+            break
+        result = session.get_json(result["nextRecordsUrl"])

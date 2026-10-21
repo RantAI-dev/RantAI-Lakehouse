@@ -1,31 +1,27 @@
-"""Source for Salesforce depending on the simple_salesforce python package.
+"""Source for Salesforce, read through the connector's `SaasSession` (SRC-3 local change 1;
+upstream used the simple_salesforce package).
 
 Imported resources are: account, campaign, contact, lead, opportunity, pricebook_2, pricebook_entry, product_2, user and user_role
 
 Salesforce api docs: https://developer.salesforce.com/docs/apis
-
-To get the security token: https://onlinehelp.coveo.com/en/ces/7.0/administrator/getting_the_security_token_for_your_salesforce_account.htm
 """
 
 from dlt.sources import DltResource
 from dlt.sources import incremental
 
-from typing import Iterable, Optional
+from typing import Any, Iterable
 
 import dlt
-from dlt.sources.helpers.requests import Session
 from dlt.common.typing import TDataItem
 
 from .helpers.records import get_records
-from .helpers.client import SalesforceAuth, make_salesforce_client
 
 
 @dlt.source(name="salesforce")
-def salesforce_source(
-    credentials: SalesforceAuth = dlt.secrets.value,
-    session: Optional[Session] = None,
-) -> Iterable[DltResource]:
-    client = make_salesforce_client(credentials, session)
+def salesforce_source(session: Any) -> Iterable[DltResource]:
+    # SRC-3 V-Salesforce.1 (local change 1): the `SaasSession` of the connector
+    # replaces upstream's credentials and `simple_salesforce` client.
+    client = session
 
     # define resources
     @dlt.resource(write_disposition="replace")
