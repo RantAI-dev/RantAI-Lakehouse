@@ -428,6 +428,22 @@ mod tests {
             .await;
     }
 
+    /// A rule that answers before the catch-all: the catch-all is mounted
+    /// first (in [`mart_server`]) and a rule of the same priority is decided
+    /// by insertion order, so a later rule needs the higher priority to be
+    /// the one that answers.
+    async fn rows_first(server: &MockServer, needle: &str, data: Vec<Value>) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(needle))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+            )
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
     async fn rest(server: &MockServer) {
         Mock::given(method("POST"))
             .respond_with(
@@ -820,10 +836,10 @@ mod tests {
             none["error"],
             json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
         );
-        rows(
+        rows_first(
             &server,
-            "FROM console.bi_chart",
-            vec![json!({ "board": "default", "owner_id": "", "is_deleted": 0 })],
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "default" })],
         )
         .await;
         let mut update = image("https://other.example/logo.png");

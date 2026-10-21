@@ -118,13 +118,14 @@ pub(crate) async fn require_board(ch: &ChClient, id: &str, viewer: &Viewer) -> R
     }
 }
 
-/// Require that a chart may be put on dashboard `board` (`None`, blank or the
-/// built-in board always pass; so does an id that never existed, as before).
+/// Require that a chart may be put on dashboard `board` (`None` and blank
+/// always pass, and so does the built-in board).
 ///
 /// # Errors
 ///
-/// As [`require_board`] when the dashboard is in the trash or private to
-/// somebody else.
+/// As [`require_board`]: an id that never existed is refused like one in the
+/// trash or private to somebody else, so the answer does not tell the three
+/// apart (`PR #199 review M SHOULD-FIX BI-18 1`).
 pub(crate) async fn require_chart_board(
     ch: &ChClient,
     board: Option<&str>,
@@ -138,7 +139,11 @@ pub(crate) async fn require_chart_board(
         .await
         .map_err(Gate::Store)?
     {
-        Some((2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
+        // An id that never existed used to pass, and the chart was created on
+        // a dashboard nobody has: the status code then told a caller that the
+        // id is unknown, while a private one was refused. Both are refused
+        // now, with the same sentence.
+        None | Some((2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         Some((_, owner)) if !viewer.sees(&owner) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         _ => Ok(()),
     }
@@ -225,23 +230,36 @@ pub(crate) async fn visible_live_chart_board(
 
 /// Check that an edit may write chart `id`: it is not in the trash and not on a
 /// board the viewer may not see. Returns the board it is on now, `None` for a
-/// new id (an edit of an unknown id keeps creating one, as before).
+/// chart that was removed for good.
 ///
 /// # Errors
 ///
-/// [`Gate::Missing`] for a chart in the trash or on a board the viewer cannot
-/// see; [`Gate::Store`] when the store is unreachable.
+/// [`Gate::Missing`] for a chart that never existed, one in the trash and one
+/// on a board the viewer cannot see: all three answer the same sentence, so
+/// the status code does not tell a caller that a chart of somebody else
+/// exists (`PR #199 review M SHOULD-FIX BI-18 1`); [`Gate::Store`] when the
+/// store is unreachable.
 pub(crate) async fn require_editable_chart(
     ch: &ChClient,
     id: &str,
     viewer: &Viewer,
 ) -> Result<Option<String>, Gate> {
     let Some((state, board)) = store::chart_row_state(ch, id).await.map_err(Gate::Store)? else {
-        return Ok(None);
+        // An id that never existed used to be edited into a new chart, so the
+        // status code told a caller that the chart is unknown, while one on a
+        // board they cannot see was refused.
+        return Err(Gate::Missing(CHART_NOT_FOUND));
     };
     match state {
         0 => {
-            require_chart_board(ch, Some(&board), viewer).await?;
+            // The chart's own sentence, not the dashboard's: a caller must not
+            // learn that a chart of somebody else exists.
+            require_chart_board(ch, Some(&board), viewer)
+                .await
+                .map_err(|gate| match gate {
+                    Gate::Missing(_) => Gate::Missing(CHART_NOT_FOUND),
+                    other @ Gate::Store(_) => other,
+                })?;
             Ok(Some(board))
         }
         2 => Err(Gate::Missing(CHART_NOT_FOUND)),

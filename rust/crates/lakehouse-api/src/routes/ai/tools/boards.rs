@@ -1118,7 +1118,14 @@ mod tests {
             let state = state_on(&server, true).await;
             let reply = run(&state, Some(&person()), name, &args_of(&args)).await;
             let error = reply["error"].as_str().unwrap_or_default().to_lowercase();
-            assert!(error.contains("not found"), "{name}: {reply}");
+            // The one answer for something the caller may not see: the
+            // board's own ("dashboard not found.") or the chart's ("this tile
+            // does not exist"), so a chart on that board does not say that the
+            // board exists (`PR #199 review M SHOULD-FIX BI-18 1`).
+            assert!(
+                error.contains("not found") || error.contains("does not exist"),
+                "{name}: {reply}"
+            );
             let sent = sent(&server).await;
             assert_eq!(writes(&sent), 0, "{name}: {sent:#?}");
         }

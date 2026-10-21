@@ -597,6 +597,74 @@ async fn a_chart_cannot_be_put_on_a_deleted_or_private_board() {
     }
 }
 
+/// `PR #199 review M SHOULD-FIX BI-18 1`: a chart cannot be put on a
+/// dashboard that never existed either. It used to be created there, so the
+/// status code told a caller that the id is unknown, while a private one was
+/// refused. The gate itself is checked, so the refusal cannot come from
+/// anything else.
+#[tokio::test]
+async fn a_dashboard_that_does_not_exist_is_refused_like_a_private_one() {
+    let me = Viewer::user(id_of(ME), false);
+    // An id that never existed.
+    let server = engine(vec![]).await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_never"),
+        &me,
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    // A dashboard in somebody else's personal space: the same refusal.
+    let server = engine(vec![(
+        &["SELECT is_deleted, owner_id FROM console.bi_board"],
+        vec![state_row(0, &id_of(OTHER))],
+    )])
+    .await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_never"),
+        &me,
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+/// `PR #199 review M SHOULD-FIX BI-18 1`: an edit of a chart that does not
+/// exist is refused, like one on a board the caller cannot see, so the status
+/// code does not tell the two apart.
+#[tokio::test]
+async fn an_edit_of_a_chart_that_does_not_exist_is_refused() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![]).await;
+    let refused =
+        super::super::dashboard_organise::require_editable_chart(&client(&server), "c_never", &me)
+            .await;
+    assert!(refused.is_err(), "{refused:?}");
+    // A chart on a dashboard the caller cannot see: the same sentence, so the
+    // answer does not say that a chart of somebody else exists.
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, board FROM console.bi_chart"],
+            vec![json!({ "is_deleted": 0, "board": "b_draft" })],
+        ),
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, &id_of(OTHER))],
+        ),
+    ])
+    .await;
+    let refused = super::super::dashboard_organise::require_editable_chart(
+        &client(&server),
+        "c_private",
+        &me,
+    )
+    .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a chart on a private dashboard must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "this tile does not exist");
+}
+
 #[tokio::test]
 async fn deleting_a_hidden_chart_deletes_nothing_and_says_nothing() {
     let server = engine(vec![
