@@ -1154,3 +1154,16 @@ no deployed connector breaks). The Confluence `\Z` fix: accepted.
   the source-object key). Tests for the form and the carrier.
 - Not verified and open for CI: the new Rust tests, the four new product
   entries, the job time (now about eight product entries).
+
+### Planner addendum before slice 6 (2026-10-21): the gate budget
+
+The `g6-saas` job took 16m17s on `7a8af090` with eight vendors (about 65–88
+s of product steps each, plus the stack bring-up), against the signed 20
+minutes per connector gate job (`connector-gates.md`). Workday and NetSuite
+would push it past the budget. **AD9 is amended**: slice 6 splits the gate
+into two CI jobs that run in parallel on the same scripts, selected by a
+vendor list: `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow) and
+`g6-saas-b` (Confluence, SharePoint, Dynamics 365, Workday, NetSuite). Both
+are in `ci-required` and `scripts/ci/required_gate.sh` (with its test),
+`docs/CI.md`, and slice 7's `coverage.json` names the job each type is
+proven in. No step is removed to fit the budget.
