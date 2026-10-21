@@ -325,3 +325,11 @@ def test_a_post_runs_under_the_same_rules_as_a_get() -> None:
     session, _ = make(Recorder(), http_post=redirect)
     with pytest.raises(ssrf_guard.SsrfBlocked):
         session.post_json("/search", {})
+
+
+def test_request_headers_that_are_not_credentials_are_sent_and_the_sessions_authentication_wins() -> None:
+    """Slice 5: Dataverse reads `Prefer: odata.maxpagesize` and `OData-Version`; a caller cannot override the credential."""
+    http = Recorder(Reply(body={"ok": True}))
+    session, _ = make(http)
+    session.get_json("/x", headers={"Prefer": "odata.maxpagesize=5", "Authorization": "Bearer attacker"})
+    assert http.headers == [{"Prefer": "odata.maxpagesize=5", "Authorization": "Bearer t"}]
