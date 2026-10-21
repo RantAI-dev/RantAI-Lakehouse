@@ -169,6 +169,7 @@ pub struct TimeContext {
     week_start: WeekStart,
     params: crate::params::ParamValues,
     content_sites: Vec<String>,
+    company_palette: Vec<String>,
 }
 
 impl Default for TimeContext {
@@ -180,6 +181,7 @@ impl Default for TimeContext {
             week_start: WeekStart::Monday,
             params: crate::params::ParamValues::default(),
             content_sites: Vec::new(),
+            company_palette: Vec::new(),
         }
     }
 }
@@ -196,6 +198,7 @@ impl TimeContext {
             week_start,
             params: crate::params::ParamValues::default(),
             content_sites: Vec::new(),
+            company_palette: Vec::new(),
         })
     }
 
@@ -211,6 +214,21 @@ impl TimeContext {
     #[must_use]
     pub fn content_sites(&self) -> &[String] {
         &self.content_sites
+    }
+
+    /// This context with the deployment's company palette (`BI-17` part A,
+    /// decision 6): the colours a new chart draws with when the person chose
+    /// no palette.
+    #[must_use]
+    pub fn with_company_palette(mut self, palette: Vec<String>) -> Self {
+        self.company_palette = palette;
+        self
+    }
+
+    /// The deployment's company palette (none unless a caller set it).
+    #[must_use]
+    pub fn company_palette(&self) -> &[String] {
+        &self.company_palette
     }
 
     /// This context with the parameter values of a read.

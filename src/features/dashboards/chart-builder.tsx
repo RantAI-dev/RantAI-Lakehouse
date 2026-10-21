@@ -83,7 +83,7 @@ import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
-import { formatRules, formatUsed, styleFromDef, stylePayload } from "@/lib/style-draft";
+import { formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
 import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
@@ -457,8 +457,9 @@ export function ChartBuilder({
   // Raw table, pivot and KPI comparison settings (BI-16 part A).
   const [tableDraft, setTableDraft] = React.useState<TableDraft>(emptyTableDraft);
   // BI-16 part B: the deployment's content sites, a progress bar's goal, a bullet's bands, a histogram's ranges, a card's address.
-  const { contentSites } = useReporting();
+  const { contentSites, companyPalette } = useReporting();
   const sites = contentSites ?? [];
+  const palette = companyPalette ?? [];
   const [typeDraft, setTypeDraft] = React.useState<TypeDraft>(emptyTypeDraft);
   const changeType = (patch: Partial<TypeDraft>) => setTypeDraft((d) => ({ ...d, ...patch }));
   const isText = kind === "text";
@@ -1043,7 +1044,12 @@ export function ChartBuilder({
       };
     }
     // BI-17 part A: only the groups this kind takes, with empty ones left out.
-    if (!isStaticTile) Object.assign(payload, stylePayload(style, fmtRules));
+    // A new chart in a deployment with a company palette draws with it
+    // (decision 6, `PR #199 review M SHOULD-FIX BI-17 4`).
+    if (!isStaticTile) {
+      const styled = stylePayload(style, fmtRules);
+      Object.assign(payload, fmtRules.colors ? withCompanyPalette(styled, palette, isEdit) : styled);
+    }
     // A chart without marks to click (text, KPI, gauge, table, density map)
     // has no click setting; one left over from another kind is dropped.
     const clickable = kindHasClickValue(kind);

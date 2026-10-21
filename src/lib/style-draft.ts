@@ -169,6 +169,23 @@ export function stylePayload(style: StyleFields, rules: FormatRules): StyleField
   return out
 }
 
+/**
+ * The colours of a new chart in a deployment with a company palette
+ * (`BI-17` part A, decision 6): the palette the company chose, unless the
+ * person chose a palette of their own. A chart being edited keeps what it
+ * has, and a chart saved before the palette was set keeps the default it was
+ * drawn with (`PR #199 review M SHOULD-FIX BI-17 4`).
+ */
+export function withCompanyPalette(
+  style: StyleFields,
+  companyPalette: readonly string[],
+  isEdit: boolean
+): StyleFields {
+  if (isEdit || companyPalette.length < 2) return style
+  if (style.colors?.palette) return style
+  return { ...style, colors: { ...style.colors, palette: "company" } }
+}
+
 /** Whether the chart being edited uses anything in the Format section, so the section opens by itself. */
 export function formatUsed(style: StyleFields, referenceLines: number): boolean {
   return referenceLines > 0 || Object.keys(style).length > 0

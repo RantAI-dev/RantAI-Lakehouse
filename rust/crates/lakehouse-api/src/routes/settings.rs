@@ -244,7 +244,13 @@ pub(crate) async fn time_context(state: &AppState) -> Result<TimeContext, ApiErr
         .and_then(|w| TimeContext::new(&saved.time_zone, w).ok())
         // BI-16 part B: the content sites ride in the context every chart
         // save already receives (see `TimeContext`).
-        .map(|ctx| ctx.with_content_sites(saved.content_sites.clone()))
+        .map(|ctx| {
+            ctx.with_content_sites(saved.content_sites.clone())
+                // BI-17 part A, decision 6: the company palette rides in the
+                // context every chart save already receives, so the
+                // assistant's `create_chart` can draw a new chart with it.
+                .with_company_palette(saved.company_palette.clone())
+        })
         .ok_or_else(|| ApiError::Internal("The reporting settings are invalid.".to_owned()))
 }
 

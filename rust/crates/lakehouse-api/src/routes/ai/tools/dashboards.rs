@@ -49,10 +49,27 @@ pub(super) async fn create_chart(
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
-    let input = match parse_chart_input(args) {
+    let mut input = match parse_chart_input(args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
+    // chart in a deployment with a company palette draws with it. A palette
+    // the model chose is kept, and a chart that already exists keeps what it
+    // has (that is `update_chart`, which does not come here).
+    if time.company_palette().len() >= 2
+        && input
+            .style
+            .colors
+            .as_ref()
+            .is_none_or(|colors| colors.palette.is_none())
+    {
+        input
+            .style
+            .colors
+            .get_or_insert_with(Default::default)
+            .palette = Some("company".to_owned());
+    }
     // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
     // else's personal space.
     if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer_for(principal)).await
@@ -631,6 +648,57 @@ mod tests {
         all.iter()
             .filter(|s| s.starts_with("SELECT") && s.contains("serving.mart_x"))
             .collect()
+    }
+
+    /// `PR #199 review M SHOULD-FIX BI-17 4` (decision M5): a new chart in a
+    /// deployment with a company palette draws with it. A palette the model
+    /// chose is kept.
+    #[tokio::test]
+    async fn a_new_chart_draws_with_the_company_palette_when_the_model_chooses_none() {
+        let time = lakehouse_bi::grain::TimeContext::default()
+            .with_company_palette(vec!["#112233".to_owned(), "#445566".to_owned()]);
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let created = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        let all = sent(&server).await;
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("\"palette\":\"company\"")),
+            "{stored:#?}"
+        );
+        // A palette the model chose is kept.
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let created = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+                "colors": { "palette": "muted" },
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        let all = sent(&server).await;
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("\"palette\":\"muted\"")),
+            "{stored:#?}"
+        );
     }
 
     /// AI-5: "Show a progress bar of visitors against a goal of 1,000,000".
