@@ -952,6 +952,199 @@ def step_dynamics365() -> None:
     _log("dynamics365 forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+WD_REPORT = "isu_owner/Headcount_Report"
+WD_ACCOUNT = "wd2-impl-services1.workday.com/acme_tenant"
+NS_ACCOUNT = "1234567_SB1"
+NS_KEY: dict[str, str] = {}
+
+
+def _workday(auth: str = "integration"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import workday as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "workday", "account": WD_ACCOUNT, "objects": [WD_REPORT], "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": "stub-wd-refresh-0"}
+    else:
+        dial = {"vendor": "workday", "account": WD_ACCOUNT, "objects": [WD_REPORT], "auth": {"type": "integration"}}
+        secrets = {"username": "isu_gate@acme_tenant", "password": "wd-password"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_workday() -> None:
+    """Workday Reports (V-Workday.4): connect (the integration user over HTTP Basic, and the browser
+    sign-in with the client in the Basic header), discover (the report the connector names, always
+    re-read in full), load (one response, no paging), reload (a changed row, a new one, a deleted one:
+    the whole report comes again), a new column, rate limit, forbidden and revoked sign-in. Workday's
+    own documentation was not readable, so the mock is the developer's model of it."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("workday", action="reset")
+
+    for auth in ("integration", "oauth"):
+        _m, _vendor, _parts, session, _dial = _workday(auth)
+        rows = session.get_json(f"/ccx/service/customreport2/acme_tenant/{WD_REPORT}", {"format": "json"})["Report_Entry"]
+        _expect(len(rows) == 3, f"workday connect ({auth}): the report answered {rows!r}")
+    _log("workday connect: the integration user (HTTP Basic) and the browser sign-in (refresh grant, client in the Basic header) both reach the report")
+
+    module, _vendor, parts, session, dial = _workday()
+    declared = module.list_objects(session, parts, dial)
+    _expect([d.name for d in declared] == [WD_REPORT], f"workday discover: {[d.name for d in declared]}")
+    _expect(declared[0].load_description().startswith("re-read in full: "), f"workday discover: {declared[0].load_description()!r}")
+    _raises("SaasSetupRefused", lambda: _read(module, parts, session, dial, "isu_owner/Missing_Report"))
+    _log("workday discover: the named report, re-read in full with the reason; an unknown report is a rejected setting")
+
+    admin("workday", action="clear_log")
+    first = _read(module, parts, session, dial, WD_REPORT)
+    _expect(sorted(r["Employee_ID"] for r in first) == ["21001", "21002", "21003"], f"workday load: {first!r}")
+    _expect(len([line for line in mock_log("workday") if "customreport2" in line]) == 1, "workday load: more than one request for one report")
+    _log("workday load: 3 rows from the one response under Report_Entry")
+
+    admin("workday", action="put", id=2, fields={"Name": "person 2 changed"})
+    admin("workday", action="put", id=4)
+    admin("workday", action="delete", id=3)
+    admin("workday", action="clear_log")
+    again = _read(module, parts, session, dial, WD_REPORT)
+    _expect(sorted(r["Employee_ID"] for r in again) == ["21001", "21002", "21004"], f"workday reload: {[r['Employee_ID'] for r in again]}")
+    _expect(any(r["Name"] == "person 2 changed" for r in again), "workday reload: the changed row is not in the report")
+    _expect(not any("since" in line or "modified" in line.lower() for line in mock_log("workday")), "workday reload: a change filter was sent; the report has none")
+    _log("workday reload: the whole report again; the changed and the new row are in it and the deleted one is gone (the table is replaced)")
+
+    admin("workday", action="add_field", name="Grade")
+    _expect(all("Grade" in r for r in _read(module, parts, session, dial, WD_REPORT)), "workday schema change: the new column is not in the rows")
+    _log("workday schema change: the new column arrives in the rows; Workday has no describe, so the observer reports it after the load")
+
+    admin("workday", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, WD_REPORT)) == 3, "workday rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "workday rate limit: the Retry-After was not waited")
+    admin("workday", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, WD_REPORT))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "workday rate limit: the run report class")
+    admin("workday", action="rate_limit", count=0)
+    _log("workday rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("workday", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, WD_REPORT))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "workday forbidden: the run report class")
+    admin("workday", action="forbid", on=False)
+    admin("workday", action="revoke", on=True)
+    exc = _raises("SaasSignInRefused", lambda: _read(module, parts, session, dial, WD_REPORT))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "workday revoked: the run report class")
+    _b_module, _bv, b_parts, b_session, b_dial = _workday("oauth")
+    exc = _raises("OAuthSignInRefused", lambda: _read(_b_module, b_parts, b_session, b_dial, WD_REPORT))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "workday revoked: the browser sign-in's run report class")
+    admin("workday", action="revoke", on=False)
+    _log("workday forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
+def _netsuite_key() -> str:
+    """A private key made for this run (never a real one); its public half is registered with the mock,
+    which checks the assertion's PS256 signature."""
+    if not NS_KEY:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+        admin("netsuite", action="register_key", n=str(numbers.n), e=str(numbers.e))
+        NS_KEY["pem"] = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    return NS_KEY["pem"]
+
+
+def _netsuite(auth: str = "integration", certificate_id: str = "cert-1"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import netsuite as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "netsuite", "account": NS_ACCOUNT, "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": "stub-ns-refresh-0"}
+    else:
+        dial = {"vendor": "netsuite", "account": NS_ACCOUNT, "certificateId": certificate_id, "auth": {"type": "integration"}}
+        secrets = {"clientId": "ns-client-id", "privateKey": _netsuite_key()}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_netsuite() -> None:
+    """NetSuite (V-NetSuite.4): connect (the certificate's PS256 assertion, checked by the mock against the
+    public key, and the browser sign-in with the client in the Basic header), discover (suggested record
+    types; one with a change time and one without), load (SuiteQL pages by offset and hasMore; a table
+    without a change time by key), reload (the lagged cursor filter), a new column, rate limit, forbidden
+    and revoked sign-in, and an assertion with the wrong certificate id. No SuiteQL function was run against
+    a real account, so the mock is the developer's model of Oracle's documentation."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("netsuite", action="reset")
+    NS_KEY.clear()
+
+    for auth in ("integration", "oauth"):
+        _m, vendor, _parts, session, _dial = _netsuite(auth)
+        who = session.get_json(vendor.whoami["path"])
+        _expect(len(who.get("items") or []) == 1, f"netsuite connect ({auth}): who-am-i answered {who!r}")
+    _log("netsuite connect: the certificate (a PS256 assertion verified by the mock) and the browser sign-in (refresh grant, client in the Basic header) both reach the account")
+
+    def wrong_certificate() -> None:
+        wrong_module, _wv, wrong_parts, wrong_session, wrong_dial = _netsuite(certificate_id="other-cert")
+        _read(wrong_module, wrong_parts, wrong_session, wrong_dial, "customer")
+
+    _raises("OAuthSignInRefused", wrong_certificate)
+    _log("netsuite connect: an assertion naming another certificate id is refused")
+
+    module, _vendor, parts, session, dial = _netsuite()
+    declared = {d.name: d for d in module.list_objects(session, parts, {**dial, "objects": ["item"]})}
+    _expect({"customer", "vendor", "employee", "transaction"} <= set(declared), "netsuite discover: the suggested record types are not listed")
+    _expect(module.declaration(session, parts, dial, "customer").load_description() == "incremental", "netsuite discover: customer should load incrementally")
+    _expect(module.declaration(session, parts, dial, "item").load_description().startswith("re-read in full: "), "netsuite discover: item has no change time")
+    _raises("SaasSetupRefused", lambda: module.declaration(session, parts, dial, "nothing_here"))
+    _log("netsuite discover: the suggested record types listed; customer incremental, item re-read in full, an unknown type a rejected setting")
+
+    admin("netsuite", action="clear_log")
+    first = _read(module, parts, session, dial, "customer")
+    _expect([r["id"] for r in first] == ["1", "2", "3"], f"netsuite load: first run read {[r['id'] for r in first]}")
+    _expect(any("offset=2" in line for line in mock_log("netsuite")), "netsuite load: hasMore was not followed to the second page")
+    _expect(all("links" not in r and "modified_at" in r for r in first), "netsuite load: a record kept its links or lacks modified_at")
+    items = _read(module, parts, session, dial, "item")
+    _expect([r["id"] for r in items] == ["1", "2", "3"] and any("item.id > 2" in line for line in mock_log("netsuite")), "netsuite load: the table without a change time was not read by key")
+    _log("netsuite load: 3 customers over 2 pages by offset and hasMore; 3 items by key (id > last)")
+
+    cursor = max(r["modified_at"] for r in first) - timedelta(seconds=1)
+    admin("netsuite", action="put", id=2, fields={"companyname": "customer 2 changed"})
+    admin("netsuite", action="put", id=4)
+    admin("netsuite", action="clear_log")
+    again = _read(module, parts, session, dial, "customer", since=cursor)
+    _expect(sorted(r["id"] for r in again) == ["2", "3", "4"], f"netsuite reload: read {[r['id'] for r in again]}, expected the changed (2), the cursor's own (3) and the new (4)")
+    _expect(any("TO_TIMESTAMP" in line for line in mock_log("netsuite")), "netsuite reload: no filtered request")
+    _expect(not declared["customer"].deletes, "netsuite reload: a delete is claimed")
+    _log("netsuite reload: only the changed, the new and the cursor record came back (lastmodifieddate filter); no delete is claimed")
+
+    admin("netsuite", action="add_field", name="custentity_region")
+    _expect(any("custentity_region" in r for r in _read(module, parts, session, dial, "customer")), "netsuite schema change: the new column is not in the records")
+    _expect(not hasattr(module, "describe"), "netsuite schema change: a describe appeared; this gate expects the after-load path")
+    _log("netsuite schema change: the new column arrives in the records; NetSuite has no describe here, so the observer reports it after the load")
+
+    admin("netsuite", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, "item")) == 3, "netsuite rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "netsuite rate limit: the Retry-After was not waited")
+    admin("netsuite", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, "item"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "netsuite rate limit: the run report class")
+    admin("netsuite", action="rate_limit", count=0)
+    _log("netsuite rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("netsuite", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "item"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "netsuite forbidden: the run report class")
+    admin("netsuite", action="forbid", on=False)
+    admin("netsuite", action="revoke", on=True)
+    exc = _raises("OAuthSignInRefused", lambda: _read(module, parts, session, dial, "item"))  # the 401 asks for a new token, which is refused
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "netsuite revoked: the run report class")
+    admin("netsuite", action="revoke", on=False)
+    _log("netsuite forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def _ga4_row_ids() -> set[str]:
     """`country|date` of every row the mock holds, read from the mock when the step needs it."""
     days = admin("ga4", action="days")["days"]
@@ -1112,6 +1305,77 @@ PRODUCT_VENDORS: dict[str, dict] = {
         ],
         "reads_marker": ("deltatoken",),
     },
+    # Workday Reports (V-Workday.4): both signed ways. The integration user is HTTP Basic; the API's connection test runs the
+    # named report and looks at the status. A report is always re-read in full (replace), so the deleted row is simply gone.
+    "workday": {
+        "type": "Workday Reports", "host": "wd2-impl-services1.workday.com", "account": WD_ACCOUNT, "label": "Workday",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "isu_gate@acme_tenant", "secondary": "wd-password"},
+        "dial_extra": {"objects": [WD_REPORT]}, "load_mode": "replace", "load_text": "re-read in full",
+        "object": WD_REPORT, "target": "saas_gate_workday_headcount", "text": "name", "key": "employee_id",
+        "columns": "employee_id, name", "order": "employee_id", "row_id": lambda r: str(r["employee_id"]),
+        "preview_columns": None,
+        "first_ids": {"21001", "21002", "21003"}, "reload_ids": {"21001", "21002", "21004"},
+        "changed_id": "21002",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"Name": "person 2 changed"}},
+            {"action": "put", "id": 4},
+            {"action": "delete", "id": 3},
+        ],
+        "reads_marker": ("customreport2",),
+    },
+    "workday-browser": {
+        "vendor": "workday",
+        "type": "Workday Reports", "host": "wd2-impl-services1.workday.com", "account": WD_ACCOUNT, "label": "Workday (browser sign-in)",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-wd-refresh-0"},
+        "dial_extra": {"objects": [WD_REPORT]}, "load_mode": "replace", "load_text": "re-read in full",
+        "object": WD_REPORT, "target": "saas_gate_workday_browser_headcount", "text": "name", "key": "employee_id",
+        "columns": "employee_id, name", "order": "employee_id", "row_id": lambda r: str(r["employee_id"]),
+        "preview_columns": None,
+        "first_ids": {"21001", "21002", "21003"}, "reload_ids": {"21001", "21002", "21004"},
+        "changed_id": "21002",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"Name": "person 2 changed"}},
+            {"action": "put", "id": 4},
+            {"action": "delete", "id": 3},
+        ],
+        "reads_marker": ("customreport2",),
+    },
+    # NetSuite (V-NetSuite.4): the certificate way (the API's connection test and the orchestrator sign an assertion with the
+    # private key made for this run; the mock checks the PS256 signature) and the browser sign-in. SuiteQL pages of two.
+    "netsuite": {
+        "type": "NetSuite", "host": "1234567-sb1.suitetalk.api.netsuite.com", "account": NS_ACCOUNT, "label": "NetSuite",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "ns-client-id", "secondary": lambda: (NS_KEY.clear(), _netsuite_key())[1]},
+        "dial_extra": {"certificateId": "cert-1"},
+        "object": "customer", "target": "saas_gate_netsuite_customer", "cursor": "modified_at", "text": "companyname", "key": "id",
+        "columns": "id, companyname, modified_at", "preview_columns": None,
+        "first_ids": {"1", "2", "3"}, "reload_ids": {"1", "2", "3", "4"},
+        "changed_id": "2",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"companyname": "customer 2 changed"}},
+            {"action": "put", "id": 4},
+        ],
+        "reads_marker": ("TO_TIMESTAMP",),
+    },
+    "netsuite-browser": {
+        "vendor": "netsuite",
+        "type": "NetSuite", "host": "1234567-sb1.suitetalk.api.netsuite.com", "account": NS_ACCOUNT, "label": "NetSuite (browser sign-in)",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-ns-refresh-0"},
+        "object": "customer", "target": "saas_gate_netsuite_browser_customer", "cursor": "modified_at", "text": "companyname", "key": "id",
+        "columns": "id, companyname, modified_at", "preview_columns": None,
+        "first_ids": {"1", "2", "3"}, "reload_ids": {"1", "2", "3", "4"},
+        "changed_id": "2",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"companyname": "customer 2 changed"}},
+            {"action": "put", "id": 4},
+        ],
+        "reads_marker": ("TO_TIMESTAMP",),
+    },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
     "salesforce": {
@@ -1232,7 +1496,12 @@ def step_product(vendor_id: str) -> None:
         json={
             "adapter": "saas", "ingestMode": "batch",
             "dial": {"vendor": vendor_id, "account": spec["account"], "auth": spec.get("auth", {"type": "integration"}), **spec.get("dial_extra", {})},
-            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": spec.get("primary_key") or [spec.get("key", "id")]}],
+            "sourceObjects": [
+                # Workday's report is re-read in full every run (slice 6): the table is replaced and nothing is merged
+                {"name": obj, "target": target, "loadMode": spec["load_mode"]}
+                if spec.get("load_mode")
+                else {"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": spec.get("primary_key") or [spec.get("key", "id")]}
+            ],
         },
         timeout=15,
     )
@@ -1251,7 +1520,8 @@ def step_product(vendor_id: str) -> None:
     listing = matrix.discovery_answer(cid, "list", {})
     found = next((o for o in listing.get("objects") or [] if o.get("name") == obj), None)
     _expect(listing.get("state") == "done" and found is not None, f"{vendor_id} discover: the list is {listing.get('state')!r} {listing.get('errorClass')!r}, without {obj!r}")
-    _expect(found.get("load") == "incremental", f"{vendor_id} discover: {obj} should say it loads incrementally, says {found.get('load')!r}")
+    load_text = spec.get("load_text", "incremental")
+    _expect(str(found.get("load")).startswith(load_text) and (load_text != "incremental" or found.get("load") == "incremental"), f"{vendor_id} discover: {obj} should say it loads as {load_text!r}, says {found.get('load')!r}")
     if spec.get("object_label"):
         # Slice 5 review BLOCKER 14: the list comes with a label for a person; the object's name stays the ids.
         _expect(found.get("label") == spec["object_label"], f"{vendor_id} discover: {obj} should be labelled {spec['object_label']!r}, is {found.get('label')!r}")
@@ -1331,6 +1601,11 @@ def step_product(vendor_id: str) -> None:
         _expect(len(by_id) == 6, f"{vendor_id} reload: a row was lost or stored twice")
     elif vendor_id == "servicenow":
         _expect(len(by_id) == 4, "servicenow reload: an incident was lost or stored twice")
+    elif vendor_id == "workday":
+        # the table is replaced by the whole report: the deleted row is gone, the new one is in, none twice
+        _expect(set(by_id) == wanted_reload and len(ids) == 3, f"workday reload: Bronze holds {sorted(ids)}")
+    elif vendor_id == "netsuite":
+        _expect(len(by_id) == 4, "netsuite reload: a customer was lost or stored twice")
     elif vendor_id == "zendesk":
         _expect(by_id["3"]["status"] == "deleted", "zendesk reload: the deleted ticket does not say status = deleted in Bronze")
         _expect(len(by_id) == 7, "zendesk reload: a ticket was lost")
@@ -1351,6 +1626,8 @@ def step_product(vendor_id: str) -> None:
              "sharepoint": "the changed and the new item merged on id from the saved delta link, no duplicate; the deleted item says is_deleted",
              "dynamics365": "the changed and the new row merged on the key, no duplicate" + ("; the deleted row says is_deleted (change tracking)" if spec.get("deleted_id") else " (a table without tracking claims no delete)"),
              "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
+             "workday": "the whole report read again and the table replaced: the changed and the new row are in it, the deleted one is gone, none twice",
+             "netsuite": "the changed and the new customer merged on id from the lagged lastmodifieddate filter, no duplicate (no delete is claimed)",
          }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
 
     # revoked sign-in, through the API's test and a run.
@@ -1380,6 +1657,8 @@ VENDOR_STEPS = {
     "confluence": lambda: step_confluence(),
     "sharepoint": lambda: step_sharepoint(),
     "dynamics365": lambda: step_dynamics365(),
+    "workday": lambda: step_workday(),
+    "netsuite": lambda: step_netsuite(),
 }
 
 
