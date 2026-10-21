@@ -14,7 +14,9 @@
 //! # What this slice tests
 //!
 //! A browser sign-in (refresh token, then an access token from the vendor's
-//! token endpoint, the client authenticating as the vendor table says) and an integration credential that is a single token. An
+//! token endpoint, the client authenticating as the vendor table says), an integration credential that is a single token, Zendesk's
+//! email + API token, and Google Analytics' service-account key (an RS256 JWT-bearer exchange,
+//! slice 3 review BLOCKER 10). An
 //! integration credential of another shape (a pair, a key file) answers
 //! `supported: false` with a reason until its vendor's own task teaches this
 //! module the vendor's scheme (plan Vn.3): "unsupported, honestly".
@@ -139,7 +141,7 @@ async fn access_token(
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
             refreshed_access(request, client_id, secrets, internal_hosts, oauth).await
         }
-        SaasAuth::Integration => integration_access(request, secrets).await,
+        SaasAuth::Integration => integration_access(request, secrets, internal_hosts, oauth).await,
     }
 }
 
@@ -229,6 +231,8 @@ async fn refreshed_access(
 async fn integration_access(
     request: &Request<'_>,
     secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
 ) -> Result<Access, Outcome> {
     let fields = request
         .vendor
@@ -259,6 +263,10 @@ async fn integration_access(
             basic: true,
         });
     }
+    // Slice 3 review BLOCKER 10 (decision 3): Google's service-account key is exchanged for a token.
+    if request.vendor.id == "ga4" && fields == ["serviceAccountJson"] {
+        return service_account_access(request, secrets, internal_hosts, oauth).await;
+    }
     if fields != ["token"] {
         return Err(Outcome::not_testable_with(format!(
             "This build cannot test {}'s integration credential from the console yet. \
@@ -268,6 +276,96 @@ async fn integration_access(
     }
     Ok(Access {
         token: resolve(secrets.resolver, secrets.primary).await?,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The claims of Google's JWT-bearer assertion
+/// (<https://developers.google.com/identity/protocols/oauth2/service-account>):
+/// `iss` the service account, `scope`, `aud` always Google's token address, `iat`, and
+/// `exp` at most one hour after `iat`.
+#[derive(serde::Serialize)]
+struct AssertionClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: u64,
+    exp: u64,
+}
+
+/// An assertion lives 50 minutes: under Google's one-hour maximum, with room for a clock
+/// that runs fast.
+const ASSERTION_SECONDS: u64 = 3000;
+
+/// `(client_email, private_key)` of a service-account key file, the key kept as a
+/// [`SecretValue`] so it is never printed. `None` for anything else.
+fn parse_service_account(file: &SecretValue) -> Option<(String, SecretValue)> {
+    let document: serde_json::Value = serde_json::from_str(file.expose_secret()).ok()?;
+    if document.get("type")?.as_str()? != "service_account" {
+        return None;
+    }
+    Some((
+        document.get("client_email")?.as_str()?.to_owned(),
+        SecretValue::new(document.get("private_key")?.as_str()?.to_owned()),
+    ))
+}
+
+/// The signed assertion (RS256, with the workspace's `jsonwebtoken`) for `vendor`'s first
+/// scope, addressed to the vendor table's token address and never to anything in the key
+/// file. `None` when the key is not an RSA private key or the clock is unreadable.
+fn sign_assertion(
+    vendor: &SaasVendor,
+    email: &str,
+    key: &SecretValue,
+    now: u64,
+) -> Option<SecretValue> {
+    let claims = AssertionClaims {
+        iss: email,
+        scope: vendor.oauth.scopes.first()?,
+        aud: vendor.oauth.token_url,
+        iat: now,
+        exp: now + ASSERTION_SECONDS,
+    };
+    let encoding = jsonwebtoken::EncodingKey::from_rsa_pem(key.expose_secret().as_bytes()).ok()?;
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &encoding)
+        .ok()
+        .map(SecretValue::new)
+}
+
+/// Google's service-account key (slice 3 review BLOCKER 10, decision 3): the key file is
+/// resolved only now (after the address check), signed into an RS256 assertion and
+/// exchanged at the token address with `grant_type=...:jwt-bearer` for a bearer token.
+/// A key file that is not one, or a key that cannot sign, is a fixed misconfiguration
+/// message that quotes nothing of the file.
+async fn service_account_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let file = resolve(secrets.resolver, secrets.primary).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let assertion = parse_service_account(&file)
+        .and_then(|(email, key)| sign_assertion(request.vendor, &email, &key, now))
+        .ok_or_else(|| {
+            Outcome::misconfigured(
+                "connector is misconfigured: the Google service-account key is not a valid key file",
+            )
+        })?;
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        ("assertion", assertion.expose_secret()),
+    ];
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
         rotated: None,
         basic: false,
     })
@@ -768,5 +866,127 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.supported);
         assert!(outcome.latency_ms.is_none());
+    }
+
+    /// Slice 3 review BLOCKER 10: Google's service-account key is signed into an RS256
+    /// assertion (checked here with the public half), exchanged for a bearer token, and
+    /// that token reaches the property.
+    #[tokio::test]
+    async fn a_service_account_key_is_exchanged_for_a_token_with_a_signed_assertion() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let private_pem = private.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let public_pem = private
+            .to_public_key()
+            .to_pkcs1_pem(LineEnding::LF)
+            .unwrap();
+        let key_file = serde_json::json!({
+            "type": "service_account",
+            "client_email": "reader@example.invalid",
+            "private_key": private_pem.as_str(),
+            "token_uri": "https://evil.example.invalid/token"
+        })
+        .to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "sa-access", "expires_in": 3599, "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer sa-access"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("KEY".to_owned(), key_file);
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "ga4",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:KEY",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let received = server.received_requests().await.unwrap();
+        let body = String::from_utf8(received[0].body.clone()).unwrap();
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            form["grant_type"],
+            "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        );
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_audience(&["https://oauth2.googleapis.com/token"]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &form["assertion"],
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("the assertion verifies against the public half");
+        assert_eq!(decoded.claims["iss"], "reader@example.invalid");
+        assert_eq!(
+            decoded.claims["scope"],
+            "https://www.googleapis.com/auth/analytics.readonly"
+        );
+        let span =
+            decoded.claims["exp"].as_u64().unwrap() - decoded.claims["iat"].as_u64().unwrap();
+        assert!(span <= 3600, "Google: at most one hour after iat");
+        assert!(
+            !outcome.message.contains("evil.example"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// A key file that is not one is a fixed message that quotes nothing, and no request goes out.
+    #[tokio::test]
+    async fn a_service_account_key_that_is_not_one_is_a_fixed_misconfiguration() {
+        let server = MockServer::start().await;
+        let mut map = HashMap::new();
+        map.insert(
+            "KEY".to_owned(),
+            "not a key file, secret-looking-text".to_owned(),
+        );
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "ga4",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:KEY",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("not a valid key file"));
+        assert!(!outcome.message.contains("secret-looking-text"));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

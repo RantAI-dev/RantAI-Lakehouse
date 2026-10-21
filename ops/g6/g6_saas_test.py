@@ -622,6 +622,28 @@ PRODUCT_VENDORS: dict[str, dict] = {
         "reload_ready": lambda rows: any(r["sessions_integer"] == 99 for r in rows),
         "reads_marker": ("runReport",),
     },
+    # Slice 3 review BLOCKER 10: the other signed way into GA4, the service-account key. The API's connection test
+    # exchanges an RS256 assertion for a token (the mock checks the signature against the public half of the key made
+    # for this step), and a load does the same in the orchestrator.
+    "ga4-key": {
+        "vendor": "ga4",
+        "type": "Google Analytics 4", "host": "analyticsdata.googleapis.com", "account": "123", "label": "Google Analytics 4 (service-account key)",
+        "auth": {"type": "integration"},
+        "dial_extra": {"objects": [GA4_REPORT]},
+        "credential": {"source": "file", "primary": "secret_key"},
+        "values": {"primary": lambda: (GA4_KEY.clear(), _ga4_key_file())[1]},
+        "object": GA4_REPORT, "target": "saas_gate_ga4_key_traffic", "cursor": "date", "text": "country", "primary_key": ["country", "date"],
+        "columns": "country, date, sessions_integer", "order": "country, date",
+        "row_id": lambda r: f"{r['country']}|{str(r['date'])[:10]}",
+        "preview_columns": {"country", "date", "sessions_INTEGER", "purchaseRevenue_CURRENCY"},
+        "first_ids": lambda: _ga4_row_ids(), "reload_ids": lambda: _ga4_row_ids(),
+        "changes": [
+            {"action": "put", "days_ago": 0, "country": "ID", "metrics": {"sessions": 99}},
+            {"action": "put", "days_ago": 2, "country": "US", "metrics": {"sessions": 55}},
+        ],
+        "reload_ready": lambda rows: any(r["sessions_integer"] == 99 for r in rows),
+        "reads_marker": ("runReport",),
+    },
 }
 
 
@@ -660,16 +682,19 @@ def _run_and_wait(connector_id: str, label: str) -> None:
 
 def step_product(vendor_id: str) -> None:
     """connect, discover, load, reload and a revoked sign-in for one vendor, through the product."""
-    spec = PRODUCT_VENDORS[vendor_id]
+    product_key = vendor_id
+    spec = PRODUCT_VENDORS[product_key]
+    vendor_id = spec.get("vendor", product_key)  # a second way of signing in to one vendor is its own entry
     label, obj, target, text = spec["label"], spec["object"], spec["target"], spec["text"]
     started = time.time()
 
-    created = matrix._create_connector(name=f"g6-saas-{vendor_id}", kind=spec["type"], host=spec["host"], credential=spec["credential"])
+    created = matrix._create_connector(name=f"g6-saas-{product_key}", kind=spec["type"], host=spec["host"], credential=spec["credential"])
     cid = created["id"]
     derived = created.get("credential") or {}
     for slot in ("primary", "secondary"):
-        if spec["values"].get(slot):
-            matrix._write_credential_file(derived[slot], spec["values"][slot])
+        value = spec["values"].get(slot)
+        if value:
+            matrix._write_credential_file(derived[slot], value() if callable(value) else value)
     resp = matrix.API.put(
         f"{matrix.API_URL}/api/connectors/{cid}/ingest-spec",
         json={
@@ -802,9 +827,9 @@ def run() -> None:
     step_stub_is_up()
     step_types_are_listed_unsupported()
     _setup_vendor_environment()
-    for vendor_id in PRODUCT_VENDORS:
-        admin(vendor_id, action="reset")
-        step_product(vendor_id)
+    for product_key, spec in PRODUCT_VENDORS.items():
+        admin(spec.get("vendor", product_key), action="reset")
+        step_product(product_key)
     run_vendors()
 
 
