@@ -68,6 +68,27 @@ def describe_sobject(session: Any, sobject: str) -> Dict[str, Any]:
     return session.get_json(f"/services/data/v{API_VERSION}/sobjects/{sobject}/describe")
 
 
+def queried_fields(desc: Dict[str, Any]) -> list:
+    """The fields of a describe result that a read selects (the vendor module's
+    `describe` answers the same list, so the schema shown before a load is the one loaded).
+
+    Salesforce returns compound fields as separate fields, so the compound parent is
+    left out (but `Name`). If no fields are specified, every other field is used,
+    except a `base64` one (a file's body): Salesforce returns it as an address of its
+    own, one record per batch, never inline.
+    """
+    compound_fields = {
+        f["compoundFieldName"]
+        for f in desc["fields"]
+        if f["compoundFieldName"] is not None
+    } - {"Name"}
+    return [
+        f
+        for f in desc["fields"]
+        if f["name"] not in compound_fields and f["type"] != "base64"
+    ]
+
+
 def get_records(
     session: Any,
     sobject: str,
@@ -93,27 +114,13 @@ def get_records(
     """
     # Get all fields for the sobject
     desc = describe_sobject(session, sobject)
-    # Salesforce returns compound fields as separate fields, so we need to filter them out
-    compound_fields = {
-        f["compoundFieldName"]
-        for f in desc["fields"]
-        if f["compoundFieldName"] is not None
-    } - {"Name"}
+    fields = [f["name"] for f in queried_fields(desc)]
 
     # Fields of type "datetime" (Standard API returns ISO strings).
     # We normalize them later.
     date_fields = {
         f["name"] for f in desc["fields"] if f["type"] in ("datetime",) and f["name"]
     }
-
-    # If no fields are specified, use all fields except compound fields. A
-    # `base64` field (a file's body) is left out too: Salesforce returns it as an
-    # address of its own, one record per batch, never inline.
-    fields = [
-        f["name"]
-        for f in desc["fields"]
-        if f["name"] not in compound_fields and f["type"] != "base64"
-    ]
 
     # Generate a predicate to filter records by the replication key
     predicate, order_by, n_records = "", "", 0

@@ -52,3 +52,7 @@
    record may carry the very time of the last one read; the merge on `Id` removes the repeat.
    The sources that have no `IsDeleted` field (for example `User`) must not use `queryAll`
    for deletes; the vendor module decides per object from `describe`.
+4. **`queried_fields(desc)`** (`helpers/records.py`; `SRC-3` decision 9). The choice of
+   fields that `get_records` made inline (drop compound parents but `Name`, drop `base64`)
+   is a function, so the vendor module's `describe` shows the fields before a load from
+   the very list the load selects. No behaviour change.
