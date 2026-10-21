@@ -916,6 +916,44 @@ SharePoint, then Dynamics 365 (Vn.1 to Vn.4), base `60909de3`, through `SaasSess
 - Nothing shown in a browser; the account label change (tenant) is text only.
 - Docker images not built, compose not re-rendered (no compose file changed).
 
+### Handoff: slice 5 fix round (developer, 2026-10-21)
+
+`BLOCKER 14` (SharePoint: pick sites, show names), one commit per logical part. **The root disk filled to 41 MB free
+(from 45 GB earlier in the day, not by this work) before the end-of-round passes, so clippy and the whole dagster
+suite did NOT run; see "Not verified".**
+
+| Part | Commit | Subject |
+| --- | --- | --- |
+| carrier | `9756a0f1` | `ListedObject.label` (bounded like a name), `ObjectKind::Site`, contract, `ObjectDecl.label`, orchestrator answers (a search also matches the label) |
+| module | `9ab74d53` | SharePoint `list_fields` (the sites, `kind: site`, name = id, label = title), lists labelled `Site / List`, picked sites titled one by one |
+| console | `b2aa7abd` | `SharepointSitePicker`, `TableFinder` shows labels / filters on them / hands them on, `labelTarget`, panel saves picks into `dial.objects` |
+| gate | `c4a22475` | mock site-by-id and list `displayName`; vendor-level and product checks of the label and the site list |
+| docs | `48769749` | feature page |
+
+- The carrier is additive (`label` skipped when absent; `deny_unknown_fields` unchanged). The ingest spec still keys the
+  object by `name` (`<site id>/<list id>`); only the default Bronze table name comes from the label
+  (`intranet_team_site_tasks`), so renaming a list or site at SharePoint changes neither the key nor an existing table.
+  Two lists with the same label would get the same default target; the existing "Another table already lands here"
+  check asks the person to rename one.
+- Picks are the dial's `objects` (site ids) and take effect when the tables are saved, because discovery lists the lists of
+  the SAVED sites; the picker says so. A saved selection shows the ids until the finder has listed again (the label map is
+  per visit).
+- Vendor text (titles) is cleaned to short printable labels before it reaches the API's bounds, so a control character in
+  a title cannot make a whole listing fail validation.
+
+**Commands run, with counts**
+- `bun test src/features/connectors`: 355 pass, 0 fail (new: `sharepoint-ingest-panel.test.tsx` 4, `table-finder.test.tsx` +2, `connector-ingest-panel.test.tsx` +1). `bun run lint`: 0 errors, 6 warnings. `bun run typecheck`: no error outside `features/landing/scene`.
+- `pytest dispar_orchestrate/test_saas_sharepoint.py dispar_orchestrate/test_discover.py`: 98 passed (SharePoint 37 incl. the loader tests).
+- Gate vendor-level steps against the local stub: `PASS (43 s)`.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **`cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` did not run** after the Rust of this round (the `label` field, `ObjectKind::Site`, validation, two struct literals, the new store test cases): the disk was full. The edit is small and `cargo fmt --check` is clean, but it is not compiled.
+- **The whole dagster suite did not run** after this round (touched tests only, above). Baseline before the round: 2065 passed.
+- The new Rust store test cases did not run (no `cargo test`).
+- The product steps of `g6-saas` (the label and site-list checks added to the two SharePoint entries) did not run.
+- Nothing shown in a browser.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
