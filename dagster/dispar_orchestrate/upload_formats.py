@@ -370,6 +370,10 @@ def avro_reader(stream: BinaryIO) -> Any:
         schema = reader.writer_schema
     except Exception as exc:  # noqa: BLE001 -- fastavro raises several types for a damaged header
         raise Refused("the file is not an Avro container") from exc
+    # The codecs the API's preview reads and this job reads with nothing extra installed
+    # (snappy and zstandard need packages this image does not carry): refused alike in both.
+    if getattr(reader, "codec", "null") not in ("null", "deflate"):
+        raise Refused("the Avro file uses a compression codec this upload does not read")
     if not isinstance(schema, dict) or schema.get("type") != "record":
         raise Refused("the Avro schema is not a record")
     if _has_binary(schema):

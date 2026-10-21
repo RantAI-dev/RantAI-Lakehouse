@@ -139,6 +139,7 @@ use super::lakehouse::is_unknown_table_or_database_error;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_formats::{self, ByName, Compression, Format, Layout, Refusal};
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet::{self, ParquetInfo};
 use crate::upload_parquet_range::RangeReader;
@@ -236,9 +237,15 @@ const NO_FILE_PART: &str = "The form has no part named file.";
 const UNREADABLE: &str = "The upload could not be read.";
 const EMPTY_FILE: &str = "The file is empty.";
 const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
-const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+const WORKBOOK: &str = "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first.";
 const PARQUET: &str = "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again.";
-const OTHER_BINARY: &str = "This is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.";
+const OTHER_BINARY: &str = "This is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.";
+const GZIP: &str = "This looks like a gzip file, but its name does not end in .gz. Rename it to end in .gz (for example data.csv.gz) and upload it again.";
+const AVRO: &str = "This looks like an Avro file, but its name does not end in .avro. Rename it to end in .avro and upload it again.";
+const NOT_AVRO: &str = "This file is named .avro but is not an Avro file.";
+const NOT_AN_ARCHIVE: &str =
+    "This file is named like a .gz or .zip archive but is not one. Rename it to match what it is.";
+const ZIP_COLUMNS_DIFFER: &str = "The files of the zip archive do not all have the same columns. Remove the ones that differ before loading.";
 const EMPTY_SHEET: &str = "That sheet is empty, so there is nothing to load.";
 const EMPTY_PARQUET: &str = "That Parquet file has no rows, so there is nothing to load.";
 const SHEET_RULE: &str = "sheet must be text.";
@@ -677,6 +684,17 @@ enum Accepted {
     /// Starts like a Parquet file (or like an encrypted one) and is named
     /// `.parquet`; whether it really opens is for `upload_parquet` to say.
     Parquet,
+    /// A top-level JSON array, named `.json` (`DATA-17` slice 4).
+    Json,
+    /// JSON Lines, named `.jsonl` or `.ndjson`.
+    JsonLines,
+    /// An Avro container, named `.avro`.
+    Avro,
+    /// A gzip stream named `.gz` that holds text or JSON.
+    Gzip,
+    /// A zip archive named `.zip`; its files are listed when it is opened
+    /// ([`open_whole`](sessions)) and each time it is read.
+    Zip,
 }
 
 /// Whether the bytes of an upload are acceptable: not empty, within the cap,
@@ -703,15 +721,52 @@ fn classify_head(head: &[u8], filename: &str) -> Result<Accepted, ApiError> {
         // Not a magic `sniff` knows; the reader names the real reason.
         return Ok(Accepted::Parquet);
     }
+    let named = upload_formats::by_name(filename);
     let message = match upload_parse::sniff(head) {
-        Kind::DelimitedText => return Ok(Accepted::Text),
+        Kind::DelimitedText => return classify_text(head, named),
         Kind::Workbook if has_workbook_name(filename) => return Ok(Accepted::Workbook),
+        Kind::Workbook if named == ByName::Zip => return Ok(Accepted::Zip),
         Kind::Workbook => WORKBOOK,
         Kind::Parquet if has_parquet_name(filename) => return Ok(Accepted::Parquet),
         Kind::Parquet => PARQUET,
+        Kind::Gzip if matches!(named, ByName::Gzip(_)) => return classify_gzip(head),
+        Kind::Gzip => GZIP,
+        Kind::Avro if named == ByName::Plain(Format::Avro) => return Ok(Accepted::Avro),
+        Kind::Avro => AVRO,
         Kind::OtherBinary => OTHER_BINARY,
     };
     Err(ApiError::BadRequest(message.to_owned()))
+}
+
+/// Text by its first bytes: delimited text, unless its name says JSON, JSON Lines or an
+/// archive, in which case the first byte of the document must agree (`[` for an array, `{`
+/// for lines): the name is never enough, as for a workbook.
+fn classify_text(head: &[u8], named: ByName) -> Result<Accepted, ApiError> {
+    let first = head
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(head)
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace());
+    let refuse = |message: &str| Err(ApiError::BadRequest(message.to_owned()));
+    match named {
+        ByName::Other => Ok(Accepted::Text),
+        ByName::Plain(Format::Json) if first == Some(&b'[') => Ok(Accepted::Json),
+        ByName::Plain(Format::Json) => refuse(&Refusal::JsonNotArray.to_string()),
+        ByName::Plain(Format::JsonLines) if first == Some(&b'{') => Ok(Accepted::JsonLines),
+        ByName::Plain(Format::JsonLines) => refuse(&Refusal::JsonNotObjects.to_string()),
+        ByName::Plain(_) => refuse(NOT_AVRO),
+        ByName::Gzip(_) | ByName::Zip => refuse(NOT_AN_ARCHIVE),
+    }
+}
+
+/// A gzip stream: its first decoded bytes must be text (not another archive, not binary).
+fn classify_gzip(head: &[u8]) -> Result<Accepted, ApiError> {
+    let (inner, _more) = upload_formats::gunzip_prefix(head, 64 * 1024)
+        .map_err(|refusal| ApiError::BadRequest(refusal.to_string()))?;
+    match upload_parse::sniff(&inner) {
+        Kind::DelimitedText => Ok(Accepted::Gzip),
+        _ => Err(ApiError::BadRequest(Refusal::GzipHoldsOther.to_string())),
+    }
 }
 
 /// `POST /api/uploads` — one multipart part named `file`. 201 with the
@@ -766,8 +821,21 @@ pub async fn create(
     // A workbook or a Parquet file is opened before anything is stored: only
     // what opens is kept. (A Parquet file is opened by its footer; a page that
     // cannot be decoded is found when the file is converted.)
+    let cap = u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX);
     let (workbook, parquet) = match accepted {
-        Accepted::Text => (None, None),
+        Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => (None, None),
+        // `DATA-17` slice 4 (decision 2): what a gzip or zip file unpacks to counts toward
+        // the cap, and a bomb is refused here, before anything is stored.
+        Accepted::Gzip => {
+            let bytes = part.bytes.clone();
+            blocking(move || upload_formats::check_gzip(std::io::Cursor::new(bytes), cap)).await?;
+            (None, None)
+        }
+        Accepted::Zip => {
+            let bytes = part.bytes.clone();
+            blocking(move || upload_formats::check_zip(std::io::Cursor::new(bytes), cap)).await?;
+            (None, None)
+        }
         Accepted::Workbook => {
             let bytes = part.bytes.clone();
             (
@@ -1179,6 +1247,13 @@ pub struct PreviewResponse {
     /// the row count its footer states (`preview.rows` are the first ones).
     #[serde(skip_serializing_if = "Option::is_none")]
     parquet: Option<ParquetInfo>,
+    /// For JSON, JSON Lines, Avro, gzip and zip (`DATA-17` slice 4): what the file is
+    /// read as. Absent for text, workbooks and Parquet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout: Option<LayoutView>,
+    /// For a zip: its files and whether each has the first file's columns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive: Option<ArchiveView>,
     /// Every column with its name, its starting type and its date reading
     /// (`DATA-18`).
     column_specs: Vec<SpecView>,
@@ -1187,6 +1262,35 @@ pub struct PreviewResponse {
     /// The names and types are a table's, not a guess.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     from_table: bool,
+}
+
+/// What a file is read as (`DATA-17` slice 4).
+#[derive(Debug, Serialize)]
+pub struct LayoutView {
+    /// `delimited`, `json`, `jsonl` or `avro`.
+    format: &'static str,
+    /// `none`, `gzip` or `zip`.
+    compression: &'static str,
+}
+
+/// The files of a zip archive.
+#[derive(Debug, Serialize)]
+pub struct ArchiveView {
+    files: Vec<ArchiveFileView>,
+}
+
+/// One file of a zip archive.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveFileView {
+    /// Its name inside the archive.
+    name: String,
+    /// Its uncompressed size as the archive declares it.
+    size_bytes: u64,
+    /// How many columns its header (or keys, or fields) has.
+    columns: usize,
+    /// Whether it has the first file's columns, whatever their order.
+    matches_first: bool,
 }
 
 /// What a workbook preview adds to a [`Preview`].
@@ -1313,6 +1417,26 @@ async fn preview_with_sample(
         }
         None => {}
     }
+    // `DATA-17` slice 4: JSON, JSON Lines, Avro, gzip and zip.
+    if let Some(layout) = layout_of(&store, row).await? {
+        let sampled = layout_sample(&store, row, layout, overrides).await?;
+        return Ok((
+            PreviewResponse {
+                preview: sampled.preview,
+                workbook: None,
+                parquet: None,
+                layout: Some(LayoutView {
+                    format: layout.format.as_str(),
+                    compression: layout.compression.as_str(),
+                }),
+                archive: sampled.archive,
+                column_specs: Vec::new(),
+                sampled_rows: 0,
+                from_table: false,
+            },
+            sampled.sample,
+        ));
+    }
     // A preview reads one chunk, so "20 rows" never implies the file has only
     // 20: `truncated` says the file goes on.
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
@@ -1346,12 +1470,243 @@ async fn preview_with_sample(
             preview,
             workbook: None,
             parquet: None,
+            layout: None,
+            archive: None,
             column_specs: Vec::new(),
             sampled_rows: 0,
             from_table: false,
         },
         sample,
     ))
+}
+
+/// What an upload is read as when it is JSON, JSON Lines, Avro, gzip or zip, or `None` for
+/// everything else (text, a workbook, Parquet). The name says it, and the first bytes agreed
+/// when the file arrived ([`classify_head`]); a gzip file with no inner name is classed by its
+/// first decoded byte, and a zip by the extensions of its files.
+///
+/// # Errors
+///
+/// 400 with the reader's own sentence for a gzip or zip file that no longer opens; 503 when
+/// the object store is unavailable.
+async fn layout_of(store: &UploadStore, row: &Upload) -> Result<Option<Layout>, ApiError> {
+    Ok(match upload_formats::by_name(&row.original_filename) {
+        ByName::Other => None,
+        ByName::Plain(format) => Some(Layout {
+            compression: Compression::None,
+            format,
+        }),
+        ByName::Gzip(Some(format)) => Some(Layout {
+            compression: Compression::Gzip,
+            format,
+        }),
+        ByName::Gzip(None) => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (prefix, _more) =
+                blocking(move || upload_formats::gunzip_prefix(reader.sequential(), 4096)).await?;
+            Some(Layout {
+                compression: Compression::Gzip,
+                format: upload_formats::format_of_text(&prefix),
+            })
+        }
+        ByName::Zip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let listing = blocking(move || upload_formats::zip_listing(reader.seekable())).await?;
+            Some(Layout {
+                compression: Compression::Zip,
+                format: listing.format,
+            })
+        }
+    })
+}
+
+/// [`layout_of`] for an upload that is not a workbook or a Parquet file.
+///
+/// # Errors
+///
+/// As [`layout_of`].
+async fn layout_unless_converted(
+    state: &AppState,
+    row: &Upload,
+    conversion: Option<Conversion>,
+) -> Result<Option<Layout>, ApiError> {
+    if conversion.is_some() {
+        return Ok(None);
+    }
+    layout_of(&UploadStore::connect(&state.config).await?, row).await
+}
+
+/// What the job is told the object is: its format and its wrapper (`DATA-17` slice 4 adds
+/// the wrapper).
+fn job_kind(
+    conversion: Option<Conversion>,
+    layout: Option<Layout>,
+) -> (&'static str, &'static str) {
+    (
+        if conversion == Some(Conversion::Parquet) {
+            "parquet"
+        } else {
+            layout.map_or("delimited", |l| l.format.as_str())
+        },
+        layout.map_or("none", |l| l.compression.as_str()),
+    )
+}
+
+/// How many decoded bytes of each file after a zip's first are read to learn its columns.
+const ARCHIVE_HEADER_BYTES: usize = 256 * 1024;
+
+/// A preview and its sample, read from the decoded bytes of a layout.
+struct Sampled {
+    preview: Preview,
+    sample: Sample,
+    archive: Option<ArchiveView>,
+}
+
+/// The preview and sample of decoded bytes of one `format`: delimited text as for a CSV, JSON
+/// and Avro from their own readers (the dialect is fixed: UTF-8, comma, the keys or fields
+/// are the header).
+///
+/// # Errors
+///
+/// 400 with the refusal's sentence.
+fn sample_of(
+    format: Format,
+    bytes: &[u8],
+    truncated: bool,
+    overrides: Overrides,
+) -> Result<(Preview, Sample), ApiError> {
+    let refused = |refusal: Refusal| ApiError::BadRequest(refusal.to_string());
+    let parsed = match format {
+        Format::Delimited => {
+            let head_len = bytes.len().min(PREVIEW_BYTES);
+            let head = &bytes[..head_len];
+            let head_truncated = truncated || head_len < bytes.len();
+            if upload_parse::header_width(head, head_truncated, overrides)
+                > upload_parse::MAX_COLUMNS
+            {
+                return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
+            }
+            let preview = upload_parse::preview(head, head_truncated, overrides, PREVIEW_ROWS);
+            let rows =
+                upload_parse::sample_records(bytes, truncated, preview.using, columns::SAMPLE_ROWS);
+            let sample = Sample {
+                header: preview.columns.clone(),
+                rows,
+                declared: None,
+            };
+            return Ok((preview, sample));
+        }
+        Format::Json => upload_formats::read_json(bytes, truncated, false, columns::SAMPLE_ROWS),
+        Format::JsonLines => {
+            upload_formats::read_json(bytes, truncated, true, columns::SAMPLE_ROWS)
+        }
+        Format::Avro => upload_formats::read_avro(bytes, truncated, columns::SAMPLE_ROWS),
+    }
+    .map_err(refused)?;
+    let reading = upload_parse::Reading {
+        encoding: Encoding::Utf8,
+        delimiter: ',',
+        header_row: 0,
+    };
+    let preview = Preview {
+        detected: reading,
+        using: reading,
+        columns: parsed.columns.clone(),
+        rows: parsed.rows.iter().take(PREVIEW_ROWS).cloned().collect(),
+        truncated: parsed.more,
+    };
+    let sample = Sample {
+        header: parsed.columns,
+        rows: parsed.rows,
+        declared: parsed.declared,
+    };
+    Ok((preview, sample))
+}
+
+/// The columns of one file of an archive: its header, keys or fields.
+fn header_of(
+    format: Format,
+    bytes: &[u8],
+    truncated: bool,
+    overrides: Overrides,
+) -> Result<Vec<String>, ApiError> {
+    Ok(sample_of(format, bytes, truncated, overrides)?.1.header)
+}
+
+/// Read the first rows of a layout: the file itself, the decoded stream of a gzip file, or the
+/// first file of a zip with a check that every other file has the same columns.
+///
+/// # Errors
+///
+/// 400 with the refusal's sentence; 503 when the object store is unavailable.
+async fn layout_sample(
+    store: &UploadStore,
+    row: &Upload,
+    layout: Layout,
+    overrides: Overrides,
+) -> Result<Sampled, ApiError> {
+    let want = columns::SAMPLE_BYTES;
+    let plain = |bytes: &[u8], truncated: bool| -> Result<Sampled, ApiError> {
+        let (preview, sample) = sample_of(layout.format, bytes, truncated, overrides)?;
+        Ok(Sampled {
+            preview,
+            sample,
+            archive: None,
+        })
+    };
+    match layout.compression {
+        Compression::None => {
+            let bytes = store.head_bytes(&row.storage_key, want).await?;
+            let truncated = row.size_bytes > i64::try_from(want).unwrap_or(i64::MAX);
+            plain(&bytes, truncated)
+        }
+        Compression::Gzip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (bytes, more) =
+                blocking(move || upload_formats::gunzip_prefix(reader.sequential(), want)).await?;
+            plain(&bytes, more)
+        }
+        Compression::Zip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            let (listing, heads) = blocking(move || {
+                let listing = upload_formats::zip_listing(reader.seekable())?;
+                let mut heads = Vec::with_capacity(listing.files.len());
+                for position in 0..listing.files.len() {
+                    let limit = if position == 0 {
+                        want
+                    } else {
+                        ARCHIVE_HEADER_BYTES
+                    };
+                    heads.push(upload_formats::zip_file_prefix(
+                        reader.seekable(),
+                        position,
+                        limit,
+                    )?);
+                }
+                Ok::<_, Refusal>((listing, heads))
+            })
+            .await?;
+            let (first_bytes, first_more) = heads.first().cloned().unwrap_or_default();
+            let mut sampled = plain(&first_bytes, first_more)?;
+            let wanted = crate::upload_types::clean_names(&sampled.sample.header);
+            let mut files = Vec::with_capacity(heads.len());
+            for (info, (bytes, more)) in listing.files.iter().zip(&heads) {
+                let header = header_of(layout.format, bytes, *more, overrides)?;
+                let mut names = crate::upload_types::clean_names(&header);
+                names.sort();
+                let mut expected = wanted.clone();
+                expected.sort();
+                files.push(ArchiveFileView {
+                    name: info.name.clone(),
+                    size_bytes: info.size,
+                    columns: header.len(),
+                    matches_first: names == expected,
+                });
+            }
+            sampled.archive = Some(ArchiveView { files });
+            Ok(sampled)
+        }
+    }
 }
 
 /// The preview of a workbook: its sheet as text, read the way the load reads
@@ -1387,6 +1742,8 @@ async fn workbook_preview(
             preview,
             workbook: Some(WorkbookView { sheet: name, info }),
             parquet: None,
+            layout: None,
+            archive: None,
             column_specs: Vec::new(),
             sampled_rows: 0,
             from_table: false,
@@ -1432,6 +1789,8 @@ async fn parquet_preview(
             preview,
             workbook: None,
             parquet: Some(converted.info),
+            layout: None,
+            archive: None,
             column_specs: Vec::new(),
             sampled_rows: 0,
             from_table: false,
@@ -1523,7 +1882,12 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 fn parse_ingest_request(
     body: &[u8],
     conversion: Option<Conversion>,
+    layout: Option<Layout>,
 ) -> Result<IngestRequest, ApiError> {
+    // JSON, JSON Lines and Avro have no dialect to choose (`DATA-17` slice 4): UTF-8, a
+    // comma, and the keys or fields as the header, as for Parquet. A gzip or zip file of
+    // delimited text keeps the person's choice.
+    let fixed = conversion.is_some() || layout.is_some_and(|l| l.format != Format::Delimited);
     let bad = |message: &str| ApiError::BadRequest(message.to_owned());
     let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(body) else {
         return Err(bad(BODY_NOT_AN_OBJECT));
@@ -1537,7 +1901,7 @@ fn parse_ingest_request(
         Some(Value::String(text)) => LoadMode::parse(text).ok_or_else(|| bad(MODE_RULE))?,
         Some(_) => return Err(bad(MODE_RULE)),
     };
-    let (encoding, delimiter) = if conversion.is_some() {
+    let (encoding, delimiter) = if fixed {
         (Encoding::Utf8, ',')
     } else {
         (
@@ -1548,6 +1912,7 @@ fn parse_ingest_request(
     };
     let header_row = match (conversion, fields.get("headerRow")) {
         (Some(Conversion::Parquet), _) => 0,
+        _ if layout.is_some_and(|l| l.format != Format::Delimited) => 0,
         (_, None | Some(Value::Null)) => return Err(bad("headerRow is required.")),
         (_, Some(value)) => value.as_u64().ok_or_else(|| bad(HEADER_ROW_RULE))?,
     };
@@ -1710,7 +2075,12 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here.
-fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str, format: &str) -> Value {
+fn run_config(
+    upload_id: &str,
+    request: &IngestRequest,
+    load_key: &str,
+    (format, compression): (&str, &str),
+) -> Value {
     let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
         "ops": {
@@ -1719,7 +2089,7 @@ fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str, format: 
                     "upload_id": upload_id,
                     "storage_keys": [load_key],
                     "format": format,
-                    "compression": "none",
+                    "compression": compression,
                     "max_bytes": MAX_UPLOAD_BYTES,
                     "bronze_table_name": request.table,
                     "load_mode": request.mode.as_str(),
@@ -1760,12 +2130,30 @@ async fn check_within_limits_and_column_cap(
     pool: &PgPool,
     row: &Upload,
     request: &IngestRequest,
+    layout: Option<Layout>,
 ) -> ApiResult<LoadLimits> {
     let limits = load_limits(state);
     if !uploads::loads_under_limits(pool, &row.id, limits).await? {
         return Err(too_many_uploads().into());
     }
     let store = UploadStore::connect(&state.config).await?;
+    if let Some(layout) = layout {
+        // `DATA-17` slice 4: the same read as the preview (it refuses more than 1,000
+        // columns), and a zip whose files differ in their columns is not loaded.
+        let confirmed = Overrides {
+            encoding: Some(request.encoding),
+            delimiter: Some(request.delimiter),
+            header_row: Some(usize::try_from(request.header_row).unwrap_or(usize::MAX)),
+        };
+        let sampled = layout_sample(&store, row, layout, confirmed).await?;
+        if sampled
+            .archive
+            .is_some_and(|archive| archive.files.iter().any(|file| !file.matches_first))
+        {
+            return Err(ApiError::BadRequest(ZIP_COLUMNS_DIFFER.to_owned()).into());
+        }
+        return Ok(limits);
+    }
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     let head_is_truncated = row.size_bytes > i64::try_from(PREVIEW_BYTES).unwrap_or(i64::MAX);
     let confirmed = Overrides {
@@ -1789,13 +2177,13 @@ async fn launch(
     claimed: &Upload,
     request: &IngestRequest,
     load_key: &str,
-    format: &str,
+    kind: (&str, &str),
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_key, format),
+            &run_config(&claimed.id, request, load_key, kind),
         )
         .await
     {
@@ -1955,7 +2343,8 @@ pub async fn ingest(
     }
     // The row first: what the body must carry depends on what the upload is.
     let conversion = conversion_of(&state, &row).await?;
-    let request = parse_ingest_request(&body, conversion)?;
+    let layout = layout_unless_converted(&state, &row, conversion).await?;
+    let request = parse_ingest_request(&body, conversion, layout)?;
     let row = Settler::new(&state, pool).settle(row).await;
     if row.status == "ingesting" {
         return Err(ApiError::Conflict(ALREADY_LOADING.to_owned()).into());
@@ -1963,7 +2352,7 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
-    let limits = check_within_limits_and_column_cap(&state, pool, &row, &request).await?;
+    let limits = check_within_limits_and_column_cap(&state, pool, &row, &request, layout).await?;
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
@@ -1986,11 +2375,7 @@ pub async fn ingest(
     let load_key = converted
         .as_ref()
         .map_or(row.storage_key.as_str(), |done| done.key.as_str());
-    let format = if conversion == Some(Conversion::Parquet) {
-        "parquet"
-    } else {
-        "delimited"
-    };
+    let kind = job_kind(conversion, layout);
     // Review finding B4: the name is claimed here, in one statement the
     // database arbitrates, and not before. `false` is a tenant that took the
     // name between the checks above and now, or one whose claim was always
@@ -2043,7 +2428,7 @@ pub async fn ingest(
         }
     };
 
-    let run_id = launch(&state, pool, &claimed, &request, load_key, format).await?;
+    let run_id = launch(&state, pool, &claimed, &request, load_key, kind).await?;
     let attached = finish_launch_and_audit(
         pool,
         &principal,
@@ -2266,15 +2651,15 @@ mod tests {
         // changed with what is accepted.
         assert_eq!(
             refusal(b"PK\x03\x04rest of a zip"),
-            "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
+            "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first."
         );
         assert!(refusal(&[0xD0, 0xCF, 0x11, 0xE0, 1, 2, 3, 4]).contains("workbook"));
         assert_eq!(
             refusal(b"PAR1\x15\x04rest"),
             "This looks like a Parquet file, but its name does not end in .parquet. Rename it to end in .parquet and upload it again."
         );
-        assert!(refusal(b"%PDF-1.7 ...").contains("not a delimited text file"));
-        assert!(refusal(b"a,b\0c,d").contains("not a delimited text file"));
+        assert!(refusal(b"%PDF-1.7 ...").contains("not a file this upload reads"));
+        assert!(refusal(b"a,b\0c,d").contains("not a file this upload reads"));
     }
 
     /// A Parquet file is accepted by its first bytes AND a `.parquet` name;
@@ -2344,7 +2729,7 @@ mod tests {
     #[test]
     fn a_parquet_load_reads_neither_a_dialect_nor_a_header_row() {
         let bare = json!({ "bronzeTable": "orders_raw" });
-        let request = parse_ingest_request(&body(&bare), Some(Conversion::Parquet)).unwrap();
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Parquet), None).unwrap();
         assert_eq!(request.encoding, Encoding::Utf8);
         assert_eq!(request.delimiter, ',');
         assert_eq!(request.header_row, 0);
@@ -2353,13 +2738,13 @@ mod tests {
         sent["headerRow"] = json!(5);
         sent["encoding"] = json!("utf-16");
         sent["delimiter"] = json!(";");
-        let request = parse_ingest_request(&body(&sent), Some(Conversion::Parquet)).unwrap();
+        let request = parse_ingest_request(&body(&sent), Some(Conversion::Parquet), None).unwrap();
         assert_eq!((request.header_row, request.encoding), (0, Encoding::Utf8));
         // The rest of the body is checked as for any upload.
         let mut bad_table = bare;
         bad_table["bronzeTable"] = json!("Orders");
         assert_eq!(
-            parse_ingest_request(&body(&bad_table), Some(Conversion::Parquet))
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Parquet), None)
                 .unwrap_err()
                 .to_string(),
             TABLE_NAME_RULE
@@ -2381,15 +2766,72 @@ mod tests {
                 "{name}"
             );
         }
-        for name in [
-            "a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.csv", "a", "a.docx", "",
-        ] {
+        for name in ["a.xlsm", "a.xlsb", "a.ods", "a.csv", "a", "a.docx", ""] {
             assert!(check_file(zip, name).is_err(), "{name}");
             assert!(check_file(&ole, name).is_err(), "{name}");
         }
         for name in ["a.xls", "a.xlsx", "a.csv", "a"] {
             assert_eq!(check_file(b"id,name\n1,a\n", name).unwrap(), Accepted::Text);
         }
+        // `DATA-17` slice 4: a `.zip` is an archive; its files are checked when it is opened.
+        assert_eq!(check_file(zip, "a.zip").unwrap(), Accepted::Zip);
+    }
+
+    /// `DATA-17` slice 4: each new kind needs its first bytes AND its name; a name alone
+    /// never makes a file one, as for a workbook.
+    #[test]
+    fn json_jsonl_avro_gzip_and_zip_need_both_their_first_bytes_and_their_name() {
+        let gzip = |data: &[u8]| {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(data).unwrap();
+            encoder.finish().unwrap()
+        };
+        let gz = gzip(b"id,name\n1,a\n");
+        let avro = b"Obj\x01\x04\x16avro.schema";
+        assert_eq!(
+            check_file(b" [{\"a\": 1}]", "a.json").unwrap(),
+            Accepted::Json
+        );
+        assert_eq!(
+            check_file(b"\xef\xbb\xbf[]", "A.JSON").unwrap(),
+            Accepted::Json
+        );
+        assert_eq!(
+            check_file(b"{\"a\": 1}\n", "a.jsonl").unwrap(),
+            Accepted::JsonLines
+        );
+        assert_eq!(
+            check_file(b"{\"a\": 1}\n", "a.ndjson").unwrap(),
+            Accepted::JsonLines
+        );
+        assert_eq!(check_file(avro, "a.avro").unwrap(), Accepted::Avro);
+        assert_eq!(check_file(&gz, "a.csv.gz").unwrap(), Accepted::Gzip);
+        assert_eq!(check_file(&gz, "a.gz").unwrap(), Accepted::Gzip);
+        // A name that says JSON over text that is not an array, an object per line, or Avro.
+        let refused = |bytes: &[u8], name: &str| check_file(bytes, name).unwrap_err().to_string();
+        assert_eq!(
+            refused(b"id,name\n1,a\n", "a.json"),
+            "A JSON file must hold an array of objects."
+        );
+        assert_eq!(
+            refused(b"{\"a\": 1}", "a.json"),
+            "A JSON file must hold an array of objects."
+        );
+        assert!(refused(b"[1]", "a.jsonl").contains("must be a JSON object"));
+        assert!(refused(b"id,name\n", "a.avro").contains("is not an Avro file"));
+        assert!(refused(b"id,name\n", "a.gz").contains("is not one"));
+        assert!(refused(b"id,name\n", "a.zip").contains("is not one"));
+        // The right bytes under the wrong name.
+        assert!(refused(&gz, "a.csv").contains("does not end in .gz"));
+        assert!(refused(&gz, "a.json").contains("does not end in .gz"));
+        assert!(refused(avro, "a.csv").contains("does not end in .avro"));
+        assert!(refused(b"PK\x03\x04x", "a.docx").contains("not named like one"));
+        // A gzip file must hold text: another gzip, a zip, or binary data is refused.
+        assert!(refused(&gzip(&gz), "a.gz").contains("not another archive"));
+        assert!(refused(&gzip(b"PK\x03\x04x"), "a.gz").contains("not another archive"));
+        assert!(refused(&gzip(b"%PDF-1.7 ..."), "a.gz").contains("must hold a CSV"));
     }
 
     #[test]
@@ -2518,14 +2960,14 @@ mod tests {
     }
 
     fn refusal_of(value: &Value) -> String {
-        parse_ingest_request(&body(value), None)
+        parse_ingest_request(&body(value), None, None)
             .unwrap_err()
             .to_string()
     }
 
     #[test]
     fn a_complete_body_is_accepted_and_mode_defaults_to_replace() {
-        let request = parse_ingest_request(&body(&valid()), None).unwrap();
+        let request = parse_ingest_request(&body(&valid()), None, None).unwrap();
         assert_eq!(
             request,
             IngestRequest {
@@ -2543,7 +2985,7 @@ mod tests {
         full["encoding"] = json!("utf-16");
         full["delimiter"] = json!("\t");
         full["headerRow"] = json!(4);
-        let request = parse_ingest_request(&body(&full), None).unwrap();
+        let request = parse_ingest_request(&body(&full), None, None).unwrap();
         assert_eq!(request.mode, LoadMode::Append);
         assert_eq!(request.encoding, Encoding::Utf16);
         assert_eq!(request.delimiter, '\t');
@@ -2551,7 +2993,9 @@ mod tests {
         let mut null_mode = valid();
         null_mode["mode"] = Value::Null;
         assert_eq!(
-            parse_ingest_request(&body(&null_mode), None).unwrap().mode,
+            parse_ingest_request(&body(&null_mode), None, None)
+                .unwrap()
+                .mode,
             LoadMode::Replace
         );
     }
@@ -2611,7 +3055,7 @@ mod tests {
         };
         let longest = "a".repeat(128);
         for ok in ["a", "a1", "a_1", "sap_material_master", longest.as_str()] {
-            let request = parse_ingest_request(&body(&with_table(ok)), None).unwrap();
+            let request = parse_ingest_request(&body(&with_table(ok)), None, None).unwrap();
             assert_eq!(request.table, ok);
         }
         let too_long = "a".repeat(129);
@@ -2643,7 +3087,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_a_json_object_is_refused_without_serde_text() {
         for raw in [&b""[..], b"not json", b"[1]", b"\"x\"", b"null", b"{"] {
-            let err = parse_ingest_request(raw, None).unwrap_err();
+            let err = parse_ingest_request(raw, None, None).unwrap_err();
             assert_eq!(err.status(), 400);
             assert_eq!(err.to_string(), "The request body must be a JSON object.");
         }
@@ -2673,18 +3117,18 @@ mod tests {
         v["encoding"] = json!("utf-16");
         v["delimiter"] = json!(";");
         v["sheet"] = json!("Quirks");
-        let request = parse_ingest_request(&body(&v), Some(Conversion::Workbook)).unwrap();
+        let request = parse_ingest_request(&body(&v), Some(Conversion::Workbook), None).unwrap();
         assert_eq!(request.encoding, Encoding::Utf8);
         assert_eq!(request.delimiter, ',');
         assert_eq!(request.sheet.as_deref(), Some("Quirks"));
         // Not read at all, so not required either.
         let bare = json!({ "bronzeTable": "stock_raw", "headerRow": 2 });
-        let request = parse_ingest_request(&body(&bare), Some(Conversion::Workbook)).unwrap();
+        let request = parse_ingest_request(&body(&bare), Some(Conversion::Workbook), None).unwrap();
         assert_eq!(request.header_row, 2);
         assert_eq!(request.sheet, None);
         // Still required and checked for a text file.
         assert_eq!(
-            parse_ingest_request(&body(&bare), None)
+            parse_ingest_request(&body(&bare), None, None)
                 .unwrap_err()
                 .to_string(),
             "encoding is required."
@@ -2693,7 +3137,7 @@ mod tests {
         let mut bad_table = bare.clone();
         bad_table["bronzeTable"] = json!("Orders");
         assert_eq!(
-            parse_ingest_request(&body(&bad_table), Some(Conversion::Workbook))
+            parse_ingest_request(&body(&bad_table), Some(Conversion::Workbook), None)
                 .unwrap_err()
                 .to_string(),
             TABLE_NAME_RULE
@@ -2711,7 +3155,7 @@ mod tests {
             (None, &bad_text_sheet),
         ] {
             assert_eq!(
-                parse_ingest_request(&body(body_with_bad_sheet), conversion)
+                parse_ingest_request(&body(body_with_bad_sheet), conversion, None)
                     .unwrap_err()
                     .to_string(),
                 "sheet must be text."
@@ -2724,13 +3168,14 @@ mod tests {
         let request = parse_ingest_request(
             &body(&json!({ "bronzeTable": "stock_raw", "headerRow": 1, "sheet": "Stock" })),
             Some(Conversion::Workbook),
+            None,
         )
         .unwrap();
         let config = run_config(
             "up-1",
             &request,
             "uploads/t/up-1.xlsx.converted.csv",
-            "delimited",
+            ("delimited", "none"),
         );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(job["upload_id"], "up-1");

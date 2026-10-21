@@ -70,6 +70,7 @@ use super::{
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
+use crate::upload_formats;
 use crate::upload_limits::too_many_uploads;
 use crate::upload_parquet;
 use crate::upload_parquet_range::RangeReader;
@@ -590,11 +591,29 @@ async fn open_whole(
     accepted: Accepted,
     declared: u64,
 ) -> Result<WholeFacts, ApiError> {
-    if accepted == Accepted::Text {
-        return Ok(WholeFacts {
-            workbook: None,
-            parquet: None,
-        });
+    let nothing = || WholeFacts {
+        workbook: None,
+        parquet: None,
+    };
+    let cap = u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX);
+    match accepted {
+        Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => {
+            return Ok(nothing());
+        }
+        // `DATA-17` slice 4 (decision 2): the whole file is decoded once, by range and
+        // never held, to count what it unpacks to against the cap: a bomb is refused (and
+        // removed by the caller) before it can be loaded.
+        Accepted::Gzip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            blocking(move || upload_formats::check_gzip(reader.sequential(), cap)).await?;
+            return Ok(nothing());
+        }
+        Accepted::Zip => {
+            let reader = RangeReader::open(store, &row.storage_key).await?;
+            blocking(move || upload_formats::check_zip(reader.seekable(), cap)).await?;
+            return Ok(nothing());
+        }
+        Accepted::Parquet | Accepted::Workbook => {}
     }
     if accepted == Accepted::Parquet {
         // `DATA-17` T2.2: only the footer is read, by range. The file is never
@@ -622,10 +641,7 @@ async fn open_whole(
                 parquet: None,
             })
         }
-        Accepted::Parquet | Accepted::Text => Ok(WholeFacts {
-            workbook: None,
-            parquet: None,
-        }),
+        _ => Ok(nothing()),
     }
 }
 

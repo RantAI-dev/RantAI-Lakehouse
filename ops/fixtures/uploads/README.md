@@ -105,3 +105,26 @@ The Rust side (`rust/crates/lakehouse-api/src/upload_types.rs`) and the job
 (`dagster/dispar_orchestrate/upload_types.py`) each have a test that reads them, so
 the guess in the preview and the cast in the load follow one set of rules
 (ADR 0014 decision 3, extended to types). Their `_about` fields say what each holds.
+
+## `formats/`: JSON, JSON Lines, Avro, gzip and zip (`DATA-17` slice 4)
+
+A second set, read by two suites that must agree: the API's preview
+(`rust/crates/lakehouse-api/src/upload_formats.rs` and its route tests) and the
+load job (`dagster/dispar_orchestrate/test_upload_formats.py`). `make_fixtures.py`
+regenerates the files (deterministically: fixed timestamps and sync marker); the
+`*.expected.json` beside them are written by hand, so the script does not test
+itself.
+
+`<file>.expected.json` has `columns` (the keys, fields or header cells) and
+`rows` (the cells as the table holds them: a string as it is, `true`/`false`, a
+number as written, a missing key or `null` as `null`, and a nested object or
+array as compact JSON in the source's key order). `orders.avro.expected.json`
+adds `declared`, the starting type of each column (decision 10 of
+`upload-column-types.md`); `three.zip.expected.json` adds `entries` (the files a
+load reads, folders left out) and lists the rows of ALL files, while the API's
+preview shows the first file's. The numbers are chosen so that both readers write
+them the same (`1.5`, `12`, `0.25`): the load keeps the digits the source wrote
+(`1.50`), the preview shows `serde_json`'s shortest form; that is the only
+difference between the two.
+
+The dialect tests above skip this directory (`the_fixture_directory_holds_exactly_the_listed_fixtures`).

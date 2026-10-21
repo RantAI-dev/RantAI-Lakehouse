@@ -186,6 +186,18 @@ def test_an_avro_file_with_a_binary_column_or_a_scalar_schema_or_other_bytes_is_
         assert harness.loads == []
 
 
+def test_an_avro_file_with_a_codec_other_than_null_or_deflate_is_unreadable_and_deflate_loads():
+    schema = fastavro.parse_schema({"type": "record", "name": "R", "fields": [{"name": "a", "type": "int"}]})
+    for codec in ("bzip2", "xz"):
+        buffer = io.BytesIO()
+        fastavro.writer(buffer, schema, [{"a": 1}], codec=codec)
+        _fails_with(_Harness(raw=buffer.getvalue()), UNREADABLE, _params(format="avro"))
+    buffer = io.BytesIO()
+    fastavro.writer(buffer, schema, [{"a": 1}], codec="deflate")
+    _, loaded = _load(buffer.getvalue(), "avro", "none")
+    assert loaded["rows"] == [{"a": "1"}]
+
+
 def test_an_avro_file_with_no_records_has_no_rows():
     raw = _avro({"type": "record", "name": "R", "fields": [{"name": "a", "type": "int"}]}, [])
     _fails_with(_Harness(raw=raw), NO_ROWS, _params(format="avro"))

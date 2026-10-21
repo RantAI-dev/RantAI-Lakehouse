@@ -2624,6 +2624,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "apache-avro",
  "arrow-array",
  "arrow-schema",
  "async-trait",
@@ -2632,6 +2633,7 @@ dependencies = [
  "calamine",
  "chrono",
  "croner",
+ "flate2",
  "futures",
  "hmac 0.13.0",
  "iceberg",
@@ -2676,6 +2678,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@
 //! What the footer may declare (its length, the place of every column chunk,
 //! the size of every row group) is checked in `upload_parquet::open`.
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -121,6 +121,75 @@ impl ChunkReader for RangeReader {
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
         self.fetch(start, u64::try_from(length).unwrap_or(u64::MAX))
+    }
+}
+
+impl RangeReader {
+    /// A sequential `Read` of the whole object, one block at a time (a gzip stream).
+    #[must_use]
+    pub fn sequential(&self) -> BlockRead {
+        BlockRead {
+            source: self.clone(),
+            next: 0,
+            block: Bytes::new(),
+        }
+    }
+
+    /// A `Read + Seek` over the object, fetching one block at a time around the position
+    /// (a zip archive: its central directory is at the end, its files are in the middle).
+    #[must_use]
+    pub fn seekable(&self) -> RangeSeek {
+        RangeSeek {
+            source: self.clone(),
+            position: 0,
+            block_start: 0,
+            block: Bytes::new(),
+        }
+    }
+}
+
+/// A `Read + Seek` over a stored object (`DATA-17` slice 4): one ranged request per block of
+/// [`BLOCK_BYTES`], the last one kept, nothing else held.
+pub struct RangeSeek {
+    source: RangeReader,
+    position: u64,
+    block_start: u64,
+    block: Bytes,
+}
+
+impl Read for RangeSeek {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.position >= self.source.size {
+            return Ok(0);
+        }
+        let held = self.position >= self.block_start
+            && self.position < self.block_start + self.block.len() as u64;
+        if !held {
+            let len = BLOCK_BYTES.min(self.source.size - self.position);
+            self.block = self
+                .source
+                .fetch(self.position, len)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            self.block_start = self.position;
+        }
+        let from = usize::try_from(self.position - self.block_start).unwrap_or(0);
+        let take = buf.len().min(self.block.len() - from);
+        buf[..take].copy_from_slice(&self.block[from..from + take]);
+        self.position += take as u64;
+        Ok(take)
+    }
+}
+
+impl Seek for RangeSeek {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(delta) => self.source.size.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        };
+        let at = target.ok_or_else(|| std::io::Error::other("a seek before the start"))?;
+        self.position = at;
+        Ok(at)
     }
 }
 
@@ -220,6 +289,40 @@ mod tests {
         .unwrap();
         assert_eq!(got.0, ORDERS[10..]);
         assert!(got.1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_seekable_reader_reads_any_range_by_blocks_and_never_past_the_end() {
+        let (_store, reader) = stored(ORDERS).await;
+        let size = usize::try_from(reader.len()).unwrap();
+        let got = tokio::task::spawn_blocking(move || {
+            let mut seek = reader.seekable();
+            let mut tail = [0u8; 8];
+            seek.seek(SeekFrom::End(-8)).unwrap();
+            seek.read_exact(&mut tail).unwrap();
+            seek.seek(SeekFrom::Start(3)).unwrap();
+            let mut middle = [0u8; 5];
+            seek.read_exact(&mut middle).unwrap();
+            let mut rest = Vec::new();
+            seek.seek(SeekFrom::Current(-5)).unwrap();
+            seek.read_to_end(&mut rest).unwrap();
+            let mut sequential = Vec::new();
+            reader.sequential().read_to_end(&mut sequential).unwrap();
+            (
+                tail,
+                middle,
+                rest,
+                sequential,
+                seek.seek(SeekFrom::Current(-1_000_000)).is_err(),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.0, ORDERS[size - 8..]);
+        assert_eq!(got.1, ORDERS[3..8]);
+        assert_eq!(got.2, ORDERS[3..]);
+        assert_eq!(got.3, ORDERS);
+        assert!(got.4, "a seek before the start is an error");
     }
 
     #[tokio::test]

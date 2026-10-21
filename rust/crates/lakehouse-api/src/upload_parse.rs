@@ -84,8 +84,14 @@ pub enum Kind {
     /// and refuse it otherwise; `upload_parquet` converts it (ADR 0014,
     /// amendment of 2026-10-08).
     Parquet,
-    /// Another binary format (a PDF, a gzip stream), or bytes that are not
-    /// text (NUL bytes in something that is not UTF-16). Refused.
+    /// A gzip stream (`.gz`, `DATA-17` slice 4). The routes accept it when it is
+    /// also named `.gz` and holds text or JSON; `upload_formats` reads it.
+    Gzip,
+    /// An Avro object container file (`Obj` and a 1). The routes accept it when it is
+    /// also named `.avro`; `upload_formats` reads it.
+    Avro,
+    /// Another binary format (a PDF), or bytes that are not text (NUL bytes in
+    /// something that is not UTF-16). Refused.
     OtherBinary,
 }
 
@@ -111,7 +117,15 @@ pub fn sniff(head: &[u8]) -> Kind {
     if head.starts_with(b"PAR1") && head.get(4).is_some_and(|b| is_control(*b)) {
         return Kind::Parquet;
     }
-    if head.starts_with(b"%PDF-") || head.starts_with(&[0x1F, 0x8B]) {
+    if head.starts_with(&[0x1F, 0x8B]) {
+        return Kind::Gzip;
+    }
+    // `Obj` and the byte 1: four bytes that are not a header of any text export a
+    // person would save, and an Avro container always starts so.
+    if head.starts_with(b"Obj\x01") {
+        return Kind::Avro;
+    }
+    if head.starts_with(b"%PDF-") {
         return Kind::OtherBinary;
     }
     if detect_encoding(head) == Encoding::Utf8 && head.contains(&0) {
@@ -674,12 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_or_a_gzip_stream_is_another_binary_format() {
+    fn a_pdf_is_another_binary_format_and_a_gzip_stream_and_an_avro_container_are_their_own_kinds()
+    {
         assert_eq!(sniff(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"), Kind::OtherBinary);
         assert_eq!(
             sniff(&[0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            Kind::OtherBinary
+            Kind::Gzip
         );
+        assert_eq!(sniff(b"Obj\x01\x04\x16avro.schema"), Kind::Avro);
+        // Text that merely starts with the same letters is still text.
+        assert_eq!(sniff(b"Obj,x\n1,2\n"), Kind::DelimitedText);
+        assert_eq!(sniff(b"Obj\x02"), Kind::DelimitedText);
     }
 
     #[test]
@@ -1521,8 +1540,14 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             // `types/` is `DATA-18` T3.1's own set, read by `upload_types`
-            // against its own list; it is not one of the dialect fixtures.
-            .filter(|name| name != "README.md" && name != ".gitattributes" && name != "types")
+            // against its own list, and `formats/` is `DATA-17` slice 4's, read by
+            // `upload_formats`; neither is one of the dialect fixtures.
+            .filter(|name| {
+                name != "README.md"
+                    && name != ".gitattributes"
+                    && name != "types"
+                    && name != "formats"
+            })
             .collect();
         found.sort_unstable();
         assert_eq!(

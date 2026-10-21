@@ -90,6 +90,11 @@ fn workbook(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
+/// A fixture of `ops/fixtures/uploads/formats/` (`DATA-17` slice 4).
+fn format_file(name: &str) -> Vec<u8> {
+    fixture(&format!("formats/{name}"))
+}
+
 /// A Parquet fixture of `ops/fixtures/parquet/`.
 fn parquet_file(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -1135,7 +1140,7 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
     .await;
     assert_eq!(
         workbook,
-        "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."
+        "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first."
     );
     assert!(
         refuse(
@@ -1143,7 +1148,7 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
             vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
         )
         .await
-        .contains("not an .xls or .xlsx file")
+        .contains("not named like one")
     );
     // Q2 of the Parquet plan: a Parquet-shaped file is refused unless it is
     // named `.parquet` (then it must open: see the Parquet tests below).
@@ -1154,12 +1159,12 @@ async fn a_file_is_judged_by_its_first_bytes_not_by_its_name() {
     assert!(
         refuse("report.pdf", b"%PDF-1.7 ...".to_vec())
             .await
-            .contains("not a delimited text file")
+            .contains("not a file this upload reads")
     );
     assert!(
         refuse("x.csv", vec![0x1F, 0x8B, 8, 0, 0, 0])
             .await
-            .contains("not a delimited text file")
+            .contains("does not end in .gz")
     );
     assert!(
         stack.bucket.keys().is_empty(),
@@ -3997,21 +4002,19 @@ async fn a_workbook_that_cannot_be_read_or_is_not_named_like_one_is_refused_with
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     let xlsx = workbook("stock.xlsx");
-    let not_accepted = "This looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.";
+    let not_accepted = "This looks like a workbook or a zip archive that is not named like one. Excel workbooks must end in .xls or .xlsx and zip archives in .zip; or save the sheet as .xlsx or CSV first.";
     // A workbook-shaped file under a name that is not `.xls` or `.xlsx`.
-    for name in [
-        "macros.xlsm",
-        "binary.xlsb",
-        "sheet.ods",
-        "archive.zip",
-        "noext",
-    ] {
+    for name in ["macros.xlsm", "binary.xlsb", "sheet.ods", "noext"] {
         assert_eq!(
             refused_upload(&stack, &bayu, name, &xlsx).await,
             not_accepted,
             "{name}"
         );
     }
+    // `DATA-17` slice 4: named `.zip` it is an archive, and a workbook's dozen parts are
+    // not the up to ten files of one supported format a zip may hold.
+    let as_zip = refused_upload(&stack, &bayu, "archive.zip", &xlsx).await;
+    assert!(as_zip.contains("at most 10 files"), "{as_zip}");
     // Named like a workbook, and not one.
     let mut encrypted = vec![0xD0, 0xCF, 0x11, 0xE0];
     encrypted.extend_from_slice(&[0_u8; 600]);
@@ -4734,7 +4737,7 @@ const STILL_RECEIVING: &str = "This upload is still being received, so it cannot
 const NOT_RECEIVING: &str = "This upload is not receiving pieces.";
 const EMPTY_FILE: &str = "The file is empty.";
 const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
-const OTHER_BINARY: &str = "This is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.";
+const OTHER_BINARY: &str = "This is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.";
 
 /// A piece that takes 1.5 s to store, so requests sent together overlap.
 struct SlowPart(Bucket);
@@ -6099,5 +6102,374 @@ async fn a_missing_malformed_or_unasked_for_report_is_no_report() {
         let reply = stack.get(&bayu, &format!("/api/uploads/{id}")).await;
         assert_eq!(reply.json["status"], "ingested", "{id}: {}", reply.text);
         assert!(reply.json.get("badValues").is_none(), "{id}");
+    }
+}
+
+// ── `DATA-17` slice 4: JSON, JSON Lines, Avro, gzip and zip ──────────────
+
+/// The expected `columns` and `rows` of a fixture of `formats/` (`null` is an empty cell).
+fn expected_of(name: &str) -> (Value, Value) {
+    let value: Value =
+        serde_json::from_slice(&format_file(&format!("{name}.expected.json"))).unwrap();
+    let rows: Vec<Value> = value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            Value::Array(
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|cell| Value::String(cell.as_str().unwrap_or_default().to_owned()))
+                    .collect(),
+            )
+        })
+        .collect();
+    (value["columns"].clone(), Value::Array(rows))
+}
+
+/// (file, format, compression)
+const NEW_KINDS: [(&str, &str, &str); 5] = [
+    ("orders.json", "json", "none"),
+    ("orders.jsonl", "jsonl", "none"),
+    ("orders.avro", "avro", "none"),
+    ("orders.csv.gz", "delimited", "gzip"),
+    ("three.zip", "delimited", "zip"),
+];
+
+/// A zip of stored (uncompressed) entries, built by hand: the tests need no zip writer.
+fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    zip_of(entries, false)
+}
+
+/// A zip of deflated entries, built by hand (the method byte, and `flate2` for the data).
+fn deflated_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    zip_of(entries, true)
+}
+
+fn zip_of(entries: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in entries {
+        let offset = u32::try_from(out.len()).unwrap();
+        let packed = if deflate {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+            std::io::Write::write_all(&mut encoder, data).unwrap();
+            encoder.finish().unwrap()
+        } else {
+            data.to_vec()
+        };
+        let method = u8::from(deflate) * 8;
+        let (crc, size, packed_size, name_len) = (
+            crc32(data),
+            u32::try_from(data.len()).unwrap(),
+            u32::try_from(packed.len()).unwrap(),
+            u16::try_from(name.len()).unwrap(),
+        );
+        out.extend_from_slice(&[0x50, 0x4b, 3, 4, 20, 0, 0, 0, method, 0, 0, 0, 0, 0]);
+        for word in [crc, packed_size, size] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&packed);
+        central.extend_from_slice(&[0x50, 0x4b, 1, 2, 20, 0, 20, 0, 0, 0, method, 0, 0, 0, 0, 0]);
+        for word in [crc, packed_size, size] {
+            central.extend_from_slice(&word.to_le_bytes());
+        }
+        central.extend_from_slice(&name_len.to_le_bytes());
+        central.extend_from_slice(&[0; 12]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let start = u32::try_from(out.len()).unwrap();
+    let count = u16::try_from(entries.len()).unwrap();
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&[0x50, 0x4b, 5, 6, 0, 0, 0, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(central.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// The 400 sentence `POST /api/uploads` answers a file with.
+async fn refusal_of(stack: &Stack, who: &Caller, name: &str, bytes: Vec<u8>) -> String {
+    let reply = stack
+        .send(
+            who,
+            "POST",
+            "/api/uploads",
+            file_form(name, "application/octet-stream", &bytes),
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "{name}: {}",
+        reply.text
+    );
+    reply.json["error"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn each_new_format_previews_with_the_columns_and_rows_of_the_shared_fixture() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    for (name, format, compression) in NEW_KINDS {
+        let upload = stack.upload(&bayu, name, &format_file(name)).await;
+        let id = id_of(&upload);
+        let reply = stack
+            .get(&bayu, &format!("/api/uploads/{id}/preview"))
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.text);
+        let (columns, rows) = expected_of(name);
+        assert_eq!(reply.json["columns"], columns, "{name}");
+        // A zip previews its first file (`a.csv`, two rows); the load reads all of them.
+        let shown = if compression == "zip" {
+            Value::Array(rows.as_array().unwrap()[..2].to_vec())
+        } else {
+            rows
+        };
+        assert_eq!(reply.json["rows"], shown, "{name}");
+        assert_eq!(
+            reply.json["layout"],
+            json!({ "format": format, "compression": compression }),
+            "{name}"
+        );
+        assert_eq!(reply.json["truncated"], false, "{name}");
+        assert_eq!(
+            reply.json["columnSpecs"].as_array().unwrap().len(),
+            columns.as_array().unwrap().len(),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_avro_preview_starts_each_column_at_the_type_its_schema_declares() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = id_of(
+        &stack
+            .upload(&bayu, "orders.avro", &format_file("orders.avro"))
+            .await,
+    );
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    let kinds: Vec<&str> = reply.json["columnSpecs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "integer", "text", "float", "boolean", "text", "text", "text", "date"
+        ],
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.json["columnSpecs"][7]["dateFormat"], "iso");
+}
+
+#[tokio::test]
+async fn a_zip_preview_lists_its_files_and_a_load_with_a_file_of_other_columns_is_refused() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = id_of(
+        &stack
+            .upload(&bayu, "three.zip", &format_file("three.zip"))
+            .await,
+    );
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    let files = reply.json["archive"]["files"].as_array().unwrap();
+    let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        ["a.csv", "sub/b.csv", "c.csv"],
+        "folders are left out"
+    );
+    assert!(
+        files
+            .iter()
+            .all(|f| f["matchesFirst"] == true && f["columns"] == 3),
+        "{}",
+        reply.text
+    );
+
+    // The same kind of archive with a file that has another column.
+    let other = stored_zip(&[("a.csv", b"id,name\n1,a\n"), ("b.csv", b"id,other\n2,b\n")]);
+    let id = id_of(&stack.upload(&bayu, "other.zip", &other).await);
+    let reply = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    let files = reply.json["archive"]["files"].as_array().unwrap();
+    assert_eq!(files[0]["matchesFirst"], true);
+    assert_eq!(files[1]["matchesFirst"], false);
+    // Load is refused until the files agree, and nothing is launched.
+    let body =
+        json!({ "bronzeTable": "zipped", "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+    let refused = stack.ingest(&bayu, &id, body).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+    assert!(
+        refused.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("do not all have the same columns")
+    );
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_job_is_told_the_format_and_the_wrapper_of_each_new_kind() {
+    for (name, format, compression) in NEW_KINDS {
+        let stack = Stack::start().await;
+        let bayu = stack.bayu().await;
+        mount_free_table(&stack.ch).await;
+        mount_launch(&stack.dagster, "run-1").await;
+        let id = id_of(&stack.upload(&bayu, name, &format_file(name)).await);
+        // JSON, JSON Lines and Avro have no dialect: what a retry sends back is not read.
+        let body = if format == "delimited" {
+            json!({ "bronzeTable": "formatted", "encoding": "utf-8", "delimiter": ",", "headerRow": 0 })
+        } else {
+            json!({ "bronzeTable": "formatted", "encoding": "utf-16", "delimiter": ";", "headerRow": 3 })
+        };
+        let reply = stack.ingest(&bayu, &id, body).await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.text);
+        let launches = requests_containing(&stack.dagster, "launchRun").await;
+        let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(config["format"], format, "{name}");
+        assert_eq!(config["compression"], compression, "{name}");
+        assert_eq!(config["max_bytes"], 52_428_800, "{name}");
+        assert_eq!(config["encoding"], "utf-8", "{name}");
+        assert_eq!(config["delimiter"], ",", "{name}");
+        assert_eq!(config["header_row"], 0, "{name}");
+        let extension = name.rsplit('.').next().unwrap();
+        assert_eq!(
+            config["storage_keys"],
+            json!([format!("uploads/{GROUP}/{id}.{extension}")]),
+            "{name}: the original object, read by the job"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_gzip_or_zip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    // 51 MiB of text that packs into a few tens of KiB: over the 50 MB cap once unpacked.
+    let mut big = b"id,name\n".to_vec();
+    big.resize(51 * MIB, b'a');
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    std::io::Write::write_all(&mut encoder, &big).unwrap();
+    let bomb = encoder.finish().unwrap();
+    assert!(bomb.len() < 200 * 1024, "the setup: a small file");
+    let unpacked = "The file is larger than the upload limit once unpacked.";
+
+    assert_eq!(
+        refusal_of(&stack, &bayu, "bomb.csv.gz", bomb.clone()).await,
+        unpacked
+    );
+    assert!(stack.bucket.keys().is_empty(), "nothing was stored");
+
+    // The same file by pieces: refused at completion and removed.
+    let id = stack.session(&bayu, "bomb.csv.gz", bomb.len()).await;
+    stack.put_part(&bayu, &id, "1", &bomb).await;
+    let reply = stack.complete(&bayu, &id).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.json["error"], unpacked);
+    assert_eq!(stack.row_count(&id).await, 0);
+
+    // A zip whose one file unpacks past the cap.
+    let zipped = deflated_zip(&[("a.csv", &big)]);
+    assert!(zipped.len() < 200 * 1024, "the setup: a small file");
+    assert_eq!(
+        refusal_of(&stack, &bayu, "bomb.zip", zipped).await,
+        unpacked
+    );
+}
+
+#[tokio::test]
+async fn an_archive_inside_an_archive_a_mixed_zip_and_a_misnamed_file_are_refused() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let refuse = |name: &'static str, bytes: Vec<u8>| refusal_of(&stack, &bayu, name, bytes);
+    let inner = stored_zip(&[("a.csv", b"a\n1\n")]);
+    assert!(
+        refuse("nested.zip", stored_zip(&[("inner.zip", &inner)]))
+            .await
+            .contains("another archive")
+    );
+    let mixed = stored_zip(&[("a.csv", b"a\n1\n"), ("b.json", b"[{}]")]);
+    assert!(
+        refuse("mixed.zip", mixed)
+            .await
+            .contains("one supported format")
+    );
+    let names: Vec<String> = (0..11).map(|i| format!("{i}.csv")).collect();
+    let eleven: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"a\n1\n"[..])).collect();
+    assert!(
+        refuse("many.zip", stored_zip(&eleven))
+            .await
+            .contains("at most 10")
+    );
+    assert!(
+        refuse("not.zip", b"not a zip".to_vec())
+            .await
+            .contains("is not one")
+    );
+    assert!(
+        refuse("array.json", b"{\"a\": 1}".to_vec())
+            .await
+            .contains("array of objects")
+    );
+    assert!(
+        refuse("data.avro", b"id,name\n".to_vec())
+            .await
+            .contains("not an Avro file")
+    );
+    assert!(
+        refuse("data.csv", format_file("orders.avro"))
+            .await
+            .contains("does not end in .avro")
+    );
+    assert!(stack.bucket.keys().is_empty());
+}
+
+#[tokio::test]
+async fn the_new_kinds_complete_by_pieces_with_the_same_checks() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    for (name, _format, _compression) in NEW_KINDS {
+        let upload = stack
+            .upload_in_pieces(&bayu, name, &format_file(name))
+            .await;
+        assert_eq!(upload["status"], "uploaded", "{name}: {upload}");
     }
 }
