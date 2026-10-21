@@ -24,6 +24,9 @@ modules, and the tests' fake vendor is a small class):
     describe(session, parts, dial, name)     optional -> list[Field] or None; a vendor that
                                                 describes its fields (decision 9); None for
                                                 an object it cannot describe
+    resolve_base_path(vendor, parts, session) optional -> str; required when the vendor table gives
+                                                a browser sign-in its own `oauth.apiBase`: the
+                                                path prefix after sign-in (Atlassian's cloud id)
     is_quota_exhausted(body)                 optional -> bool; whether a 403 body says the API quota is used up
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
@@ -44,6 +47,7 @@ lint of slice 7 is the place to forbid that (plan section 8).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -186,8 +190,12 @@ def open_session(
     extra: dict[str, Any] = {}
     if sleep is not None:
         extra["sleep"] = sleep
+    # Decision 3 / AD2: a browser sign-in whose tokens a vendor accepts only at another fixed
+    # address (Atlassian's gateway) is served from the table's `oauth.apiBase`, never from
+    # anything the vendor or the person says.
+    oauth_origin = vendor.oauth_api_origin() if dial.get("auth", {}).get("type") == vendors.OAUTH_AUTH_TYPE else None
     session = SaasSession(
-        vendors.rebase_for_gate(vendor.id, vendor.api_url(parts)),
+        vendors.rebase_for_gate(vendor.id, oauth_origin or vendor.api_url(parts)),
         headers,
         adopt_suffixes=tuple(getattr(module, "adopt_suffixes", ())),
         http_get=http_get,
@@ -208,6 +216,10 @@ def open_session(
         returned = instance_url()
         if returned:
             session.adopt_origin(returned, as_origin=vendors.rebase_for_gate(vendor.id, returned))
+    if oauth_origin:
+        # The part of the gateway's address that depends on the signed-in account (Atlassian's
+        # cloud id) is asked of the vendor through the session just opened.
+        parts = dataclasses.replace(parts, base_path=module.resolve_base_path(vendor, parts, session))
     return module, vendor, parts, session
 
 

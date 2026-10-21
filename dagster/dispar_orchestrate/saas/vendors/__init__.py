@@ -244,6 +244,10 @@ class AccountParts:
     account: str
     host: str = ""
     tenant: str = ""
+    # A path prefix every API path of the connector carries, filled in after a sign-in for a
+    # vendor whose browser tokens are accepted only behind a gateway (Atlassian:
+    # `/ex/confluence/<cloud id>`); empty everywhere else.
+    base_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,6 +277,18 @@ class Vendor:
 
     def api_url(self, parts: AccountParts, path: str = "") -> str:
         return self.render(self.api_base, parts) + path
+
+    def oauth_api_origin(self) -> str | None:
+        """`scheme://host` of the API a browser sign-in is served by, when the table gives
+        one apart from `api_base` (`oauth.apiBase`), else `None`. Only the origin: the path
+        template (`/ex/confluence/{cloudId}`) is filled by the vendor module."""
+        template = self.oauth.get("apiBase")
+        if not template:
+            return None
+        from urllib.parse import urlparse
+
+        parsed = urlparse(template)
+        return f"{parsed.scheme}://{parsed.netloc}"
 
     def token_url(self, parts: AccountParts) -> str:
         return self.render(self.oauth["tokenUrl"], parts)
@@ -396,6 +412,7 @@ MODULE_PATHS: dict[str, str] = {
     "salesforce": "dispar_orchestrate.saas.vendors.salesforce",
     "ga4": "dispar_orchestrate.saas.vendors.ga4",
     "servicenow": "dispar_orchestrate.saas.vendors.servicenow",
+    "confluence": "dispar_orchestrate.saas.vendors.confluence",
 }
 
 
