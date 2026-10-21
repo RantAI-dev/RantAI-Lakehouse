@@ -511,8 +511,8 @@ stored in the same statement that claims the upload; clippy fixes (`assigning_cl
 
 **Section 8 items proved locally** (local filesystem destination, as for V4; the real Iceberg write against
 Lakekeeper is CI-only, *not verified* here). Item 5: dlt declares the types as given and there is no variant
-column, but pyiceberg refuses a replace that changes a column type, so the sink drops the table between
-normalize and load when the types differ (`_drop_table_if_types_differ`, `_run_retyping`). Items 6 and 10:
+column, but pyiceberg refuses a replace that changes a column type, so (after review BLOCKER 1, below) the sink
+writes such a replace as one pyiceberg transaction (`_replace_changing_types`) and never drops the table. Items 6 and 10:
 covered by `test_typed_load.py` and the Parquet/Excel starting-type tests (decision 10).
 
 **Commands run, with counts.** `cargo test -p lakehouse-store --test uploads` 53 passed;
@@ -531,6 +531,26 @@ zeros (text is never trimmed or coerced, so `007` stays text).
 **T3.6 gate.** The "every column text" assertion is changed on purpose (see the commit): the load now sends the
 guessed list and each column is checked against its type; a new step covers typed load, `stop`, `null`, and
 the replace back to text.
+
+**Slice 3, round 1 fix (Phase 3 slice 3 review BLOCKER 1).** The purge is gone. A `replace` whose column
+types differ from the table's is written by `_replace_changing_types` (`adapters/sink.py`) as one pyiceberg
+transaction: per changed column `update_schema` delete and add (the type is parsed from Iceberg's own name),
+a second `update_schema` moves each back to its place (`move_first`/`move_after`, so the file's column order
+is kept), then the batches are written inside the same transaction, the first group with `overwrite`, the next
+with `append`. Groups are gathered up to 64 MiB (`RETYPE_FLUSH_BYTES`), so the file is never held whole; a
+`replace` with the same types, and every other mode, still goes through dlt. Nothing is dropped or purged
+(a test asserts `purge_table` and `drop_table` are never called). A failure inside the transaction, the
+stream's own stop included, commits nothing; data files already written stay in the bucket unreferenced, for
+the orphan clean-up. The table's dlt schema in the bucket keeps the old types until the next dlt load, which
+always declares its types and those win (section 8 item 5: no variant column). The result carries
+`columns=()` for this path (nothing guessed). New tests in `test_typed_load.py`: one commit with the new
+schema, rows and column order and all earlier snapshots kept; a failure in the stream or in the cast leaves
+the schema, rows, current snapshot and snapshot list equal; `load_via_sink` takes the transaction path for a
+type change and dlt for the same types. Commands: `pytest` file-ingest, Parquet, typed-load, upload-types,
+authored-factory, sink, sink-history, sink-refresh, sink-empty-table 520 passed, 1 skipped; both `ops/lint`
+scripts OK. *Not verified*: the transaction against Lakekeeper's REST catalog (the g9 "replace back to text"
+step exercises it in CI; if the REST catalog refuses it, stop and report, do not fall back to a drop).
+Snapshots: one `overwrite` (a delete and an append at most) per write group.
 
 **Not verified.** The gate and the large-file harness against a real stack; the Lakekeeper Iceberg write;
 `cargo test --workspace` and the full pytest and `bun test` (whole-suite runs are not possible on this machine);

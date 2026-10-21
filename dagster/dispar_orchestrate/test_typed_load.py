@@ -196,37 +196,121 @@ def test_v6_the_six_types_reach_iceberg_as_declared(tmp_path):
     assert {s.name: s.iceberg_type() for s in specs} == {n: fields[n] for n in values}
 
 
-def test_v5_a_replace_that_changes_a_columns_type_makes_no_variant_column_and_is_refused_by_iceberg_unless_dropped(tmp_path):
-    directory = str(tmp_path)
-    first = pa.table({"x": pa.array(["1", "2"], pa.string())})
-    _local_pipeline(directory).run(
-        _source(first, [{"name": "x", "data_type": "text"}]),
+def _text_table(directory: str):
+    """A local Iceberg table of three text columns and two rows, loaded by dlt."""
+    first = pa.table({
+        "a": pa.array(["1", "2"], pa.string()),
+        "b": pa.array(["x", "y"], pa.string()),
+        "c": pa.array(["1.5", "2.5"], pa.string()),
+    })
+    pipeline = _local_pipeline(directory)
+    pipeline.run(
+        _source(first, [{"name": n, "data_type": "text"} for n in "abc"]),
         table_name="t", write_disposition="replace", loader_file_format="parquet", table_format="iceberg",
     )
-    typed = pa.table({"x": pa.array([1, 2, 3], pa.int64())})
-    hints = [{"name": "x", "data_type": "bigint"}]
+    return pipeline, sink_module.history.open_table(pipeline, "t", sync=False)
 
-    # Without the drop: no `x__v_bigint`, but pyiceberg refuses the write.
+
+def _state(table) -> tuple:
+    table.refresh()
+    return (
+        [(f.name, str(f.field_type)) for f in table.schema().fields],
+        sorted(table.scan().to_arrow().column("a").to_pylist()),
+        table.current_snapshot().snapshot_id,
+        [s.snapshot_id for s in table.snapshots()],
+    )
+
+
+def test_v5_a_replace_that_changes_a_columns_type_makes_no_variant_column_and_dlt_alone_is_refused_by_iceberg(tmp_path):
+    directory = str(tmp_path)
+    _text_table(directory)
+    typed = pa.table({"a": pa.array([1, 2, 3], pa.int64())})
     plain = _local_pipeline(directory)
     with pytest.raises(Exception) as refused:
         plain.run(
-            _source(typed, hints),
+            _source(typed, [{"name": "a", "data_type": "bigint"}]),
             table_name="t", write_disposition="replace", loader_file_format="parquet", table_format="iceberg",
         )
     assert "Cannot change column type" in str(refused.value.__cause__ or refused.value) or "Cannot change column type" in repr(refused.value)
     assert not any("__v_" in name for name, _ in _iceberg_fields(directory))
     plain.drop_pending_packages()
 
-    # With it, as `load_via_sink` does when told the types: dropped, then created with the new type.
-    pipeline = _local_pipeline(directory)
-    pipeline.extract(_source(typed, hints), table_name="t", table_format="iceberg", write_disposition="replace")
-    pipeline.normalize()
-    assert sink_module._drop_table_if_types_differ(pipeline, "t", {"x": "long"}) is True
-    pipeline.load()
-    assert dict(_iceberg_fields(directory))["x"] == "long"
-    table = sink_module.history.open_table(pipeline, "t", sync=False)
-    assert sorted(table.scan().to_arrow().column("x").to_pylist()) == [1, 2, 3]
-    # The same types: nothing is dropped.
-    assert sink_module._drop_table_if_types_differ(pipeline, "t", {"x": "long"}) is False
-    # A column the load does not write is not a difference.
-    assert sink_module._drop_table_if_types_differ(pipeline, "t", {"y": "string"}) is False
+
+def test_phase_3_slice_3_review_blocker_1_a_type_changing_replace_is_one_commit_that_keeps_the_history(tmp_path):
+    _, table = _text_table(str(tmp_path))
+    schema_before, _, snapshot_before, snapshots_before = _state(table)
+    typed = pa.table({
+        "a": pa.array([7, 8, 9], pa.int64()),
+        "b": pa.array(["p", "q", "r"], pa.string()),
+        "c": pa.array([1, 2, 3], pa.float64()),
+    })
+    source = _source(typed, [])
+    changed = sink_module._changed_columns(table, {"a": "long", "b": "string", "c": "double"})
+    assert changed == ["a", "c"], "b has the type it is told: not a difference"
+    written = sink_module._replace_changing_types(table, source, changed, {"a": "long", "b": "string", "c": "double"})
+    assert written == 3
+    schema, rows, snapshot, snapshots = _state(table)
+    assert [n for n, _ in schema] == [n for n, _ in schema_before], "the column order is kept"
+    assert dict(schema)["a"] == "long" and dict(schema)["c"] == "double" and dict(schema)["b"] == "string"
+    assert rows == [7, 8, 9]
+    assert set(snapshots_before) <= set(snapshots), "the table's history is kept"
+    assert snapshot != snapshot_before
+    full = table.scan().to_arrow()
+    assert sorted(full.column("c").to_pylist()) == [1.0, 2.0, 3.0]
+    for bookkeeping in ("_dlt_id", "_dlt_load_id"):  # filled in when the table has them (Arrow loads may not create them)
+        if bookkeeping in full.schema.names:
+            assert all(full.column(bookkeeping).to_pylist())
+    assert full.column("_ingested_at").null_count == 0
+    assert len(snapshots) - len(snapshots_before) <= 2, "one overwrite: a delete and an append at most"
+
+
+def test_phase_3_slice_3_review_blocker_1_a_failure_inside_the_transaction_leaves_the_table_as_it_was(tmp_path):
+    _, table = _text_table(str(tmp_path))
+    before = _state(table)
+
+    def rows():
+        yield pa.table({"a": pa.array([7], pa.int64()), "b": pa.array(["p"]), "c": pa.array([1.0])})
+        raise RuntimeError("the stream stops")
+
+    with pytest.raises(RuntimeError, match="the stream stops"):
+        sink_module._replace_changing_types(table, rows(), ["a", "c"], {"a": "long", "b": "string", "c": "double"})
+    assert _state(table) == before
+    # A value the cast refuses is a failure inside the transaction too.
+    with pytest.raises(Exception):
+        sink_module._replace_changing_types(
+            table, [pa.table({"a": pa.array(["x"]), "b": pa.array(["p"]), "c": pa.array([1.0])})], ["a", "c"],
+            {"a": "long", "b": "string", "c": "double"},
+        )
+    assert _state(table) == before
+
+
+def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_other_loads_through_dlt(tmp_path, monkeypatch):
+    directory = str(tmp_path)
+    pipeline, table = _text_table(directory)
+    monkeypatch.setattr(sink_module, "_install_catalog_env", lambda config: None)
+    monkeypatch.setattr(sink_module, "_bronze_pipeline", lambda name, config: pipeline)
+    monkeypatch.setattr(sink_module, "_abort_pending", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sink_module.history, "refuse_history_rows", lambda *args, **kwargs: False)
+    typed = pa.table({
+        "a": pa.array([7, 8, 9], pa.int64()), "b": pa.array(["p", "q", "r"]), "c": pa.array(["u", "v", "w"]),
+    })
+    hints = [{"name": "a", "data_type": "bigint"}, {"name": "b", "data_type": "text"}, {"name": "c", "data_type": "text"}]
+    purges: list[str] = []
+    monkeypatch.setattr(type(table.catalog), "purge_table", lambda self, name: purges.append(str(name)), raising=False)
+    monkeypatch.setattr(type(table.catalog), "drop_table", lambda self, name: purges.append(str(name)), raising=False)
+    result = sink_module.load_via_sink(
+        _source(typed, hints), "t", None, sink_module.LoadPlan(mode="replace"),
+        column_types={"a": "long", "b": "string", "c": "string"},
+    )
+    assert (result.rows, result.has_failed_jobs) == (3, False)
+    assert purges == [], "the table is never purged or dropped"
+    assert dict(_iceberg_fields(directory))["a"] == "long"
+    reopened = sink_module.history.open_table(pipeline, "t", sync=False)  # the sink held its own client's table
+    assert _state(reopened)[1] == [7, 8, 9]
+    # Same types: dlt loads, as before.
+    again = sink_module.load_via_sink(
+        _source(typed, hints), "t", None, sink_module.LoadPlan(mode="replace"),
+        column_types={"a": "long", "b": "string", "c": "string"},
+    )
+    assert again.rows == 3
+    assert "replaced in one commit" not in again.load_info_str

@@ -1236,7 +1236,7 @@ def test_the_real_sink_replaces_or_appends_text_rows_that_the_job_hands_it(monke
 
     monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", factory)
     monkeypatch.setattr(sink_module, "_install_catalog_env", lambda config: None)  # it sets process-wide env vars
-    monkeypatch.setattr(sink_module, "_drop_table_if_types_differ", lambda *args: False)  # no catalog here
+    monkeypatch.setattr(sink_module.history, "open_table", lambda *args, **kwargs: None)  # no catalog here
 
     harness = _Harness(raw=b"id,when\n1,2025-02-07T10:00:00Z\n2,x\n")
     summary = run_file_load(
