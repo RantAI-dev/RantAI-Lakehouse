@@ -157,6 +157,56 @@ pub(crate) fn add_formatting(body: &mut Value, format: &FormatSettings) {
     }
 }
 
+/// The origins of the image and web cards of a payload's dashboard: the
+/// addresses of the cards, as their origin (`https://host[:port]`).
+fn card_origins(body: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(charts) = body.get("charts").and_then(Value::as_array) else {
+        return out;
+    };
+    for chart in charts {
+        // The stored definition of a card carries its address; every other
+        // kind has none.
+        let Some(url) = chart
+            .get("def")
+            .and_then(|def| def.get("url"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(origin) = lakehouse_bi::embed_access::https_origin_of(url)
+            && !out.contains(&origin)
+        {
+            out.push(origin);
+        }
+    }
+    out
+}
+
+/// Add the formatting settings to an anonymous payload (a public link or a
+/// signed embed): the number locale, the company palette and the fonts as
+/// everywhere, but only the content sites of that dashboard's own image and
+/// web cards, and only the ones an administrator still allows.
+///
+/// The whole list would tell whoever reads a public link which sites the
+/// deployment allows (`PR #199 review M SHOULD-FIX BI-16 1`, decision M6). A
+/// card whose site was taken off the list is not in it any more, so the card
+/// says so, as it does in the console.
+pub(crate) fn add_formatting_for_anonymous(body: &mut Value, format: &FormatSettings) {
+    let origins = card_origins(body);
+    add_formatting(body, format);
+    let Some(reporting) = body.get_mut("reporting").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let sites: Vec<Value> = format
+        .content_sites
+        .iter()
+        .filter(|site| origins.contains(site))
+        .map(|site| json!(site))
+        .collect();
+    reporting.insert("contentSites".to_owned(), Value::Array(sites));
+}
+
 /// Check the optional formatting fields of a body against the closed lists,
 /// with the sentence the person is told.
 fn checked_formatting(
@@ -474,6 +524,46 @@ mod tests {
         .unwrap();
         assert_eq!(got.company_palette, ["#aabbcc", "#112233"]);
         assert_eq!(got.fonts, ["inter", "system"]);
+    }
+
+    /// `PR #199 review M SHOULD-FIX BI-16 1` (decision M6): an anonymous
+    /// payload carries only the origins of that dashboard's own image and web
+    /// cards, and only the ones an administrator still allows.
+    #[test]
+    fn an_anonymous_payload_carries_only_the_sites_of_its_own_cards() {
+        let mut payload = json!({
+            "reporting": { "timeZone": "UTC" },
+            "charts": [
+                { "def": { "kind": "image", "url": "https://img.example/logo.png" } },
+                { "def": { "kind": "web", "url": "https://status.example/board" } },
+                { "def": { "kind": "bar", "dimension": "x" } }
+            ]
+        });
+        let format = FormatSettings {
+            content_sites: vec![
+                "https://img.example".to_owned(),
+                "https://status.example".to_owned(),
+                "https://other.example".to_owned(),
+            ],
+            ..FormatSettings::default()
+        };
+        add_formatting_for_anonymous(&mut payload, &format);
+        assert_eq!(
+            payload["reporting"]["contentSites"],
+            json!(["https://img.example", "https://status.example"])
+        );
+        // The rest of the formatting rides along as everywhere.
+        assert_eq!(payload["reporting"]["numberLocale"], json!("en-US"));
+        // A card whose site was taken off the list is not in it, so the card
+        // says the site is no longer allowed.
+        let mut gone = json!({
+            "reporting": { "timeZone": "UTC" },
+            "charts": [{ "def": { "kind": "image", "url": "https://img.example/logo.png" } }]
+        });
+        let mut without = format.clone();
+        without.content_sites = vec!["https://other.example".to_owned()];
+        add_formatting_for_anonymous(&mut gone, &without);
+        assert_eq!(gone["reporting"]["contentSites"], json!([]));
     }
 
     #[test]

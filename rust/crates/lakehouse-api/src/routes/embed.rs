@@ -170,7 +170,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     .await;
     match payload {
         Ok(mut body) => {
-            crate::routes::settings::add_formatting(&mut body, &format);
+            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
@@ -421,7 +421,7 @@ pub async fn public_dashboard(
     .await;
     match payload {
         Ok(mut body) => {
-            crate::routes::settings::add_formatting(&mut body, &format);
+            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
