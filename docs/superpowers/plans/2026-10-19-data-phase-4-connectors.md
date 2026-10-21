@@ -868,6 +868,54 @@ committed and stops there.** No cargo build, check, clippy or test ran; `cargo f
 **Not verified:** all of the new Rust (formatted only); the new product entry (no docker stack); the whole dagster suite and
 bun were not re-run (no Python/console code changed besides the gate script and mock).
 
+### Handoff: slice 5 (developer, 2026-10-21)
+
+SharePoint, then Dynamics 365 (Vn.1 to Vn.4), base `60909de3`, through `SaasSession` (section 8 item 3, as slices 3 and 4).
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| finding | `4985070c` | the Confluence cloud id is matched with `\Z`, not `$` (a trailing newline passed) |
+| V-SharePoint.3 / V-Dynamics.3 (rows) | `54329ef9` | Microsoft tenant in the account (Rust, Python, fixture, console), `integration.scope`, shared `saas/client_credentials.py` |
+| V-SharePoint.1, .2 | `ecc2e60a` | Graph delta feed, link in dlt state, deletes marked, 410 resync; `uses_state` in `adapters/saas.py` |
+| V-SharePoint.3 / V-Dynamics.3 (probe) | `d48a26a7` | the API's connection test of both Microsoft ways for both vendors |
+| V-SharePoint.4 | `b4b12362` | mock SharePoint + Entra, vendor-level and product steps |
+| V-Dynamics.1, .2 | `98084720` | Dataverse tables, describe, change tracking with the link in state, `modifiedon` fallback; `SaasSession.get_json(headers=)` |
+| V-Dynamics.1 | `a389dd03` | request headers never replace the credential (test) |
+| V-Dynamics.4 | `c1f4751d` | mock Dynamics 365, vendor-level and product steps |
+| docs | `152a7c1d` | limits on the feature page, `docs/CI.md` |
+
+**Found against Microsoft's documentation (read 2026-10-21; URLs in the commit bodies)**
+- Tenant "in GUID or domain-name format", `scope=<resource>/.default`, no refresh token for client credentials; the v2 platform has **no RFC 7009 revocation endpoint** (both rows have `revocationUrl: null`; slice 1's tables also had null, nothing else needed); the refresh token is replaced on every refresh (existing report path). The rows used `/organizations/`, which does not serve a single-tenant app: now `{tenant}`.
+- **The tenant is part of the account** (`contoso/<tenant>`, `<org>.crm4.dynamics.com/<tenant>`), GUID or domain (two labels, a letter in the last; no `common`/`organizations`/`consumers`, path, port, userinfo), same rule in Rust and Python with the same near-miss lists. Host stays the fixed `login.microsoftonline.com` (AD2).
+- Graph: plain `GET /sites` is **application-only**, so site discovery uses `GET /sites?search=*` (not read, not tried). Scope `Sites.Read.All`, delegated and application (same permission for list-item delta). A deleted list item is `{"id", "deleted": {"state": "deleted"}}`, not `@removed`. 410 carries a `Location` that is not followed; the token-less delta restarts.
+- Dataverse: tracking takes no `$filter/$orderby/$expand/$top`; deletes are `$deletedEntity` rows; changes are kept 7 days by default and the expiry status is **not documented** (any 4xx on the saved link is taken as a resync); `EntityDefinitions` is unpaged; paging needs the same `odata.maxpagesize` on every page.
+
+**Plan section 8 item 6 verified by running** (real dlt + Iceberg, `Lab`): the delta link survives (a) a feed failing halfway, (b) a run that extracted and normalised everything and died before its load (`sink._abort_pending` restores the state; the next run asks from the last committed link and loses no change), for both vendors; a 410 / stale link reloads every row and continues.
+
+**Plan mismatches and decisions for the planner**
+1. **Resync cannot learn deletes made while the link was stale** (Graph's advice is to compare with local state; the sink cannot). Stated on the feature page. Not built: a full-refresh path.
+2. **SharePoint object names are ids** (`<site id>/<list id>`): `ObjectDecl` and the discovery contract carry no display label. Adding one is Rust work (`ListedObject` denies unknown fields). Sites to read: found by search (first 100) or named in `dial.objects`; **there is no console control to name sites**.
+3. **Dynamics 365 without change tracking cannot see deletes** (page says so); enabling tracking on the table fixes it.
+4. SharePoint has no `describe` (decision 9 does not list it).
+5. A deleted row keeps only its key, `is_deleted` and the time seen as the cursor (SharePoint `modified_at`, Dynamics `modifiedon`); upsert nulls its other columns.
+6. Shared edits: `SaasSession.get_json(headers=)`; `adapters/saas.py` passes `state=` to a module with `uses_state`; ServiceNow's client-credentials function moved to `saas/client_credentials.py` (re-exported; its tests unchanged).
+7. Rows changed in the shared table: `integration.scope` (fixture, Rust, Python, console type) and `account.kind` `label_tenant` / `dataverse_host_tenant`. Existing SharePoint/Dynamics accounts without a tenant no longer validate (the types are `supported = false`, nothing deployed).
+8. Target identity compares the tenant as written (case-sensitive): a case change asks for credentials again; harmless.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree, loader tests included): **2065 passed, 0 failed** (17m38s; slice 4 baseline 1942). New: `test_saas_sharepoint.py` 34, `test_saas_dynamics365.py` 39, `test_saas_vendors.py` +~140 parametrised cases, `test_saas_session.py` +1.
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings`: finished, 0 warnings (4m26s).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 OK.
+- `bun test src/lib/connectors`: 49 pass, 1 skip; `src/features/connectors`: 348 pass; `src/services`: 99 pass; `bun run typecheck`: 8 errors, all `features/landing/scene` (as before); `bun run lint`: 0 errors, 6 warnings. `bash scripts/ci/tests/test_required_gate.sh`: 52 passed; `ci.yml` parses.
+- Vendor-level gate steps against a local `python ops/g6/saas_stub.py` (`g6_saas_test.py --vendors-only`): SharePoint PASS and Dynamics PASS (the whole run `PASS (42 s)`, eight vendors).
+
+**Not verified, and why**
+- **All new Rust tests did not run** (`cargo test` is forbidden here): the tenant rules, the oauth route test, and the five probe wiremock tests compiled under clippy `--all-targets` only. The fixture-equals-table test is the CI check for the Rust table.
+- **The product steps of `g6-saas`** (four new entries: `sharepoint`, `sharepoint-browser`, `dynamics365`, `dynamics365-browser`) and the job's time against 20 minutes never ran (no docker stack). CI may show: the API accepting an object name with commas and `/` in `ingest-spec`, `gate_rebase` reaching the Entra path, Bronze column names (`field_title`, `is_deleted`), and the added time (about 8 product entries now).
+- **No real tenant or environment** (decision 11): `sites?search=*`, the `list` facet, delta `fields`, the `EntityDefinitions` `$expand` on the list, `IsValidForRead`, the Dataverse expired-token status, `user_impersonation` and `WhoAmI` (not re-read) are from documentation or knowledge, modelled in mocks.
+- Nothing shown in a browser; the account label change (tenant) is text only.
+- Docker images not built, compose not re-rendered (no compose file changed).
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
