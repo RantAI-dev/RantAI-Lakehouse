@@ -31,6 +31,7 @@ import type {
   CreatePolicyInput,
 } from "@/services/contracts/governance"
 import { classificationTitle } from "./asset-badges"
+import { AssetGrants } from "./asset-grants"
 import { lineageKey } from "./asset-lineage"
 
 type PolicySummary = AssetDetail["policySummary"][number]
@@ -531,6 +532,7 @@ export function AssetAccess({
   return (
     <div className="flex flex-col gap-2">
       <YourAccess asset={a} />
+      <AssetGrants asset={a} />
       <ClassificationCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"

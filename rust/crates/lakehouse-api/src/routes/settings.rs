@@ -1,7 +1,7 @@
 //! `GET`/`PUT /api/settings/reporting` — the deployment's report time zone
 //! and first day of the week (`BI-9`), and the number locale, company palette
-//! and allowed fonts (`BI-17` part A, migration `0085`), and the sites image
-//! and web cards may load from (`BI-16` part B, migration `0086`).
+//! and allowed fonts (`BI-17` part A, migration `0086`), and the sites image
+//! and web cards may load from (`BI-16` part B, migration `0087`).
 //!
 //! # Why one deployment-wide setting
 //!

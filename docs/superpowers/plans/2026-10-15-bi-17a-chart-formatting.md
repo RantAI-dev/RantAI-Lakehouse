@@ -377,6 +377,12 @@ branches and `0090` to `0094` are reserved by Data phase 3). The file
 contents did not change. A database that applied them as 72 and 73 (only
 the dev stack) needs its two `_sqlx_migrations` rows fixed by hand.
 
+**Renumbered again (round M, decision M4, 2026-10-21).** `main` took `0085`
+for `0085_quality_incident_stale.sql` (`DATA-14`), so the two files are now
+`0086_reporting_formatting.sql` and `0087_reporting_content_sites.sql`, with
+their contents unchanged. A database that applied them as 85 and 86 (only the
+dev stack) needs its two `_sqlx_migrations` rows fixed by hand.
+
 ### Planner review of PR #199 before merge, 2026-10-21 (round M)
 
 One review covers all three items of PR #199: see `docs/superpowers/plans/2026-10-14-bi-18c-layout.md`, section 8, "Planner review of PR #199 before merge, 2026-10-21 (round M)".

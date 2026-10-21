@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
@@ -1601,7 +1601,12 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
-pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+pub async fn fields(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Query(q): Query<FieldsQuery>,
+) -> Response {
     if let Some(id) = q.source.as_deref() {
         return match source_fields_body(&state.clickhouse, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
@@ -1618,13 +1623,42 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         };
     }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            if q.mart.is_none() {
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+                // Only decorate marts if catalog_tenant_refusal allows it:
+                if let Ok(None) =
+                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+                        .await
+                {
+                    mark_marts(&state, &mut body).await;
+                }
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
+}
+
+/// `DATA-12` part 3: puts each mart's certified or deprecated mark on the
+/// mart list the chart builder's picker reads, from the same annotation
+/// fields the catalog shows (`catalog::insert_certification_fields`), so the
+/// picker can mark a mart and warn when a deprecated one is chosen. A mart's
+/// catalog id is `serving.<name>`; an unmarked mart gains no key. One batch
+/// read for the whole list.
+async fn mark_marts(state: &AppState, body: &mut Value) {
+    let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // `DATA-12` task 10 moved the merge itself to
+    // `catalog::apply_serving_certification`: the assistant's
+    // `describe_mart` marks its marts the same way, so the guard, the id
+    // convention and the field shape have one owner instead of two.
+    crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
 /// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
@@ -4128,6 +4162,80 @@ mod tests {
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
         // BI-18 part C: the tab only on a tile that names one.
         assert!(out.contains("      c2: { x: 3, y: 0, w: 3, h: 5, tab: t_maps }"));
+    }
+
+    // ── DATA-12 part 3: marks on the mart list ───────────────────────────
+    mod marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn deprecate(pool: &lakehouse_store::PgPool, id: &str, replacement: Option<&str>) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use the v2 mart".to_owned()),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecated_mart_reaches_the_picker_payload_with_its_note_and_replacement(
+            pool: lakehouse_store::PgPool,
+        ) {
+            deprecate(&pool, "serving.orders", Some("serving.orders_v2")).await;
+            let mut body = json!({ "marts": [
+                { "name": "orders", "rows": 10 },
+                { "name": "orders_v2", "rows": 12 },
+                { "name": "stock", "rows": 3 },
+            ]});
+
+            mark_marts(&state_for(&pool), &mut body).await;
+
+            let orders = &body["marts"][0];
+            assert_eq!(orders["certification"], json!("deprecated"));
+            assert_eq!(orders["certificationNote"], json!("Use the v2 mart"));
+            assert_eq!(orders["replacementAssetId"], json!("serving.orders_v2"));
+            assert_eq!(orders["replacementName"], json!("orders_v2"));
+            assert_eq!(orders["rows"], json!(10), "the existing fields are kept");
+            assert!(body["marts"][1].get("certification").is_none());
+            assert!(body["marts"][2].get("certification").is_none());
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_list_with_no_marks_is_left_exactly_as_it_was(pool: lakehouse_store::PgPool) {
+            let original = json!({ "marts": [{ "name": "orders", "rows": 10 }] });
+            let mut body = original.clone();
+            mark_marts(&state_for(&pool), &mut body).await;
+            assert_eq!(body, original);
+        }
     }
 }
 

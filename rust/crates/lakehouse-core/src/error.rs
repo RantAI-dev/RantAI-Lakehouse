@@ -58,6 +58,13 @@ pub enum ApiError {
     /// The requested resource does not exist. Maps to HTTP 404.
     #[error("{0}")]
     NotFound(String),
+    /// The resource existed and its retention window has passed, so it can
+    /// no longer be recovered. Maps to HTTP 410. Used by the asset page's
+    /// restore of a dropped table (`DATA-15` F4), where "nothing to restore"
+    /// (404) and "it was here, and the 7 days are over" (410) are different
+    /// answers for the person reading them.
+    #[error("{0}")]
+    Gone(String),
     /// The request was well-formed but semantically invalid (e.g. a query
     /// that fails validation or execution). Maps to HTTP 422.
     #[error("{0}")]
@@ -143,6 +150,7 @@ impl ApiError {
             Self::Unauthorized(_) => 401,
             Self::Forbidden | Self::PermissionDenied(_) => 403,
             Self::NotFound(_) => 404,
+            Self::Gone(_) => 410,
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
@@ -191,6 +199,11 @@ mod tests {
     #[test]
     fn forbidden_message_matches_ts_contract() {
         assert_eq!(ApiError::Forbidden.to_string(), "embedding_disabled");
+    }
+
+    #[test]
+    fn gone_maps_to_410() {
+        assert_eq!(ApiError::Gone("window passed".to_owned()).status(), 410);
     }
 
     #[test]

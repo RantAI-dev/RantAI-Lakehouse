@@ -112,7 +112,15 @@ const MAX_ITER: u32 = 8;
 
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
-const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+/// The wording forbids the three defects staging QA saw in the model's
+/// reply: an apology or a mention of the refusal, a closing question in
+/// plain text, and a reply in another language.
+const LATE_ASK_REFUSAL: &str = "ask_user is refused: a turn may ask only before \
+it runs a query, and this turn has run one. Do not apologise and do not \
+mention this refusal. Answer now from the results above with the reading \
+you used, and say in one sentence which reading it is. Do not end with a \
+question: if another reading is possible, name it as a statement. Reply in \
+the language of the user's question.";
 
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
@@ -2370,6 +2378,25 @@ mod tests {
         assert!(
             !text.contains("Tell the user the request is waiting in Approvals"),
             "the approval line must not tell the user the request is waiting unconditionally"
+        );
+    }
+
+    #[test]
+    fn the_late_ask_refusal_forbids_an_apology_a_closing_question_and_another_language() {
+        // The constant is the only instruction the model reads on its next
+        // round, so it must forbid the three defects staging QA saw.
+        let text = LATE_ASK_REFUSAL.to_lowercase();
+        assert!(
+            text.contains("apologi"),
+            "the refusal must forbid an apology, got: {text}"
+        );
+        assert!(
+            text.contains("do not end with a question"),
+            "the refusal must forbid a closing question in plain text, got: {text}"
+        );
+        assert!(
+            text.contains("language of the user's question"),
+            "the refusal must tell the model to reply in the user's language, got: {text}"
         );
     }
 

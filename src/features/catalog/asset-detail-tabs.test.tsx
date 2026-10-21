@@ -19,7 +19,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { toast } from "sonner"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -113,6 +113,7 @@ const TABLE = {
       parentId: null,
       timestampMs: Date.parse("2026-09-23T03:37:39Z"),
       operation: "append",
+      author: null,
       summary: { addedRecords: 2000, deletedRecords: null, totalRecords: 2000, totalDataFiles: 1 },
     },
   ],
@@ -182,6 +183,33 @@ function json(body: unknown, status = 200) {
   })
 }
 
+const LEARNING = {
+  asset: "bronze.demo_orders",
+  learned: false,
+  days: 3,
+  loads: 7,
+  requiredDays: 14,
+  requiredLoads: 5,
+  message: "learning: 3 days and 7 loads so far; anomalies start after 14 days and 5 loads",
+  firstLoadAt: "2026-10-13T09:00:00.000Z",
+  lastLoadAt: "2026-10-16T09:00:00.000Z",
+}
+
+const INCIDENT = {
+  id: "inc-1",
+  asset: "bronze.demo_orders",
+  ruleId: "q2",
+  ruleName: "id_unique",
+  kind: "check",
+  openedAt: "2026-10-15T09:00:00.000Z",
+  lastSeenAt: "2026-10-16T09:00:00.000Z",
+  detail: "id_unique — 3 repeated values in 50 rows (threshold: id unique)",
+  status: "open",
+  resolvedAt: null,
+  resolvedBy: null,
+  resolution: null,
+}
+
 /** What the sample route answers for a `limit`: the rows, or a response of its own (a failure). */
 type SampleAnswer = (limit: number) => Record<string, string | null>[] | Response
 
@@ -190,11 +218,81 @@ function stubApi({
   lineage = GRAPH,
   profile = PROFILE,
   sample = (limit) => Array.from({ length: limit }, (_, i) => ({ id: String(i + 1), amount: "1.5" })),
-}: { permissions?: string[]; lineage?: unknown; profile?: unknown; sample?: SampleAnswer } = {}) {
+  tagKeys = [],
+  annotationRefusal,
+  grants = [],
+  grantRefusal,
+  tableMissing = false,
+  snapshotAuthor = null,
+  restoreRefusal,
+  revokeRefusal,
+  restore = { restorable: false, reason: "no dropped copy of this table is kept" },
+  incidents = [],
+  schedules = [],
+  learning = LEARNING,
+}: {
+  permissions?: string[]
+  lineage?: unknown
+  profile?: unknown
+  sample?: SampleAnswer
+  /** The governed tag keys `GET /api/governance/tag-keys` answers. */
+  tagKeys?: unknown[]
+  /** When set, `PUT .../annotation` is refused with this sentence (400). */
+  annotationRefusal?: string
+  /** The grants `GET .../grants` answers (`DATA-15`). */
+  grants?: unknown[]
+  /** When set, `POST .../grants` is refused with this status and sentence. */
+  grantRefusal?: { status: number; error: string }
+  /** The Iceberg table is gone (404), as after a drop (`DATA-15`). */
+  tableMissing?: boolean
+  /** The author the table's one snapshot recorded (`DATA-15`); `null` when it recorded none. */
+  snapshotAuthor?: string | null
+  /** When set, `POST .../restore` is refused with this status and sentence. */
+  restoreRefusal?: { status: number; error: string }
+  /** When set, `DELETE .../grants` is refused with this status and sentence. */
+  revokeRefusal?: { status: number; error: string }
+  /** What `GET .../restore` answers. */
+  restore?: unknown
+  /** The quality incidents `GET /api/governance/quality/incidents` answers. */
+  incidents?: unknown[]
+  /** The quality schedules `GET /api/governance/quality/schedules` answers. */
+  schedules?: unknown[]
+  /** What `GET /api/governance/quality/learning/{asset}` answers. */
+  learning?: unknown
+} = {}) {
   return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input)
     const method = init?.method ?? "GET"
-    if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
+    if (method === "PUT" && path.endsWith("/annotation")) {
+      return annotationRefusal ? json({ error: annotationRefusal }, 400) : json({ ok: true })
+    }
+    if (path.endsWith("/restore")) {
+      if (method === "GET") return json(restore)
+      if (restoreRefusal) return json({ error: restoreRefusal.error }, restoreRefusal.status)
+      return json({ ok: true })
+    }
+    if (path.includes("/grants")) {
+      if (method === "GET") return json({ grants })
+      if (method === "POST") {
+        return grantRefusal ? json({ error: grantRefusal.error }, grantRefusal.status) : json({ ok: true, id: "grant-new" })
+      }
+      if (method === "DELETE") {
+        return revokeRefusal ? json({ error: revokeRefusal.error }, revokeRefusal.status) : json({ ok: true })
+      }
+    }
+    if (method === "GET" && path.endsWith("/api/governance/tag-keys")) return json(tagKeys)
+    // DATA-14: the Quality tab's incidents, schedule and learning state.
+    if (method === "GET" && path.includes("/api/governance/quality/incidents")) return json({ incidents })
+    if (method === "GET" && path.endsWith("/api/governance/quality/schedules")) {
+      return json({ schedules, defaultIntervalMinutes: 60 })
+    }
+    if (method === "PUT" && path.includes("/api/governance/quality/schedules/")) {
+      return json({ asset: "bronze.demo_orders", updatedBy: "Reader", updatedAt: "2026-10-16T09:00:00.000Z", ...JSON.parse(String(init?.body)) })
+    }
+    if (method === "GET" && path.includes("/api/governance/quality/learning/")) return json(learning)
+    if (method === "POST" && path.includes("/api/governance/quality/incidents/")) {
+      return json({ ...INCIDENT, status: "resolved", resolution: JSON.parse(String(init?.body)).resolution, resolvedBy: "Reader", resolvedAt: "2026-10-16T10:00:00.000Z" })
+    }
     if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/quality/")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/sla/")) return json({ ok: true })
@@ -220,7 +318,10 @@ function stubApi({
     if (path.endsWith("/profile")) return profile instanceof Response ? profile.clone() : json(profile)
     if (path.endsWith("/maintenance")) return json({ configured: false })
     if (method === "GET" && path.includes("/api/semantic/")) return json({ entries: [] })
-    if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
+    if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) {
+      if (tableMissing) return json({ error: "table not found" }, 404)
+      return json({ ...TABLE, snapshots: TABLE.snapshots.map((snap) => ({ ...snap, author: snapshotAuthor })) })
+    }
     return json({ error: "not stubbed" }, 404)
   }) as unknown as typeof fetch)
 }
@@ -325,6 +426,29 @@ describe("Lineage tab", () => {
     expect(within(dependents).getByText("orders_clean").closest("a")?.getAttribute("href")).toBe(
       "/pipelines/pl-clean"
     )
+  })
+
+  it("offers the table's columns for column lineage, and asks for none until one is picked", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=lineage"
+    renderTabs()
+
+    const card = (await screen.findByText("Column lineage")).closest("[data-slot=card]") as HTMLElement
+    expect(within(within(card).getByLabelText("Column")).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Pick a column",
+      "amount",
+      "id",
+    ])
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/governance/lineage/columns"))).toBe(false)
+  })
+
+  it("has no column lineage to offer without lineage:read", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read"] })
+    url.search = "tab=lineage"
+    renderTabs()
+
+    expect(await screen.findByText("Lineage needs lineage access")).toBeTruthy()
+    expect(screen.queryByText("Column lineage")).toBeNull()
   })
 
   it("says nothing is recorded, and why, instead of drawing an empty graph", async () => {
@@ -497,13 +621,122 @@ describe("Quality tab", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    // DATA-14 (AC1): the new rule is run once at once (the stub's answer to the
+    // create carries no `evaluable: false`), so a check that already fails opens
+    // its incident without waiting for the schedule. This test pinned the POST alone.
     expect(writes(fetchSpy)).toEqual([
       [
         "POST",
         "/api/governance/quality",
         { name: "demo_orders_id_unique", asset: "bronze.demo_orders", dimension: "uniqueness", threshold: "id unique", severity: "medium" },
       ],
+      ["POST", "/api/governance/quality/new/run", undefined],
     ])
+  })
+})
+
+describe("Quality tab: incidents, schedule and learning (DATA-14)", () => {
+  it("lists the table's open incidents and resolves one with a reason", async () => {
+    const fetchSpy = stubApi({ incidents: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/3 repeated values in 50 rows \(threshold: id unique\)/)).toBeTruthy()
+    expect(screen.getByText("Check failed")).toBeTruthy()
+    const incidentsRequest = fetchSpy.mock.calls.map((c) => String(c[0])).find((p) => p.includes("/quality/incidents"))
+    expect(incidentsRequest).toBe("/api/governance/quality/incidents?status=open&asset=bronze.demo_orders")
+
+    // The Resolve button waits for the session (governance:write), a separate request.
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve" }))
+    const confirm = screen.getAllByRole("button", { name: "Resolve" }).at(-1) as HTMLButtonElement
+    // A reason is required.
+    expect(confirm.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText("Why is it resolved?"), { target: { value: "  Source fixed  " } })
+    expect(confirm.disabled).toBe(false)
+    fireEvent.click(confirm)
+
+    await waitFor(() =>
+      expect(writes(fetchSpy)).toEqual([
+        ["POST", "/api/governance/quality/incidents/inc-1/resolve", { resolution: "Source fixed" }],
+      ])
+    )
+  })
+
+  it("offers no Resolve without governance:write", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read"], incidents: [INCIDENT] })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    await screen.findByText(/3 repeated values in 50 rows/)
+    expect(screen.queryByRole("button", { name: "Resolve" })).toBeNull()
+  })
+
+  it("says honestly when the incidents could not be loaded", async () => {
+    spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Reader", email: null, roles: [], permissions: ["*:*"], tenants: [] })
+      }
+      if (path.includes("/quality/incidents")) return json({ error: "boom" }, 503)
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/The incidents could not be loaded/)).toBeTruthy()
+  })
+
+  it("says a table is still learning, and how far along it is", async () => {
+    stubApi()
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(
+      await screen.findByText("learning: 3 days and 7 loads so far; anomalies start after 14 days and 5 loads")
+    ).toBeTruthy()
+    // No schedule is saved: the default is said.
+    // The schedule is its own request, so it may land after the learning state.
+    expect(await screen.findByText("Every 1 hour (the default).")).toBeTruthy()
+  })
+
+  it("says a learned table is watched", async () => {
+    stubApi({ learning: { ...LEARNING, learned: true, days: 20, loads: 40, message: null } })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText(/Learned from 20 days and 40 loads/)).toBeTruthy()
+  })
+
+  it("saves a schedule: on every load, with the backstop interval", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    const mode = await screen.findByLabelText("Run the checks")
+    // The panel seeds the control from the saved schedule in an effect; let it
+    // run, or it would put the mode back after the change below (CI race).
+    await act(async () => {})
+    fireEvent.change(mode, { target: { value: "on_load" } })
+    fireEvent.change(await screen.findByLabelText("And at least every"), { target: { value: "360" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save schedule" }))
+
+    await waitFor(() =>
+      expect(writes(fetchSpy)).toEqual([
+        ["PUT", "/api/governance/quality/schedules/bronze.demo_orders", { mode: "on_load", intervalMinutes: 360 }],
+      ])
+    )
+  })
+
+  it("shows the saved schedule, and no control without governance:write", async () => {
+    stubApi({
+      permissions: ["catalog:read", "query:read"],
+      schedules: [{ asset: "bronze.demo_orders", mode: "interval", intervalMinutes: 180, updatedBy: "Rina", updatedAt: "2026-10-15T09:00:00.000Z" }],
+    })
+    url.search = "tab=quality"
+    renderTabs(BRONZE)
+
+    expect(await screen.findByText("Every 3 hours.")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "Save schedule" })).toBeNull()
   })
 })
 
@@ -533,20 +766,39 @@ describe("Access tab", () => {
   })
 })
 
+/** A usage answer: the figures given, and nothing else listed. */
+function usageOf(figures: Partial<NonNullable<AssetDetail["usage"]>>): NonNullable<AssetDetail["usage"]> {
+  return {
+    days: 30,
+    queries: 0,
+    users: 0,
+    avgLatencyMs: 0,
+    basedOn: 0,
+    truncated: false,
+    frequentUsers: [],
+    frequentQueries: [],
+    unparsed: 0,
+    joinedTables: [],
+    columns: [],
+    columnsNote: "Counted from the queries that read only this table.",
+    ...figures,
+  }
+}
+
 describe("Activity tab: usage and history", () => {
   it("counts everyone's queries, lists only the reader's own, and shows who changed what", async () => {
     stubApi()
     url.search = "tab=activity"
     renderTabs({
       ...BRONZE,
-      usage: { queries7d: 12, users7d: 3, avgLatencyMs: 240 },
+      usage: usageOf({ queries: 12, users: 3, avgLatencyMs: 240 }),
       recentQueries: [
         { id: "q-9", sql: "SELECT count() FROM bronze.demo_orders", user: "Reader", at: "2026-09-30T08:00:00Z", status: "completed", auditEventId: "audit-77" },
       ],
       changeHistory: [{ id: "audit-1", at: "2026-09-30T09:00:00Z", actor: "Rina", summary: "Edited description, owner" }],
     })
 
-    const usage = screen.getByText("Usage (7d)").closest("[data-slot=card]") as HTMLElement
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
     expect(within(usage).getByText("12")).toBeTruthy()
     expect(within(usage).getByText("240 ms")).toBeTruthy()
     const mine = within(usage).getByText("SELECT count() FROM bronze.demo_orders").closest("li") as HTMLElement
@@ -557,11 +809,48 @@ describe("Activity tab: usage and history", () => {
     expect(within(history).getByText("Edited description, owner")).toBeTruthy()
   })
 
+  it("lists frequent users, frequent queries without values, joined tables and column popularity over 30 days", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: usageOf({
+        queries: 340,
+        users: 4,
+        avgLatencyMs: 90,
+        basedOn: 5000,
+        truncated: true,
+        unparsed: 2,
+        frequentUsers: [{ name: "Rina Wijaya", queries: 210 }],
+        frequentQueries: [{ sql: "SELECT id FROM bronze.demo_orders WHERE x = ?", runs: 77, lastAt: "2026-09-30T08:00:00Z" }],
+        joinedTables: [
+          { table: "silver.customers", assetId: "silver.customers", queries: 31 },
+          { table: "bronze.unlisted", assetId: null, queries: 3 },
+        ],
+        columns: [{ name: "amount", queries: 55 }],
+        columnsNote: "Counted from the queries that read only this table. 4 queries that read several tables are not counted.",
+      }),
+    })
+
+    const usage = screen.getByText("Usage (30d)").closest("[data-slot=card]") as HTMLElement
+    expect(within(usage).getByText(/Based on the newest 5,000 queries/)).toBeTruthy()
+    expect(within(usage).getByText("Rina Wijaya")).toBeTruthy()
+    expect(within(usage).getByText("210 queries")).toBeTruthy()
+    expect(within(usage).getByText("SELECT id FROM bronze.demo_orders WHERE x = ?")).toBeTruthy()
+    expect(within(usage).getByText("77 runs")).toBeTruthy()
+    expect(within(usage).getByText(/2 queries could not be read as SQL and are left out/)).toBeTruthy()
+    // A joined table that is a catalog asset links to its page; one that is not is plain text.
+    expect(within(usage).getByText("silver.customers").closest("a")?.getAttribute("href")).toBe("/data/assets/silver.customers")
+    expect(within(usage).getByText("bronze.unlisted").closest("a")).toBeNull()
+    expect(within(usage).getByText("amount")).toBeTruthy()
+    expect(within(usage).getByText(/4 queries that read several tables are not counted/)).toBeTruthy()
+  })
+
   it("says nobody queried the table, rather than that usage is unknown", () => {
     stubApi()
     url.search = "tab=activity"
-    renderTabs({ ...BRONZE, usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 } })
-    expect(screen.getByText("No Query Studio or copilot query in the last 7 days")).toBeTruthy()
+    renderTabs({ ...BRONZE, usage: usageOf({ queries: 0, users: 0, avgLatencyMs: 0 }) })
+    expect(screen.getByText("No Query Studio or copilot query in the last 30 days")).toBeTruthy()
     expect(screen.queryByText(/Not counted/)).toBeNull()
   })
 
@@ -571,7 +860,7 @@ describe("Activity tab: usage and history", () => {
     url.search = "tab=activity"
     renderTabs({
       ...BRONZE,
-      usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 },
+      usage: usageOf({ queries: 0, users: 0, avgLatencyMs: 0 }),
       dependents: [
         { id: "default", name: "default", kind: "dashboard", detail: "2 charts" },
         { id: "b_42", name: "Sales board", kind: "dashboard" },
@@ -634,6 +923,104 @@ describe("About card", () => {
         { description: "One row per order.", owner: "Data Platform", steward: "Rina", tags: ["finance", "monthly-report"] },
       ],
     ])
+  })
+
+  const DOMAIN_KEY = {
+    key: "data_domain",
+    allowedValues: ["finance", "ops"],
+    createdBy: "Rina",
+    createdAt: "2026-10-14T10:00:00Z",
+    updatedAt: "2026-10-14T10:00:00Z",
+  }
+
+  it("shows governed tags beside the free tags as key: value", async () => {
+    stubApi()
+    renderTabs({ ...BRONZE, tags: ["finance"], governedTags: { data_domain: "finance" } })
+    expect(await screen.findByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("finance")).toBeTruthy()
+  })
+
+  it("offers one select per tag key with its allowed values and None, and saves the choice", async () => {
+    const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
+    const reloaded = mock(() => {})
+    renderTabs(
+      { ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } },
+      reloaded
+    )
+
+    fireEvent.click(await screen.findByText("Edit"))
+    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
+    expect([...select.options].map((o) => o.value)).toEqual(["", "finance", "ops"])
+    expect(select.value).toBe("")
+    fireEvent.change(select, { target: { value: "ops" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "PUT",
+        "/api/catalog/demo-orders/annotation",
+        { description: null, owner: null, steward: null, tags: [], governedTags: { data_domain: "ops" } },
+      ],
+    ])
+  })
+
+  it("starts from the stored value and takes the key off the table when None is chosen", async () => {
+    const fetchSpy = stubApi({ tagKeys: [DOMAIN_KEY] })
+    renderTabs({
+      ...BRONZE,
+      governedTags: { data_domain: "finance" },
+      annotation: { owner: null, steward: null, tags: ["pii"], description: null, governedTags: { data_domain: "finance" } },
+    })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    const select = (await screen.findByLabelText("data_domain")) as HTMLSelectElement
+    expect(select.value).toBe("finance")
+    fireEvent.change(select, { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(writes(fetchSpy).length).toBe(1))
+    expect(writes(fetchSpy)[0][2]).toMatchObject({ tags: ["pii"], governedTags: {} })
+  })
+
+  it("shows the API's sentence when the allowed values changed under the editor", async () => {
+    stubApi({
+      tagKeys: [DOMAIN_KEY],
+      annotationRefusal:
+        'governedTags: "ops" is not an allowed value for "data_domain"; allowed values: finance',
+    })
+    renderTabs({ ...BRONZE, annotation: { owner: null, steward: null, tags: [], description: null } })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    fireEvent.change(await screen.findByLabelText("data_domain"), { target: { value: "ops" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    expect(await screen.findByText(/"ops" is not an allowed value for "data_domain"; allowed values: finance/)).toBeTruthy()
+  })
+
+  it("sends no governed tags when the keys cannot be read, so a save never wipes them", async () => {
+    const fetchSpy = stubApi()
+    fetchSpy.mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith("/api/governance/tag-keys")) return json({ error: "unavailable" }, 503)
+      if ((init?.method ?? "GET") === "PUT") return json({ ok: true })
+      if (path.includes("/api/auth/me")) {
+        return json({ id: "u1", name: "Writer", email: null, roles: [], permissions: ["*:*"], tenants: [] })
+      }
+      return json({ error: "not stubbed" }, 404)
+    }) as unknown as typeof fetch)
+    renderTabs({
+      ...BRONZE,
+      governedTags: { data_domain: "finance" },
+      annotation: { owner: null, steward: null, tags: [], description: null, governedTags: { data_domain: "finance" } },
+    })
+
+    fireEvent.click(await screen.findByText("Edit"))
+    expect(await screen.findByText(/governed tag keys could not be loaded/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(writes(fetchSpy).length).toBe(1))
+    expect(writes(fetchSpy)[0][2]).not.toHaveProperty("governedTags")
   })
 
   it("refuses a tag the API would refuse, before sending anything", async () => {
@@ -834,50 +1221,74 @@ describe("Sample tab", () => {
       .filter((path) => path.includes("/sample?limit="))
       .map((path) => Number(path.split("limit=")[1]))
 
-  it("asks for 25 rows on opening, and shows the rows the page carries until they arrive", async () => {
+  it("asks for 1,000 rows once on opening, and shows the rows the page carries until they arrive", async () => {
     const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs()
 
-    const sizes = screen.getByRole("group", { name: "Rows to show" })
-    // Labelled, so the numbers read as a choice of how many rows to show.
-    expect(within(sizes).getByText("Rows")).toBeTruthy()
-    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["25", "50", "100"])
-    expect(within(sizes).getByText("25").getAttribute("aria-pressed")).toBe("true")
-    // The detail body's one row is on screen at once (the header row and that row) while 25 load.
+    // `DATA-15` F1: the size choice (25/50/100) is gone; there is one read and a pager.
+    expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+    // The detail body's one row is on screen at once (the header row and that row) while 1,000 load.
     expect(screen.getAllByRole("row")).toHaveLength(2)
-    expect(screen.getByText(/Loading 25 rows… showing the first 1 row,/)).toBeTruthy()
+    expect(screen.getByText(/Loading 1,000 rows… showing the first 1 row,/)).toBeTruthy()
 
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
-    expect(screen.getByText(/The first 25 rows, as you would read them/)).toBeTruthy()
-    expect(sampleLimits(fetchSpy)).toEqual([25])
-    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=25"))).toBe(true)
+    // 1,000 rows come back; the grid shows the first 100 (and its header row).
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
+    expect(screen.getByText(/The first 1,000 rows, as you would read them/)).toBeTruthy()
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    expect(sampleLimits(fetchSpy)).toEqual([1000])
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/api/catalog/demo-orders/sample?limit=1000"))).toBe(true)
   })
 
-  it("asks again for 50 and for 100 rows when they are chosen", async () => {
+  it("pages the 1,000 rows 100 at a time without asking the API again", async () => {
     const fetchSpy = stubApi()
     url.search = "tab=sample"
     renderTabs()
-    const sizes = screen.getByRole("group", { name: "Rows to show" })
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(26))
-
-    fireEvent.click(within(sizes).getByText("50"))
-    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(51))
-    expect(within(sizes).getByText("50").getAttribute("aria-pressed")).toBe("true")
-    fireEvent.click(within(sizes).getByText("100"))
     await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
-    expect(sampleLimits(fetchSpy)).toEqual([25, 50, 100])
+    const previous = screen.getByRole("button", { name: "Previous" }) as HTMLButtonElement
+    const next = screen.getByRole("button", { name: "Next" }) as HTMLButtonElement
+    expect(previous.disabled).toBe(true)
+
+    fireEvent.click(next)
+    expect(screen.getByRole("status").textContent).toBe("Rows 101–200 of 1,000")
+    // The gutter keeps counting from the first row loaded.
+    expect(document.querySelector("tbody tr th")?.textContent).toBe("101")
+    expect(document.querySelector("tbody tr td")?.textContent).toBe("101")
+    expect(previous.disabled).toBe(false)
+
+    fireEvent.click(previous)
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    for (let i = 0; i < 9; i++) fireEvent.click(next)
+    expect(screen.getByRole("status").textContent).toBe("Rows 901–1,000 of 1,000")
+    expect(next.disabled).toBe(true)
+    expect(sampleLimits(fetchSpy)).toEqual([1000])
+  })
+
+  it("sorts all the rows loaded, not only the page on screen, and says so", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs()
+    await waitFor(() => expect(screen.getAllByRole("row")).toHaveLength(101))
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }))
+    fireEvent.click(screen.getByRole("button", { name: "Sort id ascending" }))
+    fireEvent.click(screen.getByRole("button", { name: "Sort id descending" }))
+    // A new sort starts at the first page, and its first row is the largest of all 1,000.
+    expect(screen.getByRole("status").textContent).toBe("Rows 1–100 of 1,000")
+    expect(document.querySelector("tbody tr td")?.textContent).toBe("1000")
+    expect(screen.getByText(/among the 1,000 rows loaded, all pages\./)).toBeTruthy()
   })
 
   it("shows the rows the page carries, with no size to choose, where the deployment cannot fetch more", () => {
     const fetchSpy = stubApi()
     const fetchMore = assetService.getAssetSample
-    assetService.getAssetSample = undefined
+    // PR #106 review R2 SHOULD-FIX 6 (PR #106 review R3 SHOULD-FIX 19)
+    ;(assetService as Partial<typeof assetService>).getAssetSample = undefined
     try {
       url.search = "tab=sample"
       renderTabs()
 
-      expect(screen.queryByRole("group", { name: "Rows to show" })).toBeNull()
+      expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
       expect(screen.getAllByRole("row")).toHaveLength(2)
       expect(screen.getByText(/The first 1 row, as you would read them/)).toBeTruthy()
       expect(screen.queryByText(/Loading/)).toBeNull()
@@ -929,15 +1340,12 @@ describe("Sample tab", () => {
     await waitFor(() => expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/sample?limit=")).length).toBe(2))
   })
 
-  it("puts the row count and Query Studio in the card's body, not the header slot that cannot shrink", () => {
+  it("puts Query Studio in the card's body, not the header slot that cannot shrink", () => {
     stubApi()
     url.search = "tab=sample"
     renderTabs()
 
     const card = screen.getByText("Sample rows").closest("[data-slot=card]") as HTMLElement
-    const controls = within(card).getByRole("group", { name: "Rows to show" })
-    expect(card.querySelector("[data-slot=card-header]")?.contains(controls)).toBe(false)
-    expect(card.querySelector("[data-slot=card-content]")?.contains(controls)).toBe(true)
     const studio = within(card).getByText("Open in Query Studio")
     expect(card.querySelector("[data-slot=card-header]")?.contains(studio)).toBe(false)
   })
@@ -1055,7 +1463,7 @@ describe("Sample tab: the data preview", () => {
     expect(within(bodyRows()[0]).getByText("NULL", { selector: ".italic" })).toBeTruthy()
   })
 
-  it("sorts the rows shown, ascending, descending, then back to the table's order, and says so", async () => {
+  it("sorts the rows loaded, ascending, descending, then back to the table's order, and says so", async () => {
     const fetchSpy = await openPreview()
     // The page's other loads (the signed-in user, the table, the lineage) are
     // still settling when the rows arrive, so the total request count is not
@@ -1070,12 +1478,12 @@ describe("Sample tab: the data preview", () => {
     // Numbers as numbers: 9 before 10 before 250,161, and the id as stored.
     expect(columnOf("id")).toEqual(["9", "10", "0250161"])
     expect(idHeader.getAttribute("aria-sort")).toBe("ascending")
-    expect(screen.getByText(/Sorted by id \(ascending\), among the rows shown\./)).toBeTruthy()
+    expect(screen.getByText(/Sorted by id \(ascending\), among the 3 rows loaded, all pages\./)).toBeTruthy()
 
     fireEvent.click(within(idHeader).getByRole("button", { name: "Sort id descending" }))
     expect(columnOf("id")).toEqual(["0250161", "10", "9"])
     expect(idHeader.getAttribute("aria-sort")).toBe("descending")
-    expect(screen.getByText(/Sorted by id \(descending\), among the rows shown\./)).toBeTruthy()
+    expect(screen.getByText(/Sorted by id \(descending\), among the 3 rows loaded, all pages\./)).toBeTruthy()
 
     fireEvent.click(within(idHeader).getByRole("button", { name: "Stop sorting by id" }))
     expect(columnOf("id")).toEqual(["10", "9", "0250161"])
@@ -1277,16 +1685,20 @@ describe("Sample tab: the data preview", () => {
       expect(document.activeElement === cellOf(1, "id")).toBe(true)
     })
 
-    it("drops a picked cell when another size is chosen, and keeps a picked column", async () => {
-      await openPreview()
-      const sizes = screen.getByRole("group", { name: "Rows to show" })
+    it("drops a picked cell when another page is shown, and keeps a picked column", async () => {
+      // `DATA-15` F1: the size choice became a pager; a cell is a place on the page that goes away.
+      const many = Array.from({ length: 150 }, (_, i) => ({ ...ROWS[0], id: String(i + 1) }))
+      stubApi({ sample: () => many })
+      url.search = "tab=sample"
+      renderTabs(PREVIEW)
+      await screen.findByText(/^The first 150 rows, as you would read them/)
 
       fireEvent.click(cellOf(0, "id"))
-      fireEvent.click(within(sizes).getByText("50"))
+      fireEvent.click(screen.getByRole("button", { name: "Next" }))
       expect(inspector()).toBeNull()
 
       fireEvent.click(within(headerOf("amount")).getByRole("button", { name: "amount" }))
-      fireEvent.click(within(sizes).getByText("100"))
+      fireEvent.click(screen.getByRole("button", { name: "Previous" }))
       expect(inspector()).not.toBeNull()
     })
   })
@@ -1364,6 +1776,173 @@ describe("Sample tab: the data preview", () => {
   })
 })
 
+describe("Activity tab: who made each version", () => {
+  it("shows the author a commit recorded, and unknown where it recorded none", async () => {
+    stubApi({ snapshotAuthor: "connector conn-pg, run 1a2b" })
+    url.search = "tab=activity"
+    renderTabs()
+    expect(await screen.findByText("connector conn-pg, run 1a2b")).toBeTruthy()
+    expect(screen.getByRole("columnheader", { name: "Author" })).toBeTruthy()
+    cleanup()
+
+    stubApi({ snapshotAuthor: null })
+    renderTabs()
+    expect(await screen.findByText("unknown")).toBeTruthy()
+  })
+})
+
+describe("Activity tab: a dropped table", () => {
+  const DROPPED = { restorable: true, droppedAt: "2026-10-16T08:00:00Z", expiresAt: "2026-10-23T08:00:00Z" }
+
+  it("says when the table was dropped and offers Restore until the window ends, then reloads the table", async () => {
+    const fetchSpy = stubApi({ tableMissing: true, restore: DROPPED })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText("No Iceberg table for this asset")).toBeTruthy()
+    expect(await screen.findByText("It was dropped on October 16, 2026. It can be restored until October 23, 2026.")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Restore (until October 23, 2026)" }))
+    await waitFor(() =>
+      expect(writes(fetchSpy).some((w) => w[0] === "POST" && w[1] === "/api/catalog/demo-orders/restore")).toBe(true)
+    )
+    // The table is read again after the restore.
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/api/lakehouse/tables/bronze/demo_orders")).length).toBeGreaterThan(1)
+    )
+  })
+
+  it("offers no Restore to a reader without governance:write, but still says when it was dropped", async () => {
+    stubApi({ tableMissing: true, restore: DROPPED, permissions: ["catalog:read"] })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText(/It was dropped on October 16, 2026/)).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Restore/ })).toBeNull()
+  })
+
+  it("shows only the reason where nothing can be restored", async () => {
+    stubApi({ tableMissing: true })
+    url.search = "tab=activity"
+    renderTabs()
+
+    expect(await screen.findByText("no dropped copy of this table is kept")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: /^Restore/ })).toBeNull()
+  })
+
+  // PR #106 review R1 SHOULD-FIX DATA-15 1
+  it("toasts the server's refusal sentence when restore fails", async () => {
+    stubApi({
+      tableMissing: true,
+      restore: DROPPED,
+      restoreRefusal: { status: 410, error: "A dropped copy of this table has expired and cannot be restored." },
+    })
+    const toasts = spyOn(toast, "error").mockImplementation(() => 1)
+    url.search = "tab=activity"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Restore (until October 23, 2026)" }))
+    await waitFor(() => expect(toasts).toHaveBeenCalled())
+    expect(toasts.mock.calls[0][0]).toBe("Failed to restore the table")
+    expect(toasts.mock.calls[0][1]?.description).toContain("A dropped copy of this table has expired and cannot be restored.")
+  })
+})
+
+describe("Access tab: grants", () => {
+  const GRANT = {
+    id: "grant-1",
+    user: "Bayu Pratama",
+    userEmail: "bayu@meridian.example",
+    permission: "query:read",
+    grantedAt: "2026-10-16T08:00:00.000Z",
+    expiresAt: "2026-11-15T08:00:00.000Z",
+    via: "direct",
+    grantedBy: "Rina Wijaya",
+  }
+
+  it("lists the grants made from the asset, with who granted and when it ends, and says what a grant is", async () => {
+    stubApi({ grants: [GRANT, { ...GRANT, id: "grant-2", permission: "lineage:read", via: "request", grantedBy: null }] })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/gives this permission for every table, for 30 days/)).toBeTruthy()
+    expect(await within(card).findAllByText("Bayu Pratama")).toHaveLength(2)
+    expect(within(card).getByText("Granted here")).toBeTruthy()
+    expect(within(card).getByText("Approved request")).toBeTruthy()
+    expect(within(card).getByText(/by Rina Wijaya, until November 15, 2026/)).toBeTruthy()
+  })
+
+  it("gives a permission by e-mail and reloads the list", async () => {
+    const fetchSpy = stubApi({ grants: [] })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    await within(card).findByText("No grant has been made from this asset.")
+    fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: " bayu@meridian.example " } })
+    fireEvent.change(within(card).getByLabelText("Permission"), { target: { value: "lineage:read" } })
+    fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
+
+    await waitFor(() => expect(writes(fetchSpy).some((w) => w[0] === "POST" && String(w[1]).endsWith("/grants"))).toBe(true))
+    const post = writes(fetchSpy).find((w) => w[0] === "POST" && String(w[1]).endsWith("/grants"))
+    expect(post?.[1]).toBe("/api/catalog/demo-orders/grants")
+    expect(post?.[2]).toEqual({ email: "bayu@meridian.example", permission: "lineage:read" })
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.filter((c) => (c[1]?.method ?? "GET") === "GET" && String(c[0]).endsWith("/grants")).length).toBe(2)
+    )
+  })
+
+  it("shows the server's refusal in its own words, without a prefix", async () => {
+    stubApi({ grantRefusal: { status: 403, error: "permission_denied: you cannot grant access to yourself" } })
+    url.search = "tab=access"
+    renderTabs()
+
+    const card = (await screen.findByText("Grants")).closest("[data-slot=card]") as HTMLElement
+    fireEvent.change(within(card).getByLabelText("E-mail of the user"), { target: { value: "me@meridian.example" } })
+    fireEvent.click(within(card).getByRole("button", { name: "Grant" }))
+    expect((await within(card).findByRole("alert")).textContent).toBe("you cannot grant access to yourself")
+  })
+
+  it("revokes after a confirmation", async () => {
+    const fetchSpy = stubApi({ grants: [GRANT] })
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke query:read from Bayu Pratama" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }))
+    await waitFor(() =>
+      expect(writes(fetchSpy).some((w) => w[0] === "DELETE" && w[1] === "/api/catalog/demo-orders/grants/grant-1")).toBe(true)
+    )
+  })
+
+  // PR #106 review R1 SHOULD-FIX DATA-15 1
+  it("toasts the server's refusal sentence when revoke fails", async () => {
+    stubApi({
+      grants: [GRANT],
+      revokeRefusal: { status: 409, error: "The grant has already been revoked." },
+    })
+    const toasts = spyOn(toast, "error").mockImplementation(() => 1)
+    url.search = "tab=access"
+    renderTabs()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke query:read from Bayu Pratama" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }))
+    await waitFor(() => expect(toasts).toHaveBeenCalled())
+    expect(toasts.mock.calls[0][0]).toBe("Failed to revoke the grant")
+    expect(toasts.mock.calls[0][1]?.description).toContain("The grant has already been revoked.")
+  })
+
+  it("shows no Grants card, and asks for no grants, to a reader without access:approve", async () => {
+    const fetchSpy = stubApi({ permissions: ["catalog:read"] })
+    url.search = "tab=access"
+    renderTabs()
+
+    await screen.findByText("Your access")
+    expect(screen.queryByText("Grants")).toBeNull()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("/grants"))).toBe(false)
+  })
+})
+
 describe("Access tab: adding a policy", () => {
   it("adds a masking policy bound to the table its rows are read from", async () => {
     const fetchSpy = stubApi()
@@ -1426,7 +2005,7 @@ describe("Quality tab: rewriting a rule", () => {
     const save = screen.getByRole("button", { name: "Save rule" }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
     fireEvent.change(screen.getByLabelText("Threshold"), { target: { value: " amount not null >= 95% " } })
-    expect(screen.getByText(/results recorded for this rule are cleared/)).toBeTruthy()
+    expect(screen.getByText(/results recorded for this rule are kept in its history/)).toBeTruthy()
     fireEvent.click(save)
 
     await waitFor(() => expect(reloaded).toHaveBeenCalled())

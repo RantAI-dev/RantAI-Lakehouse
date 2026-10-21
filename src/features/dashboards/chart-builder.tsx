@@ -1,5 +1,8 @@
 "use client";
 
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+import { Pill } from "@/components/patterns/status-badge"
+
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
@@ -28,6 +31,8 @@ import {
   type ChartSourceChoice,
 } from "@/lib/chart-source";
 import { useAuth } from "@/features/auth/auth-provider";
+import { DeprecationNotice } from "@/features/catalog/asset-certification";
+import { CertificationBadge } from "@/components/patterns/status-badge";
 import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
@@ -67,6 +72,7 @@ import {
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
@@ -352,7 +358,7 @@ export function ChartBuilder({
   const open = controlled ? openProp! : openState;
   const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
-  const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
+  const [marts, setMarts] = React.useState<Mart[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
@@ -388,6 +394,7 @@ export function ChartBuilder({
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
   const [source, setSource] = React.useState("");
   const choice = decodeSourceChoice(source);
+  const chosenMart = selectedMart(marts, choice);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
   const [kindQuery, setKindQuery] = React.useState("");
   const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
@@ -1268,11 +1275,29 @@ export function ChartBuilder({
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
-                  {marts.map((m) => (
-                    <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
-                      {m.name} · {m.rows.toLocaleString("id-ID")}
-                    </SelectItem>
-                  ))}
+                  {marts.map((m) => {
+                    const governed = governedPairLabels(m.governedTags)
+                    const tags = m.tags ?? []
+                    return (
+                      <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                        <span className="flex items-center gap-1.5 flex-wrap">
+                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
+                          <CertificationBadge certification={m.certification} />
+                          {governed.map((pair) => (
+                            <Pill key={`governed:${pair}`} tone="info" className="text-[10px]">
+                              {pair}
+                            </Pill>
+                          ))}
+                          {tags.map((tag) => (
+                            <Pill key={tag} tone="neutral" className="text-[10px]">
+                              {tag}
+                            </Pill>
+                          ))}
+                        </span>
+                      </SelectItem>
+                    )
+                  })}
                 </SelectGroup>
                 {sqlSources.length ? (
                   <SelectGroup>
@@ -1294,6 +1319,9 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {/* DATA-12 part 3: a deprecated mart still works; it warns, with the
+                note and a link to its replacement, and never blocks. */}
+            {chosenMart ? <DeprecationNotice asset={chosenMart} /> : null}
             {choice?.kind === "mart" ? (
               <JoinsSection
                 baseMart={baseMart}

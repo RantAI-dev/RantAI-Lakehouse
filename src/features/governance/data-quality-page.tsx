@@ -22,7 +22,7 @@ import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { withNotify } from "@/lib/notify"
+import { notifyError, withNotify } from "@/lib/notify"
 import type { Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule } from "@/services/contracts/governance"
@@ -30,7 +30,11 @@ import {
   SEVERITY_OPTIONS,
   getDataQualityColumns,
 } from "./data-quality-columns"
+import { CheckFields, ThresholdForms } from "./quality-check-fields"
+import { EMPTY_FORM, KINDS, ruleThreshold, type RuleForm } from "./quality-checks"
+import { QualityIncidents } from "./quality-incidents"
 import { EditRuleDialog } from "./quality-rule-edit-dialog"
+import { RuleRuns } from "./quality-rule-runs"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
@@ -43,6 +47,14 @@ export function DataQualityPage() {
   const [asset, setAsset] = React.useState("")
   const [formDimension, setFormDimension] = React.useState("")
   const [threshold, setThreshold] = React.useState("")
+  // DATA-14 (F7): a check is picked by default, so the threshold is always
+  // one the API can run; the typed form stays for what a picker cannot say.
+  const [typedThreshold, setTypedThreshold] = React.useState(false)
+  const [checkForm, setCheckForm] = React.useState<RuleForm>(EMPTY_FORM)
+  const builtThreshold = ruleThreshold(checkForm)
+  const finalThreshold = typedThreshold ? threshold.trim() : (builtThreshold ?? "")
+  const finalDimension =
+    formDimension.trim() || (typedThreshold ? "" : KINDS[checkForm.kind].dimension)
   const [severity, setSeverity] = React.useState<Severity>("medium")
   const tableUrlState = useTableUrlState()
 
@@ -121,6 +133,8 @@ export function DataQualityPage() {
     setAsset("")
     setFormDimension("")
     setThreshold("")
+    setTypedThreshold(false)
+    setCheckForm(EMPTY_FORM)
     setSeverity("medium")
   }
 
@@ -151,11 +165,20 @@ export function DataQualityPage() {
     const result = await create.run({
       name: name.trim(),
       asset: asset.trim(),
-      dimension: formDimension.trim(),
-      threshold: threshold.trim(),
+      dimension: finalDimension,
+      threshold: finalThreshold,
       severity,
     })
     if (result) {
+      // DATA-14 (AC1): run the new rule once now, so a check that already
+      // fails opens its incident at once; the rule stays whatever this says.
+      if (hasPermission("query:read") && result.evaluable !== false) {
+        try {
+          await governanceService.runQualityRule(result.id)
+        } catch (err) {
+          notifyError("The rule was added, but its first run failed", err)
+        }
+      }
       setCreateOpen(false)
       resetForm()
       state.reload()
@@ -178,6 +201,9 @@ export function DataQualityPage() {
           ) : null
         }
       />
+
+      {/* DATA-14 (F7): what is wrong now leads; the rules follow. */}
+      <QualityIncidents />
 
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
@@ -230,6 +256,16 @@ export function DataQualityPage() {
                 },
               ]}
             />
+            {selected.evaluable !== undefined ? (
+              <section className="flex flex-col gap-2">
+                <h3 className="text-sm font-semibold">Run history</h3>
+                <RuleRuns
+                  key={`${selected.id}-${selected.lastRunAt ?? "never"}`}
+                  ruleId={selected.id}
+                  threshold={selected.threshold}
+                />
+              </section>
+            ) : null}
             <div className="flex flex-wrap gap-2">
               {selected.evaluable ? (
                 <Button
@@ -283,7 +319,7 @@ export function DataQualityPage() {
         onOpenChange={(open) => (open ? undefined : setDeleting(null))}
         title="Delete quality rule"
         description={`Delete ${deleting?.name ?? "this rule"}?`}
-        impact="The rule and the results recorded for it are removed."
+        impact={`The rule and the results recorded for it are removed, and its open incidents are resolved as "rule deleted".`}
         confirmLabel="Delete rule"
         confirming={removeRule.status === "pending"}
         destructive
@@ -297,9 +333,7 @@ export function DataQualityPage() {
         }}
         title="Add Quality Rule"
         description="Define a quality check with dimension, threshold, and severity."
-        canSubmit={Boolean(
-          name.trim() && asset.trim() && formDimension.trim() && threshold.trim()
-        )}
+        canSubmit={Boolean(name.trim() && asset.trim() && finalDimension && finalThreshold)}
         submitting={create.status === "pending"}
         onSubmit={handleCreate}
       >
@@ -319,30 +353,57 @@ export function DataQualityPage() {
             onChange={(e) => setAsset(e.target.value)}
           />
         </div>
+        {typedThreshold ? (
+          <div className="space-y-1.5">
+            <Label htmlFor="qr-threshold">Threshold</Label>
+            <Input
+              id="qr-threshold"
+              className="font-mono"
+              value={threshold}
+              onChange={(e) => setThreshold(e.target.value)}
+              placeholder="email not null >= 99%"
+            />
+            <p className="text-xs text-muted-foreground">
+              To be runnable, write it as one of: <ThresholdForms />. Name the asset as
+              silver.table, serving.table or bronze.table.
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-3">
+            <CheckFields
+              form={checkForm}
+              onChange={(patch) => setCheckForm((f) => ({ ...f, ...patch }))}
+              columns={null}
+              idPrefix="qr"
+            />
+            <p className="text-xs text-muted-foreground">
+              {builtThreshold ? (
+                <>
+                  Threshold: <span className="font-mono text-foreground">{builtThreshold}</span>
+                </>
+              ) : (
+                "Fill in the check to see its threshold."
+              )}
+            </p>
+          </div>
+        )}
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="self-start px-0"
+          onClick={() => setTypedThreshold((t) => !t)}
+        >
+          {typedThreshold ? "Pick a check instead" : "Write the threshold myself"}
+        </Button>
         <div className="space-y-1.5">
           <Label htmlFor="qr-dim">Dimension</Label>
           <Input
             id="qr-dim"
             value={formDimension}
             onChange={(e) => setFormDimension(e.target.value)}
-            placeholder="completeness"
+            placeholder={typedThreshold ? "completeness" : KINDS[checkForm.kind].dimension}
           />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="qr-threshold">Threshold</Label>
-          <Input
-            id="qr-threshold"
-            value={threshold}
-            onChange={(e) => setThreshold(e.target.value)}
-            placeholder="email not null >= 99%"
-          />
-          <p className="text-xs text-muted-foreground">
-            To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
-            <span className="font-mono">column not null &gt;= 95%</span>,{" "}
-            <span className="font-mono">column unique</span> or{" "}
-            <span className="font-mono">column between 0 and 100</span>. Name the asset as
-            silver.table, serving.table or bronze.table.
-          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="qr-severity">Severity</Label>

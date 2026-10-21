@@ -1135,7 +1135,7 @@ mod tests {
         assert!(check_style_names(&bad_rule, &cols).is_err());
     }
 
-    fn colours_of(extra: serde_json::Value) -> ChartInput {
+    fn colours_of(extra: &serde_json::Value) -> ChartInput {
         let mut def = serde_json::json!({
             "title": "t", "mart": "m", "kind": "hbar", "dimension": "provinsi",
             "measures": ["visitors"], "aggregate": "sum",
@@ -1150,7 +1150,7 @@ mod tests {
     /// (`u_be2bc0d2`) drew `visitors`; the colour was saved under `sum_visitors`.
     #[test]
     fn a_series_colour_is_keyed_by_the_name_the_chart_draws() {
-        let mut def = colours_of(serde_json::json!({
+        let mut def = colours_of(&serde_json::json!({
             "colors": { "series": { "sum_visitors": "#16a34a" } },
             "format": { "style": "currency", "currency": "IDR" },
             "referenceLines": [{ "value": 1000.0, "label": "Target" }],
@@ -1166,7 +1166,7 @@ mod tests {
         assert!(def.style.format.is_some());
         assert!(def.shape.reference_lines.is_some());
         // A name the chart already draws, a breakdown value and an unknown name stay.
-        let mut right = colours_of(serde_json::json!({
+        let mut right = colours_of(&serde_json::json!({
             "colors": { "series": { "sum_visitors": "#111111", "Bali": "#222222" } },
         }));
         key_series_by_drawn_name(&mut right, &["sum_visitors".to_owned()]);
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!(kept.contains_key("sum_visitors") && kept.contains_key("Bali"));
         // The bare column also maps, and a key is never moved onto one already set.
-        let mut both = colours_of(serde_json::json!({
+        let mut both = colours_of(&serde_json::json!({
             "colors": { "series": { "visitors": "#333333", "sum_visitors": "#444444" } },
         }));
         key_series_by_drawn_name(&mut both, &["visitors".to_owned()]);
