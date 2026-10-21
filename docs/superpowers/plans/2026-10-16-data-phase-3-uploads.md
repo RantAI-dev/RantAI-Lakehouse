@@ -552,6 +552,16 @@ scripts OK. *Not verified*: the transaction against Lakekeeper's REST catalog (t
 step exercises it in CI; if the REST catalog refuses it, stop and report, do not fall back to a drop).
 Snapshots: one `overwrite` (a delete and an append at most) per write group.
 
+**Slice 3, round 1 fix (Phase 3 slice 3 review BLOCKER 2).** The five tests of `test_typed_load.py` that run a
+real dlt pipeline (V5, V6, and the three added for BLOCKER 1) are marked `loader`, so CI's unit job
+(`-m "not loader"`) no longer runs them; "Dagster · loader tests" does. Each takes a `local_catalog` fixture
+that removes the three `ICEBERG_CATALOG__*` variables (which `sink._install_catalog_env` leaves in the process
+and a CI job may carry) and gives dlt its own `DLT_DATA_DIR`; the destination was already explicit (a
+filesystem bucket under `tmp_path`). Proved with a hostile environment, those three variables set to a
+`lakekeeper:8181` REST catalog: `pytest -m loader` on `test_typed_load.py`, `test_file_ingest.py`,
+`test_upload_types.py`, `test_parquet_ingest.py` 5 passed (338 deselected); `pytest -m "not loader"` on the same
+files 337 passed, 1 skipped (5 deselected).
+
 **Not verified.** The gate and the large-file harness against a real stack; the Lakekeeper Iceberg write;
 `cargo test --workspace` and the full pytest and `bun test` (whole-suite runs are not possible on this machine);
 the `g9-upload` job `timeout-minutes: 25` (may need a measured raise); browser QA of the wizard.

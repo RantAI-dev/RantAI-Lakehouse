@@ -130,6 +130,26 @@ def test_a_parquet_file_is_cast_from_the_text_the_api_converter_wrote():
 # ── Section 8, items 5 and 6, against a local Iceberg table ──────────────
 
 
+# Phase 3 slice 3 review BLOCKER 2: the tests below run a real dlt pipeline, so they are
+# `loader` tests (CI's unit job runs `-m "not loader"`), and each one starts without the
+# `ICEBERG_CATALOG__*` variables that `sink._install_catalog_env` sets in the process (and
+# that a CI job may carry): left set, dlt would send the table to a REST catalog
+# (`lakekeeper:8181` in CI) instead of the local one the pipeline below names.
+loader = pytest.mark.loader
+CATALOG_ENV = (
+    "ICEBERG_CATALOG__ICEBERG_CATALOG_NAME",
+    "ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE",
+    "ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG",
+)
+
+
+@pytest.fixture
+def local_catalog(monkeypatch, tmp_path):
+    for name in CATALOG_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DLT_DATA_DIR", str(tmp_path / "dlt"))  # dlt's own state, one directory per test
+
+
 def _local_pipeline(directory: str):
     return dlt.pipeline(
         "typed",
@@ -153,7 +173,8 @@ def _iceberg_fields(directory: str) -> list[tuple[str, str]]:
     return [(f["name"], f["type"]) for f in current["fields"]]
 
 
-def test_v6_the_six_types_reach_iceberg_as_declared(tmp_path):
+@loader
+def test_v6_the_six_types_reach_iceberg_as_declared(local_catalog, tmp_path):
     specs = [
         spec("i", "integer"),
         spec("d", "decimal"),
@@ -221,7 +242,8 @@ def _state(table) -> tuple:
     )
 
 
-def test_v5_a_replace_that_changes_a_columns_type_makes_no_variant_column_and_dlt_alone_is_refused_by_iceberg(tmp_path):
+@loader
+def test_v5_a_replace_that_changes_a_columns_type_makes_no_variant_column_and_dlt_alone_is_refused_by_iceberg(local_catalog, tmp_path):
     directory = str(tmp_path)
     _text_table(directory)
     typed = pa.table({"a": pa.array([1, 2, 3], pa.int64())})
@@ -236,7 +258,8 @@ def test_v5_a_replace_that_changes_a_columns_type_makes_no_variant_column_and_dl
     plain.drop_pending_packages()
 
 
-def test_phase_3_slice_3_review_blocker_1_a_type_changing_replace_is_one_commit_that_keeps_the_history(tmp_path):
+@loader
+def test_phase_3_slice_3_review_blocker_1_a_type_changing_replace_is_one_commit_that_keeps_the_history(local_catalog, tmp_path):
     _, table = _text_table(str(tmp_path))
     schema_before, _, snapshot_before, snapshots_before = _state(table)
     typed = pa.table({
@@ -264,7 +287,8 @@ def test_phase_3_slice_3_review_blocker_1_a_type_changing_replace_is_one_commit_
     assert len(snapshots) - len(snapshots_before) <= 2, "one overwrite: a delete and an append at most"
 
 
-def test_phase_3_slice_3_review_blocker_1_a_failure_inside_the_transaction_leaves_the_table_as_it_was(tmp_path):
+@loader
+def test_phase_3_slice_3_review_blocker_1_a_failure_inside_the_transaction_leaves_the_table_as_it_was(local_catalog, tmp_path):
     _, table = _text_table(str(tmp_path))
     before = _state(table)
 
@@ -284,7 +308,8 @@ def test_phase_3_slice_3_review_blocker_1_a_failure_inside_the_transaction_leave
     assert _state(table) == before
 
 
-def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_other_loads_through_dlt(tmp_path, monkeypatch):
+@loader
+def test_the_sink_writes_a_type_changing_replace_through_the_transaction_and_other_loads_through_dlt(local_catalog, tmp_path, monkeypatch):
     directory = str(tmp_path)
     pipeline, table = _text_table(directory)
     monkeypatch.setattr(sink_module, "_install_catalog_env", lambda config: None)
