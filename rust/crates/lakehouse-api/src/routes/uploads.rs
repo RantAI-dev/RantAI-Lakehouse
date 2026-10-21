@@ -146,7 +146,10 @@ use crate::upload_parse::{self, Encoding, Kind, Overrides, Preview};
 use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
+pub(super) mod columns;
 pub(super) mod sessions;
+
+use columns::{ColumnPlan, Sample, SpecView};
 
 /// Largest file this endpoint accepts, in bytes.
 ///
@@ -174,7 +177,7 @@ const PREVIEW_ROWS: usize = 20;
 /// whole to be converted, but the preview runs on text, and a header-row
 /// change re-runs it: a prefix keeps that cheap. A header row chosen past this
 /// shows no columns, as for a text file whose head is shorter than the row.
-const WORKBOOK_PREVIEW_RECORDS: usize = 2000;
+const WORKBOOK_PREVIEW_RECORDS: usize = columns::SAMPLE_ROWS + 50;
 
 /// How many rows of a Parquet file the preview decodes (the converted text has
 /// one record more, the column names). Only these are decoded: the footer
@@ -1146,11 +1149,17 @@ pub struct PreviewQuery {
     /// For a workbook: the sheet to read (its default when absent). Ignored
     /// for a text file.
     sheet: Option<String>,
+    /// A table the file will be added to: when it is a table of the caller's
+    /// tenant, the columns' names and types are the table's (`DATA-18`
+    /// decision 9). Anything else is ignored, so the answer says nothing about
+    /// tables of other tenants.
+    table: Option<String>,
 }
 
 /// `GET /api/uploads/{id}/preview`'s response: the [`Preview`] and, for a
 /// workbook, which sheet it shows and which sheets there are.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewResponse {
     #[serde(flatten)]
     preview: Preview,
@@ -1160,6 +1169,14 @@ pub struct PreviewResponse {
     /// the row count its footer states (`preview.rows` are the first ones).
     #[serde(skip_serializing_if = "Option::is_none")]
     parquet: Option<ParquetInfo>,
+    /// Every column with its name, its starting type and its date reading
+    /// (`DATA-18`).
+    column_specs: Vec<SpecView>,
+    /// How many data rows the guess read (at most 10,000, or 16 MiB).
+    sampled_rows: usize,
+    /// The names and types are a table's, not a guess.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    from_table: bool,
 }
 
 /// What a workbook preview adds to a [`Preview`].
@@ -1226,6 +1243,8 @@ fn overrides_of(query: &PreviewQuery) -> Result<Overrides, ApiError> {
 /// received (`DATA-17`); 503 when Postgres or the object store is unavailable.
 pub async fn preview(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     query: Result<Query<PreviewQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<ApiJson<PreviewResponse>> {
@@ -1233,23 +1252,54 @@ pub async fn preview(
         tracing::warn!(%err, "a preview query string could not be read");
         ApiError::BadRequest(QUERY_UNREADABLE.to_owned())
     })?;
-    let overrides = overrides_of(&query)?;
     let row = uploads::get(pool(&state)?, &id)
         .await?
         .ok_or_else(not_found)?;
+    let (mut response, sample) = preview_with_sample(&state, &row, &query).await?;
+    // `DATA-18` decision 9: when the file will be added to a table of the
+    // caller's tenant, that table's names and types are the columns'.
+    let held = match (&query.table, principal) {
+        (Some(table), Some(Extension(principal))) => {
+            match crate::tenant_scope::resolve(&principal, &headers)? {
+                Some(tenant_id) => columns::own_table_columns(&state, tenant_id, table)
+                    .await
+                    .filter(|held| held.len() == sample.header.len()),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    response.column_specs = columns::spec_views(&sample, held.as_ref());
+    response.sampled_rows = sample.rows.len();
+    response.from_table = held.is_some();
+    Ok(ApiJson(response))
+}
+
+/// The preview of an upload and the sample its columns are guessed from: the
+/// header and up to 10,000 data rows (`DATA-18`, decision 1). Shared by the
+/// preview and the check; the columns of the response are filled in by the
+/// caller.
+///
+/// # Errors
+///
+/// As [`preview`].
+async fn preview_with_sample(
+    state: &AppState,
+    row: &Upload,
+    query: &PreviewQuery,
+) -> Result<(PreviewResponse, Sample), ApiError> {
+    let overrides = overrides_of(query)?;
     if row.status == "receiving" {
-        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()).into());
+        return Err(ApiError::Conflict(STILL_RECEIVING.to_owned()));
     }
     let store = UploadStore::connect(&state.config).await?;
     let head = store.head_bytes(&row.storage_key, PREVIEW_BYTES).await?;
     match conversion_of_head(&row.storage_key, &head) {
         Some(Conversion::Workbook) => {
-            let response =
-                workbook_preview(&store, &row, query.sheet, overrides.header_row).await?;
-            return Ok(ApiJson(response));
+            return workbook_preview(&store, row, query.sheet.clone(), overrides.header_row).await;
         }
         Some(Conversion::Parquet) => {
-            return Ok(ApiJson(parquet_preview(&store, &row).await?));
+            return parquet_preview(&store, row).await;
         }
         None => {}
     }
@@ -1262,13 +1312,36 @@ pub async fn preview(
     // out). Workbook and Parquet paths run their own refusal (`upload_workbook`
     // and `upload_parquet`), so the column cap is checked only for text.
     if upload_parse::header_width(&head, head_is_truncated, overrides) > upload_parse::MAX_COLUMNS {
-        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()).into());
+        return Err(ApiError::BadRequest(JOB_TOO_MANY_COLUMNS.to_owned()));
     }
-    Ok(ApiJson(PreviewResponse {
-        preview: upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS),
-        workbook: None,
-        parquet: None,
-    }))
+    let preview = upload_parse::preview(&head, head_is_truncated, overrides, PREVIEW_ROWS);
+    // The guess reads more than the preview shows (decision 1): up to 16 MiB,
+    // and of that the first 10,000 data rows.
+    let sample_bytes = columns::SAMPLE_BYTES;
+    let wide = if head_is_truncated {
+        store.head_bytes(&row.storage_key, sample_bytes).await?
+    } else {
+        head
+    };
+    let wide_truncated = row.size_bytes > i64::try_from(sample_bytes).unwrap_or(i64::MAX);
+    let rows =
+        upload_parse::sample_records(&wide, wide_truncated, preview.using, columns::SAMPLE_ROWS);
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: None,
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: None,
+            parquet: None,
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
 }
 
 /// The preview of a workbook: its sheet as text, read the way the load reads
@@ -1278,7 +1351,7 @@ async fn workbook_preview(
     row: &Upload,
     sheet: Option<String>,
     header_row: Option<usize>,
-) -> Result<PreviewResponse, ApiError> {
+) -> Result<(PreviewResponse, Sample), ApiError> {
     let bytes = store.get_all(&row.storage_key).await?;
     let (info, name, csv, cut) = blocking(move || {
         let read = upload_workbook::read_sheet(&bytes, sheet.as_deref())?;
@@ -1292,16 +1365,32 @@ async fn workbook_preview(
         delimiter: Some(','),
         header_row,
     };
-    Ok(PreviewResponse {
-        preview: upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS),
-        workbook: Some(WorkbookView { sheet: name, info }),
-        parquet: None,
-    })
+    let preview = upload_parse::preview(&csv, cut, overrides, PREVIEW_ROWS);
+    let rows = upload_parse::sample_records(&csv, cut, preview.using, columns::SAMPLE_ROWS);
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: None,
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: Some(WorkbookView { sheet: name, info }),
+            parquet: None,
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
 }
 
 /// The preview of a Parquet file: its first rows as text, read the way the load
 /// reads them (UTF-8, comma, the first record is the header).
-async fn parquet_preview(store: &UploadStore, row: &Upload) -> Result<PreviewResponse, ApiError> {
+async fn parquet_preview(
+    store: &UploadStore,
+    row: &Upload,
+) -> Result<(PreviewResponse, Sample), ApiError> {
     // `DATA-17` T2.2: the footer and the first row group, read by range; the file
     // is never held (`RangeReader`), and what the footer declares is bounded.
     let reader = RangeReader::open(store, &row.storage_key).await?;
@@ -1313,11 +1402,32 @@ async fn parquet_preview(store: &UploadStore, row: &Upload) -> Result<PreviewRes
         delimiter: Some(','),
         header_row: Some(0),
     };
-    Ok(PreviewResponse {
-        preview: upload_parse::preview(&converted.csv, cut, overrides, PREVIEW_ROWS),
-        workbook: None,
-        parquet: Some(converted.info),
-    })
+    let preview = upload_parse::preview(&converted.csv, cut, overrides, PREVIEW_ROWS);
+    let rows =
+        upload_parse::sample_records(&converted.csv, cut, preview.using, columns::SAMPLE_ROWS);
+    // A Parquet file's own types are the starting types (decision 10).
+    let declared = converted
+        .info
+        .columns
+        .iter()
+        .map(|column| crate::upload_types::declared_from_parquet(&column.type_name))
+        .collect();
+    let sample = Sample {
+        header: preview.columns.clone(),
+        rows,
+        declared: Some(declared),
+    };
+    Ok((
+        PreviewResponse {
+            preview,
+            workbook: None,
+            parquet: Some(converted.info),
+            column_specs: Vec::new(),
+            sampled_rows: 0,
+            from_table: false,
+        },
+        sample,
+    ))
 }
 
 // ── Ingest ───────────────────────────────────────────────────────────────
@@ -1332,6 +1442,9 @@ struct IngestRequest {
     header_row: u64,
     /// The sheet to load, for a workbook (`None`: its default sheet).
     sheet: Option<String>,
+    /// The columns as confirmed and what to do with a value that does not fit
+    /// (`DATA-18`); `None`: every column text.
+    columns: Option<ColumnPlan>,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -1433,6 +1546,7 @@ fn parse_ingest_request(
         Some(Value::String(name)) => Some(name.clone()),
         Some(_) => return Err(bad(SHEET_RULE)),
     };
+    let columns = columns::parse_column_plan(&fields)?;
     Ok(IngestRequest {
         table: table.to_owned(),
         mode,
@@ -1440,6 +1554,7 @@ fn parse_ingest_request(
         delimiter,
         header_row,
         sheet,
+        columns,
     })
 }
 
@@ -1586,6 +1701,7 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
 /// closed, so nothing about the sheet can be added here.
 fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str, format: &str) -> Value {
+    let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
     json!({
         "ops": {
             "ingest_uploaded_file": {
@@ -1598,6 +1714,8 @@ fn run_config(upload_id: &str, request: &IngestRequest, load_key: &str, format: 
                     "encoding": request.encoding.as_str(),
                     "delimiter": request.delimiter.to_string(),
                     "header_row": request.header_row,
+                    "columns": columns,
+                    "on_bad_value": on_bad_value,
                 }
             }
         }
@@ -1838,6 +1956,8 @@ pub async fn ingest(
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
     }
+    // `DATA-18`: the column list is checked before anything is claimed.
+    columns::plan_columns(&state, &row, &request, conversion).await?;
     let converted = match conversion {
         Some(Conversion::Workbook) => Some(
             convert_upload(&state, &row, Conversion::Workbook, request.sheet.as_deref()).await?,
@@ -1884,6 +2004,9 @@ pub async fn ingest(
     }
     // `SEC-17`: counts and marks in one locked transaction, so two starts at
     // the same moment cannot both take the last place.
+    // `DATA-18`: the column list is written by the claim itself, so a row is
+    // never `ingesting` with half of what its load was told.
+    let (column_spec, on_bad_value) = columns::claim_fields(request.columns.as_ref());
     let claimed = match uploads::mark_ingesting_within_limits(
         pool,
         &row.id,
@@ -1891,6 +2014,8 @@ pub async fn ingest(
         &request.table,
         request.mode,
         limits,
+        column_spec.as_ref(),
+        on_bad_value,
     )
     .await?
     {
@@ -2398,6 +2523,7 @@ mod tests {
                 delimiter: ',',
                 header_row: 0,
                 sheet: None,
+                columns: None,
             }
         );
         let mut full = valid();
@@ -2523,6 +2649,7 @@ mod tests {
             delimiter: delimiter.map(str::to_owned),
             header_row: header_row.map(str::to_owned),
             sheet: None,
+            table: None,
         }
     }
 

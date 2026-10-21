@@ -1068,6 +1068,8 @@ async fn a_data_engineer_is_not_refused_and_an_analyst_is_on_every_upload_route(
         ("PUT", "/api/uploads/x/parts/1"),
         ("GET", "/api/uploads/x/parts"),
         ("POST", "/api/uploads/x/complete"),
+        // DATA-18: the check of a column list.
+        ("POST", "/api/uploads/x/check"),
     ] {
         let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
         let resp = request_with_cookie(&router, method, path, &engineer).await;

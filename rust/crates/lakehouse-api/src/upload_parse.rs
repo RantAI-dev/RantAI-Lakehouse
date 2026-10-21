@@ -546,6 +546,38 @@ pub fn preview(
     }
 }
 
+/// The data records a type guess reads (`DATA-18`, decision 1): the records
+/// below the header that are not blank, at most `max_rows` of them, read as
+/// `using` says (`preview`'s `using`).
+///
+/// Only the records it returns are ever held, so a 16 MiB head of narrow rows
+/// costs `max_rows` records and not a million, whatever blanks or lines it
+/// holds; the rest of the head is parsed and dropped as it passes. A cut head
+/// drops its last record, as [`preview`] does — but only when the reading
+/// reached the end of the head: a sample that stopped at `max_rows` never read
+/// the cut record, and the one extra record parsed to tell the two apart is
+/// complete whenever anything follows.
+#[must_use]
+pub fn sample_records(
+    head: &[u8],
+    head_is_truncated: bool,
+    using: Reading,
+    max_rows: usize,
+) -> Vec<Vec<String>> {
+    let text = decode(head, using.encoding);
+    let mut records = Records::new(&text, using.delimiter);
+    let mut rows: Vec<Vec<String>> = records
+        .by_ref()
+        .skip(using.header_row.saturating_add(1))
+        .filter(|record| !is_blank(record))
+        .take(max_rows)
+        .collect();
+    if head_is_truncated && records.next().is_none() {
+        rows.pop();
+    }
+    rows
+}
+
 /// Most columns a file may have (`SEC-17`). The load job holds the same
 /// number (`MAX_COLUMNS` in `file_ingest.py`) and is the authority; the API
 /// checks early so a file that cannot load is refused before a run exists.
@@ -588,6 +620,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    // `writeln!` onto a `String` in the tests below.
+    use std::fmt::Write as _;
 
     // ── helpers ─────────────────────────────────────────────────────────
 
@@ -1253,6 +1288,64 @@ mod tests {
         assert_eq!(body["truncated"], json!(false));
     }
 
+    // ── sample_records (DATA-18) ─────────────────────────────────────────
+
+    fn sample_of(text: &str, cut: bool, max_rows: usize) -> Vec<Vec<String>> {
+        let shown = preview(text.as_bytes(), cut, Overrides::default(), 0);
+        sample_records(text.as_bytes(), cut, shown.using, max_rows)
+    }
+
+    #[test]
+    fn a_sample_reads_the_rows_below_the_header_and_skips_the_blanks() {
+        let text = "Report\n\nid,n\n1,a\n\n \n2,b\n";
+        let rows = sample_of(text, false, 10);
+        assert_eq!(rows, records(&[&["1", "a"], &["2", "b"]]));
+        assert_eq!(
+            sample_of(text, false, 1),
+            records(&[&["1", "a"]]),
+            "the sample stops at its bound, like the preview"
+        );
+    }
+
+    /// The guess reads far more rows than the preview shows, so the sample is
+    /// its own read and not `preview`'s rows with a bigger constant.
+    #[test]
+    fn a_sample_reads_many_more_rows_than_the_preview_shows() {
+        let mut text = String::from("n\n");
+        for i in 0..30 {
+            let _ = writeln!(text, "{i}");
+        }
+        assert_eq!(sample_of(&text, false, 25).len(), 25);
+        assert_eq!(sample_of(&text, false, 100).len(), 30);
+    }
+
+    #[test]
+    fn a_sample_of_a_cut_head_drops_its_last_record_but_not_one_it_stopped_before() {
+        // The reading reached the end of a cut head: the half record goes.
+        let cut = "n\n1\n2\n3";
+        assert_eq!(
+            sample_of(cut, true, 10),
+            records(&[&["1"], &["2"]]),
+            "the cut record is dropped"
+        );
+        // The reading stopped at its bound inside the head: the last record it
+        // took is complete, and the cut one was never reached.
+        let head = "n\n1\n2\n3\n4\n";
+        assert_eq!(sample_of(head, true, 3), records(&[&["1"], &["2"], &["3"]]));
+    }
+
+    /// A head of nothing but blank lines below the header yields no rows and
+    /// holds nothing while doing so: the bound is the rows kept, not the rows
+    /// parsed.
+    #[test]
+    fn a_sample_of_nothing_but_blank_lines_is_empty() {
+        let mut head = String::from("n\n");
+        for _ in 0..5_000 {
+            head.push_str("\n \n\t\n");
+        }
+        assert!(sample_of(&head, true, 10_000).is_empty());
+    }
+
     // ── the shared fixtures ─────────────────────────────────────────────
     //
     // `ops/fixtures/uploads/` is read by these tests and, in T7, by the
@@ -1427,7 +1520,9 @@ mod tests {
         let mut found: Vec<String> = std::fs::read_dir(FIXTURE_DIR)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name != "README.md" && name != ".gitattributes")
+            // `types/` is `DATA-18` T3.1's own set, read by `upload_types`
+            // against its own list; it is not one of the dialect fixtures.
+            .filter(|name| name != "README.md" && name != ".gitattributes" && name != "types")
             .collect();
         found.sort_unstable();
         assert_eq!(
@@ -1478,5 +1573,59 @@ mod tests {
             ..Overrides::default()
         };
         assert_eq!(header_width(text.as_bytes(), false, past), 0);
+    }
+
+    // ── DATA-18: the sample a type guess reads ───────────────────────────
+
+    #[test]
+    fn the_sample_is_the_non_blank_records_below_the_header_and_stops_at_the_bound() {
+        let head = b"title
+id,n
+1,a
+
+  ,
+2,b
+3,c
+";
+        let using = Reading {
+            encoding: Encoding::Utf8,
+            delimiter: ',',
+            header_row: 1,
+        };
+        assert_eq!(
+            sample_records(head, false, using, 10),
+            records(&[&["1", "a"], &["2", "b"], &["3", "c"]])
+        );
+        assert_eq!(sample_records(head, false, using, 2).len(), 2);
+        // A header past the end leaves nothing.
+        let past = Reading {
+            header_row: 99,
+            ..using
+        };
+        assert!(sample_records(head, false, past, 10).is_empty());
+    }
+
+    #[test]
+    fn a_cut_head_loses_its_last_record_only_when_the_sample_reached_it() {
+        let cut = b"id
+1
+2
+3
+4 half a rec";
+        let using = Reading {
+            encoding: Encoding::Utf8,
+            delimiter: ',',
+            header_row: 0,
+        };
+        assert_eq!(
+            sample_records(cut, true, using, 100),
+            records(&[&["1"], &["2"], &["3"]])
+        );
+        // Stopped at the bound: the cut was not reached, nothing is dropped.
+        assert_eq!(
+            sample_records(cut, true, using, 2),
+            records(&[&["1"], &["2"]])
+        );
+        assert_eq!(sample_records(cut, false, using, 100).len(), 4);
     }
 }

@@ -1682,8 +1682,8 @@ async fn the_preview_of_a_large_file_reads_one_range_and_says_it_is_truncated() 
         .collect();
     assert_eq!(
         ranges,
-        ["bytes=0-262143"],
-        "one ranged read of the first 256 KiB, never the whole object"
+        ["bytes=0-262143", "bytes=0-614403"],
+        "the first 256 KiB for the preview, then a second ranged read, bounded at 16 MiB, for the guess of the column types (DATA-18 decision 1)"
     );
 }
 
@@ -1791,6 +1791,8 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
             "encoding": "utf-16",
             "delimiter": "\t",
             "header_row": 4,
+        "columns": [],
+        "on_bad_value": "stop",
         } } } })
     );
     let row = stack.status_of(&id).await;
@@ -4219,6 +4221,8 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
             "encoding": "utf-8",
             "delimiter": ",",
             "header_row": 0,
+        "columns": [],
+        "on_bad_value": "stop",
         } } } }),
         "the job's own configuration, the converted object and the fixed dialect"
     );
@@ -4635,6 +4639,8 @@ async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_
             "encoding": "utf-8",
             "delimiter": ",",
             "header_row": 0,
+        "columns": [],
+        "on_bad_value": "stop",
         } } } }),
         "the job's own configuration: the original object, read as Parquet"
     );
@@ -5553,4 +5559,418 @@ async fn complete_recovers_when_s3_assembled_the_file_but_the_row_was_not_update
         refused.text
     );
     assert_eq!(stack.status_of(&other).await.0, "receiving");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Column types (DATA-18 T3.2)
+// ════════════════════════════════════════════════════════════════════════
+
+const TYPED_CSV: &str = "sku,qty,price,due,active,note\n\
+0250161,3,1.50,2026-10-16,yes,a\n\
+0250162,40,12,2026-10-17,no,b\n\
+0250163,,0.25,2026-10-18,yes,\n";
+
+fn spec_of(name: &str, kind: &str) -> Value {
+    json!({ "source": name, "name": name, "type": kind })
+}
+
+fn typed_columns() -> Value {
+    json!([
+        spec_of("sku", "text"),
+        spec_of("qty", "integer"),
+        spec_of("price", "decimal"),
+        { "source": "due", "name": "due", "type": "date", "dateFormat": "iso" },
+        spec_of("active", "boolean"),
+        spec_of("note", "text"),
+    ])
+}
+
+/// The preview offers every column a name, a starting type and the question a
+/// date may need: the guess of decisions 1 to 5, over the sample.
+#[tokio::test]
+async fn the_preview_guesses_each_columns_type_from_the_sample_and_asks_about_an_ambiguous_date() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = id_of(&stack.upload(&bayu, "typed.csv", TYPED_CSV.as_bytes()).await);
+
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    assert_eq!(preview.json["sampledRows"], 3);
+    let kinds: Vec<(String, String)> = preview.json["columnSpecs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["name"].as_str().unwrap().to_owned(),
+                c["type"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = [
+        ("sku", "text"),
+        ("qty", "integer"),
+        ("price", "decimal"),
+        ("due", "date"),
+        ("active", "boolean"),
+        ("note", "text"),
+    ]
+    .iter()
+    .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+    .collect();
+    assert_eq!(
+        kinds, expected,
+        "a leading zero stays text; 1 and 0 and empties do not break a guess"
+    );
+    let due = &preview.json["columnSpecs"][3];
+    assert_eq!(due["dateFormat"], "iso");
+    assert_eq!(due["askDateOrder"], false);
+    assert_eq!(preview.json["columnSpecs"][0]["source"], "sku");
+    assert!(preview.json.get("fromTable").is_none());
+
+    let ambiguous = id_of(
+        &stack
+            .upload(
+                &bayu,
+                "dates.csv",
+                b"day,Order Total\n01/02/2026,1\n03/04/2026,2\n",
+            )
+            .await,
+    );
+    let asked = stack
+        .get(&bayu, &format!("/api/uploads/{ambiguous}/preview"))
+        .await;
+    let day = &asked.json["columnSpecs"][0];
+    assert_eq!(
+        (day["type"].as_str(), day["askDateOrder"].as_bool()),
+        (Some("date"), Some(true))
+    );
+    assert!(
+        day.get("dateFormat").is_none(),
+        "no reading until the person answers"
+    );
+    assert_eq!(
+        asked.json["columnSpecs"][1]["name"], "order_total",
+        "the load's own cleaning"
+    );
+}
+
+/// A Parquet file's own types are the starting guess (decision 10).
+#[tokio::test]
+async fn a_parquet_previews_with_the_types_the_file_declares() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = id_of(
+        &stack
+            .upload(&bayu, "orders.parquet", &parquet_file("orders.parquet"))
+            .await,
+    );
+    let preview = stack
+        .get(&bayu, &format!("/api/uploads/{id}/preview"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text);
+    let kinds: Vec<&str> = preview.json["columnSpecs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["text", "text", "integer", "decimal", "date"]);
+    assert_eq!(preview.json["columnSpecs"][4]["dateFormat"], "iso");
+}
+
+/// `?table=` takes the columns from a table of the caller's tenant, and from no
+/// other (decision 9).
+#[tokio::test]
+async fn a_preview_takes_a_tables_columns_only_from_the_callers_own_table() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([
+            { "name": "sku", "type": "Nullable(String)" },
+            { "name": "qty", "type": "Nullable(Int64)" },
+            { "name": "_ingested_at", "type": "DateTime64(6, 'UTC')" },
+        ]))))
+        .mount(&stack.ch)
+        .await;
+    stack.seed(GROUP, "up-seed", b"sku,qty\n1,2\n").await;
+    stack.claim(GROUP, "stock_raw", "up-seed").await;
+    let mine = id_of(
+        &stack
+            .upload(&bayu, "more.csv", b"id,count\nA,x\nB,y\n")
+            .await,
+    );
+    let theirs = id_of(
+        &stack
+            .upload(&andi, "more.csv", b"id,count\nA,x\nB,y\n")
+            .await,
+    );
+
+    let own = stack
+        .get(
+            &bayu,
+            &format!("/api/uploads/{mine}/preview?table=stock_raw"),
+        )
+        .await;
+    assert_eq!(own.json["fromTable"], true, "{}", own.text);
+    let names: Vec<&str> = own.json["columnSpecs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["sku", "qty"],
+        "the table's names, without the loader's column"
+    );
+    assert_eq!(own.json["columnSpecs"][1]["type"], "integer");
+    assert_eq!(
+        own.json["columnSpecs"][1]["guessedType"], "text",
+        "the guess is still the file's"
+    );
+
+    // Another tenant's table is not readable through this route, and the answer does not say so.
+    let other = stack
+        .get(
+            &andi,
+            &format!("/api/uploads/{theirs}/preview?table=stock_raw"),
+        )
+        .await;
+    assert_eq!(other.status, StatusCode::OK);
+    assert!(other.json.get("fromTable").is_none());
+    assert_eq!(other.json["columnSpecs"][0]["name"], "id");
+}
+
+/// The check counts every failing value of the sample and lists the first ones.
+#[tokio::test]
+async fn the_check_lists_the_values_that_do_not_fit_and_stores_nothing() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let id = id_of(
+        &stack
+            .upload(
+                &bayu,
+                "qty.csv",
+                b"qty,when\n1,2026-10-16\nabc,2026-13-01\n,2026-10-17\n7x,2026-10-18\n",
+            )
+            .await,
+    );
+    let url = format!("/api/uploads/{id}/check");
+    let columns = json!([
+        spec_of("qty", "integer"),
+        { "source": "when", "name": "when_at", "type": "date", "dateFormat": "iso" },
+    ]);
+    let body = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0, "columns": columns });
+
+    let reply = stack.send(&bayu, "POST", &url, Payload::Json(body)).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["sampledRows"], 4);
+    assert_eq!(reply.json["count"], 3);
+    assert_eq!(
+        reply.json["byColumn"],
+        json!([{ "column": "qty", "count": 2 }, { "column": "when_at", "count": 1 }])
+    );
+    assert_eq!(
+        reply.json["rows"][0],
+        json!({ "row": 2, "column": "qty", "value": "abc" })
+    );
+    assert_eq!(stack.status_of(&id).await.0, "uploaded");
+
+    for (columns, needle) in [
+        (
+            json!([spec_of("qty", "integer")]),
+            "1 columns but the file has 2",
+        ),
+        (
+            json!([spec_of("qty", "integer"), spec_of("qty", "text")]),
+            "each name is used once",
+        ),
+        (
+            json!([spec_of("Qty", "integer"), spec_of("b", "text")]),
+            "lower-case",
+        ),
+        (
+            json!([spec_of("qty", "integer"), spec_of("d", "date")]),
+            "date reading",
+        ),
+    ] {
+        let refused = stack
+            .send(
+                &bayu,
+                "POST",
+                &url,
+                Payload::Json(json!({ "columns": columns })),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.text);
+        assert!(
+            refused.json["error"].as_str().unwrap().contains(needle),
+            "{}",
+            refused.text
+        );
+    }
+    let junk = stack
+        .send(
+            &bayu,
+            "POST",
+            &url,
+            Payload::Raw("application/json", b"nope".to_vec()),
+        )
+        .await;
+    assert_eq!(junk.status, StatusCode::BAD_REQUEST);
+
+    let andi = stack.andi().await;
+    let theirs = stack
+        .send(&andi, "POST", &url, Payload::Json(json!({ "columns": [] })))
+        .await;
+    assert_eq!(theirs.status, StatusCode::NOT_FOUND);
+    let receiving = stack.session(&bayu, "later.csv", 10).await;
+    let early = stack
+        .send(
+            &bayu,
+            "POST",
+            &format!("/api/uploads/{receiving}/check"),
+            Payload::Json(json!({ "columns": [] })),
+        )
+        .await;
+    assert_eq!(early.status, StatusCode::CONFLICT);
+}
+
+/// An ingest with a column list is validated, sent to the job whole, and kept on
+/// the upload; one without a list is every column text, as before.
+#[tokio::test]
+async fn an_ingest_with_a_column_list_sends_it_to_the_job_and_keeps_it_on_the_upload() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let id = id_of(&stack.upload(&bayu, "typed.csv", TYPED_CSV.as_bytes()).await);
+
+    let mut body = ingest_body("typed_raw");
+    body["columns"] = typed_columns();
+    let missing = stack.ingest(&bayu, &id, body.clone()).await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST, "{}", missing.text);
+    assert!(
+        missing.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("onBadValue")
+    );
+    body["onBadValue"] = json!("later");
+    assert_eq!(
+        stack.ingest(&bayu, &id, body.clone()).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    let mut stray = ingest_body("typed_raw");
+    stray["onBadValue"] = json!("stop");
+    assert_eq!(
+        stack.ingest(&bayu, &id, stray).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        stack.dagster.received_requests().await.unwrap().is_empty(),
+        "nothing was launched"
+    );
+    assert!(stack.claims().await.is_empty(), "and nothing was claimed");
+
+    body["onBadValue"] = json!("null");
+    let reply = stack.ingest(&bayu, &id, body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
+    assert_eq!(config["on_bad_value"], "null");
+    assert_eq!(
+        config["columns"][1],
+        json!({ "source": "qty", "name": "qty", "type": "integer", "date_format": null, "timezone": false })
+    );
+    assert_eq!(config["columns"][3]["date_format"], "iso");
+    let upload = stack.get(&bayu, &format!("/api/uploads/{id}")).await;
+    assert_eq!(upload.json["columns"], typed_columns());
+    assert_eq!(upload.json["onBadValue"], "null");
+}
+
+/// Adding to a table that exists keeps its names and types (decision 9): a
+/// different list is refused with the differences, and so is no list for a typed
+/// table; replacing may change the types.
+#[tokio::test]
+async fn adding_to_a_typed_table_keeps_its_columns_and_replacing_may_change_them() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_launch(&stack.dagster, "run-1").await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows_body(&json!([
+            { "name": "sku", "type": "Nullable(String)" },
+            { "name": "qty", "type": "Nullable(Int64)" },
+            { "name": "_ingested_at", "type": "DateTime64(6, 'UTC')" },
+        ]))))
+        .mount(&stack.ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("dataset_catalog"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(rows_body(&json!([{ "slug": "stock-raw" }]))),
+        )
+        .mount(&stack.ch)
+        .await;
+    stack.seed(GROUP, "up-seed", b"sku,qty\n1,2\n").await;
+    stack.claim(GROUP, "stock_raw", "up-seed").await;
+    let id = id_of(
+        &stack
+            .upload(&bayu, "more.csv", b"sku,qty\nA,1\nB,2\n")
+            .await,
+    );
+
+    let mut append = ingest_body("stock_raw");
+    append["mode"] = json!("append");
+    append["onBadValue"] = json!("stop");
+    append["columns"] = json!([spec_of("sku", "text"), spec_of("qty", "text")]);
+    let differs = stack.ingest(&bayu, &id, append.clone()).await;
+    assert_eq!(differs.status, StatusCode::BAD_REQUEST, "{}", differs.text);
+    assert!(
+        differs.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("column qty is Integer in the table and Text in the file")
+    );
+
+    let mut bare = ingest_body("stock_raw");
+    bare["mode"] = json!("append");
+    let typed = stack.ingest(&bayu, &id, bare).await;
+    assert_eq!(typed.status, StatusCode::BAD_REQUEST, "{}", typed.text);
+    assert!(
+        typed.json["error"]
+            .as_str()
+            .unwrap()
+            .contains("typed columns")
+    );
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+
+    append["columns"] = json!([spec_of("sku", "text"), spec_of("qty", "integer")]);
+    assert_eq!(
+        stack.ingest(&bayu, &id, append).await.status,
+        StatusCode::OK
+    );
+
+    let again = id_of(&stack.upload(&bayu, "again.csv", b"sku,qty\nA,x\n").await);
+    // (Another table, so the append above, still loading, is not in the way.)
+    stack.claim(GROUP, "other_raw", "up-seed").await;
+    let mut replace = ingest_body("other_raw");
+    replace["onBadValue"] = json!("stop");
+    replace["columns"] = json!([spec_of("sku", "text"), spec_of("qty", "text")]);
+    let changed = stack.ingest(&bayu, &again, replace).await;
+    assert_eq!(
+        changed.status,
+        StatusCode::OK,
+        "replacing may change the types: {}",
+        changed.text
+    );
 }

@@ -50,6 +50,7 @@ mod upload_parquet_range;
 mod upload_parse;
 mod upload_store;
 mod upload_sweep;
+mod upload_types;
 mod upload_workbook;
 mod upstream_error;
 mod webhook_guard;

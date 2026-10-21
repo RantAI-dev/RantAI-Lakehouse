@@ -66,6 +66,7 @@ pub mod upload_parquet_range;
 pub mod upload_parse;
 pub mod upload_store;
 pub mod upload_sweep;
+pub mod upload_types;
 pub mod upload_workbook;
 pub mod upstream_error;
 pub mod webhook_guard;

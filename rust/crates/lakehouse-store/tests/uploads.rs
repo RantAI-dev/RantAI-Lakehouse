@@ -41,7 +41,7 @@ use lakehouse_store::uploads::{
 };
 use lakehouse_store::uploads::{
     count_receiving, find_by_parts_digest, finish_receiving, insert_receiving, list_parts,
-    record_part, stale_receiving,
+    record_bad_values, record_part, stale_receiving,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -1733,6 +1733,8 @@ async fn start_limited(pool: &PgPool, id: &str, limits: LoadLimits) -> MarkOutco
         "limited_raw",
         LoadMode::Replace,
         limits,
+        None,
+        None,
     )
     .await
     .unwrap()
@@ -2349,5 +2351,102 @@ async fn count_receiving_counts_only_open_sessions_of_one_uploader(
         .unwrap()
         .unwrap();
     assert_eq!(count_receiving(&pool, "Test User").await.unwrap(), 1);
+    Ok(())
+}
+
+/// DATA-18: the column list is written by the claim, shown on the wire as
+/// `columns`, kept with the report, and cleared by the next claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_column_list_belongs_to_the_load_that_was_told_it_and_the_next_claim_clears_it(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-columns").await;
+    add(&pool, "up-col", tenant_a, "").await;
+    let spec = json!([{ "source": "Qty", "name": "qty", "type": "integer" }]);
+    let limits = LoadLimits {
+        per_user: 5,
+        total: 5,
+    };
+
+    let MarkOutcome::Marked(loading) = mark_ingesting_within_limits(
+        &pool,
+        "up-col",
+        &options(),
+        "stock_raw",
+        LoadMode::Replace,
+        limits,
+        Some(&spec),
+        Some("null"),
+    )
+    .await
+    .unwrap() else {
+        panic!("the upload is loadable");
+    };
+    assert_eq!(loading.column_spec.as_ref().map(|j| &j.0), Some(&spec));
+    assert_eq!(loading.on_bad_value.as_deref(), Some("null"));
+    let wire = serde_json::to_value(&*loading).unwrap();
+    assert_eq!(wire["columns"], spec);
+    assert_eq!(wire["onBadValue"], "null");
+    assert!(wire.get("badValues").is_none());
+    attach_run(&pool, "up-col", "run-1").await.unwrap().unwrap();
+
+    let report = json!({ "count": 1, "byColumn": [{ "column": "qty", "count": 1 }], "rows": [] });
+    assert!(
+        record_bad_values(&pool, "up-col", "run-1", &report)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !record_bad_values(&pool, "up-col", "run-other", &report)
+            .await
+            .unwrap()
+    );
+    mark_finished(&pool, "up-col", Some("run-1"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+    let done = get(&pool, "up-col").await.unwrap().unwrap();
+    assert_eq!(done.bad_values.as_ref().map(|j| &j.0), Some(&report));
+    assert_eq!(serde_json::to_value(&done).unwrap()["badValues"], report);
+    assert_eq!(
+        done.column_spec.as_ref().map(|j| &j.0),
+        Some(&spec),
+        "kept for Try again"
+    );
+
+    // The next claim starts from a clean slate, with or without a list.
+    start(
+        &pool,
+        "up-col",
+        "stock_raw",
+        LoadMode::Replace,
+        Some("run-2"),
+    )
+    .await;
+    let again = get(&pool, "up-col").await.unwrap().unwrap();
+    assert!(
+        again.column_spec.is_none() && again.on_bad_value.is_none() && again.bad_values.is_none()
+    );
+
+    // The database refuses any other word.
+    mark_finished(&pool, "up-col", Some("run-2"), None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = mark_ingesting_within_limits(
+        &pool,
+        "up-col",
+        &options(),
+        "stock_raw",
+        LoadMode::Replace,
+        limits,
+        Some(&spec),
+        Some("ignore"),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(StoreError::Database(_))),
+        "{refused:?}"
+    );
     Ok(())
 }

@@ -244,6 +244,19 @@ pub struct Upload {
     /// completes. Internal: never serialized.
     #[serde(skip)]
     pub parts_digest: Option<Vec<u8>>,
+    /// The column list the last load was told, `[{source, name, type, ...}]`;
+    /// absent for a load with no list (every column text) and for an upload never
+    /// loaded (`DATA-18`, `0091_upload_column_spec.sql`).
+    #[serde(rename = "columns", skip_serializing_if = "Option::is_none")]
+    pub column_spec: Option<Json<Value>>,
+    /// `null` or `stop`: what the last load did with a value that does not fit
+    /// its column. Set exactly when `column_spec` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_bad_value: Option<String>,
+    /// The report of values that did not fit, `{count, byColumn, rows}`, set when
+    /// the last load found any (bounded: 100 values of 200 characters).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_values: Option<Json<Value>>,
     /// When the bytes were stored.
     #[serde(serialize_with = "ser_ts")]
     pub created_at: OffsetDateTime,
@@ -255,8 +268,8 @@ pub struct Upload {
 
 const COLS: &str = "id, original_filename, storage_key, content_type, size_bytes, sha256, \
                     uploaded_by, tenant_id, status, parse_options, bronze_table, load_mode, \
-                    row_count, run_id, error, declared_size, multipart_id, parts_digest, \
-                    created_at, updated_at";
+                    row_count, run_id, error, declared_size, multipart_id, parts_digest, column_spec, on_bad_value, \
+                    bad_values, created_at, updated_at";
 
 /// Everything needed to record a file whose bytes are already stored.
 ///
@@ -695,7 +708,7 @@ pub async fn mark_ingesting(
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
          bronze_table = $3, load_mode = $4, run_id = $5, error = NULL, row_count = NULL, \
-         updated_at = now() \
+         column_spec = NULL, on_bad_value = NULL, bad_values = NULL, updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
     Ok(sqlx::query_as(&sql)
@@ -791,6 +804,12 @@ async fn under_limits(
 /// not of runs: a row is `ingesting` from the claim until it is settled, so
 /// a claim that never got a run counts until it is settled as stale.
 ///
+/// `column_spec`/`on_bad_value` are the column list the load was told and
+/// what it does with a value that does not fit (`DATA-18`); `None`/`None` is
+/// a load with no list, every column text. They are written by the same
+/// statement as the claim, so a row is never left `ingesting` with half of
+/// what its load was told.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] on a database failure.
@@ -801,6 +820,8 @@ pub async fn mark_ingesting_within_limits(
     bronze_table: &str,
     load_mode: LoadMode,
     limits: LoadLimits,
+    column_spec: Option<&Value>,
+    on_bad_value: Option<&str>,
 ) -> Result<MarkOutcome, StoreError> {
     let mut tx = pool.begin().await?;
     // `hashtext()` keys the lock on a constant string; the prefix keeps it
@@ -814,8 +835,8 @@ pub async fn mark_ingesting_within_limits(
     }
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
-         bronze_table = $3, load_mode = $4, run_id = NULL, error = NULL, row_count = NULL, \
-         updated_at = now() \
+         bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
+         run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
     let marked: Option<Upload> = sqlx::query_as(&sql)
@@ -823,12 +844,37 @@ pub async fn mark_ingesting_within_limits(
         .bind(Json(parse_options.clone()))
         .bind(bronze_table)
         .bind(load_mode.as_str())
+        .bind(column_spec.map(|spec| Json(spec.clone())))
+        .bind(on_bad_value)
         .fetch_optional(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(marked.map_or(MarkOutcome::NotMarked, |row| {
         MarkOutcome::Marked(Box::new(row))
     }))
+}
+
+/// Keep the report of values that did not fit on the upload the load belongs to
+/// (`DATA-18`, plan AD6). Written when the API settles the row, whatever the
+/// outcome: a `stop` load fails with the report, a `null` load succeeds with it.
+/// Only a row that is `ingesting` or just settled under `run_id` takes it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn record_bad_values(
+    pool: &PgPool,
+    id: &str,
+    run_id: &str,
+    report: &Value,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query("UPDATE file_upload SET bad_values = $3 WHERE id = $1 AND run_id = $2")
+        .bind(id)
+        .bind(run_id)
+        .bind(Json(report.clone()))
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Give a claimed upload the Dagster run that carries its load out: sets

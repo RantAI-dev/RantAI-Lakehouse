@@ -766,6 +766,11 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             get(uploads::get).delete(uploads::delete),
         )
         .route("/api/uploads/{id}/preview", get(uploads::preview))
+        // DATA-18: apply a column list to the sample, store nothing.
+        .route(
+            "/api/uploads/{id}/check",
+            axum::routing::post(uploads::columns::check),
+        )
         .route(
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
