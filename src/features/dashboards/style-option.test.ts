@@ -101,6 +101,35 @@ describe("axes", () => {
     expect(styled.option).toBe(option)
   })
 
+  test("a logarithmic axis is refused when a box has a number at or below zero", () => {
+    // A box plot's entry is its five numbers: the check used to read only the
+    // last one, so a box whose minimum was negative got a logarithmic axis.
+    const box = [
+      { k: "Bali", v: [10, 20, 30, 40, 50] },
+      { k: "Java", v: [-5, 20, 30, 40, 50] },
+    ]
+    const option = buildOption({ kind: "boxplot", x: "k", y: "v" } as never, box, false)
+    const styled = styleOption(option, { kind: "boxplot", y: "v", style: { axes: { y: { log: true } } }, locale: "en-US", decimals: 0 })
+    expect(styled.message).toBe("A logarithmic axis cannot show zero or negative values")
+  })
+
+  test("a logarithmic axis is refused when a line or a band sits at or below zero", () => {
+    const style: StyleFields = { axes: { y: { log: true } } }
+    const option = buildOption({ kind: "bar", x: "k", y: "v" } as never, rows, false)
+    for (const line of [
+      { value: 0 },
+      { value: -10 },
+      { kind: "band" as const, value: -10, to: 100 },
+      { kind: "band" as const, value: 10, to: 0 },
+    ]) {
+      const styled = styleOption(option, { kind: "bar", y: "v", style, locale: "en-US", decimals: 0, referenceLines: [line] })
+      expect(styled.message).toBe("A logarithmic axis cannot show zero or negative values")
+    }
+    // A line above zero is drawn.
+    const ok = styleOption(option, { kind: "bar", y: "v", style, locale: "en-US", decimals: 0, referenceLines: [{ value: 1000 }] })
+    expect(ok.message).toBeUndefined()
+  })
+
   test("values on the right go to a second Y axis", () => {
     const { option } = draw("bar", { axes: { rightValues: ["w"], y2: { title: "Nights" } } }, ["v", "w"])
     const axes = option.yAxis as { name?: string; position?: string }[]
