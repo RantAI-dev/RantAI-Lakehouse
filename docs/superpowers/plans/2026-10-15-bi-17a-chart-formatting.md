@@ -376,3 +376,7 @@ and BI-16 B's `0073_reporting_content_sites.sql` is
 branches and `0090` to `0094` are reserved by Data phase 3). The file
 contents did not change. A database that applied them as 72 and 73 (only
 the dev stack) needs its two `_sqlx_migrations` rows fixed by hand.
+
+### Planner review of PR #199 before merge, 2026-10-21 (round M)
+
+One review covers all three items of PR #199: see `docs/superpowers/plans/2026-10-14-bi-18c-layout.md`, section 8, "Planner review of PR #199 before merge, 2026-10-21 (round M)".

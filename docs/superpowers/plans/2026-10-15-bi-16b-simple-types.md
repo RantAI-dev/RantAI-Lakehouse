@@ -270,3 +270,7 @@ Not verified by anyone yet: the new statements on a real ClickHouse (the
 dev API rebuild and the owner's QA run them), the browser, the assistant
 through a model. The reviewer's own re-run was skipped at the owner's
 request.
+
+### Planner review of PR #199 before merge, 2026-10-21 (round M)
+
+One review covers all three items of PR #199: see `docs/superpowers/plans/2026-10-14-bi-18c-layout.md`, section 8, "Planner review of PR #199 before merge, 2026-10-21 (round M)".
