@@ -137,6 +137,15 @@ describe("axes", () => {
     expect(axes[1]).toMatchObject({ position: "right", name: "Nights" })
     expect(series(option).map((s) => s.yAxisIndex)).toEqual([0, 1])
   })
+
+  test("the second Y axis is named after the values on it when it has no title", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, measureLabels: { w: "Nights" } })
+    const axes = styled.option.yAxis as { name?: string }[]
+    expect(axes[1]!.name).toBe("Nights")
+  })
 })
 
 describe("data labels and notes", () => {

@@ -2,6 +2,7 @@ import type { EChartsOption } from "echarts";
 import { interpolate } from "@/lib/chart-palettes";
 import { escapeHtml } from "@/lib/geo-points";
 import type { AxisStyle, ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
+import { displayColumn } from "@/lib/chart-joins";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
 
 /**
@@ -38,6 +39,12 @@ export type StyleInput = {
    * (`PR #199 review M SHOULD-FIX BI-17 1`).
    */
   referenceLines?: readonly ResolvedReferenceLine[];
+  /**
+   * The readable label of each value, by result name: the same labels the
+   * legend and the tooltip use. The second axis is named after the values on
+   * it when it has no title of its own (`PR #199 review M SHOULD-FIX BI-17 2`).
+   */
+  measureLabels?: Record<string, string>;
 };
 
 export type Styled = {
@@ -147,7 +154,20 @@ function applyAxes(option: Obj, series: Obj[], cols: (string | undefined)[], inp
   if (right.size && !horizontal) {
     const left = Array.isArray(option[valKey]) ? (option[valKey] as unknown[])[0] : option[valKey];
     const existing = Array.isArray(option[valKey]) ? (option[valKey] as unknown[])[1] : undefined;
-    option[valKey] = [left, existing ?? { ...asObj(left), position: "right", splitLine: { show: false }, alignTicks: false }];
+    const rightAxis: Obj =
+      existing === undefined
+        ? { ...asObj(left), position: "right", splitLine: { show: false }, alignTicks: false }
+        : asObj(existing);
+    // The right axis's name: its own title, or the labels of the values on
+    // it, so an axis without a title is not a nameless one
+    // (`PR #199 review M SHOULD-FIX BI-17 2`).
+    if (rightAxis.name === undefined && !axes.y2?.title) {
+      const labels = [...right]
+        .map((col) => input.measureLabels?.[col] ?? displayColumn(col))
+        .filter((label) => label.length > 0);
+      if (labels.length) rightAxis.name = labels.join(", ");
+    }
+    option[valKey] = [left, rightAxis];
     series.forEach((s, i) => {
       s.yAxisIndex = right.has(cols[i] ?? "") ? 1 : 0;
     });

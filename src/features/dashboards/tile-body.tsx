@@ -163,7 +163,7 @@ export function TileBody({
     // reference line is drawn on the axis of the measure it describes
     // (`PR #199 review M BLOCKER 4`, decision M2).
     const cols = seriesColumns({ kind: spec.kind, y: spec.y, breakdown: !!spec.series }, (built.series as unknown[] | undefined)?.length ?? 0);
-    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals, columns: cols, referenceLines: cell.referenceLines });
+    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals, columns: cols, referenceLines: cell.referenceLines, measureLabels });
     if (styled.message) {
       return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
     }
