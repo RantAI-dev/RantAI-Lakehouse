@@ -1070,36 +1070,58 @@ pub async fn boards_create(
     // takes only its owner's dashboards.
     crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
         .await?;
+    // The owner of the folder a new dashboard is filed in: it travels in the
+    // first insert, so a dashboard filed in a personal space is private from
+    // the moment it exists and never public in between
+    // (`PR #199 review M BLOCKER 5`). An ordinary folder has no owner.
+    let folder_owner = if folder_id.is_empty() {
+        String::new()
+    } else {
+        lakehouse_bi::folders::folder_owner(&state.clickhouse, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+    };
+    let duplicated = parsed.duplicate.is_some();
     let mut board = if let Some(dup) = parsed.duplicate {
         store::duplicate_board(&state.clickhouse, &dup, &author, &viewer).await
     } else {
-        store::create_board(
+        store::create_board_in(
             &state.clickhouse,
             &parsed.name.unwrap_or_default(),
             &parsed.description.unwrap_or_default(),
             &author,
+            &folder_id,
+            &folder_owner,
         )
         .await
     }
     .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    if !folder_id.is_empty() {
-        store::move_board(&state.clickhouse, &board.id, &folder_id)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(folder_id);
-    } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
-        // An administrator duplicating somebody else's draft: the copy is the
-        // administrator's own draft, not a second one in the other user's
-        // space.
-        let mine =
-            lakehouse_bi::folders::ensure_personal_folder(&state.clickhouse, viewer.id(), &author)
+    if duplicated {
+        // A copy lands next to the original and is private from its first
+        // insert, so moving it into another folder is a change of place, not
+        // the first time it is given an owner.
+        if !folder_id.is_empty() {
+            store::move_board(&state.clickhouse, &board.id, &folder_id)
                 .await
-                .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
-        store::move_board(&state.clickhouse, &board.id, &mine.id)
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(folder_id);
+        } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
+            // An administrator duplicating somebody else's draft: the copy is the
+            // administrator's own draft, not a second one in the other user's
+            // space.
+            let mine = lakehouse_bi::folders::ensure_personal_folder(
+                &state.clickhouse,
+                viewer.id(),
+                &author,
+            )
             .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(mine.id);
-        board.owner_id = Some(viewer.id().to_owned());
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+            store::move_board(&state.clickhouse, &board.id, &mine.id)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(mine.id);
+            board.owner_id = Some(viewer.id().to_owned());
+        }
     }
     if let Some(Extension(p)) = principal.as_ref() {
         snapshot(&state.clickhouse, &board.id, p).await;

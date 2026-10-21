@@ -25,9 +25,9 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::super::dashboard_organise::trash_restore;
 use super::typed_filters::{chart_row, client, statements};
 use super::{
-    DashboardQuery, GrainRequest, RecordsQuery, TableExportQuery, ValuesQuery, boards_delete,
-    boards_list, boards_update, export, get_body, records_for_roles, specs_create, specs_delete,
-    specs_list, specs_update, table_export, values_for_roles,
+    DashboardQuery, GrainRequest, RecordsQuery, TableExportQuery, ValuesQuery, boards_create,
+    boards_delete, boards_list, boards_update, export, get_body, records_for_roles, specs_create,
+    specs_delete, specs_list, specs_update, table_export, values_for_roles,
 };
 use crate::config::Config;
 use crate::policy_engine::PolicyEngineObligations;
@@ -1757,6 +1757,122 @@ async fn a_duplicate_of_a_tabbed_board_names_the_tab_of_every_tile() {
     assert_eq!(tags, 2, "{board}");
     assert_eq!(board.matches(r#""tab":"t_b""#).count(), 1, "{board}");
     assert!(board.contains(&copy.id));
+}
+
+/// `PR #199 review M BLOCKER 5`: a new dashboard filed in the personal space
+/// is private from its FIRST insert, so it is never public in between.
+#[tokio::test]
+async fn a_new_dashboard_in_the_personal_space_is_private_from_its_first_insert() {
+    let server = engine(vec![(
+        &["FROM console.bi_folder FINAL"],
+        vec![folder_row("fp_me", &id_of(ME))],
+    )])
+    .await;
+    let body = json!({ "name": "Draft", "folderId": "fp_me" });
+    boards_create(
+        State(state_for(&server)),
+        Some(Extension(person(ME, "dashboard:write"))),
+        body.to_string().into(),
+    )
+    .await
+    .done("the dashboard was created");
+    let written = writes(&server).await;
+    let first = written
+        .iter()
+        .find(|w| w.contains("INTO console.bi_board ("))
+        .expect("the dashboard was created");
+    assert!(first.contains(&id_of(ME)), "{first}");
+}
+
+/// `PR #199 review M BLOCKER 5`: a copy of a private dashboard is private
+/// from its FIRST insert, so it is never visible to another user, not even
+/// for the moment between the insert and the write that used to give it its
+/// owner back.
+#[tokio::test]
+async fn a_duplicate_of_a_private_board_is_private_from_its_first_insert() {
+    let server = engine(vec![
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![board_row("b1", "u_owner")],
+        ),
+        (
+            &[
+                "SELECT id, spec_json, board, created_by",
+                "FROM console.bi_chart FINAL",
+            ],
+            vec![chart_row("c1", "b1", "mart_a", None)],
+        ),
+    ])
+    .await;
+    let ch = client(&server);
+    let copy =
+        lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+            .await
+            .unwrap();
+    assert_eq!(copy.owner_id.as_deref(), Some("u_owner"));
+    let written = writes(&server).await;
+    let first = written
+        .iter()
+        .find(|w| w.contains("INTO console.bi_board ("))
+        .expect("the copy was created");
+    // The owner is in the first insert, not only in a later write.
+    assert!(first.contains("'u_owner'"), "{first}");
+}
+
+/// `PR #199 review M BLOCKER 5`: a copy whose chart could not be written is
+/// taken back, so no half-built dashboard is left behind.
+#[tokio::test]
+async fn a_duplicate_that_cannot_be_finished_leaves_no_copy_behind() {
+    use wiremock::matchers::{body_string_contains, method};
+    let server = MockServer::start().await;
+    // The chart's own statement fails, so the copy cannot be finished. The
+    // first mock registered is the one that answers, so this one is mounted
+    // before the catch-all.
+    Mock::given(method("POST"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [board_row("b1", "u_owner")], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_chart FINAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [chart_row("c1", "b1", "mart_a", None)], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0
+        })))
+        .mount(&server)
+        .await;
+    let ch = client(&server);
+    lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+        .await
+        .expect_err("the chart's statement fails");
+    let written = writes(&server).await;
+    // The copy was taken back: the board and its charts are wiped.
+    assert!(
+        written
+            .iter()
+            .any(|w| w.contains("INTO console.bi_board (id, name, owner_id, is_deleted)")),
+        "{written:?}"
+    );
+    assert!(
+        written.iter().any(|w| w.contains(
+            "INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted)"
+        )),
+        "{written:?}"
+    );
 }
 
 /// Going back to a version saved before the stamping: its untagged tiles were on

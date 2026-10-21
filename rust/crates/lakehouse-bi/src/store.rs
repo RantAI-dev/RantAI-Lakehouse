@@ -1163,6 +1163,30 @@ pub async fn create_board(
     description: &str,
     created_by: &str,
 ) -> Result<Board, BiError> {
+    create_board_in(ch, name, description, created_by, "", "").await
+}
+
+/// Create a new board in `folder_id`, owned by `owner_id` when it is not
+/// empty.
+///
+/// Why the folder and the owner travel in the FIRST insert: a board written
+/// without an owner is visible to everybody who may read dashboards, so a
+/// board that is filed in a personal space a moment later was public in
+/// between (`PR #199 review M BLOCKER 5`). A board created without them is an
+/// ordinary shared board, as before.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when `name` is blank after trimming, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn create_board_in(
+    ch: &ChClient,
+    name: &str,
+    description: &str,
+    created_by: &str,
+    folder_id: &str,
+    owner_id: &str,
+) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
@@ -1174,11 +1198,13 @@ pub async fn create_board(
     let author = created_by.trim();
     let id = new_board_id();
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, description, created_by) VALUES ({}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, folder_id, owner_id) VALUES ({}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id.as_str()),
         SqlLiteral::from(clean),
         SqlLiteral::from(desc),
-        SqlLiteral::from(author)
+        SqlLiteral::from(author),
+        SqlLiteral::from(folder_id),
+        SqlLiteral::from(owner_id)
     );
     ch.exec(&sql, None).await?;
     Ok(Board {
@@ -1199,8 +1225,8 @@ pub async fn create_board(
         updated_at: None,
         public_token: None,
         embed_enabled: None,
-        folder_id: None,
-        owner_id: None,
+        folder_id: Some(folder_id.to_owned()).filter(|f| !f.is_empty()),
+        owner_id: Some(owner_id.to_owned()).filter(|o| !o.is_empty()),
         embed_access: EmbedAccess::default(),
     })
 }
@@ -2164,6 +2190,35 @@ pub async fn delete_board(ch: &ChClient, id: &str, deleted_by: &str) -> Result<(
     ch.exec(&board, None).await
 }
 
+/// Take a board and every chart on it back for good: the rows are wiped
+/// (`is_deleted = 1`, the state the trash's own purge leaves behind), so no
+/// half-built copy of a dashboard is left behind after a write that failed
+/// (`PR #199 review M BLOCKER 5`).
+///
+/// The owner travels with the board, so what is left of a private board's
+/// charts stays private. The charts go first, like a delete does, so a
+/// failure cannot leave live charts on a board that is gone.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+async fn wipe_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
+    let charts = format!(
+        "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted) \
+         SELECT id, '', '{{}}', board, 'system', 1 FROM console.bi_chart FINAL \
+         WHERE is_deleted = 0 AND board = {board}",
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&charts, None).await?;
+    let board = format!(
+        "INSERT INTO console.bi_board (id, name, owner_id, is_deleted) \
+         SELECT id, '', owner_id, 1 FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND id = {board}",
+        board = SqlLiteral::from(id),
+    );
+    ch.exec(&board, None).await
+}
+
 /// The built-in board's fixed tiles as saved charts, so the built-in board
 /// can be duplicated (`BI-18` part C). The tiles are kept as the fixed
 /// statements they are: the stored definition has no mart, which is what
@@ -2342,14 +2397,26 @@ pub async fn duplicate_board(
     };
     let stored = list_stored_charts(ch, viewer).await?;
     let charts: Vec<_> = stored.into_iter().filter(|c| c.board == id).collect();
+    // The copy lands next to the original, not at the root. In the personal
+    // space it is private to the same owner; the caller moves it into the
+    // duplicating user's own space when that is someone else.
+    let folder_id = src.folder_id.clone().unwrap_or_default();
+    let owner_id = src.owner_id.clone().unwrap_or_default();
     // The copy carries the original's description — it describes the same
     // thing — but is authored by whoever pressed Duplicate, not by the
     // person who made the original.
-    let new_board = create_board(
+    //
+    // The folder and the owner travel in this FIRST insert: a copy written
+    // without an owner is visible to everybody who may read dashboards, so a
+    // copy of a private draft was public until the last write gave it back
+    // its owner (`PR #199 review M BLOCKER 5`).
+    let new_board = create_board_in(
         ch,
         &format!("Copy of {}", src.name),
         src.description.as_deref().unwrap_or(""),
         created_by,
+        &folder_id,
+        &owner_id,
     )
     .await?;
     let builtin = if id == DEFAULT_BOARD_ID {
@@ -2359,16 +2426,16 @@ pub async fn duplicate_board(
     };
     let plan = plan_duplicate(&src, charts, builtin, &new_board.id, new_chart_id);
     for chart in &plan.charts {
-        insert_chart(ch, chart).await?;
+        if let Err(err) = insert_chart(ch, chart).await {
+            // A copy that could not be finished is taken back, so no
+            // half-built dashboard is left behind.
+            let _ = wipe_board(ch, &new_board.id).await;
+            return Err(err.into());
+        }
     }
     let (new_layout, new_phone) = (plan.layout, plan.phone_layout);
-    // The copy lands next to the original, not at the root. In the personal
-    // space it is private to the same owner; the caller moves it into the
-    // duplicating user's own space when that is someone else.
-    let folder_id = src.folder_id.clone().unwrap_or_default();
-    let owner_id = src.owner_id.clone().unwrap_or_default();
     // One full-row write for everything the copy inherits.
-    save_board_patch(
+    if let Err(err) = save_board_patch(
         ch,
         &new_board,
         BoardPatch {
@@ -2386,7 +2453,11 @@ pub async fn duplicate_board(
             ..Default::default()
         },
     )
-    .await?;
+    .await
+    {
+        let _ = wipe_board(ch, &new_board.id).await;
+        return Err(err.into());
+    }
     Ok(Board {
         owner_id: Some(owner_id).filter(|o| !o.is_empty()),
         layout: Some(new_layout),
