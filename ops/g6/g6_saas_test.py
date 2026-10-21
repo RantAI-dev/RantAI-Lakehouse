@@ -1519,7 +1519,7 @@ def step_product(vendor_id: str) -> None:
     )
     if not resp.ok:
         raise SaasGateFailure(f"{label}: PUT ingest-spec answered {resp.status_code} {resp.text[:300]}")
-    _log(f"{vendor_id} create: the {spec['type']} connector (a type that is not supported yet) was created and its spec saved through the API")
+    _log(f"{vendor_id} create: the {spec['type']} connector was created and its spec saved through the API")
 
     # connect: the API's connection test dials the mock vendor with the saved credential.
     test = matrix.API.post(f"{matrix.API_URL}/api/connectors/{cid}/test", timeout=30)
