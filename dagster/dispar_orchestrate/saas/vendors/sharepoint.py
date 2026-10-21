@@ -16,11 +16,14 @@ GUID,web GUID` and the list id a GUID, both checked to be exactly that before th
 path. Files are not loaded (the feature page's "Not included"): a document library is a list in
 Graph, and it is left out of the listing, as are hidden lists.
 
-*Which sites.* Sites are found with `GET /sites?search=*`
+*Which sites.* The person picks them (slice 5 review BLOCKER 14): `list_fields` answers discovery's
+`schema: "fields"` request with the tenant's sites (`kind: "site"`, `name` the site id, `label` the title), the
+console saves the picks as site ids in the dial's `objects`, and the lists are those of the picked sites, each
+labelled `Site / List` (the object's name stays the two ids, so a rename changes nothing stored). Sites are found with `GET /sites?search=*`
 (https://learn.microsoft.com/en-us/graph/api/site-search; the plain `GET /sites` list is
 application-only, https://learn.microsoft.com/en-us/graph/api/site-list, so a browser sign-in could
-not use it). The person narrows them by naming site ids in the dial's `objects`; with none named the
-first `MAX_SITES` found are listed, and a larger tenant must name its sites. `search` was NOT tried
+not use it). With none picked the
+first `MAX_SITES` found are listed, and a larger tenant must pick its sites. `search` was NOT tried
 against a tenant (no Microsoft tenant is available to this project, decision 11).
 
 # Reading: the delta query (decisions 6 and 7; plan AD5, section 8 item 6)
@@ -67,6 +70,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -135,34 +139,64 @@ def _picked_sites(dial: dict) -> list[str]:
     return [n for n in (dial.get("objects") or []) if isinstance(n, str) and _SITE_ID.match(n)]
 
 
-def list_sites(session: Any, dial: dict) -> list[str]:
-    """The site ids to list lists of: the ones the dial names, else the first `MAX_SITES` that
-    `GET /sites?search=*` finds (personal sites left out)."""
-    picked = _picked_sites(dial)
-    if picked:
-        return picked
-    found: list[str] = []
-    for body in _pages(session, f"{API}/sites", {"search": "*", "$select": "id,isPersonalSite", "$top": PAGE_SIZE}):
+def _text(value: Any, fallback: str) -> str:
+    """A name Graph gave, as a short printable label (it goes to a list for a person and must pass the
+    API's bounds: no control characters, not blank); `fallback` when nothing printable is left."""
+    cleaned = " ".join("".join(c if c.isprintable() else " " for c in str(value or "")).split())[:100]
+    return cleaned or fallback
+
+
+def search_sites(session: Any) -> list[tuple[str, str]]:
+    """`(site id, title)` of the first `MAX_SITES` sites `GET /sites?search=*` finds (personal sites left out)."""
+    found: list[tuple[str, str]] = []
+    for body in _pages(session, f"{API}/sites", {"search": "*", "$select": "id,displayName,name,isPersonalSite", "$top": PAGE_SIZE}):
         for site in body["value"]:
             if isinstance(site, dict) and isinstance(site.get("id"), str) and not site.get("isPersonalSite") and _SITE_ID.match(site["id"]):
-                found.append(site["id"])
+                found.append((site["id"], _text(site.get("displayName") or site.get("name"), site["id"])))
         if len(found) >= MAX_SITES:
             break
     return found[:MAX_SITES]
 
 
+def _site_title(session: Any, site: str) -> str:
+    """The title of a site the dial names; its id when Graph no longer knows it."""
+    try:
+        body = session.get_json(f"{API}/sites/{site}", {"$select": "displayName,name"})
+    except requests.HTTPError as exc:
+        if getattr(exc.response, "status_code", None) in (400, 404):
+            return site
+        raise
+    return _text(body.get("displayName") or body.get("name"), site) if isinstance(body, dict) else site
+
+
+def list_fields(session: Any, parts: Any, dial: dict) -> list[dict[str, str]]:
+    """The sites a person can pick (slice 5 review BLOCKER 14): discovery's `schema: "fields"` request, the
+    same one Google Analytics uses for its dimensions. The `name` is the site id (what the dial's `objects`
+    keeps), the `label` its title."""
+    return [{"name": site, "kind": "site", "label": title} for site, title in search_sites(session)]
+
+
+def list_sites(session: Any, dial: dict) -> list[tuple[str, str]]:
+    """`(site id, title)` to list lists of: the sites the dial names (the person's pick), else the first
+    `MAX_SITES` that the search finds."""
+    picked = _picked_sites(dial)
+    return [(site, _site_title(session, site)) for site in picked] if picked else search_sites(session)
+
+
 def list_objects(session: Any, parts: Any, dial: dict) -> list[ObjectDecl]:
-    """The lists of the sites (document libraries and hidden lists left out: files are not loaded)."""
+    """The lists of the sites (document libraries and hidden lists left out: files are not loaded), each
+    labelled `Site / List` for a person; the object's name stays the two ids."""
     out: list[ObjectDecl] = []
-    for site in list_sites(session, dial):
-        for body in _pages(session, f"{API}/sites/{site}/lists", {"$select": "id,list", "$top": PAGE_SIZE}):
+    for site, site_title in list_sites(session, dial):
+        for body in _pages(session, f"{API}/sites/{site}/lists", {"$select": "id,displayName,name,list", "$top": PAGE_SIZE}):
             for entry in body["value"]:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not _LIST_ID.match(entry["id"]):
                     continue
                 facet = entry.get("list") if isinstance(entry.get("list"), dict) else {}
                 if facet.get("hidden") or facet.get("template") == "documentLibrary":
                     continue
-                out.append(_decl(f"{site}/{entry['id']}"))
+                list_title = _text(entry.get("displayName") or entry.get("name"), entry["id"])
+                out.append(replace(_decl(f"{site}/{entry['id']}"), label=f"{site_title} / {list_title}"))
                 if len(out) >= MAX_LISTS:
                     return out
     return out

@@ -114,6 +114,10 @@ class Graph:
             return Reply(200, {"value": [s for s in self.sites if s.get("id")]})
         if path == f"/v1.0/sites/{SITE.split(',')[0]}":
             return Reply(200, {"id": SITE, "displayName": "Team"})
+        if path == f"/v1.0/sites/{SITE}":
+            return Reply(200, {"id": SITE, "displayName": "Team\nSite"})
+        if path == f"/v1.0/sites/{OTHER_SITE}":
+            return Reply(404, {"error": {"message": "STUB-VENDOR-WORDS"}})
         pieces = path.split("/")  # '', v1.0, sites, <site>, lists, <list>, items, [delta]
         if len(pieces) >= 5 and pieces[2] == "sites" and pieces[4] == "lists":
             site = pieces[3]
@@ -200,15 +204,19 @@ def test_the_lists_of_the_found_sites_are_offered_without_libraries_hidden_lists
     module, _v, parts, session = open_(graph)
     listed = module.list_objects(session, parts, DIAL)
     assert [d.name for d in listed] == [OBJECT], "a document library and a hidden list are left out; a personal site is not searched"
+    assert [d.label for d in listed] == ["Team / Tasks"], "BLOCKER 14: a name for a person; the object's name stays the two ids"
     assert all(d.load_description() == "incremental" and d.deletes and d.primary_key == ("id",) for d in listed)
     assert "search=*" in graph.log[0] and graph.log[0].startswith("graph.microsoft.com/v1.0/sites?")
 
 
-def test_sites_the_dial_names_replace_the_search(graph: Graph) -> None:
+def test_sites_the_person_picked_replace_the_search_and_are_titled_one_by_one(graph: Graph) -> None:
     module, _v, parts, session = open_(graph)
-    dial = {**DIAL, "objects": [OTHER_SITE, "not a site", OBJECT]}
-    assert [d.name for d in module.list_objects(session, parts, dial)] == ["acme.sharepoint.com,33333333-3333-4333-8333-333333333333,44444444-4444-4444-8444-444444444444/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+    dial = {**DIAL, "objects": [OTHER_SITE, "not a site", OBJECT, SITE]}
+    listed = module.list_objects(session, parts, dial)
     assert not any("search" in line for line in graph.log)
+    # a site Graph no longer knows is labelled by its id; a control character in a title never reaches the label
+    assert [d.label for d in listed] == [f"{OTHER_SITE} / Other", "Team Site / Tasks"]
+    assert [d.name for d in listed] == [f"{OTHER_SITE}/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", OBJECT]
 
 
 @pytest.mark.parametrize(
@@ -220,6 +228,25 @@ def test_an_object_name_that_is_not_a_site_id_and_a_list_guid_is_refused_before_
     with pytest.raises(saas_adapter.SaasSetupRefused):
         module.declaration(session, parts, DIAL, name)
     assert graph.log == []
+
+
+def test_the_sites_a_person_can_pick_are_listed_with_their_titles_and_the_id_as_the_name(graph: Graph) -> None:
+    module, _v, parts, session = open_(graph)
+    assert module.list_fields(session, parts, DIAL) == [{"name": SITE, "kind": "site", "label": "Team"}]
+    assert "search=*" in graph.log[0]
+
+
+def test_discovery_lists_the_labels_and_the_site_picker_through_the_vendor_module(graph: Graph) -> None:
+    from dispar_orchestrate import discover
+
+    backends = discover.Backends(saas_open=lambda *a, **kw: open_(graph), resolve_checked=resolver)
+    connector_dial = DIAL
+    lists = discover._saas(connector_dial, SECRETS, discover.DiscoverRequest(connector_id="c", request_id="r", kind="list"), backends)
+    assert lists["objects"] == [{"name": OBJECT, "kind": "object", "load": "incremental", "label": "Team / Tasks"}]
+    sites = discover._saas(connector_dial, SECRETS, discover.DiscoverRequest(connector_id="c", request_id="r", kind="list", schema="fields"), backends)
+    assert sites["objects"] == [{"name": SITE, "kind": "site", "label": "Team"}]
+    found = discover._saas(connector_dial, SECRETS, discover.DiscoverRequest(connector_id="c", request_id="r", kind="list", search="tASks"), backends)
+    assert [o["name"] for o in found["objects"]] == [OBJECT], "the search also matches the label"
 
 
 def test_sharepoint_does_not_describe_its_fields_so_a_changed_column_is_seen_after_the_load() -> None:
