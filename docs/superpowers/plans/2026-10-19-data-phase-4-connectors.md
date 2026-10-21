@@ -963,6 +963,84 @@ validated the account `"acme"` for every vendor; HubSpot, GA4, Workday and NetSu
 `lakehouse-store` (non-test code), but clippy was still not run and the store's `tests/connector_discovery.rs` cases did not run.
 No product entry was added in this round (the `g6-saas` job is at 16m17s of 20).
 
+### Handoff: slice 6 (developer, 2026-10-21)
+
+Task 0, Task 1 (the gate split, AD9 amended), then Workday and NetSuite (Vn.1 to Vn.4), base `cdfd1821`. Both stay
+`supported = false` (decision 10). Disk 26 to 27 GB free and no other cargo, so clippy ran and the two permitted
+`cargo test` filters ran.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| 0 | `667194a7` | backtick `SharePoint` (`connector_discovery.rs:271,:298`) and two more in `connector_probe/saas.rs` (PR #216 CI clippy) |
+| 1 | `49c8a609` | `g6-saas-a` / `g6-saas-b`, `SAAS_GATE_VENDORS`, `ci-required`, `required_gate.sh` + test, `docs/CI.md` |
+| V-Workday.3 (row) | `6193e12d` | Workday's client authenticates in the Basic header (fixture, Rust, Python, console) |
+| V-Workday.1, .2 | `a75b7f3b` | `workday.py` (report, `Report_Entry`, always in full); `ObjectDecl` without a key when in full; `SaasSession(request_timeout)`, `post_json(headers=)` |
+| V-NetSuite.1 to .3 (Python) | `5a440ba8` | `netsuite.py` (SuiteQL, paging, `PS256`/`ES256` assertion); `integration_auth(dial=)` |
+| V-Workday.3, V-NetSuite.3 (Rust) | `62bce1b3` | the API's connection test of both vendors' ways; `SaasDial.certificate_id` |
+| V-Workday.4, V-NetSuite.4 | `37502dd5` | the two mocks (ports 8109, 8110), vendor-level steps, four product entries |
+| console | `e944bba9` | Workday report owner/name fields, NetSuite certificate id, Workday user label |
+| docs | `aafb78e2` | feature page limits, `docs/CI.md` |
+
+**Task 1.** Two jobs on the same scripts, selected by `SAAS_GATE_VENDORS` (env, or `--vendors=` argument; empty means all, an
+id the mock does not serve fails the run): `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow), `g6-saas-b` (Confluence,
+SharePoint, Dynamics 365, Workday, NetSuite), names "Rust · SRC-3 business-app connectors (A)" and "(B)", own compose
+projects, both in `ci-required` and `required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_SAAS_B_RESULT`). The runner service passes the variable
+(`docker-compose.g6.override.yml`). No step was removed. Estimated, NOT measured: job A runs 6 product entries (13 before), job B
+10 entries; the job that took 16m17s on `7a8af090` had 13 entries. If B nears 20 minutes in CI, say so; do not cut steps.
+
+**Vendor rows checked against official documentation (2026-10-21)**
+- *NetSuite*, Oracle pages: authorise address, `rest_webservices` scope and PKCE (`section_158081944642`); token address and "client credentials in the
+  HTTP Authorization header", Basic (`section_160855590788`, `section_158082518856`); the client-credentials assertion, header `PS256` + `kid`,
+  claims `iss`/`scope`/`aud`/`iat`/`exp`, `aud` = the token address (`section_0312092247`); SuiteQL `POST`, `Prefer: transient` "a required header parameter",
+  `limit`/`offset`, `count`/`offset`/`totalResults` (`section_157909186990`); sandbox host form (`1234567_SB1` is `1234567-sb1`,
+  `section_1498251763`, read through a search summary). **Not confirmed**: the revocation address (no page read names it), the who-am-i
+  path `/services/rest/record/v1/employee?limit=1` (the REST record page was not read; an integration role may lack employee access), the
+  `hasMore` rules beyond the examples, and the 100,000-row limit (a search summary of a third-party page).
+- *Workday*: docs.workday.com answers a script shell and community.workday.com redirects to a sign-in, so **no Workday page was
+  readable**. Used: Databricks' source setup page (docs.databricks.com/gcp/ingestion/lakeflow-connect/workday/workday-reports/source-setup:
+  API client for integrations, non-expiring refresh token, copy the JSON URL with `format=json`), knowledgelib.io/business/erp-integration/
+  workday-raas-integration/2026 (third party: the URL form, `Report_Entry`, no paging, 30 minutes, `user@tenant`) and Fivetran's RaaS guide
+  (Basic allowed instead of OAuth). The token address (`/ccx/oauth2/<tenant>/token`) is the table's slice 1 value, unconfirmed.
+  The row changed from `post` to `basic` for the client authentication from the developer's knowledge of Workday's OAuth setup: **not verified**.
+
+**Mismatches and decisions for the planner**
+1. **Decision 9 is not met for NetSuite.** The decision lists NetSuite as a vendor that describes its fields before the load. SuiteQL's columns are
+   not the REST record properties (`metadata-catalog` describes the latter) and no call that lists a SuiteQL table's columns was found in the pages read,
+   so NetSuite has no `describe`; a changed column is seen after the load. Stated on the feature page, in the module and in the gate. Needs a decision (a Records Catalog call, if there is one).
+2. **`SaasDial.certificate_id` (new, optional, NetSuite integration only).** NetSuite's assertion needs the certificate ID (`kid`), which is neither of the two secret
+   fields in the row nor in the plan. It is a dial field (Rust, contract, console), a plain name, not part of the target identity. The alternative was a third
+   secret slot, which the connector's two-slot credential cannot hold.
+3. **NetSuite does not take `RS256`.** The brief said RS256/PS256 per NetSuite's documentation; Oracle's page shows `PS256` and certificate-dependent `ES256`, so RSA keys sign `PS256`
+   and P-256 keys `ES256` (Rust and Python); other keys are a fixed rejected setting.
+4. **Workday's who-am-i is running the first named report** (the table has none, `whoami: null`, fixture unchanged), reading the status only, with a 60 s wait instead of 5 s.
+   It costs the customer's tenant one report run per test; with no report named the test answers "not testable". Said on the page.
+5. **Small shared edits**: `ObjectDecl` may have an empty key when it is re-read in full (a report row has no id); `SaasSession(request_timeout=)` and the module attribute
+   `request_timeout_seconds` (Workday 600 s, NetSuite 120 s; the default 30 s fails most reports); `post_json(headers=)`; `integration_auth(dial=)`.
+6. **Workday's host rule accepts one label under `workday.com` / `myworkday.com`** (slice 1). Hosts such as `services1.wd503.myworkday.com`, which the developer
+   believes exist, would be refused; not checked (the documentation is unreadable). Change the rule in four places if that is wrong.
+7. **NetSuite's cursor** is a derived `modified_at` (`TO_CHAR(lastmodifieddate, ...)`), because a SuiteQL answer shows dates in the user's format; a record with no change time gets
+   the epoch in that column only. A table is read by key when it has no change time (offset 0, so the 100,000-row limit does not apply); an incremental read starts again from the
+   last change time before the offset reaches 90,000 and stops with a plain message if more rows share one time.
+8. The brief's "RS256/PS256 ... `jsonwebtoken` in Rust for the probe": done for `PS256`/`ES256`; `jsonwebtoken` `ES256` uses `from_ec_pem` (PKCS#8); an EC key in another PEM form is refused (not tested in Rust; Python tests both).
+
+**Commands run, with counts**
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings`:
+  finished, 0 warnings (after Task 0, and again on the final Rust tree).
+- `cargo test -p lakehouse-api --lib connector_probe::saas`: **29 passed, 0 failed** (seven new, one removed: Workday Basic and the named report, a refused Workday user, the report path rule, no report named, the NetSuite `PS256` assertion verified with the public half, a missing certificate id or unusable key, and a walk of the table's integration shapes that replaces the old "not one token" test).
+  `cargo test -p lakehouse-store --lib saas_vendors`: **13 passed, 0 failed** (includes the fixture comparison with the Workday row).
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree): **2123 passed, 0 failed** (17m20s; slice 5 baseline 2065). New: `test_saas_workday.py` 26 (one `loader`), `test_saas_netsuite.py` 29 (one `loader`), `test_saas_session.py` +1, three tests that used NetSuite as "no module" now remove it from the registry.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun test src/features/connectors`: 361 pass, 0 fail; `bun test src/lib/connectors`: 52 pass, 1 skip, 0 fail; `bun test src/services`: 99 pass, 0 fail; `bun run lint`: 0 errors, 6 warnings (none in these files); `bun run typecheck`: no error outside `features/landing/scene`.
+- `bash scripts/ci/tests/test_required_gate.sh`: 56 passed (52 + 4 new); `ci.yml` parses; `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.g6-saas.override.yml --profile g6-saas --profile dagster config --quiet` (with `SAAS_GATE_VENDORS` set): OK; `--profile '*' config --quiet`: OK.
+- Gate vendor-level steps against a local `python ops/g6/saas_stub.py` (`g6_saas_test.py --vendors-only`): `SAAS_GATE_VENDORS=workday,netsuite` PASS (12 s); the five vendors of job B PASS (27 s); the five of job A PASS. The mock checks the NetSuite `PS256` signature for real (stdlib RSASSA-PSS).
+
+**Not verified, and why**
+- **The two jobs in CI and the product steps** (four new entries, and the changed `step_product`) never ran: no docker stack here. CI may show: the API accepting `certificateId` and a `workday` report name with a slash in `ingest-spec`, the API's Workday test reaching the mock through `gate_rebase`, Bronze column names (`employee_id`, `name`, `modified_at`), and whether `replace` loads of a saas object are accepted. Each job's time against 20 minutes is unmeasured (estimates above).
+- **New Rust tests in `ingest_spec.rs`** (`certificateId`, Workday dial) compiled under clippy but did not run: only the two permitted filters were run.
+- **Every Workday and NetSuite wire detail** is the developer's model of documentation (see "checked" above): the `Report_Entry` shape, Workday's token request, SuiteQL's `TO_CHAR`/`TO_TIMESTAMP`/`customer.*`, `lastmodifieddate` as a column of the tables, the time zone of the filter, NetSuite's assertion lifetime (600 s here; Oracle's page shows 120 s and states no maximum). No real account (decision 10).
+- The new console fields were not shown in a browser.
+- Docker images were not built.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
