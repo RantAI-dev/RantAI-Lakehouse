@@ -369,6 +369,7 @@ fn charts_reaching(
 /// The charts and dashboards that depend on the column, for a `down` answer.
 /// `Err(())` when they could not be read; the caller says so rather than
 /// answering an empty list.
+///
 /// The charts and dashboards that read a reached column, as the caller may
 /// see them: the personal space (`BI-18` part C) is closed to everybody but
 /// its owner and an administrator, so the read takes the caller's
@@ -1384,6 +1385,87 @@ mod tests {
             assert_eq!(build_target("silver.__staging_x"), None);
             assert_eq!(build_target("console.alerts"), None);
             assert_eq!(build_target("nodot"), None);
+        }
+    }
+
+    /// The charts a column depends on, as the caller may see them: another
+    /// user's private dashboard is not one of them (`BI-18` part C, part 2).
+    mod dependent_charts {
+        use std::collections::HashMap;
+
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            // No Postgres: the read below does not need one.
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                "not a connection string".to_owned(),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A chart on somebody else's private dashboard. It comes back only
+        /// if the read did not restrict it — the statement without the
+        /// viewer's clause — which is how the personal space stays out of the
+        /// answer.
+        struct PrivateChart;
+
+        impl Respond for PrivateChart {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body);
+                let data = if sql.contains("FROM console.bi_chart")
+                    && !sql.contains("owner_id != ''")
+                {
+                    vec![json!({
+                        "id": "c_private", "board": "b_private", "created_by": "ui",
+                        "created_at": "2026-01-01 00:00:00",
+                        "spec_json": json!({
+                            "spec": {
+                                "id": "c_private", "title": "Private chart", "kind": "bar",
+                                "mart": "mart_x", "sql": "SELECT 1", "x": "kab", "y": "visitors",
+                            },
+                            "def": {
+                                "title": "Private chart", "mart": "mart_x", "kind": "bar",
+                                "dimension": "kab", "measures": ["visitors"],
+                            },
+                            "hasYear": false,
+                        })
+                        .to_string(),
+                    })]
+                } else {
+                    Vec::new()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() }))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_chart_on_another_users_private_dashboard_is_not_listed() {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(PrivateChart)
+                .mount(&server)
+                .await;
+            let reached: HashSet<(String, String)> =
+                HashSet::from([("serving.mart_x".to_owned(), "kab".to_owned())]);
+            let answer = dependent_charts(
+                &state_for(&server.uri()),
+                &reached,
+                &lakehouse_bi::access::Viewer::user("u_other", false),
+            )
+            .await
+            .expect("the charts could be read");
+            assert!(
+                answer.is_empty(),
+                "a chart on another user's private dashboard is not listed: {answer:?}"
+            );
         }
     }
 }
