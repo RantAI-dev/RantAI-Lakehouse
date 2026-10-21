@@ -2941,8 +2941,8 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the eight reasons the API knows are the
-    /// eight in the file the job's own tests assert its constants against
+    /// Review findings B6 and C2: the nine reasons the API knows are the
+    /// nine in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -2958,7 +2958,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 8, "eight different reasons");
+        assert_eq!(distinct.len(), 9, "nine different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

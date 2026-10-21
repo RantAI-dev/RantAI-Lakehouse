@@ -562,6 +562,15 @@ filesystem bucket under `tmp_path`). Proved with a hostile environment, those th
 `test_upload_types.py`, `test_parquet_ingest.py` 5 passed (338 deselected); `pytest -m "not loader"` on the same
 files 337 passed, 1 skipped (5 deselected).
 
+**Slice 3, round 1 fix (Phase 3 slice 3 review BLOCKER 3).** `routes::uploads::tests::the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture`
+still asserted eight distinct reasons; `DATA-18` added the ninth. The shared fixture
+`ops/fixtures/upload_load_failure_reasons.json` already lists nine (the Python side reads the same file), so
+only the test's count and comment changed. My scoped runs filtered on `upload_ columns` and never ran
+`routes::uploads::tests`; the lesson is that a change to a shared list is proved by the unfiltered
+`cargo test -p lakehouse-api --lib`. Run: `cargo test -p lakehouse-api -j 4 --lib` 2163 passed, 0 failed, 15
+ignored; `cargo fmt --check -p lakehouse-api` clean; `pytest dispar_orchestrate/test_file_ingest.py -m "not loader"`
+206 passed, 1 skipped.
+
 **Not verified.** The gate and the large-file harness against a real stack; the Lakekeeper Iceberg write;
 `cargo test --workspace` and the full pytest and `bun test` (whole-suite runs are not possible on this machine);
 the `g9-upload` job `timeout-minutes: 25` (may need a measured raise); browser QA of the wizard.
