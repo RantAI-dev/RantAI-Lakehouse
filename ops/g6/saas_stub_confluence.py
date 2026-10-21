@@ -63,6 +63,9 @@ class State:
         self.rate_limits_left = 0
         self.refresh_token = "stub-cf-refresh-0"
         self.rotations = 0
+        # Atlassian rotates the refresh token on every refresh. The product steps keep their refresh
+        # token in a `file:` secret, which cannot take the new one, so they turn this off (admin `rotate`).
+        self.rotate = True
         self.log: list[str] = []
 
 
@@ -161,8 +164,9 @@ def _token(handler, parsed) -> None:  # noqa: ANN001
         )  # fmt: skip
         if not ok:
             return stub.send_json(handler, {"error": "invalid_grant", "error_description": "STUB-VENDOR-WORDS"}, 403)
-        STATE.rotations += 1
-        STATE.refresh_token = f"stub-cf-refresh-{STATE.rotations}"
+        if STATE.rotate:
+            STATE.rotations += 1
+            STATE.refresh_token = f"stub-cf-refresh-{STATE.rotations}"
         out = {"access_token": f"stub-cf-access-{STATE.rotations}", "refresh_token": STATE.refresh_token, "expires_in": 3600, "scope": "read:page:confluence offline_access"}
     stub.send_json(handler, out)
 
@@ -186,6 +190,8 @@ def _admin(handler, parsed) -> None:  # noqa: ANN001
             STATE.store["pages"] = [{**p, body["name"]: "x"} for p in STATE.store["pages"]]
         elif action == "refresh_token":  # tell the gate which refresh token is current
             return stub.send_json(handler, {"refresh_token": STATE.refresh_token})
+        elif action == "rotate":
+            STATE.rotate = bool(body.get("on", True))
         elif action == "revoke":
             STATE.revoked = bool(body.get("on", True))
         elif action == "forbid":

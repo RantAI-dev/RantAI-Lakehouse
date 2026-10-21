@@ -42,9 +42,17 @@ struct Request<'a> {
     vendor: &'static SaasVendor,
     account: &'a str,
     url: String,
+    /// A vendor whose browser tokens are served from a gateway keyed by the signed-in site
+    /// (Atlassian): the address that lists the sites the token reaches. `url` then holds
+    /// [`CLOUD_ID_PLACEHOLDER`] where the site's id goes.
+    lookup_url: Option<String>,
     token_url: String,
     auth: &'a SaasAuth,
 }
+
+/// Stands for the cloud id in a gateway address until the site list has been read. A valid
+/// path segment, so the gate-only rebase (which parses the address) leaves it alone.
+const CLOUD_ID_PLACEHOLDER: &str = "cloud-id-placeholder";
 
 /// The connector's credential references and the resolver that reads them.
 struct Secrets<'a> {
@@ -83,21 +91,36 @@ pub(super) async fn probe_saas_info(
             vendor.label
         ));
     };
+    // Slice 4 review BLOCKER 13: a browser sign-in whose vendor table row names its own gateway
+    // (`oauth.api_base`) is tested there, at the fixed host of the table, never at the site.
+    let gateway = match (&dial.auth, vendor.oauth.api_base) {
+        (SaasAuth::Oauth2AuthorizationCode { .. }, Some(base)) => Some(base),
+        _ => None,
+    };
+    let rebase = |url: &str| connector_oauth::gate_rebase(oauth, vendor.id, url);
     let request = Request {
         vendor,
         account: &dial.account,
         // Slice 2 review SHOULD-FIX 5: the gate-only mock origin, ignored unless the
         // gate-only switch is on (`connector_oauth::gate_rebase`).
-        url: connector_oauth::gate_rebase(
-            oauth,
-            vendor.id,
-            &SaasVendor::render(&format!("{}{}", vendor.api_base, whoami.path), &parts),
-        ),
-        token_url: connector_oauth::gate_rebase(
-            oauth,
-            vendor.id,
-            &SaasVendor::render(vendor.oauth.token_url, &parts),
-        ),
+        url: rebase(&SaasVendor::render(
+            &format!(
+                "{}{}",
+                gateway.map_or_else(
+                    || vendor.api_base.to_owned(),
+                    |base| base.replace("{cloudId}", CLOUD_ID_PLACEHOLDER)
+                ),
+                whoami.path
+            ),
+            &parts,
+        )),
+        lookup_url: gateway.and_then(|base| {
+            let origin = base.split("/ex/").next()?;
+            Some(rebase(&format!(
+                "{origin}/oauth/token/accessible-resources"
+            )))
+        }),
+        token_url: rebase(&SaasVendor::render(vendor.oauth.token_url, &parts)),
         auth: &dial.auth,
     };
     let secrets = Secrets {
@@ -138,16 +161,6 @@ async fn access_token(
     oauth: OAuthSettings,
 ) -> Result<Access, Outcome> {
     match request.auth {
-        // Atlassian's browser sign-in is only accepted at `api.atlassian.com/ex/confluence/{cloudId}`,
-        // and the cloud id comes from a second request this build does not make: "unsupported,
-        // honestly" (slice 4, V-Confluence.3). Nothing is sent to the vendor.
-        SaasAuth::Oauth2AuthorizationCode { .. } if request.vendor.oauth.api_base.is_some() => {
-            Err(Outcome::not_testable_with(format!(
-                "{}'s browser sign-in is used through a gateway address that the connection test \
-                 does not reach yet. A load reports whether the connection worked.",
-                request.vendor.label
-            )))
-        }
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
             refreshed_access(request, client_id, secrets, internal_hosts, oauth).await
         }
@@ -434,6 +447,103 @@ fn rejected(label: &str, status: u16) -> String {
     }
 }
 
+/// Whether `text` is a lower-case hexadecimal UUID (8-4-4-4-12), the shape of an Atlassian cloud
+/// id. The id goes into a request path, so nothing else is accepted.
+fn is_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                matches!(b, b'0'..=b'9' | b'a'..=b'f')
+            }
+        })
+}
+
+/// The cloud id of the site in Atlassian's `accessible-resources` answer whose address is
+/// `<account>.atlassian.net` and whose grant has a Confluence scope (the same id can also name a
+/// Jira-only grant). `None` when there is none or its id is not a UUID.
+fn site_cloud_id<'a>(sites: &'a serde_json::Value, account: &str) -> Option<&'a str> {
+    let wanted = format!("{}.atlassian.net", account.to_ascii_lowercase());
+    sites.as_array()?.iter().find_map(|site| {
+        let url = reqwest::Url::parse(site.get("url")?.as_str()?).ok()?;
+        let confluence = site
+            .get("scopes")?
+            .as_array()?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|scope| scope.contains("confluence"));
+        let id = site.get("id")?.as_str()?;
+        (url.host_str()?.eq_ignore_ascii_case(&wanted) && confluence && is_uuid(id)).then_some(id)
+    })
+}
+
+/// The who-am-i address behind Atlassian's gateway: ask `lookup` which sites the token reaches,
+/// pick this connector's, put its id into the address. Every message is fixed text; nothing the
+/// vendor said is echoed (`AGENTS.md` principle 4).
+async fn gateway_url(
+    request: &Request<'_>,
+    lookup: &str,
+    client: &reqwest::Client,
+    access: &Access,
+) -> Result<String, Outcome> {
+    let label = request.vendor.label;
+    let started = Instant::now();
+    let get = client.get(lookup).bearer_auth(access.token.expose_secret());
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, get.send()).await;
+    let elapsed = started.elapsed();
+    let response = match attempt {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            return Err(Outcome::failure(
+                elapsed,
+                format!("{label} request failed: {}", classify_reqwest_error(&err)),
+            ));
+        }
+        Err(_) => {
+            return Err(Outcome::failure(
+                elapsed,
+                format!(
+                    "{label} request timed out after {}s",
+                    DIAL_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    };
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(Outcome::failure(
+            elapsed,
+            format!(
+                "{label} answered with a redirect (HTTP {}); connection tests do not follow \
+                 redirects",
+                status.as_u16()
+            ),
+        ));
+    }
+    if !status.is_success() {
+        return Err(Outcome::failure(elapsed, rejected(label, status.as_u16())));
+    }
+    let unreadable = || {
+        Outcome::failure(
+            elapsed,
+            format!("{label} answered in a form the connection test does not read"),
+        )
+    };
+    let bytes = tokio::time::timeout(DIAL_TIMEOUT, response.bytes())
+        .await
+        .map_err(|_| unreadable())?
+        .map_err(|_| unreadable())?;
+    let sites: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| unreadable())?;
+    let cloud_id = site_cloud_id(&sites, request.account).ok_or_else(|| {
+        Outcome::failure(
+            elapsed,
+            format!("{label} signed in, but the account reaches no {label} site by this connector's name."),
+        )
+    })?;
+    Ok(request.url.replace(CLOUD_ID_PLACEHOLDER, cloud_id))
+}
+
 /// Run the test for `request`. Split from [`probe_saas_info`] so a test can
 /// point the vendor's address at a local server.
 async fn probe_saas_at(
@@ -459,8 +569,21 @@ async fn probe_saas_at(
         Ok(access) => access,
         Err(outcome) => return outcome,
     };
+    // Slice 4 review BLOCKER 13: the gateway address of a browser sign-in needs the signed-in
+    // site's id, read from the vendor's list of accessible sites with the same pinned client
+    // (the same fixed host as the who-am-i request).
+    let url = match &request.lookup_url {
+        Some(lookup) => match gateway_url(request, lookup, &client, &access).await {
+            Ok(url) => url,
+            Err(mut outcome) => {
+                outcome.rotated_refresh_token = access.rotated;
+                return outcome;
+            }
+        },
+        None => request.url.clone(),
+    };
     let started = Instant::now();
-    let get = client.get(&request.url);
+    let get = client.get(&url);
     let get = if access.basic {
         get.header(
             reqwest::header::AUTHORIZATION,
@@ -549,6 +672,7 @@ mod tests {
             vendor: saas_vendors::vendor(vendor).unwrap(),
             account: "acme",
             url,
+            lookup_url: None,
             token_url,
             auth,
         }
@@ -933,33 +1057,160 @@ mod tests {
         assert!(!outcome.message.contains("sn-secret"));
     }
 
-    /// `SRC-3` slice 4: Atlassian's browser sign-in is not testable here, and nothing is sent.
-    #[tokio::test]
-    async fn confluences_browser_sign_in_is_not_testable_and_sends_nothing() {
+    const CLOUD: &str = "0f1e2d3c-4b5a-4968-8776-655443322110";
+
+    /// Slice 4 review BLOCKER 13: the browser token is exchanged, the site list is read, this
+    /// connector's site picked (not another site, not a Jira-only grant), and the who-am-i
+    /// request goes to the gateway address with that id.
+    async fn confluence_browser(
+        sites: serde_json::Value,
+        who_status: u16,
+    ) -> (MockServer, Outcome) {
         let server = MockServer::start().await;
-        let resolver = resolver();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/oauth/token/accessible-resources"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sites))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/ex/confluence/{CLOUD}/wiki/api/v2/spaces")))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(who_status).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
         let auth = SaasAuth::Oauth2AuthorizationCode {
             client_id: "app".to_owned(),
         };
-        let outcome = probe_saas_at(
-            &request(
-                "confluence",
-                format!("{}/who", server.uri()),
-                String::new(),
-                &auth,
+        let mut req = request(
+            "confluence",
+            format!(
+                "{}/ex/confluence/{CLOUD_ID_PLACEHOLDER}/wiki/api/v2/spaces?limit=1",
+                server.uri()
             ),
+            format!("{}/token", server.uri()),
+            &auth,
+        );
+        req.lookup_url = Some(format!("{}/oauth/token/accessible-resources", server.uri()));
+        let outcome = probe_saas_at(
+            &req,
             &Secrets {
-                primary: "env:SAAS_TEST_SECRET",
-                secondary: None,
+                primary: "env:S",
+                secondary: Some("env:R"),
                 resolver: &resolver,
             },
             &InternalHosts::ALL,
-            OAuthSettings::default(),
+            OAuthSettings { allow_http: true },
         )
         .await;
-        assert!(!outcome.ok && !outcome.supported);
-        assert!(outcome.message.contains("gateway address"));
-        assert!(server.received_requests().await.unwrap().is_empty());
+        (server, outcome)
+    }
+
+    fn sites(scopes: &[&str], url: &str, id: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"id": "ffffffff-0000-4000-8000-000000000000", "url": "https://other.atlassian.net",
+             "scopes": ["read:page:confluence"]},
+            {"id": id, "url": url, "scopes": scopes}
+        ])
+    }
+
+    #[tokio::test]
+    async fn confluences_browser_sign_in_finds_its_site_and_asks_the_gateway() {
+        let body = sites(
+            &["read:page:confluence"],
+            "https://acme.atlassian.net",
+            CLOUD,
+        );
+        let (_server, outcome) = confluence_browser(body, 200).await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert_eq!(outcome.message, "Connected to Confluence account acme.");
+        assert_eq!(
+            outcome.rotated_refresh_token.unwrap().expose_secret(),
+            "refresh-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn confluences_browser_sign_in_without_a_site_by_that_name_or_a_confluence_grant_fails_in_fixed_words()
+     {
+        for body in [
+            sites(
+                &["read:page:confluence"],
+                "https://nobody.atlassian.net",
+                CLOUD,
+            ),
+            sites(&["read:jira-work"], "https://acme.atlassian.net", CLOUD),
+            // an id that is not a UUID never reaches a request path
+            sites(
+                &["read:page:confluence"],
+                "https://acme.atlassian.net",
+                "../../x",
+            ),
+        ] {
+            let (server, outcome) = confluence_browser(body, 200).await;
+            assert!(!outcome.ok && outcome.supported, "{}", outcome.message);
+            assert!(
+                outcome.message.contains("no Confluence site"),
+                "{}",
+                outcome.message
+            );
+            assert!(!outcome.message.contains(".."));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2,
+                "the token and the site list; no who-am-i request"
+            );
+            // the rotated refresh token is handed back whatever the outcome
+            assert!(outcome.rotated_refresh_token.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn confluences_gateway_answers_are_each_their_own_fixed_sentence() {
+        for (status, needle) in [
+            (401, "refused the sign-in"),
+            (403, "lacks a permission"),
+            (429, "limited the rate"),
+        ] {
+            let body = sites(
+                &["read:page:confluence"],
+                "https://acme.atlassian.net",
+                CLOUD,
+            );
+            let (_server, outcome) = confluence_browser(body, status).await;
+            assert!(!outcome.ok && outcome.supported, "{status}");
+            assert!(
+                outcome.message.contains(needle),
+                "{status}: {}",
+                outcome.message
+            );
+            assert!(!outcome.message.contains("vendor secret text"));
+        }
+    }
+
+    #[test]
+    fn a_cloud_id_is_a_lower_case_uuid_and_nothing_else() {
+        assert!(is_uuid(CLOUD));
+        for bad in [
+            "",
+            "../../x",
+            &CLOUD.to_uppercase(),
+            &format!("{CLOUD}/x"),
+            "0f1e2d3c4b5a49688776655443322110",
+        ] {
+            assert!(!is_uuid(bad), "{bad:?}");
+        }
     }
 
     #[tokio::test]

@@ -155,8 +155,8 @@ To be confirmed when the plan is built. Expected from the defaults:
 - Confluence: spaces, pages, blog posts and comments. A page or blog post moved to the trash stays in
   Bronze until a full reload. Spaces are re-read in full each run. Pages and blog posts are loaded with
   their body in storage format. An hourly request quota that is used up fails the run as "the vendor
-  limited the rate". With the browser sign-in the connection test cannot run (Atlassian serves it from a
-  gateway address that needs a second request); a load reports whether it worked. Email + API token and
+  limited the rate". With the browser sign-in the connection test first asks Atlassian which sites the sign-in reaches and
+  needs one with this connector's name. Email + API token and
   the browser sign-in both read the same objects.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.

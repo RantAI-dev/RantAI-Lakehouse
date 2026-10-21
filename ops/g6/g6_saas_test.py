@@ -785,6 +785,27 @@ PRODUCT_VENDORS: dict[str, dict] = {
         ],
         "reads_marker": ("/pages",), "max_reads": 2,  # newest first, stopped at the cursor: 2 of 3 pages
     },
+    # BLOCKER 13 of the slice 4 review: the other signed way into Confluence, the browser sign-in. The API's
+    # connection test refreshes the token, reads accessible-resources, picks the connector's site and asks the
+    # gateway; the app's secret and a refresh token are files, so the mock must not rotate the refresh token
+    # (a file cannot take the new one; the vendor-level step covers the rotation).
+    "confluence-browser": {
+        "vendor": "confluence",
+        "type": "Confluence", "host": "acme.atlassian.net", "account": "acme", "label": "Confluence (browser sign-in)",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-cf-refresh-0"},
+        "before": [{"action": "rotate", "on": False}],
+        "object": "pages", "target": "saas_gate_confluence_browser_pages", "cursor": "modified_at", "text": "title", "key": "id",
+        "columns": "id, title, modified_at", "preview_columns": None,
+        "first_ids": {str(1000 + i) for i in range(1, 6)}, "reload_ids": {str(1000 + i) for i in range(1, 7)},
+        "changed_id": "1002",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
+            {"action": "put", "id": 6},
+        ],
+        "reads_marker": ("/pages",), "max_reads": 2,
+    },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
     "salesforce": {
@@ -890,6 +911,8 @@ def step_product(vendor_id: str) -> None:
     vendor_id = spec.get("vendor", product_key)  # a second way of signing in to one vendor is its own entry
     label, obj, target, text = spec["label"], spec["object"], spec["target"], spec["text"]
     started = time.time()
+    for setup in spec.get("before", []):
+        admin(vendor_id, **setup)
 
     created = matrix._create_connector(name=f"g6-saas-{product_key}", kind=spec["type"], host=spec["host"], credential=spec["credential"])
     cid = created["id"]

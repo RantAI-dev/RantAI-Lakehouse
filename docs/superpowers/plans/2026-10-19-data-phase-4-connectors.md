@@ -844,6 +844,30 @@ credentials only after it, no redirects, the bounded `Retry-After` and the same-
 - Pages not readable from here: none for the points above; ServiceNow's release pages disagree on the revoke prerequisites (noted in the commit).
 - Nothing was shown in a browser; no console change beyond the table copy (the connector form for Confluence/ServiceNow comes from the table).
 
+### Handoff: slice 4 fix round (developer, 2026-10-21)
+
+`BLOCKER 13` fixed in one commit (the Confluence browser sign-in in the API's connection test). **Disk fell to 524 MB
+during this round (below the 1 GB stop line), so the whole suite and any further run were not done; the work is
+committed and stops there.** No cargo build, check, clippy or test ran; `cargo fmt --check` clean.
+
+- Rust `connector_probe/saas.rs`: for a browser sign-in whose vendor row has `oauth.api_base` (Confluence only) the
+  request carries `lookup_url` (the table's fixed gateway host + `/oauth/token/accessible-resources`) and a who-am-i
+  address with a placeholder where the cloud id goes. After the token refresh (JSON token request, rotated refresh token
+  handed back whatever the outcome) the site list is read with the same pinned client, the site whose address is
+  `<account>.atlassian.net` with a Confluence scope is picked, its id must be a lower-case UUID (`is_uuid`), and the
+  who-am-i goes to `api.atlassian.com/ex/confluence/<id>/...`. Fixed texts only (no site: "reaches no Confluence site by
+  this connector's name"; 401/403/429/redirect as the other probes). The old "not testable" arm and its test are removed.
+  New unit tests: success with the rotated token, no site / Jira-only grant / non-UUID id (no who-am-i request sent),
+  401/403/429 at the gateway, `is_uuid`.
+- Gate: product entry `confluence-browser` in `PRODUCT_VENDORS` (create, test, discovery, load, reload with `max_reads`,
+  revoked). The mock gained `rotate` (default on; the entry turns it off because a `file:` secret cannot take Atlassian's
+  rotated refresh token; the vendor-level step still proves the rotation). Vendor-level steps re-run against the local stub:
+  `PASS (33 s)`.
+- Feature page: the limit about the untestable browser sign-in is replaced.
+
+**Not verified:** all of the new Rust (formatted only); the new product entry (no docker stack); the whole dagster suite and
+bun were not re-run (no Python/console code changed besides the gate script and mock).
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
