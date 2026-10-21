@@ -387,7 +387,7 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
 - Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets (it cannot change where a connector points: that needs its credentials again and is done in the console), run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
-- Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
+- Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; set_pipeline_target_lag to set or clear refresh target lag; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
 - Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity.
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
@@ -625,8 +625,16 @@ const DOMAINS: &[Domain] = &[
             "transform",
             "buat pipeline",
             "create a pipeline",
+            "target lag",
+            "lag",
+            "behind",
         ],
-        tools: &["get_pipeline", "create_pipeline", "mark_pipeline_ready"],
+        tools: &[
+            "get_pipeline",
+            "create_pipeline",
+            "mark_pipeline_ready",
+            "set_pipeline_target_lag",
+        ],
     },
     Domain {
         words: &[

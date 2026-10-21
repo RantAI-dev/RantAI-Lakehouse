@@ -9,12 +9,18 @@ mod agents;
 pub(crate) mod ai;
 mod alerts;
 pub mod auth;
-mod authored_pipelines;
+// `pub(crate)`, not private: `crate::pipeline_lag` (BLD-2) reads
+// `authored_pipelines::job_name` to name the job a lag run launches, and
+// re-deriving the `authored__<id>` mapping in a second place is exactly
+// the drift the one definition exists to prevent.
+pub(crate) mod authored_pipelines;
 mod calc_fields;
 mod catalog;
 mod catalog_governance;
+mod catalog_grants;
 mod catalog_profile;
 mod catalog_query;
+mod catalog_restore;
 mod catalog_search;
 mod catalog_source;
 mod connector_discovery;
@@ -44,6 +50,10 @@ mod overview;
 pub(crate) mod params;
 mod pipelines;
 mod quality;
+mod quality_anomaly;
+mod quality_incidents;
+mod quality_load;
+mod quality_schedules;
 mod query;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -59,7 +69,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use serde::Serialize;
 
 use crate::json::ApiJson;
@@ -251,11 +261,14 @@ fn pipelines_router() -> Router<AppState> {
                 .put(authored_pipelines::update)
                 .delete(authored_pipelines::delete),
         )
+        .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route(
             "/api/pipelines/{id}/schedule-ticks",
             get(authored_pipelines::schedule_ticks),
         )
-        .route("/api/pipelines/{id}/source", get(pipelines::source))
+        // BLD-2: the two target-lag routes live in `target_lag_routes`,
+        // merged in above.
+        .merge(target_lag_routes())
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         // Plan R4 2b: definition version history. Static under
         // `{id}/versions`, so it is registered BEFORE
@@ -376,6 +389,31 @@ fn pipelines_router() -> Router<AppState> {
         )
 }
 
+/// BLD-2 (plan D6/D8): the target lag's own two routes, merged into the
+/// pipeline sub-router. They sit together because they are one feature's
+/// two doors — the orchestrator asks [`authored_pipelines::lag_check`] and
+/// a user sets the target through
+/// [`authored_pipelines::set_target_lag`] — and splitting them from
+/// [`pipelines_router`] is also what keeps that function under
+/// `clippy::too_many_lines`.
+///
+/// `lag-check` is under `/runnable/` because only the orchestrator may ask
+/// (the same gate as `runnable` itself), not because it lists anything.
+/// `target-lag` is its own route rather than a field on
+/// `PUT /api/pipelines/{id}`: clearing the lag (`AC8`) is a value that
+/// route's "absent means unchanged" body cannot express.
+fn target_lag_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/pipelines/runnable/{id}/lag-check",
+            post(authored_pipelines::lag_check),
+        )
+        .route(
+            "/api/pipelines/{id}/target-lag",
+            put(authored_pipelines::set_target_lag),
+        )
+}
+
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
 fn storage_router() -> Router<AppState> {
@@ -422,6 +460,40 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // DATA-13: column-level lineage. A static path ahead of the
+        // `{kind}` capture like `lineage` above (and four segments deep).
+        .route(
+            "/api/governance/lineage/columns",
+            get(governance::column_lineage),
+        )
+        // DATA-14 (F2): quality incidents. Static segments, mounted ahead of
+        // `/api/governance/quality/{id}` and the `{kind}` capture.
+        .route(
+            "/api/governance/quality/incidents",
+            get(quality_incidents::list_incidents),
+        )
+        .route(
+            "/api/governance/quality/incidents/{id}/resolve",
+            axum::routing::post(quality_incidents::resolve_incident),
+        )
+        // DATA-14 (F3): when a table's rules run. Static `schedules` segment,
+        // so `/api/governance/quality/{id}/run` cannot capture it.
+        .route(
+            "/api/governance/quality/schedules",
+            get(quality_schedules::list_schedules),
+        )
+        .route(
+            "/api/governance/quality/schedules/{asset}",
+            put(quality_schedules::put_schedule),
+        )
+        // DATA-14 (F5): whether a table's anomalies are being raised yet.
+        .route(
+            "/api/governance/quality/learning/{asset}",
+            get(quality_anomaly::learning_status),
+        )
+        // DATA-14 (F7): a rule's run history. `runs` is not `run`, so it
+        // cannot be captured by the POST route below.
+        .route("/api/governance/quality/{id}/runs", get(quality::rule_runs))
         // Evaluates one authored quality rule on request. Three segments
         // deep, so it cannot collide with the `{kind}` capture.
         .route(
@@ -470,6 +542,16 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/classification/{id}",
             axum::routing::delete(governance::delete_classification_rule),
         )
+        // DATA-12 part 2: governed tag keys. Static segments, so they match
+        // ahead of the `{kind}` capture, as `policies` and `sla` do.
+        .route(
+            "/api/governance/tag-keys",
+            get(governance::list_tag_keys).post(governance::create_tag_key),
+        )
+        .route(
+            "/api/governance/tag-keys/{key}",
+            axum::routing::put(governance::update_tag_key).delete(governance::delete_tag_key),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +
@@ -488,6 +570,20 @@ fn catalog_access_router() -> Router<AppState> {
         .route(
             "/api/catalog/access-requests/{id}/decide",
             axum::routing::post(catalog::decide_access_request),
+        )
+        // `DATA-15` F3: grant and revoke from the asset's page.
+        .route(
+            "/api/catalog/{id}/grants",
+            get(catalog_grants::list).post(catalog_grants::create),
+        )
+        .route(
+            "/api/catalog/{id}/grants/{grant_id}",
+            axum::routing::delete(catalog_grants::revoke),
+        )
+        // `DATA-15` F4: undrop a dropped Iceberg table within its window.
+        .route(
+            "/api/catalog/{id}/restore",
+            get(catalog_restore::status).post(catalog_restore::restore),
         )
 }
 
@@ -869,6 +965,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
+        )
+        .route(
+            "/api/catalog/{id}/certification",
+            put(catalog::put_certification),
         )
         // The semantic layer: a table's and a column's plain-words
         // description. `{asset}` is `serving.<table>` or `silver.<table>`;

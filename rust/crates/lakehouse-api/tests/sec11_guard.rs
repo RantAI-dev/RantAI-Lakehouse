@@ -130,6 +130,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "Invalid request body: {err}",
         "serde error over the caller's own request body",
     ),
+    // DATA-14: `detail` is built by our own code from numbers and our own rule/asset names
+    // (`open_for_failed_run`: rule name, `Verdict::value`, threshold; `open_anomaly`: the
+    // `detail()` sentences of `quality_anomaly`); no ClickHouse or other upstream text.
+    (
+        "quality_incidents.rs",
+        "let text = format!(\"{asset}: {detail}. View: /governance/data-quality\");",
+        "asset key and incident detail are written in this repository from counts, percentages and rule names, never upstream error text",
+    ),
     (
         "storage.rs",
         "invalid JSON: {err}",
@@ -274,6 +282,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "ai/tools/dashboards.rs",
         ".map_err(|e| e.to_string())",
         "serde error over the model's own tool arguments",
+    ),
+    (
+        "ai/tools/pipelines.rs",
+        "invalid targetLag: {err}",
+        "serde error over the model's own tool arguments, the same class as dashboards.rs above: it tells the model which of its `targetLag` fields is wrong, never a payload from Postgres, Iceberg or ClickHouse",
     ),
     (
         "ai/tools/data.rs",

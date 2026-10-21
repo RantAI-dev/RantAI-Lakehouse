@@ -15,6 +15,7 @@ import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
 import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
+import { ColumnLineageCard, MappingList } from "./column-lineage"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -275,8 +276,8 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
 }
 
 /**
- * The Lineage tab: the recorded graph around the asset, the columns its
- * pipelines map, what reads it, and any table the catalog relates to it
+ * The Lineage tab: the recorded graph around the asset, the column view
+ * (which columns feed a column and what is built from it), what reads it, and any table the catalog relates to it
  * outside the graph.
  */
 export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: AssetLineageState }) {
@@ -302,22 +303,17 @@ export function AssetLineage({ asset: a, state }: { asset: AssetDetail; state: A
 
       <GraphCard a={a} state={state} />
 
+      {graph?.supported ? (
+        <ColumnLineageCard tableKey={lineageKey(a)} columns={a.schema.map((c) => c.name)} />
+      ) : null}
+
       {mappings.length > 0 ? (
         <SectionCard
           size="sm"
           title="Column mappings"
-          description="How the pipelines in this graph carry columns from source to target."
+          description="Every recorded step that reads or writes a column of this table."
         >
-          <ul className="divide-y divide-border text-sm">
-            {mappings.map((m) => (
-              <li key={`${m.source}-${m.target}`} className="flex flex-wrap items-baseline gap-x-2 py-1.5">
-                <span className="font-mono text-xs">{m.source}</span>
-                <span className="text-muted-foreground">→</span>
-                <span className="font-mono text-xs">{m.target}</span>
-                <span className="ml-auto text-xs text-muted-foreground">{m.transform}</span>
-              </li>
-            ))}
-          </ul>
+          <MappingList mappings={mappings} />
         </SectionCard>
       ) : null}
 

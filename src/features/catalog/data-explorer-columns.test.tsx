@@ -60,6 +60,15 @@ describe("Data Explorer columns", () => {
     expect(screen.getByText("—")).toBeTruthy()
   })
 
+  it("shows governed tags as key: value pills beside the free tags", () => {
+    // DATA-12 part 2: the Tags column shows both kinds.
+    render(<>{cellOf("tags", { tags: ["pii"], governedTags: { data_domain: "finance" } })}</>)
+    expect(screen.getByText("data_domain: finance")).toBeTruthy()
+    expect(screen.getByText("pii")).toBeTruthy()
+    render(<>{cellOf("tags", { governedTags: { tier: "gold" } })}</>)
+    expect(screen.getByText("tier: gold")).toBeTruthy()
+  })
+
   it("filters Owner and Tags as text and offers no sort on Tags", () => {
     expect(column("owner").meta).toMatchObject({ variant: "text" })
     expect(column("tags").meta).toMatchObject({ variant: "text" })
@@ -80,3 +89,31 @@ describe("Data Explorer columns", () => {
     ])
   })
 })
+
+describe("Data Explorer certification mark (DATA-12)", () => {
+  it.each([
+    ["certified", "Certified"],
+    ["deprecated", "Deprecated"],
+  ])("shows the %s mark beside the name", (certification, label) => {
+    render(<>{cellOf("name", { name: "Sales", certification })}</>)
+    expect(screen.getByText("Sales")).toBeTruthy()
+    expect(screen.getByText(label)).toBeTruthy()
+  })
+
+  it("shows no mark beside the name of a table without one", () => {
+    render(<>{cellOf("name", { name: "Sales" })}</>)
+    expect(screen.queryByText("Certified")).toBeNull()
+    expect(screen.queryByText("Deprecated")).toBeNull()
+  })
+
+  it("filters on certification with a multi-select of the two marks", () => {
+    expect(column("certification").meta).toMatchObject({
+      variant: "multiSelect",
+      options: [
+        { value: "certified", label: "Certified" },
+        { value: "deprecated", label: "Deprecated" },
+      ],
+    })
+  })
+})
+

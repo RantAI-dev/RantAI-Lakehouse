@@ -101,15 +101,16 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
 ///
-/// The match is the registry-to-domain lookup and nothing more: 65 arms
+/// The match is the registry-to-domain lookup and nothing more: 66 arms
 /// naming a tool, plus one guard arm (`n if calc_fields::handles(n)`),
 /// plus a catch-all, over 16 per-domain modules. All but
-/// `create_chart | update_chart` are a one-line delegation; that one reads
-/// the report time zone first, because a chart's SQL is built in it (`BI-9`).
+/// `create_chart | update_chart` are a plain delegation (rustfmt wraps some
+/// onto three lines, as for `set_pipeline_target_lag`); that one reads the
+/// report time zone first, because a chart's SQL is built in it (`BI-9`).
 #[allow(
     clippy::too_many_lines,
-    reason = "one lookup table over 16 domain modules, 65 of its 66 arms a \
-              one-line delegation; the split by domain already happened, so \
+    reason = "one lookup table over 16 domain modules, 66 of its 67 arms a \
+              delegation; the split by domain already happened, so \
               splitting the table itself would only scatter that lookup"
 )]
 pub(in crate::routes) async fn run_tool(
@@ -145,7 +146,7 @@ pub(in crate::routes) async fn run_tool(
         "get_quality" => data::get_quality(ch).await,
         "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
-        "describe_mart" => data::describe_mart(ch, args).await,
+        "describe_mart" => data::describe_mart(state, principal, args).await,
         "create_chart" | "update_chart" => {
             // BI-9: a chart's SQL is built with the report time zone (a deployment setting).
             let Ok(time) = crate::routes::settings::time_context(state).await else {
@@ -214,6 +215,9 @@ pub(in crate::routes) async fn run_tool(
         "create_pipeline" => pipelines::create_pipeline(state, principal, args).await,
         "get_pipeline" => pipelines::get_pipeline(state, args).await,
         "mark_pipeline_ready" => pipelines::mark_pipeline_ready(state, args).await,
+        "set_pipeline_target_lag" => {
+            pipelines::set_pipeline_target_lag(state, principal, args).await
+        }
         "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
         "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
         "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,

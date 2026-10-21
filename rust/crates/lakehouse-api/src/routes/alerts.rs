@@ -114,7 +114,10 @@ pub(crate) async fn visible_rules(
     principal: Option<&Principal>,
     rules: Vec<AlertRule>,
 ) -> Result<Vec<AlertRule>, ApiError> {
-    if !rules.iter().any(|rule| rule.kind.is_connector_scoped()) {
+    if !rules
+        .iter()
+        .any(|rule| rule.kind.is_connector_scoped() || rule.kind.is_asset_scoped())
+    {
         return Ok(rules);
     }
     let Some(principal) = principal else {
@@ -146,11 +149,15 @@ pub(crate) async fn visible_rules(
     Ok(rules
         .into_iter()
         .filter(|rule| {
-            !rule.kind.is_connector_scoped()
-                || rule
-                    .connector
-                    .as_deref()
-                    .is_some_and(|connector| own.contains(connector))
+            // `DATA-14`: a quality incident rule is installation-wide, like a
+            // `*` connector rule, so only an unrestricted caller (returned
+            // above) sees it.
+            !rule.kind.is_asset_scoped()
+                && (!rule.kind.is_connector_scoped()
+                    || rule
+                        .connector
+                        .as_deref()
+                        .is_some_and(|connector| own.contains(connector)))
         })
         .collect())
 }
@@ -179,6 +186,11 @@ fn parse_body(body: &Bytes) -> Result<AlertRuleInput, ApiError> {
 const ALL_SCOPE_DENIED: &str =
     "only an administrator who sees every tenant can save a rule for all connectors or for uploads";
 
+/// The refusal for a quality incident rule by someone who does not see every
+/// tenant (`DATA-14`).
+const QUALITY_SCOPE_DENIED: &str =
+    "only an administrator who sees every tenant can save a rule for quality incidents";
+
 /// Who may save a rule of the `SRC-7` kinds (decision D7, finding F7). Rules
 /// are one list for the installation, so a rule for all connectors, or for
 /// uploads, would carry every tenant's connector and file names:
@@ -206,6 +218,20 @@ pub(crate) async fn authorise_rule_scope(
     kind: Option<&str>,
     connector: Option<&str>,
 ) -> Result<(), ApiError> {
+    // `DATA-14`: a quality incident rule's message names tables and rules
+    // that may belong to any tenant, and its scope is a table, not a
+    // connector the tenant check could test. Fail closed: only an
+    // unrestricted caller saves, changes or deletes one.
+    if kind.is_some_and(|k| AlertKind::parse_asset_kind(k).is_some()) {
+        let Some(principal) = principal else {
+            return Err(ApiError::unauthorized());
+        };
+        return if crate::routes::catalog::is_unrestricted(principal) {
+            Ok(())
+        } else {
+            Err(ApiError::PermissionDenied(QUALITY_SCOPE_DENIED.to_owned()))
+        };
+    }
     let Some(kind) = kind.and_then(AlertKind::parse_connector_kind) else {
         return Ok(());
     };
@@ -639,6 +665,7 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::PipelineSlow => "Pipeline SLA: duration",
         AlertKind::PipelineLate => "Pipeline SLA: late",
         AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
+        AlertKind::PipelineBehindTarget => "Pipeline target lag: behind",
         // `SRC-7`: connector and upload rules fire from the run event
         // routes (`routes::pipelines`), which persist their own instance
         // with the source label; `run_rules` skips them, so these labels
@@ -649,6 +676,10 @@ fn fired_source(kind: AlertKind) -> &'static str {
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess => "Connector runs",
         AlertKind::UploadFailure => "File uploads",
+        // `DATA-14`: delivered when an incident opens
+        // (`routes::quality_incidents`), which persists its own instance;
+        // `run_rules` skips the kind, so this is only an exhaustive-match label.
+        AlertKind::QualityIncident => "Data quality",
     }
 }
 
@@ -688,6 +719,7 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         AlertKind::PipelineVolumeDrop => {
             "pipeline run processed fewer than half the median rows of prior runs".to_owned()
         }
+        AlertKind::PipelineBehindTarget => "pipeline is behind its target lag".to_owned(),
         // `SRC-7`: never reached from `run_rules` (it skips these kinds);
         // the event routes write their own detail.
         AlertKind::ConnectorFailure
@@ -696,6 +728,8 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
         | AlertKind::ConnectorSchemaChange
         | AlertKind::ConnectorSuccess
         | AlertKind::UploadFailure => "connector or upload event".to_owned(),
+        // `DATA-14`: never reached from `run_rules`; the incident route writes its own.
+        AlertKind::QualityIncident => "quality incident".to_owned(),
     }
 }
 
@@ -930,6 +964,9 @@ pub async fn run(
     // (switch off, no key, one already running) is not a fault to show.
     if query.id.is_none() {
         crate::routes::ai::semantic::spawn_pass(&state);
+        // DATA-13 (F3): the builds `ClickHouse` logged since the last tick
+        // become column lineage, in the background for the same reason.
+        crate::routes::lineage::columns::spawn_builds_pass(&state);
     }
 
     Ok(ApiJson(json!({
@@ -2356,6 +2393,139 @@ mod rule_scope_authorisation {
         // Other kinds delete as before.
         let (state, _ch) = setup(&pool, ("pipeline_failure", "")).await;
         deleted_as(&state, Some(engineer())).await.unwrap();
+    }
+
+    // ── DATA-14: quality incident rules are for an administrator ──────────
+
+    fn quality_body(asset: Option<&str>, id: Option<&str>) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "id": id, "name": "Quality incident", "type": "quality_incident",
+                "asset": asset, "channel": "webhook", "target": "https://93.184.216.34/x",
+            }))
+            .unwrap(),
+        )
+    }
+
+    async fn create_quality_as(
+        state: &AppState,
+        principal: Option<Principal>,
+        asset: Option<&str>,
+    ) -> Result<(), ApiError> {
+        create(
+            State(state.clone()),
+            principal.map(Extension),
+            quality_body(asset, None),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+    }
+
+    /// The message names tables and rules of any tenant, so a user who does not
+    /// see every tenant cannot save, move or delete such a rule, whatever the
+    /// table; the refusal is the same text, and fails closed with no principal.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn only_an_administrator_saves_a_quality_incident_rule(pool: sqlx::PgPool) {
+        let (state, _ch) = setup(&pool, ("quality_incident", "")).await;
+        for asset in [Some("*"), Some("silver.orders"), None] {
+            let err = create_quality_as(&state, Some(engineer()), asset)
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), 403, "{asset:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("permission_denied: {QUALITY_SCOPE_DENIED}")
+            );
+        }
+        let err = create_quality_as(&state, None, Some("*"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 401);
+
+        create_quality_as(&state, Some(admin()), Some("*"))
+            .await
+            .unwrap();
+        create_quality_as(&state, Some(admin()), Some("silver.orders"))
+            .await
+            .unwrap();
+        // The administrator's own validation still applies: a bad table is a 400.
+        let err = create_quality_as(&state, Some(admin()), Some("orders"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), 400);
+
+        // An update or a delete of a stored quality rule is refused the same way.
+        let err = update(
+            State(state.clone()),
+            Some(Extension(engineer())),
+            quality_body(Some("silver.orders"), Some("al_x")),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+        .unwrap_err();
+        assert_eq!(err.status(), 403);
+        let err = delete(
+            State(state.clone()),
+            Some(Extension(engineer())),
+            Query(DeleteQuery {
+                id: Some("al_x".to_owned()),
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|rejection| rejection.0)
+        .unwrap_err();
+        assert_eq!(err.status(), 403);
+    }
+
+    /// The list hides quality incident rules (and their webhook targets) from
+    /// everyone but an administrator.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_list_hides_quality_incident_rules_from_a_user_who_does_not_see_every_tenant(
+        pool: sqlx::PgPool,
+    ) {
+        let (state, _ch) = setup(&pool, ("quality_incident", "")).await;
+        let rule = |id: &str, kind: AlertKind| AlertRule {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            kind,
+            mart: None,
+            measure: None,
+            agg: "sum".to_owned(),
+            op: lakehouse_alerts::AlertOp::Gt,
+            threshold: 0.0,
+            board: None,
+            channel: lakehouse_alerts::AlertChannel::Webhook,
+            target: "https://hooks.example.com/secret".to_owned(),
+            enabled: true,
+            created_at: None,
+            severity: None,
+            pipeline: None,
+            metric: None,
+            connector: None,
+            asset: (kind == AlertKind::QualityIncident).then(|| "*".to_owned()),
+        };
+        let rules = vec![
+            rule("quality", AlertKind::QualityIncident),
+            rule("plain", AlertKind::Alert),
+        ];
+        let ids = |list: Vec<AlertRule>| list.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(visible_rules(&state, Some(&engineer()), rules.clone())
+                .await
+                .unwrap()),
+            vec!["plain"]
+        );
+        assert_eq!(
+            ids(visible_rules(&state, Some(&admin()), rules.clone())
+                .await
+                .unwrap()),
+            vec!["quality", "plain"]
+        );
+        let err = visible_rules(&state, None, rules).await.unwrap_err();
+        assert_eq!(err.status(), 401);
     }
 }
 

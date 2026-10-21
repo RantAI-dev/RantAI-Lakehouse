@@ -1,10 +1,13 @@
 "use client"
 
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+
 import type { ReactNode } from "react"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { Pill, StatusBadge } from "@/components/patterns/status-badge"
+import { CertificationBadge, Pill, StatusBadge } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Skeleton } from "@/components/ui/skeleton"
+import { DeprecationNotice } from "@/features/catalog/asset-certification"
 import type { ActionState } from "@/hooks/use-service"
 import { formatBytes, formatCost } from "@/lib/format"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
@@ -16,6 +19,64 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
       <dd className="text-right">{children}</dd>
     </div>
+  )
+}
+
+/**
+ * The tables a query reads, each with its certification mark (`DATA-12`
+ * part 3), and a warning under the list for each deprecated one. A deprecated
+ * table still runs: the warning names it and what to use instead, and never
+ * blocks the query. `marks` is absent when no source is marked.
+ */
+function SourcesList({
+  sources,
+  marks,
+}: {
+  sources: string[]
+  marks: QueryEstimate["sourceMarks"]
+}) {
+  return (
+    <>
+      <ul className="space-y-0.5">
+        {sources.map((source) => {
+          const mark = marks?.[source]
+          const governed = governedPairLabels(mark?.governedTags)
+          const tags = mark?.tags ?? []
+          return (
+            <li key={source} className="font-mono text-xs flex items-center flex-wrap gap-1">
+              <span>{source}</span>
+              {/* PR #106 review R1 BLOCKER 2: mark, governed tags, free tags */}
+              <CertificationBadge
+                certification={mark?.certification}
+                className="align-middle font-sans"
+              />
+              {governed.map((pair) => (
+                <Pill key={`governed:${pair}`} tone="info" className="align-middle font-sans text-[10px]">
+                  {pair}
+                </Pill>
+              ))}
+              {tags.map((tag) => (
+                <Pill key={tag} tone="neutral" className="align-middle font-sans text-[10px]">
+                  {tag}
+                </Pill>
+              ))}
+            </li>
+          )
+        })}
+      </ul>
+      <div className="mt-2 space-y-1.5">
+        {sources.map((source) => {
+          const mark = marks?.[source]
+          if (mark?.certification !== "deprecated") return null
+          return (
+            <div key={source} className="text-left">
+              <span className="sr-only">{source}</span>
+              <DeprecationNotice asset={mark} />
+            </div>
+          )
+        })}
+      </div>
+    </>
   )
 }
 
@@ -170,13 +231,7 @@ export function QueryTransparencyPanel({
           <div>
             <dt className="text-muted-foreground">Sources</dt>
             <dd className="mt-1">
-              <ul className="space-y-0.5">
-                {state.data.sources.map((s) => (
-                  <li key={s} className="font-mono text-xs">
-                    {s}
-                  </li>
-                ))}
-              </ul>
+              <SourcesList sources={state.data.sources} marks={state.data.sourceMarks} />
             </dd>
           </div>
           <QueryPlanPanel plan={state.data.plan} />

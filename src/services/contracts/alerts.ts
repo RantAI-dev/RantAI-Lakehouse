@@ -14,7 +14,7 @@
  * `<namespace>.<table>` target and the backend clears
  * `measure`/`agg`/`threshold`/`board` for that kind (WS5 item E3).
  */
-export type AlertRuleKind = "alert" | "digest" | "freshness" | string
+export type AlertRuleKind = "alert" | "digest" | "freshness" | "pipeline_behind_target" | string
 
 /**
  * The six rule kinds for connector and upload loads (`SRC-7`). The first five
@@ -32,6 +32,14 @@ export const LOAD_ALERT_KINDS = [
 ] as const
 
 export type LoadAlertKind = (typeof LOAD_ALERT_KINDS)[number]
+
+/**
+ * The rule kind for an opened quality incident (`DATA-14`): a failed check, or
+ * a learned volume or freshness anomaly. Scoped to one table or `*` by `asset`;
+ * saved only by an administrator who sees every tenant, because its message
+ * names tables and rules of any tenant.
+ */
+export const QUALITY_ALERT_KIND = "quality_incident" as const
 
 /** Mirrors `AlertChannel` (`#[serde(rename_all = "lowercase")]`). */
 export type AlertChannel = "webhook" | "email" | string
@@ -78,6 +86,13 @@ export type AlertRule = {
    * `pipeline`.
    */
   connector?: string
+  /**
+   * A table (`silver.orders`) or `*` for every table, on a `quality_incident`
+   * rule (`DATA-14`). Omitted from the wire body when unset, like `connector`.
+   */
+  asset?: string
+  /** Pipeline id or `*` for pipeline rules. */
+  pipeline?: string
 }
 
 /**
@@ -103,6 +118,9 @@ export type SaveAlertRuleInput = {
   severity?: string
   /** Connector id or `*`; see [`AlertRule.connector`]. */
   connector?: string
+  /** Table or `*`; see [`AlertRule.asset`]. */
+  asset?: string
+  pipeline?: string
 }
 
 /** Body of `GET /api/alerts/status`. */

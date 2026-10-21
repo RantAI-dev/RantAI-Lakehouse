@@ -236,13 +236,7 @@ export function ApprovalsPage() {
     withNotify(
       { success: "Decision recorded", error: "Failed to record decision" },
       (signal, id: string, dec: "approved" | "rejected", cmt: string | undefined) => {
-        // `decideAccessRequest` is optional on `AssetService` only so the
-        // dead `mock/assets.ts` fixture still satisfies the interface —
-        // see that contract's own doc comment. Fail closed rather than
-        // silently no-op if that assumption is ever wrong.
-        if (!assetService.decideAccessRequest) {
-          return Promise.reject(new Error("This deployment cannot decide access requests."))
-        }
+        // PR #106 review R2 SHOULD-FIX 6: decideAccessRequest is required on AssetService
         return assetService.decideAccessRequest(id, dec, cmt, signal)
       }
     )

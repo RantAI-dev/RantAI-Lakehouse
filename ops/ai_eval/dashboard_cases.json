@@ -59,10 +59,13 @@
     "id": "chart_line_monthly",
     "mode": "build",
     "confirm": true,
-    "turns": ["Draw a line chart of foreign visitors per month."],
-    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "line", "grain": "month"}},
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Visitors By Month", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, negara, kawasan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Draw a line chart of foreign visitors per month from the saved source \"Eval Visitors By Month\"."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "kind": "line", "grain": "month"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "line", "def.grain": "month"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "line", "def.grain": "month"}, "count": 1}
     ]
   },
   {
@@ -70,10 +73,13 @@
     "mode": "build",
     "lang": "id",
     "confirm": true,
-    "turns": ["Buat grafik garis jumlah pengunjung mancanegara per kuartal."],
-    "expect_tool": {"name": "create_chart", "args_contains": {"grain": "quarter"}},
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Pengunjung Per Kuartal", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, negara, kawasan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Buat grafik garis jumlah pengunjung mancanegara per kuartal dari sumber tersimpan \"Eval Pengunjung Per Kuartal\"."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "grain": "quarter"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "line", "def.grain": "quarter"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "line", "def.grain": "quarter"}, "count": 1}
     ]
   },
   {
@@ -100,10 +106,13 @@
     "id": "chart_kpi_compare",
     "mode": "build",
     "confirm": true,
-    "turns": ["Add a KPI card of foreign visitors, compared with the previous period."],
-    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "kpi"}},
+    "setup": [
+      {"name": "src", "method": "POST", "path": "/api/dashboard/sources", "body": {"title": "Eval Visitors With Dates", "sql": "SELECT makeDate(tahun, bulan_no, 1) AS bulan, negara, kawasan, jumlah FROM serving.mart_wisman"}, "id_at": "source.id"}
+    ],
+    "turns": ["Add a KPI card of foreign visitors from the saved source \"Eval Visitors With Dates\", compared with the previous period."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"sqlSource": "{src}", "kind": "kpi"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "kpi", "def.compare.kind": "previous"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"sqlSource": "{src}", "kind": "kpi", "def.compare.kind": "previous"}, "count": 1}
     ]
   },
   {
@@ -127,10 +136,47 @@
     ]
   },
   {
+    "id": "chart_pivot_totals",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Make a pivot of foreign visitors by year and month, with a grand total row."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "pivot"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "pivot", "def.rows": "tahun", "def.columns": "bulan_no", "def.totals": "grand"}, "count": 1}
+    ]
+  },
+  {
+    "id": "metric_first",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "metric", "method": "POST", "path": "/api/dashboard/metrics", "body": {"mart": "mart_wisman", "name": "eval_foreign_visitors", "label": "Foreign visitors", "formula": "Sum([jumlah])"}, "id_at": "metric.id"}
+    ],
+    "turns": ["Add a bar chart of foreign visitors by country."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.measures[].metric": "eval_foreign_visitors"}, "count": 1}
+    ]
+  },
+  {
+    "id": "metric_first_id",
+    "mode": "build",
+    "lang": "id",
+    "confirm": true,
+    "setup": [
+      {"name": "metric", "method": "POST", "path": "/api/dashboard/metrics", "body": {"mart": "mart_wisman", "name": "eval_pengunjung_mancanegara", "label": "Pengunjung mancanegara", "formula": "Sum([jumlah])"}, "id_at": "metric.id"}
+    ],
+    "turns": ["Buat grafik batang pengunjung mancanegara per negara."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"mart": "mart_wisman", "kind": "bar"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"mart": "mart_wisman", "kind": "bar", "def.measures[].metric": "eval_pengunjung_mancanegara"}, "count": 1}
+    ]
+  },
+  {
     "id": "chart_on_new_board",
     "mode": "build",
     "confirm": true,
-    "turns": ["Make a board \"Eval Events Board\" and put a bar chart of events per year on it."],
+    "turns": ["Make a board \"Eval Events Board\".", "Now put a bar chart of events per year on the board \"Eval Events Board\"."],
     "expect_tool": {"name": "create_board", "args_contains": {"name": "Eval Events Board"}},
     "expect_state": [
       {"path": "/api/dashboard/boards", "list": "boards", "where": {"name": "Eval Events Board"}, "count": 1},
@@ -192,7 +238,7 @@
     "id": "calc_then_chart",
     "mode": "build",
     "confirm": true,
-    "turns": ["Make a field called per_event that divides events by two on mart_event, then chart it by year."],
+    "turns": ["Make a field called per_event that divides events by two on mart_event.", "Now chart per_event by year."],
     "expect_tool": {"name": "create_calculated_field", "args_contains": {"mart": "mart_event"}},
     "expect_state": [
       {"path": "/api/dashboard/calc-fields?mart=mart_event", "list": "fields", "where": {"name": "per_event"}, "count": 1},
@@ -353,7 +399,7 @@
     "turns": ["Put these two charts side by side at the top, each half the width."],
     "expect_tool": {"name": "arrange_board", "args_contains": {"board": "{board}"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "chartCount": 2}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "chartCount": 2, "layout.{chart_a}.w": 6, "layout.{chart_a}.y": 0, "layout.{chart_b}.w": 6, "layout.{chart_b}.y": 0}, "count": 1}
     ]
   },
   {

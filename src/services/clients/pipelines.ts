@@ -159,4 +159,12 @@ export const dagsterPipelineService: PipelineService = {
     );
     return { schedule: body.schedule ?? null, ticks: body.ticks ?? [], unavailable: body.unavailable ?? null };
   },
+  setTargetLag(id, targetLag, signal) {
+    return sendJson<Pipeline>(
+      "PUT",
+      `/api/pipelines/${encodeURIComponent(id)}/target-lag`,
+      { targetLag },
+      signal
+    );
+  },
 };

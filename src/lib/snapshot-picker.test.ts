@@ -75,6 +75,7 @@ function snap(id: string, timestampMs: number): LakehouseSnapshot {
     parentId: null,
     timestampMs,
     operation: "append",
+    author: null,
     summary: { addedRecords: null, deletedRecords: null, totalRecords: null, totalDataFiles: null },
   }
 }

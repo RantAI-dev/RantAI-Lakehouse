@@ -13,6 +13,16 @@
 //! start`, which re-imports its module on reload; the plain `dagster api
 //! grpc` server it used before would not have.
 //!
+//! A third trigger exists for a pipeline with a target lag (plan D3): while
+//! one is set, `authored_factory.py` builds NEITHER the cron schedule nor
+//! the `_after` sensor, and an `authored__<id>_lag` sensor asks
+//! `POST /api/pipelines/runnable/{id}/lag-check` every 30 seconds instead.
+//! `schedule` and `depends_on` stay stored, so removing the lag returns the
+//! pipeline to them. What that ask is answered with lives in
+//! [`crate::pipeline_lag`]; this module owns the two routes that write the
+//! lag and forward the ask, so the console, the assistant's tool and the
+//! orchestrator all reach the same decision through one door.
+//!
 //! # Who may read every tenant's definitions
 //!
 //! [`runnable`] lists authored pipelines across all tenants, as
@@ -1006,6 +1016,259 @@ pub async fn runnable(
     Ok(ApiJson(json!({ "pipelines": list })))
 }
 
+/// `POST /api/pipelines/runnable/{id}/lag-check` — one target-lag check
+/// for one authored pipeline (plan D5). The orchestrator's `lag` sensor
+/// calls it every [`crate::pipeline_lag::CHECK_INTERVAL_SECONDS`] seconds
+/// and launches the job the answer names.
+///
+/// Orchestrator-only, exactly like [`runnable`]: the `pipeline:read` row in
+/// `POLICY_TABLE` is a floor, and this handler refuses anyone but a
+/// service identity or a Platform Admin. A `pipeline:write` user is not the
+/// orchestrator.
+///
+/// The gate runs first, so a human caller is told "you are not the
+/// orchestrator" (403) whatever id it asked for — which is plan D5's
+/// "another tenant's id and an unknown id are the same answer" in its
+/// strongest form: for every non-admitted caller the answer is identical,
+/// so this route cannot be used to learn whether an id exists. Only after
+/// it, and only for the one admitted non-service caller shape (a Platform
+/// Admin acting inside one tenant), does the per-id scope check run: an
+/// orchestrator is cross-tenant by design — it runs every tenant's
+/// pipelines, the whole point of `runnable` — so the scope check must not
+/// be applied to it.
+///
+/// # Errors
+///
+/// 403 for a caller that is neither the orchestrator nor a Platform Admin;
+/// 404 for an unknown id, a `Dagster`-native job name, or an id outside the
+/// caller's tenant; 503 when no Postgres is configured; 500 on a store
+/// failure; 503 when the orchestrator could not be asked about an
+/// outstanding run (the sensor skips that tick and asks again).
+#[allow(
+    clippy::too_many_lines,
+    reason = "orchestrates lag-check permissions, inputs resolution, state preservation, and alert evaluation"
+)]
+pub async fn lag_check(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity checks a pipeline's target lag".to_owned(),
+        )
+        .into());
+    }
+    let pool = crate::routes::pipelines::pool(&state)?;
+    if !matches!(principal.id, PrincipalId::Service(_)) {
+        in_scope(Some(pool), &principal, &headers, &id).await?;
+    }
+    authored_only(&id)?;
+    let Some(pipeline) = pipelines::get_pipeline(pool, &id).await? else {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    };
+    // BLD-2 review R2 SHOULD-FIX 2: guard: pipeline has no target lag configured
+    let (target_seconds, downstream) = crate::pipeline_lag::target_of(&pipeline);
+    if target_seconds.is_none() && !downstream {
+        return Ok(ApiJson(serde_json::json!({
+            "decision": "wait",
+            "runKey": serde_json::Value::Null,
+            "jobName": crate::routes::authored_pipelines::job_name(&pipeline.id),
+            "status": "not_measured",
+            "lagSeconds": serde_json::Value::Null,
+            "targetSeconds": serde_json::Value::Null,
+            "behindStreak": 0,
+            "reason": "pipeline has no target lag configured",
+        })));
+    }
+
+    let Some(inputs) = crate::pipeline_lag::inputs_of(pool, &pipeline).await? else {
+        // BLD-2 review R2 SHOULD-FIX 2: unparseable source preserves existing row and propagates errors
+        let now = time::OffsetDateTime::now_utc();
+        let existing = pipelines::get_lag_state(pool, &pipeline.id).await?;
+        // BLD-2 review R3 SHOULD-FIX 6: the shared builder, not a hand-built copy.
+        let p_update = crate::pipeline_lag::make_lag_update(
+            &pipeline,
+            &crate::pipeline_lag::CheckState::from_stored(existing.as_ref()),
+            now,
+            "not_measured",
+            0,
+        );
+        // BLD-2 review R2 SHOULD-FIX 2: do not let _ = a database error; propagate it
+        pipelines::upsert_lag_state(pool, &p_update).await?;
+        return Ok(ApiJson(serde_json::json!({
+            "decision": "wait",
+            "runKey": serde_json::Value::Null,
+            "jobName": crate::routes::authored_pipelines::job_name(&pipeline.id),
+            "status": "not_measured",
+            "lagSeconds": serde_json::Value::Null,
+            "targetSeconds": serde_json::Value::Null,
+            "behindStreak": 0,
+            "reason": "pipeline source is not a valid <zone>.<table> location",
+        })));
+    };
+    let outcome = crate::pipeline_lag::run_lag_check(
+        pool,
+        &state.dagster,
+        &crate::pipeline_lag::StateTokenReader { state: &state },
+        &pipeline,
+        &inputs,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    if crate::pipeline_lag::behind_alert_due(outcome.behind_streak) {
+        // Plan D9: the alert rides the check that completes the streak.
+        // SEC-10: the sender checks every webhook target and never follows
+        // a redirect, like every other rule evaluation in this crate.
+        let http = state.webhook_sender();
+        let email =
+            lakehouse_notify::EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
+        let silence_source: Option<Box<dyn lakehouse_alerts::SilenceSource>> =
+            state.pg.as_deref().map(|pg| {
+                Box::new(crate::routes::alerts::ApiSilenceSource { pg })
+                    as Box<dyn lakehouse_alerts::SilenceSource>
+            });
+        // BLD-2 review R3 BLOCKER 1 / decision R14: pass check's reason to alert
+        if let Err(err) = lakehouse_alerts::evaluate_pipeline_behind_target(
+            &state.clickhouse,
+            &http,
+            &email,
+            &id,
+            outcome.lag_seconds,
+            outcome.target_seconds,
+            outcome.reason.as_deref(),
+            silence_source.as_deref(),
+        )
+        .await
+        {
+            // Best-effort, and deliberately NOT turned into a 5xx: the
+            // check's decision and its state row are already written, so a
+            // refusal here would make the sensor repeat a check that has
+            // run — the streak would advance twice for one tick. The gap
+            // is logged rather than hidden, and the next streak fires
+            // again from zero.
+            tracing::warn!(%err, pipeline_id = %id, "target lag: the behind-target alert rules could not be evaluated");
+        }
+    }
+    Ok(ApiJson(json!({
+        "decision": match outcome.decision {
+            crate::pipeline_lag::Decision::Run => "run",
+            crate::pipeline_lag::Decision::Wait => "wait",
+        },
+        "runKey": outcome.run_key,
+        "jobName": outcome.job_name,
+        "status": outcome.status.as_str(),
+        "lagSeconds": outcome.lag_seconds,
+        "targetSeconds": outcome.target_seconds,
+        "behindStreak": outcome.behind_streak,
+        "reason": outcome.reason,
+    })))
+}
+
+/// Body accepted by `PUT /api/pipelines/{id}/target-lag`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTargetLagBody {
+    #[serde(default)]
+    pub target_lag: Option<pipelines::TargetLag>,
+}
+
+// BLD-2 review R3 BLOCKER 3: 1 minute floor citing R8 logs and R6/R6a history
+/// The smallest target lag a pipeline may be given, in whole minutes.
+///
+/// BLD-2 review round 1 R6b / round 2 R8, plan D11: the spec's floor is 1 minute (60 seconds).
+/// Under R6b it was temporarily set to 2 minutes, but with R6a (request-to-land budget),
+/// the R8 gate measurements on the compose stack (`bld2-gate-r8-1min.log` and
+/// `bld2-gate-r8-final.log`) confirmed that 1 minute passes all 5 samples (worst 32.70 s).
+/// It is a measured floor, not a preference: change it only with a new measurement
+/// behind it, and change `0084_pipeline_target_lag.sql`'s CHECK in the same PR
+/// so the route and the column cannot disagree.
+pub const MIN_TARGET_LAG_MINUTES: i32 = 1;
+
+/// The largest target lag a pipeline may be given: 7 days, Snowflake's.
+pub const MAX_TARGET_LAG_MINUTES: i32 = 10_080;
+
+/// Validates an optional `target_lag` value. Minutes must be between
+/// [`MIN_TARGET_LAG_MINUTES`] and [`MAX_TARGET_LAG_MINUTES`] (1 minute to
+/// 7 days; the top of the range is Snowflake's, the bottom is the measured
+/// floor — plan D11).
+///
+/// # Errors
+///
+/// Returns 400 if minutes is outside
+/// `MIN_TARGET_LAG_MINUTES..=MAX_TARGET_LAG_MINUTES`.
+pub fn validate_target_lag(lag: Option<pipelines::TargetLag>) -> Result<(), ApiError> {
+    if let Some(pipelines::TargetLag::Lag { minutes }) = lag
+        && !(MIN_TARGET_LAG_MINUTES..=MAX_TARGET_LAG_MINUTES).contains(&minutes)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "targetLag minutes must be between {MIN_TARGET_LAG_MINUTES} and {MAX_TARGET_LAG_MINUTES} (1 minute to 7 days)"
+        )));
+    }
+    Ok(())
+}
+
+/// Core logic for setting target lag on an authored pipeline (shared between
+/// `PUT /api/pipelines/{id}/target-lag` and the assistant's `set_pipeline_target_lag` tool).
+///
+/// # Errors
+///
+/// Returns 404 if the pipeline does not exist; 400 on cycle or invalid lag; 503 if store is down.
+// BLD-2 review R2 BLOCKER 1: pass caller headers so X-Tenant is preserved
+pub async fn apply_set_target_lag(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    pipeline_id: &str,
+    target_lag: Option<pipelines::TargetLag>,
+) -> ApiResult<pipelines::Pipeline> {
+    // BLD-2 review R1 BLOCKER 1: authored_only and in_scope checks inside apply_set_target_lag
+    // BLD-2 review R2 BLOCKER 1: in_scope uses passed caller headers
+    authored_only(pipeline_id)?;
+    in_scope(state.pg.as_deref(), principal, headers, pipeline_id).await?;
+    validate_target_lag(target_lag)?;
+    let pool = crate::routes::pipelines::pool(state)?;
+    let updated = pipelines::set_target_lag(pool, pipeline_id, target_lag)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {pipeline_id} not found")))?;
+    // BLD-2 review R1 SHOULD-FIX 13: audit action name pipeline.target_lag.set
+    record_pipeline_audit(
+        state,
+        principal,
+        "pipeline.target_lag.set",
+        pipeline_id,
+        serde_json::to_value(target_lag).unwrap_or(Value::Null),
+    )
+    .await;
+    Ok(updated)
+}
+
+/// `PUT /api/pipelines/{id}/target-lag` — set or clear an authored pipeline's
+/// target lag.
+///
+/// # Errors
+///
+/// Returns 404 for an unknown or non-authored id or an id outside the caller's tenant;
+/// 400 for minutes outside `1..=10080` or if the lag would create a cycle;
+/// 503 if the store is unavailable.
+pub async fn set_target_lag(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    authored_only(&id)?;
+    in_scope(state.pg.as_deref(), &principal, &headers, &id).await?;
+    let body: SetTargetLagBody = crate::routes::pipelines::parse_body(&body)?;
+    let updated = apply_set_target_lag(&state, &principal, &headers, &id, body.target_lag).await?;
+    let reloaded = reload_orchestrator(&state).await;
+    Ok(ApiJson(with_orchestrator(&updated, reloaded)))
+}
+
 /// The refusal D2 fixes for every pipeline that has no usable author, in
 /// both its cases (no `run_as` at all; an author who is deactivated). One
 /// constant for both, because the fix is the same and an operator reading
@@ -1150,6 +1413,11 @@ pub async fn enforce_pipeline_sql(
     .map_err(|err| {
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })?;
+    // DATA-13 (F2): the API sees the run's real SELECT only here. Keep the SQL
+    // as the orchestrator submitted it, not `rewritten` (masking wraps the
+    // source in subqueries, which would make every column partial); the
+    // mapping is written when the run is reported successful.
+    super::lineage::columns::note_pipeline_sql(pool, &id, &sql).await;
     Ok(ApiJson(json!({ "sql": rewritten })))
 }
 
@@ -1206,7 +1474,7 @@ fn authored_only(id: &str) -> Result<(), ApiRejection> {
 
 /// The body every authored write returns: the pipeline, plus whether the
 /// orchestrator picked the change up.
-fn with_orchestrator(pipeline: &pipelines::Pipeline, reloaded: bool) -> Value {
+pub(crate) fn with_orchestrator(pipeline: &pipelines::Pipeline, reloaded: bool) -> Value {
     let mut body = serde_json::to_value(pipeline).unwrap_or_else(|_| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("orchestratorReloaded".to_owned(), json!(reloaded));
@@ -1398,6 +1666,8 @@ pub async fn delete(
     }
     match pipelines::delete_pipeline(pool, &id, Some(principal.id.uuid())).await {
         Ok(true) => {
+            // PR #106 review R1 SHOULD-FIX DATA-13 4: forget column lineage when pipeline is deleted
+            crate::routes::lineage::columns::forget_pipeline(&state, &id).await;
             record_pipeline_audit(&state, &principal, "pipeline.delete", &id, Value::Null).await;
             let reloaded = reload_orchestrator(&state).await;
             (
@@ -2309,8 +2579,10 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -2703,8 +2975,10 @@ mod tests {
                 // slug-derived default; that is exactly what `id: None`
                 // triggers in `create_pipeline`.
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -3056,8 +3330,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -3193,10 +3469,13 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this helper seeds a plain pipeline with no target
+                // lag; the lag tests name the field they need.
+                target_lag: None,
                 // BLD-1 / D1: no author — this fixture seeds a row that
                 // the update and restore routes then refuse, so it never
                 // reaches the orchestrator.
+                run_as: None,
             }
         }
 
@@ -3468,8 +3747,10 @@ mod tests {
                 depends_on: Vec::new(),
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -3660,8 +3941,10 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -3794,8 +4077,10 @@ mod tests {
                 depends_on,
                 connector_id: None,
                 id: None,
-                run_as: None,
+                // BLD-2: this fixture is not about a target lag.
+                target_lag: None,
                 // BLD-1 / D1: no author — these fixtures never reach the orchestrator.
+                run_as: None,
             }
         }
 
@@ -4061,6 +4346,485 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .expect("detail has a downstream array");
             assert!(downstream.is_empty(), "downstream must be empty");
+        }
+
+        // PR #106 review R1 SHOULD-FIX DATA-13 4
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn delete_pipeline_removes_column_lineage_mappings(pool: sqlx::PgPool) {
+            let pl =
+                pipelines::create_pipeline(&pool, &create_input("pl-col", Vec::new(), None), None)
+                    .await
+                    .expect("create pl-col");
+
+            lakehouse_store::column_lineage::replace_producer(
+                &pool,
+                "pipeline",
+                &pl.id,
+                None,
+                &[lakehouse_store::column_lineage::NewMapping {
+                    from_table: Some("bronze.raw".to_owned()),
+                    from_column: Some("x".to_owned()),
+                    to_table: "silver.out".to_owned(),
+                    to_column: "x".to_owned(),
+                    transform: "copy".to_owned(),
+                    partial: false,
+                    reason: None,
+                }],
+            )
+            .await
+            .expect("write mappings");
+
+            let response = delete(
+                State(state_for(&pool)),
+                Extension(unrestricted_principal()),
+                HeaderMap::new(),
+                Path(pl.id.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let remaining: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM column_lineage WHERE producer_kind = 'pipeline' AND producer_ref = $1",
+            )
+            .bind(&pl.id)
+            .fetch_one(&pool)
+            .await
+            .expect("query count");
+            assert_eq!(
+                remaining.0, 0,
+                "column lineage rows must be deleted when pipeline is deleted"
+            );
+        }
+    }
+
+    mod target_lag_route_tests {
+        use lakehouse_store::pipelines::{self, CreatePipelineInput, TargetLag};
+
+        async fn provision_tenant(pool: &sqlx::PgPool, slug: &str) -> uuid::Uuid {
+            let t = lakehouse_store::identity::create_tenant(
+                pool,
+                &lakehouse_store::identity::CreateTenantInput {
+                    name: slug.to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "starter".to_owned(),
+                    residency: "in-region".to_owned(),
+                },
+            )
+            .await
+            .expect("create tenant");
+            uuid::Uuid::parse_str(&t.id).expect("tenant id is a uuid")
+        }
+
+        fn tenant_principal(tenant_id: uuid::Uuid) -> Principal {
+            Principal {
+                tenant_ids: vec![tenant_id],
+                ..principal(PrincipalId::User(uuid::Uuid::from_u128(3)))
+            }
+        }
+        use lakehouse_test_support as _;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        async fn test_state(pool: &sqlx::PgPool) -> (AppState, MockServer) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("listJobsForRepository"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("reloadWorkspace"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({ "data": { "reloadWorkspace": { "__typename": "Workspace" } } }),
+                ))
+                .mount(&server)
+                .await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert(
+                "DAGSTER_URL".to_owned(),
+                format!("{}/graphql", server.uri()),
+            );
+            (
+                AppState::new(Config::from_map(&env).expect("valid Config")),
+                server,
+            )
+        }
+
+        #[test]
+        fn validate_target_lag_enforces_the_measured_floor_and_10080_minute_ceiling() {
+            // BLD-2 review round 2 / R8: the floor is 1 minute, confirmed by gate run.
+            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 1 })).is_ok());
+            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 2 })).is_ok());
+            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 10080 })).is_ok());
+            assert!(validate_target_lag(Some(TargetLag::Lag { minutes: 60 })).is_ok());
+            assert!(validate_target_lag(Some(TargetLag::Downstream)).is_ok());
+            assert!(validate_target_lag(None).is_ok());
+
+            let zero_err = validate_target_lag(Some(TargetLag::Lag { minutes: 0 })).unwrap_err();
+            assert!(matches!(zero_err, ApiError::BadRequest(_)));
+            assert!(
+                zero_err.to_string().contains("between 1 and 10080"),
+                "the message names the measured floor: {zero_err}"
+            );
+
+            let over_err =
+                validate_target_lag(Some(TargetLag::Lag { minutes: 10081 })).unwrap_err();
+            assert!(matches!(over_err, ApiError::BadRequest(_)));
+            assert!(over_err.to_string().contains("between 1 and 10080"));
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_sets_lag_and_records_audit(pool: sqlx::PgPool) {
+            let (state, _server) = test_state(&pool).await;
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-lag-test".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: None,
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-lag-test".to_owned()),
+                    target_lag: None,
+                    // BLD-1 / D1: the fixture is about the target-lag route,
+                    // not about a pipeline author.
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let principal = unrestricted_principal();
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 15 }
+            }))
+            .expect("body");
+
+            let res = set_target_lag(
+                State(state.clone()),
+                Extension(principal.clone()),
+                HeaderMap::new(),
+                Path(pl.id.clone()),
+                Bytes::from(body),
+            )
+            .await
+            .expect("set_target_lag succeeds");
+
+            let res_json = res.0;
+            assert_eq!(
+                res_json["targetLag"],
+                json!({ "kind": "lag", "minutes": 15 })
+            );
+
+            let stored = pipelines::get_pipeline(&pool, &pl.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.target_lag, Some(TargetLag::Lag { minutes: 15 }));
+
+            // BLD-2 review R1 SHOULD-FIX 12: assert the audit row the PUT
+            // wrote — `audit_event`'s timestamp column is `at`, not
+            // `created_at`.
+            let audit_rows: Vec<(String, Value)> = sqlx::query_as(
+                "SELECT action, args FROM audit_event WHERE resource_id = $1 ORDER BY at ASC",
+            )
+            .bind(&pl.id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch audit");
+            assert!(!audit_rows.is_empty(), "audit event must be recorded");
+            assert_eq!(audit_rows[0].0, "pipeline.target_lag.set");
+            assert_eq!(audit_rows[0].1["kind"], "lag");
+            assert_eq!(audit_rows[0].1["minutes"], 15);
+
+            // Clearing target lag with null
+            let clear_body = serde_json::to_vec(&json!({ "targetLag": null })).expect("body");
+            let clear_res = set_target_lag(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Path(pl.id.clone()),
+                Bytes::from(clear_body),
+            )
+            .await
+            .expect("clear succeeds");
+            assert_eq!(clear_res.0["targetLag"], Value::Null);
+
+            let stored_after_clear = pipelines::get_pipeline(&pool, &pl.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored_after_clear.target_lag, None);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_rejects_out_of_bounds_minutes(pool: sqlx::PgPool) {
+            let (state, _server) = test_state(&pool).await;
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-bounds".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: None,
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-bounds".to_owned()),
+                    target_lag: None,
+                    // BLD-1 / D1: the fixture is about the target-lag route,
+                    // not about a pipeline author.
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let principal = unrestricted_principal();
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 0 }
+            }))
+            .expect("body");
+
+            let err = set_target_lag(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Path(pl.id),
+                Bytes::from(body),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_refuses_a_cross_tenant_pipeline(pool: sqlx::PgPool) {
+            let (state, _server) = test_state(&pool).await;
+            let tenant_a = provision_tenant(&pool, "lag-tenant-a").await;
+            let tenant_b = provision_tenant(&pool, "lag-tenant-b").await;
+
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-tenant-b".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: Some(tenant_b),
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-tenant-b".to_owned()),
+                    target_lag: None,
+                    // BLD-1 / D1: the fixture is about tenant scoping, not
+                    // about a pipeline author.
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let caller_a = tenant_principal(tenant_a);
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 10 }
+            }))
+            .expect("body");
+
+            let err = set_target_lag(
+                State(state),
+                Extension(caller_a),
+                HeaderMap::new(),
+                Path(pl.id),
+                Bytes::from(body),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+        }
+
+        /// BLD-2 review R2 BLOCKER 1: a user in tenants [A, B] acting through
+        /// X-Tenant: B can set target lag on a tenant-B pipeline (200).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_allows_user_in_multiple_tenants_acting_as_second_tenant(
+            pool: sqlx::PgPool,
+        ) {
+            let (state, _server) = test_state(&pool).await;
+            let tenant_a = provision_tenant(&pool, "multi-tenant-a").await;
+            let tenant_b = provision_tenant(&pool, "multi-tenant-b").await;
+
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-b-multi".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: Some(tenant_b),
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-b-multi".to_owned()),
+                    target_lag: None,
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let caller_ab = Principal {
+                tenant_ids: vec![tenant_a, tenant_b],
+                ..principal(PrincipalId::User(uuid::Uuid::from_u128(99)))
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("x-tenant", tenant_b.to_string().parse().unwrap());
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 10 }
+            }))
+            .expect("body");
+
+            let res = set_target_lag(
+                State(state),
+                Extension(caller_ab),
+                headers,
+                Path(pl.id.clone()),
+                Bytes::from(body),
+            )
+            .await
+            .expect("set_target_lag succeeds when acting as tenant B");
+
+            assert_eq!(res.0["targetLag"], json!({ "kind": "lag", "minutes": 10 }));
+        }
+
+        /// BLD-2 review R2 BLOCKER 1: a Platform Admin acting through X-Tenant: B
+        /// can save lag on a B pipeline (200), and gets 404 when acting as X-Tenant: A.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn put_target_lag_allows_platform_admin_acting_through_x_tenant(pool: sqlx::PgPool) {
+            let (state, _server) = test_state(&pool).await;
+            let tenant_a = provision_tenant(&pool, "admin-tenant-a").await;
+            let tenant_b = provision_tenant(&pool, "admin-tenant-b").await;
+
+            let pl = pipelines::create_pipeline(
+                &pool,
+                &CreatePipelineInput {
+                    name: "pl-b-admin".to_owned(),
+                    kind: "batch".to_owned(),
+                    source_zone: "bronze".to_owned(),
+                    source_table: "orders".to_owned(),
+                    incremental_column: None,
+                    transforms: Vec::new(),
+                    fbic_enabled: false,
+                    target_zone: "silver".to_owned(),
+                    target_table: "orders_clean".to_owned(),
+                    schedule: "manual".to_owned(),
+                    owner: None,
+                    description: None,
+                    max_retries: None,
+                    tenant_id: Some(tenant_b),
+                    depends_on: Vec::new(),
+                    connector_id: None,
+                    id: Some("pl-b-admin".to_owned()),
+                    target_lag: None,
+                    run_as: None,
+                },
+                None,
+            )
+            .await
+            .expect("create pipeline");
+
+            let admin = Principal {
+                tenant_ids: vec![tenant_a, tenant_b],
+                ..unrestricted_principal()
+            };
+            let mut headers_b = HeaderMap::new();
+            headers_b.insert("x-tenant", tenant_b.to_string().parse().unwrap());
+            let body = serde_json::to_vec(&json!({
+                "targetLag": { "kind": "lag", "minutes": 10 }
+            }))
+            .expect("body");
+
+            let res = set_target_lag(
+                State(state.clone()),
+                Extension(admin.clone()),
+                headers_b,
+                Path(pl.id.clone()),
+                Bytes::from(body.clone()),
+            )
+            .await
+            .expect("admin acting as tenant B succeeds");
+            assert_eq!(res.0["targetLag"], json!({ "kind": "lag", "minutes": 10 }));
+
+            // Acting as tenant A against tenant B's pipeline must 404
+            let mut headers_a = HeaderMap::new();
+            headers_a.insert("x-tenant", tenant_a.to_string().parse().unwrap());
+            let err = set_target_lag(
+                State(state),
+                Extension(admin),
+                headers_a,
+                Path(pl.id),
+                Bytes::from(body),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
         }
     }
 }
