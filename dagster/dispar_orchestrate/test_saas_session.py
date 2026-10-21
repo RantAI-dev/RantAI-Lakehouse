@@ -250,6 +250,10 @@ def test_an_object_without_a_cursor_must_say_why_it_is_re_read_in_full() -> None
         ObjectDecl(name="x", primary_key=("id",), cursor="u", full_reason="r")
     with pytest.raises(ValueError, match="primary key"):
         ObjectDecl(name="x", primary_key=(), cursor="u")
+    # Slice 6: a Workday report has no identifier; re-read in full, it needs no key.
+    assert ObjectDecl(name="r", primary_key=(), full_reason="no filter").primary_key == ()
+    with pytest.raises(ValueError, match="no reason"):
+        ObjectDecl(name="r", primary_key=())
 
 
 def test_a_401_asks_for_a_new_token_once_and_a_second_401_is_the_credential() -> None:
@@ -333,3 +337,18 @@ def test_request_headers_that_are_not_credentials_are_sent_and_the_sessions_auth
     session, _ = make(http)
     session.get_json("/x", headers={"Prefer": "odata.maxpagesize=5", "Authorization": "Bearer attacker"})
     assert http.headers == [{"Prefer": "odata.maxpagesize=5", "Authorization": "Bearer t"}]
+
+
+def test_a_post_carries_request_headers_that_never_replace_the_credential() -> None:
+    """Slice 6 (NetSuite's `Prefer: transient`): `post_json(headers=)` adds non-credential headers,
+    and the session's own authentication wins over a name they share."""
+    seen: list[dict] = []
+
+    def post(url: str, *, headers: dict, json: object, timeout: float) -> Reply:
+        seen.append({"headers": headers, "json": json, "timeout": timeout})
+        return Reply(body={"ok": 1})
+
+    session = SaasSession(ORIGIN, lambda: {"Authorization": "Bearer t"}, http_post=post, resolve_checked=resolver, request_timeout=77)
+    assert session.post_json("/q", {"q": "x"}, headers={"Prefer": "transient", "Authorization": "Bearer other"}) == {"ok": 1}
+    assert seen[0]["headers"] == {"Prefer": "transient", "Authorization": "Bearer t"}
+    assert seen[0]["json"] == {"q": "x"} and seen[0]["timeout"] == 77

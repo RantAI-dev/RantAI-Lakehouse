@@ -19,7 +19,8 @@ class ObjectDecl:
 
     `cursor`: the field whose value the vendor's API can filter by ("last
     modified"), or `None`. `primary_key`: the fields that identify one record
-    (merge key). `deletes`: whether the vendor reports deleted records in the
+    (merge key); empty only for an object re-read in full whose records carry no identifier
+    (a Workday report). `deletes`: whether the vendor reports deleted records in the
     same read (decision 7). `full_reason`: required when `cursor` is `None`.
     """
 
@@ -36,7 +37,10 @@ class ObjectDecl:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("an object needs a name")
-        if not self.primary_key:
+        # Slice 6 (Workday): a custom report has no identifier, so a report that is re-read in full
+        # may declare no key (the table is replaced on every run, nothing is merged). An object that
+        # continues from a cursor merges on its key and still needs one.
+        if not self.primary_key and self.cursor is not None:
             raise ValueError(f"object {self.name!r} needs a primary key")
         if self.cursor is None and not (self.full_reason or "").strip():
             raise ValueError(f"object {self.name!r} has no cursor and gives no reason it is re-read in full")

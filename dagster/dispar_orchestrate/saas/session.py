@@ -162,6 +162,7 @@ class SaasSession:
         resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
         forbidden_is_quota: Callable[[Any], bool] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        request_timeout: float = _REQUEST_TIMEOUT_SECONDS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
     ) -> None:
@@ -174,6 +175,9 @@ class SaasSession:
         self._resolve_checked = resolve_checked
         self._forbidden_is_quota = forbidden_is_quota
         self._sleep = sleep
+        # A vendor module may name a longer wait for a vendor that builds its answer on request
+        # (Workday runs the report before it answers, `request_timeout_seconds`).
+        self._timeout = request_timeout
         self._max_attempts = max(1, max_attempts)
         self._max_retry_after = max_retry_after
 
@@ -256,17 +260,19 @@ class SaasSession:
         body, link = self._send("GET", target, params, None, with_link=True)
         return body, link
 
-    def post_json(self, target: str, body: Any) -> Any:
+    def post_json(self, target: str, body: Any, *, headers: dict | None = None) -> Any:
         """POST `body` as JSON to `target` (same rules as `get_json`) and return
         the answer's JSON. For the vendors whose change filter is a search
-        request and not a query string (HubSpot's CRM search, `SRC-3` V-HubSpot.1).
-        The request is a read: a vendor module posts only to a search endpoint.
+        request and not a query string (HubSpot's CRM search, `SRC-3` V-HubSpot.1;
+        NetSuite's SuiteQL, slice 6, which also needs `Prefer: transient`, so `headers`
+        are request headers that are not credentials, as for `get_json`).
+        The request is a read: a vendor module posts only to a search or query endpoint.
 
         # Errors
 
         See `_send`.
         """
-        return self._send("POST", target, None, body)
+        return self._send("POST", target, None, body, extra_headers=headers)
 
     def _send(
         self,
@@ -296,9 +302,9 @@ class SaasSession:
             headers = {**(extra_headers or {}), **self._auth_headers()}
             with ssrf_guard.pinned_resolution(host, resolved):
                 if method == "POST":
-                    response = self._http_post(url, headers=headers, json=body, timeout=_REQUEST_TIMEOUT_SECONDS)
+                    response = self._http_post(url, headers=headers, json=body, timeout=self._timeout)
                 else:
-                    response = self._http_get(url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT_SECONDS)
+                    response = self._http_get(url, headers=headers, params=params, timeout=self._timeout)
             status = response.status_code
             if 300 <= status < 400:
                 raise ssrf_guard.SsrfBlocked("the vendor answered with a redirect; not followed")

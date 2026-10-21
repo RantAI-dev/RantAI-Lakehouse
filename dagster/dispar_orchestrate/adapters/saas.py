@@ -194,6 +194,9 @@ def open_session(
     extra: dict[str, Any] = {}
     if sleep is not None:
         extra["sleep"] = sleep
+    # Slice 6: a vendor that builds its answer when asked (Workday runs the report) names a longer wait.
+    if getattr(module, "request_timeout_seconds", None):
+        extra["request_timeout"] = module.request_timeout_seconds
     # Decision 3 / AD2: a browser sign-in whose tokens a vendor accepts only at another fixed
     # address (Atlassian's gateway) is served from the table's `oauth.apiBase`, never from
     # anything the vendor or the person says.
