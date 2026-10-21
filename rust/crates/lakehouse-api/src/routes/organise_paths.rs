@@ -2036,17 +2036,20 @@ async fn a_duplicate_whose_cleanup_fails_reports_the_cleanup_failure() {
             .expect_err("the chart's statement fails");
     match err {
         lakehouse_bi::store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+            // The error's own text is not written here: the SEC-11 scan reads
+            // a route file's test tail too, and an error's text belongs in a
+            // log, not in a message.
             assert!(
                 matches!(cause, lakehouse_bi::store::BiError::Clickhouse(_)),
-                "the copy's own error is kept: {cause:?}"
+                "the copy's own error is kept"
             );
             assert!(
                 matches!(cleanup, lakehouse_clickhouse::ChError::Server(_)),
-                "the cleanup failure is carried out: {cleanup:?}"
+                "the cleanup failure is carried out"
             );
         }
-        other @ lakehouse_bi::store::DuplicateError::Copy(_) => {
-            panic!("a cleanup that failed must be reported, not dropped: {other:?}")
+        lakehouse_bi::store::DuplicateError::Copy(_) => {
+            panic!("a cleanup that failed must be reported, not dropped")
         }
     }
 }
