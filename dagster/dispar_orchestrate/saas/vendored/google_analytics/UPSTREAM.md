@@ -43,5 +43,14 @@
    for `isoYearIsoWeek`, `yearMonth` and `year` (Analytics sums a partial period over the
    days asked for only, which the merge would write over the whole period); a start after
    yesterday (a configured start in the future) asks nothing, where Google would answer
-   with an error. The date range stays whole days: the Data API's `dateRanges` are dates,
-   in the property's time zone, while the end ("yesterday") is UTC as upstream had it.
+   with an error. The date range stays whole days.
+3. **"Yesterday" in the property's time zone** (`helpers/__init__.py` `basic_report`; slice 3
+   review SHOULD-FIX 11). Upstream computed the end date as yesterday in UTC, while the Data
+   API's dates are in the property's reporting time zone, so a property ahead of UTC could
+   miss its newest day and one behind could ask for a day that has not ended. The end is now
+   the relative term `yesterday`, which the API infers in the property's reporting time zone
+   ("the date is inferred based on the property's reporting time zone",
+   https://developers.google.com/analytics/devguides/reporting/data/v1/rest/v1beta/DateRange).
+   No second host or scope is needed (the Admin API would need `analyticsadmin.googleapis.com`,
+   a host the vendor table does not hold). Only a start later than UTC today plus one day skips
+   the request.

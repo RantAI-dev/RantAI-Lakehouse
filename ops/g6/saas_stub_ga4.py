@@ -109,7 +109,8 @@ def _run_report(handler, parsed) -> None:  # noqa: ANN001
         known = set(_DIMENSIONS) | set(STATE.custom_dimensions)
         if not set(wanted_dims) <= known or not set(wanted_metrics) <= set(_METRICS) or not isinstance(body.get("offset"), str) or not isinstance(body.get("limit"), str):
             return _error(handler, 400, "INVALID_ARGUMENT")
-        lo, hi = ranges["startDate"].replace("-", ""), ranges["endDate"].replace("-", "")
+        # `yesterday` is inferred in the property's reporting time zone (the mock's is UTC)
+        lo, hi = ranges["startDate"].replace("-", ""), _day(0) if ranges["endDate"] == "yesterday" else ranges["endDate"].replace("-", "")
         if lo > hi:
             return _error(handler, 400, "INVALID_ARGUMENT")
         hits = sorted((k, v) for k, v in STATE.rows.items() if lo <= k[0] <= hi)

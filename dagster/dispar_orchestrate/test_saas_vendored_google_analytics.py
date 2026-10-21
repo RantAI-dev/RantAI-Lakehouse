@@ -9,6 +9,7 @@ metric values are text with a `type` in the header."""
 from __future__ import annotations
 
 import ast
+from dlt.common import pendulum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -52,6 +53,7 @@ class FakeGa4:
         self.posts.append((path, json))
         assert path.endswith(":runReport"), path
         lo, hi = json["dateRanges"][0]["startDate"].replace("-", ""), json["dateRanges"][0]["endDate"].replace("-", "")
+        hi = pendulum.yesterday().strftime("%Y%m%d") if hi == "yesterday" else hi
         hits = [r for r in self.rows if lo <= r[0] <= hi]
         start, size = int(json["offset"]), int(json["limit"])
         page = hits[start : start + size]
@@ -168,7 +170,7 @@ def test_the_report_resources_merge_on_their_dimensions_and_the_last_days_are_re
     last = pendulum.yesterday().subtract(days=1)
     list(ga_helpers.basic_report(session_over(fake), 1000, ["country", "date"], ["sessions"], 123, "traffic", "2015-08-14", SimpleNamespace(last_value=last, cursor_path="date")))
     sent = fake.posts[-1][1]["dateRanges"][0]
-    assert sent["startDate"] == last.subtract(days=3).to_date_string() and sent["endDate"] == pendulum.yesterday().to_date_string()
+    assert sent["startDate"] == last.subtract(days=3).to_date_string() and sent["endDate"] == "yesterday", "the property's own yesterday, not UTC's"
 
 
 def test_no_request_is_made_when_the_start_is_after_yesterday() -> None:

@@ -29,6 +29,13 @@ value (vendored local change 2: Google may change a day for 24-48 hours; the obj
 `lag_seconds`, which dlt's incremental subtracts from the last value and for which it
 switches its boundary de-duplication off) and the merge replaces the rows read again. A report always has a cursor, so none is "re-read in full".
 
+# The property's time zone (slice 3 review SHOULD-FIX 11)
+
+Rows are dated in the property's reporting time zone, so the end of every request is the
+relative term `yesterday`, which Google infers in that zone (vendored change 3). The
+lookback (3 days) is counted from dates that are already in that zone. No time zone is
+read or stored, and no extra scope is needed.
+
 # Deletes (decision 7)
 
 GA4 reports have no deleted records; no object says `deletes`.

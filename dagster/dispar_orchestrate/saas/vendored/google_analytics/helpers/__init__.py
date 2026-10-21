@@ -77,10 +77,14 @@ def basic_report(
     start_date = report_start_date(
         last_date.cursor_path, last_date.last_value, start_date, lookback_days
     )
-    end_date = pendulum.yesterday().to_date_string()
-    if start_date > end_date:
-        # Nothing of the report is final yet (the start is after yesterday): Google answers
-        # such a range with an error, so no request is made.
+    # SHOULD-FIX 11 (slice 3 review): the end is the relative term `yesterday`, which the Data
+    # API infers in the PROPERTY's reporting time zone ("the date is inferred based on the
+    # property's reporting time zone", DateRange reference), where upstream computed the date
+    # in UTC. The dates in the rows are in that zone too, so the cursor and the end agree.
+    end_date = "yesterday"
+    if start_date > pendulum.now("UTC").add(days=1).to_date_string():
+        # Later than "yesterday" in every time zone (a configured start in the future):
+        # Google answers such a range with an error, so no request is made.
         return
 
     processed_response = get_report(
