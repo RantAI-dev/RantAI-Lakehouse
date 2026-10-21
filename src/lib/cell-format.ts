@@ -63,8 +63,14 @@ export function formatDate(value: unknown): string {
   return d && !Number.isNaN(d.getTime()) ? DATE.format(d) : raw
 }
 
-/** What one cell shows under its column's setting. `null` is an empty cell. */
-export function cellContent(value: unknown, setting?: ColumnSetting): CellContent {
+/**
+ * What one cell shows under its column's setting. `null` is an empty cell.
+ * `locale` is the deployment's number locale (BI-17); without it numbers are
+ * `en-US` as before. A currency column with no code of its own stays the
+ * Indonesian `Rp` it always was, whatever the locale, so no table changes
+ * until somebody sets a code.
+ */
+export function cellContent(value: unknown, setting?: ColumnSetting, locale?: string): CellContent {
   if (value === null || value === undefined) return { kind: "text", text: "" }
   const format = setting?.format ?? "auto"
   const decimals = setting?.decimals
@@ -82,20 +88,20 @@ export function cellContent(value: unknown, setting?: ColumnSetting): CellConten
       return { kind: "text", text: formatDate(value) }
     case "percent":
       // A ratio, as `Intl` reads it: 0.25 is 25%.
-      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat("en-US", { style: "percent", ...fractionOptions(decimals, 2) }).format(n) }
+      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat(locale ?? "en-US", { style: "percent", ...fractionOptions(decimals, 2) }).format(n) }
     case "currency":
-      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", ...fractionOptions(decimals ?? 0, 0) }).format(n) }
+      return { kind: "text", text: n === null ? String(value) : new Intl.NumberFormat(setting?.currency ? (locale ?? "en-US") : "id-ID", { style: "currency", currency: setting?.currency ?? "IDR", ...fractionOptions(decimals ?? 0, 0) }).format(n) }
     case "number":
-      return { kind: "text", text: n === null ? String(value) : n.toLocaleString("en-US", fractionOptions(decimals, 3)) }
+      return { kind: "text", text: n === null ? String(value) : n.toLocaleString(locale ?? "en-US", fractionOptions(decimals, 3)) }
     default:
       // `auto`: a JSON number reads as a number; a quoted one is left as text.
-      if (typeof value === "number") return { kind: "text", text: value.toLocaleString("en-US", fractionOptions(decimals, 3)) }
+      if (typeof value === "number") return { kind: "text", text: value.toLocaleString(locale ?? "en-US", fractionOptions(decimals, 3)) }
       return { kind: "text", text: String(value) }
   }
 }
 
 /** The plain text of a cell, for a CSV or a one-record view. */
-export function cellText(value: unknown, setting?: ColumnSetting): string {
-  const c = cellContent(value, setting)
+export function cellText(value: unknown, setting?: ColumnSetting, locale?: string): string {
+  const c = cellContent(value, setting, locale)
   return c.kind === "image" ? c.src : c.text
 }

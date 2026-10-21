@@ -7,7 +7,8 @@ import { bucketLabel, isGrain, isTruncation } from "@/lib/time-grain";
 import { buildPivot, canCollapse, collapsibleGroups, columnLabel, groupId, visibleRows, type PivotRow } from "@/lib/pivot";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import { cn } from "@/lib/utils";
-import { cellClass, CellValue } from "./table-cell";
+import type { StyleFields } from "@/lib/chart-style";
+import { cellClass, CellValue, conditionalCss } from "./table-cell";
 import type { Rows } from "./tile-dialogs";
 
 /** A value's header: its label setting, else `sum of visitors`. */
@@ -23,7 +24,7 @@ function valueLabel(def: TableDefFields, i: number): string {
  * saved. Only a pivot with `all` totals can fold, because the folded group
  * stays in view as its subtotal. A result cut at the cell cap says so.
  */
-export function PivotTable({ def, cell }: { readonly def: TableDefFields; readonly cell: Rows }) {
+export function PivotTable({ def, cell }: { readonly def: TableDefFields & StyleFields; readonly cell: Rows }) {
   const rowFields = def.rows ?? [];
   const colFields = def.columns ?? [];
   const valueCount = def.values?.length ?? 0;
@@ -39,6 +40,15 @@ export function PivotTable({ def, cell }: { readonly def: TableDefFields; readon
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [cell.rows, rowFields.join("\u0001"), colFields.join("\u0001"), valueCount, grain, grainField],
   );
+  // BI-17: a colour range runs over the minimum and maximum of each value's cells on screen.
+  const domains = React.useMemo(() => {
+    const out: Record<string, { min: number; max: number }> = {};
+    (def.values ?? []).forEach((v, vi) => {
+      const nums = model.rows.flatMap((row) => row.cells.flatMap((vals) => (typeof vals[vi] === "number" ? [vals[vi] as number] : [])));
+      if (nums.length) out[v.column] = { min: Math.min(...nums), max: Math.max(...nums) };
+    });
+    return out;
+  }, [def.values, model.rows]);
   const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(new Set());
   const foldable = canCollapse(def.totals) ? collapsibleGroups(model) : new Set<string>();
   const rows = visibleRows(model, collapsed);
@@ -89,8 +99,8 @@ export function PivotTable({ def, cell }: { readonly def: TableDefFields; readon
               <tr key={groupId(row.path) + row.kind} className={cn("border-b border-border/40 last:border-0", row.kind !== "leaf" && "bg-muted font-medium")}>
                 <RowHead row={row} rowFields={rowFields} previous={rows[ri - 1]} foldable={foldable} collapsed={collapsed} onToggle={toggle} />
                 {row.cells.flatMap((values, ci) => values.map((n, vi) => (
-                  <td key={`${ci}-${vi}`} className={cellClass(settingOf(vi), "text-right")}>
-                    {n === null ? "" : <CellValue value={n} setting={settingOf(vi)} />}
+                  <td key={`${ci}-${vi}`} style={n === null ? undefined : conditionalCss(def.conditional, def.values?.[vi]?.column ?? null, n, domains)} className={cellClass(settingOf(vi), "text-right")}>
+                    {n === null ? "" : <CellValue value={n} setting={settingOf(vi)} format={def.valueFormats?.[def.values?.[vi]?.column ?? ""] ?? def.format} />}
                   </td>
                 )))}
               </tr>

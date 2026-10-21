@@ -157,11 +157,19 @@ pub struct InvalidTimeZone;
 /// context every formula compile and statement build already receives, so the
 /// values reach all of them without a new argument anywhere. They are not time
 /// settings; see [`crate::params`].
+///
+/// It carries a third thing for the same reason (`BI-16` part B): the
+/// administrator's list of content sites, which every path that saves a chart
+/// (the console, the assistant, a version revert) already reaches through this
+/// context, so an image or web card cannot be saved around the list. Empty
+/// means no site is allowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeContext {
     zone: TimeZoneName,
     week_start: WeekStart,
     params: crate::params::ParamValues,
+    content_sites: Vec<String>,
+    company_palette: Vec<String>,
 }
 
 impl Default for TimeContext {
@@ -172,6 +180,8 @@ impl Default for TimeContext {
             zone: TimeZoneName(DEFAULT_TIME_ZONE.to_owned()),
             week_start: WeekStart::Monday,
             params: crate::params::ParamValues::default(),
+            content_sites: Vec::new(),
+            company_palette: Vec::new(),
         }
     }
 }
@@ -187,7 +197,38 @@ impl TimeContext {
             zone: TimeZoneName::new(zone).ok_or(InvalidTimeZone)?,
             week_start,
             params: crate::params::ParamValues::default(),
+            content_sites: Vec::new(),
+            company_palette: Vec::new(),
         })
+    }
+
+    /// This context with the content sites an image or web card may use
+    /// (`https://host[:port]`, already normalised by the settings route).
+    #[must_use]
+    pub fn with_content_sites(mut self, sites: Vec<String>) -> Self {
+        self.content_sites = sites;
+        self
+    }
+
+    /// The allowed content sites (none unless a caller set them).
+    #[must_use]
+    pub fn content_sites(&self) -> &[String] {
+        &self.content_sites
+    }
+
+    /// This context with the deployment's company palette (`BI-17` part A,
+    /// decision 6): the colours a new chart draws with when the person chose
+    /// no palette.
+    #[must_use]
+    pub fn with_company_palette(mut self, palette: Vec<String>) -> Self {
+        self.company_palette = palette;
+        self
+    }
+
+    /// The deployment's company palette (none unless a caller set it).
+    #[must_use]
+    pub fn company_palette(&self) -> &[String] {
+        &self.company_palette
     }
 
     /// This context with the parameter values of a read.

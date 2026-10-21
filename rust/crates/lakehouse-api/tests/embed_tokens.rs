@@ -177,16 +177,68 @@ impl FakeCh {
         self.log.lock().unwrap().clone()
     }
 
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): record the embed event an
+    /// `INSERT INTO console.bi_board_embed_event` carries, so a later read
+    /// of the aggregate sees it. Split out of [`Respond::respond`] for the
+    /// line limit.
+    fn record_embed_event(&self, sql: &str) {
+        let Some(pos) = sql.find("VALUES (") else {
+            return;
+        };
+        let rest = &sql[pos + "VALUES (".len()..];
+        let rest = rest.trim_end().trim_end_matches(')');
+        let parts: Vec<&str> = rest.splitn(4, ", ").collect();
+        if sql.contains("'origins'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let origins_json = parts[2].trim_matches('\'').replace("\\\"", "\"");
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "origins",
+                "revoked_before": "0",
+                "jti": "",
+                "exp": "0",
+                "origins_json": origins_json,
+            }));
+        } else if sql.contains("'revoke_all'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let revoked_before = parts[2].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "revoke_all",
+                "revoked_before": revoked_before,
+                "jti": "",
+                "exp": "0",
+                "origins_json": "[]",
+            }));
+        } else if sql.contains("'withdraw'") && parts.len() >= 4 {
+            let board_id = parts[0].trim_matches('\'');
+            let jti = parts[2].trim_matches('\'');
+            let exp = parts[3].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "withdraw",
+                "revoked_before": "0",
+                "jti": jti,
+                "exp": exp,
+                "origins_json": "[]",
+            }));
+        }
+    }
+
     fn inserts_into_board(&self) -> Vec<String> {
         self.statements()
             .into_iter()
+            // The board table only: a content edit also writes a row of
+            // `bi_board_version` (BI-18 part C, part 2), whose name starts the same.
             .filter(|s| {
-                s.starts_with("INSERT INTO console.bi_board ")
-                    || s.starts_with("INSERT INTO console.bi_board (")
+                s.starts_with("INSERT INTO console.bi_board (")
+                    || s.starts_with("INSERT INTO console.bi_board ")
             })
             .collect()
     }
 
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is
+    /// written to the append-only event table and never to the board row.
     fn inserts_into_embed_events(&self) -> Vec<String> {
         self.statements()
             .into_iter()
@@ -212,6 +264,24 @@ impl Respond for FakeCh {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
+        // The state lookup every board edit makes first (BI-18 part C, part 2):
+        // live, and nobody's personal board.
+        if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
+            let found: Vec<Value> = self
+                .boards
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| {
+                    let id = b["id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("WHERE id = '{id}'"))
+                })
+                .map(|b| json!({ "is_deleted": 0, "owner_id": b["owner_id"].as_str().unwrap_or("") }))
+                .collect();
+            return rows(found);
+        }
+        // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is read
+        // by aggregating the append-only event table, never from the row.
         if sql.contains("FROM console.bi_board_embed_event") {
             let found: Vec<Value> = self
                 .events
@@ -226,53 +296,18 @@ impl Respond for FakeCh {
                 .collect();
             return rows(found);
         }
+        // And it is written there too: the event table is the only writer of
+        // the embed access state.
         if sql.starts_with("INSERT INTO console.bi_board_embed_event") {
-            if let Some(pos) = sql.find("VALUES (") {
-                let rest = &sql[pos + "VALUES (".len()..];
-                let rest = rest.trim_end().trim_end_matches(')');
-                let parts: Vec<&str> = rest.splitn(4, ", ").collect();
-                if sql.contains("'origins'") && parts.len() >= 3 {
-                    let board_id = parts[0].trim_matches('\'');
-                    let origins_json = parts[2].trim_matches('\'').replace("\\\"", "\"");
-                    self.events.lock().unwrap().push(json!({
-                        "board_id": board_id,
-                        "kind": "origins",
-                        "revoked_before": "0",
-                        "jti": "",
-                        "exp": "0",
-                        "origins_json": origins_json,
-                    }));
-                } else if sql.contains("'revoke_all'") && parts.len() >= 3 {
-                    let board_id = parts[0].trim_matches('\'');
-                    let revoked_before = parts[2].trim();
-                    self.events.lock().unwrap().push(json!({
-                        "board_id": board_id,
-                        "kind": "revoke_all",
-                        "revoked_before": revoked_before,
-                        "jti": "",
-                        "exp": "0",
-                        "origins_json": "[]",
-                    }));
-                } else if sql.contains("'withdraw'") && parts.len() >= 4 {
-                    let board_id = parts[0].trim_matches('\'');
-                    let jti = parts[2].trim_matches('\'');
-                    let exp = parts[3].trim();
-                    self.events.lock().unwrap().push(json!({
-                        "board_id": board_id,
-                        "kind": "withdraw",
-                        "revoked_before": "0",
-                        "jti": jti,
-                        "exp": exp,
-                        "origins_json": "[]",
-                    }));
-                }
-            }
+            self.record_embed_event(&sql);
             return ResponseTemplate::new(200).set_body_string(
                 "Ok.
 ",
             );
         }
-        if sql.contains("FROM console.bi_board") {
+        // A chart read names the boards table too (its sub-selects), so it is
+        // not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             let found: Vec<Value> = self
                 .boards
                 .lock()

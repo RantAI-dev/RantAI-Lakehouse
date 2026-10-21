@@ -127,8 +127,9 @@ pub fn is_write_high_pending(value: &Value) -> bool {
 fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
+        // BI-18 part C, part 2: a deleted chart goes to the trash, not away.
         "delete_chart" => format!(
-            "Menghapus chart {} dari dashboard secara permanen.",
+            "Memindahkan chart {} dari dashboard ke tempat sampah; bisa dipulihkan selama 30 hari.",
             s("id")
         ),
         "delete_calculated_field" => format!("Menghapus kolom hitung {} secara permanen.", s("id")),
@@ -137,6 +138,11 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         "delete_metric" => format!("Menghapus metrik {} secara permanen.", s("id")),
+        "delete_tab" => format!(
+            "Menghapus tab {} dari dashboard {}; chart di dalamnya pindah ke tab pertama.",
+            s("tab"),
+            s("board")
+        ),
         "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
             Iceberg yatim secara permanen (bukan dry run)."
             .to_owned(),
@@ -267,6 +273,50 @@ fn pipeline_summary(args: &Map<String, Value>) -> String {
 /// `WriteHigh`-elevation call ([`effective_risk`]) only fires when
 /// `runConfig` is present, and a model confirming a call without
 /// seeing those keys would be confirming in the dark.
+/// The confirmation line of the two formatting tools (`BI-17` part A), apart from
+/// [`summary_for`] to keep that match under clippy's line limit.
+fn look_summary(name: &str, args: &Map<String, Value>) -> String {
+    let get = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    let or_same = |key: &str| {
+        let v = get(key);
+        if v.is_empty() { "tetap" } else { v }
+    };
+    if name == "format_chart" {
+        return format!(
+            "Mengubah tampilan chart {} (format, warna, sumbu, garis acuan).",
+            get("chart")
+        );
+    }
+    format!(
+        "Mengatur tema dan font dashboard {} (tema: {}, font: {}).",
+        get("board"),
+        or_same("theme"),
+        or_same("font")
+    )
+}
+
+/// The confirmation sentence of `arrange_board` and `save_board_filters`.
+/// Split out of [`summary_for`] when the board tools of main met phase 3's tab
+/// and look tools there and took it over the line limit (merge of main into
+/// phase 3).
+fn board_layout_summary(name: &str, args: &Map<String, Value>) -> String {
+    let board = args.get("board").and_then(Value::as_str).unwrap_or("");
+    if name == "arrange_board" {
+        let n = args
+            .get("tiles")
+            .and_then(Value::as_object)
+            .map_or(0, Map::len);
+        return format!(
+            "Menata ulang {n} tile pada board {board} (grid 12 kolom, hanya tile yang disebut berubah)."
+        );
+    }
+    let n = args
+        .get("filters")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    format!("Menyimpan {n} filter sebagai default board {board} untuk semua pengguna.")
+}
+
 fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
     let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
     match spec.name {
@@ -294,33 +344,32 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("title"),
             s("kind")
         ),
+        "format_chart" | "set_dashboard_theme" => look_summary(spec.name, args),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        "create_tab" => format!(
+            "Menambah tab \"{}\" pada dashboard {}.",
+            s("title"),
+            s("board")
+        ),
+        "rename_tab" => format!(
+            "Mengganti nama tab {} pada dashboard {} menjadi \"{}\".",
+            s("tab"),
+            s("board"),
+            s("title")
+        ),
+        "move_charts_to_tab" => format!(
+            "Memindahkan chart ke tab {} pada dashboard {}.",
+            s("tab"),
+            s("board")
+        ),
+        "move_tab" => format!("Mengubah urutan tab pada dashboard {}.", s("board")),
         "rename_board" => format!(
             "Mengganti nama board {} menjadi \"{}\".",
             s("id"),
             s("name")
         ),
-        "arrange_board" => {
-            let n = args
-                .get("tiles")
-                .and_then(Value::as_object)
-                .map_or(0, Map::len);
-            format!(
-                "Menata ulang {n} tile pada board {} (grid 12 kolom, hanya tile yang disebut berubah).",
-                s("board")
-            )
-        }
+        "arrange_board" | "save_board_filters" => board_layout_summary(spec.name, args),
         "move_chart" => format!("Memindahkan chart {} ke board {}.", s("id"), s("board")),
-        "save_board_filters" => {
-            let n = args
-                .get("filters")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            format!(
-                "Menyimpan {n} filter sebagai default board {} untuk semua pengguna.",
-                s("board")
-            )
-        }
         "create_calculated_field" => format!(
             "Membuat kolom hitung \"{}\" = {} (pada {}).",
             s("name"),
@@ -546,6 +595,9 @@ mod tests {
         "create_board",
     ];
 
+    /// BI-17 part A / AI-8: the two formatting tools are `WriteLow` like `update_chart`.
+    const FORMAT_TOOLS: [&str; 2] = ["format_chart", "set_dashboard_theme"];
+
     /// A `PermissionSet` granting everything (`*:*`) — Platform Admin.
     fn admin_perms() -> PermissionSet {
         PermissionSet::parse("*:*")
@@ -558,6 +610,43 @@ mod tests {
 
     fn spec(name: &str) -> &'static registry::ToolSpec {
         registry::find(name).expect("registered tool")
+    }
+
+    /// BI-17 part A / AI-8: the formatting tools wait for the chat's confirmation, do not execute
+    /// without it, are refused to a user without `dashboard:write`, and (being `WriteLow`) need no approval.
+    #[test]
+    fn the_formatting_tools_need_confirmation_and_dashboard_write() {
+        let admin = admin_perms();
+        let editor = PermissionSet::parse("dashboard:read, dashboard:write");
+        let reader = PermissionSet::parse("dashboard:read");
+        for name in FORMAT_TOOLS {
+            let mut args = Map::new();
+            args.insert("chart".to_owned(), json!("c1"));
+            args.insert("board".to_owned(), json!("b1"));
+            let pending =
+                decide(true, Some(&editor), spec(name), &args).expect("must wait for confirmation");
+            assert_eq!(pending["needs_confirmation"], json!(true), "{name}");
+            assert!(
+                pending["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("c1") || s.contains("b1")),
+                "{name}"
+            );
+            assert_eq!(
+                decide(true, Some(&admin), spec(name), &confirmed_args()),
+                None,
+                "{name}"
+            );
+            let refused =
+                decide(true, Some(&reader), spec(name), &confirmed_args()).expect("refused");
+            assert!(
+                refused.get("needs_confirmation").is_none() && refused.get("error").is_some(),
+                "{name}: {refused}"
+            );
+            let ask = decide(false, Some(&admin), spec(name), &confirmed_args())
+                .expect("refused in ask mode");
+            assert!(ask.get("error").is_some(), "{name}");
+        }
     }
 
     #[test]

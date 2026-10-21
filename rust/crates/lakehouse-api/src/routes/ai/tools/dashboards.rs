@@ -2,14 +2,38 @@
 //! `create_board`, `list_boards`, `list_charts`, `suggest_dashboard`.
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
+use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, ChartInput};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
+use crate::routes::dashboard_organise::{
+    Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
+    viewer_of, visible_live_chart_board,
+};
 use crate::routes::support::is_numeric_type;
 use crate::upstream_error;
+
+/// Who the tools read as: the signed-in person, or nobody in particular when
+/// none is attached (fail closed: no personal space, nothing in the trash).
+fn viewer_for(principal: Option<&Principal>) -> Viewer {
+    principal.map_or_else(Viewer::anonymous, viewer_of)
+}
+
+/// The tool's error for a refused dashboard or chart: the route's own
+/// sentence, or, for a store that could not be read, the fixed message with
+/// its reference id (never the database's text).
+pub(super) fn refused(gate: Gate) -> Value {
+    match gate {
+        Gate::Missing(sentence) => json!({ "error": sentence }),
+        Gate::Store(cause) => {
+            upstream_error::report_ch(&upstream_error::DATABASE, &cause).to_json()
+        }
+    }
+}
 
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
@@ -20,17 +44,50 @@ fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
 
 pub(super) async fn create_chart(
     ch: &ChClient,
+    principal: Option<&Principal>,
     args: &Map<String, Value>,
     id: Option<String>,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
-    let input = match parse_chart_input(args) {
+    let mut input = match parse_chart_input(args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
+    // chart in a deployment with a company palette draws with it. A palette
+    // the model chose is kept, and a chart that already exists keeps what it
+    // has (that is `update_chart`, which does not come here).
+    //
+    // `PR #199 review O BLOCKER 2`: only a kind that takes colours gets one.
+    // The style check refuses colours on a table, a KPI or a static tile, so
+    // setting the palette on every kind made the assistant unable to create
+    // any of them in a deployment with a company palette.
+    if time.company_palette().len() >= 2
+        && lakehouse_bi::style::is_chart(input.kind)
+        && input
+            .style
+            .colors
+            .as_ref()
+            .is_none_or(|colors| colors.palette.is_none())
+    {
+        input
+            .style
+            .colors
+            .get_or_insert_with(Default::default)
+            .palette = Some("company".to_owned());
+    }
+    // BI-18 part C, part 2: not onto a dashboard in the trash or in somebody
+    // else's personal space.
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer_for(principal)).await
+    {
+        return refused(err);
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => json!({
+            Ok(()) => {
+                place_new_chart(ch, &spec.board, &spec.spec.id).await;
+                snapshot_as(ch, &spec.board, principal).await;
+                json!({
                 "created": true,
                 "id": spec.spec.id,
                 "title": spec.spec.title,
@@ -39,7 +96,8 @@ pub(super) async fn create_chart(
                 "board": spec.board,
                 "url": "/dashboards",
                 "note": "Chart tersimpan & langsung tampil di halaman Dashboards.",
-            }),
+                })
+            }
             Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
@@ -75,6 +133,7 @@ pub(super) async fn check_chart_draft(
 
 pub(super) async fn update_chart(
     ch: &ChClient,
+    principal: Option<&Principal>,
     args: &Map<String, Value>,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Value {
@@ -86,22 +145,42 @@ pub(super) async fn update_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    // BI-18 part C, part 2: a chart in the trash or on somebody else's
+    // personal board cannot be edited, nor moved onto such a board.
+    let viewer = viewer_for(principal);
+    let old_board = match require_editable_chart(ch, &id, &viewer).await {
+        Ok(board) => board,
+        Err(err) => return refused(err),
+    };
+    if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
+        return refused(err);
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
-            Ok(()) => json!({
-                "updated": true,
-                "id": spec.spec.id,
-                "title": spec.spec.title,
-                "kind": spec.spec.kind,
-                "mart": spec.spec.mart,
-            }),
+            Ok(()) => {
+                if old_board != spec.board {
+                    snapshot_as(ch, &old_board, principal).await;
+                }
+                snapshot_as(ch, &spec.board, principal).await;
+                json!({
+                    "updated": true,
+                    "id": spec.spec.id,
+                    "title": spec.spec.title,
+                    "kind": spec.spec.kind,
+                    "mart": spec.spec.mart,
+                })
+            }
             Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn create_board(
+    ch: &ChClient,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     // `created_by` is left empty: the assistant is not a person, and naming
     // it as the author would put a non-account into a column the UI shows
     // as an owner.
@@ -113,19 +192,29 @@ pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Va
     )
     .await
     {
-        Ok(board) => json!({
-            "created": true, "id": board.id, "name": board.name,
-            "note": "Pakai id ini di create_chart.board.",
-        }),
+        Ok(board) => {
+            snapshot_as(ch, &board.id, principal).await;
+            json!({
+                "created": true, "id": board.id, "name": board.name,
+                "note": "Pakai id ini di create_chart.board.",
+            })
+        }
         Err(err) => upstream_error::bi(&upstream_error::DATABASE, &err).to_json(),
     }
 }
 
-pub(super) async fn list_boards(ch: &ChClient) -> Value {
-    match store::list_boards(ch).await {
+pub(super) async fn list_boards(ch: &ChClient, principal: Option<&Principal>) -> Value {
+    match store::list_boards(ch, &viewer_for(principal)).await {
         Ok(boards) => {
             let mut out = vec![json!({ "id": "default", "name": "Main" })];
-            out.extend(boards.iter().map(|b| json!({ "id": b.id, "name": b.name })));
+            // BI-18 part C: a board's tabs, when it has any, so the assistant can name them.
+            out.extend(boards.iter().map(|b| {
+                let mut entry = json!({ "id": b.id, "name": b.name });
+                if let Some(tabs) = b.tabs.as_ref().filter(|t| !t.is_empty()) {
+                    entry["tabs"] = json!(tabs);
+                }
+                entry
+            }));
             json!({ "boards": out })
         }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
@@ -179,8 +268,8 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
     json!({ "marts": out })
 }
 
-pub(super) async fn list_charts(ch: &ChClient) -> Value {
-    match store::list_stored_charts(ch).await {
+pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) -> Value {
+    match store::list_stored_charts(ch, &viewer_for(principal)).await {
         Ok(charts) => {
             let out: Vec<Value> = charts
                 .iter()
@@ -266,13 +355,30 @@ pub(super) async fn list_sql_sources(ch: &ChClient) -> Value {
     }
 }
 
-pub(super) async fn delete_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
+pub(super) async fn delete_chart(
+    ch: &ChClient,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    match store::delete_chart(ch, &id).await {
-        Ok(()) => json!({ "deleted": true, "id": id }),
+    // BI-18 part C, part 2: a chart the person cannot see is answered like one
+    // that does not exist, and nothing is deleted. A deleted chart goes to the
+    // trash, restorable for 30 days.
+    let board = match visible_live_chart_board(ch, &id, &viewer_for(principal)).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return json!({ "deleted": true, "id": id }),
+        Err(err) => return refused(err),
+    };
+    let by = principal.map_or("Assistant", |p| p.display_name.as_str());
+    match store::delete_chart(ch, &id, by).await {
+        Ok(()) => {
+            drop_tile(ch, &board, &id).await;
+            snapshot_as(ch, &board, principal).await;
+            json!({ "deleted": true, "id": id })
+        }
         Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
     }
 }
@@ -300,10 +406,10 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
 
         for result in [
-            list_boards(&ch).await,
-            list_charts(&ch).await,
+            list_boards(&ch, None).await,
+            list_charts(&ch, None).await,
             suggest_dashboard(&ch).await,
-            delete_chart(&ch, &{
+            delete_chart(&ch, None, &{
                 let mut a = Map::new();
                 a.insert("id".to_owned(), json!("c1"));
                 a
@@ -315,5 +421,555 @@ mod tests {
             assert!(!text.contains("version 0.0.0"), "{text}");
             assert!(result["errorId"].is_string(), "{text}");
         }
+    }
+
+    // ── BI-18 part C, part 2: the personal space and the trash ──────────────
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use wiremock::matchers::body_string_contains;
+
+    fn person(n: u128) -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(n)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina".to_owned(),
+            permissions: PermissionSet::parse("dashboard:read, dashboard:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
+    async fn rows(server: &MockServer, needle: &str, data: Vec<Value>) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(needle))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// A rule that answers before the catch-all: the catch-all is mounted
+    /// first (in [`mart_server`]) and a rule of the same priority is decided
+    /// by insertion order, so a later rule needs the higher priority to be
+    /// the one that answers.
+    async fn rows_first(server: &MockServer, needle: &str, data: Vec<Value>) {
+        Mock::given(method("POST"))
+            .and(body_string_contains(needle))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+            )
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn rest(server: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn sent(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn writes(sent: &[String]) -> Vec<&String> {
+        sent.iter()
+            .filter(|s| s.trim_start().starts_with("INSERT"))
+            .collect()
+    }
+
+    /// The assistant reads as the person it acts for; with nobody attached it
+    /// reads as nobody in particular, which sees no personal space.
+    #[tokio::test]
+    async fn the_assistant_lists_boards_and_charts_as_the_person_it_acts_for() {
+        let server = MockServer::start().await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let me = person(7);
+        let id = uuid::Uuid::from_u128(7).to_string();
+        let _ = list_boards(&ch, Some(&me)).await;
+        let _ = list_charts(&ch, Some(&me)).await;
+        let _ = list_boards(&ch, None).await;
+        let all = sent(&server).await;
+        let boards: Vec<&String> = all
+            .iter()
+            .filter(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
+            .collect();
+        assert!(
+            boards[0].contains(&format!("(owner_id = '' OR owner_id = '{id}')")),
+            "{}",
+            boards[0]
+        );
+        assert!(
+            boards[1].contains("(owner_id = '' OR owner_id = '')"),
+            "{}",
+            boards[1]
+        );
+        let charts: Vec<&String> = all
+            .iter()
+            .filter(|s| s.contains("FROM console.bi_chart FINAL"))
+            .collect();
+        assert!(
+            charts[0].contains(&format!("owner_id != '' AND owner_id != '{id}'")),
+            "{}",
+            charts[0]
+        );
+        assert!(charts[0].contains("is_deleted = 2"), "{}", charts[0]);
+    }
+
+    /// A chart the person cannot see is answered like one that does not exist,
+    /// and nothing is deleted.
+    #[tokio::test]
+    async fn the_assistant_cannot_delete_a_chart_on_somebody_elses_private_board() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "b_draft" })],
+        )
+        .await;
+        rows(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "someone-else" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_private"));
+        let _ = delete_chart(&ch, Some(&person(7)), &args).await;
+        let all = sent(&server).await;
+        assert!(writes(&all).is_empty(), "{:?}", writes(&all));
+    }
+
+    #[tokio::test]
+    async fn the_assistant_moves_a_chart_to_the_trash_under_the_persons_name() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "default" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_mine"));
+        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        assert_eq!(reply["deleted"], json!(true));
+        let all = sent(&server).await;
+        let copy = writes(&all)
+            .into_iter()
+            .find(|s| s.contains("INTO console.bi_chart"))
+            .unwrap();
+        assert!(copy.contains(", 2, now(), 'Rina', ''"), "{copy}");
+    }
+
+    #[tokio::test]
+    async fn the_assistant_cannot_put_a_chart_on_a_dashboard_in_the_trash() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 2, "owner_id": "" })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        for (k, v) in [
+            ("title", json!("t")),
+            ("kind", json!("bar")),
+            ("mart", json!("m")),
+            ("dimension", json!("d")),
+            ("measures", json!(["x"])),
+            ("board", json!("b_gone")),
+        ] {
+            args.insert(k.to_owned(), v);
+        }
+        let reply = create_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["error"], json!("dashboard not found."));
+        assert!(writes(&sent(&server).await).is_empty());
+    }
+
+    // ── BI-16 part B (AI-5): progress, histogram, bullet, image and web ─────
+
+    /// A mart with a text and three number columns, and a console that takes
+    /// every write.
+    async fn mart_server() -> MockServer {
+        let server = MockServer::start().await;
+        rows(&server, "FROM system.tables", vec![json!({ "n": "1" })]).await;
+        rows(
+            &server,
+            "FROM system.columns",
+            vec![
+                json!({ "name": "province", "type": "String" }),
+                json!({ "name": "visitors", "type": "UInt64" }),
+                json!({ "name": "target", "type": "UInt64" }),
+                json!({ "name": "price", "type": "Float64" }),
+            ],
+        )
+        .await;
+        rest(&server).await;
+        server
+    }
+
+    fn arguments(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(map) => map,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    fn sites(list: &[&str]) -> lakehouse_bi::grain::TimeContext {
+        lakehouse_bi::grain::TimeContext::default()
+            .with_content_sites(list.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// The statement the tool ran to check the chart it saved.
+    fn statements(all: &[String]) -> Vec<&String> {
+        all.iter()
+            .filter(|s| s.starts_with("SELECT") && s.contains("serving.mart_x"))
+            .collect()
+    }
+
+    /// `PR #199 review M SHOULD-FIX BI-17 4` (decision M5): a new chart in a
+    /// deployment with a company palette draws with it. A palette the model
+    /// chose is kept.
+    #[tokio::test]
+    async fn a_new_chart_draws_with_the_company_palette_when_the_model_chooses_none() {
+        let time = lakehouse_bi::grain::TimeContext::default()
+            .with_company_palette(vec!["#112233".to_owned(), "#445566".to_owned()]);
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let created = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        let all = sent(&server).await;
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("\"palette\":\"company\"")),
+            "{stored:#?}"
+        );
+        // A palette the model chose is kept.
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let created = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+                "colors": { "palette": "muted" },
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        let all = sent(&server).await;
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("\"palette\":\"muted\"")),
+            "{stored:#?}"
+        );
+    }
+
+    /// `PR #199 review O BLOCKER 2`: a kind that takes no colours must not be
+    /// given the company palette — the style check refuses colours on a
+    /// table, a KPI or a static tile, so the assistant could create none of
+    /// them in a deployment with a company palette.
+    #[tokio::test]
+    async fn a_kind_that_takes_no_colours_is_created_even_with_a_company_palette() {
+        let time = lakehouse_bi::grain::TimeContext::default()
+            .with_company_palette(vec!["#112233".to_owned(), "#445566".to_owned()]);
+        for (kind, extra) in [
+            (
+                "table",
+                json!({ "mart": "mart_x", "dimension": "province", "measures": ["visitors"] }),
+            ),
+            (
+                "kpi",
+                json!({ "mart": "mart_x", "measures": ["visitors"], "aggregate": "sum" }),
+            ),
+            ("text", json!({ "text": "Hello" })),
+        ] {
+            let mut body = json!({ "title": "Tile", "kind": kind });
+            let fields = body.as_object_mut().expect("an object");
+            for (name, value) in extra.as_object().expect("an object") {
+                fields.insert(name.clone(), value.clone());
+            }
+            let server = mart_server().await;
+            let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+            let created = create_chart(&ch, None, &arguments(body), None, &time).await;
+            assert_eq!(created["created"], json!(true), "{kind}: {created}");
+            let all = sent(&server).await;
+            let stored = writes(&all);
+            assert!(
+                !stored.iter().any(|w| w.contains("\"palette\":\"company\"")),
+                "{kind}: a kind that takes no colours is given no palette: {stored:#?}"
+            );
+        }
+    }
+
+    /// AI-5: "Show a progress bar of visitors against a goal of 1,000,000".
+    #[tokio::test]
+    async fn the_request_for_a_progress_bar_against_a_goal_of_a_million_creates_one() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against 1,000,000", "kind": "progress", "mart": "mart_x",
+                "measures": ["visitors"], "aggregate": "sum", "goal": 1_000_000,
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["created"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("progress"));
+        let all = sent(&server).await;
+        assert_eq!(
+            statements(&all)
+                .first()
+                .map(|s| s.trim_end_matches("\nFORMAT JSON")),
+            Some("SELECT round(sum(visitors)) AS v FROM serving.mart_x")
+        );
+        let stored = writes(&all);
+        assert!(
+            stored.iter().any(|w| w.contains("goal")),
+            "the goal is stored"
+        );
+        // A goal that is a second value, and a goal that is missing.
+        let valued = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Against target", "kind": "progress", "mart": "mart_x",
+                "measures": ["visitors", "target"], "goal": { "measure": "target" },
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(valued["created"], json!(true), "{valued}");
+        let none = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "No goal", "kind": "progress", "mart": "mart_x", "measures": ["visitors"],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert!(
+            none["error"].as_str().unwrap().contains("needs a goal"),
+            "{none}"
+        );
+    }
+
+    /// AI-5: "Show how hotel prices are spread" is a histogram of the price
+    /// column; the same call with `histogram: {count: 10}` cuts it in ten.
+    #[tokio::test]
+    async fn the_request_to_show_how_prices_are_spread_creates_a_histogram() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let auto = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "How hotel prices are spread", "kind": "histogram", "mart": "mart_x",
+                "dimension": "price",
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(auto["created"], json!(true), "{auto}");
+        let ten = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "In ten ranges", "kind": "histogram", "mart": "mart_x",
+                "dimension": "price", "histogram": { "count": 10 },
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(ten["created"], json!(true), "{ten}");
+        let all = sent(&server).await;
+        let ran = statements(&all);
+        // BI-18 part C review fix (SHOULD-FIX) R21: automatic aims at the nice width
+        // nearest 20 ranges, and a count of 10 is ten ranges, not "at most 10".
+        assert!(ran[0].contains("log10((mx - mn) / 20)"), "{}", ran[0]);
+        assert!(ran[1].contains("(mx - mn) / 10 AS raw"), "{}", ran[1]);
+        assert!(ran.iter().all(|s| s.contains("count() AS __count")));
+        // The same refusals as the console, in the same words.
+        for (extra, sentence) in [
+            (json!({ "histogram": { "count": 101 } }), "1 to 100 ranges"),
+            (
+                json!({ "histogram": { "count": 5, "width": 2 } }),
+                "not both",
+            ),
+            (json!({ "dimension": "province" }), "not a number column"),
+        ] {
+            let mut input = json!({
+                "title": "t", "kind": "histogram", "mart": "mart_x", "dimension": "price",
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let reply = create_chart(&ch, None, &arguments(input), None, &time).await;
+            assert!(
+                reply["error"].as_str().unwrap().contains(sentence),
+                "{reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bullet_graph_per_province_with_bands_is_created_and_a_goal_on_a_bar_chart_is_refused()
+     {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let bullet = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors", "target"],
+                "goal": { "measure": "target" }, "bands": [50, 80, 100],
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(bullet["created"], json!(true), "{bullet}");
+        let bar = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "t", "kind": "bar", "mart": "mart_x", "dimension": "province",
+                "measures": ["visitors"], "goal": 5,
+            })),
+            None,
+            &time,
+        )
+        .await;
+        assert_eq!(
+            bar["error"],
+            json!("goal is only for a progress bar and a bullet graph.")
+        );
+    }
+
+    /// The address of an image or a web page is checked against the
+    /// administrator's list on the assistant's path as on the console's, with
+    /// the console's sentence, and the address is not repeated.
+    #[tokio::test]
+    async fn an_image_on_a_site_that_is_not_allowed_is_refused_with_the_consoles_sentence() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let image = |url: &str| {
+            arguments(json!({ "title": "Logo", "kind": "image", "url": url, "alt": "The logo" }))
+        };
+        let allowed = sites(&["https://img.example"]);
+        let created = create_chart(
+            &ch,
+            None,
+            &image("https://img.example/logo.png"),
+            None,
+            &allowed,
+        )
+        .await;
+        assert_eq!(created["created"], json!(true), "{created}");
+        for url in [
+            "https://other.example/logo.png",
+            "http://img.example/logo.png",
+            "https://img.example@evil.example/logo.png",
+        ] {
+            let refused = create_chart(&ch, None, &image(url), None, &allowed).await;
+            assert_eq!(
+                refused["error"],
+                json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED),
+                "{url}"
+            );
+            assert!(!refused.to_string().contains(url));
+        }
+        // With no site listed nothing can be created; update_chart is checked too.
+        let none = create_chart(
+            &ch,
+            None,
+            &image("https://img.example/logo.png"),
+            None,
+            &sites(&[]),
+        )
+        .await;
+        assert_eq!(
+            none["error"],
+            json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
+        );
+        rows_first(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "default" })],
+        )
+        .await;
+        let mut update = image("https://other.example/logo.png");
+        update.insert("id".to_owned(), json!("c_1"));
+        let refused = update_chart(&ch, None, &update, &allowed).await;
+        assert_eq!(
+            refused["error"],
+            json!(lakehouse_bi::types_b::CONTENT_SITE_REFUSED)
+        );
+        let web = create_chart(
+            &ch,
+            None,
+            &arguments(
+                json!({ "title": "Status", "kind": "web", "url": "https://img.example/status" }),
+            ),
+            None,
+            &allowed,
+        )
+        .await;
+        assert_eq!(web["created"], json!(true), "{web}");
     }
 }

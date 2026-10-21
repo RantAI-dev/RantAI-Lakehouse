@@ -17,6 +17,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::builder::{ReadContext, RelationColumns};
 use lakehouse_bi::filters::{ColumnKind, validate_filters, without_inert};
 use lakehouse_bi::grain::{Grain, TimeContext};
@@ -30,6 +31,10 @@ use serde_json::{Map, Value, json};
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
+use crate::routes::dashboard_organise::{
+    drop_tile, place_new_chart, require_board, require_chart_board, require_editable_chart,
+    snapshot, viewer_of, visible_live_chart_board,
+};
 use crate::routes::support::{
     effective_chart, is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for,
     stored_chart_sql, strip_non_ident,
@@ -161,7 +166,16 @@ pub async fn get(
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts go out in the
+    // payload's `reporting` object next to the zone.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let obligations = PolicyEngineObligations::from_state(&state);
+    // BI-18 part C, part 2: a board in the trash or in somebody else's
+    // personal space reads as a board that does not exist.
+    let viewer = viewer_of(&principal);
     match get_body(
         &state.clickhouse,
         &q,
@@ -169,11 +183,14 @@ pub async fn get(
         &principal.role_names,
         &placeholders,
         &obligations,
-        (&time, requested),
+        (&time, requested, &viewer),
     )
     .await
     {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(BodyError::Params(err)) => crate::error::ApiRejection(err).into_response(),
         Err(BodyError::Store(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -197,7 +214,7 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain): (&TimeContext, GrainRequest),
+    (time, requested_grain, viewer): (&TimeContext, GrainRequest, &Viewer),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -208,19 +225,21 @@ async fn get_body(
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
     let mut store_error: Option<String> = None;
-    let (stored, boards) =
-        match tokio::try_join!(store::list_stored_charts(ch), store::list_boards(ch)) {
-            Ok(v) => v,
-            Err(err) => {
-                store_error =
-                    Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
-                (Vec::new(), Vec::new())
-            }
-        };
+    let (stored, boards) = match tokio::try_join!(
+        store::list_stored_charts(ch, viewer),
+        store::list_boards(ch, viewer)
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            store_error =
+                Some(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_string());
+            (Vec::new(), Vec::new())
+        }
+    };
 
     // The built-in board's layout row is kept out of `list_boards`.
     let default_row = if board == store::DEFAULT_BOARD_ID {
-        store::get_board(ch, store::DEFAULT_BOARD_ID)
+        store::get_board(ch, store::DEFAULT_BOARD_ID, viewer)
             .await
             .unwrap_or_else(|err| {
                 store_error.get_or_insert_with(|| {
@@ -236,6 +255,9 @@ async fn get_body(
         .find(|b| b.id == board)
         .or(default_row.as_ref());
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
+    // BI-18 part C: the tabs decide which filters each tile is given.
+    let tabs: Vec<lakehouse_bi::layout::Tab> =
+        board_obj.and_then(|b| b.tabs.clone()).unwrap_or_default();
     let filters = param_filters
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
@@ -348,7 +370,15 @@ async fn get_body(
             }
         };
         let c = &*c;
-        let filtered = match stored_chart_sql(c, &years, &filters, &cols, &sources, &read) {
+        // BI-18 part C: a filter tied to other tabs is not given to this tile,
+        // and so is not reported as skipped on it either.
+        let tile_filters =
+            lakehouse_bi::layout::filters_for_chart(&filters, &tabs, &layout, &c.spec.id);
+        let tile_layer_ctx = crate::routes::layers::LayerContext {
+            filters: &tile_filters,
+            ..layer_ctx
+        };
+        let filtered = match stored_chart_sql(c, &years, &tile_filters, &cols, &sources, &read) {
             Ok(filtered) => filtered,
             Err(msg) => {
                 results.insert(c.spec.id.clone(), json!({ "error": msg }));
@@ -374,7 +404,7 @@ async fn get_body(
             (roles, placeholders, obligations),
         )
         .await;
-        crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain).await;
+        crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain).await;
         crate::routes::support::annotate_metric_labels(
             &mut val,
             c,
@@ -410,7 +440,13 @@ async fn get_body(
 
     let mut boards_out = vec![json!({ "id": "default", "name": "Main" })];
     for b in &boards {
-        boards_out.push(json!({ "id": b.id, "name": b.name, "folderId": b.folder_id }));
+        let mut entry = json!({ "id": b.id, "name": b.name, "folderId": b.folder_id });
+        // BI-18 part C review fix (SHOULD-FIX) R11: the page needs to know a
+        // dashboard is in a personal space; the key is absent for every other.
+        if let (Some(owner), Some(map)) = (&b.owner_id, entry.as_object_mut()) {
+            map.insert("ownerId".to_owned(), json!(owner));
+        }
+        boards_out.push(entry);
     }
 
     let kpis_out: Vec<Value> = if on_default {
@@ -454,7 +490,7 @@ async fn get_body(
         charts_out.push(rendered);
     }
 
-    Ok(json!({
+    let mut body = json!({
         "board": board,
         "years": years,
         "layout": layout_to_json(&layout),
@@ -487,7 +523,29 @@ async fn get_body(
         "charts": charts_out,
         "results": results,
         "storeError": store_error,
-    }))
+    });
+    // BI-18 part C: left off when there are none, so the payload of a board
+    // saved before tabs and phone layouts is the one it always was.
+    if let Some(map) = body.as_object_mut() {
+        if !tabs.is_empty() {
+            map.insert("tabs".to_owned(), json!(tabs));
+        }
+        if let Some(phone) = board_obj
+            .and_then(|b| b.phone_layout.as_ref())
+            .filter(|p| !p.is_empty())
+        {
+            map.insert("phoneLayout".to_owned(), json!(phone));
+        }
+        // BI-17 part A (D6): left off when the board follows the console, so
+        // a board saved before themes has the payload it always had.
+        if let Some(theme) = board_obj.and_then(|b| b.theme.as_ref()) {
+            map.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = board_obj.and_then(|b| b.font.as_ref()) {
+            map.insert("font".to_owned(), json!(font));
+        }
+    }
+    Ok(body)
 }
 
 /// Parse the `filters` query parameter. Absent or blank means "use the
@@ -521,7 +579,7 @@ fn filter_fields(
 ) -> Vec<Value> {
     let mut by_column: BTreeMap<String, (ColumnKind, usize)> = BTreeMap::new();
     for c in charts {
-        if c.spec.kind == ChartKind::Text {
+        if c.spec.kind.is_static() {
             continue;
         }
         let source_cols;
@@ -576,19 +634,21 @@ fn filter_fields(
         .collect()
 }
 
-fn layout_to_json(layout: &LayoutMap) -> Value {
-    let mut m = Map::new();
-    for (k, b) in layout {
-        m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-    }
-    Value::Object(m)
+/// The layout as the payload carries it: `{ chartId: { x, y, w, h, tab? } }`,
+/// `tab` only on a tile that names one (`BI-18` part C). Shared with the embed
+/// and public payloads so the three agree.
+pub(crate) fn layout_to_json(layout: &LayoutMap) -> Value {
+    serde_json::to_value(layout).unwrap_or_else(|_| json!({}))
 }
 
 // ── /api/dashboard/specs ────────────────────────────────────────────────
 
 /// `GET /api/dashboard/specs` — every stored chart, in render shape.
-pub async fn specs_list(State(state): State<AppState>) -> Response {
-    match store::list_stored_charts(&state.clickhouse).await {
+pub async fn specs_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    match store::list_stored_charts(&state.clickhouse, &viewer_of(&principal)).await {
         Ok(stored) => {
             let charts: Vec<Value> = stored.iter().map(render_stored_chart).collect();
             (StatusCode::OK, ApiJson(json!({ "charts": charts }))).into_response()
@@ -622,8 +682,16 @@ fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
 ///
 /// 400 on an unparseable body or a `lakehouse_bi` validation/`ClickHouse`
 /// failure, matching the `TypeScript`'s single `catch` around both.
-pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_create(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let input = parse_chart_input(&body)?;
+    // BI-18 part C, part 2: a chart cannot be put on a dashboard that is in
+    // the trash or in somebody else's personal space.
+    let viewer = viewer_of(&principal);
+    require_chart_board(&state.clickhouse, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
     let spec = store::spec_from_input(
         &state.clickhouse,
@@ -644,6 +712,8 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
                 upstream_error::FailedAs::BadRequest,
             )
         })?;
+    place_new_chart(&state.clickhouse, &spec.board, &spec.spec.id).await;
+    snapshot(&state.clickhouse, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -672,7 +742,7 @@ pub async fn specs_preview(
     // a value that does not fit is a 400.
     let sent_params = raw.as_object_mut().and_then(|o| o.remove("params"));
     let input = if raw.get("drillOf").is_some() {
-        crate::routes::drill::drill_input(&state.clickhouse, raw).await?
+        crate::routes::drill::drill_input(&state.clickhouse, raw, &viewer_of(&principal)).await?
     } else {
         serde_json::from_value(raw)
             .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?
@@ -789,7 +859,11 @@ pub async fn specs_preview(
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
 /// failure.
-pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+pub async fn specs_update(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
@@ -802,26 +876,29 @@ pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResu
     };
     let input: ChartInput = serde_json::from_value(raw)
         .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
+    // BI-18 part C, part 2: an edit may not reach a chart in the trash (it
+    // would bring it back without a restore) or on somebody else's personal
+    // board, nor move a chart onto such a board.
+    let viewer = viewer_of(&principal);
+    let ch = &state.clickhouse;
+    let old_board = require_editable_chart(ch, &id, &viewer).await?;
+    require_chart_board(ch, input.board.as_deref(), &viewer).await?;
     let time = crate::routes::settings::time_context(&state).await?;
-    let spec = store::spec_from_input(
-        &state.clickhouse,
-        &input,
-        ChartSource::Ui,
-        "ui",
-        Some(id),
-        &time,
-    )
-    .await
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    store::insert_chart(&state.clickhouse, &spec)
+    let spec = store::spec_from_input(ch, &input, ChartSource::Ui, "ui", Some(id), &time)
         .await
-        .map_err(|err| {
-            upstream_error::ch_error_as(
-                &upstream_error::DATABASE,
-                &err,
-                upstream_error::FailedAs::BadRequest,
-            )
-        })?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    store::insert_chart(ch, &spec).await.map_err(|err| {
+        upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            &err,
+            upstream_error::FailedAs::BadRequest,
+        )
+    })?;
+    // The board it left changed too, when the edit moved it.
+    if old_board != spec.board {
+        snapshot(ch, &old_board, &principal).await;
+    }
+    snapshot(ch, &spec.board, &principal).await;
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
@@ -858,12 +935,19 @@ impl IdQuery {
 /// [`ApiError::Internal`] on a `ClickHouse` failure.
 pub async fn specs_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
-    store::delete_chart(&state.clickhouse, &id)
+    // A chart the caller may not see is answered like one that does not exist:
+    // `ok`, and nothing is deleted (BI-18 part C, part 2).
+    let ch = &state.clickhouse;
+    let Some(board) = visible_live_chart_board(ch, &id, &viewer_of(&principal)).await? else {
+        return Ok(ApiJson(json!({ "ok": true })));
+    };
+    store::delete_chart(ch, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -872,6 +956,8 @@ pub async fn specs_delete(
                 upstream_error::FailedAs::Internal,
             )
         })?;
+    drop_tile(ch, &board, &id).await;
+    snapshot(ch, &board, &principal).await;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -884,19 +970,25 @@ pub async fn specs_delete(
 /// and would go stale the moment a chart is added, moved between boards, or
 /// deleted. The built-in board's count comes from the compiled-in specs,
 /// which is where its tiles actually come from.
-pub async fn boards_list(State(state): State<AppState>) -> Response {
+pub async fn boards_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
     let ch = &state.clickhouse;
-    let (boards, stored) =
-        match tokio::try_join!(store::list_boards(ch), store::list_stored_charts(ch)) {
-            Ok(pair) => pair,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-                )
-                    .into_response();
-            }
-        };
+    let viewer = viewer_of(&principal);
+    let (boards, stored) = match tokio::try_join!(
+        store::list_boards(ch, &viewer),
+        store::list_stored_charts(ch, &viewer)
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response();
+        }
+    };
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for c in &stored {
         *counts.entry(c.board.as_str()).or_default() += 1;
@@ -961,6 +1053,11 @@ pub async fn boards_create(
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    // Fail closed: with nobody attached (the assistant's tool surface does not
+    // come through here) the caller is anonymous and sees no personal space.
+    let viewer = principal
+        .as_ref()
+        .map_or_else(Viewer::anonymous, |Extension(p)| viewer_of(p));
     let parsed: BoardCreateBody = if body.is_empty() {
         BoardCreateBody::default()
     } else {
@@ -969,25 +1066,80 @@ pub async fn boards_create(
     };
     let author = author_name(principal.as_ref());
     let folder_id = parsed.folder_id.unwrap_or_default().trim().to_owned();
-    // Checked first, so an unknown folder creates nothing.
-    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
-    let mut board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup, &author).await
+    // Checked first, so an unknown folder creates nothing. A personal space
+    // takes only its owner's dashboards.
+    crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
+        .await?;
+    // The owner of the folder a new dashboard is filed in: it travels in the
+    // first insert, so a dashboard filed in a personal space is private from
+    // the moment it exists and never public in between
+    // (`PR #199 review M BLOCKER 5`). An ordinary folder has no owner.
+    let folder_owner = if folder_id.is_empty() {
+        String::new()
     } else {
-        store::create_board(
+        lakehouse_bi::folders::folder_owner(&state.clickhouse, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+    };
+    let duplicated = parsed.duplicate.is_some();
+    let mut board = if let Some(dup) = parsed.duplicate {
+        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer)
+            .await
+            .map_err(|err| match err {
+                store::DuplicateError::Copy(cause) => {
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+                store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+                    // The half-built copy that could not be taken back is the
+                    // operator's problem: it is reported under a reference id
+                    // (the raw text goes to the log, never to a response) and
+                    // the caller's own error is kept
+                    // (`PR #199 review O SHOULD-FIX 3`).
+                    let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+            })?
+    } else {
+        store::create_board_in(
             &state.clickhouse,
             &parsed.name.unwrap_or_default(),
             &parsed.description.unwrap_or_default(),
             &author,
+            &folder_id,
+            &folder_owner,
         )
         .await
-    }
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    if !folder_id.is_empty() {
-        store::move_board(&state.clickhouse, &board.id, &folder_id)
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?
+    };
+    if duplicated {
+        // A copy lands next to the original and is private from its first
+        // insert, so moving it into another folder is a change of place, not
+        // the first time it is given an owner.
+        if !folder_id.is_empty() {
+            store::move_board(&state.clickhouse, &board.id, &folder_id)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(folder_id);
+        } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
+            // An administrator duplicating somebody else's draft: the copy is the
+            // administrator's own draft, not a second one in the other user's
+            // space.
+            let mine = lakehouse_bi::folders::ensure_personal_folder(
+                &state.clickhouse,
+                viewer.id(),
+                &author,
+            )
             .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(folder_id);
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+            store::move_board(&state.clickhouse, &board.id, &mine.id)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(mine.id);
+            board.owner_id = Some(viewer.id().to_owned());
+        }
+    }
+    if let Some(Extension(p)) = principal.as_ref() {
+        snapshot(&state.clickhouse, &board.id, p).await;
     }
     Ok(ApiJson(json!({ "ok": true, "board": board })))
 }
@@ -1033,6 +1185,40 @@ struct BoardEditBody {
     /// empty list shows none.
     #[serde(default)]
     params: Option<Vec<lakehouse_bi::params::BoardParam>>,
+    /// The tabs of the board (`BI-18` part C); an empty list removes them. The
+    /// tiles in `layout` and the ties in `filters` that the same save (or the
+    /// stored board) holds must name only tabs in this list.
+    #[serde(default)]
+    tabs: Option<Vec<lakehouse_bi::layout::Tab>>,
+    /// The order and heights of the tiles below 640 px (`BI-18` part C); an
+    /// empty list goes back to the computed stacking.
+    #[serde(default, rename = "phoneLayout")]
+    phone_layout: Option<Vec<lakehouse_bi::layout::PhoneTile>>,
+    /// The dashboard's theme (`BI-17` part A): `auto`, `light` or `dark`.
+    #[serde(default)]
+    theme: Option<String>,
+    /// The dashboard's font (`BI-17` part A): `""` for the console's own, or
+    /// one of the fonts an administrator allows in Admin > Settings.
+    #[serde(default)]
+    font: Option<String>,
+}
+
+impl BoardEditBody {
+    /// Whether the body changes what a version holds (`BI-18` part C, part 2):
+    /// everything but sharing, the folder and the embed state.
+    fn changes_content(&self) -> bool {
+        self.name.is_some()
+            || self.description.is_some()
+            || self.layout.is_some()
+            || self.filters.is_some()
+            || self.refresh_seconds.is_some()
+            || self.grain.is_some()
+            || self.params.is_some()
+            || self.tabs.is_some()
+            || self.phone_layout.is_some()
+            || self.theme.is_some()
+            || self.font.is_some()
+    }
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -1049,6 +1235,14 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 && body.embed_revoke_all.is_none()
                 && body.embed_origins.is_none()
                 && body.folder_id.is_none()
+                // BI-18 part C: the built-in board is one page; duplicate it
+                // for a copy that can have tabs. Its phone layout is a
+                // layout, so it is accepted.
+                && body.tabs.is_none()
+                // BI-17 part A: a theme and a font are the dashboard's own,
+                // and the built-in board is code, not a saved dashboard.
+                && body.theme.is_none()
+                && body.font.is_none()
         }
         Some(_) => true,
     }
@@ -1068,6 +1262,135 @@ fn checked_refresh(raw: Option<i64>) -> Result<Option<u32>, ApiError> {
     let seconds = u32::try_from(raw).unwrap_or(u32::MAX);
     lakehouse_bi::click::validate_refresh_seconds(seconds).map_err(ApiError::BadRequest)?;
     Ok(Some(seconds))
+}
+
+/// The tab rules of a board edit (`BI-18` part C), checked before the first
+/// write so a save that would leave a tile on a missing tab, or a filter tied
+/// to one, changes nothing. The tabs, tiles and filters it judges are the
+/// body's where it sends them and the stored board's where it does not, so a
+/// body that only deletes a tab is checked against the tiles and filters
+/// already saved.
+///
+/// # Errors
+///
+/// 400 with our sentence for tabs that are not valid, a tile on a tab that does
+/// not exist, or a filter tied to one; a classified error when the board
+/// cannot be read.
+async fn check_tab_rules(ch: &ChClient, id: &str, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        lakehouse_bi::layout::validate_tabs(tabs).map_err(ApiError::BadRequest)?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        lakehouse_bi::layout::validate_phone_layout(phone).map_err(ApiError::BadRequest)?;
+    }
+    let ties = |filters: &[FilterDef]| {
+        filters
+            .iter()
+            .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    };
+    let layout_names_tab = parsed
+        .layout
+        .as_ref()
+        .is_some_and(|l| l.values().any(|t| t.tab.is_some()));
+    let filters_tie = parsed.filters.as_deref().is_some_and(ties);
+    // A save that touches no tab, tile tab or tie needs no other row.
+    if parsed.tabs.is_none() && !layout_names_tab && !filters_tie {
+        return Ok(());
+    }
+    // The caller was checked against this board before the first read
+    // (`boards_update`); the tabs and ties are judged against what is stored.
+    let stored = store::get_board(ch, id, &Viewer::system())
+        .await
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
+    let tabs = match (&parsed.tabs, &stored) {
+        (Some(tabs), _) => tabs.clone(),
+        (None, Some(board)) => board.tabs.clone().unwrap_or_default(),
+        (None, None) => Vec::new(),
+    };
+    let stored_layout = stored.as_ref().and_then(|b| b.layout.as_ref());
+    let layout = parsed.layout.as_ref().or(stored_layout);
+    if let Some(layout) = layout {
+        lakehouse_bi::layout::check_layout_tabs(layout, &tabs).map_err(ApiError::BadRequest)?;
+    }
+    let stored_filters = stored.as_ref().and_then(|b| b.filters.as_deref());
+    let filters = parsed
+        .filters
+        .as_deref()
+        .or(stored_filters)
+        .unwrap_or_default();
+    lakehouse_bi::layout::check_filter_ties(filters, &tabs).map_err(ApiError::BadRequest)?;
+    Ok(())
+}
+
+/// The theme and the font of a board edit (`BI-17` part A, D6), checked before
+/// the first write: the theme is one of the three, and the font is one the
+/// administrator allows (Admin > Settings), so a font removed from the list
+/// cannot be chosen again. An empty font (the console's own) is always
+/// allowed.
+///
+/// # Errors
+///
+/// 400 with our sentence; a classified error when the settings cannot be read.
+async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Result<(), ApiError> {
+    if let Some(theme) = &parsed.theme
+        && !store::BOARD_THEMES.contains(&theme.as_str())
+    {
+        return Err(ApiError::BadRequest(
+            "theme must be auto, light or dark.".to_owned(),
+        ));
+    }
+    let Some(font) = parsed.font.as_deref().filter(|f| !f.is_empty()) else {
+        return Ok(());
+    };
+    let allowed = crate::routes::settings::format_settings(state).await?.fonts;
+    if allowed.iter().any(|f| f == font) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "That font is not one an administrator allows for dashboards.".to_owned(),
+        ))
+    }
+}
+
+/// The error of a board write: a board that is not there any more (deleted
+/// while the edit was on its way) is refused with its own sentence, and the
+/// store's failure keeps the mapping the write had before
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+fn board_write_error(err: &store::BiError) -> ApiError {
+    match err {
+        store::BiError::Validation(msg) => ApiError::BadRequest(msg.clone()),
+        store::BiError::Clickhouse(err) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            err,
+            upstream_error::FailedAs::BadRequest,
+        ),
+    }
+}
+
+/// The tabs and the phone layout of a board edit (`BI-18` part C), both
+/// already checked by [`check_tab_rules`].
+async fn save_tabs_and_phone_layout(
+    ch: &ChClient,
+    id: &str,
+    parsed: &BoardEditBody,
+) -> Result<(), ApiError> {
+    if let Some(tabs) = &parsed.tabs {
+        store::update_board_tabs(ch, id, tabs)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    if let Some(phone) = &parsed.phone_layout {
+        store::update_board_phone_layout(ch, id, phone)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    // BI-17 part A: the theme and font ride with the other presentation saves.
+    if parsed.theme.is_some() || parsed.font.is_some() {
+        store::update_board_theme(ch, id, parsed.theme.as_deref(), parsed.font.as_deref())
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+    }
+    Ok(())
 }
 
 /// The `SEC-12` part of [`boards_update`]: withdraw every embed token of the
@@ -1132,6 +1455,20 @@ async fn save_grain_and_params(
     Ok(())
 }
 
+/// File board `id` in `folder_id` (`""` = the root), if `viewer` may use that
+/// folder: another user's personal space is refused (`BI-18` part C, part 2).
+async fn file_in_folder(
+    ch: &ChClient,
+    id: &str,
+    folder_id: &str,
+    viewer: &Viewer,
+) -> Result<(), ApiError> {
+    crate::routes::dashboard_folders::ensure_folder_usable(ch, folder_id, viewer).await?;
+    store::move_board(ch, id, folder_id)
+        .await
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
+}
+
 /// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
 /// board.
 ///
@@ -1142,8 +1479,15 @@ async fn save_grain_and_params(
 ///
 /// 400 when `id` is missing, when `"default"` is sent anything but a
 /// layout, or on a validation/`ClickHouse` failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered pipeline (check everything, then write, then snapshot); the \
+              BI-17 theme check pushed it one line over and splitting it would scatter \
+              the order that keeps a bad save from leaving a board half-edited"
+)]
 pub async fn boards_update(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: BoardEditBody = if body.is_empty() {
@@ -1157,11 +1501,21 @@ pub async fn boards_update(
     }
     let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
+    // BI-18 part C, part 2: only a live board the caller may see can be
+    // edited. Without this a layout save for a deleted board would write a
+    // blank live row over its trash entry, and an edit by id could reach
+    // another user's draft.
+    let viewer = viewer_of(&principal);
+    if id != store::DEFAULT_BOARD_ID {
+        require_board(ch, &id, &viewer).await?;
+    }
     // Before the first write, so a bad filter list does not leave a board
     // half-edited (BI-18).
     if let Some(filters) = &parsed.filters {
         validate_filters(filters).map_err(ApiError::BadRequest)?;
     }
+    check_tab_rules(ch, &id, &parsed).await?;
+    check_theme_and_font(&state, &parsed).await?;
     let refresh = checked_refresh(parsed.refresh_seconds)?;
     let checked_params =
         crate::routes::params::check_board_params_opt(ch, parsed.params.as_deref()).await?;
@@ -1183,13 +1537,7 @@ pub async fn boards_update(
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(seconds) = refresh {
         store::update_board_refresh(ch, &id, seconds)
@@ -1197,6 +1545,7 @@ pub async fn boards_update(
             .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     save_grain_and_params(ch, &id, parsed.grain.as_deref(), checked_params.as_deref()).await?;
+    save_tabs_and_phone_layout(ch, &id, &parsed).await?;
     if let Some(filters) = &parsed.filters {
         // BI-18 review round 1: a save cleans the row of filters that filter
         // nothing. Not rejected (an older console still sends them) and not
@@ -1204,20 +1553,15 @@ pub async fn boards_update(
         let filters = without_inert(filters);
         store::update_board_filters(ch, &id, &filters)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
-        let folder_id = folder_id.trim();
-        crate::routes::dashboard_folders::ensure_folder_exists(ch, folder_id).await?;
-        store::move_board(ch, &id, folder_id)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
+    }
+    // BI-18 part C, part 2: one version per request that changed the content.
+    let changes_content = parsed.changes_content();
+    if changes_content {
+        snapshot(ch, &id, &principal).await;
     }
     // SEC-12. Merged into whichever response below is returned, so a body
     // that also sets `public` or `embed` still reports them.
@@ -1254,13 +1598,18 @@ pub async fn boards_update(
 /// 400 when `id` is missing/`"default"`; 500 on a `ClickHouse` failure.
 pub async fn boards_delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
-    store::delete_board(&state.clickhouse, &id)
+    // BI-18 part C, part 2: deleting moves to the trash, and only a board the
+    // caller may see can be deleted. An unknown, already deleted or private
+    // board is "not found" alike.
+    require_board(&state.clickhouse, &id, &viewer_of(&principal)).await?;
+    store::delete_board(&state.clickhouse, &id, &principal.display_name)
         .await
         .map_err(|err| {
             upstream_error::ch_error_as(
@@ -1818,7 +2167,7 @@ pub async fn records(
     records_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -1979,17 +2328,62 @@ async fn with_calculated_columns(
     })
 }
 
+/// `filters` narrowed to the ones the tile of `chart` is given (`BI-18` part
+/// C): a records list, an export or a drill of a tile on one tab must not take
+/// a filter tied to another, as the tile itself does not.
+///
+/// Nothing is read when no filter is tied to a tab. A board that cannot be
+/// read leaves every filter on: the result can only be narrower than the tile,
+/// never wider, and the failure is logged under a reference.
+pub(crate) async fn filters_for_chart_tab(
+    ch: &ChClient,
+    chart: &StoredChartSpec,
+    filters: Vec<FilterDef>,
+) -> Vec<FilterDef> {
+    if !filters
+        .iter()
+        .any(|f| f.tabs.as_ref().is_some_and(|t| !t.is_empty()))
+    {
+        return filters;
+    }
+    // `chart` was found through a viewer-scoped read by the caller, so its board
+    // is one that viewer may see; the board is read here only for its tabs.
+    let board = match store::get_board(ch, &chart.board, &Viewer::system()).await {
+        Ok(Some(board)) => board,
+        Ok(None) => return filters,
+        Err(err) => {
+            let _ = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            return filters;
+        }
+    };
+    lakehouse_bi::layout::filters_for_chart(
+        &filters,
+        board.tabs.as_deref().unwrap_or_default(),
+        &board.layout.unwrap_or_default(),
+        &chart.spec.id,
+    )
+    .into_owned()
+}
+
 /// The own filters of the tile `q.chart` names (`BI-6`), or none when it names
 /// no tile. The tile must read the relation the query names: its filters mean
 /// nothing over another one.
 async fn chart_own_filters(
     ch: &ChClient,
     q: &RecordsQuery,
-) -> Result<(Vec<FilterDef>, Vec<lakehouse_bi::joins::JoinSpec>), ApiError> {
+    dashboard_filters: Vec<FilterDef>,
+    viewer: &Viewer,
+) -> Result<TileFilters, ApiError> {
     let Some(id) = q.chart.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(TileFilters {
+            own: Vec::new(),
+            joins: Vec::new(),
+            dashboard: dashboard_filters,
+        });
     };
-    let stored = store::list_stored_charts(ch)
+    // A tile in the trash, or on another user's personal board, is "this tile
+    // does not exist" (BI-18 part C, part 2).
+    let stored = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let chart = stored
@@ -2034,7 +2428,21 @@ async fn chart_own_filters(
     // BI-2: a segment in the tile's filters is its filters here too, so the
     // records behind a mark are the rows the mark was drawn from.
     let own = expand_tile_segments(ch, own, sql_source, mart).await?;
-    Ok((own, joins))
+    // BI-18 part C: only the dashboard filters the tile itself is given.
+    let dashboard = filters_for_chart_tab(ch, chart, dashboard_filters).await;
+    Ok(TileFilters {
+        own,
+        joins,
+        dashboard,
+    })
+}
+
+/// What [`chart_own_filters`] found for a tile: its own filters and joins, and
+/// the dashboard filters it is given.
+struct TileFilters {
+    own: Vec<FilterDef>,
+    joins: Vec<lakehouse_bi::joins::JoinSpec>,
+    dashboard: Vec<FilterDef>,
 }
 
 /// `filters` with each `{ "segment": … }` replaced by the segment's filters,
@@ -2195,7 +2603,7 @@ fn records_value<'a>(
 async fn records_for_roles(
     ch: &ChClient,
     q: RecordsQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
@@ -2209,7 +2617,11 @@ async fn records_for_roles(
     .clamp(1, RECORDS_PAGE_MAX);
     let offset = records_number(q.offset.as_deref(), "offset", 0)?;
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
-    let (own, joins) = chart_own_filters(ch, &q).await?;
+    let TileFilters {
+        own,
+        joins,
+        dashboard: dashboard_filters,
+    } = chart_own_filters(ch, &q, dashboard_filters, viewer).await?;
 
     // A drill is a column and a value together; neither is the whole tile.
     let drill = match (
@@ -2589,7 +3001,7 @@ pub async fn table_export(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ApiError::BadRequest("chart is required".to_owned()))?;
-    let stored = store::list_stored_charts(ch)
+    let stored = store::list_stored_charts(ch, &viewer_of(&principal))
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let chart = stored
@@ -2603,6 +3015,8 @@ pub async fn table_export(
         .into());
     }
     let dashboard_filters = parse_filters_param(q.filters.as_deref())?.unwrap_or_default();
+    // BI-18 part C: a filter tied to another tab is not in this tile's file.
+    let dashboard_filters = filters_for_chart_tab(ch, chart, dashboard_filters).await;
     let time = crate::routes::settings::time_context(&state).await?;
     let loaded = crate::routes::params::load(ch, &[], q.params.as_deref()).await?;
     let time = time.with_params(loaded.values);
@@ -2744,7 +3158,7 @@ pub async fn values(
     values_for_roles(
         &state.clickhouse,
         q,
-        &principal.role_names,
+        (&principal.role_names, &viewer_of(&principal)),
         &placeholders,
         &obligations,
         &time,
@@ -2807,18 +3221,17 @@ fn values_statement(selects: &[String], settings: &str) -> String {
 async fn board_value_selects(
     ch: &ChClient,
     board: &str,
-    column: &str,
-    search: Option<&str>,
+    (column, search): (&str, Option<&str>),
     other_filters: &[FilterDef],
-    time: &TimeContext,
+    (time, viewer): (&TimeContext, &Viewer),
 ) -> Result<(Vec<String>, bool), ApiError> {
-    let charts = store::list_stored_charts(ch)
+    let charts = store::list_stored_charts(ch, viewer)
         .await
         .map_err(|err| classify_dashboard_ch_error(&err))?;
     let on_board: Vec<&StoredChartSpec> = charts
         .iter()
         .filter(|c| board == "all" || c.board == board)
-        .filter(|c| c.spec.kind != ChartKind::Text)
+        .filter(|c| !c.spec.kind.is_static())
         .collect();
     let mart_cols = mart_columns(ch)
         .await
@@ -2883,7 +3296,7 @@ async fn board_value_selects(
 async fn values_for_roles(
     ch: &ChClient,
     q: ValuesQuery,
-    roles: &[String],
+    (roles, viewer): (&[String], &Viewer),
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
     time: &TimeContext,
@@ -2904,7 +3317,7 @@ async fn values_for_roles(
     let (selects, settings) = if let Some(board) = q.board.as_deref().filter(|b| !b.is_empty()) {
         let others: Vec<FilterDef> = linked.into_iter().filter(|f| f.column != column).collect();
         let (selects, has_source) =
-            board_value_selects(ch, board, &column, search, &others, time).await?;
+            board_value_selects(ch, board, (&column, search), &others, (time, viewer)).await?;
         let settings = if has_source {
             lakehouse_bi::builder::SQL_SOURCE_SETTINGS
         } else {
@@ -2972,11 +3385,17 @@ async fn values_for_roles(
 /// # Errors
 ///
 /// 500 (`ApiError::Internal`) if either `ClickHouse` listing fails.
-pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
+pub async fn export(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<Response> {
+    // The file is the caller's view of the dashboards: no deleted board or
+    // chart, and no other user's personal space (BI-18 part C, part 2).
+    let viewer = viewer_of(&principal);
     let (charts, boards, default_row) = tokio::try_join!(
-        store::list_stored_charts(&state.clickhouse),
-        store::list_boards(&state.clickhouse),
-        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID)
+        store::list_stored_charts(&state.clickhouse, &viewer),
+        store::list_boards(&state.clickhouse, &viewer),
+        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID, &viewer)
     )
     .map_err(|err| {
         upstream_error::ch_error_as(
@@ -3003,6 +3422,17 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
             b.layout.as_ref(),
             b.params.as_deref(),
         ));
+        // BI-18 part C: a board's tabs, after its other keys.
+        if let Some(tabs) = b.tabs.as_deref().filter(|t| !t.is_empty()) {
+            let rendered = tabs
+                .iter()
+                .map(|t| serde_json::to_string(t).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str("    tabs: [");
+            out.push_str(&rendered);
+            out.push_str("]\n");
+        }
     }
     out.push('\n');
     out.push_str("charts:\n");
@@ -3074,8 +3504,14 @@ fn yaml_board(
     {
         lines.push("    layout:".to_owned());
         for (cid, bx) in layout {
+            // BI-18 part C: the tab only when the tile names one, so the
+            // line of a board saved before tabs is unchanged.
+            let tab = bx
+                .tab
+                .as_deref()
+                .map_or_else(String::new, |t| format!(", tab: {}", yaml_value(&json!(t))));
             lines.push(format!(
-                "      {cid}: {{ x: {}, y: {}, w: {}, h: {} }}",
+                "      {cid}: {{ x: {}, y: {}, w: {}, h: {}{tab} }}",
                 bx.x, bx.y, bx.w, bx.h
             ));
         }
@@ -3215,6 +3651,7 @@ fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
                 out.push(("grain", json!(grain)));
             }
             push_table_fields(def, &mut out);
+            push_type_fields(def, &mut out);
             push_shape_fields(def, &mut out);
             if let Some(span) = def.span {
                 out.push(("span", json!(span)));
@@ -3256,6 +3693,21 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
         "axis",
     ];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.shape) else {
+        return;
+    };
+    for name in NAMES {
+        if let Some(value) = fields.get(name) {
+            out.push((name, value.clone()));
+        }
+    }
+}
+
+/// The `BI-16` part B fields of a definition (goal, bands, histogram ranges,
+/// the address and description of an image or web card), present only on the
+/// charts that carry them.
+fn push_type_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
+    const NAMES: [&str; 5] = ["goal", "bands", "histogram", "url", "alt"];
+    let Ok(Value::Object(fields)) = serde_json::to_value(&def.types) else {
         return;
     };
     for name in NAMES {
@@ -3327,6 +3779,7 @@ pub struct EmbedInfoQuery {
 /// exist; 500 on any other `ClickHouse` failure.
 pub async fn embed_info(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<EmbedInfoQuery>,
 ) -> Response {
     let id = q.board.unwrap_or_default();
@@ -3337,7 +3790,7 @@ pub async fn embed_info(
         )
             .into_response();
     }
-    match embed_info_body(&state, &id).await {
+    match embed_info_body(&state, &id, &viewer_of(&principal)).await {
         Ok(Some(body)) => (StatusCode::OK, ApiJson(body)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -3355,8 +3808,9 @@ pub async fn embed_info(
 async fn embed_info_body(
     state: &AppState,
     id: &str,
+    viewer: &Viewer,
 ) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
-    let Some(board) = store::get_board(&state.clickhouse, id).await? else {
+    let Some(board) = store::get_board(&state.clickhouse, id, viewer).await? else {
         return Ok(None);
     };
     let enabled = board.embed_enabled.unwrap_or(false);
@@ -3730,11 +4184,24 @@ mod tests {
                 y: 0,
                 w: 3,
                 h: 5,
+                tab: None,
+            },
+        );
+        layout.insert(
+            "c2".to_owned(),
+            store::TileBox {
+                x: 3,
+                y: 0,
+                w: 3,
+                h: 5,
+                tab: Some("t_maps".to_owned()),
             },
         );
         let out = yaml_board("b1", "Board 1", Some(&layout), None);
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+        // BI-18 part C: the tab only on a tile that names one.
+        assert!(out.contains("      c2: { x: 3, y: 0, w: 3, h: 5, tab: t_maps }"));
     }
 
     // ── DATA-12 part 3: marks on the mart list ───────────────────────────
@@ -3918,7 +4385,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4011,7 +4481,10 @@ mod records_enforcement {
         let body = records_for_roles(
             &ch,
             q,
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4056,7 +4529,7 @@ mod records_enforcement {
         let err = records_for_roles(
             &ch,
             drill("mart_x", "region", "north"),
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4160,7 +4633,10 @@ mod values_enforcement {
                 column: Some("email".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4255,7 +4731,10 @@ mod values_enforcement {
                 q: Some("secret".to_owned()),
                 ..ValuesQuery::default()
             },
-            &["Analyst".to_owned()],
+            (
+                &["Analyst".to_owned()],
+                &lakehouse_bi::access::Viewer::system(),
+            ),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -4381,7 +4860,12 @@ mod typed_filters {
     use crate::policy_engine::PolicyEngineObligations;
     use crate::sql_rewrite::PlaceholderValues;
 
-    async fn answer(server: &MockServer, statement_has: &str, meta: &[&str], data: Vec<Value>) {
+    pub(super) async fn answer(
+        server: &MockServer,
+        statement_has: &str,
+        meta: &[&str],
+        data: Vec<Value>,
+    ) {
         let meta: Vec<Value> = meta
             .iter()
             .map(|n| json!({ "name": n, "type": "String" }))
@@ -4398,7 +4882,7 @@ mod typed_filters {
     }
 
     /// Anything not matched above (DDL, tile queries): success, no rows.
-    async fn answer_rest(server: &MockServer) {
+    pub(super) async fn answer_rest(server: &MockServer) {
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4408,7 +4892,7 @@ mod typed_filters {
             .await;
     }
 
-    async fn statements(server: &MockServer) -> Vec<String> {
+    pub(super) async fn statements(server: &MockServer) -> Vec<String> {
         server
             .received_requests()
             .await
@@ -4418,7 +4902,7 @@ mod typed_filters {
             .collect()
     }
 
-    fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
+    pub(super) fn chart_row(id: &str, board: &str, mart: &str, source: Option<&str>) -> Value {
         let mut spec = json!({
             "id": id, "title": id, "kind": "bar", "mart": mart,
             "sql": "SELECT 1", "x": "kab", "y": "visitors"
@@ -4437,13 +4921,13 @@ mod typed_filters {
         })
     }
 
-    fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
+    pub(super) fn mart_column_rows(table: &str, cols: &[(&str, &str)]) -> Vec<Value> {
         cols.iter()
             .map(|(name, ty)| json!({ "table": table, "name": name, "type": ty }))
             .collect()
     }
 
-    fn client(server: &MockServer) -> ChClient {
+    pub(super) fn client(server: &MockServer) -> ChClient {
         ChClient::new(server.uri(), "default".to_owned(), String::new())
     }
 
@@ -4521,6 +5005,7 @@ mod typed_filters {
             (
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
             ),
         )
         .await
@@ -4755,7 +5240,7 @@ mod typed_filters {
         values_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -5075,7 +5560,7 @@ mod records_pages {
         records_for_roles(
             &ch,
             q,
-            &[],
+            (&[], &lakehouse_bi::access::Viewer::system()),
             &PlaceholderValues::none(),
             &obligations,
             &lakehouse_bi::grain::TimeContext::default(),
@@ -5671,7 +6156,11 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (time, requested.into()),
+            (
+                time,
+                requested.into(),
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -5743,7 +6232,11 @@ mod time_grain {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), super::GrainRequest::Own),
+            (
+                &TimeContext::default(),
+                super::GrainRequest::Own,
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .unwrap();
@@ -5846,7 +6339,15 @@ mod time_grain {
     ) -> Result<Value, ApiError> {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let obligations = PolicyEngineObligations::new(None, &ch);
-        records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations, time).await
+        records_for_roles(
+            &ch,
+            q,
+            (&[], &lakehouse_bi::access::Viewer::system()),
+            &PlaceholderValues::none(),
+            &obligations,
+            time,
+        )
+        .await
     }
 
     fn bucket_query(column: &str, value: &str, grain: &str) -> RecordsQuery {
@@ -6121,7 +6622,11 @@ mod table_tiles {
             &[],
             &PlaceholderValues::none(),
             &obligations,
-            (&TimeContext::default(), GrainRequest::Saved),
+            (
+                &TimeContext::default(),
+                GrainRequest::Saved,
+                &lakehouse_bi::access::Viewer::system(),
+            ),
         )
         .await
         .expect("the payload builds")
@@ -6210,8 +6715,25 @@ mod join_rewrite;
 #[path = "bin_rewrite.rs"]
 mod bin_rewrite;
 
+// BI-16 part B: the role rewrite on the progress, histogram and bullet
+// statements; reuses the governed table and helpers of `bin_rewrite` above.
+#[cfg(test)]
+#[path = "type_b_rewrite.rs"]
+mod type_b_rewrite;
+
 // BI-11: the role rewrite on the three ways a parameter's value reaches a
 // statement; see `chart_shapes_rewrite` above.
 #[cfg(test)]
 #[path = "param_rewrite.rs"]
 mod param_rewrite;
+
+// BI-18 part C: tabs, tab ties and section tiles on the dashboard routes; see
+// `chart_shapes_rewrite` above. It uses the helpers of `typed_filters`.
+#[cfg(test)]
+#[path = "layout_tabs.rs"]
+mod layout_tabs;
+
+// BI-18 part C, part 2: what every read and write path does about the trash and
+// the personal space; the ignored tests check the clauses on the real engine.
+#[path = "organise_paths.rs"]
+mod organise_paths;

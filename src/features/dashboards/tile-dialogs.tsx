@@ -1,5 +1,6 @@
 "use client";
 
+import type { ResolvedReferenceLine } from "@/lib/chart-style";
 import { Download, Table2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -20,6 +21,8 @@ export type Rows = {
   filtersSkipped?: FilterSkip[];
   /** The label of each metric the tile shows, by metric name; a metric with no label is absent and reads by its name (BI-2). */
   metricLabels?: Record<string, string>;
+  /** BI-17: the format hint of each metric on the tile, by metric name. */
+  metricFormats?: Record<string, string>;
   /** The grain the rows were bucketed with, when the chart has one (BI-9). */
   grain?: string;
   /** The kind of the grouped dimension (`date` or `datetime`), so the dashboard's switch knows whether hour and minute fit (BI-9). */
@@ -35,7 +38,7 @@ export type Rows = {
   limit?: number;
   offset?: number;
   /** Lines on the value axis, at the values this read gave their parameters (BI-11). */
-  referenceLines?: { value: number; label?: string }[];
+  referenceLines?: ResolvedReferenceLine[];
   /** The chart's other questions, each answered on its own (BI-13). */
   layers?: LayerCell[];
 };

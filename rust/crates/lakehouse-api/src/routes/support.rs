@@ -347,6 +347,11 @@ pub(crate) fn annotate_metric_labels(
     if !labels.is_empty() {
         tile.insert("metricLabels".to_owned(), json!(labels));
     }
+    // BI-17 (D4): the format hint of each metric, the default format of its value.
+    let formats = fields.metric_formats(&chart.def, own.as_ref());
+    if !formats.is_empty() {
+        tile.insert("metricFormats".to_owned(), json!(formats));
+    }
 }
 
 /// The SQL to run for a stored chart right now: a mart chart through

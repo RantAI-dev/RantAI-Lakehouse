@@ -37,6 +37,10 @@ use serde::{Deserialize, Serialize};
 /// At most this many allowed origins per dashboard.
 pub const MAX_ORIGINS: usize = 20;
 
+/// The most sites an administrator may list as allowed content sites for
+/// image and web cards (`BI-16` part B, decision 4).
+pub const MAX_CONTENT_SITES: usize = 50;
+
 /// At most this many individually withdrawn tokens kept per dashboard. The
 /// list only needs to hold tokens that are still within their lifetime; past
 /// this, "withdraw all" is the right tool and the caller is told so.
@@ -187,6 +191,55 @@ pub fn validate_origins(raw: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Validate the administrator's list of sites images and web pages may come
+/// from (`BI-16` part B, decision 4).
+///
+/// The same entry grammar and normal form as [`validate_origins`] (it calls
+/// the same [`normalize_origin`], rule 4: no second parser), with two
+/// differences: at most [`MAX_CONTENT_SITES`] entries, and `https` only, with
+/// no `http://localhost` exception, because a card loads the site into every
+/// viewer's browser.
+///
+/// # Errors
+///
+/// A message naming the first entry that is not acceptable, or the limit.
+pub fn validate_content_sites(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let origin = normalize_origin(entry)?;
+        if !origin.starts_with("https://") {
+            let shown: String = entry.chars().take(80).collect();
+            return Err(format!(
+                "\"{shown}\" is not an allowed site: write it as https://host or https://host:port"
+            ));
+        }
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    if out.len() > MAX_CONTENT_SITES {
+        return Err(format!(
+            "at most {MAX_CONTENT_SITES} content sites can be allowed."
+        ));
+    }
+    Ok(out)
+}
+
+/// The origin (`https://host[:port]`, normal form) of an address, or `None`
+/// when it is not an `https` address with a valid host. Used to compare a
+/// card's address with the allowed content sites; it goes through
+/// [`normalize_origin`] so both sides are written the same way.
+#[must_use]
+pub fn https_origin_of(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // User-info is how `https://allowed.example@evil.example/` hides the host.
+    if authority.contains('@') {
+        return None;
+    }
+    normalize_origin(&format!("https://{authority}")).ok()
+}
+
 fn normalize_origin(raw: &str) -> Result<String, String> {
     let shown: String = raw.chars().take(80).collect();
     let bad = |why: &str| Err(format!("\"{shown}\" is not an allowed site: {why}"));
@@ -250,6 +303,35 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn content_sites_are_https_only_and_capped_at_fifty() {
+        assert_eq!(
+            validate_content_sites(&strings(&["https://Img.Example", "https://img.example"])),
+            Ok(strings(&["https://img.example"]))
+        );
+        assert!(validate_content_sites(&strings(&["http://localhost"])).is_err());
+        assert!(validate_content_sites(&strings(&["http://a.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://*.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://a.example/path"])).is_err());
+        let fifty: Vec<String> = (0..50).map(|i| format!("https://s{i}.example")).collect();
+        assert_eq!(validate_content_sites(&fifty).unwrap().len(), 50);
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("https://s{i}.example")).collect();
+        assert!(validate_content_sites(&fifty_one).is_err());
+    }
+
+    #[test]
+    fn the_origin_of_an_address_ignores_the_path_and_refuses_user_info() {
+        assert_eq!(
+            https_origin_of("https://Img.Example:8443/a/b.png?x=1#f").as_deref(),
+            Some("https://img.example:8443")
+        );
+        assert_eq!(https_origin_of("http://img.example/a.png"), None);
+        assert_eq!(https_origin_of("https://ok.example@evil.example/"), None);
+        assert_eq!(https_origin_of("https://[::1]/"), None);
+        assert_eq!(https_origin_of("//img.example/a.png"), None);
+        assert_eq!(https_origin_of("https:///a.png"), None);
     }
 
     #[test]

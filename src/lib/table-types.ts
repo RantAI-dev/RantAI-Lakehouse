@@ -12,8 +12,10 @@ export type ColumnFormat = (typeof COLUMN_FORMATS)[number]
 export type ColumnSetting = {
   label?: string
   format?: ColumnFormat | string
-  /** Digits after the point, 0 to 6. */
+  /** Digits after the point, 0 to 10 (BI-17 widened it from 6). */
   decimals?: number
+  /** BI-17: the ISO 4217 code of a `currency` column. Absent: `IDR`, what a currency column always showed. */
+  currency?: string
   /** Pixels, 60 to 800. */
   width?: number
   wrap?: boolean

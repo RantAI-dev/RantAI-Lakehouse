@@ -1,0 +1,72 @@
+{
+  "why": "BI-18 part C review fix (BLOCKER) R13: the rule that gives a chart with no stored box its place. The server (lakehouse_bi::layout::place_unboxed) and the console (placeUnboxed in src/lib/dashboard-tabs.ts) are both tested against these cases, so the grid's resolve() and the stored box cannot drift apart. 'placed' is the box each unstored chart gets; the stored boxes are untouched.",
+  "cases": [
+    {
+      "name": "a board with no tabs: below the stored bottom, two to a row, a heading one row high, a full-width chart on its own row",
+      "tabs": [],
+      "layout": {
+        "a": { "x": 0, "y": 0, "w": 6, "h": 6 },
+        "b": { "x": 6, "y": 0, "w": 6, "h": 6 }
+      },
+      "charts": [
+        { "id": "a", "span": 1, "kind": "bar" },
+        { "id": "b", "span": 1, "kind": "bar" },
+        { "id": "c", "span": 1, "kind": "bar" },
+        { "id": "d", "span": 1, "kind": "line" },
+        { "id": "e", "span": 2, "kind": "heading" },
+        { "id": "f", "span": 2, "kind": "bar" },
+        { "id": "g", "span": 1, "kind": "section" },
+        { "id": "h", "span": 1, "kind": "bar" }
+      ],
+      "placed": {
+        "c": { "x": 0, "y": 6, "w": 6, "h": 6 },
+        "d": { "x": 6, "y": 6, "w": 6, "h": 6 },
+        "e": { "x": 0, "y": 12, "w": 12, "h": 1 },
+        "f": { "x": 0, "y": 13, "w": 12, "h": 6 },
+        "g": { "x": 0, "y": 19, "w": 6, "h": 1 },
+        "h": { "x": 6, "y": 19, "w": 6, "h": 6 }
+      }
+    },
+    {
+      "name": "a row wraps by its tallest tile, not by the height of the tile that does not fit",
+      "tabs": [],
+      "layout": {},
+      "charts": [
+        { "id": "a", "span": 1, "kind": "bar" },
+        { "id": "b", "span": 2, "kind": "divider" },
+        { "id": "c", "span": 1, "kind": "heading" },
+        { "id": "d", "span": 2, "kind": "bar" }
+      ],
+      "placed": {
+        "a": { "x": 0, "y": 0, "w": 6, "h": 6 },
+        "b": { "x": 0, "y": 6, "w": 12, "h": 1 },
+        "c": { "x": 0, "y": 7, "w": 6, "h": 1 },
+        "d": { "x": 0, "y": 8, "w": 12, "h": 6 }
+      }
+    },
+    {
+      "name": "a tabbed board: below the first tab only, on the first tab, a tile that names none counts as first-tab",
+      "tabs": ["t_a", "t_b"],
+      "layout": {
+        "x": { "x": 0, "y": 0, "w": 12, "h": 4, "tab": "t_b" },
+        "y": { "x": 0, "y": 0, "w": 6, "h": 6, "tab": "t_a" },
+        "z": { "x": 6, "y": 0, "w": 6, "h": 3 }
+      },
+      "charts": [
+        { "id": "y", "span": 1, "kind": "bar" },
+        { "id": "x", "span": 2, "kind": "bar" },
+        { "id": "z", "span": 1, "kind": "bar" },
+        { "id": "p", "span": 1, "kind": "bar" },
+        { "id": "q", "span": 2, "kind": "heading" },
+        { "id": "r", "span": 1, "kind": "bar" },
+        { "id": "s", "span": 1, "kind": "bar" }
+      ],
+      "placed": {
+        "p": { "x": 0, "y": 6, "w": 6, "h": 6, "tab": "t_a" },
+        "q": { "x": 0, "y": 12, "w": 12, "h": 1, "tab": "t_a" },
+        "r": { "x": 0, "y": 13, "w": 6, "h": 6, "tab": "t_a" },
+        "s": { "x": 6, "y": 13, "w": 6, "h": 6, "tab": "t_a" }
+      }
+    }
+  ]
+}

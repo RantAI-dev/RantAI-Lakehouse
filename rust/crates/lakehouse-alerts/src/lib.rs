@@ -1459,10 +1459,15 @@ fn fmt_id_id(n: f64) -> String {
 
 /// Digest text for a board's `KPI`/gauge tiles. Ports `digestText`.
 async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Result<String, ChError> {
-    let Some(board) = lakehouse_bi::store::get_board(ch, board_id).await? else {
+    // A digest goes to whoever the rule names (a mailbox, a webhook), not to a
+    // signed-in viewer, so it is read as nobody in particular: a dashboard in
+    // a personal space, or in the trash, is "not found" here, and its charts
+    // are not listed (BI-18 part C, part 2).
+    let viewer = lakehouse_bi::access::Viewer::anonymous();
+    let Some(board) = lakehouse_bi::store::get_board(ch, board_id, &viewer).await? else {
         return Ok("Dashboard not found.".to_owned());
     };
-    let charts = lakehouse_bi::store::list_stored_charts(ch).await?;
+    let charts = lakehouse_bi::store::list_stored_charts(ch, &viewer).await?;
     let on_board: Vec<_> = charts.iter().filter(|c| c.board == board_id).collect();
     // A tile on a dashboard SQL source is rebuilt from the source's current
     // text, as the dashboard itself does; the SQL stored with the chart may
@@ -1489,6 +1494,10 @@ async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Resul
         on_board.len()
     )];
     for chart in on_board {
+        // BI-16 part B: a progress bar and a bullet graph are deliberately not
+        // digest tiles. Their row is a value and a goal (`v`, `g`), and a digest
+        // line is one number with its title; alerts are rules on metrics, not on
+        // tiles, so no alert is offered on them either.
         let is_kpi_or_gauge = matches!(
             chart.spec.kind,
             lakehouse_bi::specs::ChartKind::Kpi | lakehouse_bi::specs::ChartKind::Gauge
@@ -4879,6 +4888,66 @@ mod tests {
         .await
         .unwrap();
         assert!(delivered.is_empty());
+    }
+
+    /// `BI-18` part C, part 2: a digest goes to the rule's recipients, not to a
+    /// signed-in viewer, so it is read as nobody in particular. A dashboard in
+    /// somebody's personal space is "not found" there (the statement carries the
+    /// owner restriction, so the store never hands the row back), and so is one
+    /// in the trash (`is_deleted = 0`); the digest says so and sends no numbers.
+    #[tokio::test]
+    async fn a_digest_of_a_private_or_deleted_dashboard_is_not_found() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let private = serde_json::json!({
+            "id": "b_draft", "name": "Secret draft", "owner_id": "u_someone",
+            "layout_json": "{}", "filters_json": "[]", "created_at": "2026-10-14 00:00:00"
+        });
+        // The row comes back only to a statement with no owner restriction.
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_board FINAL"))
+            .and(body_string_contains("owner_id = ''"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FROM console.bi_board FINAL"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "meta": [], "data": [private], "rows": 1 })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let text = digest_text(&ch, &PassGate, "b_draft").await.unwrap();
+        assert_eq!(text, "Dashboard not found.");
+        let sent = server.received_requests().await.unwrap();
+        let reads: Vec<String> = sent
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|r| r.contains("owner_id = ''")),
+            "{reads:?}"
+        );
+        // No chart was listed for it.
+        assert!(
+            sent.iter()
+                .all(|r| !String::from_utf8_lossy(&r.body).contains("FROM console.bi_chart"))
+        );
     }
 
     // ── DATA-14: the quality_incident kind ──────────────────────────────

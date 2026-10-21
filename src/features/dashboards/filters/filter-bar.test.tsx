@@ -129,3 +129,41 @@ describe("the Required switch while adding a filter", () => {
     expect(screen.queryByLabelText("Remove price filter")).toBeNull()
   })
 })
+
+describe("the Applies to control (BI-18 part C)", () => {
+  const tabs = [{ id: "t1", title: "Overview" }, { id: "t2", title: "Maps" }]
+  function Harness({ canSaveDefault, withTabs = tabs, initial = [] }: { canSaveDefault: boolean; withTabs?: typeof tabs; initial?: FilterDef[] }) {
+    const [state, setState] = React.useState<FilterDef[]>(initial)
+    return (
+      <>
+        <FilterBar board="b1" fields={fields} filters={state} savedFilters={[]} onChange={setState} dirty={false}
+          canSaveDefault={canSaveDefault} saving={false} onSaveDefault={() => {}} onReset={() => {}} tabs={withTabs} />
+        <output data-testid="state">{JSON.stringify(state)}</output>
+      </>
+    )
+  }
+  const state = () => JSON.parse(screen.getByTestId("state").textContent ?? "[]") as FilterDef[]
+
+  it("is offered to an editor of a dashboard with several tabs, and not otherwise", () => {
+    render(<Harness canSaveDefault initial={[{ column: "province", values: ["Bali"] }]} />)
+    fireEvent.click(screen.getByText("province is Bali"))
+    expect(screen.getByText("Applies to")).toBeDefined()
+    cleanup()
+    render(<Harness canSaveDefault={false} initial={[{ column: "province", values: ["Bali"] }]} />)
+    fireEvent.click(screen.getByText("province is Bali"))
+    expect(screen.queryByText("Applies to")).toBeNull()
+    cleanup()
+    render(<Harness canSaveDefault withTabs={[tabs[0]]} initial={[{ column: "province", values: ["Bali"] }]} />)
+    fireEvent.click(screen.getByText("province is Bali"))
+    expect(screen.queryByText("Applies to")).toBeNull()
+  })
+
+  it("ties a filter to a tab and back to every tab", () => {
+    render(<Harness canSaveDefault initial={[{ column: "province", values: ["Bali"] }]} />)
+    fireEvent.click(screen.getByText("province is Bali"))
+    fireEvent.click(screen.getByRole("button", { name: "Maps" }))
+    expect(state()[0].tabs).toEqual(["t2"])
+    fireEvent.click(screen.getByRole("button", { name: "All tabs" }))
+    expect(state()[0].tabs).toBeUndefined()
+  })
+})

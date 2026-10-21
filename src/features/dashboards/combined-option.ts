@@ -1,10 +1,13 @@
 import { displayColumn } from "@/lib/chart-joins";
 import type { EChartsOption } from "echarts";
-import { decimalsFor, formatCompactNumber, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
+import { decimalsFor, monthlyAxisLabel } from "@/lib/chart-axis";
+import { resolvePalette } from "@/lib/chart-palettes";
+import type { StyleFields } from "@/lib/chart-style";
+import { formatAxisValue, formatValue } from "@/lib/value-format";
 import { tileMeasureLabels, type MeasureEntry } from "@/lib/chart-shape";
 import type { LayerAxis, LayerDraw } from "@/lib/chart-layers";
 import { bucketLabel, type Grain } from "@/lib/time-grain";
-import { LEGEND_TEXT, PALETTE, showsPointMarkers } from "./chart-option";
+import { LEGEND_TEXT, showsPointMarkers } from "./chart-option";
 
 /**
  * A chart with more questions on it (`BI-13`): the base chart's series and the
@@ -52,6 +55,10 @@ export type CombinedInput = {
   baseAxis?: LayerAxis;
   /** The grain the buckets were cut with, to label them. */
   grain: Grain | null;
+  /** BI-17: the chart's formats and palette, the number locale and the company palette. */
+  style?: StyleFields;
+  locale?: string;
+  companyPalette?: readonly string[];
 };
 
 export type Combined = {
@@ -109,6 +116,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
   const keys = categoryKeys(rows, x, layers);
   const labels = keys.map((k) => (input.grain ? bucketLabel(input.grain, k) : k));
   const baseCols = Array.isArray(input.y) ? input.y : [input.y];
+  const locale = input.locale ?? "en-US";
   const baseLabel = (c: string) => input.measureLabels?.[c] ?? displayColumn(c);
 
   const series: Series[] = baseCols.map((col, i) => ({
@@ -143,7 +151,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
   const decimals: Record<LayerAxis, number> = { left: decimalsOf("left"), right: decimalsOf("right") };
 
   const option = {
-    color: PALETTE,
+    color: [...resolvePalette(input.style?.colors, input.companyPalette)],
     textStyle: { color: ink, fontFamily: "inherit" },
     tooltip: {
       backgroundColor: dark ? "#18181b" : "#ffffff", borderWidth: 0,
@@ -160,7 +168,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
     yAxis: sides.map((side) => ({
       type: "value",
       position: side,
-      axisLabel: { color: ink, fontSize: 11, formatter: (v: number) => formatCompactNumber(v, decimals[side]) },
+      axisLabel: { color: ink, fontSize: 11, formatter: (v: number) => formatAxisValue(v, input.style?.format, locale, decimals[side]) },
       splitLine: { show: side === sides[0], lineStyle: { color: split } },
       axisLine: { show: false }, axisTick: { show: false },
       // The two axes have different scales (visitors against a rate).
@@ -171,7 +179,7 @@ export function buildCombinedOption(input: CombinedInput, dark: boolean): Combin
       type: s.type,
       yAxisIndex: sides.indexOf(s.axis),
       data: s.values,
-      tooltip: { valueFormatter: (v: unknown) => (typeof v === "number" ? formatNumber(v, decimals[s.axis]) : "–") },
+      tooltip: { valueFormatter: (v: unknown) => (typeof v === "number" ? formatValue(v, input.style?.format, locale, decimals[s.axis]) : "–") },
       emphasis: { focus: "series" },
       ...(s.type === "bar"
         ? { barMaxWidth: 26, itemStyle: { borderRadius: [3, 3, 0, 0] } }

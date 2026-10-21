@@ -22,8 +22,14 @@ export type ChartKind =
   | "sankey" | "sunburst" | "boxplot" | "calendar"
   // single number
   | "kpi" | "gauge"
+  // BI-16 part B: a value against a goal as a bar, a count per range of a number, a value with a target and bands
+  | "progress" | "histogram" | "bullet"
   // non-chart; a pivot is a table whose rows and columns are fields (BI-16 part A)
-  | "table" | "pivot" | "text";
+  | "table" | "pivot" | "text"
+  // no data, no statement (BI-18 part C): a heading, a rule, and a heading that folds the tiles below it
+  | "heading" | "divider" | "section"
+  // BI-16 part B: a picture and a web page from a site an administrator allows (no statement)
+  | "image" | "web";
 export type NumFmt = "int" | "float";
 /** Spec origin: builtin (seeded), AI-generated via chat, or manual via the UI. */
 export type ChartSource = "builtin" | "ai" | "ui";

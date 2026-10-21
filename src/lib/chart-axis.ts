@@ -44,17 +44,24 @@ export function decimalsFor(values: readonly number[]): number {
   return 3
 }
 
-/** `v` with at most `decimals` decimals (none trailing), thousands separated. */
-export function formatNumber(v: number, decimals = 0): string {
-  return v.toLocaleString("en-US", { maximumFractionDigits: decimals })
+/**
+ * `v` with at most `decimals` decimals (none trailing), thousands separated.
+ * `locale` (BI-17: the deployment's number locale) is `en-US` unless the
+ * caller passes one, which is what every chart showed before.
+ */
+export function formatNumber(v: number, decimals = 0, locale = "en-US"): string {
+  return v.toLocaleString(locale, { maximumFractionDigits: decimals })
 }
 
-/** Compact number for axes: 1.2K, 3.5M, 2B; below 1,000 up to `decimals` decimals. */
-export function formatCompactNumber(v: number, decimals = 0): string {
+/**
+ * Compact number for axes: 1.2K, 3.5M, 2B; below 1,000 up to `decimals`
+ * decimals. This is the `auto` style of `value-format.ts`.
+ */
+export function formatCompactNumber(v: number, decimals = 0, locale = "en-US"): string {
   const a = Math.abs(v)
-  const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 })
+  const fmt = (n: number) => n.toLocaleString(locale, { maximumFractionDigits: 1 })
   if (a >= 1_000_000_000) return `${fmt(v / 1_000_000_000)}B`
   if (a >= 1_000_000) return `${fmt(v / 1_000_000)}M`
   if (a >= 1_000) return `${fmt(v / 1_000)}K`
-  return formatNumber(v, decimals)
+  return formatNumber(v, decimals, locale)
 }
