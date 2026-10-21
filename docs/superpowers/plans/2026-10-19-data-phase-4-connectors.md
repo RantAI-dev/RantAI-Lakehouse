@@ -1319,3 +1319,23 @@ connector page must say a test runs one report at the vendor).
   readable from here; `SRC-3-AC1` on a real tenant decides.)
 - Not verified and open for CI: the two gate jobs and their times, the four
   new product entries, the `ingest_spec.rs` tests.
+
+### Review of slice 7 (planner, 2026-10-21, head `9b0a749b`)
+
+Before it: CI on `933de5e8` green, 39 of 39; job A 7m18s, job B 13m23s.
+
+Read: `0096` (guarded updates, eight types; Workday and NetSuite keep a
+reason), `coverage.json`, the lint count (19 supported), the RESULT (it
+says the split rests on one run), the brand-mark choices (only marks
+Simple Icons publishes today: four), the backlog rows `SRC-26` to `SRC-31`.
+Accepted: the gate's first step now expecting eight supported and two not;
+`gate: "g6-saas"` with the job named in each entry's note.
+
+- `SHOULD-FIX 16`. The Sources page header (`connectors-page.tsx`) still
+  names no business apps while eight are now supported. It is a one-line
+  console change in this feature's scope, not a follow-up: change it here
+  and take that part out of `SRC-29` (the six missing brand marks stay).
+- After CI is green on the fix: the product owner's browser check on a QA
+  instance (picker, the ten forms, the GA4 report editor, the SharePoint
+  site picker, a connector page's incremental/full notes). Real-account
+  rows of the checklist wait for decision 11's accounts.
