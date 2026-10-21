@@ -494,6 +494,48 @@ Review SHOULD-FIX items 1 to 4 of slice 1 (round 1), then T2.1 to T2.3, one comm
 8. The harness workflow is its own file, not a job of `ci.yml`: on a manual run `ci.yml`'s change detector has nothing to compare and every other job would start.
 9. Session cap: counted before the multipart upload is opened, not atomic with the insert (two simultaneous requests can overshoot by one); the comment at the constant says so.
 
+### Slice 3
+
+Developer (Claude Sonnet 5.5), branch `feat/data-phase-3-uploads`, `DATA-18` T3.1 to T3.6. The run was
+stopped once by a rate limit and resumed; another session had touched the worktree meanwhile.
+
+**Commits.** `e70723b7` T3.1 shared fixtures; `657a9ce5` T3.2 guess, check route, column list on ingest
+(migration 0091); `b9592280` T3.3 job casts, counts, writes the report (and the retype in the sink);
+`383f1046` T3.4 the settled load carries the report; `89a22b7f` T3.5 wizard; `c6bc8f8c` T3.6 gate; plus this entry.
+
+**Kept from the other session's work.** The T3.1 fixtures, migration 0091, `columns.rs`, and the staged type
+rules and tests, after reading every hunk. Changed: its SQL bound the spec and on-bad-value to `$6,$7`
+(jsonb against text type error), now `$5,$6`, covered by a store test; the call to a removed
+`record_column_spec` is replaced by the atomic claim fields (`columns::claim_fields`) so the column list is
+stored in the same statement that claims the upload; clippy fixes (`assigning_clones`, `too_many_lines`).
+
+**Section 8 items proved locally** (local filesystem destination, as for V4; the real Iceberg write against
+Lakekeeper is CI-only, *not verified* here). Item 5: dlt declares the types as given and there is no variant
+column, but pyiceberg refuses a replace that changes a column type, so the sink drops the table between
+normalize and load when the types differ (`_drop_table_if_types_differ`, `_run_retyping`). Items 6 and 10:
+covered by `test_typed_load.py` and the Parquet/Excel starting-type tests (decision 10).
+
+**Commands run, with counts.** `cargo test -p lakehouse-store --test uploads` 53 passed;
+`cargo test -p lakehouse-api --test upload_routes` 118 passed; `--test route_auth` 44 passed;
+`cargo test -p lakehouse-api --lib upload_` and `columns` 201 passed; `cargo clippy -p lakehouse-api -p
+lakehouse-store --all-targets -- -D warnings` clean; pytest `test_file_ingest.py`, the Parquet, typed-load
+and type tests about 330 passed; bun on the queue, lib, client and connectors test files 419 passed;
+`bun run typecheck` clean; both `ops/lint` scripts OK; `py_compile` on `ops/g9/upload_test.py`.
+
+**Additions beyond the plan text.** `file_upload.bad_values` column (report kept with the upload); `float`
+wire type (from Parquet); a `timezone` flag on timestamp columns; `?table=` on the preview (columns of the
+table for append, decision 9); stricter name rule `^[a-z][a-z0-9]*(_[a-z0-9]+)*$`, at most 128, not `_dlt...`;
+the ninth failure reason "Some values do not fit their column's type."; the choices on trimming and leading
+zeros (text is never trimmed or coerced, so `007` stays text).
+
+**T3.6 gate.** The "every column text" assertion is changed on purpose (see the commit): the load now sends the
+guessed list and each column is checked against its type; a new step covers typed load, `stop`, `null`, and
+the replace back to text.
+
+**Not verified.** The gate and the large-file harness against a real stack; the Lakekeeper Iceberg write;
+`cargo test --workspace` and the full pytest and `bun test` (whole-suite runs are not possible on this machine);
+the `g9-upload` job `timeout-minutes: 25` (may need a measured raise); browser QA of the wizard.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
