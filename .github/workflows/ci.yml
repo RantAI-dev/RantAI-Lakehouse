@@ -2317,7 +2317,6 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
           UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
-          DAGSTER_URL=http://dagster-webserver:3000/graphql
           # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
@@ -2429,6 +2428,9 @@ jobs:
           INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
           PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          # PR #216 CI g6-saas: the API's own default is an unreachable host, so discovery and
+          # runs answered 503 "orchestrator could not be reached"; as the other Dagster-backed gates do.
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
           UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
           UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
           # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
