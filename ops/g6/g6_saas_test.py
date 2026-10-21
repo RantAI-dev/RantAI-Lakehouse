@@ -324,6 +324,169 @@ def step_zendesk() -> None:
     _log("zendesk forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+# ---- the product steps (slice 2 review BLOCKER 4) ------------------------------------------------
+#
+# AD9 and the SRC-9 registry want connect, discover, load and reload to be `real`, which means
+# THROUGH THE PRODUCT, not through the vendor module alone: the connector is created through the API
+# (a type that is `supported = false` is not refused), the API's connection test dials the mock, the
+# discovery routes run on the orchestrator, and `ingest_job` loads into Bronze Iceberg, which the
+# gate reads back through ClickHouse. Built once here for every vendor: a vendor's slice adds an
+# entry to `PRODUCT_VENDORS` and its mock. The browser sign-in cannot be driven without a browser, so
+# it stays a vendor-level step above; these steps sign in with the vendor's integration credential.
+
+PRODUCT_VENDORS: dict[str, dict] = {
+    "hubspot": {
+        "type": "HubSpot", "host": "api.hubapi.com", "account": "123456", "label": "HubSpot",
+        "credential": {"source": "file", "primary": "token"}, "values": {"primary": "stub-private-app-token"},
+        "object": "deals", "target": "saas_gate_hubspot_deals", "cursor": "hs_lastmodifieddate", "text": "dealname",
+        # discovery: the properties API describes deals before a load (decision 9)
+        "preview_columns": {"id", "dealname", "amount"},
+        "first_ids": {"1", "2", "3"}, "reload_ids": {"1", "2", "3", "4"},
+    },
+    "zendesk": {
+        "type": "Zendesk", "host": "acme.zendesk.com", "account": "acme", "label": "Zendesk",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "agent@example.invalid", "secondary": "stub-api-token"},
+        "object": "tickets", "target": "saas_gate_zendesk_tickets", "cursor": "updated_at", "text": "subject",
+        # Zendesk does not describe its fields before a read, so its preview is honestly unsupported
+        "preview_columns": None,
+        "first_ids": {"1", "2", "3", "4", "5", "6"}, "reload_ids": {"1", "2", "3", "4", "5", "6", "7"},
+    },
+}
+
+
+def _poll(what: str, read, ok, timeout_s: int = 90):  # noqa: ANN001, ANN202
+    """Read until `ok(observed)`, else fail naming what was last seen (ClickHouse may lag a load)."""
+    deadline = time.time() + timeout_s
+    observed = None
+    while True:
+        try:
+            observed = read()
+            if ok(observed):
+                return observed
+        except matrix.G6Failure as exc:
+            observed = f"read error: {str(exc)[:200]}"
+        if time.time() >= deadline:
+            raise SaasGateFailure(f"{what}; last saw {observed!r}")
+        time.sleep(3.0)
+
+
+def _bronze_rows(target: str, columns: str) -> list[dict]:
+    """The rows of `bronze.<target>` through ClickHouse, ordered by key, under a `WHERE` (R11)."""
+    matrix._bronze_row_count(target)  # creates the catalog database
+    text = matrix.ch_query(
+        f"SELECT {columns} FROM {matrix.CATALOG_DB}.`bronze.{target}` WHERE 1 "
+        "ORDER BY toString(id) SETTINGS allow_database_iceberg = 1 FORMAT JSONEachRow"
+    )
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _run_and_wait(connector_id: str, label: str) -> None:
+    run_id = matrix._post_ingest_run(connector_id).json().get("runId")
+    if not run_id:
+        raise SaasGateFailure(f"{label}: ingest/run returned no runId")
+    matrix.step_wait_for_run_success(run_id)
+
+
+def step_product(vendor_id: str) -> None:
+    """connect, discover, load, reload and a revoked sign-in for one vendor, through the product."""
+    spec = PRODUCT_VENDORS[vendor_id]
+    label, obj, target, text = spec["label"], spec["object"], spec["target"], spec["text"]
+    started = time.time()
+
+    created = matrix._create_connector(name=f"g6-saas-{vendor_id}", kind=spec["type"], host=spec["host"], credential=spec["credential"])
+    cid = created["id"]
+    derived = created.get("credential") or {}
+    for slot in ("primary", "secondary"):
+        if spec["values"].get(slot):
+            matrix._write_credential_file(derived[slot], spec["values"][slot])
+    resp = matrix.API.put(
+        f"{matrix.API_URL}/api/connectors/{cid}/ingest-spec",
+        json={
+            "adapter": "saas", "ingestMode": "batch",
+            "dial": {"vendor": vendor_id, "account": spec["account"], "auth": {"type": "integration"}},
+            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": ["id"]}],
+        },
+        timeout=15,
+    )
+    if not resp.ok:
+        raise SaasGateFailure(f"{label}: PUT ingest-spec answered {resp.status_code} {resp.text[:300]}")
+    _log(f"{vendor_id} create: the {spec['type']} connector (a type that is not supported yet) was created and its spec saved through the API")
+
+    # connect: the API's connection test dials the mock vendor with the saved credential.
+    test = matrix.API.post(f"{matrix.API_URL}/api/connectors/{cid}/test", timeout=30)
+    body = test.json() if test.ok else {}
+    _expect(test.ok and body.get("supported") is True and body.get("ok") is True, f"{vendor_id} connect: POST .../test answered {test.status_code} {str(body)[:300]}")
+    _expect(spec["account"] in str(body.get("message")) and VENDOR_WORDS not in str(body), f"{vendor_id} connect: the message does not name the account, or repeats the vendor: {body.get('message')!r}")
+    _log(f"{vendor_id} connect: the API's connection test passed and named the account ({body.get('latencyMs')} ms)")
+
+    # discover: through the orchestrator.
+    listing = matrix.discovery_answer(cid, "list", {})
+    found = next((o for o in listing.get("objects") or [] if o.get("name") == obj), None)
+    _expect(listing.get("state") == "done" and found is not None, f"{vendor_id} discover: the list is {listing.get('state')!r} {listing.get('errorClass')!r}, without {obj!r}")
+    _expect(found.get("load") == "incremental", f"{vendor_id} discover: {obj} should say it loads incrementally, says {found.get('load')!r}")
+    preview = matrix.discovery_answer(cid, "preview", {"object": obj})
+    if spec["preview_columns"] is None:
+        _expect(preview.get("state") == "failed" and preview.get("errorClass") == "not_supported", f"{vendor_id} discover: expected an honest not_supported preview, got {preview.get('state')!r} {preview.get('errorClass')!r}")
+        detail = "its preview is honestly unsupported (no describe)"
+    else:
+        names = {c.get("name") for c in preview.get("columns") or []}
+        _expect(preview.get("state") == "done" and spec["preview_columns"] <= names, f"{vendor_id} discover: the preview shows {sorted(names)[:12]}")
+        detail = f"previewed {len(names)} columns"
+    _log(f"{vendor_id} discover: {len(listing['objects'])} objects listed by the orchestrator, {obj} loads incrementally; {detail}")
+
+    # load: ingest_job into Bronze Iceberg, read back.
+    _run_and_wait(cid, f"{vendor_id} load")
+    columns = f"id, {text}" + (", status" if vendor_id == "zendesk" else "")
+    rows = _poll(f"{vendor_id} load: Bronze {target}", lambda: _bronze_rows(target, columns), lambda r: len(r) == len(spec["first_ids"]))
+    _expect({str(r["id"]) for r in rows} == spec["first_ids"], f"{vendor_id} load: Bronze holds ids {[r['id'] for r in rows]}")
+    _log(f"{vendor_id} load: {len(rows)} rows in Bronze {target}, read back through ClickHouse, each once")
+
+    # reload: the vendor changes; only the changed and new records are read, merged on the key.
+    if vendor_id == "hubspot":
+        admin("hubspot", action="put", object="deals", id=2, properties={"dealname": "deal 2 changed"})
+        admin("hubspot", action="put", object="deals", id=4, properties={"dealname": "deal 4 new"})
+        admin("hubspot", action="archive", object="deals", id=1)
+    else:
+        admin("zendesk", action="put", id=2, fields={"subject": "ticket 2 changed"})
+        admin("zendesk", action="put", id=7, fields={"subject": "ticket 7 new"})
+        admin("zendesk", action="delete", id=3)
+    admin(vendor_id, action="clear_log")
+    _run_and_wait(cid, f"{vendor_id} reload")
+    after = _poll(
+        f"{vendor_id} reload: Bronze {target}", lambda: _bronze_rows(target, columns),
+        lambda r: {str(x["id"]) for x in r} == spec["reload_ids"] and any("changed" in str(x[text]) for x in r),
+    )
+    ids = [str(r["id"]) for r in after]
+    _expect(len(ids) == len(set(ids)), f"{vendor_id} reload: a key is in Bronze twice: {ids}")
+    by_id = {str(r["id"]): r for r in after}
+    _expect("changed" in str(by_id["2"][text]), f"{vendor_id} reload: ticket/deal 2 was not updated")
+    if vendor_id == "zendesk":
+        _expect(by_id["3"]["status"] == "deleted", "zendesk reload: the deleted ticket does not say status = deleted in Bronze")
+        _expect(len(by_id) == 7, "zendesk reload: a ticket was lost")
+    else:
+        _expect("1" in by_id, "hubspot reload: the archived deal vanished; no delete is claimed, so it must stay")
+    seen = mock_log(vendor_id)
+    reads = [line for line in seen if "/search" in line or "cursor" in line or "incremental" in line]
+    _expect(reads, f"{vendor_id} reload: the mock saw no incremental request ({seen})")
+    _expect(not any(line == "GET /crm/v3/objects/deals" for line in seen), f"{vendor_id} reload: it listed every deal again")
+    _log(f"{vendor_id} reload: the changed and the new record merged on the key, no duplicate; "
+         + ("the deleted ticket says status = deleted" if vendor_id == "zendesk" else "the archived deal stays (HubSpot reports no deletes)"))
+
+    # revoked sign-in, through the API's test and a run.
+    admin(vendor_id, action="revoke", on=True)
+    try:
+        test = matrix.API.post(f"{matrix.API_URL}/api/connectors/{cid}/test", timeout=30)
+        body = test.json() if test.ok else {}
+        _expect(test.ok and body.get("ok") is False and VENDOR_WORDS not in str(body), f"{vendor_id} revoked: the connection test said {str(body)[:300]}")
+        run_id = matrix._post_ingest_run(cid).json().get("runId")
+        matrix.step_wait_for_run_failure(run_id)
+    finally:
+        admin(vendor_id, action="revoke", on=False)
+    _log(f"{vendor_id} revoked sign-in: the API's test fails in plain words and the run fails; none of the vendor's words appear in the test")
+    _log(f"{vendor_id} product steps took {time.time() - started:.0f} s")
+
+
 def run_vendors() -> None:
     _setup_vendor_environment()
     step_hubspot()
@@ -331,11 +494,15 @@ def run_vendors() -> None:
 
 
 def run() -> None:
-    matrix._wait_for("lakehouse-api", lambda: matrix.API.get(f"{matrix.API_URL}/health", timeout=5).status_code == 200, 120)
+    matrix.step_wait_for_services()  # ClickHouse, the API, Dagster and its code location
     matrix.step_login()
     matrix.step_ensure_tenant()
     step_stub_is_up()
     step_types_are_listed_unsupported()
+    _setup_vendor_environment()
+    for vendor_id in PRODUCT_VENDORS:
+        admin(vendor_id, action="reset")
+        step_product(vendor_id)
     run_vendors()
 
 

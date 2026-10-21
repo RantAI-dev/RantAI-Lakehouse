@@ -2317,6 +2317,7 @@ jobs:
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
           UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
           # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
           # throwaway values for this job's own throwaway stack; they protect
           # nothing and are never used outside it.
@@ -2371,25 +2372,27 @@ jobs:
   # Own job, so no existing connector gate grows: `g6-ingest-other` measured
   # 14m53s to 18m36s of its 20 minutes (docs/plans/SRC-9-RESULT.md). One mock
   # vendor server (`saas-stub-g6`, profile `g6-saas`) answers for every vendor
-  # on its own path prefix. Slice 1 has no vendor behind the adapter: the gate
-  # needs only the API (and what it depends on) and the stub, and asserts the
-  # ten types are listed as not supported. Each vendor adds its steps in its
-  # own slice, and Dagster joins this stack with the first load step. Budget:
-  # the signed 20 minutes for connector gates; the first CI runs are its
-  # measurement. Not run against a real stack before it reached CI. ──
+  # on the vendor's own port. Since the slice 2 review (BLOCKER 4) the gate goes
+  # through the product: connectors created through the API, the API's connection
+  # test, discovery and loads through Dagster into Bronze Iceberg, read back through
+  # ClickHouse; so the job runs the Dagster stack as `g6-ingest-other` does, with the
+  # gate-only switches of `ops/g6/docker-compose.g6-saas.override.yml` on the API and
+  # the code location. Budget: the signed 20 minutes for connector gates; the first CI
+  # runs are its measurement (the job summary has the gate's lines and times). ──
   g6-saas:
     name: Rust · SRC-3 business-app connectors
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
       COMPOSE: >-
         docker compose -p saasgci -f docker-compose.yml
         -f ops/g6/docker-compose.g6.override.yml
-        --profile g6-saas
+        -f ops/g6/docker-compose.g6-saas.override.yml
+        --profile g6-saas --profile dagster
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -2442,8 +2445,8 @@ jobs:
       - name: Build the fixture images (oidc-mock, saas-stub-g6)
         run: $COMPOSE build oidc-mock saas-stub-g6
 
-      - name: Bring up the API and the mock vendor server
-        run: $COMPOSE up -d --no-build lakehouse-api saas-stub-g6
+      - name: Bring up the API, Dagster and the mock vendor server
+        run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
 
       - name: Gate, business-app connectors
         shell: bash
