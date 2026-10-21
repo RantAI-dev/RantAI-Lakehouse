@@ -312,7 +312,11 @@ jobs:
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 40, not 25: on `main` this job took 16-23 min (last six runs before
+    # 2026-10-21), and PR #106 (catalog phase 2) ran out of the 25-min budget
+    # twice with every test passing up to the cancel. The budget is a guard
+    # against a hung test, not a speed target; a hang still ends here.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v7
