@@ -1703,7 +1703,12 @@ pub async fn set_board_embed_origins(
 
 /// "Withdraw all embed tokens" for a board (`SEC-12`): every token whose
 /// `iat` is at or before `now_unix_seconds` is refused from the next request.
-/// Returns the stored instant.
+///
+/// Returns the cut-off in force: the maximum over every `revoke_all` event
+/// of this board, which is what the refusal check enforces. A later, smaller
+/// value cannot move the cut-off back, and another session's withdrawal (a
+/// larger one) is what is enforced, so the answer is read back rather than
+/// the instant this call wrote.
 ///
 /// # Errors
 ///
@@ -1724,7 +1729,11 @@ pub async fn revoke_all_embed_tokens(
         now_unix_seconds,
     );
     ch.exec(&sql, None).await?;
-    Ok(now_unix_seconds)
+    // PR #201 review F SHOULD-FIX 7: the cut-off in force is the maximum over
+    // every `revoke_all` event of this board, not the instant this call
+    // wrote — the answer the caller shows must be the one that is enforced.
+    let access = get_board_embed_access(ch, id).await?;
+    Ok(access.revoked_before.max(now_unix_seconds))
 }
 
 /// "Withdraw one embed token" for a board (`SEC-12`): a token carrying
@@ -5189,6 +5198,60 @@ mod tests {
                 && insert_statements[2].contains("1700003600"),
             "withdraw insert: {}",
             insert_statements[2]
+        );
+    }
+
+    /// PR #201 review F SHOULD-FIX 7: "withdraw all" answers the cut-off in
+    /// force — the maximum over every `revoke_all` event of the board — not
+    /// the instant this call wrote. The response the Share dialog shows must
+    /// be the one the refusal check enforces.
+    #[tokio::test]
+    async fn a_withdraw_all_answers_the_cut_off_in_force() {
+        /// Answers the event table with a withdrawal whose instant is LATER
+        /// than the one the call under test writes.
+        struct MockEvents;
+        impl wiremock::Respond for MockEvents {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let sql = String::from_utf8_lossy(&request.body);
+                if sql.contains("FROM console.bi_board_embed_event") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "meta": [],
+                        "data": [{
+                            "kind": "revoke_all",
+                            "revoked_before": "1700009999",
+                            "jti": "",
+                            "exp": "0",
+                            "origins_json": "[]"
+                        }],
+                        "rows": 1
+                    }));
+                }
+                if sql.contains("FROM console.bi_board FINAL") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "meta": [],
+                        "data": [{"1": 1}],
+                        "rows": 1
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_string("Ok.\n")
+            }
+        }
+
+        let _lock = TEST_DDL_LOCK.lock().await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MockEvents)
+            .mount(&server)
+            .await;
+        let ch = client(&server.uri());
+
+        let answer = revoke_all_embed_tokens(&ch, "b_1", 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer, 1_700_009_999,
+            "the cut-off in force, not the instant this call wrote"
         );
     }
 
