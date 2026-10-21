@@ -5974,3 +5974,124 @@ async fn adding_to_a_typed_table_keeps_its_columns_and_replacing_may_change_them
         changed.text
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// The report of values that did not fit (DATA-18 T3.4)
+// ════════════════════════════════════════════════════════════════════════
+
+const BAD_VALUES_REASON: &str = "Some values do not fit their column's type.";
+
+fn report_bytes(count: u64) -> Vec<u8> {
+    json!({
+        "count": count,
+        "byColumn": [{ "column": "qty", "count": count }],
+        "rows": [{ "row": 2, "column": "qty", "value": "abc" }],
+        "secret": "never copied",
+    })
+    .to_string()
+    .into_bytes()
+}
+
+async fn seed_typed_loading(stack: &Stack, id: &str) {
+    stack
+        .seed_loading(GROUP, id, "stock_raw", Some("run-1"), "1 hour")
+        .await;
+    sqlx::query("UPDATE file_upload SET column_spec = $2, on_bad_value = 'null' WHERE id = $1")
+        .bind(id)
+        .bind(sqlx::types::Json(
+            json!([{ "source": "qty", "name": "qty", "type": "integer" }]),
+        ))
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+}
+
+/// When a typed load is settled, the job's report is kept on the upload, rebuilt
+/// from the fields the API knows; a load that succeeded and one told to stop both
+/// carry it.
+#[tokio::test]
+async fn a_settled_typed_load_carries_the_report_of_values_that_did_not_fit() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "SUCCESS").await;
+    seed_typed_loading(&stack, "up-1").await;
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-1.csv.bad-values.json"),
+        &report_bytes(3),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-1", "succeeded", Some(7), "", 30)]),
+    )
+    .await;
+
+    let reply = stack.get(&bayu, "/api/uploads/up-1").await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["status"], "ingested");
+    assert_eq!(
+        reply.json["badValues"],
+        json!({ "count": 3, "byColumn": [{ "column": "qty", "count": 3 }], "rows": [{ "row": 2, "column": "qty", "value": "abc" }] }),
+        "only the fields the API knows"
+    );
+    assert!(!reply.text.contains("never copied"));
+    assert!(
+        !reply.text.contains("bad-values.json"),
+        "no storage key reaches a response"
+    );
+
+    // A load told to stop: failed, with the fixed reason, and the report.
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    seed_typed_loading(&stack, "up-2").await;
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-2.csv.bad-values.json"),
+        &report_bytes(5),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-2", "failed", None, BAD_VALUES_REASON, 30)]),
+    )
+    .await;
+    let failed = stack.get(&bayu, "/api/uploads/up-2").await;
+    assert_eq!(failed.json["status"], "failed");
+    assert_eq!(failed.json["error"], BAD_VALUES_REASON);
+    assert_eq!(failed.json["badValues"]["count"], 5);
+}
+
+/// No report, a report that is not the job's shape, and a report of an upload
+/// that was loaded with no column list are all no report.
+#[tokio::test]
+async fn a_missing_malformed_or_unasked_for_report_is_no_report() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "SUCCESS").await;
+    seed_typed_loading(&stack, "up-1").await; // typed, nothing written
+    seed_typed_loading(&stack, "up-2").await; // typed, a report that is not the shape
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-2.csv.bad-values.json"),
+        b"{\"count\":\"many\"}",
+    );
+    stack
+        .seed_loading(GROUP, "up-3", "stock_raw", Some("run-1"), "1 hour")
+        .await; // untyped
+    stack.bucket.put(
+        &format!("uploads/{GROUP}/up-3.csv.bad-values.json"),
+        &report_bytes(9),
+    );
+    mount_results(
+        &stack.ch,
+        &json!([
+            result_row("up-1", "succeeded", Some(1), "", 30),
+            result_row("up-2", "succeeded", Some(1), "", 30),
+            result_row("up-3", "succeeded", Some(1), "", 30),
+        ]),
+    )
+    .await;
+    for id in ["up-1", "up-2", "up-3"] {
+        let reply = stack.get(&bayu, &format!("/api/uploads/{id}")).await;
+        assert_eq!(reply.json["status"], "ingested", "{id}: {}", reply.text);
+        assert!(reply.json.get("badValues").is_none(), "{id}");
+    }
+}

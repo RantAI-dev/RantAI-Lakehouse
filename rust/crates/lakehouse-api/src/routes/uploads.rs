@@ -1071,7 +1071,11 @@ impl<'a> Settler<'a> {
             }
         };
         match settled {
-            Ok(Some(updated)) => updated,
+            Ok(Some(updated)) => match run_id {
+                // `DATA-18`: a typed load may have left a report of values that did not fit.
+                Some(run_id) => columns::keep_report(self.state, self.pool, updated, run_id).await,
+                None => updated,
+            },
             Ok(None) => uploads::get(self.pool, &row.id)
                 .await
                 .ok()

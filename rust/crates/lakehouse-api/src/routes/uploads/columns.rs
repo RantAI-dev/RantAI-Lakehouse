@@ -413,3 +413,124 @@ const fn date_format_word(format: crate::upload_types::DateFormat) -> &'static s
         crate::upload_types::DateFormat::Mdy => "mdy",
     }
 }
+
+// ── the load's report ────────────────────────────────────────────────────
+
+/// The suffix of the object the job writes its report to, beside the upload
+/// (`file_ingest.REPORT_SUFFIX`).
+const REPORT_SUFFIX: &str = ".bad-values.json";
+
+/// The most bytes of a report the API reads: 100 values of 200 characters and the
+/// counts of up to 1,000 columns fit in a few tens of KiB; a larger object is not
+/// the job's.
+const MAX_REPORT_BYTES: usize = 256 * 1024;
+
+/// Read the job's report of values that did not fit out of the bytes of the
+/// object, rebuilding it from the fields the API knows: `{count, byColumn, rows}`
+/// with at most 100 rows of 200 characters, so nothing else the object holds
+/// (it is written by the job, but it is storage) reaches a response. `None` for
+/// anything that is not that shape.
+#[must_use]
+pub(super) fn parse_report(bytes: &[u8]) -> Option<Value> {
+    use crate::upload_types::{MAX_LISTED, MAX_VALUE_CHARS};
+    let Value::Object(object) = serde_json::from_slice::<Value>(bytes).ok()? else {
+        return None;
+    };
+    let count = object.get("count")?.as_u64().filter(|n| *n > 0)?;
+    let by_column: Vec<Value> = object
+        .get("byColumn")?
+        .as_array()?
+        .iter()
+        .take(1_000)
+        .map(|entry| {
+            let column = entry.get("column")?.as_str()?;
+            let n = entry.get("count")?.as_u64()?;
+            Some(json!({ "column": column.chars().take(128).collect::<String>(), "count": n }))
+        })
+        .collect::<Option<_>>()?;
+    let rows: Vec<Value> = object
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .take(MAX_LISTED)
+        .map(|entry| {
+            Some(json!({
+                "row": entry.get("row")?.as_u64()?,
+                "column": entry.get("column")?.as_str()?.chars().take(128).collect::<String>(),
+                "value": entry.get("value")?.as_str()?.chars().take(MAX_VALUE_CHARS).collect::<String>(),
+            }))
+        })
+        .collect::<Option<_>>()?;
+    Some(json!({ "count": count, "byColumn": by_column, "rows": rows }))
+}
+
+/// After a typed load is settled, keep the job's report on the upload, whatever
+/// the outcome (a `stop` load fails with it, a `null` load succeeds with it).
+/// Returns the row as it is afterwards. A missing or unreadable report changes
+/// nothing: no values to report is the common case. Never fails the settling.
+pub(super) async fn keep_report(
+    state: &AppState,
+    pool: &lakehouse_store::PgPool,
+    row: Upload,
+    run_id: &str,
+) -> Upload {
+    if row.column_spec.is_none() {
+        return row;
+    }
+    let Ok(store) = crate::upload_store::UploadStore::connect(&state.config).await else {
+        return row;
+    };
+    let key = format!("{}{REPORT_SUFFIX}", row.storage_key);
+    let Ok(bytes) = store.head_bytes(&key, MAX_REPORT_BYTES).await else {
+        return row;
+    };
+    let Some(report) = parse_report(&bytes) else {
+        return row;
+    };
+    match uploads::record_bad_values(pool, &row.id, run_id, &report).await {
+        Ok(true) => uploads::get(pool, &row.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(row),
+        _ => row,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn a_report_is_rebuilt_from_the_fields_the_api_knows_and_bounded() {
+        let rows: Vec<Value> = (0..150)
+            .map(|n| json!({ "row": n, "column": "c", "value": "v".repeat(500) }))
+            .collect();
+        let raw = json!({ "count": 150, "byColumn": [{ "column": "c", "count": 150 }], "rows": rows, "extra": 1 });
+        let report = parse_report(raw.to_string().as_bytes()).unwrap();
+        assert_eq!(report["count"], 150);
+        assert_eq!(report["rows"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            report["rows"][0]["value"].as_str().unwrap().chars().count(),
+            200
+        );
+        assert!(report.get("extra").is_none());
+    }
+
+    #[test]
+    fn what_is_not_a_report_is_none() {
+        for bad in [
+            "",
+            "[]",
+            "{}",
+            r#"{"count":0,"byColumn":[],"rows":[]}"#,
+            r#"{"count":"3","byColumn":[],"rows":[]}"#,
+            r#"{"count":1,"byColumn":[{"column":1,"count":1}],"rows":[]}"#,
+            r#"{"count":1,"byColumn":[],"rows":[{"row":1}]}"#,
+        ] {
+            assert!(parse_report(bad.as_bytes()).is_none(), "{bad:?}");
+        }
+    }
+}
