@@ -636,6 +636,13 @@ ACTIONS = (ACTION_REFRESH_KEEP, ACTION_REFRESH_REMOVE, ACTION_CLEAR)
 _REFRESH_OF_ACTION = {ACTION_REFRESH_KEEP: "keep", ACTION_REFRESH_REMOVE: "remove"}
 
 
+def _run_author(connector_id: str, run_id: str | None) -> str:
+    """Who our own `pyiceberg` commits are recorded as (`DATA-15` F5): the connector and
+    the first eight characters of the Dagster run, e.g. `connector conn-x, run 1a2b3c4d`.
+    The run part is left out when there is no run id, never invented."""
+    return f"connector {connector_id}, run {run_id[:8]}" if run_id else f"connector {connector_id}"
+
+
 def _single_table_request(connector_id: str, object_name: Any, action: Any) -> tuple[str, str] | None:
     """The `(object, action)` a run was started with, or `None` for an ordinary run
     of every table. Both or neither: an `object` without an `action` (or the reverse)
@@ -716,7 +723,9 @@ def _run_one_object(
         try:
             sink_adapter.clear_table(
                 obj["target"],
-                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                sink_adapter.SinkConfig.from_bronze_ingest_config(
+                    dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+                ),
             )
         except Exception as exc:  # noqa: BLE001 -- every failure still gets a row (never silently invisible)
             _record(rows=None, status="failed", error=_classify_exception(exc))
@@ -781,7 +790,9 @@ def _run_one_object(
             outcome = sink_adapter.load_via_sink(
                 result.source,
                 obj["target"],
-                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                sink_adapter.SinkConfig.from_bronze_ingest_config(
+                    dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+                ),
                 plan,
             )
             _record(rows=outcome.rows, status="succeeded")
@@ -845,7 +856,9 @@ def _run_one_object(
             source, resolved = result.source, result.resolved
 
         def _load():
-            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(
+                dlt_pipeline.BronzeIngestConfig.from_env(), author=_run_author(connector_id, run_id)
+            )
             return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan)
 
         host = _host_of(dial)

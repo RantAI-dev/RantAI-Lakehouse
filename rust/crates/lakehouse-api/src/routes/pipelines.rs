@@ -2811,10 +2811,12 @@ pub async fn run_finished_event(
     // may deliver `connector_success`. An upload's success needs no alert.
     if load_alerts::is_connector_job(&req.job_name) {
         return Ok(ApiJson(
-            load_alerts::connector_run_event(&state, pool, &req, load_alerts::Outcome::Success)
-                .await?,
+            super::quality_load::connector_success(&state, pool, &req).await?,
         ));
     }
+    // DATA-14 (F4): an upload's success needs no alert, but its table was just
+    // loaded (followed up in the background); the answer stays "unknown jobName".
+    super::quality_load::spawn_upload(&state, &req);
     let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
         return Ok(ApiJson(json!({
             "matched": 0,
@@ -2841,6 +2843,14 @@ pub async fn run_finished_event(
         ))
         .into());
     }
+    // DATA-13 (F2): the run is confirmed SUCCESS, so the SQL it ran becomes
+    // the pipeline's column lineage. A failed run was refused above and
+    // writes nothing.
+    super::lineage::columns::record_pipeline_run(&state, pool, &pipeline_id).await;
+    // DATA-14 (F4): the same confirmed success starts the on-load checks of
+    // the pipeline's target table, in the background; nothing here can fail
+    // this event.
+    super::quality_load::spawn_pipeline(&state, &req.run_id, &pipeline_id);
     // Plan 1f: compute the two per-run outcomes from the run's own data
     // and the pipeline's `pipeline_sla` row, then hand them to the
     // evaluator. `slow` is `None` when no duration SLA is configured
@@ -9446,11 +9456,15 @@ mod tests {
                 "the retry for the same (run, kind) is deduped away"
             );
 
-            let rows: Vec<(String, String, String)> =
-                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
-                    .fetch_all(&pool)
-                    .await
-                    .expect("read the dedupe table");
+            // DATA-14 (F4): the load's quality follow-up is deduped in this table
+            // too, in the background; this test is about the alert kinds.
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT run_id, pipeline_id, kind FROM pipeline_run_event \
+                 WHERE kind <> 'quality_load'",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("read the dedupe table");
             assert_eq!(
                 rows,
                 vec![(

@@ -156,15 +156,18 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-13` | Feature | Table discovery for every source type, not only databases. | Data | P2 | In Acceptance | [#144](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/144) | `reference/competitive-comparison.md` (Data matrix) |
 | `SRC-15` | Feature | Load a SQL column whose type changed to one its Bronze column cannot hold (integer to text, text to a number, a changed decimal) into a second column when the change is approved. Today such a change cannot be approved and the table waits (`SRC-8`, decision 10). Starts after the g6 gate has shown the loader's behaviour on a real database. No spec yet | Data | P3 | Idea |  | `features/source-schema-changes.md` |
 | `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07). **Blocked by `SRC-11` (column choice), `SEC-14` (credentials)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter waits for `DATA-12` | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
+| `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter is built with `DATA-12` part 1 | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
 | `DATA-20` | Feature | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data | P2 | Idea |  | `features/catalog-search.md` |
-| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values. In three parts: marks in search, the Data Explorer and the asset page, set with `governance:write` (part 1); governed tags (part 2); marks in the chart builder and Query Studio (part 3). All three parts built on the phase-2 branch | Data | P2 | Building | #106 | `features/certification-and-governed-tags.md` |
+| `DATA-22` | Feature | A tag on a namespace applies to its tables. Split from `DATA-12` by the product owner (2026-10-09): a namespace is one of four fixed names with no stored record and no page to edit | Data | P3 | Idea |  | `features/certification-and-governed-tags.md` |
+| `DATA-23` | Task | The Catalog page's links to the Data Explorer filter by a namespace's display name where assets carry its id, so by reading the code they match nothing (found planning `DATA-12`; not run) | Data | P2 | Todo |  | `plans/2026-10-09-data-12-part-1-certification.md` |
+| `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-16` | Task | Time travel proven safe on ClickHouse: a gate test that a past-version query keeps masking and row filters, a fix so a role named by a policy can read the policy's raw table at all, a version picker that follows the engine, and a plain refusal on Trino (`specs/data-16.md`) | Data | P2 | Done | #100 | `features/time-travel.md` |
 | `DATA-21` | Task | Past versions and masking on Trino: the masking rewrite writes ClickHouse functions for both engines and cannot read Trino's version clause, so on Trino a past version is refused and, by reading, a masked table cannot be read at all. Needs the rewrite made engine-aware and a gate with Trino. Split from `DATA-16` by the product owner (2026-10-09) | Data | P2 | Todo |  | `features/time-travel.md` |
 | `DATA-25` | Task | Time travel follow-ups from the `DATA-16` review: a past version that does not exist reaches the Query Studio response as ClickHouse's own text (principle 4); the Trino refusal (422) for a past-version query has no route-level test | Data | P2 | Todo |  | PR #100 review |
+| `DATA-26` | Task | Record who wrote each Iceberg version on loads written through dlt (the loader commits without snapshot properties, so `DATA-15`'s history says "unknown" for them); owned by the orchestration owners | Data | P3 | Todo |  | `plans/2026-10-16-data-15-asset-page-depth.md` |
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | In Acceptance | #165 | `reference/competitive-comparison.md` (Data matrix) |
@@ -274,7 +277,7 @@ parity), built after it.
 | `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
-| `DATA-13` | Planned | — | `BI-14` (column part) |
+| `DATA-13` | Building | — | `BI-14` (column part) |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
 | `DEC-9` | Open (decision) | — | `SRC-3` |
@@ -322,6 +325,10 @@ set by the product owner and are left empty until they are.
 | `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
+| `DATA-12` | 2026-10-09 | | |
+| `DATA-13` | 2026-10-16 | | |
+| `DATA-14` | 2026-10-16 | | |
+| `DATA-15` | 2026-10-16 | | |
 | `DATA-16` | 2026-10-09 | 2026-10-12 | |
 | `SEC-23` | 2026-10-09 | 2026-10-12 | |
 | `WEB-1` | 2026-10-11 | 2026-10-11 | |

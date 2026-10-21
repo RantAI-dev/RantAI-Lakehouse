@@ -511,8 +511,26 @@ def ensure_columns(
     pipeline.run(resource, table_name=table, table_format="iceberg", write_disposition="append")
 
 
+AUTHOR_PROPERTY = "rantai.author"
+
+
+def snapshot_properties(author: str) -> dict[str, str]:
+    """The snapshot summary entries that record who made a commit (`DATA-15` F5): the
+    one key the console's Snapshots card reads as the version's author. Empty for an
+    empty `author`, so a commit made without a run context records nothing rather than a
+    guess, and the page says "unknown". `pyiceberg` copies these into the snapshot's
+    summary, next to the keys it writes itself."""
+    return {AUTHOR_PROPERTY: author} if author else {}
+
+
 def write_versions(
-    iceberg_table: Any, key: tuple[str, ...], versions: Versions, *, table: str, load_time: datetime
+    iceberg_table: Any,
+    key: tuple[str, ...],
+    versions: Versions,
+    *,
+    table: str,
+    load_time: datetime,
+    author: str = "",
 ) -> None:
     """ONE transaction: the closed rows replace the current rows they close (matched
     on the key and `_valid_from`) and the new rows are appended. A failure anywhere
@@ -530,11 +548,14 @@ def write_versions(
     with iceberg_table.transaction() as transaction:
         if closed_arrow is not None:
             result = transaction.upsert(
-                closed_arrow, join_cols=[*key, "_valid_from"], when_not_matched_insert_all=False
+                closed_arrow,
+                join_cols=[*key, "_valid_from"],
+                when_not_matched_insert_all=False,
+                snapshot_properties=snapshot_properties(author),
             )
             if result.rows_updated != len(versions.closed):
                 raise HistoryRefused(f"table {table!r}: its current rows changed while this load ran; load again")
-        transaction.append(new_arrow)
+        transaction.append(new_arrow, snapshot_properties=snapshot_properties(author))
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +585,10 @@ def load_history(
     *,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     limits: dedup.DedupLimits | None = None,
+    author: str = "",
 ) -> HistoryOutcome:
-    """One history load; see the module docstring. `pipeline` is the table's
+    """One history load; see the module docstring. `author` is recorded on the commits
+    as `rantai.author` (`snapshot_properties`). `pipeline` is the table's
     `dlt` pipeline with no package pending. Returns the number of NEW rows written
     (the closed rows are not counted) and of rows closed; `0, 0` when nothing
     changed, in which case nothing was written and nothing committed.
@@ -619,5 +642,5 @@ def load_history(
         iceberg_table = open_table(pipeline, table)
     if iceberg_table is None:
         raise HistoryRefused(f"table {table!r}: the table could not be created")
-    write_versions(iceberg_table, key, versions, table=table, load_time=load_time)
+    write_versions(iceberg_table, key, versions, table=table, load_time=load_time, author=author)
     return HistoryOutcome(new_versions=len(versions.new), closed=len(versions.closed))

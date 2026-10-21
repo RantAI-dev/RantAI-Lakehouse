@@ -389,9 +389,14 @@ class SinkConfig:
     rustfs_secret_key: str
     warehouse_bucket: str
     lakekeeper_token: str
+    # Who the commits of OUR OWN `pyiceberg` writes (the history mode, emptying a table)
+    # are recorded as: the run's label, e.g. `connector conn-x, run 1a2b`
+    # (`history.snapshot_properties`). Empty when the caller has no run context; `dlt`'s
+    # own commits do not carry it (`DATA-15` F5: that is the loader's owners' change).
+    author: str = ""
 
     @classmethod
-    def from_bronze_ingest_config(cls, config: BronzeIngestConfigLike) -> "SinkConfig":
+    def from_bronze_ingest_config(cls, config: BronzeIngestConfigLike, author: str = "") -> "SinkConfig":
         return cls(
             lakekeeper_catalog_uri=config.lakekeeper_catalog_uri,
             lakekeeper_warehouse=config.lakekeeper_warehouse,
@@ -400,6 +405,7 @@ class SinkConfig:
             rustfs_secret_key=config.rustfs_secret_key,
             warehouse_bucket=config.warehouse_bucket,
             lakekeeper_token=config.lakekeeper_token,
+            author=author,
         )
 
 
@@ -623,7 +629,7 @@ def _bronze_pipeline(bronze_table_name: str, config: SinkConfig) -> Any:
     )
 
 
-def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
+def empty_table(pipeline: Any, bronze_table_name: str, author: str = "") -> bool:
     """Delete every row of a Bronze table in ONE `pyiceberg` transaction, keeping the
     table: its columns, its day partition on `_ingested_at`, `format-version` 2 and its
     snapshot history. The ONE way a Bronze table is emptied (`clear_table`, a refresh
@@ -649,6 +655,8 @@ def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
     history pass: it tolerates a write of ours), so its view stays consistent; the
     cursor and marker are forgotten by the caller.
 
+    `author` is recorded on the commit as `rantai.author` (`history.snapshot_properties`).
+
     # Errors
 
     Whatever the catalog raises; `RuntimeError` (fixed text) if a row remains after
@@ -659,7 +667,7 @@ def empty_table(pipeline: Any, bronze_table_name: str) -> bool:
     with warnings.catch_warnings():
         # pyiceberg warns when a delete matches nothing: an already empty table.
         warnings.filterwarnings("ignore", message="Delete operation did not match any records")
-        iceberg_table.delete(delete_filter=AlwaysTrue())
+        iceberg_table.delete(delete_filter=AlwaysTrue(), snapshot_properties=history.snapshot_properties(author))
     if iceberg_table.scan(limit=1).to_arrow().num_rows:
         raise RuntimeError(f"table {bronze_table_name!r}: rows remained after the delete")
     return True
@@ -679,7 +687,7 @@ def clear_table(bronze_table_name: str, config: SinkConfig) -> SinkResult:
     pipeline = _bronze_pipeline(bronze_table_name, config)
     _abort_pending(pipeline, strict=True)
     _forget_table_state(pipeline)
-    emptied = empty_table(pipeline, bronze_table_name)
+    emptied = empty_table(pipeline, bronze_table_name, config.author)
     return SinkResult(
         rows=0,
         has_failed_jobs=False,
@@ -807,7 +815,7 @@ def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan:
         _forget_table_state(pipeline)
     try:
         outcome = history.load_history(
-            pipeline, source, bronze_table_name, plan.key, _apply_iceberg_hints
+            pipeline, source, bronze_table_name, plan.key, _apply_iceberg_hints, author=config.author
         )
     except Exception:
         _abort_pending(pipeline)

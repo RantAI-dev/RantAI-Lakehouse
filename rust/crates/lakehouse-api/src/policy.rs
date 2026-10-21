@@ -216,6 +216,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    permission string, no grant migration (WS2 plan review W8). ─────
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
+    // DATA-12 D1: the certified / deprecated mark is its own write, behind
+    // `governance:write`, so a `catalog:write` holder who edits the details
+    // cannot vouch for a table.
+    ("PUT", "/api/catalog/{id}/certification", Policy::RequiresPermission("governance:write")),
 
     // ── Semantic layer (AI-16): plain-words descriptions of tables and
     //    columns, read by the Copilot's DATA MAP. The same two permissions
@@ -230,6 +234,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    governance authority from `agent:approve` that decides it. ───────
     ("POST", "/api/catalog/{id}/access-request",         Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/catalog/access-requests/{id}/decide", Policy::RequiresPermission("access:approve")),
+    // DATA-15 F3: grant and revoke from the asset's page. The same
+    // authority as deciding a request, and no weaker: listing shows who
+    // holds what, so it is not `catalog:read`.
+    ("GET", "/api/catalog/{id}/grants",                  Policy::RequiresPermission("access:approve")),
+    ("POST", "/api/catalog/{id}/grants",                 Policy::RequiresPermission("access:approve")),
+    ("DELETE", "/api/catalog/{id}/grants/{grant_id}",    Policy::RequiresPermission("access:approve")),
+
+    // DATA-15 F4: whether a dropped table can come back (anyone who can see
+    // the asset), and bringing it back (a governance decision, like the
+    // certification mark and unlike an edit of the details).
+    ("GET", "/api/catalog/{id}/restore",                 Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/catalog/{id}/restore",                Policy::RequiresPermission("governance:write")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
@@ -271,6 +287,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // DATA-13: column-level lineage reads the same records' lineage, so the
+    // same permission; charts and dashboards in the answer are listed only
+    // to `dashboard:read` inside the handler.
+    ("GET",  "/api/governance/lineage/columns", Policy::RequiresPermission("lineage:read")),
     // WS3 item 17: surfaces per-connector ingest history, the same
     // audience as the base `/api/connectors` routes above.
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
@@ -293,6 +313,30 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // setting one.
     ("DELETE", "/api/governance/sla/{table}", Policy::RequiresPermission("governance:write")),
     ("DELETE", "/api/governance/classification/{id}", Policy::RequiresPermission("governance:write")),
+    // DATA-12 part 2: governed tag keys. Reading the list is `catalog:read`
+    // because an editor with `catalog:write` needs it to render the value
+    // pickers and a definition is not sensitive; defining, changing and
+    // removing a key is a governance act, like a mark (decision 1).
+    ("GET",  "/api/governance/tag-keys",        Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/governance/tag-keys",        Policy::RequiresPermission("governance:write")),
+    ("PUT",  "/api/governance/tag-keys/{key}",  Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/tag-keys/{key}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F2): quality incidents. Listing them is open to any login
+    // like the rule list; resolving one is a governance decision, like
+    // editing or deleting a rule.
+    ("GET",  "/api/governance/quality/incidents", Policy::RequiresAuth),
+    ("POST", "/api/governance/quality/incidents/{id}/resolve", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F3): per-table schedules. Reading is open to any login like
+    // the rule list; setting one changes when real checks (and their
+    // incidents and alerts) run, so it is a governance decision.
+    ("GET",  "/api/governance/quality/schedules", Policy::RequiresAuth),
+    ("PUT",  "/api/governance/quality/schedules/{asset}", Policy::RequiresPermission("governance:write")),
+    // DATA-14 (F5): a table's learned-or-learning state; open to any login
+    // like the quality list it is shown beside.
+    ("GET",  "/api/governance/quality/learning/{asset}", Policy::RequiresAuth),
+    // DATA-14 (F7): a rule's run history; the rule list it belongs to is open to
+    // any login, and the history shows what that list shows (a verdict).
+    ("GET",  "/api/governance/quality/{id}/runs", Policy::RequiresAuth),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),
@@ -905,6 +949,125 @@ pub async fn auth_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DATA-12` D1: the certified / deprecated mark is gated by
+    /// `governance:write`, not by the `catalog:write` of the details.
+    #[test]
+    fn the_certification_write_needs_governance_write() {
+        assert_eq!(
+            policy_for("PUT", "/api/catalog/{id}/certification"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-13`: column-level lineage needs `lineage:read`, like the table
+    /// graph, and the route is classified (an unclassified route is a 500).
+    #[test]
+    fn column_lineage_needs_lineage_read() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/lineage/columns"),
+            Some(Policy::RequiresPermission("lineage:read"))
+        );
+    }
+
+    /// `DATA-15` F4: the restore status is `catalog:read`; undropping a table
+    /// is `governance:write`.
+    #[test]
+    fn restore_status_needs_catalog_read_and_the_undrop_needs_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/catalog/{id}/restore"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-15` F3: listing, making and ending a grant from an asset's page
+    /// all need `access:approve`, the authority that decides a request.
+    #[test]
+    fn the_grant_routes_need_access_approve() {
+        for (method, path) in [
+            ("GET", "/api/catalog/{id}/grants"),
+            ("POST", "/api/catalog/{id}/grants"),
+            ("DELETE", "/api/catalog/{id}/grants/{grant_id}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("access:approve")),
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// `DATA-12` part 2: reading the tag-key list is `catalog:read` (editors
+    /// need it to render pickers); defining, changing and removing a key is
+    /// `governance:write`, and nothing under `tag-keys` is left unclassified.
+    #[test]
+    fn tag_key_reads_need_catalog_read_and_writes_need_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/tag-keys"),
+            Some(Policy::RequiresPermission("catalog:read"))
+        );
+        for (method, path) in [
+            ("POST", "/api/governance/tag-keys"),
+            ("PUT", "/api/governance/tag-keys/{key}"),
+            ("DELETE", "/api/governance/tag-keys/{key}"),
+        ] {
+            assert_eq!(
+                policy_for(method, path),
+                Some(Policy::RequiresPermission("governance:write")),
+                "{method} {path}"
+            );
+        }
+    }
+
+    /// `DATA-14` (F2): listing quality incidents needs only a login, like the
+    /// quality list; resolving one needs `governance:write`.
+    #[test]
+    fn quality_incidents_are_listed_by_any_login_and_resolved_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/incidents"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("POST", "/api/governance/quality/incidents/{id}/resolve"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F3): reading schedules needs only a login; setting one needs
+    /// `governance:write`.
+    #[test]
+    fn quality_schedules_are_read_by_any_login_and_set_with_governance_write() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/schedules"),
+            Some(Policy::RequiresAuth)
+        );
+        assert_eq!(
+            policy_for("PUT", "/api/governance/quality/schedules/{asset}"),
+            Some(Policy::RequiresPermission("governance:write"))
+        );
+    }
+
+    /// `DATA-14` (F7): a rule's run history is readable by any login.
+    #[test]
+    fn a_rules_run_history_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/{id}/runs"),
+            Some(Policy::RequiresAuth)
+        );
+    }
+
+    /// `DATA-14` (F5): the learning state is readable by any login.
+    #[test]
+    fn the_learning_state_is_readable_by_any_login() {
+        assert_eq!(
+            policy_for("GET", "/api/governance/quality/learning/{asset}"),
+            Some(Policy::RequiresAuth)
+        );
+    }
 
     #[test]
     fn health_is_public() {

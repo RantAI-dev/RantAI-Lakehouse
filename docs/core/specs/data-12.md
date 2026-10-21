@@ -6,7 +6,7 @@
 | Module | Data |
 | Size | M (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
-| Spec checked | Against the code on 2026-10-09 |
+| Spec checked | Against the code on 2026-10-09. Feature page [`certification-and-governed-tags.md`](../features/certification-and-governed-tags.md); built in three parts. Inheritance is split off as `DATA-22` |
 
 ## Why
 
@@ -18,15 +18,15 @@ Trusted tables are marked, deprecated ones warn, and tags follow agreed values.
 
 ## Target specs
 
-"Today" is `main` at `c338862`, re-read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
+"Today" is `main` at `bc048e0` (after `DATA-11`), read from the code on 2026-10-09, not tested. A target is either a competitor's documented number (named under Benchmark) or marked *(proposed)*: the planner's number, which the product owner confirms or changes on the feature page before the plan is written.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Certified and deprecated marks | None | Set by a data owner or admin; shown in search, on the asset page, in the chart builder's table picker and in Query Studio |
+| Certified and deprecated marks | None | Set by anyone with `governance:write` (the product has no data-owner role; decision 1). Part 1: shown in search, the Data Explorer (with a filter) and on the asset page. Part 3: on Gold marts in the chart builder's picker and on the sources Query Studio lists for a ClickHouse query |
 | Deprecation | None | A note and an optional replacement table; users of a deprecated table see a warning |
 | Governed tags | A table carries up to 20 tags, each one lowercase word; no keys, no allowed values. Anyone with `catalog:write` sets them | Admin-defined tag keys with allowed values; only admins create keys |
-| Inheritance | None | A tag on a schema applies to its tables (Snowflake behaviour) |
-| Where tags show | Only on the asset page's About card. Search matches them without showing them; the Data Explorer list, the chart builder's table picker and Query Studio show none | With the marks: in search results, the Data Explorer list, the asset page, the chart builder's table picker and Query Studio |
+| Inheritance | None. A schema here is one of four fixed namespaces, with no stored record and no page to edit | A tag on a schema applies to its tables (Snowflake behaviour). Not built by this task: `DATA-22` (decision 3) |
+| Where tags show | The asset page's About card, the Data Explorer's Tags column (from 1760 px) and the reason line of a search result. The chart builder's table picker and Query Studio show none | With the marks: in search results, the Data Explorer list, the asset page, the chart builder's table picker and Query Studio |
 
 ## Benchmark
 
@@ -36,14 +36,16 @@ Databricks: certified and deprecated system tags, governed tags with allowed val
 
 Run on a running console by the product owner. A step not performed is never a pass.
 
-- `DATA-12-AC1` A certified table shows its mark in search and in the chart builder
-- `DATA-12-AC2` Setting a tag value outside the allowed list is refused
-- `DATA-12-AC3` A user without the owner role cannot certify
+- `DATA-12-AC1` A certified table shows its mark in search, in the Data Explorer and on its page (part 1), and in the chart builder and Query Studio (part 3)
+- `DATA-12-AC2` Setting a tag value outside the allowed list is refused (part 2)
+- `DATA-12-AC3` A user without `governance:write` cannot certify
 - `DATA-12-AC4` A user without the permission is refused, and a failure shows an honest message (principles 2 and 4)
 
 ## Not included
 
 - Tag-based masking (later)
+- Tag inheritance from a namespace: `DATA-22`
+- Marks on a dashboard SQL source, and in the SQL editor's autocomplete
 
 ## Asking the assistant
 

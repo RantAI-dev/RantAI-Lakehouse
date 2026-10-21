@@ -445,6 +445,21 @@ impl<'a> PolicyEngineObligations<'a> {
         )
     }
 
+    /// The column names of `schema.table`: a `ClickHouse` table first, then
+    /// an Iceberg table through the configured `DataLakeCatalog` database,
+    /// the same two steps [`Self::obligations_for_async`] takes. `None` when
+    /// the table is unknown to both or a query fails. Column lineage
+    /// (`DATA-13`) uses it to expand `*` and to tell which table an
+    /// unqualified column belongs to; `None` makes the mapping partial
+    /// instead of guessed.
+    pub async fn table_columns(&self, schema: &str, table: &str) -> Option<Vec<String>> {
+        let columns = match self.real_columns_with_defaults(schema, table).await {
+            Some(cols) => cols,
+            None => self.iceberg_columns(schema, table).await?,
+        };
+        Some(columns.into_iter().map(|(name, ..)| name).collect())
+    }
+
     /// The mask/row-filter obligations `table` carries for a principal
     /// holding `roles`, unioning every matching `status = 'ready'` policy
     /// (masks union; row filters `AND` together) — or `None` if none
