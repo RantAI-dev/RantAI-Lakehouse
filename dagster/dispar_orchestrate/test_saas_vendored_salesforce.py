@@ -159,3 +159,19 @@ def test_a_next_records_url_on_another_host_is_refused() -> None:
     fake.get = to_another_host  # type: ignore[method-assign]
     with pytest.raises(ssrf_guard.SsrfBlocked):
         list(records.get_records(session_over(fake), "Account"))
+
+
+# ---- local change 2: a primary key on every resource (upstream dlt-hub/verified-sources#692) ----
+
+
+def test_every_resource_of_the_source_declares_id_as_its_primary_key() -> None:
+    """Upstream declared none, so a `merge` resource appended the changed records again
+    (upstream pull request #692 is the open attempt; it was read, not copied)."""
+    from dispar_orchestrate.saas.vendored.salesforce import salesforce_source
+
+    resources = list(salesforce_source(session_over(FakeSalesforce([]))).resources.values())
+    assert len(resources) == 15
+    for resource in resources:
+        assert resource._hints.get("primary_key") == "Id", resource.name
+    merging = {r.name for r in resources if r.write_disposition == "merge"}
+    assert merging >= {"account", "opportunity", "task", "event"}

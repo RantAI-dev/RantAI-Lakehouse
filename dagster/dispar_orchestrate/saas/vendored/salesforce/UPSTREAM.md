@@ -35,3 +35,9 @@
    one record per batch); a query longer than 12,000 characters (a `GET` address
    Salesforce would refuse beyond 16,384 bytes) is a fixed failure. `requirements.txt`
    is upstream's and is not read by anything here.
+2. **`primary_key = Id` on every resource** (`__init__.py`; `SRC-3` decision 6,
+   V-Salesforce.1; upstream issue/PR dlt-hub/verified-sources#692, the open attempt,
+   read and not copied). Upstream declared no key, so a `merge` resource had nothing to
+   merge on and a changed record was stored again next to the old one. Every sObject of
+   Salesforce has an `Id`, so all fifteen resources, the full-read ones too, declare it.
+   Test: `test_saas_vendored_salesforce.py`.
