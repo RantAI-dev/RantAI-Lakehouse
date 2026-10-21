@@ -1741,24 +1741,15 @@ pub async fn withdraw_embed_token(
     // raced by two concurrent requests, which is acceptable since a small
     // temporary overshoot does not compromise security.
     //
-    // PR #201 review F SHOULD-FIX 1: the count is over the tokens that could
-    // still be accepted (the tolerance the caller passes is the verifier's,
-    // `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`), while the list itself
-    // keeps every withdrawn id.
-    let access = get_board_embed_access(ch, id).await?;
-    let unexpired = access
-        .withdrawn
-        .iter()
-        .filter(|w| w.exp.saturating_add(tolerance_secs) >= now_unix_seconds)
-        .count();
-    if !access.withdrawn.iter().any(|w| w.jti == jti)
-        && unexpired >= embed_access::MAX_WITHDRAWN_TOKENS
-    {
-        return Err(BiError::Validation(
-            "too many tokens are withdrawn one by one for this dashboard; withdraw all of them instead."
-                .to_owned(),
-        ));
-    }
+    // PR #201 review F SHOULD-FIX 2: the guard is [`EmbedAccess::withdraw_token`]
+    // and only that one — it drops the entries that could no longer be
+    // accepted anyway (the tolerance the caller passes is the verifier's,
+    // `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`) and refuses a full list.
+    // The store used to re-implement both, and the two could drift apart.
+    get_board_embed_access(ch, id)
+        .await?
+        .withdraw_token(jti, exp, now_unix_seconds, tolerance_secs)
+        .map_err(BiError::Validation)?;
     let sql = format!(
         "INSERT INTO console.bi_board_embed_event (board_id, kind, jti, exp) VALUES ({}, 'withdraw', {}, {})",
         SqlLiteral::from(id),
