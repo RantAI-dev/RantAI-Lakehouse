@@ -615,3 +615,129 @@ restored before the commit.
   but `lakehouse_embed::CLOCK_TOLERANCE_SECONDS` is still the single
   tolerance (the API passes it in). Raising it is now safe for the
   withdrawn list: the list does not expire.
+
+### Handoff — round G (developer, MiniMax M3.1 Flash), 2026-10-21
+
+**The finding.** `PR #201 review G BLOCKER 1`: CI's `Rust · test (stable)`
+was red on this branch —
+`rust/crates/lakehouse-api/tests/query_author_exception.rs`'s
+`a_failing_tile_inside_a_signed_embed_is_the_fixed_message_with_a_reference`
+answered `500` (`{"error":"The database request failed."}`) instead of
+`200` (the assertion at line 230).
+
+**The cause — the mock, not the product.** Two things in the branch's
+`ensure_bi_table` meet this test's mock:
+
+1. The one-time legacy copy (`store::copy_legacy_embed_state`) asks
+   `system.columns` whether the legacy embed columns are still on
+   `console.bi_board`. The mock (`EmbedClickhouse`) had no branch for
+   that statement, so it fell through to the planted engine error
+   (`404`), the DDL bootstrap failed, and the request answered `500`.
+2. The mock's board branch matched on the table-name PREFIX
+   (`sql.contains("FROM console.bi_board")`), and the append-only event
+   table's name starts with the same prefix
+   (`FROM console.bi_board_embed_event`), so the embed access aggregate
+   read was answered with a board row.
+
+Why the fault was hidden: the DDL bootstrap is guarded process-wide
+(`BI_TABLE_ENSURED`), so the test only failed when it was the FIRST in
+the binary to reach the bootstrap. Any other test in the same binary
+having run it first hid the fault — the planner reproduced exactly that
+(alone: fails; after another test: passes).
+
+**What changed** — one file, the test mocks
+(`rust/crates/lakehouse-api/tests/query_author_exception.rs`, commit
+`45d595ee8d81`). No product code and no assertion was changed or
+weakened (rule 2):
+
+- `system.columns` is answered with an EMPTY result, so the legacy copy
+  is skipped, exactly as on a fresh database (no legacy columns);
+- `console.bi_board_embed_event` is answered with an EMPTY result (this
+  board has no events: nothing withdrawn, no site allowed to frame it);
+- an `INSERT` is answered `200`;
+- the board is matched on `FROM console.bi_board FINAL` — the exact
+  table, not the prefix.
+
+The same two corrections are applied to the file's other mock
+(`CombinedEmbedClickhouse`), which had the prefix match and answered the
+legacy column check with a mart's columns (its `system.columns` answer
+is now split: the `console` check is empty, the `serving` mart columns
+are unchanged).
+
+**The other mocks, checked and not changed.** Every mock in
+`rust/crates/lakehouse-api/tests` and `rust/crates/lakehouse-bi` was
+grepped for the same pitfall (`contains("FROM console.bi_board")`,
+`contains("console.bi_board")`, a mock that 404s or 500s
+`system.columns`):
+
+- `lakehouse-api/tests/embed_tokens.rs` — the only other
+  `contains("FROM console.bi_board")` mock. It answers
+  `FROM console.bi_board_embed_event` in an earlier branch, so the
+  aggregate never reaches the board branch, and its `system.columns`
+  answer falls through to the `200 "Ok.\n"` default, which the client
+  reads as an empty result (no legacy columns). Its 21 tests were run
+  ALONE, one by one: all pass.
+- `lakehouse-api/tests/dashboard_export.rs`,
+  `column_lineage_sql_source.rs` — their `system.columns` mocks answer
+  `200` with column names that are not the legacy ones, so the copy is
+  skipped. Whole binaries pass (6 and 2).
+- `lakehouse-api/tests/upstream_errors.rs` — its mock answers every
+  statement `500`, so the bootstrap fails and the routes answer `500`;
+  that is what the test asserts (no upstream text in a body). All 6
+  tests were run ALONE, one by one: all pass.
+- `lakehouse-bi/src/store.rs` — the three mocks there
+  (`LegacyEmbedCh`, `MockBiCh`, `MockEvents`) answer `200` for
+  everything, so the extra `system.columns` read is an empty result and
+  the copy is skipped. `-p lakehouse-bi` is green (435 + 1 passed).
+
+**Commands run, in the foreground, with their counts.** Every cargo
+command through `/home/shiro/rantai/bin/cargo-locked` with `-j 2` (the
+shared `CARGO_TARGET_DIR`; the tool takes the shared lock itself);
+`cargo fmt --check` direct.
+
+| command | result |
+| --- | --- |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception a_failing_tile_inside_a_signed_embed` (BEFORE the fix) | `0 passed; 1 failed` — `500` instead of `200`, "The database request failed." |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception a_failing_tile_inside_a_signed_embed` (AFTER) | `1 passed; 0 failed` |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception` (all 8, AFTER) | `8 passed; 0 failed; 0 ignored` |
+| each of the 8 tests of that binary ALONE, one by one (AFTER) | `1 passed; 0 failed` in each of the 8 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens` | `21 passed; 0 failed; 0 ignored` |
+| each of the 21 tests of `embed_tokens` ALONE, one by one | `1 passed; 0 failed` in each of the 21 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test upstream_errors` | `6 passed; 0 failed; 0 ignored` |
+| each of the 6 tests of `upstream_errors` ALONE, one by one | `1 passed; 0 failed` in each of the 6 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test dashboard_export --test column_lineage_sql_source --test column_lineage_route --test agents_approval` | `6 passed` / `2 passed` / `8 passed` / `13 passed`; 0 failed in each |
+| `cargo-locked test -j 2 -p lakehouse-api --test route_auth` | `54 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi` | `435 passed; 0 failed; 3 ignored` (+ `1 passed` in the other target) |
+| `cargo-locked test -j 2 -p lakehouse-api --lib` and `--bin lakehouse-api` | `2269 passed; 0 failed; 14 ignored` / `2315 passed; 0 failed; 14 ignored` |
+| all 68 `lakehouse-api` integration binaries, one command, `--no-fail-fast`, `RUST_TEST_THREADS=2` | every binary `ok`, 0 failed (largest: `upload_routes` 94, `route_auth` 54) |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` | exit 0, no warnings |
+| `git status` | clean, nothing generated staged |
+
+**One environment failure, recorded honestly.** The first full
+`cargo-locked test -j 2 -p lakehouse-api` run (the two lib binaries
+passed: 2269 and 2315) failed in `tests/agents_approval.rs` with 5
+panics at `tests/common/mod.rs:225` ("connect to the fresh per-test
+database") and `:283` ("mint a session for a test principal"). The
+container's PostgreSQL log shows the cause:
+`could not resize shared memory segment "/PostgreSQL.…": No space left
+on device` (the container's `/dev/shm` is 64 MB), then
+`server process … was terminated by signal 11: Segmentation fault` and a
+server restart — the shared test database, not a product fault. The
+same binary passes ALONE (`13 passed; 0 failed`), and all 68 integration
+binaries pass when the run is given less concurrency
+(`RUST_TEST_THREADS=2`, as in the table above). The two lib binaries had
+already passed in the first run. No container or volume was removed or
+touched.
+
+**Not verified, and why.**
+
+- Nothing was run against a live `ClickHouse`; the mocks are the proof
+  (as in round F).
+- `bun run typecheck`, `bun run lint` and `bun run test` were not run:
+  this fix touches one Rust test file, no TypeScript.
+- `cargo test --workspace` was not run as one command: the workspace
+  suite is run crate by crate here for build time, and the crates this
+  branch touches (`lakehouse-api`, `lakehouse-bi`) are green above.
+- The `ops/g*` gates and `docker compose` were not run: no compose
+  change and no gate change in this fix.
