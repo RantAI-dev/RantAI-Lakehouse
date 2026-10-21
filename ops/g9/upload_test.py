@@ -132,12 +132,15 @@ the API lets it (an upload that is still loading cannot be deleted).
 from __future__ import annotations
 
 import argparse
+import gzip
+import io
 import json
 import os
 import re
 import secrets
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "uploads"
@@ -885,6 +888,91 @@ def _delete_upload(api, upload_id: str, state: dict) -> None:
     state["deleted"] = True
 
 
+# DATA-17 (slice 4): JSON, JSON Lines, Avro, gzip and zip. The files are the shared fixtures of
+# ops/fixtures/uploads/formats/ (the API's preview tests and the job's tests read them too).
+FORMATS_DIR = FIXTURES / "formats"
+NEW_FORMATS = [
+    # file, layout the preview reports, the dialect the load is told (None: JSON and Avro have none)
+    ("orders.json", {"format": "json", "compression": "none"}, None),
+    ("orders.jsonl", {"format": "jsonl", "compression": "none"}, None),
+    ("orders.avro", {"format": "avro", "compression": "none"}, None),
+    ("orders.csv.gz", {"format": "delimited", "compression": "gzip"}, "dialect"),
+    ("three.zip", {"format": "delimited", "compression": "zip"}, "dialect"),
+]
+UNPACKED_SENTENCE = "The file is larger than the upload limit once unpacked."
+
+
+def step_new_formats(api, base_table: str, state: dict) -> None:
+    """One small file per format loads and reads back (DATA-17 AC6, AC7), and a gzip and a zip
+    bomb are refused and stored nowhere (decision 2): no column list, so every column is text
+    and a nested value is JSON text (decision 11)."""
+    for index, (name, layout, dialect) in enumerate(NEW_FORMATS):
+        expected = json.loads((FORMATS_DIR / f"{name}.expected.json").read_text(encoding="utf-8"))
+        names = expected["columns"]
+        raw = (FORMATS_DIR / name).read_bytes()
+        state["upload_id"], state["deleted"] = None, False
+        resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, raw, "application/octet-stream")}, timeout=60)
+        upload_id = _expect(resp, 201, f"POST /api/uploads ({name})").json()["id"]
+        state["upload_id"] = upload_id
+        preview = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}/preview", timeout=60), 200, f"{name} preview").json()
+        if preview.get("layout") != layout or preview.get("columns") != names:
+            raise G9Failure(f"{name}: the preview should say {layout} and list {names}, got {preview.get('layout')} and {preview.get('columns')}")
+        if name == "three.zip":
+            files = [f["name"] for f in preview["archive"]["files"]]
+            if files != expected["entries"] or not all(f["matchesFirst"] for f in preview["archive"]["files"]):
+                raise G9Failure(f"{name}: the preview should list {expected['entries']} with matching columns, got {preview.get('archive')}")
+        if name == "orders.avro":
+            kinds = [c["type"] for c in preview["columnSpecs"]]
+            if kinds != expected["declared"]:
+                raise G9Failure(f"{name}: the schema's types are the starting guess {expected['declared']}, got {kinds}")
+
+        table = f"{base_table}_f{index}"
+        body = {"bronzeTable": table, "mode": "replace"}
+        if dialect:
+            using = preview["using"]
+            body.update(encoding=using["encoding"], delimiter=using["delimiter"], headerRow=using["headerRow"])
+        launched = _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=60), 200, f"POST .../ingest ({name})").json()
+        if not launched.get("runId"):
+            raise G9Failure(f"{name}: an accepted load should return a run id, got {launched}")
+
+        def settled():
+            current = _expect(api.get(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 200, "GET /api/uploads/{id}").json()
+            if current.get("status") == "failed":
+                raise G9Failure(f"{name}: the load failed: {current.get('error')!r}")
+            return current if current.get("status") == "ingested" else None
+
+        loaded = _wait_for(f"{name} ingested", settled, LOAD_TIMEOUT_S)
+        if loaded.get("rows") != len(expected["rows"]) or loaded.get("bronzeTable") != table:
+            raise G9Failure(f"{name}: the load settled with rows {loaded.get('rows')!r} in {loaded.get('bronzeTable')!r}, expected {len(expected['rows'])} in {table!r}")
+        _wait_for(f"{table} holds its rows", lambda: count_rows(api, table) == len(expected["rows"]), VISIBLE_TIMEOUT_S, retry_failures=True)
+        got = run_query(api, f"SELECT {', '.join(names)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
+        got_rows = sorted(([r[c] for c in names] for r in got), key=lambda row: str(row[0]))
+        want_rows = sorted(expected["rows"], key=lambda row: str(row[0]))
+        if got_rows != want_rows:
+            raise G9Failure(f"{name}: the table holds {got_rows}, the fixture says {want_rows}")
+        print(f"[g9] formats: {name} loaded {len(want_rows)} rows into {table}")
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, f"DELETE {name}")
+        state["deleted"] = True
+
+    # Bombs: a few KiB of gzip or zip that unpack past the 50 MB cap are refused, and nothing is kept.
+    before = len(_expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json())
+    big = b"id,name\n" + b"a" * (51 * 1024 * 1024)
+    zipped = io.BytesIO()
+    with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("a.csv", big)
+    for name, raw in (("bomb.csv.gz", gzip.compress(big, compresslevel=9)), ("bomb.zip", zipped.getvalue())):
+        if len(raw) > 1024 * 1024:
+            raise G9Failure(f"{name}: the setup should be a small file, it is {len(raw)} bytes")
+        resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, raw, "application/octet-stream")}, timeout=60)
+        refused = _expect(resp, 400, f"POST /api/uploads ({name})").json()
+        if refused.get("error") != UNPACKED_SENTENCE:
+            raise G9Failure(f"{name}: a bomb should be refused with {UNPACKED_SENTENCE!r}, got {refused}")
+    after = len(_expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json())
+    if after != before:
+        raise G9Failure(f"a refused bomb must leave no upload behind, the list went from {before} to {after}")
+    print("[g9] formats: a gzip bomb and a zip bomb were refused and nothing was stored")
+
+
 def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
     """Author a `bronze.<table>` -> `silver.<silver_table>` pipeline whose
     `dependsOn` names `file_ingest_job`, exactly the body the console's
@@ -1234,6 +1322,7 @@ def main() -> int:
         step_workbook(api, table, state)
         step_parquet(api, table, state)
         step_typed_columns(api, table, state)
+        step_new_formats(api, table, state)
         step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
