@@ -741,7 +741,8 @@ def _sharepoint(auth: str = "integration", state_account: str = "acme/00000000-0
 
 
 SP_ACCOUNT = "acme/00000000-0000-0000-0000-0000000000a1"
-SP_OBJECT = "acme.sharepoint.com,11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222/55555555-5555-4555-8555-555555555555"
+SP_SITE = "acme.sharepoint.com,11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222"
+SP_OBJECT = f"{SP_SITE}/55555555-5555-4555-8555-555555555555"
 
 
 def _read_state(module, parts, session, dial, state: dict, name: str = SP_OBJECT) -> list[dict]:  # noqa: ANN001
@@ -767,6 +768,10 @@ def step_sharepoint() -> None:
     declared = {d.name: d for d in module.list_objects(session, parts, dial)}
     _expect(list(declared) == [SP_OBJECT], f"sharepoint discover: {sorted(declared)}")
     _expect(declared[SP_OBJECT].load_description() == "incremental" and declared[SP_OBJECT].deletes, "sharepoint discover: the list should load incrementally and report deletes")
+    _expect(declared[SP_OBJECT].label == "Team / Tasks", f"sharepoint discover: the list's label is {declared[SP_OBJECT].label!r}")
+    _expect(module.list_fields(session, parts, dial) == [{"name": SP_SITE, "kind": "site", "label": "Team"}], "sharepoint discover: the site picker's list")
+    picked = {**dial, "objects": [SP_SITE]}
+    _expect([d.label for d in module.list_objects(session, parts, picked)] == ["Team / Tasks"], "sharepoint discover: a picked site's lists")
     _log("sharepoint discover: one list of the one non-personal site; the document library is not offered (files are not loaded)")
 
     admin("sharepoint", action="clear_log")
@@ -1035,6 +1040,7 @@ PRODUCT_VENDORS: dict[str, dict] = {
         "type": "SharePoint", "host": "graph.microsoft.com", "account": SP_ACCOUNT, "label": "SharePoint",
         "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
         "values": {"primary": "sp-app", "secondary": "sp-secret"},
+        "dial_extra": {"objects": [SP_SITE]}, "object_label": "Team / Tasks",
         "object": SP_OBJECT, "target": "saas_gate_sharepoint_tasks", "cursor": "modified_at", "text": "field_title", "key": "id",
         "columns": "id, field_title, modified_at, is_deleted", "preview_columns": None,
         "first_ids": {"1", "2", "3", "4", "5"}, "reload_ids": {"1", "2", "3", "4", "5", "6"},
@@ -1055,6 +1061,7 @@ PRODUCT_VENDORS: dict[str, dict] = {
         "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
         "values": {"primary": "stub-client-secret", "secondary": "stub-sp-refresh-0"},
         "before": [{"action": "rotate", "on": False}],
+        "dial_extra": {"objects": [SP_SITE]}, "object_label": "Team / Tasks",
         "object": SP_OBJECT, "target": "saas_gate_sharepoint_browser_tasks", "cursor": "modified_at", "text": "field_title", "key": "id",
         "columns": "id, field_title, modified_at, is_deleted", "preview_columns": None,
         "first_ids": {"1", "2", "3", "4", "5"}, "reload_ids": {"1", "2", "3", "4", "5", "6"},
@@ -1245,6 +1252,9 @@ def step_product(vendor_id: str) -> None:
     found = next((o for o in listing.get("objects") or [] if o.get("name") == obj), None)
     _expect(listing.get("state") == "done" and found is not None, f"{vendor_id} discover: the list is {listing.get('state')!r} {listing.get('errorClass')!r}, without {obj!r}")
     _expect(found.get("load") == "incremental", f"{vendor_id} discover: {obj} should say it loads incrementally, says {found.get('load')!r}")
+    if spec.get("object_label"):
+        # Slice 5 review BLOCKER 14: the list comes with a label for a person; the object's name stays the ids.
+        _expect(found.get("label") == spec["object_label"], f"{vendor_id} discover: {obj} should be labelled {spec['object_label']!r}, is {found.get('label')!r}")
     preview = matrix.discovery_answer(cid, "preview", {"object": obj})
     if spec["preview_columns"] is None:
         _expect(preview.get("state") == "failed" and preview.get("errorClass") == "not_supported", f"{vendor_id} discover: expected an honest not_supported preview, got {preview.get('state')!r} {preview.get('errorClass')!r}")
@@ -1254,6 +1264,10 @@ def step_product(vendor_id: str) -> None:
         _expect(preview.get("state") == "done" and spec["preview_columns"] <= names, f"{vendor_id} discover: the preview shows {sorted(names)[:12]}")
         detail = f"previewed {len(names)} columns"
     _log(f"{vendor_id} discover: {len(listing['objects'])} objects listed by the orchestrator, {obj} loads incrementally; {detail}")
+    if vendor_id == "sharepoint":
+        sites = matrix.discovery_answer(cid, "list", {"schema": "fields"})
+        _expect(sites.get("state") == "done" and [(o.get("name"), o.get("kind"), o.get("label")) for o in sites.get("objects") or []] == [(SP_SITE, "site", "Team")], f"sharepoint discover: the site picker's list is {sites.get('objects')!r}")
+        _log("sharepoint discover: the tenant's site listed with its title for the console's site picker")
     if vendor_id == "ga4":
         # Slice 3 review BLOCKER 9: the console's report editor lists the property's own dimensions and metrics.
         fields = matrix.discovery_answer(cid, "list", {"schema": "fields"})

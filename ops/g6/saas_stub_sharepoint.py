@@ -133,13 +133,13 @@ def _graph(handler, parsed) -> None:  # noqa: ANN001
                 {"id": SITE, "displayName": "Team", "isPersonalSite": False},
                 {"id": "me.sharepoint.com,66666666-6666-4666-8666-666666666666,77777777-7777-4777-8777-777777777777", "isPersonalSite": True},
             ]})  # fmt: skip
-        if parsed.path == "/v1.0/sites/acme.sharepoint.com":
+        if parsed.path in ("/v1.0/sites/acme.sharepoint.com", f"/v1.0/sites/{SITE}"):
             return stub.send_json(handler, {"id": SITE, "displayName": "Team"})
         if len(pieces) < 5 or pieces[2] != "sites" or pieces[4] != "lists" or pieces[3] != SITE:
             return stub.send_json(handler, _words("Not Found"), 404)
         if len(pieces) == 5:
             return stub.send_json(handler, {"value": [
-                {"id": LIST, "displayName": "Tasks", "list": {"template": "genericList", "hidden": False}},
+                {"id": LIST, "displayName": "Tasks", "name": "Tasks", "list": {"template": "genericList", "hidden": False}},
                 {"id": LIBRARY, "displayName": "Documents", "list": {"template": "documentLibrary", "hidden": False}},
             ]})  # fmt: skip
         if pieces[5] != LIST:
