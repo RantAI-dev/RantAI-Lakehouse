@@ -831,7 +831,10 @@ mod tests {
         );
         let dyn365 = app_of(&info(
             "saas",
-            oauth_dial("dynamics365", "org.crm4.dynamics.com"),
+            oauth_dial(
+                "dynamics365",
+                "org.crm4.dynamics.com/00000000-0000-0000-0000-000000000001",
+            ),
         ))
         .unwrap();
         assert_eq!(
@@ -841,6 +844,22 @@ mod tests {
                 "offline_access"
             ]
         );
+        // Slice 5: the customer's tenant forms the Entra token and sign-in addresses (a fixed host).
+        assert_eq!(
+            dyn365.token_url,
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/oauth2/v2.0/token"
+        );
+        assert!(dyn365.authorize_url.starts_with(
+            "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000001/"
+        ));
+        // A dial with no tenant, or a tenant that is a path, is no sign-in at all.
+        for account in [
+            "org.crm4.dynamics.com",
+            "org.crm4.dynamics.com/common",
+            "org.crm4.dynamics.com/a.example.invalid/../x",
+        ] {
+            assert!(app_of(&info("saas", oauth_dial("dynamics365", account))).is_none());
+        }
     }
 
     #[test]

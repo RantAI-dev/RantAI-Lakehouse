@@ -221,13 +221,13 @@
       "label": "Dynamics 365",
       "connectorType": "Dynamics 365",
       "account": {
-        "kind": "dataverse_host"
+        "kind": "dataverse_host_tenant"
       },
-      "accountLabel": "Environment address, as org.crm4.dynamics.com",
+      "accountLabel": "Environment address and tenant, as org.crm4.dynamics.com/tenant-id-or-domain",
       "apiBase": "https://{account}",
       "oauth": {
-        "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-        "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+        "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+        "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
         "revocationUrl": null,
         "scopes": [
           "https://{account}/user_impersonation",
@@ -240,7 +240,8 @@
         "secretFields": [
           "clientId",
           "clientSecret"
-        ]
+        ],
+        "scope": "https://{account}/.default"
       },
       "whoami": {
         "method": "GET",
@@ -282,13 +283,13 @@
       "label": "SharePoint",
       "connectorType": "SharePoint",
       "account": {
-        "kind": "label"
+        "kind": "label_tenant"
       },
-      "accountLabel": "Tenant name (the part before .sharepoint.com)",
+      "accountLabel": "Tenant name and tenant, as contoso/tenant-id-or-domain (contoso is the part before .sharepoint.com)",
       "apiBase": "https://graph.microsoft.com",
       "oauth": {
-        "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-        "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+        "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+        "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
         "revocationUrl": null,
         "scopes": [
           "https://graph.microsoft.com/Sites.Read.All",
@@ -301,7 +302,8 @@
         "secretFields": [
           "clientId",
           "clientSecret"
-        ]
+        ],
+        "scope": "https://graph.microsoft.com/.default"
       },
       "whoami": {
         "method": "GET",

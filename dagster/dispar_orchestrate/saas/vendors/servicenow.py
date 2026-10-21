@@ -61,7 +61,7 @@ A 429 with `Retry-After` is waited out by `SaasSession` within its bound.
 
 * **Browser sign-in**: the vendor table's row (`oauth_auth.do`, `oauth_token.do`; the
   client in the form body).
-* **Client credentials** (the integration credential, built here): `POST /oauth_token.do`
+* **Client credentials** (the integration credential; `saas/client_credentials.py`, shared with the Microsoft vendors): `POST /oauth_token.do`
   with `grant_type=client_credentials`, `client_id` and `client_secret` in the form body
   (https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html).
   The instance must allow the grant (`glide.oauth.inbound.client.credential.grant_type.enabled`)
@@ -73,16 +73,14 @@ A 429 with `Retry-After` is waited out by `SaasSession` within its bound.
 from __future__ import annotations
 
 import re
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
 import requests
 
-from dispar_orchestrate.adapters import rest as rest_adapter
 from dispar_orchestrate.adapters.saas import Field, SaasSetupRefused
-from dispar_orchestrate.saas import vendors
+from dispar_orchestrate.saas.client_credentials import integration_auth  # noqa: F401 -- the module protocol looks it up by name
 from dispar_orchestrate.saas.objects import ObjectDecl
 from dispar_orchestrate.saas.session import SaasPermissionMissing
 
@@ -267,48 +265,3 @@ def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any) 
                 if decl.cursor and decl.cursor in record:
                     record[decl.cursor] = _as_time(record[decl.cursor])
                 yield record
-
-
-# ---- client credentials (decision 3, second way) ------------------------------------------------
-
-_EXPIRY_MARGIN_SECONDS = 60
-
-
-def integration_auth(
-    vendor: Any,
-    secrets: dict[str, str],
-    *,
-    resolve_checked: Callable[..., Any],
-    parts: Any,
-    clock: Callable[[], float] | None = None,
-) -> tuple[Callable[[], dict], Callable[[], None]]:
-    """`(headers, refresh)` for the client-credentials grant: a bearer token fetched when
-    first needed, again once it has expired, and again on demand after a 401.
-
-    The token is asked for at the vendor table's address for this instance (`rebase_for_gate`
-    only moves it to the gate's mock under the gate-only switch), after the address check and
-    pinning that `rest._token_request` applies.
-
-    # Errors
-
-    `OAuthSignInRefused` (at the first request) when ServiceNow refuses the exchange.
-    """
-    clock = clock or (lambda: time.time())  # looked up at the call: a test moves the time
-    token_url = vendors.rebase_for_gate(vendor.id, vendor.token_url(parts))
-    form = {"grant_type": "client_credentials", "client_id": secrets["clientId"], "client_secret": secrets["clientSecret"]}
-    state: dict[str, Any] = {"headers": None, "expires_at": 0.0}
-
-    def headers() -> dict:
-        if state["headers"] is None or clock() >= state["expires_at"]:
-            body = rest_adapter._token_request(token_url, form, resolve_checked=resolve_checked)
-            lifetime = body.get("expires_in")
-            valid = isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) and lifetime > 0
-            # No stated lifetime: replaced only after a 401 (as `rest.AuthSession` does).
-            state["expires_at"] = clock() + max(lifetime - _EXPIRY_MARGIN_SECONDS, 0) if valid else float("inf")
-            state["headers"] = {"Authorization": f"Bearer {body['access_token']}"}
-        return state["headers"]
-
-    def refresh() -> None:
-        state["headers"] = None
-
-    return headers, refresh

@@ -23,10 +23,12 @@ def test_there_are_ten_vendors_with_unique_ids_and_connector_types() -> None:
     assert len({v.connector_type for v in vendors.VENDORS.values()}) == 10
 
 
+TENANT_GUID = "00000000-0000-0000-0000-000000000001"
+
 SAMPLE = {
-    "salesforce": "acme", "servicenow": "acme", "zendesk": "acme", "confluence": "acme", "sharepoint": "acme",
+    "salesforce": "acme", "servicenow": "acme", "zendesk": "acme", "confluence": "acme", "sharepoint": "acme/00000000-0000-0000-0000-000000000001",
     "workday": "wd2-impl-services1.workday.com/acme_tenant", "ga4": "123456789", "hubspot": "123456789",
-    "dynamics365": "acme.crm4.dynamics.com", "netsuite": "1234567_SB1",
+    "dynamics365": "acme.crm4.dynamics.com/contoso.example.invalid", "netsuite": "1234567_SB1",
 }  # fmt: skip
 
 
@@ -58,8 +60,8 @@ def test_the_near_misses_of_workday_dataverse_and_netsuite_are_refused() -> None
     for value in ["acme.dynamics.com", "acme.crm123.dynamics.com", "acme.crmx.dynamics.com",
                   "acme.crm.dynamics.com.evil.invalid", "a.b.crm.dynamics.com", "acme.api.crm.dynamics.com"]:  # fmt: skip
         with pytest.raises(vendors.InvalidAccount):
-            vendors.vendor("dynamics365").validate_account(value)
-    assert vendors.vendor("dynamics365").validate_account("Acme.CRM.dynamics.com").account == "acme.crm.dynamics.com"
+            vendors.vendor("dynamics365").validate_account(f"{value}/{TENANT_GUID}")
+    assert vendors.vendor("dynamics365").validate_account(f"Acme.CRM.dynamics.com/{TENANT_GUID}").account == "acme.crm.dynamics.com"
     assert vendors.vendor("netsuite").validate_account("1234567_SB1").account == "1234567-sb1"
     with pytest.raises(vendors.InvalidAccount):
         vendors.vendor("netsuite").validate_account("1234567_")
@@ -102,3 +104,45 @@ def test_the_gate_rebase_does_nothing_unless_the_gate_only_switch_and_the_vendor
     monkeypatch.setenv("CONNECTOR_OAUTH_ALLOW_HTTP", "yes")
     monkeypatch.setenv("SAAS_GATE_ORIGINS", origins)
     assert vendors.rebase_for_gate("hubspot", real) == real, "only the exact word true opens the switch"
+
+
+# ---- the Microsoft tenant (slice 5): a validated part of the account ---------------------------------
+
+
+@pytest.mark.parametrize(("vendor_id", "inner"), [("sharepoint", "Acme"), ("dynamics365", "Acme.CRM4.dynamics.com")])
+def test_a_microsoft_account_carries_a_tenant_that_forms_the_token_address(vendor_id: str, inner: str) -> None:
+    v = vendors.vendor(vendor_id)
+    for tenant in (TENANT_GUID.upper(), "contoso.example.invalid", "a.b.example.invalid"):
+        parts = v.validate_account(f"{inner}/{tenant}")
+        assert parts.tenant == tenant.lower() and parts.account == inner.lower()
+        assert v.token_url(parts) == f"https://login.microsoftonline.com/{tenant.lower()}/oauth2/v2.0/token"
+        assert v.render(v.oauth["authorizeUrl"], parts).startswith(f"https://login.microsoftonline.com/{tenant.lower()}/")
+
+
+@pytest.mark.parametrize("vendor_id", ["sharepoint", "dynamics365"])
+@pytest.mark.parametrize(
+    "tenant",
+    ["", "common", "organizations", "consumers", "contoso", "contoso.", ".contoso.com", "1.2.3.4", "a..b.com", "-a.example.invalid",
+     "contoso.example.invalid/x", "contoso.example.invalid?x=1", "contoso.example.invalid#x", "contoso.example.invalid:443",
+     "user@contoso.example.invalid", "../x.example.invalid", "00000000-0000-0000-0000-00000000000g", "00000000000000000000000000000001",
+     "0000000-00000-0000-0000-000000000001", "contoso.example.invalid\n", " contoso.example.invalid", "x" * 64 + ".com"],
+)  # fmt: skip
+def test_a_tenant_that_is_not_a_guid_or_a_domain_name_is_refused(vendor_id: str, tenant: str) -> None:
+    inner = "acme" if vendor_id == "sharepoint" else "acme.crm4.dynamics.com"
+    with pytest.raises(vendors.InvalidAccount):
+        vendors.vendor(vendor_id).validate_account(f"{inner}/{tenant}")
+
+
+@pytest.mark.parametrize("vendor_id", ["sharepoint", "dynamics365"])
+def test_a_microsoft_account_without_a_tenant_is_refused(vendor_id: str) -> None:
+    for value in ("acme", "acme.crm4.dynamics.com", "acme/", "/" + TENANT_GUID):
+        with pytest.raises(vendors.InvalidAccount):
+            vendors.vendor(vendor_id).validate_account(value)
+
+
+def test_the_microsoft_client_credentials_scope_is_dot_default_of_the_vendors_own_resource() -> None:
+    graph, dataverse = vendors.vendor("sharepoint"), vendors.vendor("dynamics365")
+    assert graph.integration_scope(graph.validate_account(SAMPLE["sharepoint"])) == "https://graph.microsoft.com/.default"
+    parts = dataverse.validate_account(SAMPLE["dynamics365"])
+    assert dataverse.integration_scope(parts) == "https://acme.crm4.dynamics.com/.default"
+    assert [v.id for v in vendors.VENDORS.values() if (v.integration or {}).get("scope")] == ["dynamics365", "sharepoint"]

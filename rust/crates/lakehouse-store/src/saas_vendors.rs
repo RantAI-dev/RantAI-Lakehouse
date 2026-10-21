@@ -42,6 +42,12 @@ pub enum AccountRule {
     /// A Dataverse environment address `<org>.crm<N>.dynamics.com`, where
     /// `<N>` is zero to two digits (the vendor's region number).
     DataverseHost,
+    /// SharePoint (slice 5): `<label>/<tenant>`, a [`Self::Label`] and the customer's Microsoft
+    /// Entra tenant (see [`is_entra_tenant`]). The tenant forms the token address.
+    LabelTenant,
+    /// Dynamics 365 (slice 5): `<org>.crm<N>.dynamics.com/<tenant>`, a [`Self::DataverseHost`]
+    /// and the customer's Microsoft Entra tenant.
+    DataverseHostTenant,
     /// `<host>/<tenant>`: `host` is one label under one of `suffixes`, and
     /// `tenant` a name of letters, digits, `-` and `_`.
     HostTenant {
@@ -99,6 +105,11 @@ pub struct Integration {
     pub secret_key: &'static str,
     /// The named secret fields, in slot order (primary first).
     pub secret_fields: &'static [&'static str],
+    /// The `scope` of the client-credentials request, with the same placeholders as the
+    /// addresses, when the vendor needs one: Microsoft Entra wants the resource's `/.default`
+    /// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow>).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<&'static str>,
 }
 
 /// The vendor's "who am I" request used by the connection test.
@@ -177,6 +188,33 @@ fn is_tenant(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Whether `text` is a Microsoft Entra tenant as `login.microsoftonline.com/{tenant}` takes it, in
+/// "GUID or domain-name format"
+/// (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow>).
+/// `common`, `organizations` and `consumers` are not one customer's tenant and have no dot, so a
+/// domain needs two labels or more; its last label must hold a letter, so a dotted number is not
+/// taken for a domain. Only these characters can reach the token address' path.
+fn is_entra_tenant(text: &str) -> bool {
+    let is_guid = text.len() == 36
+        && text.char_indices().all(|(index, c)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        });
+    if is_guid {
+        return true;
+    }
+    let labels: Vec<&str> = text.split('.').collect();
+    text.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| is_label(label))
+        && labels
+            .last()
+            .is_some_and(|last| last.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
 impl SaasVendor {
     /// Validate `account` against this vendor's rule and split it into the
     /// parts the placeholders use.
@@ -225,6 +263,25 @@ impl SaasVendor {
                     && digits.chars().all(|c| c.is_ascii_digit())
                     && is_label(org);
                 ok.then(|| plain(lowered)).ok_or(bad)
+            }
+            AccountRule::LabelTenant | AccountRule::DataverseHostTenant => {
+                // Slice 5: `<account>/<tenant>`; the account is checked by the plain rule.
+                let (inner, tenant) = account.split_once('/').ok_or(bad)?;
+                if !is_entra_tenant(tenant) {
+                    return Err(bad);
+                }
+                let base = if self.account == AccountRule::LabelTenant {
+                    AccountRule::Label
+                } else {
+                    AccountRule::DataverseHost
+                };
+                let mut parts = SaasVendor {
+                    account: base,
+                    ..*self
+                }
+                .validate_account(inner)?;
+                parts.tenant = tenant.to_ascii_lowercase();
+                Ok(parts)
             }
             AccountRule::HostTenant { suffixes } => {
                 let (host, tenant) = account.split_once('/').ok_or(bad)?;
@@ -331,6 +388,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:servicenow",
             secret_fields: &["clientId", "clientSecret"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -357,6 +415,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:workday",
             secret_fields: &["username", "password"],
+            scope: None,
         }),
         whoami: None,
     },
@@ -378,6 +437,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:ga4",
             secret_fields: &["serviceAccountJson"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -415,6 +475,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:hubspot",
             secret_fields: &["token"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -439,6 +500,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:zendesk",
             secret_fields: &["email", "apiToken"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -471,6 +533,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:confluence",
             secret_fields: &["email", "apiToken"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -481,12 +544,16 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         id: "dynamics365",
         label: "Dynamics 365",
         connector_type: "Dynamics 365",
-        account: AccountRule::DataverseHost,
-        account_label: "Environment address, as org.crm4.dynamics.com",
+        account: AccountRule::DataverseHostTenant,
+        account_label: "Environment address and tenant, as org.crm4.dynamics.com/tenant-id-or-domain",
         api_base: "https://{account}",
         oauth: OauthPreset {
-            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-            token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            // The customer's tenant, not `organizations`: a single-tenant app registration cannot sign in
+            // through the common endpoints
+            // (<https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow>).
+            // Microsoft has no RFC 7009 revocation endpoint in the v2 platform: none is listed.
+            authorize_url: "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+            token_url: "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
             revocation_url: None,
             scopes: &["https://{account}/user_impersonation", "offline_access"],
             client_auth: ClientAuth::Post,
@@ -495,6 +562,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:dynamics365",
             secret_fields: &["clientId", "clientSecret"],
+            scope: Some("https://{account}/.default"),
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -521,6 +589,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:netsuite",
             secret_fields: &["clientId", "privateKey"],
+            scope: None,
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -531,12 +600,12 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         id: "sharepoint",
         label: "SharePoint",
         connector_type: "SharePoint",
-        account: AccountRule::Label,
-        account_label: "Tenant name (the part before .sharepoint.com)",
+        account: AccountRule::LabelTenant,
+        account_label: "Tenant name and tenant, as contoso/tenant-id-or-domain (contoso is the part before .sharepoint.com)",
         api_base: "https://graph.microsoft.com",
         oauth: OauthPreset {
-            authorize_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-            token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+            authorize_url: "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+            token_url: "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
             revocation_url: None,
             scopes: &[
                 "https://graph.microsoft.com/Sites.Read.All",
@@ -548,6 +617,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: Some(Integration {
             secret_key: "integration:sharepoint",
             secret_fields: &["clientId", "clientSecret"],
+            scope: Some("https://graph.microsoft.com/.default"),
         }),
         whoami: Some(Whoami {
             method: "GET",
@@ -564,10 +634,11 @@ mod tests {
 
     fn sample(id: &str) -> &'static str {
         match id {
-            "salesforce" | "servicenow" | "zendesk" | "confluence" | "sharepoint" => "acme",
+            "salesforce" | "servicenow" | "zendesk" | "confluence" => "acme",
+            "sharepoint" => "acme/00000000-0000-0000-0000-000000000001",
             "workday" => "wd2-impl-services1.workday.com/acme_tenant",
             "ga4" | "hubspot" => "123456789",
-            "dynamics365" => "acme.crm4.dynamics.com",
+            "dynamics365" => "acme.crm4.dynamics.com/contoso.example.invalid",
             "netsuite" => "1234567_SB1",
             other => panic!("no sample account for {other}"),
         }
@@ -671,11 +742,12 @@ mod tests {
             "a.b.crm.dynamics.com",
             "acme.api.crm.dynamics.com",
         ] {
-            assert!(dataverse.validate_account(value).is_err(), "{value:?}");
+            let account = format!("{value}/00000000-0000-0000-0000-000000000001");
+            assert!(dataverse.validate_account(&account).is_err(), "{value:?}");
         }
         assert!(
             dataverse
-                .validate_account("Acme.CRM.dynamics.com")
+                .validate_account("Acme.CRM.dynamics.com/00000000-0000-0000-0000-000000000001")
                 .is_ok_and(|parts| parts.account == "acme.crm.dynamics.com")
         );
         let netsuite = vendor("netsuite").unwrap();
@@ -685,6 +757,103 @@ mod tests {
             netsuite.validate_account("1234567_SB1").unwrap().account,
             "1234567-sb1"
         );
+    }
+
+    #[test]
+    fn a_microsoft_account_carries_a_tenant_that_forms_the_token_address() {
+        for (id, inner) in [
+            ("sharepoint", "Acme"),
+            ("dynamics365", "Acme.CRM4.dynamics.com"),
+        ] {
+            let vendor = vendor(id).unwrap();
+            for tenant in [
+                "00000000-0000-0000-0000-00000000000A",
+                "contoso.example.invalid",
+                "a.b.example.invalid",
+            ] {
+                let parts = vendor
+                    .validate_account(&format!("{inner}/{tenant}"))
+                    .unwrap();
+                assert_eq!(parts.tenant, tenant.to_ascii_lowercase());
+                assert_eq!(parts.account, inner.to_ascii_lowercase());
+                assert_eq!(
+                    SaasVendor::render(vendor.oauth.token_url, &parts),
+                    format!(
+                        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+                        tenant.to_ascii_lowercase()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tenant_that_is_not_a_guid_or_a_domain_name_is_refused() {
+        let long_label = format!("{}.com", "x".repeat(64));
+        for id in ["sharepoint", "dynamics365"] {
+            let vendor = vendor(id).unwrap();
+            let inner = if id == "sharepoint" {
+                "acme"
+            } else {
+                "acme.crm4.dynamics.com"
+            };
+            for tenant in [
+                "",
+                "common",
+                "organizations",
+                "consumers",
+                "contoso",
+                "contoso.",
+                ".contoso.com",
+                "1.2.3.4",
+                "a..b.com",
+                "-a.example.invalid",
+                "contoso.example.invalid/x",
+                "contoso.example.invalid?x=1",
+                "contoso.example.invalid#x",
+                "contoso.example.invalid:443",
+                "user@contoso.example.invalid",
+                "../x.example.invalid",
+                "00000000-0000-0000-0000-00000000000g",
+                "00000000000000000000000000000001",
+                "0000000-00000-0000-0000-000000000001",
+                " contoso.example.invalid",
+                long_label.as_str(),
+            ] {
+                assert!(
+                    vendor
+                        .validate_account(&format!("{inner}/{tenant}"))
+                        .is_err(),
+                    "{id}: {tenant:?}"
+                );
+            }
+            // No tenant at all.
+            for account in [
+                inner,
+                &format!("{inner}/"),
+                "/00000000-0000-0000-0000-000000000001",
+            ] {
+                assert!(
+                    vendor.validate_account(account).is_err(),
+                    "{id}: {account:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_two_microsoft_vendors_name_a_client_credentials_scope() {
+        let scoped: Vec<_> = SAAS_VENDORS
+            .iter()
+            .filter(|v| v.integration.is_some_and(|i| i.scope.is_some()))
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(scoped, ["dynamics365", "sharepoint"]);
+        for vendor in SAAS_VENDORS {
+            if let Some(scope) = vendor.integration.and_then(|i| i.scope) {
+                assert!(scope.ends_with("/.default"), "{}: {scope}", vendor.id);
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@
  */
 
 export type SaasAccountRule =
-  | { kind: "label" | "digits" | "account_id" | "dataverse_host" }
+  | { kind: "label" | "digits" | "account_id" | "dataverse_host" | "label_tenant" | "dataverse_host_tenant" }
   | { kind: "host_tenant"; suffixes: readonly string[] }
 
 export type SaasVendor = {
@@ -35,7 +35,12 @@ export type SaasVendor = {
     apiBase?: string
   }
   /** The integration credential, when the vendor offers one (Salesforce does not: decision 4). */
-  integration: { secretKey: string; secretFields: readonly string[] } | null
+  integration: {
+    secretKey: string
+    secretFields: readonly string[]
+    /** The scope of a client-credentials request, when the vendor needs one (Microsoft's `/.default`). */
+    scope?: string
+  } | null
   whoami: { method: string; path: string } | null
 }
 
@@ -260,13 +265,13 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "label": "Dynamics 365",
     "connectorType": "Dynamics 365",
     "account": {
-      "kind": "dataverse_host"
+      "kind": "dataverse_host_tenant"
     },
-    "accountLabel": "Environment address, as org.crm4.dynamics.com",
+    "accountLabel": "Environment address and tenant, as org.crm4.dynamics.com/tenant-id-or-domain",
     "apiBase": "https://{account}",
     "oauth": {
-      "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-      "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+      "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+      "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
       "revocationUrl": null,
       "scopes": [
         "https://{account}/user_impersonation",
@@ -279,7 +284,8 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
       "secretFields": [
         "clientId",
         "clientSecret"
-      ]
+      ],
+      "scope": "https://{account}/.default"
     },
     "whoami": {
       "method": "GET",
@@ -321,13 +327,13 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "label": "SharePoint",
     "connectorType": "SharePoint",
     "account": {
-      "kind": "label"
+      "kind": "label_tenant"
     },
-    "accountLabel": "Tenant name (the part before .sharepoint.com)",
+    "accountLabel": "Tenant name and tenant, as contoso/tenant-id-or-domain (contoso is the part before .sharepoint.com)",
     "apiBase": "https://graph.microsoft.com",
     "oauth": {
-      "authorizeUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-      "tokenUrl": "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+      "authorizeUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
+      "tokenUrl": "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
       "revocationUrl": null,
       "scopes": [
         "https://graph.microsoft.com/Sites.Read.All",
@@ -340,7 +346,8 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
       "secretFields": [
         "clientId",
         "clientSecret"
-      ]
+      ],
+      "scope": "https://graph.microsoft.com/.default"
     },
     "whoami": {
       "method": "GET",

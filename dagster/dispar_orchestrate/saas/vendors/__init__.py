@@ -144,16 +144,17 @@ _TABLE: list[dict[str, Any]] = [{'id': 'salesforce',
  {'id': 'dynamics365',
   'label': 'Dynamics 365',
   'connectorType': 'Dynamics 365',
-  'account': {'kind': 'dataverse_host'},
-  'accountLabel': 'Environment address, as org.crm4.dynamics.com',
+  'account': {'kind': 'dataverse_host_tenant'},
+  'accountLabel': 'Environment address and tenant, as org.crm4.dynamics.com/tenant-id-or-domain',
   'apiBase': 'https://{account}',
-  'oauth': {'authorizeUrl': 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize',
-            'tokenUrl': 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token',
+  'oauth': {'authorizeUrl': 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize',
+            'tokenUrl': 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token',
             'revocationUrl': None,
             'scopes': ['https://{account}/user_impersonation', 'offline_access'],
             'clientAuth': 'post'},
   'integration': {'secretKey': 'integration:dynamics365',
-                  'secretFields': ['clientId', 'clientSecret']},
+                  'secretFields': ['clientId', 'clientSecret'],
+                  'scope': 'https://{account}/.default'},
   'whoami': {'method': 'GET', 'path': '/api/data/v9.2/WhoAmI'}},
  {'id': 'netsuite',
   'label': 'NetSuite',
@@ -171,16 +172,18 @@ _TABLE: list[dict[str, Any]] = [{'id': 'salesforce',
  {'id': 'sharepoint',
   'label': 'SharePoint',
   'connectorType': 'SharePoint',
-  'account': {'kind': 'label'},
-  'accountLabel': 'Tenant name (the part before .sharepoint.com)',
+  'account': {'kind': 'label_tenant'},
+  'accountLabel': 'Tenant name and tenant, as contoso/tenant-id-or-domain (contoso is the part '
+                  'before .sharepoint.com)',
   'apiBase': 'https://graph.microsoft.com',
-  'oauth': {'authorizeUrl': 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize',
-            'tokenUrl': 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token',
+  'oauth': {'authorizeUrl': 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize',
+            'tokenUrl': 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token',
             'revocationUrl': None,
             'scopes': ['https://graph.microsoft.com/Sites.Read.All', 'offline_access'],
             'clientAuth': 'post'},
   'integration': {'secretKey': 'integration:sharepoint',
-                  'secretFields': ['clientId', 'clientSecret']},
+                  'secretFields': ['clientId', 'clientSecret'],
+                  'scope': 'https://graph.microsoft.com/.default'},
   'whoami': {'method': 'GET', 'path': '/v1.0/sites/{account}.sharepoint.com'}}]
 # ---------------------------------------------------------------------------------
 
@@ -290,6 +293,12 @@ class Vendor:
         parsed = urlparse(template)
         return f"{parsed.scheme}://{parsed.netloc}"
 
+    def integration_scope(self, parts: AccountParts) -> str | None:
+        """The `scope` of this vendor's client-credentials request, rendered, or `None` when its
+        integration credential needs none (Microsoft's `/.default`, slice 5)."""
+        scope = (self.integration or {}).get("scope")
+        return self.render(scope, parts) if scope else None
+
     def token_url(self, parts: AccountParts) -> str:
         return self.render(self.oauth["tokenUrl"], parts)
 
@@ -314,8 +323,29 @@ def _is_tenant(text: str) -> bool:
     return bool(text) and len(text) <= 64 and all(c.isascii() and (c.isalnum() or c in "-_") for c in text)
 
 
+def _is_entra_tenant(text: str) -> bool:
+    """A Microsoft Entra tenant as `login.microsoftonline.com/{tenant}` takes it: a GUID or a
+    domain name (https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow,
+    "in GUID or domain-name format"). `common`, `organizations` and `consumers` are not tenants of
+    one customer and have no dot, so a domain needs at least two labels; the last label must hold a
+    letter, so a dotted number is not taken for a domain."""
+    if len(text) == 36 and text.isascii() and all((c == "-") == (i in (8, 13, 18, 23)) for i, c in enumerate(text)):
+        return all(c in "0123456789abcdefABCDEF" for c in text.replace("-", ""))
+    labels = text.split(".")
+    return len(text) <= 253 and len(labels) >= 2 and all(_is_label(label) for label in labels) and any(c.isalpha() for c in labels[-1])
+
+
 def _validate_account(rule: dict[str, Any], account: str) -> AccountParts:
     kind = rule["kind"]
+    if kind in ("label_tenant", "dataverse_host_tenant"):
+        # SharePoint and Dynamics 365 (slice 5): `<account>/<tenant>`. The tenant forms the token address
+        # `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`, a fixed Microsoft host (AD2); only
+        # the path segment is the customer's, and it is checked to hold nothing but a GUID or a domain name.
+        inner, slash, tenant = account.partition("/")
+        if slash and _is_entra_tenant(tenant):
+            base = _validate_account({"kind": "label" if kind == "label_tenant" else "dataverse_host"}, inner)
+            return AccountParts(base.account, tenant=tenant.lower())
+        raise InvalidAccount()
     if kind == "label" and _is_label(account):
         return AccountParts(account.lower())
     if kind == "digits" and account and len(account) <= 20 and account.isascii() and account.isdigit():
