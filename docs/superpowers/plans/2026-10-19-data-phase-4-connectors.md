@@ -954,6 +954,15 @@ suite did NOT run; see "Not verified".**
 - The product steps of `g6-saas` (the label and site-list checks added to the two SharePoint entries) did not run.
 - Nothing shown in a browser.
 
+**Addendum (PR #216 CI rust test).** Eight older probe tests panicked because my test helper `request()` (slice 5, `d48a26a7`)
+validated the account `"acme"` for every vendor; HubSpot, GA4, Workday and NetSuite never accept it. Fixed in the test helper only
+(`sample_account` names every vendor's valid form; the validation is unchanged, rule 2); no other Rust test builds a vendor account
+(grep). Run with the coordinator's permission once the disk had recovered (22 GB free, no other cargo):
+`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p lakehouse-api --lib connector_probe::saas`:
+**23 passed, 0 failed**, including the five Microsoft tests. That run compiled the Rust of BLOCKER 14 for `lakehouse-api` and
+`lakehouse-store` (non-test code), but clippy was still not run and the store's `tests/connector_discovery.rs` cases did not run.
+No product entry was added in this round (the `g6-saas` job is at 16m17s of 20).
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
