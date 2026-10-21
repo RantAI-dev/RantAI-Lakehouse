@@ -111,6 +111,8 @@ pub(super) async fn probe_saas_info(
 struct Access {
     token: SecretValue,
     rotated: Option<SecretValue>,
+    /// `token` is the base64 of an HTTP Basic credential, not a bearer token.
+    basic: bool,
 }
 
 /// Resolve one credential reference, or the outcome that ends the test.
@@ -202,6 +204,7 @@ async fn access_token(
             Ok(Access {
                 token: tokens.access_token,
                 rotated: tokens.refresh_token,
+                basic: false,
             })
         }
         SaasAuth::Integration => {
@@ -209,6 +212,31 @@ async fn access_token(
                 .vendor
                 .integration
                 .map_or(&[][..], |integration| integration.secret_fields);
+            // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with
+            // `<email>/token` as the user name
+            // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>).
+            if request.vendor.id == "zendesk" && fields == ["email", "apiToken"] {
+                let email = resolve(secrets.resolver, secrets.primary).await?;
+                let Some(secondary) = secrets.secondary else {
+                    return Err(Outcome::misconfigured(
+                        "connector is misconfigured: the Zendesk API token is not saved",
+                    ));
+                };
+                let api_token = resolve(secrets.resolver, secondary).await?;
+                let pair = format!(
+                    "{}/token:{}",
+                    email.expose_secret(),
+                    api_token.expose_secret()
+                );
+                return Ok(Access {
+                    token: SecretValue::new(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        pair,
+                    )),
+                    rotated: None,
+                    basic: true,
+                });
+            }
             if fields != ["token"] {
                 return Err(Outcome::not_testable_with(format!(
                     "This build cannot test {}'s integration credential from the console yet. \
@@ -219,6 +247,7 @@ async fn access_token(
             Ok(Access {
                 token: resolve(secrets.resolver, secrets.primary).await?,
                 rotated: None,
+                basic: false,
             })
         }
     }
@@ -262,14 +291,16 @@ async fn probe_saas_at(
         Err(outcome) => return outcome,
     };
     let started = Instant::now();
-    let attempt = tokio::time::timeout(
-        DIAL_TIMEOUT,
-        client
-            .get(&request.url)
-            .bearer_auth(access.token.expose_secret())
-            .send(),
-    )
-    .await;
+    let get = client.get(&request.url);
+    let get = if access.basic {
+        get.header(
+            reqwest::header::AUTHORIZATION,
+            format!("Basic {}", access.token.expose_secret()),
+        )
+    } else {
+        get.bearer_auth(access.token.expose_secret())
+    };
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, get.send()).await;
     let elapsed = started.elapsed();
     let mut outcome = match attempt {
         // A redirect is reported, never followed; the `Location` is the
@@ -607,11 +638,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_integration_credential_that_is_not_one_token_is_not_testable_yet() {
+    async fn zendesks_email_and_api_token_are_sent_as_basic_with_email_slash_token() {
+        // `ZD_EMAIL`/`ZD_TOKEN` are placeholders; base64 of `agent@example.invalid/token:zd-token`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header(
+                "authorization",
+                "Basic YWdlbnRAZXhhbXBsZS5pbnZhbGlkL3Rva2VuOnpkLXRva2Vu",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("ZD_EMAIL".to_owned(), "agent@example.invalid".to_owned());
+        map.insert("ZD_TOKEN".to_owned(), "zd-token".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
         let auth = SaasAuth::Integration;
         let outcome = probe_saas_at(
             &request(
                 "zendesk",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:ZD_EMAIL",
+                secondary: Some("env:ZD_TOKEN"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("zd-token"));
+    }
+
+    #[tokio::test]
+    async fn an_integration_credential_that_is_not_one_token_is_not_testable_yet() {
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "servicenow",
                 "http://127.0.0.1:9/who".to_owned(),
                 String::new(),
                 &auth,
