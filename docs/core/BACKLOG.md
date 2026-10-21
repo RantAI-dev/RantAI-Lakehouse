@@ -86,6 +86,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-9` | Task | Move the Rust toolchain and the declared minimum from 1.96.1 and 1.88 to the latest stable (1.99.1), and prove the code is safe on it: every compatibility note in the 1.97–1.99 release notes checked, every new warning fixed | Delivery | P1 | Todo |  | [spec](specs/rel-9.md) |
 | `SEC-41` | Task | Upgrade `sqlx` to 0.9: 0.8.6 cannot verify a CA when it dials an IP (it misses rustls' `NotValidForNameContext`), so `SEC-14` part B's `VerifyCa` dials fail. `mysql-rsa` stays off; each run-time query string is wrapped in `AssertSqlSafe` with its reason. **Blocked by `REL-9`** | Administration & Security | P1 | Todo |  | [spec](specs/sec-41.md) |
 | `SEC-42` | Task | `cargo audit` and `cargo deny` are red on `main` since 2026-10-16: `zip` 8.6.0 (through `calamine` 0.36.1, the workbook reader) has `RUSTSEC-2026-0367`, `-0368`, `-0369`, fixed in `zip` 9.0.0, and no `calamine` release accepts `zip` 9 yet. All three are in `extract` (writing an archive to disk); `calamine` only reads entries and never calls it (checked in its 0.36.1 source). Ignore the three IDs in `rust/deny.toml` and the `cargo audit` step, each with that reason and a note to drop it when `calamine` moves to `zip` 9 | Administration & Security | P1 | Done | #196 | `security.yml` on `main` |
+| `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
 ## Next (P2)
@@ -158,16 +159,17 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-4` | Feature | More databases, with live change capture: Oracle tested end to end, MariaDB and Teradata added; live change capture for PostgreSQL, MySQL, SQL Server, Oracle and MongoDB, each gate-tested. Cloud warehouses and enterprise databases excluded (product owner, 2026-10-07). **Blocked by `SRC-11` (column choice), `SEC-14` (credentials)** | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-11` | Feature | Catalog search that finds columns and tags, with tolerant matching. The certification filter is built with `DATA-12` part 1 | Data | P2 | In Acceptance | #98 | `features/catalog-search.md` |
 | `DATA-20` | Feature | Hide single tables from single users in the catalog and in search. Today whoever may open the catalog sees every table in it (found planning `DATA-11`, decision 5) | Data | P2 | Idea |  | `features/catalog-search.md` |
-| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values. In three parts: marks in search, the Data Explorer and the asset page, set with `governance:write` (part 1); governed tags (part 2); marks in the chart builder and Query Studio (part 3). All three parts built on the phase-2 branch | Data | P2 | Building | #106 | `features/certification-and-governed-tags.md` |
+| `DATA-12` | Feature | Certified and deprecated marks; governed tags with allowed values. In three parts: marks in search, the Data Explorer and the asset page, set with `governance:write` (part 1); governed tags (part 2); marks in the chart builder and Query Studio (part 3). All three parts built on the phase-2 branch | Data | P2 | In Acceptance | #106 | `features/certification-and-governed-tags.md` |
 | `DATA-22` | Feature | A tag on a namespace applies to its tables. Split from `DATA-12` by the product owner (2026-10-09): a namespace is one of four fixed names with no stored record and no page to edit | Data | P3 | Idea |  | `features/certification-and-governed-tags.md` |
 | `DATA-23` | Task | The Catalog page's links to the Data Explorer filter by a namespace's display name where assets carry its id, so by reading the code they match nothing (found planning `DATA-12`; not run) | Data | P2 | Todo |  | `plans/2026-10-09-data-12-part-1-certification.md` |
-| `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
-| `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | Building | #106 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-13` | Feature | Column-level lineage. Also check the lineage gate, which by reading does not accept the `build` link kind the API emits (`specs/data-13.md`) | Data | P2 | In Acceptance | #106 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-14` | Feature | Data quality in depth: a fuller library of ready checks (four exist), freshness and volume anomaly detection, incidents and their overview, and alerts on a failed check | Data | P2 | In Acceptance | #106 | `reference/competitive-comparison.md` (Data matrix) |
+| `DATA-15` | Feature | Asset page depth: 1,000-row preview, 30-day usage, grant and revoke, restore a dropped table | Data | P2 | In Acceptance | #106 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-16` | Task | Time travel proven safe on ClickHouse: a gate test that a past-version query keeps masking and row filters, a fix so a role named by a policy can read the policy's raw table at all, a version picker that follows the engine, and a plain refusal on Trino (`specs/data-16.md`) | Data | P2 | Done | #100 | `features/time-travel.md` |
 | `DATA-21` | Task | Past versions and masking on Trino: the masking rewrite writes ClickHouse functions for both engines and cannot read Trino's version clause, so on Trino a past version is refused and, by reading, a masked table cannot be read at all. Needs the rewrite made engine-aware and a gate with Trino. Split from `DATA-16` by the product owner (2026-10-09) | Data | P2 | Todo |  | `features/time-travel.md` |
 | `DATA-25` | Task | Time travel follow-ups from the `DATA-16` review: a past version that does not exist reaches the Query Studio response as ClickHouse's own text (principle 4); the Trino refusal (422) for a past-version query has no route-level test | Data | P2 | Todo |  | PR #100 review |
 | `DATA-26` | Task | Record who wrote each Iceberg version on loads written through dlt (the loader commits without snapshot properties, so `DATA-15`'s history says "unknown" for them); owned by the orchestration owners | Data | P3 | Todo |  | `plans/2026-10-16-data-15-asset-page-depth.md` |
+| `DATA-27` | Task | Catalog phase 2 follow-ups from the last `#106` review (round 4): a connector success asks Dagster for its run config twice; stale comments in `quality_load.rs`, `load_alerts.rs` and `route_auth.rs`; write down that an incident alert is retried only when the failure is seen again and is not retried after a failed webhook; one constant for the sensor-retry message; dead checks for now-required service methods; governed-tag reads drop a database error silently; the grantee-in-tenant check does not run when several tenants exist and no catalog tenant is set (fail closed instead); two quality test files call as `*:*` | Data | P2 | Todo |  | `superpowers/plans/2026-10-14-data-phase-2.md` (round 4) |
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | In Acceptance | #165 | `reference/competitive-comparison.md` (Data matrix) |
@@ -212,6 +214,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-33` | Task | A Query Studio download rewrites the history's statement, which was stored already rewritten, so an old mask or row filter stays inside and the current one applies on top. Fails closed, but the doc says today's policy governs the file; store the original statement or test the stored shape and correct the doc (`query.rs`, `tests/query_download.rs` seeds raw SQL) | Administration & Security | P2 | Done | #203 | PR #104 review SHOULD-FIX 1 |
 | `SEC-43` | Task | The row-filter validator checked only a function's arguments, an operator's sides and a column's last name part; every other part of a call, any operator and any qualifier now must match a fixed shape | Administration & Security | P2 | Done | #205 | `SEC-32` follow-up, batch review 2026-10-17 |
 | `SEC-44` | Task | A checked row filter could print differently from how it was checked: two signs in a row printed as a `--` comment, a text could span lines, and `LIKE ANY` was not checked | Administration & Security | P2 | Done | #207 | PR #205 review |
+| `SEC-45` | Task | Approving an access request does not check that the approver holds the permission they approve (`decide_access_request`), the gap `#106` closed for direct grants | Administration & Security | P1 | Todo |  | `#106` review round 1 (BLOCKER 4 note) |
 | `SEC-34` | Task | Calculated-field names read back from storage enter the SQL as a plain alias, not re-validated (`fields.rs` `row_to_field`, `builder.rs`). Not reachable through the API; wrap the name in `Ident` on read | Administration & Security | P2 | Todo |  | PR #104 review SHOULD-FIX 2 |
 | `BI-27` | Task | Whole-result export holds up to three copies of 100,001 rows and mart exports have no time or byte limit (`dashboard.rs`). Take the rows instead of cloning, add a byte cap and a timeout, or stream | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 3 |
 | `BI-28` | Task | Export honesty: negative `Int64` values are written `'-5` (decide number columns from `result.meta`); a file can include rows a tile skipped with nothing saying so (`RecordsSql.skipped` dropped); a raw table with a calculated column cannot be exported (400) | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 4 |
@@ -219,6 +222,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-30` | Task | One CSV rule: `csv_export.rs` repeats `upload_workbook.rs`'s quoting and BOM, its `neutralise` differs from `csv_safe::neutralize_csv` (#86), and `src/lib/csv.ts` does not neutralise. Pick one owner | Dashboards | P2 | Todo |  | PR #104 review SHOULD-FIX 7 |
 | `AI-20` | Task | The dashboard's page context sends the filters but not the time-grain override (`dashboard-page.tsx`), so the assistant cannot see it | AI Copilot | P2 | Done | #188 | PR #104 review SHOULD-FIX 11 |
 | `AI-21` | Feature | The assistant undoes its last dashboard change in one step. **Waits for `BI-18`** (version history part) | AI Copilot | P2 | Planned |  | `AI-1` spec |
+| `AI-22` | Task | The assistant warns about a deprecated mart and names its replacement, as the chart builder does: `describe_mart` returns the marks, but nothing tells or tests the assistant to use them (no `AI-15` request) | AI Copilot | P2 | Todo |  | `#106` review round 1 (repo 3) |
 
 ## Later (P3)
 
@@ -271,13 +275,12 @@ parity), built after it.
 | `BI-18` | Building | — | `AI-21` (version history part), `AI-2`, `AI-9` (layout part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
 | `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
 | `RPT-1` | Planned | `BI-1` (PDF and Excel attachments) | `AI-10`, `BI-19` (digest schedules) |
-| `BI-14` | Planned | `DATA-13` (column part) | `AI-13` |
+| `BI-14` | Planned | — | `AI-13` |
 | `BI-16` | Building | — | `AI-5` (per chart type as it lands) |
 | `BI-17` | Planned | — | `AI-8` |
 | `BI-19` | Planned | `RPT-1` (digest schedules) | `AI-11` |
 | `BI-26` | Planned | `BI-18` (locking a dashboard filter in an embed) | `AI-11` |
 | `BLD-1` | Building | — | `REL-6` |
-| `DATA-13` | Building | — | `BI-14` (column part) |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
 | `DEC-9` | Open (decision) | — | `SRC-3` |
@@ -303,7 +306,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-1`, `AI-14`, `AI-19`, `AI-20`, `BI-1`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-12`, `DATA-13`, `DATA-14`, `DATA-15`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-24`, `DATA-25`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-22`, `BI-1`, `BI-14`, `BI-17`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -325,10 +328,10 @@ set by the product owner and are left empty until they are.
 | `SEC-14` | 2026-10-08 | first PR, 2026-10-08 | |
 | `SEC-15` | 2026-10-08 | 2026-10-08 | |
 | `DATA-11` | 2026-10-09 | 2026-10-09 | |
-| `DATA-12` | 2026-10-09 | | |
-| `DATA-13` | 2026-10-16 | | |
-| `DATA-14` | 2026-10-16 | | |
-| `DATA-15` | 2026-10-16 | | |
+| `DATA-12` | 2026-10-09 | 2026-10-21 | |
+| `DATA-13` | 2026-10-16 | 2026-10-21 | |
+| `DATA-14` | 2026-10-16 | 2026-10-21 | |
+| `DATA-15` | 2026-10-16 | 2026-10-21 | |
 | `DATA-16` | 2026-10-09 | 2026-10-12 | |
 | `SEC-23` | 2026-10-09 | 2026-10-12 | |
 | `WEB-1` | 2026-10-11 | 2026-10-11 | |
@@ -357,6 +360,7 @@ set by the product owner and are left empty until they are.
 | `SEC-32` | | 2026-10-17 | |
 | `SEC-43` | 2026-10-17 | 2026-10-17 | |
 | `SEC-44` | 2026-10-17 | | |
+| `SEC-46` | 2026-10-21 | 2026-10-21 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
