@@ -533,7 +533,8 @@
     "expect_tool": {"name": "move_tab", "args_contains": {"board": "{board}"}},
     "expect_state": [
       {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Overview"}, "count": 1},
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[0].title": "Maps"}, "count": 1}
     ]
   },
   {
@@ -560,10 +561,10 @@
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Map Tab Board"}, "id_at": "board.id"},
       {"name": "map_chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Provinces Map", "kind": "geomap", "mart": "mart_kuliner", "dimension": "wilayah", "measures": ["jumlah_usaha"], "map": "id-provinces", "board": "{board}"}, "id_at": "chart.id"}
     ],
-    "turns": ["Put the map charts in a separate tab on dashboard {board}."],
-    "expect_tool": {"name": "create_tab", "args_contains": {"board": "{board}"}},
+    "turns": ["Put the map charts in a separate tab called Maps on dashboard {board}."],
+    "expect_tool": {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{map_chart}"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
     ]
   },
   {
