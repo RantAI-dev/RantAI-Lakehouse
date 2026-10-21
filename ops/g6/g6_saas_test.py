@@ -410,6 +410,137 @@ def step_salesforce() -> None:
     _log("salesforce instance_url: a returned host outside .salesforce.com / .force.com stops the run before any read")
 
 
+GA4_REPORT = "traffic = country, date | sessions, purchaseRevenue"
+GA4_BROWSER = {"vendor": "ga4", "account": "123", "objects": [GA4_REPORT], "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+GA4_KEY = {}  # the gate's throwaway service-account key, made once per run
+
+
+def _ga4_key_file() -> str:
+    """A service-account key file whose private key was made for this run (never a real one);
+    its public half is registered with the mock, which checks the assertion's signature."""
+    if not GA4_KEY:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+        admin("ga4", action="register_key", n=str(numbers.n), e=str(numbers.e))
+        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        GA4_KEY["file"] = json.dumps({"type": "service_account", "client_email": "reader@example.invalid", "private_key": pem})
+    return GA4_KEY["file"]
+
+
+def _ga4(auth: str = "integration"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import ga4 as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial, secrets = GA4_BROWSER, {"clientSecret": "stub-client-secret", "refreshToken": "stub-refresh-token"}
+    else:
+        dial, secrets = {"vendor": "ga4", "account": "123", "objects": [GA4_REPORT], "auth": {"type": "integration"}}, {"serviceAccountJson": _ga4_key_file()}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_ga4() -> None:
+    """Google Analytics 4 (V-GA4.4): connect (browser sign-in and a service-account key signed
+    with a throwaway RSA key the mock verifies), discover (the report the connector defines, its
+    columns from the property's metadata), load (paged by offset), reload (the last days are read
+    again, Google having corrected them), a new custom dimension, rate limit, forbidden, revoked."""
+    from dispar_orchestrate import ingest_errors
+    from dispar_orchestrate.saas.vendors import ga4 as ga4_module
+
+    admin("ga4", action="reset")
+    GA4_KEY.clear()
+    for auth in ("integration", "oauth"):
+        _module, vendor, parts, session, _dial = _ga4(auth)
+        meta = session.get_json(vendor.whoami["path"].replace("{account}", parts.account))
+        _expect({"sessions", "purchaseRevenue"} <= {m["apiName"] for m in meta["metrics"]}, f"ga4 connect ({auth}): the metadata is {meta!r}")
+    log = mock_log("ga4")
+    _expect("POST /token urn:ietf:params:oauth:grant-type:jwt-bearer" in log and "POST /token refresh_token" in log, f"ga4 connect: the token grants the mock saw are {log}")
+    _log("ga4 connect: the browser sign-in (refresh grant) and the service-account key (an RS256 assertion whose signature the mock verified) both reach the property")
+
+    module, vendor, parts, session, dial = _ga4("integration")
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect(list(declared) == [GA4_REPORT] and declared[GA4_REPORT].load_description() == "incremental", f"ga4 discover: the objects are {list(declared)}")
+    _expect(declared[GA4_REPORT].primary_key == ("country", "date") and declared[GA4_REPORT].cursor == "date", "ga4 discover: the key and the cursor")
+    fields = {f.name: f.type_name for f in module.describe(session, parts, dial, GA4_REPORT)}
+    _expect(fields == {"country": "text", "date": "timestamp", "sessions_INTEGER": "bigint", "purchaseRevenue_CURRENCY": "double"}, f"ga4 discover: the described columns are {fields}")
+    _raises("SaasSetupRefused", lambda: module.describe(session, parts, dial, "t = country | nosuchmetric"))
+    _log("ga4 discover: the connector's report is the one object, incremental on date, keyed by its dimensions; its columns come from getMetadata and a metric the property lacks is refused")
+
+    days = admin("ga4", action="days")["days"]
+    ga4_module.ROWS_PER_PAGE = 4  # the mock has 10 rows: show the offset paging
+    try:
+        admin("ga4", action="clear_log")
+        decl = module.declaration(session, parts, dial, GA4_REPORT)
+        first = list(module.read(session, parts, dial, decl, since=None))
+    finally:
+        ga4_module.ROWS_PER_PAGE = 10_000
+    pages = [line for line in mock_log("ga4") if "runReport" in line]
+    _expect(len(first) == 10 and len(pages) == 3 and "offset=8" in pages[-1], f"ga4 load: {len(first)} rows over {len(pages)} pages ({pages})")
+    _expect(first[0]["sessions_INTEGER"] in range(10, 20) and isinstance(first[0]["purchaseRevenue_CURRENCY"], float), "ga4 load: the metrics are not typed")
+    _expect(pages[0].split(" ")[2].startswith("2015-08-14.."), f"ga4 load: the first run asked from {pages[0]}")
+    _log("ga4 load: 10 rows (5 days x 2 countries) over 3 pages of 4 by offset, metrics typed, the first run from the start of Analytics")
+
+    cursor = max(r["date"] for r in first)
+    admin("ga4", action="put", days_ago=0, country="ID", metrics={"sessions": 99})
+    admin("ga4", action="put", days_ago=2, country="US", metrics={"sessions": 55})
+    admin("ga4", action="clear_log")
+    lagged = cursor.subtract(seconds=decl.lag_seconds)
+    again = list(module.read(session, parts, dial, decl, since=lagged))
+    got = {(r["country"], r["date"].strftime("%Y%m%d")): r["sessions_INTEGER"] for r in again}
+    _expect(got[("ID", days[-1])] == 99 and got[("US", days[-3])] == 55, f"ga4 reload: the corrected numbers are not in {got}")
+    _expect(len(got) == 8 and min(d for _c, d in got) == days[-4], f"ga4 reload: read {sorted(got)}; expected the last four days, nothing older")
+    _expect(any(f" {lagged.to_date_string()}.." in line for line in mock_log("ga4") if "runReport" in line), "ga4 reload: the request did not start at the lagged cursor")
+    _log("ga4 reload: the last four days (the cursor day and the three before it) were read again with Google's corrected numbers; nothing older; merge on country + date")
+
+    admin("ga4", action="add_dimension", name="customEvent:plan")
+    both = module.describe(session, parts, dial, "t2 = country, customEvent:plan | sessions")
+    _expect("customEvent:plan" in {f.name for f in both}, "ga4 schema change: the new custom dimension is not accepted")
+    _log("ga4 schema change: a custom dimension added at the property is accepted by describe before any load")
+
+    admin("ga4", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(list(module.read(session, parts, dial, decl, since=None))) == 10, "ga4 rate limit: the report did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "ga4 rate limit: the Retry-After was not waited")
+    admin("ga4", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: list(module.read(session, parts, dial, decl, since=None)))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "ga4 rate limit: the run report class")
+    admin("ga4", action="rate_limit", count=0)
+    _log("ga4 rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("ga4", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: list(module.read(session, parts, dial, decl, since=None)))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "ga4 forbidden: the run report class")
+    admin("ga4", action="forbid", on=False)
+
+    def key_read() -> None:
+        k_module, _v, k_parts, k_session, k_dial = _ga4("integration")
+        list(k_module.read(k_session, k_parts, k_dial, k_module.declaration(k_session, k_parts, k_dial, GA4_REPORT), since=None))
+
+    # The mock checks the signature for real: another key's public half must refuse the assertion.
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key().public_numbers()
+    admin("ga4", action="register_key", n=str(other.n), e=str(other.e))
+    _raises("OAuthSignInRefused", key_read)
+    GA4_KEY.clear()  # a new throwaway key, registered again
+    _ga4_key_file()
+    _log("ga4 service-account key: an assertion signed by a key the property does not know is refused (the mock verifies the RS256 signature)")
+    admin("ga4", action="revoke", on=True)
+
+    def browser_read() -> None:
+        b_module, _v, b_parts, b_session, b_dial = _ga4("oauth")
+        list(b_module.read(b_session, b_parts, b_dial, b_module.declaration(b_session, b_parts, b_dial, GA4_REPORT), since=None))
+
+    for name, call in (("browser sign-in", browser_read), ("service-account key", key_read)):
+        exc = _raises("OAuthSignInRefused", call)
+        _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", f"ga4 revoked ({name}): the run report class")
+    admin("ga4", action="revoke", on=False)
+    _log("ga4 forbidden and revoked sign-in (the refresh token and the service-account key): the fixed failures, none of the vendor's words")
+
+
 # ---- the product steps (slice 2 review BLOCKER 4) ------------------------------------------------
 #
 # AD9 and the SRC-9 registry want connect, discover, load and reload to be `real`, which means
@@ -419,6 +550,12 @@ def step_salesforce() -> None:
 # gate reads back through ClickHouse. Built once here for every vendor: a vendor's slice adds an
 # entry to `PRODUCT_VENDORS` and its mock. The browser sign-in cannot be driven without a browser, so
 # it stays a vendor-level step above; these steps sign in with the vendor's integration credential.
+
+def _ga4_row_ids() -> set[str]:
+    """`country|date` of every row the mock holds, read from the mock when the step needs it."""
+    days = admin("ga4", action="days")["days"]
+    return {f"{c}|{d[:4]}-{d[4:6]}-{d[6:]}" for d in days for c in ("ID", "US")}
+
 
 PRODUCT_VENDORS: dict[str, dict] = {
     "hubspot": {
@@ -457,6 +594,27 @@ PRODUCT_VENDORS: dict[str, dict] = {
         ],
         "reads_marker": ("queryAll",),
     },
+    # Google Analytics 4: the object is a report the connector defines; the sign-in is the browser's (the API's
+    # connection test cannot present a service-account key yet, and says so), with the app's secret and a
+    # refresh token as files. A report has no id column: its key is country + date.
+    "ga4": {
+        "type": "Google Analytics 4", "host": "analyticsdata.googleapis.com", "account": "123", "label": "Google Analytics 4",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "dial_extra": {"objects": [GA4_REPORT]},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-refresh-token"},
+        "object": GA4_REPORT, "target": "saas_gate_ga4_traffic", "cursor": "date", "text": "country", "primary_key": ["country", "date"],
+        "columns": "country, date, sessions_integer", "order": "country, date",
+        "row_id": lambda r: f"{r['country']}|{str(r['date'])[:10]}",
+        "preview_columns": {"country", "date", "sessions_INTEGER", "purchaseRevenue_CURRENCY"},
+        "first_ids": lambda: _ga4_row_ids(), "reload_ids": lambda: _ga4_row_ids(),
+        "changes": [
+            {"action": "put", "days_ago": 0, "country": "ID", "metrics": {"sessions": 99}},
+            {"action": "put", "days_ago": 2, "country": "US", "metrics": {"sessions": 55}},
+        ],
+        "reload_ready": lambda rows: any(r["sessions_integer"] == 99 for r in rows),
+        "reads_marker": ("runReport",),
+    },
 }
 
 
@@ -476,12 +634,12 @@ def _poll(what: str, read, ok, timeout_s: int = 90):  # noqa: ANN001, ANN202
         time.sleep(3.0)
 
 
-def _bronze_rows(target: str, columns: str) -> list[dict]:
+def _bronze_rows(target: str, columns: str, order: str = "toString(id)") -> list[dict]:
     """The rows of `bronze.<target>` through ClickHouse, ordered by key, under a `WHERE` (R11)."""
     matrix._bronze_row_count(target)  # creates the catalog database
     text = matrix.ch_query(
         f"SELECT {columns} FROM {matrix.CATALOG_DB}.`bronze.{target}` WHERE 1 "
-        "ORDER BY toString(id) SETTINGS allow_database_iceberg = 1 FORMAT JSONEachRow"
+        f"ORDER BY {order} SETTINGS allow_database_iceberg = 1 FORMAT JSONEachRow"
     )
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
@@ -509,8 +667,8 @@ def step_product(vendor_id: str) -> None:
         f"{matrix.API_URL}/api/connectors/{cid}/ingest-spec",
         json={
             "adapter": "saas", "ingestMode": "batch",
-            "dial": {"vendor": vendor_id, "account": spec["account"], "auth": spec.get("auth", {"type": "integration"})},
-            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": [spec.get("key", "id")]}],
+            "dial": {"vendor": vendor_id, "account": spec["account"], "auth": spec.get("auth", {"type": "integration"}), **spec.get("dial_extra", {})},
+            "sourceObjects": [{"name": obj, "target": target, "loadMode": "incremental_dedup", "incrementalKey": spec["cursor"], "primaryKey": spec.get("primary_key") or [spec.get("key", "id")]}],
         },
         timeout=15,
     )
@@ -543,8 +701,11 @@ def step_product(vendor_id: str) -> None:
     # load: ingest_job into Bronze Iceberg, read back.
     _run_and_wait(cid, f"{vendor_id} load")
     columns = spec.get("columns") or f"id, {text}" + (", status" if vendor_id == "zendesk" else "")
-    rows = _poll(f"{vendor_id} load: Bronze {target}", lambda: _bronze_rows(target, columns), lambda r: len(r) == len(spec["first_ids"]))
-    _expect({str(r["id"]) for r in rows} == spec["first_ids"], f"{vendor_id} load: Bronze holds ids {[r['id'] for r in rows]}")
+    order = spec.get("order", "toString(id)")
+    row_id = spec.get("row_id", lambda r: str(r["id"]))  # a report has no id column: its key is its dimensions
+    wanted_first = spec["first_ids"]() if callable(spec["first_ids"]) else spec["first_ids"]
+    rows = _poll(f"{vendor_id} load: Bronze {target}", lambda: _bronze_rows(target, columns, order), lambda r: len(r) == len(wanted_first))
+    _expect({row_id(r) for r in rows} == wanted_first, f"{vendor_id} load: Bronze holds ids {sorted(row_id(r) for r in rows)}")
     _log(f"{vendor_id} load: {len(rows)} rows in Bronze {target}, read back through ClickHouse, each once")
 
     # reload: the vendor changes; only the changed and new records are read, merged on the key.
@@ -561,16 +722,26 @@ def step_product(vendor_id: str) -> None:
         admin("zendesk", action="delete", id=3)
     admin(vendor_id, action="clear_log")
     _run_and_wait(cid, f"{vendor_id} reload")
+    wanted_reload = spec["reload_ids"]() if callable(spec["reload_ids"]) else spec["reload_ids"]
+    ready = spec.get("reload_ready") or (lambda r: any("changed" in str(x[text]) for x in r))
     after = _poll(
-        f"{vendor_id} reload: Bronze {target}", lambda: _bronze_rows(target, columns),
-        lambda r: {str(x["id"]) for x in r} == spec["reload_ids"] and any("changed" in str(x[text]) for x in r),
+        f"{vendor_id} reload: Bronze {target}", lambda: _bronze_rows(target, columns, order),
+        lambda r: {row_id(x) for x in r} == wanted_reload and ready(r),
     )
-    ids = [str(r["id"]) for r in after]
+    ids = [row_id(r) for r in after]
     _expect(len(ids) == len(set(ids)), f"{vendor_id} reload: a key is in Bronze twice: {ids}")
-    by_id = {str(r["id"]): r for r in after}
-    changed_id = "001STUB002" if vendor_id == "salesforce" else "2"
-    _expect("changed" in str(by_id[changed_id][text]), f"{vendor_id} reload: record {changed_id} was not updated")
-    if vendor_id == "salesforce":
+    by_id = {row_id(r): r for r in after}
+    if vendor_id != "ga4":
+        changed_id = "001STUB002" if vendor_id == "salesforce" else "2"
+        _expect("changed" in str(by_id[changed_id][text]), f"{vendor_id} reload: record {changed_id} was not updated")
+    if vendor_id == "ga4":
+        days = admin("ga4", action="days")["days"]
+        key = lambda country, back: f"{country}|{days[-1 - back][:4]}-{days[-1 - back][4:6]}-{days[-1 - back][6:]}"  # noqa: E731
+        _expect(by_id[key("ID", 0)]["sessions_integer"] == 99 and by_id[key("US", 2)]["sessions_integer"] == 55, "ga4 reload: Google's corrected numbers are not in Bronze")
+        _expect(len(by_id) == 10, "ga4 reload: a row was lost or stored twice")
+        starts = [line.split(" ")[2].split("..")[0] for line in mock_log("ga4") if "runReport" in line]
+        _expect(starts and all(start != "2015-08-14" for start in starts), f"ga4 reload: the run read from the start of Analytics instead of the lagged cursor ({starts})")
+    elif vendor_id == "salesforce":
         _expect(by_id["001STUB003"]["is_deleted"] in (True, 1, "true"), "salesforce reload: the deleted account does not say is_deleted in Bronze")
         _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
     elif vendor_id == "zendesk":
@@ -582,8 +753,12 @@ def step_product(vendor_id: str) -> None:
     reads = [line for line in seen if any(m in line for m in spec.get("reads_marker", ("/search", "cursor", "incremental")))]
     _expect(reads, f"{vendor_id} reload: the mock saw no incremental request ({seen})")
     _expect(not any(line == "GET /crm/v3/objects/deals" for line in seen), f"{vendor_id} reload: it listed every deal again")
-    _log(f"{vendor_id} reload: the changed and the new record merged on the key, no duplicate; "
-         + {"zendesk": "the deleted ticket says status = deleted", "salesforce": "the deleted account says is_deleted (queryAll)"}.get(vendor_id, "the archived deal stays (HubSpot reports no deletes)"))
+    _log(f"{vendor_id} reload: "
+         + {
+             "zendesk": "the changed and the new record merged on the key, no duplicate; the deleted ticket says status = deleted",
+             "salesforce": "the changed and the new record merged on the key, no duplicate; the deleted account says is_deleted (queryAll)",
+             "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
+         }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
 
     # revoked sign-in, through the API's test and a run.
     admin(vendor_id, action="revoke", on=True)
@@ -604,6 +779,7 @@ def run_vendors() -> None:
     step_hubspot()
     step_zendesk()
     step_salesforce()
+    step_ga4()
 
 
 def run() -> None:
