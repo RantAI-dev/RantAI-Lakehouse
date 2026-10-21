@@ -158,6 +158,22 @@ To be confirmed when the plan is built. Expected from the defaults:
   limited the rate". With the browser sign-in the connection test first asks Atlassian which sites the sign-in reaches and
   needs one with this connector's name. Email + API token and
   the browser sign-in both read the same objects.
+- SharePoint: the lists of the sites (document libraries and hidden lists are not offered; files are not
+  loaded). Objects are named by site id and list id (`<site id>/<list id>`); the list's display name is not part
+  of the name. Sites are found with a Graph search, the first 100, or the site ids named in the connector's
+  object list. Each run reads Graph's delta feed from the link the last run kept and merges on `id`. A deleted
+  item stays in Bronze with `is_deleted = true` and only its id; when Graph no longer serves the saved link
+  (`410 Gone`) the list is read again in full, and items deleted while the link was stale stay until a full
+  reload. A changed column is seen after the load (SharePoint does not describe its columns).
+- Dynamics 365: any Dataverse table. The account is the environment address and the tenant, as
+  `org.crm4.dynamics.com/<tenant id or domain>`; the same tenant is used for the token. A table with change
+  tracking is read by its change-tracking delta link and a deleted row stays with `is_deleted = true`; Dataverse
+  keeps changes for 7 days by default, so a connector that does not run for longer is read again in full (rows
+  deleted in that time stay until a full reload). A table without change tracking is read by `modifiedon`
+  (with a five-minute margin, ours) and a row deleted at Dynamics stays, unmarked; enable change tracking on the
+  table to have deletes applied. A table without a `modifiedon` column is re-read in full. Fields are described
+  before the load; a lookup column is loaded as `_<name>_value`. Client credentials need the app to be added to
+  the environment as an application user with a security role.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.
 - SharePoint and Confluence files and attachments are not loaded.
