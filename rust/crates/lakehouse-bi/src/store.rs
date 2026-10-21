@@ -1555,6 +1555,26 @@ fn shell_board(id: &str) -> Board {
     }
 }
 
+/// The board a write updates, or the built-in board's shell: it has no row
+/// until something about it is first saved.
+///
+/// Any other board with no live row is refused: a write that arrives after
+/// the board was deleted must not write a blank row over its trash entry, so
+/// the board would come back to life as an empty shell
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] when the board is not there, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+async fn board_for_update(ch: &ChClient, id: &str) -> Result<Board, BiError> {
+    match get_board(ch, id, &Viewer::system()).await? {
+        Some(board) => Ok(board),
+        None if id == DEFAULT_BOARD_ID => Ok(shell_board(id)),
+        None => Err(BiError::Validation("dashboard not found.".to_owned())),
+    }
+}
+
 /// Update a board's tile layout, creating a bare `Board { id, name:
 /// "Dashboard" }` shell if it does not exist yet. Ports `updateBoardLayout`.
 ///
@@ -1565,11 +1585,9 @@ pub async fn update_board_layout(
     ch: &ChClient,
     id: &str,
     layout: &LayoutMap,
-) -> Result<(), ChError> {
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1579,6 +1597,7 @@ pub async fn update_board_layout(
         },
     )
     .await
+    .map_err(BiError::Clickhouse)
 }
 
 /// Update a board's dashboard-wide filters, same fallback as
@@ -1591,11 +1610,9 @@ pub async fn update_board_filters(
     ch: &ChClient,
     id: &str,
     filters: &[FilterDef],
-) -> Result<(), ChError> {
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1605,6 +1622,7 @@ pub async fn update_board_filters(
         },
     )
     .await
+    .map_err(BiError::Clickhouse)
 }
 
 /// Save a board's auto-refresh interval in seconds (`0` = off), same
@@ -1618,9 +1636,7 @@ pub async fn update_board_filters(
 pub async fn update_board_refresh(ch: &ChClient, id: &str, seconds: u32) -> Result<(), BiError> {
     crate::click::validate_refresh_seconds(seconds).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1649,9 +1665,7 @@ pub async fn update_board_grain(ch: &ChClient, id: &str, grain: &str) -> Result<
         ));
     }
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1678,9 +1692,7 @@ pub async fn update_board_params(
     params: &[crate::params::BoardParam],
 ) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1711,9 +1723,7 @@ pub async fn update_board_tabs(
 ) -> Result<(), BiError> {
     crate::layout::validate_tabs(tabs).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1741,9 +1751,7 @@ pub async fn update_board_phone_layout(
 ) -> Result<(), BiError> {
     crate::layout::validate_phone_layout(phone).map_err(BiError::Validation)?;
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,
@@ -1865,9 +1873,7 @@ pub async fn update_board_theme(
         ));
     }
     ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .unwrap_or_else(|| shell_board(id));
+    let board = board_for_update(ch, id).await?;
     save_board_patch(
         ch,
         &board,

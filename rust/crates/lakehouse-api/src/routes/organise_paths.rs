@@ -1943,6 +1943,40 @@ async fn a_duplicate_that_cannot_be_finished_leaves_no_copy_behind() {
     );
 }
 
+/// `PR #199 review M SHOULD-FIX BI-18 3`: a save that arrives after the
+/// dashboard was deleted must not write a blank row over its trash entry: the
+/// dashboard would come back to life as an empty shell.
+#[tokio::test]
+async fn a_save_that_races_a_delete_writes_no_row() {
+    let server = engine(vec![(
+        &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+        vec![],
+    )])
+    .await;
+    let ch = client(&server);
+    let layout: lakehouse_bi::store::LayoutMap =
+        serde_json::from_value(json!({ "c1": { "x": 0, "y": 0, "w": 6, "h": 4 } })).unwrap();
+    let refused = lakehouse_bi::store::update_board_layout(&ch, "b1", &layout).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(writes(&server).await.is_empty());
+    // The built-in dashboard has no row until something is saved: its shell is
+    // still written.
+    let written = lakehouse_bi::store::update_board_layout(
+        &ch,
+        lakehouse_bi::store::DEFAULT_BOARD_ID,
+        &layout,
+    )
+    .await;
+    assert!(written.is_ok(), "{written:?}");
+    assert!(
+        writes(&server)
+            .await
+            .iter()
+            .any(|w| w.contains("INTO console.bi_board (")),
+        "the built-in dashboard's row is still written"
+    );
+}
+
 /// Going back to a version saved before the stamping: its untagged tiles were on
 /// ITS first tab (B), not the live board's (A).
 #[tokio::test]

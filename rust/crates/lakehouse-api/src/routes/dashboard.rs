@@ -1337,6 +1337,21 @@ async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Resul
     }
 }
 
+/// The error of a board write: a board that is not there any more (deleted
+/// while the edit was on its way) is refused with its own sentence, and the
+/// store's failure keeps the mapping the write had before
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+fn board_write_error(err: &store::BiError) -> ApiError {
+    match err {
+        store::BiError::Validation(msg) => ApiError::BadRequest(msg.clone()),
+        store::BiError::Clickhouse(err) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            err,
+            upstream_error::FailedAs::BadRequest,
+        ),
+    }
+}
+
 /// The tabs and the phone layout of a board edit (`BI-18` part C), both
 /// already checked by [`check_tab_rules`].
 async fn save_tabs_and_phone_layout(
@@ -1507,13 +1522,7 @@ pub async fn boards_update(
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(seconds) = refresh {
         store::update_board_refresh(ch, &id, seconds)
@@ -1529,13 +1538,7 @@ pub async fn boards_update(
         let filters = without_inert(filters);
         store::update_board_filters(ch, &id, &filters)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
         file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
