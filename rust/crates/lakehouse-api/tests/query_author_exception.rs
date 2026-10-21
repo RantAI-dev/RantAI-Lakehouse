@@ -166,30 +166,51 @@ struct EmbedClickhouse;
 impl Respond for EmbedClickhouse {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let sql = String::from_utf8_lossy(&request.body).into_owned();
-        let rows = |row: Value| {
+        let rows = |data: Vec<Value>| {
+            let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({
-                "meta": [], "data": [row], "rows": 1
+                "meta": [], "data": data, "rows": n
             }))
         };
-        if sql.starts_with("CREATE") || sql.starts_with("ALTER") {
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("INSERT") {
             return ResponseTemplate::new(200);
         }
+        // PR #201 review G BLOCKER 1: the DDL bootstrap asks `system.columns`
+        // whether the legacy embed columns are still on `console.bi_board`.
+        // This database has none (a fresh one), so the answer is empty and
+        // the one-time copy of the legacy state is skipped. Answering the
+        // question with an engine error instead made the whole bootstrap
+        // fail, and the request answered `500` — but only while this test
+        // was the first to reach the bootstrap, because the DDL guard is
+        // process-wide.
+        if sql.contains("FROM system.columns") {
+            return rows(Vec::new());
+        }
+        // The embed access state is read by aggregating the append-only event
+        // table (SEC-12). This board has no events: nothing is withdrawn and
+        // no site may frame it.
+        if sql.contains("FROM console.bi_board_embed_event") {
+            return rows(Vec::new());
+        }
+        // The board itself. The table name is matched exactly: the event
+        // table's name starts with `console.bi_board` too, and a match on
+        // the prefix answered the aggregate read with a board row.
         // A chart read names the boards table too (its sub-selects keep another
         // user's personal board and a deleted board out, BI-18 part C part 2),
         // so a statement that reads charts is not the board read.
-        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
-            return rows(json!({
+        if sql.contains("FROM console.bi_board FINAL") && !sql.contains("FROM console.bi_chart") {
+            return rows(vec![json!({
                 "id": "b_embed", "name": "Embedded", "description": "", "created_by": "t",
                 "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "1",
                 "folder_id": "", "created_at": "2026-10-10 00:00:00"
-            }));
+            })]);
         }
         if sql.contains("FROM console.bi_chart") {
             let spec = r#"{"spec":{"id":"u_1","title":"T","kind":"bar","mart":"mart_x","sql":"SELECT 1","x":"place","y":"visitors"},"def":{"title":"T","mart":"mart_x","kind":"bar","dimension":"place","measures":["visitors"]}}"#;
-            return rows(json!({
+            return rows(vec![json!({
                 "id": "u_1", "spec_json": spec, "board": "b_embed", "created_by": "t",
                 "created_at": "2026-10-10 00:00:00"
-            }));
+            })]);
         }
         ResponseTemplate::new(404).set_body_string(ENGINE_ERROR)
     }
@@ -265,18 +286,26 @@ impl Respond for CombinedEmbedClickhouse {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
-        if sql.starts_with("CREATE") || sql.starts_with("ALTER") {
+        if sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("INSERT") {
             return ResponseTemplate::new(200);
         }
+        // PR #201 review G BLOCKER 1: the board is read from `console.bi_board`
+        // exactly; the append-only event table's name starts with the same
+        // prefix, and a match on the prefix answered the aggregate read with
+        // a board row.
         // A chart read names the boards table too (its sub-selects keep another
         // user's personal board and a deleted board out, BI-18 part C part 2),
         // so a statement that reads charts is not the board read.
-        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
+        if sql.contains("FROM console.bi_board FINAL") && !sql.contains("FROM console.bi_chart") {
             return rows(vec![json!({
                 "id": "b_embed", "name": "Embedded", "description": "", "created_by": "t",
                 "layout_json": "", "filters_json": "", "public_token": "", "embed_enabled": "1",
                 "folder_id": "", "created_at": "2026-10-10 00:00:00"
             })]);
+        }
+        // The embed access state: this board has no events.
+        if sql.contains("FROM console.bi_board_embed_event") {
+            return rows(Vec::new());
         }
         if sql.contains("FROM console.bi_chart") {
             let spec = json!({
@@ -290,6 +319,15 @@ impl Respond for CombinedEmbedClickhouse {
                 "id": "u_1", "spec_json": spec.to_string(), "board": "b_embed",
                 "created_by": "t", "created_at": "2026-10-10 00:00:00"
             })]);
+        }
+        // PR #201 review G BLOCKER 1: the DDL bootstrap asks `system.columns`
+        // whether the legacy embed columns are still on `console.bi_board`.
+        // This database has none (a fresh one), so the answer is empty and
+        // the one-time copy of the legacy state is skipped. The other
+        // `system.columns` read — a serving mart's columns — is answered
+        // below.
+        if sql.contains("FROM system.columns") && sql.contains("'console'") {
+            return rows(Vec::new());
         }
         if sql.contains("FROM system.columns") {
             return rows(

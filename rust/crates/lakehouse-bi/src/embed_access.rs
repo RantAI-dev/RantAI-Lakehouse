@@ -1,30 +1,33 @@
 //! Who may use a dashboard's signed embed, and who may frame it (`SEC-12`).
 //!
-//! Three things are kept with the board (`console.bi_board`, three columns
-//! beside `embed_enabled`):
+//! Three things make up a board's access state:
 //!
 //! - **`revoked_before`**: "withdraw all". A Unix-seconds instant; a token
 //!   whose `iat` is at or before it is refused.
-//! - **`withdrawn`**: "withdraw one". A small list of `(jti, exp)`. A token
-//!   carrying a listed `jti` is refused for this board only. An entry is
-//!   dropped once the token could no longer be accepted anyway, which is
-//!   `exp` plus the clock tolerance, not `exp` alone: the verifier accepts a
-//!   token up to 60 seconds past its `exp`, so dropping the record at `exp`
-//!   would let the token back in for that minute.
+//! - **`withdrawn`**: "withdraw one". A list of `(jti, exp)`. A token
+//!   carrying a listed `jti` is refused for this board only. The list is
+//!   not where a token expires: the verifier accepts a token up to its `exp`
+//!   plus the clock tolerance, so an entry that expires would still have to
+//!   be refused while the verifier honours it (PR #201 review F SHOULD-FIX
+//!   1). The cap that bounds the list counts only the entries that could
+//!   still be accepted.
 //! - **`origins`**: the sites allowed to frame the embed pages.
 //!
-//! # Why on the board
+//! # Where the state lives
 //!
-//! The board is read with `FINAL` on every `POST /api/embed/data`, so a
-//! withdrawal written by the Share dialog is seen by the next request. There
-//! is no cache in between (see the plan, section 7). Putting the state in
-//! the board row also means deleting a board deletes its withdrawals.
+//! In `console.bi_board_embed_event`, an append-only table the state is
+//! written to and read back by aggregation (PR #105 review SHOULD-FIX 1).
+//! It was on the board row once, and a dashboard save (a full-row `INSERT`
+//! into a `ReplacingMergeTree`) could write the old state back: a token
+//! withdrawn in between worked again. The events are aggregated on every
+//! request, so there is no cache in between (see the plan, section 7) and a
+//! withdrawal takes effect on the next request.
 //!
 //! # Limits
 //!
 //! `revoked_before` is the API server's clock at the moment of withdrawal,
 //! compared with the `iat` the customer's server wrote. A token minted by a
-//! clock that runs ahead of ours by up to the 60-second tolerance carries an
+//! clock that runs ahead of ours by up to the clock tolerance carries an
 //! `iat` later than the withdrawal and survives "withdraw all" until it
 //! expires; the maximum lifetime bounds that. Withdraw one by `jti` is
 //! exact.
@@ -71,8 +74,10 @@ impl EmbedAccess {
     /// Fails closed (principle 3): a withdrawn-tokens column that does not
     /// parse is something this code never writes, and ignoring it would
     /// silently re-admit withdrawn tokens, so every token is refused instead
-    /// (`revoked_before` is set to its maximum) until the board is saved
-    /// again. An origins column that does not parse allows no site.
+    /// (`revoked_before` is set to its maximum) — permanently, not until the
+    /// board is saved again (PR #201 review F doc note: the legacy columns
+    /// are never written again, so nothing saves that board again). An
+    /// origins column that does not parse allows no site.
     #[must_use]
     pub fn from_stored(revoked_before: u64, withdrawn_json: &str, origins_json: &str) -> Self {
         let withdrawn_json = withdrawn_json.trim();
