@@ -1,4 +1,5 @@
 import { displayColumn } from "@/lib/chart-joins";
+import { escapeHtml } from "@/lib/geo-points";
 import type { EChartsOption } from "echarts";
 import { decimalsFor, formatNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import { DEFAULT_PALETTE, resolvePalette } from "@/lib/chart-palettes";
@@ -30,6 +31,15 @@ export const PALETTE: readonly string[] = DEFAULT_PALETTE;
 const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
 
 type Row = Record<string, unknown>;
+
+/**
+ * PR #199 review O BLOCKER 1: ECharts sets a tooltip formatter's result as
+ * HTML (its own `encodeHTMLContent` is off by default), so every warehouse
+ * or user text that goes into one is escaped with `escapeHtml` first — a
+ * category or series name with markup would otherwise run for every viewer.
+ * The axis and label formatters below are canvas text, not HTML, and are
+ * left as they are.
+ */
 
 /**
  * BI-9 review fix (SHOULD-FIX) R5: a line with more points than this draws no
@@ -105,7 +115,7 @@ export function buildOption(
       grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
         const o = p as { name: string; value: number; percent: number };
-        return `${o.name}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`;
+        return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`;
       } },
       legend: { bottom: 0, textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [
@@ -149,7 +159,7 @@ export function buildOption(
 
   if (spec.kind === "rose") {
     return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`; } },
       legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [{ type: "pie", roseType: "area", radius: ["15%", "72%"], center: ["50%", "44%"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, borderRadius: 4 },
@@ -159,7 +169,7 @@ export function buildOption(
 
   if (spec.kind === "funnel") {
     return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b>`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b>`; } },
       legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11, ...LEGEND_TEXT }, tooltip: { show: true }, icon: "circle" },
       series: [{ type: "funnel", left: "8%", right: "8%", top: 10, bottom: 28, sort: "descending", gap: 2,
         label: { show: true, position: "inside", color: "#fff", fontSize: 11, formatter: "{b}" },
@@ -170,7 +180,7 @@ export function buildOption(
 
   if (spec.kind === "treemap") {
     return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b>`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${escapeHtml(o.name)}<br/><b>${fmtInt(o.value)}</b>`; } },
       series: [{ type: "treemap", roam: false, nodeClick: false, breadcrumb: { show: false },
         width: "100%", height: "100%", top: 4, left: 4, right: 4, bottom: 4,
         label: { show: true, formatter: "{b}", color: "#fff", fontSize: 11 },
@@ -213,7 +223,7 @@ export function buildOption(
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
         const o = p as ItemP; const d = o.value;
-        return `${o.name}<br/>${labelOf(xc)}: <b>${fmtInt(d[0])}</b><br/>${labelOf(yc)}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${labelOf(sc)}: <b>${fmtInt(d[2])}</b>` : ""}`;
+        return `${escapeHtml(o.name)}<br/>${escapeHtml(labelOf(xc))}: <b>${fmtInt(d[0])}</b><br/>${escapeHtml(labelOf(yc))}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${escapeHtml(labelOf(sc))}: <b>${fmtInt(d[2])}</b>` : ""}`;
       } },
       xAxis: valAxis(labelOf(xc)), yAxis: valAxis(labelOf(yc)),
       series: [{ type: "scatter",
@@ -251,7 +261,7 @@ export function buildOption(
     }
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: "shadow" },
-        formatter: (ps: unknown) => { const a = ps as AxisPs; const i = a[0]?.dataIndex ?? 0; return `${cat[i]}<br/><b>${fmtInt(vals[i])}</b>`; } },
+        formatter: (ps: unknown) => { const a = ps as AxisPs; const i = a[0]?.dataIndex ?? 0; return `${escapeHtml(cat[i] ?? "")}<br/><b>${fmtInt(vals[i])}</b>`; } },
       xAxis: catAxis(cat), yAxis: valAxis(),
       series: [
         { type: "bar", stack: "wf", itemStyle: { color: "transparent" }, emphasis: { itemStyle: { color: "transparent" } }, data: pad },
@@ -273,7 +283,7 @@ export function buildOption(
     }
     const maxV = Math.max(1, ...data.map((d) => d[2]));
     return { ...base, grid: { ...base.grid, top: 8, bottom: 48, left: 8, right: 12 },
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: number[] }; return `${xCats[o.value[0]]} · ${yCats[o.value[1]]}<br/><b>${fmtInt(o.value[2])}</b>`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: number[] }; return `${escapeHtml(xCats[o.value[0]] ?? "")} · ${escapeHtml(yCats[o.value[1]] ?? "")}<br/><b>${fmtInt(o.value[2])}</b>`; } },
       xAxis: { type: "category", data: xCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10, interval: 0, hideOverlap: true, rotate: xCats.length > 6 ? 30 : 0 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       yAxis: { type: "category", data: yCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
@@ -287,8 +297,8 @@ export function buildOption(
     return { ...base, grid: undefined,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
         const o = p as { dataType?: string; name: string; value: number; data: { source?: string; target?: string } };
-        if (o.dataType === "edge") return `${labelOf.get(o.data.source ?? "")} → ${labelOf.get(o.data.target ?? "")}<br/><b>${fmtInt(o.value)}</b>`;
-        return `${labelOf.get(o.name) ?? o.name}<br/><b>${fmtInt(o.value)}</b>`;
+        if (o.dataType === "edge") return `${escapeHtml(labelOf.get(o.data.source ?? "") ?? "")} → ${escapeHtml(labelOf.get(o.data.target ?? "") ?? "")}<br/><b>${fmtInt(o.value)}</b>`;
+        return `${escapeHtml(labelOf.get(o.name) ?? o.name)}<br/><b>${fmtInt(o.value)}</b>`;
       } },
       series: [{ type: "sankey", left: 8, right: 96, top: 8, bottom: 8, nodeGap: 10, draggable: false,
         emphasis: { focus: "adjacency" },
@@ -302,7 +312,7 @@ export function buildOption(
 
   if (spec.kind === "sunburst" && spec.series) {
     return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { treePathInfo: { name: string }[]; value: number }; return `${o.treePathInfo.map((t) => t.name).filter(Boolean).join(" › ")}<br/><b>${fmtInt(o.value)}</b>`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { treePathInfo: { name: string }[]; value: number }; return `${escapeHtml(o.treePathInfo.map((t) => t.name).filter(Boolean).join(" › "))}<br/><b>${fmtInt(o.value)}</b>`; } },
       // `nodeClick: false`: by default a click zooms the ring in, and a click now
       // opens the drill menu (BI-18·B); the two cannot share the gesture.
       series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined, nodeClick: false,
@@ -327,11 +337,11 @@ export function buildOption(
         const o = p as { name: string; data: number[]; seriesType: string; dataIndex: number };
         if (o.seriesType === "scatter") {
           const i = o.data[0];
-          return `${categories[i]}${nText(i)}<br/>every value <b>${fmtInt(o.data[1])}</b>`;
+          return `${escapeHtml(categories[i] ?? "")}${nText(i)}<br/>every value <b>${fmtInt(o.data[1])}</b>`;
         }
         // `data` is the five-number array we passed (toBoxplot).
         const [min, q1, med, q3, max] = o.data;
-        return `${categories[o.dataIndex]}${nText(o.dataIndex)}<br/>max <b>${fmtInt(max)}</b><br/>Q3 ${fmtInt(q3)}<br/>median <b>${fmtInt(med)}</b><br/>Q1 ${fmtInt(q1)}<br/>min <b>${fmtInt(min)}</b>`;
+        return `${escapeHtml(categories[o.dataIndex] ?? "")}${nText(o.dataIndex)}<br/>max <b>${fmtInt(max)}</b><br/>Q3 ${fmtInt(q3)}<br/>median <b>${fmtInt(med)}</b><br/>Q1 ${fmtInt(q1)}<br/>min <b>${fmtInt(min)}</b>`;
       } },
       xAxis: catAxis(labels),
       // Log only when the values span 1000× or more (boxplotNeedsLogAxis),
@@ -348,7 +358,7 @@ export function buildOption(
     const { data, range } = toCalendar(rows, spec.x, y0);
     const maxV = Math.max(1, ...data.map((d) => d[1]));
     return { ...base, grid: undefined,
-      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: [string, number] }; return `${o.value[0]}<br/><b>${fmtInt(o.value[1])}</b>`; } },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: [string, number] }; return `${escapeHtml(o.value[0])}<br/><b>${fmtInt(o.value[1])}</b>`; } },
       visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
       calendar: range ? { range, top: 24, left: 36, right: 12, bottom: 44, cellSize: ["auto", "auto"],
         itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, color: dark ? "#18181b" : "#fafafa" },
