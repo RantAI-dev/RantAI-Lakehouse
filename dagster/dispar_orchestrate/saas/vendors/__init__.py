@@ -446,6 +446,7 @@ MODULE_PATHS: dict[str, str] = {
     "sharepoint": "dispar_orchestrate.saas.vendors.sharepoint",
     "dynamics365": "dispar_orchestrate.saas.vendors.dynamics365",
     "workday": "dispar_orchestrate.saas.vendors.workday",
+    "netsuite": "dispar_orchestrate.saas.vendors.netsuite",
 }
 
 

@@ -33,6 +33,7 @@ def integration_auth(
     *,
     resolve_checked: Callable[..., Any],
     parts: Any,
+    dial: dict | None = None,
     clock: Callable[[], float] | None = None,
 ) -> tuple[Callable[[], dict], Callable[[], None]]:
     """`(headers, refresh)` for the client-credentials grant: a bearer token fetched when

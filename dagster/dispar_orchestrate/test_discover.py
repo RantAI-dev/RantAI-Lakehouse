@@ -1002,7 +1002,7 @@ class _FakeSaasModule:
 _SAAS = {
     "id": "conn-1",
     "adapter": "saas",
-    "dial": {"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}},  # a vendor with no module yet
+    "dial": {"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}},  # the module is injected by `_saas_backends`
     "secretRef": "env:CONNECTOR_SAAS_TOKEN",
 }
 
@@ -1071,7 +1071,12 @@ def test_the_saas_failures_have_discovery_classes() -> None:
     assert discover.classify_discovery(vendors.UnsupportedVendor()) == discover.NOT_SUPPORTED
 
 
-def test_a_saas_vendor_with_no_module_is_not_supported_through_the_real_opener() -> None:
+def test_a_saas_vendor_with_no_module_is_not_supported_through_the_real_opener(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Slice 6 gave NetSuite, the last of the ten, a module; remove it to have the case of a vendor id added to the table first.
+    from dispar_orchestrate.saas import vendors
+
+    monkeypatch.delitem(vendors.MODULE_PATHS, "netsuite")
+    monkeypatch.delitem(vendors._MODULES, "netsuite", raising=False)
     with pytest.raises(Exception) as raised:
         discover.discover(_SAAS, _request("list"), backends=_backends())
     assert discover.classify_discovery(raised.value) == discover.NOT_SUPPORTED

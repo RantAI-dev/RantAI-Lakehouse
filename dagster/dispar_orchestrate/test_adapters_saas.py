@@ -169,8 +169,11 @@ def test_the_factory_offers_incremental_modes_to_saas_and_sql_but_not_to_rest() 
         f._load_plan("rest", o)
 
 
-def test_a_vendor_without_a_module_is_unsupported_and_not_retried() -> None:
-    with pytest.raises(vendors.UnsupportedVendor) as raised:  # NetSuite has no module until slice 6
+def test_a_vendor_without_a_module_is_unsupported_and_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Slice 6 gave the last of the ten a module; the case is still real for a vendor id added to the table first.
+    monkeypatch.delitem(vendors.MODULE_PATHS, "netsuite")
+    monkeypatch.delitem(vendors._MODULES, "netsuite", raising=False)
+    with pytest.raises(vendors.UnsupportedVendor) as raised:
         saas_adapter.build_source({"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}}, SECRETS, [obj()])
     assert ingest_errors.classify(raised.value) == ingest_errors.Classified(ingest_errors.UNSUPPORTED, retried=False)
 

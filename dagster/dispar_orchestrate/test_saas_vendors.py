@@ -67,11 +67,15 @@ def test_the_near_misses_of_workday_dataverse_and_netsuite_are_refused() -> None
         vendors.vendor("netsuite").validate_account("1234567_")
 
 
-def test_an_unknown_vendor_and_a_vendor_without_a_module_are_unsupported() -> None:
+def test_an_unknown_vendor_and_a_vendor_without_a_module_are_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(vendors.UnsupportedVendor):
         vendors.vendor("nobody")
+    # Slice 6 gave the last of the ten a module; a vendor id added to the table first would be in this case.
+    monkeypatch.delitem(vendors.MODULE_PATHS, "netsuite")
+    monkeypatch.delitem(vendors._MODULES, "netsuite", raising=False)
     with pytest.raises(vendors.UnsupportedVendor):
-        vendors.module_for("netsuite")  # no module until slice 6
+        vendors.module_for("netsuite")
+    assert set(vendors.MODULE_PATHS) | {"netsuite"} == set(vendors.VENDORS), "every other vendor of the table has a module"
     with pytest.raises(vendors.UnsupportedVendor):
         vendors.register("nobody", object())
 
