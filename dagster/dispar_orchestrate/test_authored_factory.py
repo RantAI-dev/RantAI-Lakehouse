@@ -1510,6 +1510,8 @@ def _file_ingest_run(
                         "encoding": "utf-8",
                         "delimiter": ",",
                         "header_row": 0,
+                        "columns": [],
+                        "on_bad_value": "stop",
                     }
                 }
             }
@@ -2354,6 +2356,8 @@ class TestFileIngestRunConfigReader:
                         "encoding": "utf-8",
                         "delimiter": ",",
                         "header_row": 0,
+                        "columns": [],
+                        "on_bad_value": "stop",
                     }
                 }
             }

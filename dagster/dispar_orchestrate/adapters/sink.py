@@ -151,7 +151,7 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -735,6 +735,49 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
         resource.apply_hints(incremental=dlt.sources.incremental(cursor))
 
 
+def _drop_table_if_types_differ(pipeline: Any, bronze_table_name: str, column_types: Mapping[str, str]) -> bool:
+    """Drop the Iceberg table when a column it holds has another type than the load is
+    about to write (`DATA-18` decision 9: "replacing a table may change its types").
+
+    Measured with dlt 1.30.0 and pyiceberg 0.12.0 against a local Iceberg table
+    (section 8 item 5 of the Phase 3 plan): a `replace` run that changes a column's
+    type creates no variant column (`x__v_bigint`, the `SRC-15` behaviour), but the
+    write is refused by pyiceberg, `Cannot change column type: x: string -> long`,
+    and leaves a partly loaded package. So the table is dropped between the normalize
+    and the load, when everything that can fail on the file has already happened, and
+    the load creates it again with the new types. `column_types` maps a column name to
+    the Iceberg type name the load writes; a column the table has and the load does not
+    write is not a difference (replace rewrites the table's rows either way).
+
+    Not atomic: a failure of the load after the drop leaves no table. The window is the
+    load itself, after the whole file has been read and checked.
+
+    Returns whether it dropped. # Errors: whatever the catalog raises."""
+    table = history.open_table(pipeline, bronze_table_name, sync=False)
+    if table is None:
+        return False
+    held = {field.name: str(field.field_type) for field in table.schema().fields}
+    if all(held.get(name) in (None, expected) for name, expected in column_types.items()):
+        return False
+    catalog = table.catalog
+    drop = getattr(catalog, "purge_table", None) or catalog.drop_table
+    drop(table.name())
+    return True
+
+
+def _run_retyping(
+    pipeline: Any, source: Any, bronze_table_name: str, write_disposition: Any, run_options: dict[str, Any], column_types: Mapping[str, str]
+) -> Any:
+    """`pipeline.run` as its three steps, with `_drop_table_if_types_differ` between the
+    last two."""
+    pipeline.extract(
+        source, table_name=bronze_table_name, table_format="iceberg", write_disposition=write_disposition, **run_options
+    )
+    pipeline.normalize()
+    _drop_table_if_types_differ(pipeline, bronze_table_name, column_types)
+    return pipeline.load()
+
+
 def _abort_pending(pipeline: Any, *, strict: bool = False) -> None:
     """Abort the pipeline's pending packages and restore its state to before
     them (`Pipeline.abort_packages`; `SRC-10` measurement 4). After a failure it
@@ -834,7 +877,11 @@ def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan:
 
 
 def load_via_sink(
-    source, bronze_table_name: str, config: SinkConfig, plan: LoadPlan = LoadPlan()
+    source,
+    bronze_table_name: str,
+    config: SinkConfig,
+    plan: LoadPlan = LoadPlan(),
+    column_types: Mapping[str, str] | None = None,
 ) -> SinkResult:
     """Write `source` (an already-configured `dlt` source, e.g. `sql_database(...)`
     with hints/maps already applied by the calling adapter) to Bronze
@@ -852,6 +899,10 @@ def load_via_sink(
     with no key value, more distinct keys than `INGEST_DEDUP_MAX_ROWS`, cursor
     values that cannot be ordered. On any failure the pipeline's pending
     packages are aborted first (see "What a failed load leaves behind").
+
+    `column_types` (name to Iceberg type name, `DATA-18`): when given, a `replace` that
+    changes a column's type drops the table first instead of failing
+    (`_drop_table_if_types_differ`).
     """
     _install_catalog_env(config)
     if plan.refresh == "remove":
@@ -973,13 +1024,19 @@ def load_via_sink(
         # re-reads and re-merges the last row.
         write_disposition = "replace"
     try:
-        load_info = pipeline.run(
-            source,
-            table_name=bronze_table_name,
-            table_format="iceberg",
-            write_disposition=write_disposition,
-            **run_options,
-        )
+        if column_types is not None and write_disposition == "replace":
+            # `DATA-18`: a replace may change the column types; see `_drop_table_if_types_differ`.
+            load_info = _run_retyping(
+                pipeline, source, bronze_table_name, write_disposition, run_options, column_types
+            )
+        else:
+            load_info = pipeline.run(
+                source,
+                table_name=bronze_table_name,
+                table_format="iceberg",
+                write_disposition=write_disposition,
+                **run_options,
+            )
         dedup.assert_flushed(dedup_steps, table=bronze_table_name)
     except Exception as exc:
         # SRC-10 measurement 4: a failed load leaves its package pending and the

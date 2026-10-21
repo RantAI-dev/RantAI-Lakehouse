@@ -92,6 +92,7 @@ import codecs
 import csv
 import io
 import itertools
+import json
 import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -110,6 +111,7 @@ from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult, l
 from dispar_orchestrate.bronze_catalog import record_ingest_run
 from dispar_orchestrate.connector_catalog import register_loaded_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
+from dispar_orchestrate.upload_types import BadReport, ColumnSpec, cast_batch, check_specs, specs_from_config
 from dispar_orchestrate.parquet_ingest import UnsupportedColumn, check_types, column_names_of, open_parquet, text_batches
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
@@ -175,7 +177,7 @@ DELIMITERS = (",", ";", "\t", "|")
 
 # The reasons a failed load records, in the order of
 # `ops/fixtures/upload_load_failure_reasons.json` (review finding B6): the
-# API shows a recorded reason only when it is one of these eight, and
+# API shows a recorded reason only when it is one of these nine, and
 # `test_file_ingest.py` asserts this list against that file.
 UNREADABLE = "The stored file could not be read."
 HEADER_PAST_END = "The header row is past the end of the file."
@@ -189,6 +191,8 @@ LOAD_FAILED = "The load into the table failed."
 NOT_REGISTERED = "The table was loaded but could not be registered in the catalog."
 # `SEC-17`: appended last, so the fixture's order of the first seven is kept.
 TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
+# `DATA-18`: a load told to stop at a value that does not fit its column's type.
+BAD_VALUES = "Some values do not fit their column's type."
 
 FAILURE_REASONS = (
     UNREADABLE,
@@ -199,6 +203,7 @@ FAILURE_REASONS = (
     LOAD_FAILED,
     NOT_REGISTERED,
     TOO_MANY_COLUMNS,
+    BAD_VALUES,
 )
 
 
@@ -257,6 +262,12 @@ class FileIngestParams:
     #: Zero-based index of the RECORD that holds the column names. Blank
     #: records and records that span lines count as the reader sees them.
     header_row: int
+    #: The column list the person confirmed (`DATA-18`), one entry per column of the
+    #: file, in the file's order; empty for a load with no list: every column text,
+    #: named by this module's own rules.
+    columns: tuple[ColumnSpec, ...]
+    #: `null` (load a value that does not fit as empty) or `stop` (fail the load).
+    on_bad_value: str
 
     @classmethod
     def from_op_config(cls, config: Mapping[str, Any]) -> FileIngestParams:
@@ -264,6 +275,7 @@ class FileIngestParams:
         validated against `CONFIG_SCHEMA`."""
         values = {name: config[name] for name in CONFIG_SCHEMA}
         values["storage_keys"] = tuple(values["storage_keys"])
+        values["columns"] = tuple(specs_from_config(values["columns"]))
         return cls(**values)
 
 
@@ -282,6 +294,11 @@ CONFIG_SCHEMA = {
     "encoding": Field(str, description="`utf-8` or `utf-16`."),
     "delimiter": Field(str, description="One character: a comma, a semicolon, a pipe or a real tab."),
     "header_row": Field(int, description="Zero-based index of the record that holds the column names."),
+    "columns": Field(
+        [{"source": str, "name": str, "type": str, "date_format": str, "timezone": bool}],
+        description="The column list, one entry per column; empty for every column text.",
+    ),
+    "on_bad_value": Field(str, description="`null` or `stop`: what to do with a value that does not fit its column."),
 }
 
 
@@ -297,6 +314,8 @@ class LoadSummary:
     columns: int
     #: The table's total after the load, as registered in the catalog.
     table_total: int
+    #: Values that did not fit their column's type and were loaded as empty.
+    bad_values: int = 0
 
 
 # ── Reading the file ─────────────────────────────────────────────────────
@@ -478,6 +497,14 @@ class TableStream:
     row_count: int = 0
     failure: LoadFailure | None = field(default=None, repr=False)
 
+    def hints(self) -> list[dict[str, Any]]:
+        """dlt column hints: every column text."""
+        return [{"name": name, "data_type": "text"} for name in self.columns]
+
+    def column_types(self) -> dict[str, str]:
+        """The Iceberg type each column is written as."""
+        return {name: "string" for name in self.columns}
+
     def _table(self, cells: list[list[str]]) -> pa.Table:
         return pa.table({name: pa.array(values, type=pa.string()) for name, values in zip(self.columns, cells)})
 
@@ -554,6 +581,14 @@ class ParquetStream:
     row_count: int = 0
     failure: LoadFailure | None = field(default=None, repr=False)
 
+    def hints(self) -> list[dict[str, Any]]:
+        """dlt column hints: every column text."""
+        return [{"name": name, "data_type": "text"} for name in self.columns]
+
+    def column_types(self) -> dict[str, str]:
+        """The Iceberg type each column is written as."""
+        return {name: "string" for name in self.columns}
+
     def batches(self) -> Iterator[pa.Table]:
         """The rows as tables of `string` columns, at most `BATCH_ROWS` each.
 
@@ -606,6 +641,66 @@ def open_parquet_stream(handle: Any) -> ParquetStream:
     return ParquetStream(parquet_file=parquet_file, columns=_column_names(names))
 
 
+class TypedStream:
+    """A stream cast to the person's column list (`DATA-18`): each batch of text goes
+    through `upload_types.cast_batch`, bad values are counted over the WHOLE file in
+    `report`, and the columns leave under the names the person gave, in the list's order.
+
+    With `on_bad_value == "stop"` the file is still read to its end, because the page
+    promises the count and the first 100, and then the load fails from the last
+    step of the generator, which is dlt's extract step: nothing is written.
+    """
+
+    def __init__(self, inner: TableStream | ParquetStream, specs: list[ColumnSpec], on_bad_value: str) -> None:
+        self.inner = inner
+        self.specs = specs
+        self.on_bad_value = on_bad_value
+        self.columns = [spec.name for spec in specs]
+        self.report = BadReport(self.columns)
+        self._failure: LoadFailure | None = None
+
+    @property
+    def failure(self) -> LoadFailure | None:
+        return self._failure or self.inner.failure
+
+    @property
+    def row_count(self) -> int:
+        return self.inner.row_count
+
+    def hints(self) -> list[dict[str, Any]]:
+        return [spec.hint() for spec in self.specs]
+
+    def column_types(self) -> dict[str, str]:
+        return {spec.name: spec.iceberg_type() for spec in self.specs}
+
+    def batches(self) -> Iterator[pa.Table]:
+        """The cast batches.
+
+        # Errors
+
+        Raises `LoadFailure(BAD_VALUES)` after the last batch when told to stop and a
+        value did not fit, and whatever the inner stream raises."""
+        first_row = 1
+        for batch in self.inner.batches():
+            typed = cast_batch(batch, self.specs, first_row, self.report)
+            first_row += batch.num_rows
+            yield typed
+        if self.on_bad_value == "stop" and self.report.count:
+            self._failure = LoadFailure(BAD_VALUES)
+            raise self._failure
+
+
+def _typed(stream: TableStream | ParquetStream, params: FileIngestParams) -> TableStream | ParquetStream | TypedStream:
+    """The stream the load writes: cast to the column list, or as it is (every column text)."""
+    if not params.columns:
+        return stream
+    if len(params.columns) != len(stream.columns):
+        raise LoadFailure(LOAD_FAILED) from ValueError(
+            f"the column list has {len(params.columns)} columns and the file has {len(stream.columns)}"
+        )
+    return TypedStream(stream, list(params.columns), params.on_bad_value)
+
+
 def _checked_key(storage_key: str) -> str:
     """The key, if it is inside the uploads prefix and cannot climb out of it.
 
@@ -644,6 +739,35 @@ def _blocks(handle: BinaryIO) -> Iterator[bytes]:
         yield block
 
 
+REPORT_SUFFIX = ".bad-values.json"
+
+
+def write_stored_report(
+    config: SinkConfig, key: str, payload: bytes | None, *, filesystem_factory: Callable[..., Any] | None = None
+) -> None:
+    """Write (or, with `payload=None`, remove) the report of values that did not fit,
+    the object `<key>.bad-values.json` beside the upload (`DATA-18`, plan AD6). The API
+    reads it when it settles the row. Removing a stale one is what keeps a clean load
+    after a load with bad values from showing the old report.
+
+    # Errors
+
+    Whatever the store raises; the caller logs it and goes on (a report that could not
+    be written never changes how the load ended)."""
+    make_fs = filesystem_factory or s3fs.S3FileSystem
+    fs = make_fs(
+        key=config.rustfs_access_key,
+        secret=config.rustfs_secret_key,
+        client_kwargs={"endpoint_url": config.rustfs_endpoint},
+    )
+    path = f"{config.warehouse_bucket}/{key}{REPORT_SUFFIX}"
+    if payload is None:
+        if fs.exists(path):
+            fs.rm_file(path)
+    else:
+        fs.pipe_file(path, payload)
+
+
 @contextmanager
 def _unbounded_csv_fields() -> Iterator[None]:
     """Raise Python's per-cell limit (131,072 characters) to none, as the
@@ -659,7 +783,7 @@ def _unbounded_csv_fields() -> Iterator[None]:
 # ── Writing it ───────────────────────────────────────────────────────────
 
 
-def _text_resource(stream: TableStream | ParquetStream, table: str) -> DltResource:
+def _text_resource(stream: TableStream | ParquetStream | TypedStream, table: str) -> DltResource:
     """The record batches as a dlt resource with every column declared `text`,
     for `load_via_sink` (which takes an already configured resource).
 
@@ -675,7 +799,7 @@ def _text_resource(stream: TableStream | ParquetStream, table: str) -> DltResour
     stack.
     """
     resource = dlt.resource(stream.batches(), name=table)
-    resource.apply_hints(columns=[{"name": name, "data_type": "text"} for name in stream.columns])
+    resource.apply_hints(columns=stream.hints())
     return resource
 
 
@@ -724,6 +848,9 @@ def _check_settings(params: FileIngestParams) -> None:
         problems.append(f"delimiter {params.delimiter!r} is not one of {DELIMITERS!r}")
     if params.header_row < 0:
         problems.append(f"header_row {params.header_row} is negative")
+    if params.on_bad_value not in ("null", "stop"):
+        problems.append(f"on_bad_value {params.on_bad_value!r} is not null or stop")
+    problems.extend(check_specs(list(params.columns)))
     if params.format not in FORMATS:
         problems.append(f"format {params.format!r} is not one of {', '.join(FORMATS)}")
     if len(params.storage_keys) != 1:
@@ -760,14 +887,20 @@ def _now() -> str:
 
 
 def _write(
-    stream: TableStream | ParquetStream,
+    stream: TableStream | ParquetStream | TypedStream,
     params: FileIngestParams,
     sink_config: SinkConfig,
     load: Callable[..., SinkResult],
 ) -> SinkResult:
     table = params.bronze_table_name
     try:
-        result = load(_text_resource(stream, table), table, sink_config, LoadPlan(mode=params.load_mode))
+        result = load(
+            _text_resource(stream, table),
+            table,
+            sink_config,
+            LoadPlan(mode=params.load_mode),
+            column_types=stream.column_types(),
+        )
     except Exception as exc:  # noqa: BLE001 -- whatever dlt or the catalog raised is the cause, never the reason
         # dlt wraps what the generator raised: the stream knows if it was the
         # row cap or the store, and that is the reason, not "the load failed".
@@ -800,6 +933,23 @@ def _register(
         raise LoadFailure(NOT_REGISTERED, rows=result.rows) from exc
 
 
+def _keep_report(
+    stream: Any, key: str, config: SinkConfig, write_report: Callable[..., None], log: Any, params: FileIngestParams
+) -> None:
+    """Write the report when the load found values that did not fit, whatever became of
+    the load, and remove an earlier one when it found none. A typed stream only: a load
+    with no column list has nothing to report. Never raises."""
+    if not isinstance(stream, TypedStream):
+        return
+    payload = None
+    if stream.report.count:
+        payload = json.dumps(stream.report.as_json(), ensure_ascii=False).encode("utf-8")
+    try:
+        write_report(config, key, payload)
+    except Exception as exc:  # noqa: BLE001 -- the load's outcome stands; the report is lost, which the run log says
+        log.warning(f"upload {params.upload_id}: the report of values that did not fit could not be kept ({type(exc).__name__}: {exc})")
+
+
 def _load(
     params: FileIngestParams,
     log: Any,
@@ -807,6 +957,7 @@ def _load(
     open_object: Callable[[SinkConfig, str], BinaryIO],
     load: Callable[..., SinkResult],
     register: Callable[..., int],
+    write_report: Callable[..., None],
 ) -> LoadSummary:
     _check_settings(params)
     key = _checked_key(params.storage_keys[0])
@@ -830,8 +981,12 @@ def _load(
                 raise
             except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause
                 raise LoadFailure(UNREADABLE) from exc
+            stream = _typed(stream, params)
             log.info(f"upload {params.upload_id}: {len(stream.columns)} columns to load, streaming")
-            result = _write(stream, params, sink_config, load)
+            try:
+                result = _write(stream, params, sink_config, load)
+            finally:
+                _keep_report(stream, key, sink_config, write_report, log, params)
     log.info(f"upload {params.upload_id}: {stream.row_count} rows read")
     if result.rows is not None and result.rows != stream.row_count:
         log.warning(
@@ -844,6 +999,7 @@ def _load(
         parsed_rows=stream.row_count,
         columns=len(stream.columns),
         table_total=total,
+        bad_values=stream.report.count if isinstance(stream, TypedStream) else 0,
     )
 
 
@@ -855,6 +1011,7 @@ def run_file_load(
     open_object: Callable[[SinkConfig, str], BinaryIO] = open_stored_object,
     load: Callable[..., SinkResult] = load_via_sink,
     register: Callable[..., int] = register_loaded_table,
+    write_report: Callable[..., None] = write_stored_report,
     record: Callable[..., None] = record_ingest_run,
     now: Callable[[], str] = _now,
 ) -> LoadSummary:
@@ -874,7 +1031,7 @@ def run_file_load(
     failure: LoadFailure | None = None
     summary: LoadSummary | None = None
     try:
-        summary = _load(params, log, load_config, open_object, load, register)
+        summary = _load(params, log, load_config, open_object, load, register, write_report)
     except LoadFailure as caught:
         failure = caught
     except Exception as exc:  # noqa: BLE001 -- a bug in this module; the run still gets its one row
@@ -939,6 +1096,8 @@ def ingest_uploaded_file(context) -> dict:
         "columns": summary.columns,
         "table_total": summary.table_total,
     }
+    if summary.bad_values:
+        metadata["bad_values_loaded_as_empty"] = summary.bad_values
     if summary.rows is not None:
         metadata["rows_loaded"] = summary.rows
     context.add_output_metadata(metadata)

@@ -385,7 +385,7 @@ pub(super) fn run_config_columns(plan: Option<&ColumnPlan>) -> (Value, &'static 
                 "source": spec.source,
                 "name": spec.name,
                 "type": spec.column_type,
-                "date_format": spec.date_format,
+                "date_format": spec.date_format.map_or("", date_format_word),
                 "timezone": spec.timezone.unwrap_or(false),
             })
         })
@@ -403,4 +403,13 @@ pub(super) fn claim_fields(plan: Option<&ColumnPlan>) -> (Option<Value>, Option<
             Some(plan.on_bad_value.as_str()),
         )
     })
+}
+
+/// The word the job's configuration uses for a date reading; `""` has none.
+const fn date_format_word(format: crate::upload_types::DateFormat) -> &'static str {
+    match format {
+        crate::upload_types::DateFormat::Iso => "iso",
+        crate::upload_types::DateFormat::Dmy => "dmy",
+        crate::upload_types::DateFormat::Mdy => "mdy",
+    }
 }

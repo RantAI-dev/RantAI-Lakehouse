@@ -58,7 +58,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   eight the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   nine the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -294,10 +294,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these eight (review finding
+// shows a recorded reason only when it is one of these nine (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same eight as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same nine as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -313,10 +313,12 @@ const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be register
 // ingest's 400 and as the job's failure reason (`TOO_MANY_COLUMNS` in
 // `file_ingest.py`). One constant, so the three cannot word it differently.
 const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
+// `DATA-18`: a load told to stop at a value that does not fit its column's type.
+const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 8] = [
+const JOB_FAILURE_REASONS: [&str; 9] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -325,6 +327,7 @@ const JOB_FAILURE_REASONS: [&str; 8] = [
     JOB_LOAD_FAILED,
     JOB_NOT_REGISTERED,
     JOB_TOO_MANY_COLUMNS,
+    JOB_BAD_VALUES,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {

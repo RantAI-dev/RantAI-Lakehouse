@@ -113,6 +113,8 @@ def _params(**overrides) -> FileIngestParams:
         encoding="utf-8",
         delimiter=",",
         header_row=0,
+        columns=(),
+        on_bad_value="stop",
     )
     return dataclasses.replace(base, **overrides)
 
@@ -181,6 +183,7 @@ class _Harness:
         self.registered: list[dict] = []
         self.recorded: list[dict] = []
         self.record_attempts = 0
+        self.reports: list[tuple[str, bytes | None]] = []
         self.log = _Log()
         self._ticks = iter(f"2026-10-02T10:00:{second:02d}+00:00" for second in range(60))
 
@@ -195,13 +198,14 @@ class _Harness:
             raise self.read_error
         return io.BytesIO(self.raw)
 
-    def load(self, resource, table: str, config: SinkConfig, plan: LoadPlan) -> SinkResult:
+    def load(self, resource, table: str, config: SinkConfig, plan: LoadPlan, **kwargs) -> SinkResult:
         # The rows are consumed here, as dlt would, so a generator that is
         # read after the call returns would show up as an empty list.
         self.loads.append(
             {
                 "table": table,
                 "plan": plan,
+                "column_types": kwargs.get("column_types"),
                 "columns": dict(resource.columns),
                 "rows": [row for batch in resource for row in batch.to_pylist()],
             }
@@ -215,6 +219,9 @@ class _Harness:
         if self.register_error:
             raise self.register_error
         return self.total
+
+    def write_report(self, config: SinkConfig, key: str, payload: bytes | None) -> None:
+        self.reports.append((key, payload))
 
     def record(self, **row) -> None:
         self.record_attempts += 1
@@ -233,6 +240,7 @@ class _Harness:
             open_object=self.read,
             load=self.load,
             register=self.register,
+            write_report=self.write_report,
             record=self.record,
             now=self.now,
         )
@@ -252,12 +260,12 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
-def test_there_are_eight_different_failure_reasons_among_them_the_header_row_with_no_columns():
+def test_there_are_nine_different_failure_reasons_among_them_the_header_row_with_no_columns():
     # Review finding C2 made it seven: a header row with no columns has a
     # sentence of its own. SEC-17 made it eight with the column cap. The API
     # counts the same eight against the same file.
     in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
-    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 8
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 9
     assert HEADER_NO_COLUMNS == "The header row has no columns."
     assert HEADER_NO_COLUMNS != HEADER_PAST_END
 
@@ -413,9 +421,9 @@ def test_the_row_cap_fails_the_run_from_inside_the_load_and_the_reason_is_not_th
     # fake wraps it as dlt does, so only the stream's own record of it tells the reason.
     original = harness.load
 
-    def wrapping(resource, table, config, plan):
+    def wrapping(resource, table, config, plan, **kwargs):
         try:
-            return original(resource, table, config, plan)
+            return original(resource, table, config, plan, **kwargs)
         except LoadFailure as exc:
             raise RuntimeError("PipelineStepFailed") from exc
 
@@ -440,9 +448,9 @@ def test_a_store_that_fails_while_the_file_is_read_is_unreadable_and_not_a_faile
     harness.read = lambda config, key: Dying()
     original = harness.load
 
-    def wrapping(resource, table, config, plan):
+    def wrapping(resource, table, config, plan, **kwargs):
         try:
-            return original(resource, table, config, plan)
+            return original(resource, table, config, plan, **kwargs)
         except LoadFailure as exc:
             raise RuntimeError("PipelineStepFailed") from exc
 
@@ -456,7 +464,7 @@ def _local_pipeline_load(directory: str):
     local filesystem destination, stamped as the sink stamps it. Not Iceberg:
     it proves what dlt does with a generator that raises, which is dlt's."""
 
-    def load(resource, table, config, plan):
+    def load(resource, table, config, plan, **kwargs):
         pipeline = dlt.pipeline(
             "v4", destination=dlt.destinations.filesystem(bucket_url=directory), dataset_name="ds",
             pipelines_dir=os.path.join(directory, "_pipelines"),
@@ -1189,9 +1197,24 @@ class _FakePipeline:
         self.write_disposition = None
         self.materialized_rows: list[dict] = []
         self.run_batches: list = []
+        self.extracted = None
 
     def sync_destination(self) -> None:
         pass
+
+    # The retyping replace runs the three steps itself (`DATA-18`).
+    def extract(self, source, table_name, table_format, write_disposition):
+        self.run_source = source
+        self.table_name = table_name
+        self.write_disposition = write_disposition
+        self.run_batches = list(source)
+        self.materialized_rows = [row for batch in self.run_batches for row in batch.to_pylist()]
+
+    def normalize(self) -> None:
+        pass
+
+    def load(self):
+        return _FakeLoadInfo()
 
     def run(self, source, table_name, table_format, write_disposition):
         self.run_source = source
@@ -1213,6 +1236,7 @@ def test_the_real_sink_replaces_or_appends_text_rows_that_the_job_hands_it(monke
 
     monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", factory)
     monkeypatch.setattr(sink_module, "_install_catalog_env", lambda config: None)  # it sets process-wide env vars
+    monkeypatch.setattr(sink_module, "_drop_table_if_types_differ", lambda *args: False)  # no catalog here
 
     harness = _Harness(raw=b"id,when\n1,2025-02-07T10:00:00Z\n2,x\n")
     summary = run_file_load(
@@ -1221,6 +1245,7 @@ def test_the_real_sink_replaces_or_appends_text_rows_that_the_job_hands_it(monke
         load_config=harness.load_config,
         open_object=harness.read,
         register=harness.register,
+        write_report=harness.write_report,
         record=harness.record,
         now=harness.now,
     )
@@ -1253,6 +1278,8 @@ RUN_CONFIG = {
                 "encoding": "utf-16",
                 "delimiter": "\t",
                 "header_row": 4,
+                "columns": [],
+                "on_bad_value": "stop",
             }
         }
     }
@@ -1287,6 +1314,8 @@ def test_the_run_config_the_api_sends_reaches_the_load_as_the_same_settings(monk
             encoding="utf-16",
             delimiter="\t",
             header_row=4,
+            columns=(),
+            on_bad_value="stop",
         )
     ]
     assert result.output_for_node("ingest_uploaded_file") == {

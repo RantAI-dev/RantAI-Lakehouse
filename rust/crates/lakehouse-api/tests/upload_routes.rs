@@ -5889,7 +5889,7 @@ async fn an_ingest_with_a_column_list_sends_it_to_the_job_and_keeps_it_on_the_up
     assert_eq!(config["on_bad_value"], "null");
     assert_eq!(
         config["columns"][1],
-        json!({ "source": "qty", "name": "qty", "type": "integer", "date_format": null, "timezone": false })
+        json!({ "source": "qty", "name": "qty", "type": "integer", "date_format": "", "timezone": false })
     );
     assert_eq!(config["columns"][3]["date_format"], "iso");
     let upload = stack.get(&bayu, &format!("/api/uploads/{id}")).await;
