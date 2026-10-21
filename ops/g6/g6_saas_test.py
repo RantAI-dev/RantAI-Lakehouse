@@ -828,6 +828,125 @@ def step_sharepoint() -> None:
     _log("sharepoint forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+DV_ACCOUNT = "acme.crm4.dynamics.com/00000000-0000-0000-0000-0000000000b2"
+
+
+def _dv_id(n: int) -> str:
+    return f"00000000-0000-0000-0000-{n:012d}"
+
+
+def _dynamics(auth: str = "integration"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import dynamics365 as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "dynamics365", "account": DV_ACCOUNT, "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        # Entra replaces the refresh token on every refresh: ask the mock which one is current.
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": admin("dynamics365", action="refresh_token")["refresh_token"]}
+    else:
+        dial = {"vendor": "dynamics365", "account": DV_ACCOUNT, "auth": {"type": "integration"}}
+        secrets = {"clientId": "dv-app", "clientSecret": "dv-secret"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def _dv_read(module, parts, session, dial, name: str, since=None, state=None) -> list[dict]:  # noqa: ANN001
+    decl = module.declaration(session, parts, dial, name)
+    return list(module.read(session, parts, dial, decl, since=since, state=state))
+
+
+def step_dynamics365() -> None:
+    """Dynamics 365 (V-Dynamics.4): connect (client credentials and the browser sign-in, both at the customer's tenant),
+    discover (the tables, which are incremental and which report deletes) and describe, load (paged by @odata.nextLink),
+    reload (a table without tracking: modifiedon filter; a tracked table: its delta link, a delete marked), a stale link
+    as a full resync, a new column seen before the load, rate limit, forbidden and revoked sign-in."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("dynamics365", action="reset")
+
+    for auth in ("integration", "oauth"):
+        _m, vendor, parts, session, _dial = _dynamics(auth)
+        who = session.get_json(vendor.whoami["path"])
+        _expect(who.get("UserId") == "u", f"dynamics365 connect ({auth}): who-am-i answered {who!r}")
+    _log("dynamics365 connect: client credentials (scope <org>/.default) and the browser sign-in (refresh grant, the refresh token replaced) both reach Dataverse through the customer's tenant")
+
+    module, _vendor, parts, session, dial = _dynamics()
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect(set(declared) == {"account", "contact"}, f"dynamics365 discover: {sorted(declared)}")
+    _expect(declared["account"].load_description() == "incremental" and not declared["account"].deletes, "dynamics365 discover: account should be incremental without deletes")
+    _expect(declared["contact"].load_description() == "incremental" and declared["contact"].deletes, "dynamics365 discover: contact has change tracking, so it reports deletes")
+    fields = {f.name: f.type_name for f in module.describe(session, parts, dial, "account")}
+    _expect({"accountid", "name", "modifiedon", "revenue", "_ownerid_value", "is_deleted"} <= set(fields) and "owneridname" not in fields, f"dynamics365 discover: the described columns are {sorted(fields)}")
+    _log(f"dynamics365 discover: {len(declared)} tables (contact reports deletes through change tracking), account described with {len(fields)} columns before the load")
+
+    admin("dynamics365", action="clear_log")
+    first = _dv_read(module, parts, session, dial, "account")
+    _expect([r["name"] for r in first] == [f"row {i}" for i in range(1, 6)], f"dynamics365 load: first run read {[r['name'] for r in first]}")
+    _expect(len([line for line in mock_log("dynamics365") if "/accounts" in line]) == 3, "dynamics365 load: the @odata.nextLink was not followed to the third page")
+    _log("dynamics365 load: 5 accounts over 3 pages followed by @odata.nextLink, in key order")
+
+    cursor = max(r["modifiedon"] for r in first) - timedelta(seconds=1)  # the lag is applied by dlt; here the cursor is given as is
+    admin("dynamics365", action="put", table="account", id=2, fields={"name": "account 2 changed"})
+    admin("dynamics365", action="put", table="account", id=6)
+    admin("dynamics365", action="clear_log")
+    again = _dv_read(module, parts, session, dial, "account", since=cursor)
+    _expect(sorted(r["name"] for r in again) == ["account 2 changed", "row 5", "row 6"], f"dynamics365 reload: read {[r['name'] for r in again]}")
+    _expect(any("$filter=modifiedon" in unquote_plus(line) for line in mock_log("dynamics365")), "dynamics365 reload: no modifiedon filter")
+    _log("dynamics365 reload: a table without tracking was filtered by modifiedon; only the changed, the new and the cursor row came back; no delete is claimed")
+
+    state: dict = {}
+    _expect(len(_dv_read(module, parts, session, dial, "contact", state=state)) == 5 and "delta" in state, f"dynamics365 tracked load: state {state!r}")
+    admin("dynamics365", action="put", table="contact", id=2, fields={"name": "contact 2 changed"})
+    admin("dynamics365", action="put", table="contact", id=6)
+    admin("dynamics365", action="delete", table="contact", id=3)
+    admin("dynamics365", action="clear_log")
+    tracked = {r["contactid"]: r for r in _dv_read(module, parts, session, dial, "contact", state=state)}
+    _expect(sorted(tracked) == [_dv_id(2), _dv_id(3), _dv_id(6)], f"dynamics365 tracked reload: read {sorted(tracked)}")
+    _expect(tracked[_dv_id(3)]["is_deleted"] is True and set(tracked[_dv_id(3)]) == {"contactid", "is_deleted", "modifiedon"}, "dynamics365 tracked reload: the delete is not marked")
+    _expect(any("deltatoken=5" in line for line in mock_log("dynamics365")), "dynamics365 tracked reload: the saved link was not opened")
+    _log("dynamics365 tracked reload: change tracking's delta link returned only the changed, the new and the deleted row; the delete is marked (is_deleted)")
+
+    admin("dynamics365", action="put", table="contact", id=7)
+    admin("dynamics365", action="expire", on=True)
+    resync = _dv_read(module, parts, session, dial, "contact", state=state)
+    _expect(sorted(r["contactid"] for r in resync) == [_dv_id(n) for n in (1, 2, 4, 5, 6, 7)], f"dynamics365 resync: read {sorted(r['contactid'] for r in resync)}")
+    _expect(state["delta"]["link"].endswith("deltatoken=9"), f"dynamics365 resync: the new link is {state!r}")
+    admin("dynamics365", action="expire", on=False)
+    _log("dynamics365 resync: a delta token Dataverse no longer serves made a full read from a fresh tracking request; the new link was kept")
+
+    before = set(fields)
+    admin("dynamics365", action="add_field", table="account", name="new_region")
+    after = {f.name for f in module.describe(session, parts, dial, "account")}
+    _expect(after - before == {"new_region"}, f"dynamics365 schema change: describe differs by {after - before}")
+    _log("dynamics365 schema change: the new column shows in describe before any load (EntityDefinitions)")
+
+    admin("dynamics365", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_dv_read(module, parts, session, dial, "account")) >= 1, "dynamics365 rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "dynamics365 rate limit: the Retry-After was not waited")
+    admin("dynamics365", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _dv_read(module, parts, session, dial, "account"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "dynamics365 rate limit: the run report class")
+    admin("dynamics365", action="rate_limit", count=0)
+    _log("dynamics365 rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("dynamics365", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _dv_read(module, parts, session, dial, "account"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "dynamics365 forbidden: the run report class")
+    admin("dynamics365", action="forbid", on=False)
+    admin("dynamics365", action="revoke", on=True)
+
+    def sign_in_and_read(auth: str) -> list[dict]:
+        m, _v, p, sess, d = _dynamics(auth)
+        return _dv_read(m, p, sess, d, "account")
+
+    for auth in ("integration", "oauth"):
+        exc = _raises("OAuthSignInRefused", lambda auth=auth: sign_in_and_read(auth))
+        _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", f"dynamics365 revoked ({auth}): the run report class")
+    admin("dynamics365", action="revoke", on=False)
+    _log("dynamics365 forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def _ga4_row_ids() -> set[str]:
     """`country|date` of every row the mock holds, read from the mock when the step needs it."""
     days = admin("ga4", action="days")["days"]
@@ -946,6 +1065,45 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "delete", "id": 3},
         ],
         "reads_marker": ("token=v",),
+    },
+    # Dynamics 365 (V-Dynamics.4): the client-credentials way over a table WITHOUT change tracking (account: modifiedon
+    # filter, no delete is claimed) and the browser sign-in over a TRACKED table (contact: the delta link, a delete marked).
+    # Both go to the customer's tenant (part of the account). The preview is the described columns (decision 9).
+    "dynamics365": {
+        "type": "Dynamics 365", "host": "acme.crm4.dynamics.com", "account": DV_ACCOUNT, "label": "Dynamics 365",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "dv-app", "secondary": "dv-secret"},
+        "object": "account", "target": "saas_gate_dynamics365_account", "cursor": "modifiedon", "text": "name", "key": "accountid",
+        "columns": "accountid, name, modifiedon, is_deleted", "order": "accountid",
+        "row_id": lambda r: str(r["accountid"]),
+        "preview_columns": {"accountid", "name", "modifiedon", "is_deleted"},
+        "first_ids": {_dv_id(n) for n in range(1, 6)}, "reload_ids": {_dv_id(n) for n in range(1, 7)},
+        "changed_id": _dv_id(2),
+        "changes": [
+            {"action": "put", "table": "account", "id": 2, "fields": {"name": "account 2 changed"}},
+            {"action": "put", "table": "account", "id": 6},
+        ],
+        "reads_marker": ("filter=modifiedon",),
+    },
+    "dynamics365-browser": {
+        "vendor": "dynamics365",
+        "type": "Dynamics 365", "host": "acme.crm4.dynamics.com", "account": DV_ACCOUNT, "label": "Dynamics 365 (browser sign-in)",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-dv-refresh-0"},
+        "before": [{"action": "rotate", "on": False}],
+        "object": "contact", "target": "saas_gate_dynamics365_contact", "cursor": "modifiedon", "text": "name", "key": "contactid",
+        "columns": "contactid, name, modifiedon, is_deleted", "order": "contactid",
+        "row_id": lambda r: str(r["contactid"]),
+        "preview_columns": {"contactid", "name", "modifiedon", "is_deleted"},
+        "first_ids": {_dv_id(n) for n in range(1, 6)}, "reload_ids": {_dv_id(n) for n in range(1, 7)},
+        "changed_id": _dv_id(2), "deleted_id": _dv_id(3),
+        "changes": [
+            {"action": "put", "table": "contact", "id": 2, "fields": {"name": "contact 2 changed"}},
+            {"action": "put", "table": "contact", "id": 6},
+            {"action": "delete", "table": "contact", "id": 3},
+        ],
+        "reads_marker": ("deltatoken",),
     },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
@@ -1151,9 +1309,12 @@ def step_product(vendor_id: str) -> None:
         _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
     elif vendor_id == "confluence":
         _expect(len(by_id) == 6, "confluence reload: a page was lost or stored twice")
-    elif vendor_id == "sharepoint":
-        _expect(by_id["3"]["is_deleted"] in (True, 1, "true") and by_id["1"]["is_deleted"] in (False, 0, "false"), "sharepoint reload: the delete is not marked is_deleted in Bronze")
-        _expect(len(by_id) == 6, "sharepoint reload: an item was lost or stored twice")
+    elif vendor_id in ("sharepoint", "dynamics365"):
+        if spec.get("deleted_id") or vendor_id == "sharepoint":
+            gone = spec.get("deleted_id", "3")
+            _expect(by_id[gone]["is_deleted"] in (True, 1, "true"), f"{vendor_id} reload: the delete is not marked is_deleted in Bronze")
+            _expect(all(r["is_deleted"] in (False, 0, "false") for k, r in by_id.items() if k != gone), f"{vendor_id} reload: a row that was not deleted is marked")
+        _expect(len(by_id) == 6, f"{vendor_id} reload: a row was lost or stored twice")
     elif vendor_id == "servicenow":
         _expect(len(by_id) == 4, "servicenow reload: an incident was lost or stored twice")
     elif vendor_id == "zendesk":
@@ -1174,6 +1335,7 @@ def step_product(vendor_id: str) -> None:
              "confluence": "the changed and the new page merged on id, no duplicate; the read stopped near the cursor (no delete is claimed)",
              "servicenow": "the changed and the new incident merged on sys_id, no duplicate (no delete is claimed)",
              "sharepoint": "the changed and the new item merged on id from the saved delta link, no duplicate; the deleted item says is_deleted",
+             "dynamics365": "the changed and the new row merged on the key, no duplicate" + ("; the deleted row says is_deleted (change tracking)" if spec.get("deleted_id") else " (a table without tracking claims no delete)"),
              "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
          }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
 
@@ -1200,6 +1362,7 @@ def run_vendors() -> None:
     step_servicenow()
     step_confluence()
     step_sharepoint()
+    step_dynamics365()
 
 
 def run() -> None:
