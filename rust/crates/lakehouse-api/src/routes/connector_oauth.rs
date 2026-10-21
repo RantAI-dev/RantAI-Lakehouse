@@ -397,6 +397,65 @@ pub async fn callback(
     }
 }
 
+/// The token request of the code exchange, the client authenticating as the vendor
+/// table says (PR #214 CI clippy: split out of [`finish_sign_in`], behaviour unchanged).
+async fn exchange_code(
+    state: &AppState,
+    app: &App,
+    client_secret: &lakehouse_core::secret::SecretValue,
+    exchange: &[(&str, &str)],
+) -> Result<connector_oauth::Tokens, TokenFailure> {
+    let internal_hosts = state.config.connector_internal_hosts();
+    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin; a no-op unless the
+    // gate-only switch is on, and never for a `rest` connector.
+    let token_url = app.gate_vendor.map_or_else(
+        || app.token_url.clone(),
+        |vendor| {
+            connector_oauth::gate_rebase(state.config.oauth_settings(), vendor, &app.token_url)
+        },
+    );
+    match app.client_auth {
+        ClientAuth::Post => {
+            let mut form = exchange.to_vec();
+            form.push(("client_id", app.client_id.as_str()));
+            form.push(("client_secret", client_secret.expose_secret()));
+            connector_oauth::token_request(
+                &token_url,
+                &form,
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
+        // Slice 2 review BLOCKER 3 (`client_secret_post_json`): the same fields as
+        // `Post`, as a JSON body (Zendesk's token endpoint requires it).
+        ClientAuth::PostJson => {
+            let mut form = exchange.to_vec();
+            form.push(("client_id", app.client_id.as_str()));
+            form.push(("client_secret", client_secret.expose_secret()));
+            connector_oauth::token_request_json(
+                &token_url,
+                &form,
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
+        // `SRC-3` AD8: the client is in the header, not the body.
+        ClientAuth::Basic => {
+            connector_oauth::token_request_basic(
+                &token_url,
+                exchange,
+                &app.client_id,
+                client_secret.expose_secret(),
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
+    }
+}
+
 /// The callback's work. Returns the connector's id on success; on any error
 /// nothing was stored.
 async fn finish_sign_in(
@@ -460,56 +519,9 @@ async fn finish_sign_in(
         ("redirect_uri", redirect_uri),
         ("code_verifier", pending.code_verifier.as_str()),
     ];
-    let internal_hosts = state.config.connector_internal_hosts();
-    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin; a no-op unless the
-    // gate-only switch is on, and never for a `rest` connector.
-    let token_url = app.gate_vendor.map_or_else(
-        || app.token_url.clone(),
-        |vendor| {
-            connector_oauth::gate_rebase(state.config.oauth_settings(), vendor, &app.token_url)
-        },
-    );
-    let tokens = match app.client_auth {
-        ClientAuth::Post => {
-            let mut form = exchange.to_vec();
-            form.push(("client_id", app.client_id.as_str()));
-            form.push(("client_secret", client_secret.expose_secret()));
-            connector_oauth::token_request(
-                &token_url,
-                &form,
-                &internal_hosts,
-                state.config.oauth_settings(),
-            )
-            .await
-        }
-        // Slice 2 review BLOCKER 3 (`client_secret_post_json`): the same fields as
-        // `Post`, as a JSON body (Zendesk's token endpoint requires it).
-        ClientAuth::PostJson => {
-            let mut form = exchange.to_vec();
-            form.push(("client_id", app.client_id.as_str()));
-            form.push(("client_secret", client_secret.expose_secret()));
-            connector_oauth::token_request_json(
-                &token_url,
-                &form,
-                &internal_hosts,
-                state.config.oauth_settings(),
-            )
-            .await
-        }
-        // `SRC-3` AD8: the client is in the header, not the body.
-        ClientAuth::Basic => {
-            connector_oauth::token_request_basic(
-                &token_url,
-                &exchange,
-                &app.client_id,
-                client_secret.expose_secret(),
-                &internal_hosts,
-                state.config.oauth_settings(),
-            )
-            .await
-        }
-    }
-    .map_err(Refusal::Provider)?;
+    let tokens = exchange_code(state, &app, &client_secret, &exchange)
+        .await
+        .map_err(Refusal::Provider)?;
     // The access token ends here: it is not needed to sign in and is never
     // stored.
     drop(tokens.access_token);

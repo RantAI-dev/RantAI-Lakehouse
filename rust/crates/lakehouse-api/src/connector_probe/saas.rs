@@ -137,120 +137,140 @@ async fn access_token(
 ) -> Result<Access, Outcome> {
     match request.auth {
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
-            let client_secret = resolve(secrets.resolver, secrets.primary).await?;
-            // No refresh token means nobody has signed in: nothing is wrong
-            // with the connector, so this is `supported: false` with the
-            // reason, never a failure that would stop the client secret being
-            // saved before the first sign-in (as for `rest`, `SRC-12`).
-            let refresh_token = match secrets.secondary {
-                Some(secondary) => secrets.resolver.resolve_dyn(secondary).await.ok(),
-                None => None,
-            };
-            let Some(refresh_token) = refresh_token else {
-                return Err(Outcome::not_testable_with(
-                    "Nobody has signed in to this connector yet, so the connection cannot be \
-                     tested. Use Sign in on the connector page, then test again.",
-                ));
-            };
-            let started = Instant::now();
-            let form = [
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.expose_secret()),
-            ];
-            let tokens = match request.vendor.oauth.client_auth {
-                ClientAuth::Post => {
-                    connector_oauth::token_request(
-                        &request.token_url,
-                        &[
-                            form[0],
-                            form[1],
-                            ("client_id", client_id),
-                            ("client_secret", client_secret.expose_secret()),
-                        ],
-                        internal_hosts,
-                        oauth,
-                    )
-                    .await
-                }
-                // Slice 2 review BLOCKER 3 (`client_secret_post_json`): as `Post`, a JSON body.
-                ClientAuth::PostJson => {
-                    connector_oauth::token_request_json(
-                        &request.token_url,
-                        &[
-                            form[0],
-                            form[1],
-                            ("client_id", client_id),
-                            ("client_secret", client_secret.expose_secret()),
-                        ],
-                        internal_hosts,
-                        oauth,
-                    )
-                    .await
-                }
-                // `SRC-3` AD8: the client is in the header, not the body.
-                ClientAuth::Basic => {
-                    connector_oauth::token_request_basic(
-                        &request.token_url,
-                        &form,
-                        client_id,
-                        client_secret.expose_secret(),
-                        internal_hosts,
-                        oauth,
-                    )
-                    .await
-                }
-            }
-            .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
-            Ok(Access {
-                token: tokens.access_token,
-                rotated: tokens.refresh_token,
-                basic: false,
-            })
+            refreshed_access(request, client_id, secrets, internal_hosts, oauth).await
         }
-        SaasAuth::Integration => {
-            let fields = request
-                .vendor
-                .integration
-                .map_or(&[][..], |integration| integration.secret_fields);
-            // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with
-            // `<email>/token` as the user name
-            // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>).
-            if request.vendor.id == "zendesk" && fields == ["email", "apiToken"] {
-                let email = resolve(secrets.resolver, secrets.primary).await?;
-                let Some(secondary) = secrets.secondary else {
-                    return Err(Outcome::misconfigured(
-                        "connector is misconfigured: the Zendesk API token is not saved",
-                    ));
-                };
-                let api_token = resolve(secrets.resolver, secondary).await?;
-                let pair = format!(
-                    "{}/token:{}",
-                    email.expose_secret(),
-                    api_token.expose_secret()
-                );
-                return Ok(Access {
-                    token: SecretValue::new(base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        pair,
-                    )),
-                    rotated: None,
-                    basic: true,
-                });
-            }
-            if fields != ["token"] {
-                return Err(Outcome::not_testable_with(format!(
-                    "This build cannot test {}'s integration credential from the console yet. \
-                     A load reports whether the connection worked.",
-                    request.vendor.label
-                )));
-            }
-            Ok(Access {
-                token: resolve(secrets.resolver, secrets.primary).await?,
-                rotated: None,
-                basic: false,
-            })
+        SaasAuth::Integration => integration_access(request, secrets).await,
+    }
+}
+
+/// A browser sign-in: exchange the saved refresh token for an access token,
+/// the client authenticating as the vendor table says (PR #214 CI clippy:
+/// split out of [`access_token`], behaviour unchanged).
+async fn refreshed_access(
+    request: &Request<'_>,
+    client_id: &str,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let client_secret = resolve(secrets.resolver, secrets.primary).await?;
+    // No refresh token means nobody has signed in: nothing is wrong
+    // with the connector, so this is `supported: false` with the
+    // reason, never a failure that would stop the client secret being
+    // saved before the first sign-in (as for `rest`, `SRC-12`).
+    let refresh_token = match secrets.secondary {
+        Some(secondary) => secrets.resolver.resolve_dyn(secondary).await.ok(),
+        None => None,
+    };
+    let Some(refresh_token) = refresh_token else {
+        return Err(Outcome::not_testable_with(
+            "Nobody has signed in to this connector yet, so the connection cannot be \
+             tested. Use Sign in on the connector page, then test again.",
+        ));
+    };
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.expose_secret()),
+    ];
+    let tokens = match request.vendor.oauth.client_auth {
+        ClientAuth::Post => {
+            connector_oauth::token_request(
+                &request.token_url,
+                &[
+                    form[0],
+                    form[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+        }
+        // Slice 2 review BLOCKER 3 (`client_secret_post_json`): as `Post`, a JSON body.
+        ClientAuth::PostJson => {
+            connector_oauth::token_request_json(
+                &request.token_url,
+                &[
+                    form[0],
+                    form[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                internal_hosts,
+                oauth,
+            )
+            .await
+        }
+        // `SRC-3` AD8: the client is in the header, not the body.
+        ClientAuth::Basic => {
+            connector_oauth::token_request_basic(
+                &request.token_url,
+                &form,
+                client_id,
+                client_secret.expose_secret(),
+                internal_hosts,
+                oauth,
+            )
+            .await
         }
     }
+    .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
+        rotated: tokens.refresh_token,
+        basic: false,
+    })
+}
+
+/// The vendor's integration credential: one token, or Zendesk's email + API
+/// token (PR #214 CI clippy: split out of [`access_token`], behaviour unchanged).
+async fn integration_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+) -> Result<Access, Outcome> {
+    let fields = request
+        .vendor
+        .integration
+        .map_or(&[][..], |integration| integration.secret_fields);
+    // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with
+    // `<email>/token` as the user name
+    // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>).
+    if request.vendor.id == "zendesk" && fields == ["email", "apiToken"] {
+        let email = resolve(secrets.resolver, secrets.primary).await?;
+        let Some(secondary) = secrets.secondary else {
+            return Err(Outcome::misconfigured(
+                "connector is misconfigured: the Zendesk API token is not saved",
+            ));
+        };
+        let api_token = resolve(secrets.resolver, secondary).await?;
+        let pair = format!(
+            "{}/token:{}",
+            email.expose_secret(),
+            api_token.expose_secret()
+        );
+        return Ok(Access {
+            token: SecretValue::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pair,
+            )),
+            rotated: None,
+            basic: true,
+        });
+    }
+    if fields != ["token"] {
+        return Err(Outcome::not_testable_with(format!(
+            "This build cannot test {}'s integration credential from the console yet. \
+             A load reports whether the connection worked.",
+            request.vendor.label
+        )));
+    }
+    Ok(Access {
+        token: resolve(secrets.resolver, secrets.primary).await?,
+        rotated: None,
+        basic: false,
+    })
 }
 
 /// The fixed sentence for a status the vendor answered with.
