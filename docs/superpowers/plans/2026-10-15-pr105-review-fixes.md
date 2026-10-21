@@ -179,4 +179,565 @@ planner (section 5).
 
 ## 6. Handoff
 
+### Slice B — developer (OpenCode MiniMax M3.1), 2026-10-15
+
+Branch `fix/pr105-orchestrator-class`, base `e17a8281`:
+
+- `66fc42f3` — `fix(api): retry code only for an unreachable orchestrator (PR #105 review SHOULD-FIX 5)` (B1; 5 files, +237/−34)
+- `ba8d63a2` — `docs(proxy): say why the embed frame check uses fetch (PR #105 review SHOULD-FIX 2)` (B2; `src/proxy.ts` only, +8)
+- `29f31e98` — `docs(dagster): name Status in launch_run_with_config's Errors` (doc only, part of B1)
+- `89231890`, `1f4766fc`, `3e2eee8d` — the three commits carrying this section; the first was pushed by an interrupted run of this slice and the other two consolidate it into the single section below.
+
+**Plan vs code.** No scope mismatch. The anchors held at `e17a8281`
+(`DgError` 157, `Server(format!("Dagster HTTP …"))` 1157,
+`orchestrator_unreachable` 181), and the file's two further non-2xx sites
+(2323, 2393) fall under the plan's "any other non-2xx site in that file".
+Two things the plan did not spell out, both recorded below: the new
+`ApiError::BadGateway` variant (accepted by the planner) and the
+`routes/connectors.rs` doc comment that named the old class.
+
+**B1, what changed.** `lakehouse-dagster` gains `DgError::Status(u16)`
+(`Display` unchanged, `"Dagster HTTP {n}"`), built at all three non-2xx
+sites, so a caller can tell a `5xx` from a `4xx` without parsing text.
+`upstream_error::orchestrator_unreachable` keeps `Transport` and
+`Status(s) if s >= 500` on `503` + `code: orchestrator_unreachable` +
+`Retry-After`, and sends `Status(4xx)` and `Server(..)` to a `502` with the
+context's `failed` sentence, no `code`, no `Retry-After`, raw text to the log
+only. `UpstreamFailure::into_bad_gateway` sits beside `into_not_ready`.
+`routes/connectors.rs`'s `ingest_run_request` doc is updated to state the
+split (it still called a protocol failure "unreachable").
+
+**One file the plan does not name: `lakehouse-core`.** No `502` existed
+anywhere in the workspace (`ApiError::status()` covered
+400/401/403/404/409/422/429/500/503) and D2 asks for one, so
+`ApiError::BadGateway(String)` is added beside `Self::Unavailable` with the
+unreachable/unusable split documented at the variant, plus its `status()` →
+502 arm and a test. `ApiError::status()` is the only exhaustive `match` on
+the enum in the workspace (grep over `rust/crates`); the renderer
+`lakehouse-api/src/error.rs` picks `code` with an `if let` + `_ =>`, so no
+route status table moves. Accepted by the planner.
+
+**Tests added.** Four in `upstream_error.rs` (Transport → 503 + code + a
+`WARN` log line, `Status(502)` → 503 + code, `Status(400)` → 502 without a
+code, a GraphQL `Server(..)` → 502 whose planted marker is in the log and
+not in the body), one in `lakehouse-dagster` (a `503` answer is
+`DgError::Status(503)` with the same `Display`), one in `lakehouse-core`
+(`BadGateway` → 502).
+
+**Commands run, with the counts they printed.** Rust, from `rust/`:
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo clippy -p lakehouse-dagster -p lakehouse-api --all-targets -- -D warnings` | exit 0, no warnings |
+| `cargo test -p lakehouse-dagster` | `69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-api --lib upstream_error` | `21 passed; 0 failed; 0 ignored; 0 measured; 1677 filtered out` (17 pre-existing + the 4 above) |
+| `cargo test -p lakehouse-api --lib connectors` | `75 passed; 0 failed; 0 ignored; 0 measured; 1623 filtered out` |
+| `cargo test -p lakehouse-api --lib pipelines` | `157 passed; 0 failed; 0 ignored; 0 measured; 1541 filtered out` |
+| `cargo test -p lakehouse-api --test sec11_guard` | `4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-core` (extra: the crate B1 edits) | `48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+| `cargo test -p lakehouse-api --test ingest_run -- --test-threads=2` (extra) | `22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` — includes `ingest_run_with_dagster_down_is_a_503_with_an_unreachable_code`, the end-to-end proof the `Transport` → 503 + code arm is unmoved |
+| `cargo test -p lakehouse-api --test upstream_errors -- --test-threads=2` (extra) | `6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` |
+
+Without `--test-threads`, `ingest_run` fails all 22 on this 11 GB machine
+(each test starts a Postgres container); that is a resource limit of the
+box, not a code failure — one test alone passes.
+
+TypeScript, from the worktree root: `bun run typecheck` exit 0;
+`bun run lint` exit 0 — `✖ 6 problems (0 errors, 6 warnings)`, all
+pre-existing and in files this slice does not touch.
+
+**Deviation: the toolchain.** The shell this slice ran in had no Rust
+toolchain at all (`cargo: command not found`, no `~/.cargo`, no `~/.rustup`),
+so the pinned toolchain of `rust/rust-toolchain.toml` (1.96.1 + rustfmt +
+clippy, minimal profile) was installed with rustup before anything could be
+run. That is a change to the machine, not to the repository.
+
+**Deviation: `CARGO_TARGET_DIR`.** The plan's shared
+`/home/uaa/rantai/.cargo-target` is not safe while two worktrees build the
+same crates, and this slice hit exactly that. Against the shared dir,
+`cargo test -p lakehouse-api --lib upstream_error` first failed to compile
+B1's own tests against the other worktree's crates (`E0599: no variant ...
+named Status` / `... named BadGateway`), and the next run of the same
+command reported `17 passed` — 17 is the pre-change count and the four new
+tests were absent from the binary it ran; that binary's dep-info names
+`/home/uaa/rantai/wt-pr105-embed/rust/migrations/...`, i.e. the slice-A
+worktree. A unit's `-C metadata` and extra-filename are identical across
+the two worktrees, so their builds overwrite each other's artifacts and
+cargo's mtime freshness check can accept the wrong one: a false green of
+exactly the kind rule 7 exists to catch. Every number above therefore comes
+from a private target dir, `CARGO_TARGET_DIR=/home/uaa/rantai/.cargo-target-orch-pr105`,
+built from this worktree only. Nothing in the shared directory was deleted
+and `cargo clean` was never run, so the other developer's cache is
+untouched. The reviewer should re-run its own verification somewhere other
+than the shared dir while two worktrees are live; a per-branch target dir
+(or a note in `AGENTS.md`) may be worth the planner's attention.
+
+**Re-verified on the final tree** (code identical to `29f31e98`, after that
+commit): every command in the table above was run once more against the
+plan's *shared* `/home/uaa/rantai/.cargo-target` and printed the same counts
+— `69`, `21`, `75`, `157`, `4`, `cargo fmt --check` clean, `bun run typecheck`
+exit 0, `bun run lint` 0 errors/6 warnings. `--lib upstream_error` is the
+discriminating one: `21` (17 pre-existing + this slice's 4) is this branch's
+binary, where the slice-A worktree's prints `17`. In that same shared dir
+the first clippy run failed `E0599` on code that had passed there minutes
+earlier and the immediate re-run was clean — the overwrite described above,
+seen from the other side, and the reason the shared dir is not a place to
+take a green from.
+
+**Consequences worth a look.** A `Dagster` answer that is neither a
+transport failure nor a `5xx` is now a `502`, and
+`ops/g6/g6_ingest_matrix_test.py` raises at once on anything that is not
+`503` + one of `RETRYABLE_ORCHESTRATOR_CODES` — that is the gate's own rule
+and D2's point, but such an answer no longer consumes the gate's 120 s wait
+window. The transient in `docs/superpowers/plans/2026-10-14-ci-green.md`
+(F3: a launch answering `Dagster HTTP 500` while the code location reloads)
+is a `5xx`, so it keeps the retry code. No gate needed a change.
+
+**Not verified, and why.**
+
+- `cargo test --workspace` and `cargo clippy --workspace`: the plan forbids
+  them on this 11 GB machine while two developers build; CI runs them.
+- `bun run test`, the `ops/g*` gates and `docker compose config`: not run —
+  this slice changes no TypeScript behaviour and no compose, and the gates
+  need the whole stack up.
+- The `502` is proven by unit tests over constructed `DgError` values, not
+  against a live `Dagster` answering a `4xx` or a GraphQL error; no Dagster
+  or ClickHouse was run here.
+- Slice A (embed events) is not in this branch.
+- The doc pages in section 5, and
+  `docs/core/features/no-raw-upstream-errors.md:52` (which still presents
+  `orchestrator_unreachable` as the answer for every orchestrator failure),
+  are the planner's and were left untouched.
+
+### Slice A — developer (Antigravity), 2026-10-15
+
+- Implemented Task A1: moved embed access state from `console.bi_board` row to append-only `console.bi_board_embed_event` table read by aggregation (`PR #105 review SHOULD-FIX 1`).
+- Commit: `3d2263c7` (`fix(bi): keep embed access out of the board row (PR #105 review SHOULD-FIX 1)`)
+- Commands verified:
+  - `cargo fmt --check`: passed (clean)
+  - `cargo clippy -p lakehouse-bi -p lakehouse-api --all-targets -- -D warnings`: passed (clean)
+  - `cargo test -p lakehouse-bi`: 96 passed, 0 failed, 1 doc-test passed
+  - `cargo test -p lakehouse-api --lib embed`: 8 passed, 0 failed
+  - `cargo test -p lakehouse-api --lib dashboard`: 22 passed, 0 failed
+  - `cargo test -p lakehouse-api --test embed_tokens`: 21 passed, 0 failed
+- Not verified:
+  - `cargo test --workspace` or workspace-wide clippy (skipped per rule to conserve memory on 11 GB host; CI runs workspace checks).
+
+### Slice A on the current base — developer (Claude Sonnet), 2026-10-17
+
+Merge of `origin/fix/pr105-embed-events` into this branch (base `48f3295b`),
+conflicts in `store.rs` and this file resolved by hand (see the merge commit).
+
+- Checks run, in the foreground, `CARGO_TARGET_DIR` shared, jobs 2:
+  - `cargo fmt --check`: clean
+  - `cargo clippy -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster -p lakehouse-core --all-targets -- -D warnings`: clean
+  - `cargo test -p lakehouse-bi`: 427 passed, 3 ignored; doc-test 1 passed
+  - `cargo test -p lakehouse-api --lib -- embed dashboard upstream_error connectors`: 223 passed
+  - `--test embed_tokens`: 21 passed; `--test sec11_guard`: 4 passed; `--test upstream_errors`: 6 passed
+  - `bun run typecheck`: no errors
+- **Plan assumption falsified.** D1 says the embed columns "never reached
+  `main`, so no data moves". They did: `5d8f61e1` (SEC-12) is on `main` and
+  creates `embed_revoked_before`, `embed_revoked_jti_json`,
+  `embed_origins_json`. A deployment that ran it holds withdrawals there;
+  after this change they are no longer read, so a withdrawn token would be
+  accepted again. A one-time backfill of those columns into the event table
+  (guarded by `system.columns`) is needed before this ships if `main` has
+  been deployed. Not built in this entry; built afterwards as R-A1 (below).
+- Not verified: `route_auth`, the full workspace test run, `bun run lint`
+  and `bun run test`, anything against a live ClickHouse.
+
+### R-A1 fix — developer (Claude Sonnet), 2026-10-17
+
+- Commit: `fix(bi): copy the embed state stored on the board row into the event table (PR #105 review R-A1 BLOCKER)`;
+  `copy_legacy_embed_state` in `store.rs`, called at the end of `ensure_bi_table`.
+- Tests added (5, in `store.rs`): copy keeps jti/cut-off/origins effective;
+  second run inserts nothing; no legacy columns runs no copy; copied
+  origins event is epoch-stamped (the `argMax` read half is pinned by a
+  source check, not run); unparseable list revokes everything.
+- DDL-count test 22 to 23: the `system.columns` check request.
+- Commands (foreground, shared target, jobs 2): `cargo fmt --check` clean;
+  clippy on bi/api/dagster/core `--all-targets -D warnings` clean;
+  `cargo test -p lakehouse-bi` 432 passed, 3 ignored, doc-test 1;
+  `-p lakehouse-api --lib -- embed dashboard upstream_error connectors` 223;
+  `--test embed_tokens` 21; `--test sec11_guard` 4; `--test upstream_errors` 6;
+  `--test route_auth` (threads 2) 42.
+- Not verified: against a live ClickHouse. The `NOT IN (... at = epoch)`
+  idempotence and the `FINAL` read are SQL the mock stands in for (the mock
+  emulates the idempotence); the real statements are unrun. No full
+  workspace run, `bun run lint/test`.
+
+### R-A3 / R-A4 fix — developer (Claude Sonnet), 2026-10-17
+
+- Commit: `fix(bi): copy a board's legacy embed state in one INSERT and include trashed boards (PR #105 review R-A3/R-A4 SHOULD-FIX)`.
+- R-A3: one multi-row `INSERT` per board (`legacy_embed_insert`). R-A4: no
+  `is_deleted` condition in the copy's `SELECT`.
+- Tests: the one-`INSERT` assertion replaces the earlier three-`INSERT` ones;
+  new `the_legacy_embed_copy_does_not_skip_boards_in_the_trash` (checks the
+  query text; the mock does not filter).
+- Commands (foreground, shared target, jobs 2): `cargo fmt --check` clean;
+  clippy bi/api/dagster/core `--all-targets -D warnings` clean;
+  `cargo test -p lakehouse-bi` 433 passed, 3 ignored, doc-test 1;
+  `-p lakehouse-api --lib -- embed dashboard upstream_error connectors` 223;
+  `--test embed_tokens` 21; `sec11_guard` 4; `upstream_errors` 6;
+  `route_auth` (threads 2) 42.
+- Not verified: that ClickHouse writes a multi-row `INSERT` as one block
+  (the planner's premise; not run here), full workspace run, `bun run lint/test`.
+
 ## 7. Review
+
+### Review — slice A merged onto `main`, 2026-10-17, planner
+
+- **R-A1 BLOCKER — withdrawals already stored on `main` stop being read.**
+  The plan said the board row's embed columns never reached `main`; they
+  did (SEC-12, `5d8f61e1`: `embed_revoked_before`, `embed_revoked_jti_json`,
+  `embed_origins_json`, checked in `origin/main` `store.rs`). After the
+  merge nothing reads them, so on a deployed database a withdrawn token is
+  accepted again and a board's allowed origins are lost. That is the
+  failure D1 exists to prevent, so the fix is in scope. Decision: a
+  one-time copy into `console.bi_board_embed_event`, run by
+  `ensure_bi_table` after the event table is created:
+  - Only when `system.columns` shows the legacy columns on
+    `console.bi_board` (a fresh database has none; skip without error).
+  - Read each board's current row (`FINAL`, not deleted) and insert a
+    `revoke_all` event when `embed_revoked_before > 0`, a `withdraw` event
+    per `{jti, exp}` in `embed_revoked_jti_json`, and an `origins` event
+    when `embed_origins_json` is not `[]`.
+  - Every copied event gets `at` = the Unix epoch, so any real event
+    written since wins over it (origins are read latest-first).
+  - Idempotent: a second run inserts nothing (skip a board that already
+    has an event at the epoch). Values bound, never formatted in.
+  - The legacy columns are left in place and not written; dropping them is
+    not this PR's (a migration header-style comment at the site says why).
+  - Accept: a mocked legacy database with one withdrawn jti, a cut-off and
+    two origins → after `ensure_bi_table` the jti is refused, a token older
+    than the cut-off is refused and the origins are served; a second run
+    inserts nothing; a fresh database (no legacy columns) runs no copy; a
+    real `origins` event newer than the copy wins.
+- **R-A2** — the three clippy fixes in `embed_tokens.rs` may stay in the
+  merge commit; they are mechanical.
+
+### Review — R-A1 fix (`5679107b`), 2026-10-17, planner
+
+Re-run by the planner against the dev `ClickHouse` (26.8) in a scratch
+database with the same table shapes: the copy's `SELECT` picks the legacy
+board, returns nothing once an epoch event exists (idempotent), and
+`argMax(origins_json, at)` returns a real event's origins even when the copy
+is inserted after it. That half of the handoff's *not verified* is now
+verified; the `FINAL` read on the real `bi_board` is not.
+
+- **R-A3 SHOULD-FIX — a copy cut off half-way is never finished.** The
+  board's first `INSERT` already writes the epoch marker, so if the process
+  stops after it, the board's other events (a withdrawn jti) are never
+  copied and that token is accepted again. Write each board's events in
+  **one** multi-row `INSERT` (all columns listed, one `VALUES` tuple per
+  event): `ClickHouse` inserts one block whole or not at all. Accept: the
+  test that a board with a cut-off, a jti and origins issues one `INSERT`.
+- **R-A4 SHOULD-FIX — boards in the trash are skipped.** `is_deleted = 0`
+  leaves out phase 3's trashed boards (`is_deleted = 2`), which can be
+  restored; a restored board would lose its withdrawals. Drop the
+  `is_deleted` condition: an event for a deleted board is never read and
+  costs nothing. Accept: a test with a trashed legacy board.
+
+### Review — PR #201 before merge, 2026-10-21, planner (round F)
+
+Reviewed at `3831f7b5` merged locally with `main` (`c8f6d395`; the branch is
+107 commits behind and merges cleanly). **No BLOCKER.** R-A1, R-A3 and R-A4
+are fixed in code: the embed state is written only by `INSERT` into
+`console.bi_board_embed_event` and every reader (token check, `/api/embed/frame`,
+`embed-info`) aggregates it; the legacy copy is idempotent, includes trashed
+boards, is skipped on a fresh database and fails closed (`ensure_bi_table`
+errors and retries). Slice B returns `orchestrator_unreachable` only for a
+transport error or a 5xx, and merges with `main`'s `ApiError::Gone` without a
+conflict. Before merge, fix these (one commit each, cite
+`PR #201 review F SHOULD-FIX n` at the site and in the commit body):
+
+1. **One clock tolerance.** `lakehouse-bi/src/store.rs` ~1585 keeps its own
+   `DEFAULT_CLOCK_TOLERANCE_SECS = 60` and `get_board_embed_access` (~1640,
+   ~1663) drops withdrawn tokens after `exp + 60`, while the verifier's
+   tolerance is `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`. If that is ever
+   raised, a withdrawn token that the verifier still accepts drops off the
+   withdrawn list and works again. Drop expired entries only when counting
+   toward the cap, not in the list `is_withdrawn` reads (or take the tolerance
+   from `lakehouse_embed`); a test with a tolerance above 60 that fails today.
+2. **Rule 4:** `store.rs` ~1768–1780 re-implements `EmbedAccess::withdraw_token`'s
+   unexpired-then-cap guard; call it (or delete the now test-only methods).
+3. The `#[cfg(test)]` swap of the production `OnceCell` for a `RwLock<bool>`
+   (`store.rs` ~559–566, ~588) means
+   `ensure_bi_table_runs_ddl_at_most_once_per_process` no longer tests the
+   production cache, and its doc ("only test … allowed to exercise
+   `ensure_bi_table`", ~4335) is false now. Make the test exercise the real
+   cache, or say plainly what it pins.
+4. Stale comment, `lakehouse-api/src/routes/embed.rs` ~136: withdrawal is read
+   by aggregating the event table, not "a `FINAL` read" of the board.
+5. `src/proxy.ts`: the last sentence reads as if a visitor with no session
+   always gets `frame-ancestors 'none'`; embed viewers have no session and get
+   the board's allowed sites. Say the answer does not depend on a session.
+6. `# Errors` docs in `lakehouse-dagster/src/lib.rs` (~1149, ~2229, ~2270,
+   ~2344, ~2383, ~2420) still name only `Transport` and `Server`; the non-2xx
+   sites return `DgError::Status`.
+7. `revoke_all_embed_tokens` returns `now` (~1744) but documents "the stored
+   instant"; the cut-off in force is the max over all `revoke_all` events.
+   Return that max (the response's `embedRevokedBefore` must be what is
+   enforced).
+
+Also, one line each (no code): the legacy unparseable list becoming
+`revoke_all(u64::MAX)` is permanent, so say "permanently" where `from_stored`
+said "until saved again"; and the deploy note on the feature page — stop old
+API instances before starting this build (an old instance's withdrawal after
+the copy is never copied).
+
+### Handoff — round F (developer, MiniMax M3.1 Flash), 2026-10-21
+
+Branch `fix/pr105-review-fixes`. `origin/main` merged in first as `ffa779c1`
+(the branch was 107 commits behind; the merge was clean, no conflict, and
+`cargo check -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster
+--all-targets` passed on it). Every finding below is one commit, in the
+order the review lists them; the fix site carries the same tag as the
+commit body (rule 13).
+
+| Finding | Commit | What it changes |
+| --- | --- | --- |
+| SHOULD-FIX 1 | `8130ae1d047a` | The store's own `DEFAULT_CLOCK_TOLERANCE_SECS = 60` is gone; the aggregate read keeps every withdrawn id and expiry is applied only when counting toward the cap. `get_board_embed_access_at` goes with it (the read takes no instant and no tolerance any more); `get_board_embed_access` is the read. |
+| SHOULD-FIX 2 | `69134d7846ed` | `withdraw_embed_token` calls `EmbedAccess::withdraw_token` instead of re-implementing its unexpired-then-cap guard. The message the caller gets is unchanged (it is the guard's own). |
+| SHOULD-FIX 3 | `4628713cd720` | One DDL guard for both builds: an `AtomicU8` (not started / done) plus a mutex, with `OnceCell::get_or_try_init`'s contract (one runner, the others wait, a failed attempt is not cached). The `RwLock<bool>` stand-in the test build carried is gone; the test drives the production path and its doc says what it pins. |
+| SHOULD-FIX 4 | `52e0916c8cc0` | The comment in `routes/embed.rs` no longer says the withdrawal is read with a `FINAL` read of the board: it is aggregated from `console.bi_board_embed_event`. |
+| SHOULD-FIX 5 | `ef6f4b0ff5d3` | The comment in `src/proxy.ts` says the answer does not depend on a session: an embed visitor has none and gets the board's allowed sites; `frame-ancestors 'none'` is what a refused token, a board with no allowed site, or an unreachable API gets. |
+| SHOULD-FIX 6 | `b20960c959b9` | `find_run_by_run_key` and `run_logs` name `DgError::Status`; the four sites the finding names that cannot return it now say plainly that the HTTP status is not inspected there. |
+| SHOULD-FIX 7 | `6be750144764` | `revoke_all_embed_tokens` answers the cut-off in force — the maximum over every `revoke_all` event, read back after the insert — not the instant the call wrote. |
+| Doc notes | `de9b92d46c51` | `from_stored` says the fail-closed refusal is permanent; the feature page says to stop the old API instances before starting this build. |
+
+**SHOULD-FIX 1, the two choices the finding offers.** The finding offers
+"drop expired entries only when counting toward the cap, not in the list
+`is_withdrawn` reads" OR "take the tolerance from `lakehouse_embed`". The
+first one is what is built: the aggregate keeps every withdrawn id, so the
+list a refusal reads cannot depend on any tolerance at all, and the one
+tolerance left in the crate is the caller's (the API passes the verifier's,
+`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`, for the cap count). The
+second one would have made `lakehouse-bi` depend on `lakehouse-embed`; the
+module doc of `embed_access.rs` says on purpose that it does not, and the
+first choice needs no new dependency.
+
+**SHOULD-FIX 1, the failing test.** `a_withdrawn_token_is_still_refused_after_it_expires`
+(store.rs). It fails without the fix: with the old expiry filter put back
+(60 s, the constant the store kept) it fails — `1 failed; 0 passed` — and
+with the fix it passes. `aggregate_read_maps_rows_to_embed_access` fails
+with the old filter too (2 withdrawn ids instead of 3), and was updated
+with the rule.
+
+**SHOULD-FIX 6, where the finding is not right against the code.** The
+finding names six `# Errors` sites and says the non-2xx sites return
+`DgError::Status`. Two of the six do: `find_run_by_run_key` (it goes
+through `execute`, which turns a non-2xx into `Status`) and `run_logs`
+(it checks the status itself). The other four — `pipeline_run_pipeline_name`,
+`pipeline_run_status`, `run_steps`, `run_config` — never look at the HTTP
+status: they read the body whatever it is (`lib.rs:2237`, `2278`, `2352`,
+`2388` have no `status` check, unlike `1231`, `2439` and `2509`), so they
+cannot return `Status` today, and naming it there would be false. Their
+docs now say that plainly instead. Turning a non-2xx into a `Status` error
+in those four is a behaviour change the finding did not ask for (it would
+also move them into the API's retry class), so it is left to the planner.
+
+**SHOULD-FIX 7, what the answer is.** The cut-off in force is the maximum
+over every `revoke_all` event of the board. The function reads the
+aggregate back after its own insert and answers
+`max(read, now_unix_seconds)`: the read carries another session's larger
+withdrawal, and `now` is the floor for the event this call just wrote
+(should the read not see it). Test: `a_withdraw_all_answers_the_cut_off_in_force`.
+
+**One thing the finding did not ask for.** The module doc of
+`embed_access.rs` still said the state is kept on the board row and read
+with `FINAL` — the same staleness as SHOULD-FIX 4, in the file the first
+doc note names. It is corrected in `de9b92d46c51` (doc only).
+
+**Commands run, in the foreground, with their counts.** Rust, from `rust/`,
+every cargo command through `/home/shiro/rantai/bin/cargo-locked` with
+`-j 2` (the shared `CARGO_TARGET_DIR`; the tool takes the shared lock
+itself).
+
+| command | commit it ran on | result |
+| --- | --- | --- |
+| `cargo-locked check -j 2 -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster --all-targets` | `ffa779c1` (the merge) | finished, no error |
+| `cargo fmt --check` | every commit | exit 0, no diff |
+| `cargo-locked clippy -j 2 -p lakehouse-bi --all-targets -- -D warnings` | `8130ae1d`, `69134d78`, `4628713c`, `6be75014`, `de9b92d4` | exit 0, no warnings |
+| `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` | `52e0916c` | exit 0, no warnings |
+| `cargo-locked clippy -j 2 -p lakehouse-dagster --all-targets -- -D warnings` | `b20960c9` | exit 0, no warnings |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib embed` | `8130ae1d`, `69134d78`, `de9b92d4` | `26 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `4628713c` | `434 passed; 0 failed; 3 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `6be75014` | `435 passed; 0 failed; 3 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --lib embed` | `8130ae1d`, `52e0916c` | `11 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens` | `8130ae1d`, `69134d78`, `6be75014` | `21 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-dagster --lib` | `b20960c9` | `72 passed; 0 failed; 0 ignored` |
+| `flock /home/shiro/rantai/.heavy.lock bun run typecheck` | `ef6f4b0f` | exit 0, no output |
+
+The failing-test proof, run on `8130ae1d`'s tree with the fix reverted
+(the old 60 s expiry filter put back): `cargo-locked test -j 2 -p
+lakehouse-bi --lib a_withdrawn_token_is_still_refused_after_it_expires` →
+`0 passed; 1 failed` ("the withdrawn id stays in the list"), and
+`--lib embed` → `25 passed; 1 failed` (the aggregate test). The fix was
+restored before the commit.
+
+**The full verification block, on the final commit `de9b92d46c51`.**
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | exit 0, no warnings |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `435 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out` |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens --test sec11_guard --test upstream_errors` | `21 passed` / `4 passed` / `6 passed`; 0 failed in each |
+| `cargo-locked test -j 2 -p lakehouse-api --test route_auth` | `54 passed; 0 failed; 0 ignored` (first run; no `53100`/`UnexpectedEof`/"Connection reset" from the shared test database, so there is nothing to re-run alone) |
+| `cargo-locked test -j 2 -p lakehouse-dagster --lib` | `72 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --lib embed` (extra) | `11 passed; 0 failed; 0 ignored` |
+| `flock /home/shiro/rantai/.heavy.lock bun run typecheck` (extra) | exit 0, no output |
+| `git status` | clean, nothing generated staged |
+
+**Not verified, and why.**
+
+- Nothing was run against a live `ClickHouse`. The aggregate query, the
+  three event `INSERT`s, the legacy copy and the new "cut-off in force"
+  read are proven against mocks. SHOULD-FIX 7 adds a read after the
+  insert: against a real `ClickHouse` the just-inserted row is visible at
+  once (a `MergeTree` needs no `FINAL` for that), but that is not run
+  here.
+- `bun run lint` and `bun run test` were not run: the PR changes one
+  TypeScript comment, and the plan's scoped check for `src/proxy.ts` is
+  `bun run typecheck` (green).
+- `cargo test --workspace` and the `ops/g*` gates were not run: this PR
+  touches `lakehouse-bi`, `lakehouse-api`, `lakehouse-dagster` and one
+  TypeScript comment; CI runs the workspace suite and the gates need the
+  whole stack up.
+- No `docker compose` change, so no compose run.
+- `EmbedAccess::from_stored` is now used by its own tests only (the legacy
+  copy has its own reader, `legacy_embed_insert`). It stays `pub`, so
+  there is no dead-code warning; it was left in place because the doc note
+  names it.
+- The `lakehouse-bi` crate no longer holds a clock tolerance of its own,
+  but `lakehouse_embed::CLOCK_TOLERANCE_SECONDS` is still the single
+  tolerance (the API passes it in). Raising it is now safe for the
+  withdrawn list: the list does not expire.
+
+### Handoff — round G (developer, MiniMax M3.1 Flash), 2026-10-21
+
+**The finding.** `PR #201 review G BLOCKER 1`: CI's `Rust · test (stable)`
+was red on this branch —
+`rust/crates/lakehouse-api/tests/query_author_exception.rs`'s
+`a_failing_tile_inside_a_signed_embed_is_the_fixed_message_with_a_reference`
+answered `500` (`{"error":"The database request failed."}`) instead of
+`200` (the assertion at line 230).
+
+**The cause — the mock, not the product.** Two things in the branch's
+`ensure_bi_table` meet this test's mock:
+
+1. The one-time legacy copy (`store::copy_legacy_embed_state`) asks
+   `system.columns` whether the legacy embed columns are still on
+   `console.bi_board`. The mock (`EmbedClickhouse`) had no branch for
+   that statement, so it fell through to the planted engine error
+   (`404`), the DDL bootstrap failed, and the request answered `500`.
+2. The mock's board branch matched on the table-name PREFIX
+   (`sql.contains("FROM console.bi_board")`), and the append-only event
+   table's name starts with the same prefix
+   (`FROM console.bi_board_embed_event`), so the embed access aggregate
+   read was answered with a board row.
+
+Why the fault was hidden: the DDL bootstrap is guarded process-wide
+(`BI_TABLE_ENSURED`), so the test only failed when it was the FIRST in
+the binary to reach the bootstrap. Any other test in the same binary
+having run it first hid the fault — the planner reproduced exactly that
+(alone: fails; after another test: passes).
+
+**What changed** — one file, the test mocks
+(`rust/crates/lakehouse-api/tests/query_author_exception.rs`, commit
+`45d595ee8d81`). No product code and no assertion was changed or
+weakened (rule 2):
+
+- `system.columns` is answered with an EMPTY result, so the legacy copy
+  is skipped, exactly as on a fresh database (no legacy columns);
+- `console.bi_board_embed_event` is answered with an EMPTY result (this
+  board has no events: nothing withdrawn, no site allowed to frame it);
+- an `INSERT` is answered `200`;
+- the board is matched on `FROM console.bi_board FINAL` — the exact
+  table, not the prefix.
+
+The same two corrections are applied to the file's other mock
+(`CombinedEmbedClickhouse`), which had the prefix match and answered the
+legacy column check with a mart's columns (its `system.columns` answer
+is now split: the `console` check is empty, the `serving` mart columns
+are unchanged).
+
+**The other mocks, checked and not changed.** Every mock in
+`rust/crates/lakehouse-api/tests` and `rust/crates/lakehouse-bi` was
+grepped for the same pitfall (`contains("FROM console.bi_board")`,
+`contains("console.bi_board")`, a mock that 404s or 500s
+`system.columns`):
+
+- `lakehouse-api/tests/embed_tokens.rs` — the only other
+  `contains("FROM console.bi_board")` mock. It answers
+  `FROM console.bi_board_embed_event` in an earlier branch, so the
+  aggregate never reaches the board branch, and its `system.columns`
+  answer falls through to the `200 "Ok.\n"` default, which the client
+  reads as an empty result (no legacy columns). Its 21 tests were run
+  ALONE, one by one: all pass.
+- `lakehouse-api/tests/dashboard_export.rs`,
+  `column_lineage_sql_source.rs` — their `system.columns` mocks answer
+  `200` with column names that are not the legacy ones, so the copy is
+  skipped. Whole binaries pass (6 and 2).
+- `lakehouse-api/tests/upstream_errors.rs` — its mock answers every
+  statement `500`, so the bootstrap fails and the routes answer `500`;
+  that is what the test asserts (no upstream text in a body). All 6
+  tests were run ALONE, one by one: all pass.
+- `lakehouse-bi/src/store.rs` — the three mocks there
+  (`LegacyEmbedCh`, `MockBiCh`, `MockEvents`) answer `200` for
+  everything, so the extra `system.columns` read is an empty result and
+  the copy is skipped. `-p lakehouse-bi` is green (435 + 1 passed).
+
+**Commands run, in the foreground, with their counts.** Every cargo
+command through `/home/shiro/rantai/bin/cargo-locked` with `-j 2` (the
+shared `CARGO_TARGET_DIR`; the tool takes the shared lock itself);
+`cargo fmt --check` direct.
+
+| command | result |
+| --- | --- |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception a_failing_tile_inside_a_signed_embed` (BEFORE the fix) | `0 passed; 1 failed` — `500` instead of `200`, "The database request failed." |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception a_failing_tile_inside_a_signed_embed` (AFTER) | `1 passed; 0 failed` |
+| `cargo-locked test -j 2 -p lakehouse-api --test query_author_exception` (all 8, AFTER) | `8 passed; 0 failed; 0 ignored` |
+| each of the 8 tests of that binary ALONE, one by one (AFTER) | `1 passed; 0 failed` in each of the 8 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens` | `21 passed; 0 failed; 0 ignored` |
+| each of the 21 tests of `embed_tokens` ALONE, one by one | `1 passed; 0 failed` in each of the 21 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test upstream_errors` | `6 passed; 0 failed; 0 ignored` |
+| each of the 6 tests of `upstream_errors` ALONE, one by one | `1 passed; 0 failed` in each of the 6 runs |
+| `cargo-locked test -j 2 -p lakehouse-api --test dashboard_export --test column_lineage_sql_source --test column_lineage_route --test agents_approval` | `6 passed` / `2 passed` / `8 passed` / `13 passed`; 0 failed in each |
+| `cargo-locked test -j 2 -p lakehouse-api --test route_auth` | `54 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi` | `435 passed; 0 failed; 3 ignored` (+ `1 passed` in the other target) |
+| `cargo-locked test -j 2 -p lakehouse-api --lib` and `--bin lakehouse-api` | `2269 passed; 0 failed; 14 ignored` / `2315 passed; 0 failed; 14 ignored` |
+| all 68 `lakehouse-api` integration binaries, one command, `--no-fail-fast`, `RUST_TEST_THREADS=2` | every binary `ok`, 0 failed (largest: `upload_routes` 94, `route_auth` 54) |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` | exit 0, no warnings |
+| `git status` | clean, nothing generated staged |
+
+**One environment failure, recorded honestly.** The first full
+`cargo-locked test -j 2 -p lakehouse-api` run (the two lib binaries
+passed: 2269 and 2315) failed in `tests/agents_approval.rs` with 5
+panics at `tests/common/mod.rs:225` ("connect to the fresh per-test
+database") and `:283` ("mint a session for a test principal"). The
+container's PostgreSQL log shows the cause:
+`could not resize shared memory segment "/PostgreSQL.…": No space left
+on device` (the container's `/dev/shm` is 64 MB), then
+`server process … was terminated by signal 11: Segmentation fault` and a
+server restart — the shared test database, not a product fault. The
+same binary passes ALONE (`13 passed; 0 failed`), and all 68 integration
+binaries pass when the run is given less concurrency
+(`RUST_TEST_THREADS=2`, as in the table above). The two lib binaries had
+already passed in the first run. No container or volume was removed or
+touched.
+
+**Not verified, and why.**
+
+- Nothing was run against a live `ClickHouse`; the mocks are the proof
+  (as in round F).
+- `bun run typecheck`, `bun run lint` and `bun run test` were not run:
+  this fix touches one Rust test file, no TypeScript.
+- `cargo test --workspace` was not run as one command: the workspace
+  suite is run crate by crate here for build time, and the crates this
+  branch touches (`lakehouse-api`, `lakehouse-bi`) are green above.
+- The `ops/g*` gates and `docker compose` were not run: no compose
+  change and no gate change in this fix.

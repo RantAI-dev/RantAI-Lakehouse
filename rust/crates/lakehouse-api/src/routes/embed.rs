@@ -133,10 +133,14 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
-    // SEC-12: withdrawal is read from the board on every request (a `FINAL`
-    // read, no cache in this process), so "withdraw all" and "withdraw one"
-    // take effect on the next request. A token with no `iat` cannot get here
-    // (`verify_embed` refuses it); `NEG_INFINITY` would be refused if it did.
+    // SEC-12: withdrawal is read on every request — the board's embed events
+    // are aggregated on each read, with no cache in this process — so
+    // "withdraw all" and "withdraw one" take effect on the next request. A
+    // token with no `iat` cannot get here (`verify_embed` refuses it);
+    // `NEG_INFINITY` would be refused if it did.
+    // PR #201 review F SHOULD-FIX 4: the withdrawal is not read from the
+    // board row any more (it lives in `console.bi_board_embed_event`), so
+    // this is an aggregation of that table, not a `FINAL` read of the board.
     if board.embed_access.is_withdrawn(
         claims.iat.unwrap_or(f64::NEG_INFINITY),
         claims.jti.as_deref(),

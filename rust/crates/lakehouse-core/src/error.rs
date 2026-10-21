@@ -94,6 +94,20 @@ pub enum ApiError {
     /// (500).
     #[error("{0}")]
     Unavailable(String),
+    /// A backing service this request needs answered, and the answer was
+    /// not usable: an upstream `HTTP 502`/`503`, a body that did not parse,
+    /// or a protocol-level refusal. Maps to HTTP 502.
+    ///
+    /// Distinct from [`Self::Unavailable`] on purpose: the orchestrator
+    /// (`upstream_error::orchestrator_unreachable`, `PR #105 review
+    /// SHOULD-FIX 5`) is reachable often enough that "did not answer" must
+    /// not read as "not there" — only a transport failure or a `5xx` status
+    /// earns the retryable `503` with a `code`, while an answer this service
+    /// cannot use (a GraphQL `errors` array, an unparseable body, a `4xx`)
+    /// is a `502` with no code, because repeating the request unchanged
+    /// produces the same answer.
+    #[error("{0}")]
+    BadGateway(String),
     /// An unexpected server-side failure. Maps to HTTP 500.
     #[error("{0}")]
     Internal(String),
@@ -154,6 +168,7 @@ impl ApiError {
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
+            Self::BadGateway(_) => 502,
             Self::Unavailable(_) | Self::NotReady { .. } => 503,
             Self::TooManyRequests { .. } => 429,
         }
@@ -221,6 +236,14 @@ mod tests {
         assert_eq!(
             ApiError::Unavailable("database is not available".to_owned()).status(),
             503
+        );
+    }
+
+    #[test]
+    fn bad_gateway_maps_to_502() {
+        assert_eq!(
+            ApiError::BadGateway("upstream did not accept the request".to_owned()).status(),
+            502
         );
     }
 

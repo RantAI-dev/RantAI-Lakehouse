@@ -56,6 +56,7 @@ embeds.
 - **Breaking on upgrade.** Embed tokens without `iat` and `exp`, or living longer than the limit, stop working. Sign a fresh token per page view or per session.
 - **Breaking on upgrade.** An embed stops rendering until the dashboard's owner lists the embedding site in the Share dialog.
 - **Breaking on upgrade.** A deployment that relied on the generated secret must set `EMBED_SECRET`; until then signed embeds are unavailable.
+- **Upgrade order.** Stop the old API instances before starting this build. An old instance still writes withdrawals to the dashboard row, which this build no longer reads, and the one-time copy of that row runs when the new build starts: a withdrawal an old instance writes after the copy is never copied, and the token it withdrew works again.
 - Withdrawing all tokens also withdraws ones issued seconds before; tokens issued afterwards work.
 - The framing rule is enforced by the viewer's browser. It stops another site from showing the embed; it is not a substitute for the token.
 
