@@ -82,6 +82,16 @@ export type DashboardService = {
   duplicateBoard(id: string, signal?: AbortSignal): Promise<Board>
   updateBoard(input: UpdateBoardInput, signal?: AbortSignal): Promise<void>
   deleteBoard(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Save the tile layout of a dashboard (`PUT /api/dashboard/boards`). The
+   * console's own write; it needs `dashboard:write`.
+   */
+  saveBoardLayout(id: string, layout: LayoutMap, signal?: AbortSignal): Promise<void>
+  /**
+   * Delete one saved chart card (`DELETE /api/dashboard/specs`). It needs
+   * `dashboard:write`.
+   */
+  deleteChart(id: string, signal?: AbortSignal): Promise<void>
 
   listSqlSources(signal?: AbortSignal): Promise<SqlSource[]>
   createSqlSource(input: SaveSqlSourceInput, signal?: AbortSignal): Promise<SqlSource>
