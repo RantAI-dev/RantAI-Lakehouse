@@ -1079,3 +1079,31 @@ cursor (sound because the sort field is the cursor); no deletes claimed.
   the vendor table; add a product step for the browser way.
 - Not verified and open for CI: the Rust of this slice, the two vendors'
   product steps, and the job time.
+
+### Review of slice 5 (planner, 2026-10-21, head `f851a806`)
+
+Before it: CI on `60909de3` green, 38 of 38; the six vendors' product steps
+pass, the Confluence browser sign-in included (the fix: a refresh token the
+provider repeats is not a rotation, RFC 6749 section 6).
+
+Read: the handoff, the tenant rule, the SharePoint delta and the Dynamics
+change-tracking paths, the state handling. Plan section 8 item 6 answered by
+running (the delta link survives a failed run and a run that died before
+loading; a 410 resyncs): accepted. Accepted as stated limits on the page:
+deletes missed while a link was stale (until a full reload), Dynamics tables
+without change tracking see no deletes, SharePoint has no `describe` (not on
+decision 9's list), any 4xx on a saved Dataverse link resyncs. The tenant
+becoming part of the account: accepted (the types are not supported yet, so
+no deployed connector breaks). The Confluence `\Z` fix: accepted.
+
+- `BLOCKER 14` (decision 5: "SharePoint: the lists of the sites the user
+  picks"; `SRC-3-AC2`/`AC3`). Objects are `<site id>/<list id>` with no
+  label, and nothing lets the user pick sites: with none named the first
+  100 found by search are listed. Add a display label to a listed object
+  (the discovery carrier, Rust and contract, additive like `ObjectKind`
+  before), a site picker on the SharePoint form fed by discovery
+  (`/sites?search=`), the lists shown as "site / list" names, and the
+  loaded table named from the labels (stable when renamed: keep the ids in
+  the source-object key). Tests for the form and the carrier.
+- Not verified and open for CI: the new Rust tests, the four new product
+  entries, the job time (now about eight product entries).
