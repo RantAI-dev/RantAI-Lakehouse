@@ -1582,15 +1582,6 @@ async fn board_exists(ch: &ChClient, id: &str) -> Result<bool, ChError> {
     Ok(!rows.is_empty())
 }
 
-const DEFAULT_CLOCK_TOLERANCE_SECS: u64 = 60;
-
-fn current_unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Map rows returned by the aggregate query on `console.bi_board_embed_event`
 /// into an [`EmbedAccess`].
 ///
@@ -1598,12 +1589,18 @@ fn current_unix_timestamp() -> u64 {
 /// - `revoked_before`: maximum across all `revoke_all` events;
 /// - `origins`: newest `origins` event;
 /// - `withdrawn`: union across distinct `jti` with maximum `exp`, dropping
-///   tokens that have expired (`exp + tolerance < now`) or are covered by
-///   `revoked_before` (`exp <= revoked_before`).
+///   the tokens the cut-off already refuses (`exp <= revoked_before`).
+///
+/// PR #201 review F SHOULD-FIX 1: an expired entry is NOT dropped here. The
+/// list [`EmbedAccess::is_withdrawn`] reads must not depend on a clock
+/// tolerance: the verifier's tolerance
+/// (`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`) is what decides whether a
+/// token is still acceptable at all, and a second, smaller tolerance kept
+/// here would drop a withdrawal the verifier still honours — the withdrawn
+/// token would work again. Expiry is applied where it belongs: when
+/// counting toward the cap ([`EmbedAccess::withdraw_token`]).
 pub(crate) fn embed_access_from_aggregate_rows(
     rows: &[serde_json::Map<String, Value>],
-    now_unix_seconds: u64,
-    tolerance_secs: u64,
 ) -> EmbedAccess {
     let mut revoked_before: u64 = 0;
     let mut origins = Vec::new();
@@ -1636,9 +1633,7 @@ pub(crate) fn embed_access_from_aggregate_rows(
 
     let withdrawn = withdrawn_map
         .into_iter()
-        .filter(|(_, exp)| {
-            exp.saturating_add(tolerance_secs) >= now_unix_seconds && *exp > revoked_before
-        })
+        .filter(|(_, exp)| *exp > revoked_before)
         .map(|(jti, exp)| WithdrawnToken { jti, exp })
         .collect();
 
@@ -1656,26 +1651,6 @@ pub(crate) fn embed_access_from_aggregate_rows(
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
 pub async fn get_board_embed_access(ch: &ChClient, board_id: &str) -> Result<EmbedAccess, ChError> {
-    get_board_embed_access_at(
-        ch,
-        board_id,
-        current_unix_timestamp(),
-        DEFAULT_CLOCK_TOLERANCE_SECS,
-    )
-    .await
-}
-
-/// Read the current embed access state for a board at a specific instant and tolerance.
-///
-/// # Errors
-///
-/// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board_embed_access_at(
-    ch: &ChClient,
-    board_id: &str,
-    now_unix_seconds: u64,
-    tolerance_secs: u64,
-) -> Result<EmbedAccess, ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
         "SELECT kind, max(revoked_before) AS revoked_before, jti, max(exp) AS exp, argMax(origins_json, at) AS origins_json \
@@ -1683,11 +1658,7 @@ pub async fn get_board_embed_access_at(
         SqlLiteral::from(board_id)
     );
     let rows = ch.rows(&sql, None).await?;
-    Ok(embed_access_from_aggregate_rows(
-        &rows,
-        now_unix_seconds,
-        tolerance_secs,
-    ))
+    Ok(embed_access_from_aggregate_rows(&rows))
 }
 
 /// Replace the sites allowed to frame a board's embed pages (`SEC-12`).
@@ -1769,9 +1740,19 @@ pub async fn withdraw_embed_token(
     // tokens, not a security property. Checking it before INSERT can be
     // raced by two concurrent requests, which is acceptable since a small
     // temporary overshoot does not compromise security.
-    let access = get_board_embed_access_at(ch, id, now_unix_seconds, tolerance_secs).await?;
+    //
+    // PR #201 review F SHOULD-FIX 1: the count is over the tokens that could
+    // still be accepted (the tolerance the caller passes is the verifier's,
+    // `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`), while the list itself
+    // keeps every withdrawn id.
+    let access = get_board_embed_access(ch, id).await?;
+    let unexpired = access
+        .withdrawn
+        .iter()
+        .filter(|w| w.exp.saturating_add(tolerance_secs) >= now_unix_seconds)
+        .count();
     if !access.withdrawn.iter().any(|w| w.jti == jti)
-        && access.withdrawn.len() >= embed_access::MAX_WITHDRAWN_TOKENS
+        && unexpired >= embed_access::MAX_WITHDRAWN_TOKENS
     {
         return Err(BiError::Validation(
             "too many tokens are withdrawn one by one for this dashboard; withdraw all of them instead."
@@ -4753,7 +4734,9 @@ mod tests {
             .as_object()
             .unwrap()
             .clone(),
-            // Expired token (exp + tolerance < now): must be dropped.
+            // Expired token (exp < now): kept in the list, because the list
+            // `is_withdrawn` reads must not depend on a clock tolerance
+            // (PR #201 review F SHOULD-FIX 1).
             serde_json::json!({
                 "kind": "withdraw",
                 "jti": "tok_expired",
@@ -4777,18 +4760,15 @@ mod tests {
     /// PR #105 review SHOULD-FIX 1 / acceptance check (b):
     /// the aggregate read maps rows from `console.bi_board_embed_event` to
     /// `EmbedAccess` (max `revoked_before`, union of `jti` with max `exp`,
-    /// newest `origins`, and expired `jti` dropped).
+    /// newest `origins`).
     ///
     /// Replaces the former `row_to_board_reads_the_embed_access_columns_and_does_not_serialise_them`
     /// because embed access columns were removed from `console.bi_board`.
     #[test]
     fn aggregate_read_maps_rows_to_embed_access() {
-        let now = 1_700_000_000;
-        let tolerance = 60;
-
         let rows = sample_aggregate_event_rows();
 
-        let access = embed_access_from_aggregate_rows(&rows, now, tolerance);
+        let access = embed_access_from_aggregate_rows(&rows);
         assert_eq!(access.revoked_before, 1_699_995_000, "max revoked_before");
         assert_eq!(
             access.origins,
@@ -4798,14 +4778,19 @@ mod tests {
             ],
             "newest origins"
         );
-        assert_eq!(access.withdrawn.len(), 2, "union of unexpired jtis");
+        assert_eq!(
+            access.withdrawn.len(),
+            3,
+            "union of jtis; an expired one stays (PR #201 review F SHOULD-FIX 1)"
+        );
         assert_eq!(access.withdrawn[0].jti, "tok_1");
         assert_eq!(access.withdrawn[0].exp, 1_700_000_800, "max exp for tok_1");
         assert_eq!(access.withdrawn[1].jti, "tok_2");
         assert_eq!(access.withdrawn[1].exp, 1_700_001_000);
+        assert_eq!(access.withdrawn[2].jti, "tok_expired");
 
         // Empty rows aggregate to EmbedAccess::default()
-        let empty_access = embed_access_from_aggregate_rows(&[], now, tolerance);
+        let empty_access = embed_access_from_aggregate_rows(&[]);
         assert_eq!(empty_access, EmbedAccess::default());
 
         // row_to_board leaves embed_access as default, and does not serialize it
@@ -4817,6 +4802,44 @@ mod tests {
         assert_eq!(board.embed_access, EmbedAccess::default());
         let json = serde_json::to_string(&board).unwrap();
         assert!(!json.contains("embed_access") && !json.contains("embedAccess"));
+    }
+
+    /// PR #201 review F SHOULD-FIX 1: a withdrawn token stays withdrawn.
+    ///
+    /// The list `is_withdrawn` reads must not depend on a clock tolerance.
+    /// The tolerance that decides whether a token is acceptable at all is
+    /// the verifier's (`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`), and the
+    /// store used to keep a second copy of it (60 s). The day that constant
+    /// is raised, a withdrawal that the verifier still honours fell off the
+    /// list and the withdrawn token worked again. The list therefore keeps
+    /// every withdrawn id; expiry is applied only when counting toward the
+    /// cap.
+    #[test]
+    fn a_withdrawn_token_is_still_refused_after_it_expires() {
+        let now = 1_700_000_000u64;
+        // A token withdrawn an hour ago, whose own expiry passed five
+        // minutes ago: with a tolerance above 60 s the verifier would still
+        // accept it, so the withdrawal has to stand.
+        let rows = vec![
+            serde_json::json!({
+                "kind": "withdraw",
+                "jti": "tok_1",
+                "exp": (now - 300).to_string()
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+
+        let access = embed_access_from_aggregate_rows(&rows);
+        assert!(
+            access.withdrawn.iter().any(|w| w.jti == "tok_1"),
+            "the withdrawn id stays in the list"
+        );
+        assert!(
+            access.is_withdrawn(1_699_999_400.0, Some("tok_1")),
+            "a withdrawn token is refused even after it expired"
+        );
     }
 
     /// PR #105 review SHOULD-FIX 1 / acceptance check (a):
@@ -4967,7 +4990,7 @@ mod tests {
             .iter()
             .map(|v| v.as_object().unwrap().clone())
             .collect();
-        let access = embed_access_from_aggregate_rows(&rows, 1_800_000_000, 0);
+        let access = embed_access_from_aggregate_rows(&rows);
         assert!(access.is_withdrawn(2_000_000_000.0, Some("gone-1")));
         assert!(access.is_withdrawn(1_699_999_999.0, Some("other")));
         assert!(!access.is_withdrawn(1_700_000_001.0, Some("other")));
