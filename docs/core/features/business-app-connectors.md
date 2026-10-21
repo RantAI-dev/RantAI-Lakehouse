@@ -144,6 +144,20 @@ To be confirmed when the plan is built. Expected from the defaults:
 - Google Analytics: a report's last three days are read again on every run, because Google
   may still change them for 24 to 48 hours; the dates are in the property's reporting time
   zone.
+- ServiceNow: any table is loaded by name (incident, change request, problem, user and CMDB item are
+  suggested). Each run reads again the last day before the previous run's newest change, because
+  ServiceNow's documentation does not say whether a date in a query is read in UTC or in the user's time
+  zone; the merge on `sys_id` removes the repeats. A record deleted at ServiceNow stays until a full reload
+  (the table `sys_audit_delete` is not read). Fields are described before the load only when the account may
+  read ServiceNow's dictionary tables; otherwise a changed field is seen after the load. Signing in with
+  client credentials needs ServiceNow's admin to allow the grant and name an application user; the
+  application user's roles decide which tables are readable.
+- Confluence: spaces, pages, blog posts and comments. A page or blog post moved to the trash stays in
+  Bronze until a full reload. Spaces are re-read in full each run. Pages and blog posts are loaded with
+  their body in storage format. An hourly request quota that is used up fails the run as "the vendor
+  limited the rate". With the browser sign-in the connection test cannot run (Atlassian serves it from a
+  gateway address that needs a second request); a load reports whether it worked. Email + API token and
+  the browser sign-in both read the same objects.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.
 - SharePoint and Confluence files and attachments are not loaded.
