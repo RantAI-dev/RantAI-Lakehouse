@@ -708,7 +708,7 @@ mod tests {
     }
 
     /// An account in the shape each vendor's row accepts (slice 5: the Microsoft ones carry a tenant;
-    /// PR #216 CI rust test: HubSpot, GA4, Workday and `NetSuite` have their own forms, so every vendor is named).
+    /// PR #216 CI rust test: `HubSpot`, GA4, Workday and `NetSuite` have their own forms, so every vendor is named).
     fn sample_account(vendor: &str) -> &'static str {
         match vendor {
             "sharepoint" => "acme/00000000-0000-0000-0000-000000000001",
@@ -1142,7 +1142,7 @@ mod tests {
         assert!(!outcome.message.contains("sn-secret"));
     }
 
-    /// Slice 5 (V-SharePoint.3, V-Dynamics.3, lesson of BLOCKERs 10 and 13): both signed ways of
+    /// Slice 5 (`V-SharePoint.3`, `V-Dynamics.3`, lesson of BLOCKERs 10 and 13): both signed ways of
     /// both Microsoft vendors are tested. Client credentials: the form body carries the vendor's
     /// `.default` scope (Entra: "of all the direct application permissions ... the ones associated
     /// with the resource") and the token is the bearer of the who-am-i request.

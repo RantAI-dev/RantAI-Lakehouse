@@ -268,7 +268,7 @@ pub enum ObjectKind {
     Dimension,
     /// A metric a Google Analytics report can be built from (same listing).
     Metric,
-    /// A SharePoint site the person can pick (`SRC-3` slice 5 review BLOCKER 14): listed with
+    /// A `SharePoint` site the person can pick (`SRC-3` slice 5 review BLOCKER 14): listed with
     /// `schema: "fields"`, its `name` the Graph site id and its `label` the site's title.
     Site,
 }
@@ -295,7 +295,7 @@ pub struct ListedObject {
     /// listing carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<String>,
-    /// A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a SharePoint
+    /// A name for a person where `name` is an id (`SRC-3` slice 5 review BLOCKER 14: a `SharePoint`
     /// list is `<site id>/<list id>`, shown as `Site / List`). The vendor module's own text, bounded
     /// like a name; the ingest spec still keys the object by `name`, so a rename changes nothing stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
