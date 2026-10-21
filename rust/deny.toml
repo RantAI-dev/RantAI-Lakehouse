@@ -54,12 +54,24 @@ targets = []
 #
 # Latest `calamine` (0.36.1) requires `zip ^8.6` and does not yet accept
 # `zip` 9.0.0. Drop when `calamine` accepts `zip` >= 9.0.0; then `cargo update -p zip`.
+# RUSTSEC-2026-0381 (SEC-46, bundled roots trust distrusted emSign
+# intermediates) on `webpki-roots` 0.26.11: a version-number match only.
+# 0.26.11 is a semver-trick shim whose sole dependency is `webpki-roots` 1.x
+# and whose `TLS_SERVER_ROOTS` are re-exported from it; the lockfile pins 1.x at
+# 1.0.10, which carries the fix. No 0.26 release is patched (0.26.11 is the
+# last). Only `sqlx-core` 0.8.6 requires the 0.26 shim:
+#
+#   webpki-roots 0.26 <- sqlx-core <- sqlx
+#
+# Drop when SEC-41 moves `sqlx` to 0.9 and `webpki-roots` 0.26 leaves
+# Cargo.lock; then remove this entry.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0381",
 ]
 
 [licenses]
