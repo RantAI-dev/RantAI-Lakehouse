@@ -312,7 +312,7 @@ async fn integration_access(
     })
 }
 
-/// ServiceNow's client-credentials grant (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>):
+/// `ServiceNow`'s client-credentials grant (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>):
 /// the client id and secret are resolved only now (after the address check) and sent in the
 /// form body of the token request, the address being the vendor table's for this instance.
 async fn client_credentials_access(
@@ -1009,7 +1009,7 @@ mod tests {
         assert!(!outcome.message.contains("cf-token"));
     }
 
-    /// `SRC-3` slice 4: ServiceNow's client credentials go to the token address in the form body
+    /// `SRC-3` slice 4: `ServiceNow`'s client credentials go to the token address in the form body
     /// and the access token it returns is the bearer of the who-am-i request.
     #[tokio::test]
     async fn servicenows_client_credentials_are_exchanged_for_a_bearer_token() {
