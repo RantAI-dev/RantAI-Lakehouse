@@ -77,7 +77,7 @@ def google_analytics(
             dimensions += [time_dimension]
         resource_name = query["resource_name"]
         resource_list.append(
-            dlt.resource(basic_report, name=resource_name, write_disposition="append")(
+            dlt.resource(basic_report, name=resource_name, write_disposition="merge", primary_key=dimensions)(
                 session=session,
                 rows_per_page=rows_per_page,
                 property_id=property_id,

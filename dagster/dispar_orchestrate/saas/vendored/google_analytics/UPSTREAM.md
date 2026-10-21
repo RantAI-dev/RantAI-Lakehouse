@@ -31,3 +31,17 @@
    upstream gave (`sessions_INTEGER`, a UTC datetime for the date dimensions). The
    interactive `setup_script_gcp_oauth.py` (a local browser flow built on
    `google_auth_oauthlib`) is deleted: the product's own sign-in replaces it.
+2. **Reports merge on their dimensions, re-read the last days, and make no empty-range
+   request** (`__init__.py`, `helpers/__init__.py` `report_start_date`, `settings.py`
+   `LOOKBACK_DAYS`; `SRC-3` decision 6, V-GA4.1). Upstream wrote each report with
+   `write_disposition="append"` and no key, starting the day AFTER the last value read.
+   Google says "Data processing can take 24-48 hours. During that time, data in your
+   reports may change." (https://support.google.com/analytics/answer/11198161), so the
+   last days were stored once and never corrected, and a rerun of a range stored its rows
+   twice. Now: `merge` with the dimensions as the key; a later run starts `LOOKBACK_DAYS`
+   (3) days before the last value, moved back to the first day of its week, month or year
+   for `isoYearIsoWeek`, `yearMonth` and `year` (Analytics sums a partial period over the
+   days asked for only, which the merge would write over the whole period); a start after
+   yesterday (a configured start in the future) asks nothing, where Google would answer
+   with an error. The date range stays whole days: the Data API's `dateRanges` are dates,
+   in the property's time zone, while the end ("yesterday") is UTC as upstream had it.

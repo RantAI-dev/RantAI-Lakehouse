@@ -7,8 +7,29 @@ import dlt
 from dlt.common import logger, pendulum
 from dlt.common.typing import TDataItem
 
-from ..settings import START_DATE
+from ..settings import LOOKBACK_DAYS, START_DATE
 from .data_processing import get_report
+
+
+def report_start_date(time_dimension: str, last_value: Any, start_date: str) -> str:
+    """
+    The first day (`YYYY-MM-DD`) a report is asked for.
+
+    First run (no `last_value`): `start_date`. Later runs: `LOOKBACK_DAYS` days before the
+    last value read, moved back to the first day of its week, month or year when the
+    report's time dimension is that coarse, because Analytics sums a partial period over
+    only the days asked for and the merge would then replace a whole month with a part of it.
+    (SRC-3 V-GA4.1 local change 2. Upstream started the day AFTER the last value, so
+    the last days, which Google may still change for 24 to 48 hours, were never read again.)
+    """
+    if not last_value:
+        return start_date or START_DATE
+    floor = pendulum.parse(last_value) if isinstance(last_value, str) else pendulum.instance(last_value)
+    floor = floor.subtract(days=LOOKBACK_DAYS)
+    unit = {"isoYearIsoWeek": "week", "yearMonth": "month", "year": "year"}.get(time_dimension)
+    if unit:
+        floor = floor.start_of(unit)
+    return floor.to_date_string()
 
 
 def basic_report(
@@ -48,10 +69,12 @@ def basic_report(
             logger.warning(
                 f"Using the starting date: {last_date.last_value} for incremental report: {resource_name} and ignoring start date passed as argument {start_date}"
             )
-        # take next day after yesterday to avoid double loads
-        start_date = last_date.last_value.add(days=1).to_date_string()
-    else:
-        start_date = start_date or START_DATE
+    start_date = report_start_date(last_date.cursor_path, last_date.last_value, start_date)
+    end_date = pendulum.yesterday().to_date_string()
+    if start_date > end_date:
+        # Nothing of the report is final yet (the start is after yesterday): Google answers
+        # such a range with an error, so no request is made.
+        return
 
     processed_response = get_report(
         session=session,
@@ -61,6 +84,6 @@ def basic_report(
         limit=rows_per_page,
         start_date=start_date,
         # configure end_date to yesterday as a date string
-        end_date=pendulum.yesterday().to_date_string(),
+        end_date=end_date,
     )
     yield from processed_response

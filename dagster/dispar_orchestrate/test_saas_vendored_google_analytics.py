@@ -130,3 +130,48 @@ def test_the_source_builds_its_resources_over_a_session_and_the_metadata_tables_
     assert names == ["dimensions", "metrics", "traffic"]
     assert [r["apiName"] for r in source.resources["metrics"]] == ["sessions", "purchaseRevenue"]
     assert [r["apiName"] for r in source.resources["dimensions"]] == ["date", "country"]
+
+
+# ---- local change 2: merge on the dimensions, a lookback, no empty-range request --------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from dlt.common import pendulum  # noqa: E402
+
+from dispar_orchestrate.saas.vendored.google_analytics import helpers as ga_helpers  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "dimension,last,expected",
+    [
+        ("date", "2024-03-10", "2024-03-07"),
+        ("dateHour", "2024-03-10T05:00:00", "2024-03-07"),
+        ("yearMonth", "2024-03-01", "2024-02-01"),
+        ("yearMonth", "2024-03-20", "2024-03-01"),
+        ("year", "2024-01-01", "2023-01-01"),
+        ("isoYearIsoWeek", "2024-03-11", "2024-03-04"),
+    ],
+)
+def test_a_later_run_starts_three_days_before_the_last_value_at_the_start_of_a_coarse_period(dimension: str, last: str, expected: str) -> None:
+    assert ga_helpers.report_start_date(dimension, pendulum.parse(last), "2015-08-14") == expected
+
+
+def test_a_first_run_starts_at_the_configured_date() -> None:
+    assert ga_helpers.report_start_date("date", None, "2020-01-01") == "2020-01-01"
+
+
+def test_the_report_resources_merge_on_their_dimensions_and_the_last_days_are_read_again() -> None:
+    fake = FakeGa4([(pendulum.yesterday().subtract(days=n).strftime("%Y%m%d"), "ID", 1, 1.0) for n in range(6)])
+    source = ga.google_analytics(session_over(fake), property_id=123, queries=[{"resource_name": "traffic", "dimensions": ["country"], "metrics": ["sessions"]}])
+    resource = source.resources["traffic"]
+    assert resource.write_disposition == "merge" and resource._hints["primary_key"] == ["country", "date"]
+    last = pendulum.yesterday().subtract(days=1)
+    list(ga_helpers.basic_report(session_over(fake), 1000, ["country", "date"], ["sessions"], 123, "traffic", "2015-08-14", SimpleNamespace(last_value=last, cursor_path="date")))
+    sent = fake.posts[-1][1]["dateRanges"][0]
+    assert sent["startDate"] == last.subtract(days=3).to_date_string() and sent["endDate"] == pendulum.yesterday().to_date_string()
+
+
+def test_no_request_is_made_when_the_start_is_after_yesterday() -> None:
+    fake = FakeGa4([])
+    rows = list(ga_helpers.basic_report(session_over(fake), 1000, ["date"], ["sessions"], 123, "t", "2999-01-01", SimpleNamespace(last_value=None, cursor_path="date")))
+    assert rows == [] and fake.posts == []
