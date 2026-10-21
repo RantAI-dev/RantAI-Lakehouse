@@ -130,7 +130,7 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "accountLabel": "GA4 property id (digits)",
     "apiBase": "https://analyticsdata.googleapis.com",
     "oauth": {
-      "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+      "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent",
       "tokenUrl": "https://oauth2.googleapis.com/token",
       "revocationUrl": "https://oauth2.googleapis.com/revoke",
       "scopes": [

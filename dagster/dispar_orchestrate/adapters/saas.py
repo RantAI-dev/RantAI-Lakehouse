@@ -26,6 +26,9 @@ modules, and the tests' fake vendor is a small class):
                                                 an object it cannot describe
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
+    integration_auth(vendor, secrets, resolve_checked)
+                                             optional -> (headers(), refresh()); an integration
+                                                credential exchanged for a short-lived token
 
 The module never builds a host: it asks the session for a path. It never sees
 a secret it was not given in `secrets`, and every record it yields is data,
@@ -128,6 +131,13 @@ def _auth(
     if kind == "integration":
         if vendor.integration is None:
             raise SaasSetupRefused("this vendor does not offer an integration credential")
+        sign_in = getattr(module, "integration_auth", None)
+        if sign_in is not None:
+            # A credential that is exchanged for a short-lived token (Google's service
+            # account key): the module gives the headers and the function that forgets
+            # the token, and asks for the token through the vendor table's address.
+            headers, refresh = sign_in(vendor, secrets, resolve_checked=resolve_checked)
+            return headers, refresh, lambda: None
         build = getattr(module, "integration_headers", None)
         if build is not None:
             headers = build(vendor, secrets)

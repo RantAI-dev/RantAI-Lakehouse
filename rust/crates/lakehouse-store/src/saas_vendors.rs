@@ -356,7 +356,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         account_label: "GA4 property id (digits)",
         api_base: "https://analyticsdata.googleapis.com",
         oauth: OauthPreset {
-            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent",
             token_url: "https://oauth2.googleapis.com/token",
             revocation_url: Some("https://oauth2.googleapis.com/revoke"),
             scopes: &["https://www.googleapis.com/auth/analytics.readonly"],
