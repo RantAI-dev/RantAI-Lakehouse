@@ -242,9 +242,15 @@ async fn refreshed_access(
         }
     }
     .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    // PR #216 CI g6-saas: a provider may repeat the refresh token it was given (RFC 6749 6 lets
+    // it); that is not a rotation, and storing it would rewrite a credential for nothing (and
+    // fail for an operator's `file:` secret).
+    let rotated = tokens
+        .refresh_token
+        .filter(|token| token.expose_secret() != refresh_token.expose_secret());
     Ok(Access {
         token: tokens.access_token,
-        rotated: tokens.refresh_token,
+        rotated,
         basic: false,
     })
 }
@@ -833,6 +839,49 @@ mod tests {
         assert!(!outcome.ok && !outcome.supported);
         assert!(outcome.message.contains("Nobody has signed in"));
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// PR #216 CI g6-saas: a refresh token the provider merely repeats is not a rotation.
+    #[tokio::test]
+    async fn a_repeated_refresh_token_is_not_handed_back_as_a_rotation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("S".to_owned(), "client-secret".to_owned());
+        map.insert("R".to_owned(), "refresh-1".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "zendesk",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:S",
+                secondary: Some("env:R"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.rotated_refresh_token.is_none());
     }
 
     #[tokio::test]

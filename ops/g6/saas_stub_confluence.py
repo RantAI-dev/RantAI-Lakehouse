@@ -167,7 +167,9 @@ def _token(handler, parsed) -> None:  # noqa: ANN001
         if STATE.rotate:
             STATE.rotations += 1
             STATE.refresh_token = f"stub-cf-refresh-{STATE.rotations}"
-        out = {"access_token": f"stub-cf-access-{STATE.rotations}", "refresh_token": STATE.refresh_token, "expires_in": 3600, "scope": "read:page:confluence offline_access"}
+        out = {"access_token": f"stub-cf-access-{STATE.rotations}", "expires_in": 3600, "scope": "read:page:confluence offline_access"}
+        if STATE.rotate:  # without rotation the answer carries no refresh token (RFC 6749 6)
+            out["refresh_token"] = STATE.refresh_token
     stub.send_json(handler, out)
 
 
