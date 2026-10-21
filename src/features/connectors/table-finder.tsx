@@ -105,8 +105,9 @@ function ObjectRow({
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/50"
       >
         <input id={id} type={inputType} checked={checked} disabled={disabled} onChange={onToggle} />
-        <span id={nameId} className="min-w-0 flex-1 truncate font-mono text-xs">
-          {object.name}
+        {/* Slice 5 review BLOCKER 14: a vendor whose names are ids (SharePoint lists) gives a label to read. */}
+        <span id={nameId} className={cn("min-w-0 flex-1 truncate text-xs", object.label ? "" : "font-mono")} title={object.label ? object.name : undefined}>
+          {object.label ?? object.name}
         </span>
         {object.kind === "file" ? (
           <span className="shrink-0 text-xs text-muted-foreground">
@@ -134,7 +135,7 @@ type RowsProps = {
   inputType: "checkbox" | "radio"
   selected: ReadonlySet<string>
   disabled: boolean
-  onToggle: (name: string) => void
+  onToggle: (name: string, label?: string) => void
   onColumns: (name: string) => void
 }
 
@@ -148,7 +149,7 @@ function PlainRows({ objects, inputType, selected, disabled, onToggle, onColumns
             inputType={inputType}
             checked={selected.has(object.name)}
             disabled={disabled}
-            onToggle={() => onToggle(object.name)}
+            onToggle={() => onToggle(object.name, object.label)}
             onColumns={() => onColumns(object.name)}
           />
         </li>
@@ -188,7 +189,7 @@ function WindowedRows({ objects, inputType, selected, disabled, onToggle, onColu
                 inputType={inputType}
                 checked={selected.has(object.name)}
                 disabled={disabled}
-                onToggle={() => onToggle(object.name)}
+                onToggle={() => onToggle(object.name, object.label)}
                 onColumns={() => onColumns(object.name)}
               />
             </li>
@@ -274,9 +275,10 @@ export type TableFinderProps = {
   defaultSchema: string
   previews: ColumnPreviews
   selectedNames: ReadonlySet<string>
-  onToggle: (name: string) => void
-  /** Tick (`true`) or untick (`false`) every one of `names`: the buttons over the shown rows. */
-  onSetMany: (names: string[], on: boolean) => void
+  /** `label` is the listed object's label, when the vendor gave one (it names the Bronze table by default). */
+  onToggle: (name: string, label?: string) => void
+  /** Tick (`true`) or untick (`false`) every one of `names`: the buttons over the shown rows. `labels` are the shown objects' labels. */
+  onSetMany: (names: string[], on: boolean, labels?: Record<string, string>) => void
   /** Kafka: one topic per connector, so the list is radio buttons and has no "select shown" (D4). */
   single?: boolean
   /** Locks the list while a pick is being saved. */
@@ -331,7 +333,7 @@ export function TableFinder({
     ? (searched.objects ?? [])
     : serverSearch || needle === ""
       ? baseObjects
-      : baseObjects.filter((o) => o.name.toLowerCase().includes(needle))
+      : baseObjects.filter((o) => o.name.toLowerCase().includes(needle) || (o.label ?? "").toLowerCase().includes(needle))
   const schemas = (schemaList.data?.state === "done" ? (schemaList.data.objects ?? []) : []).filter(
     (o) => o.kind === "schema"
   )
@@ -497,7 +499,8 @@ export function TableFinder({
                 onClick={() =>
                   onSetMany(
                     objects.map((o) => o.name),
-                    !allShownSelected
+                    !allShownSelected,
+                    Object.fromEntries(objects.flatMap((o) => (o.label ? [[o.name, o.label]] : [])))
                   )
                 }
               >

@@ -28,6 +28,7 @@ import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import { TableActionsMenu } from "./connector-table-actions"
 import { Ga4ReportEditor } from "./ga4-report-editor"
+import { SharepointSitePicker } from "./sharepoint-site-picker"
 import { FINDER_WORDS, finderKind, TableFinder } from "./table-finder"
 import { useColumnPreviews, type PreviewEntry } from "./use-discovery"
 import type {
@@ -63,6 +64,17 @@ export function defaultTarget(connectorName: string, objectName: string): string
   const table = slug(objectName.split(".").pop() ?? objectName)
   const prefix = slug(connectorName)
   const joined = [prefix, table].filter(Boolean).join("_") || "table"
+  return /^[0-9]/.test(joined) ? `t_${joined}` : joined
+}
+
+/**
+ * The Bronze table of a listed object that came with a label (`SRC-3` slice 5 review BLOCKER 14: a SharePoint
+ * list is named by two ids and labelled `Site / List`): `<connector>_<label>`, the whole label slugged, because
+ * a label is words and not a `schema.table` whose last part names the table. The source-object key stays the ids,
+ * so renaming the list at the source changes neither the key nor the table already created.
+ */
+export function labelTarget(connectorName: string, label: string): string {
+  const joined = [slug(connectorName), slug(label)].filter(Boolean).join("_") || "table"
   return /^[0-9]/.test(joined) ? `t_${joined}` : joined
 }
 
@@ -384,12 +396,19 @@ function IngestEditor({
   // that cannot list); a SQL source and Kafka take no typed name.
   // Slice 3 review BLOCKER 9: a Google Analytics connector has no tables to type or tick; the person defines reports.
   const isGa4 = adapter === "saas" && spec.dial.vendor === "ga4"
+  // Slice 5 review BLOCKER 14: a SharePoint connector's sites are picked, and the picks are the dial's `objects`.
+  const isSharepoint = adapter === "saas" && spec.dial.vendor === "sharepoint"
+  const keepsDialObjects = isGa4 || isSharepoint
   const manualAdd = finder !== "sql" && finder !== "kafka" && !isGa4
   const savedReports = React.useMemo(
     () => (Array.isArray(spec.dial.objects) ? spec.dial.objects.filter((o: unknown): o is string => typeof o === "string") : []),
     [spec.dial]
   )
   const [reports, setReports] = React.useState<string[]>(savedReports)
+  // The labels the finder listed, to name a Bronze table and to show a picked object in words (BLOCKER 14).
+  const [labels, setLabels] = React.useState<Record<string, string>>({})
+  const rememberLabels = (found: Record<string, string>) =>
+    setLabels((current) => (Object.entries(found).every(([k, v]) => current[k] === v) ? current : { ...current, ...found }))
   const previews = useColumnPreviews(connectorId)
   const columnChoice = !isCdc && supportsColumnChoice(adapter, spec.dial)
   // Owned here, not by the Runs card: the per-table actions are disabled while a run is going.
@@ -414,7 +433,7 @@ function IngestEditor({
         {
           adapter,
           ingestMode: spec.ingestMode ?? "batch",
-          dial: isGa4 ? { ...spec.dial, objects: reports } : spec.dial,
+          dial: keepsDialObjects ? { ...spec.dial, objects: reports } : spec.dial,
           sourceObjects: toSourceObjects(selection, !isCdc),
           ...(cron && !isCdc ? { scheduleCron: cron } : {}),
         },
@@ -435,7 +454,7 @@ function IngestEditor({
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
     (!isCdc && cron !== savedCron) ||
-    (isGa4 && JSON.stringify(reports) !== JSON.stringify(savedReports))
+    (keepsDialObjects && JSON.stringify(reports) !== JSON.stringify(savedReports))
   const canSave =
     dirty && problems.every((p) => p === null) && modeProblems.every((p) => p === null) && scheduleProblem === null
 
@@ -460,31 +479,33 @@ function IngestEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readsColumnsAhead, selection, previews.ensure])
 
-  function toggle(name: string) {
+  function toggle(name: string, label?: string) {
+    if (label) rememberLabels({ [name]: label })
     setSelection((current) =>
       current.some((s) => s.name === name)
         ? current.filter((s) => s.name !== name)
-        : [...current, newTable(name)]
+        : [...current, newTable(name, label)]
     )
     // A ticked SQL table's key comes with its columns; the mode switch below fills it in (SRC-10 decision 3).
     if (readsColumnsAhead && !selectedNames.has(name)) previews.ensure(name)
   }
 
   /** Tick or untick every one of `names`: the button over the shown rows of the list. */
-  function setMany(names: string[], on: boolean) {
+  function setMany(names: string[], on: boolean, found: Record<string, string> = {}) {
+    rememberLabels(found)
     setSelection((current) => {
       if (!on) return current.filter((s) => !names.includes(s.name))
       const have = new Set(current.map((s) => s.name))
-      return [...current, ...names.filter((n) => !have.has(n)).map((n) => newTable(n))]
+      return [...current, ...names.filter((n) => !have.has(n)).map((n) => newTable(n, found[n]))]
     })
   }
 
   /** A ticked table: one copy of the source per run, with the key the source declares when it declares one. */
-  function newTable(name: string): Selected {
+  function newTable(name: string, label?: string): Selected {
     const detected = keysOf.get(name)
     return {
       name,
-      target: defaultTarget(connectorName, name),
+      target: label ? labelTarget(connectorName, label) : defaultTarget(connectorName, name),
       loadMode: DEFAULT_LOAD_MODE,
       ...(detected ? { primaryKey: detected } : {}),
     }
@@ -586,8 +607,8 @@ function IngestEditor({
             {selection.map((s, i) => (
               <li key={s.name} className="space-y-1.5 px-3 py-2">
                 <div className="flex items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate font-mono text-xs" title={s.name}>
-                    {s.name}
+                  <span className={cn("min-w-0 flex-1 truncate text-xs", labels[s.name] ? "" : "font-mono")} title={s.name}>
+                    {labels[s.name] ?? s.name}
                   </span>
                   {waitingTables?.has(s.name) ? (
                     <Pill
@@ -659,6 +680,14 @@ function IngestEditor({
         )}
       </div>
 
+      {isSharepoint ? (
+        <SharepointSitePicker
+          connectorId={connectorId}
+          picked={reports}
+          savedPicked={savedReports}
+          onToggle={(site) => setReports((current) => (current.includes(site) ? current.filter((n) => n !== site) : [...current, site]))}
+        />
+      ) : null}
       {/* Finding tables (SRC-13): one flow for every type that can list. */}
       {finder ? (
         <TableFinder

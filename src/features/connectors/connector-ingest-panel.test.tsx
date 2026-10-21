@@ -5,6 +5,7 @@ import {
   cronProblem,
   defaultDiscoverSchema,
   defaultTarget,
+  labelTarget,
   isAutoDisablePause,
   loadModeProblem,
   lockedColumns,
@@ -130,6 +131,12 @@ describe("ingest panel helpers", () => {
     expect(defaultTarget("northwind", "public.orders")).toBe("northwind_orders")
     expect(defaultTarget("Northwind DB!", "public.Order Details")).toBe("northwind_db_order_details")
     expect(defaultTarget("2024 sales", "t")).toBe("t_2024_sales_t")
+  })
+  it("names the table of a labelled object from the whole label (slice 5 review BLOCKER 14)", () => {
+    expect(labelTarget("intranet", "Team Site / Tasks")).toBe("intranet_team_site_tasks")
+    expect(labelTarget("Intranet", "v1.2 Plan / Q3 2026")).toBe("intranet_v1_2_plan_q3_2026")
+    expect(labelTarget("2024", "HR / Staff")).toBe("t_2024_hr_staff")
+    expect(labelTarget("", "!!!")).toBe("table")
   })
   // The edge cases below are pinned by `default_bronze_target`'s Rust test as
   // well (`lakehouse-store/src/ingest_spec.rs`): both rules must agree.
