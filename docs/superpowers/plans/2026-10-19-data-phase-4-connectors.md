@@ -739,6 +739,60 @@ the copy its own commit. **No new Python library**, so no pin, note or licence e
 - The GA4 gRPC/REST transport claim was read in the wheel, not run (the package is not installed).
 - Nothing was shown in a browser.
 
+### Handoff: slice 3 fix round (developer, 2026-10-21)
+
+Findings of the slice 3 review (commit `0e04656d`), one commit each. No cargo build, check, clippy or test ran and no image
+was built (disk 2.3 to 5 GB free); the Rust was written and checked with `cargo fmt --check` only.
+
+| Finding | Commit | Subject |
+| --- | --- | --- |
+| BLOCKER 8 | `9ebf45e5` | Salesforce's 403 `REQUEST_LIMIT_EXCEEDED` is `rate_limited`, not retried in the run |
+| SHOULD-FIX 11 | `d6242106` | GA4 reads up to `yesterday` in the property's time zone |
+| SHOULD-FIX 12 | `82346962` | Salesforce and GA4 limits on the connector page |
+| BLOCKER 9 | `47488264` | the GA4 report editor in the console, fields through discovery |
+| BLOCKER 10 | `57b41000` | the API's connection test of GA4's service-account key; the key in the GA4 product steps |
+
+- **BLOCKER 8**: a vendor module may name `is_quota_exhausted(body)`; `SaasSession` gives it the 403 body and raises
+  `SaasQuotaExhausted` (a `SaasRateLimited`), which `ingest_errors.classify` reports as `rate_limited` with `retried=False`
+  (a per-24-hours quota is not waited out in minutes). Any other 403 is still `SaasPermissionMissing`. Salesforce's limits page
+  stays unreadable from this machine (HTTP 403), so the code `REQUEST_LIMIT_EXCEEDED` is the reviewer's and the developer's;
+  `SRC-3-AC1` on a real org is the proof. Mock route `quota`, vendor-level gate step "salesforce quota".
+- **SHOULD-FIX 11**: no Admin API call was needed. The Data API's `DateRange` reference says `yesterday`, `today` and `NdaysAgo`
+  are "inferred based on the property's reporting time zone", so the request's end is the term `yesterday` (same host, same scope,
+  no stored time zone). No wider lookback and no stated limit were needed; the connector page says the dates are in the property's zone.
+- **SHOULD-FIX 12**: "Limits to tell a customer" states the Salesforce query-length failure, API version 62.0, the recycle-bin purge
+  and the daily limit not retried the same day, and GA4's three re-read days.
+- **BLOCKER 9**: the report editor is `ga4-report-editor.tsx`, shown on the connector's tables card for a GA4 connector in place of
+  "Add by name". The fields come through discovery: `POST .../discovery/list` with `schema: "fields"` reaches the orchestrator, whose
+  saas reader calls the vendor module's `list_fields` (GA4: `getMetadata`, names only) and answers objects of kind `dimension` and `metric`
+  (two new `ObjectKind` variants in Rust and in the contract). The date dimension is always included and shown as the cursor; a chosen
+  time dimension is the cursor instead. The report text (`label = dims | metrics`, `src/lib/connectors/ga4-report.ts`, the server's
+  `parse_report` is the authority) is saved into `dial.objects` and ticked as an `incremental_dedup` object keyed by its dimensions.
+  The GA4 product step also lists the fields through discovery.
+- **BLOCKER 10**: `service_account_access` in `connector_probe/saas.rs`: the key file is resolved after the address check, the key stays a
+  `SecretValue`, the RS256 assertion is signed with the workspace `jsonwebtoken` 11 (no new crate; `aud` is the vendor table's token address,
+  never the key file's `token_uri`), and the exchange goes through `connector_oauth::token_request`. A file that is not a key is a fixed message.
+  `g6-saas` has a second GA4 product entry, `ga4-key`, with a key made for the step and verified by the mock's RS256 check.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree; `df -h /` showed 2.3 GB, above the 2 GB rule):
+  **1886 passed, 0 failed** (16m38s); slice 3 baseline 1882.
+- `python3 ops/lint/check_intra_package_imports.py` and `check_connector_gate_coverage.py`: OK.
+- `bun test src/lib/connectors`: 49 pass; `bun test src/features/connectors`: 348 pass (new: `ga4-report-editor.test.tsx` 6,
+  `ga4-ingest-panel.test.tsx` 3, `ga4-report.test.ts` 4); `bun test src/services`: 85 pass; `bun run typecheck`: no error outside
+  `features/landing/scene`; `bun run lint`: 0 errors.
+- Gate vendor steps against the local stub after BLOCKER 8 and SHOULD-FIX 11: `PASS (22 s)`.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified**
+- **All Rust**: the two `ObjectKind` variants and the whole of `service_account_access` with its two tests (the signed assertion decoded with the public
+  half; a non-key file) are formatted, not compiled, not run. In particular the `jsonwebtoken` 11 calls (`EncodingKey::from_rsa_pem`,
+  `encode`, `Validation::set_audience`, `DecodingKey::from_rsa_pem`) and the `rsa` 0.9 dev-dependency in the test follow the existing
+  `routes/auth.rs` test but were not compiled.
+- The new `ga4-key` and discovery-fields product steps, and the whole `g6-saas` job, did not run (no docker stack).
+- The report editor was not shown in a browser.
+- Salesforce's own documentation, still unreadable from this machine.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
