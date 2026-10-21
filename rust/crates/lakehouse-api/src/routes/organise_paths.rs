@@ -2143,6 +2143,31 @@ async fn going_back_names_a_chart_that_was_removed_for_good_and_leaves_no_hole()
     assert!(!board.contains(r#""c1":"#), "{board}");
 }
 
+/// `PR #199 review M SHOULD-FIX BI-18 2`: a chart the version had that was
+/// moved to another dashboard is not gone. The revert says where it is, so the
+/// answer does not say it was removed from the trash for good.
+#[tokio::test]
+async fn going_back_says_a_chart_that_moved_to_another_dashboard() {
+    let mut rules = trash_rules(false);
+    rules.insert(
+        0,
+        (
+            vec![
+                "SELECT id, spec_json, board, created_by",
+                "FROM console.bi_chart FINAL",
+            ],
+            vec![chart_row("c1", "b_other", "mart_a", None)],
+        ),
+    );
+    let server = history_server(rules).await;
+    let done = match revert_to(&server, 2).await {
+        Ok(done) => done,
+        Err(response) => panic!("not restored: {}", text_of(response).await),
+    };
+    assert_eq!(done["chartsMoved"], json!(["Hotels"]));
+    assert_eq!(done["chartsGone"], json!([]));
+}
+
 /// R8, and the question about dragging: a layout save (what a drag in edit mode
 /// sends) records a version.
 #[tokio::test]

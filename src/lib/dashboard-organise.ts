@@ -54,12 +54,20 @@ export function restoreBlocked(item: Pick<TrashItem, "kind" | "boardState">): bo
   return item.kind === "chart" && item.boardState === "trash"
 }
 
-/** The words after a revert about the charts it took out of the trash and the ones that could not come back (BI-18 part C review fix R7). */
-export function revertNote(done: { chartsRemoved: number; chartsRestored: string[]; chartsGone: string[] }): string {
+/**
+ * The words after a revert about the charts it took out of the trash, the ones
+ * that now sit on another dashboard and the ones that could not come back
+ * (BI-18 part C review fix R7; `PR #199 review M SHOULD-FIX BI-18 2`).
+ */
+export function revertNote(done: { chartsRemoved: number; chartsRestored: string[]; chartsGone: string[]; chartsMoved?: string[] }): string {
   const plural = (n: number) => (n === 1 ? "chart" : "charts")
   const parts: string[] = []
   if (done.chartsRestored.length) parts.push(`${done.chartsRestored.length} ${plural(done.chartsRestored.length)} came back from the trash.`)
   if (done.chartsRemoved) parts.push(`${done.chartsRemoved} ${plural(done.chartsRemoved)} added since went to the trash.`)
+  if (done.chartsMoved?.length) {
+    const n = done.chartsMoved.length
+    parts.push(`${n} ${plural(n)} now ${n === 1 ? "sits" : "sit"} on another dashboard: ${done.chartsMoved.join(", ")}.`)
+  }
   if (done.chartsGone.length) {
     parts.push(`${done.chartsGone.length} ${plural(done.chartsGone.length)} could not come back: removed from the trash for good: ${done.chartsGone.join(", ")}.`)
   }

@@ -90,6 +90,15 @@ describe("restoring after a dashboard (R10) and going back (R7)", () => {
       "1 chart came back from the trash. 2 charts added since went to the trash. 1 chart could not come back: removed from the trash for good: B.",
     )
   })
+
+  test("says a chart that moved to another dashboard, not that it is gone for good", () => {
+    expect(revertNote({ chartsRemoved: 0, chartsRestored: [], chartsGone: [], chartsMoved: ["C"] })).toBe(
+      "1 chart now sits on another dashboard: C.",
+    )
+    expect(revertNote({ chartsRemoved: 0, chartsRestored: [], chartsGone: [], chartsMoved: ["C", "D"] })).toBe(
+      "2 charts now sit on another dashboard: C, D.",
+    )
+  })
 })
 
 test("a folder is personal when it has an owner (the New dashboard hint)", () => {

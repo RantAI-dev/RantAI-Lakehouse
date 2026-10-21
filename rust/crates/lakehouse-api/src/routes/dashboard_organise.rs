@@ -407,6 +407,9 @@ struct RevertPlan {
     /// Titles of charts the version had that were removed from the trash for
     /// good: they cannot come back, and their tiles are left out.
     gone: Vec<String>,
+    /// Titles of charts the version had that now sit on another dashboard:
+    /// they are not on this one any more, and their tiles are left out.
+    moved: Vec<String>,
     /// Ids of charts on the dashboard now that the version did not have.
     added_since: Vec<String>,
     /// The layout and phone layout with the tiles of skipped charts removed.
@@ -451,13 +454,23 @@ async fn prepare_revert(
     number: u32,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Result<RevertPlan, ApiError> {
-    let live: Vec<StoredChartSpec> = store::list_stored_charts(ch, &Viewer::system())
+    let all_live: Vec<StoredChartSpec> = store::list_stored_charts(ch, &Viewer::system())
         .await
-        .map_err(|err| classify_ch_error(&err))?
-        .into_iter()
+        .map_err(|err| classify_ch_error(&err))?;
+    let live: Vec<StoredChartSpec> = all_live
+        .iter()
         .filter(|c| c.board == board)
+        .cloned()
         .collect();
     let live_ids: HashSet<&str> = live.iter().map(|c| c.spec.id.as_str()).collect();
+    // The live charts that are on another dashboard: a chart of the version
+    // that was moved elsewhere is not gone, it sits on another dashboard
+    // (`PR #199 review M SHOULD-FIX BI-18 2`).
+    let elsewhere: HashSet<&str> = all_live
+        .iter()
+        .filter(|c| c.board != board)
+        .map(|c| c.spec.id.as_str())
+        .collect();
     let trashed = trash::trashed_chart_ids(ch, board)
         .await
         .map_err(|err| classify_ch_error(&err))?;
@@ -495,9 +508,14 @@ async fn prepare_revert(
     let mut charts = Vec::new();
     let mut restored = Vec::new();
     let mut gone = Vec::new();
+    let mut moved = Vec::new();
     for chart in &state.charts {
         if !kept_ids.contains(chart.id.as_str()) {
-            gone.push(chart.title.clone());
+            if elsewhere.contains(chart.id.as_str()) {
+                moved.push(chart.title.clone());
+            } else {
+                gone.push(chart.title.clone());
+            }
             continue;
         }
         if !live_ids.contains(chart.id.as_str()) {
@@ -514,6 +532,7 @@ async fn prepare_revert(
         charts,
         restored,
         gone,
+        moved,
         added_since,
         layout,
         phone_layout,
@@ -654,6 +673,7 @@ pub async fn revert(
         "chartsRemoved": plan.added_since.len(),
         "chartsRestored": plan.restored,
         "chartsGone": plan.gone,
+        "chartsMoved": plan.moved,
     })))
 }
 

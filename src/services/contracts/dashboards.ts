@@ -140,6 +140,8 @@ export type RevertResult = {
   chartsRestored: string[]
   /** Titles of charts the version had that were removed from the trash for good: they could not come back. */
   chartsGone: string[]
+  /** Titles of charts the version had that now sit on another dashboard: they are not on this one any more. */
+  chartsMoved: string[]
 }
 
 /** `lakehouse_bi::trash::TrashItem`. */
