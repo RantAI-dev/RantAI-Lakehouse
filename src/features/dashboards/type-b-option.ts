@@ -43,12 +43,17 @@ export type HistogramInput = {
   showLabels?: boolean;
 };
 
-export type HistogramDrawn = { option: EChartsOption; ranges: number } | { message: string };
+export type HistogramDrawn =
+  | { option: EChartsOption; ranges: number; /** Rows with no value in the binned column: they are not drawn, and the tile says so. */ withoutValue: number }
+  | { message: string };
 
 export function histogramOption(i: HistogramInput): HistogramDrawn {
-  const counted = i.rows
-    .map((r) => ({ lower: num(r[i.column]), count: num(r[i.countColumn]) ?? 0 }))
-    .filter((r): r is { lower: number; count: number } => r.lower !== null);
+  const all = i.rows.map((r) => ({ lower: num(r[i.column]), count: num(r[i.countColumn]) ?? 0 }));
+  const counted = all.filter((r): r is { lower: number; count: number } => r.lower !== null);
+  // A row with no value in the binned column has no range to be counted in,
+  // so it is not drawn; the tile says how many were left out
+  // (`PR #199 review M SHOULD-FIX BI-16 5`).
+  const withoutValue = all.length - counted.length;
   if (!counted.length) return { message: "No data" };
   const filled = i.width ? fillRanges(counted, i.width) : [...counted].sort((a, b) => a.lower - b.lower);
   if (filled === null) {
@@ -84,7 +89,7 @@ export function histogramOption(i: HistogramInput): HistogramDrawn {
       label: { show: !!i.showLabels, position: "top", fontSize: 10, color: t.axis, formatter: (p: { value?: unknown }) => i.format(Number(p.value ?? 0)) },
     }],
   };
-  return { option, ranges: filled.length };
+  return { option, ranges: filled.length, withoutValue };
 }
 
 // ── bullet ───────────────────────────────────────────────────────────────

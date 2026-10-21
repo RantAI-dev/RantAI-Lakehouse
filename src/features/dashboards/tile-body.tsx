@@ -240,6 +240,11 @@ function TypeBBody({
         {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
           <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
         ) : null}
+        {drawn.withoutValue > 0 ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {drawn.withoutValue} {drawn.withoutValue === 1 ? "row has" : "rows have"} no value
+          </p>
+        ) : null}
       </div>
     );
   }

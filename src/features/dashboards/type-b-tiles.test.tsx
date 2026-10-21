@@ -105,6 +105,14 @@ describe("a histogram", () => {
     tile(spec, rows([]))
     expect(screen.getByText("No data.")).toBeTruthy()
   })
+
+  it("says how many rows have no value, instead of losing them", () => {
+    tile(spec, rows([{ price: 0, __count: 3 }, { price: null, __count: 1 }, { price: 2000, __count: 7 }]))
+    expect(screen.getByText("1 row has no value")).toBeTruthy()
+    cleanup()
+    tile(spec, rows([{ price: 0, __count: 3 }, { price: null, __count: 1 }, { price: null, __count: 2 }]))
+    expect(screen.getByText("2 rows have no value")).toBeTruthy()
+  })
 })
 
 describe("a bullet graph", () => {
