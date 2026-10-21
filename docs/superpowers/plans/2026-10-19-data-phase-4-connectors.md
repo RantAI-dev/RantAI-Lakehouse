@@ -1052,6 +1052,45 @@ projects, both in `ci-required` and `required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_
   **14 passed**; `pytest dispar_orchestrate/test_saas_vendors.py dispar_orchestrate/test_saas_workday.py`: **242 passed**. The whole dagster suite and bun were not re-run (only the Python
   account rule and its tests changed). Not pushed.
 
+### Handoff: slice 7 (developer, 2026-10-21)
+
+Base `933de5e8` (CI 39/39 green). Disk 26 GB free, no other cargo, 8 GB RAM available, so clippy and the one permitted `cargo test` ran. Not pushed.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| T7.1 | `fcc489c3` | `0096_saas_connectors_supported.sql`, eight `coverage.json` entries and `_about`, `connector_type.rs`, the lint's real-migrations test, the gate's first step |
+| T7.1 | `846fe1cd` | the gate's create log line no longer says "a type that is not supported yet" |
+| T7.2 | `c54f6aff` | `docs/plans/SRC-3-RESULT.md` |
+| brand marks | `4e30d85d` | Confluence, Google Analytics, HubSpot, Zendesk (Simple Icons 16.35.0) |
+| T7.3 | `4a1163a4` | PRODUCT, comparison, feature pages, user guide, README, NOTICE, CHANGELOG, BACKLOG |
+
+**T7.1.** `0096` flips Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365 and SharePoint with the guarded `UPDATE ... WHERE name AND adapter = 'saas' AND supported = false` (reason set to `NULL`), and rewrites the reason of Workday Reports and NetSuite to "Built and tested against a mock; waits for a test on a real account (SRC-3)." The registry entries use `gate: "g6-saas"` (one gate, two jobs, as `g6` is for its two jobs; the registry "names gates, not jobs"), all four steps `real`; each entry's `notes.all` names job A or B. `connector_type.rs`: the exception list is now five names (Google Sheets, the two CDC types, Workday Reports, NetSuite); the old 0095 test became "ten listed, eight supported without a reason, two unsupported with a reason that says `real account`". `g6_saas_test.py` `step_types_are_listed` asserted all ten unsupported and would have failed in CI after `0096`; it now asserts the same split (not in the plan's T7.1 text; found by grep).
+
+**T7.2.** Only one completed run has the split jobs: 39597521529 on `933de5e8`: A 7m18s (script 338 s), B 13m23s (script 716 s). The two earlier completed runs have the unsplit job (14m45s on `81ec8621`, 16m17s on `7a8af090`); the run between was cancelled. The RESULT says so; the split rests on one run. Per-vendor lines were read from the two job logs (`gh api .../actions/jobs/<id>/logs`, 2 calls plus the run list and 4 `run view`). The rate-limit notice appeared on the last call; no gh call was made after it.
+
+**Brand marks.** Simple Icons latest is 16.35.0 (jsDelivr). Its data file lists Confluence, Google Analytics, HubSpot, Salesforce and Zendesk, but `icons/salesforce.svg` is not in the release (404 and absent from the file list), so Salesforce got no mark; ServiceNow, Workday, Dynamics 365, NetSuite and SharePoint are in neither. Path data of the four added marks was compared with the fetched files. Contrast against the dark chip, same method as the first eight (reproduced Kafka 1.10 and MongoDB 4.60): Confluence 1.05 and Zendesk 1.13 are drawn in the foreground in dark; Google Analytics 4.76 and HubSpot 5.76 are not.
+
+**Commands run, with counts**
+- `cd rust && cargo fmt --check`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-catalog-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo clippy -p lakehouse-store --all-targets -- -D warnings`: finished, 0 warnings.
+- `cargo test -p lakehouse-store --test connector_type` (same env): **7 passed, 0 failed** (a testcontainers Postgres applied every migration including `0096`).
+- `python3 ops/lint/check_connector_gate_coverage.py`: OK, 19 supported types, 0 waived. `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK. `check_intra_package_imports.py`, `check_bare_iceberg_count.py`: OK.
+- `bun test src/lib/connectors`: 54 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 361 pass, 0 fail. `bun run lint`: 0 errors, 6 warnings (none in these files).
+
+**Mismatches and decisions for the planner**
+1. The plan says `gate: "g6-saas"`, the brief said "the job each is proven in": both are in the entry (gate name, job in the note).
+2. The Sources page header (`connectors-page.tsx:145`) still names no business apps; that is console code, so not changed. Written as part of `SRC-29`, and `connectors-that-work.md` says so.
+3. PRODUCT.md's other rows around the ones I edited are stale from before this phase (for example "Connect to common databases"); I changed only the SaaS lines, its header date is unchanged.
+4. Feature page `business-app-connectors.md`: status now says #216; the "Limits" intro line ("To be confirmed when the plan is built") was replaced since the limits are built.
+
+**Backlog IDs added** (all in the right section, ready-to-start list updated): `SRC-26` second wave by demand (Idea, P3); `SRC-27` Workday and NetSuite on real accounts (Todo, P2, in Next); `SRC-28` NetSuite before-load schema changes (decision 9); `SRC-29` header text and brand marks for six types; `SRC-30` vendor shapes from unreadable documentation (HubSpot API versions, Salesforce quota code, Atlassian PKCE, Dataverse, ServiceNow revoke); `SRC-31` gate gaps (browser sign-in through the product, volume, shared account-rule fixture). `SRC-3` stays Building with #216; no Dates change.
+
+**Not verified, and why**
+- The new gate step `step_types_are_listed` and the whole `g6-saas-a` / `g6-saas-b` jobs after `0096`: no docker stack here; CI decides. Also not run: other Rust tests that might assume the ten types are unsupported (grep found none; only `connector_type.rs` ran), the dagster suite, `bun run typecheck`, `bun test src/services`.
+- `0096` ran only through `connector_type.rs` and the lint's replay, not through the whole store suite.
+- The brand marks were not seen in a browser or the dark theme (contrast is computed, not looked at).
+- The docs state what the gates logged; none of it was tried on a real account.
+- Docs wording on Zendesk/Confluence `post_json` and Workday/NetSuite Basic client authentication is from `ops/fixtures/saas_vendors.json`; the schema-change line for after-load vendors under "Pause" follows decision 9 ("as for other API sources today") and was not re-checked in the code.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
