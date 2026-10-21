@@ -36,7 +36,8 @@ and injectable.
 
 # What never leaves
 
-401 raises `SaasSignInRefused`, 403 `SaasPermissionMissing`, 429 past the bound
+401 raises `SaasSignInRefused`, 403 `SaasPermissionMissing` (or `SaasQuotaExhausted` when the
+vendor module recognises a used-up quota in the body: Salesforce), 429 past the bound
 `SaasRateLimited`; any other error status raises `requests.HTTPError` (its
 status is what `ingest_errors` reads). None of the messages holds the vendor's
 words, the URL or a header.
@@ -83,6 +84,13 @@ class SaasRateLimited(Exception):
 
     def __init__(self) -> None:
         super().__init__("the vendor limited the rate of requests")
+
+
+class SaasQuotaExhausted(SaasRateLimited):
+    """The vendor's API quota for the period is used up (Salesforce answers HTTP 403
+    `REQUEST_LIMIT_EXCEEDED`; slice 3 review BLOCKER 8, decision 13). Classified
+    `rate_limited` like its parent, but NOT retried within the run: the quota is per 24
+    hours, so waiting the run's minutes would only spend more requests."""
 
 
 def _allow_http() -> bool:
@@ -141,6 +149,7 @@ class SaasSession:
         http_post: Callable[..., Any] | None = None,
         refresh_auth: Callable[[], None] | None = None,
         resolve_checked: Callable[..., ssrf_guard.ResolvedAddress] = ssrf_guard.resolve_checked,
+        forbidden_is_quota: Callable[[Any], bool] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
@@ -152,6 +161,7 @@ class SaasSession:
         self._http_get = http_get or _real_get
         self._http_post = http_post or _real_post
         self._resolve_checked = resolve_checked
+        self._forbidden_is_quota = forbidden_is_quota
         self._sleep = sleep
         self._max_attempts = max(1, max_attempts)
         self._max_retry_after = max_retry_after
@@ -189,6 +199,15 @@ class SaasSession:
         if _origin_of(target) != self._origin:
             raise ssrf_guard.SsrfBlocked("a link in a vendor answer pointed to another host; not followed")
         return target
+
+    def _answers_quota(self, response: Any) -> bool:
+        """Whether the vendor module says this 403 body is a used-up quota. The body is
+        read, never repeated."""
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        return bool(self._forbidden_is_quota(body))  # type: ignore[misc]
 
     def _wait_for(self, response: Any, attempt: int) -> float:
         raw = getattr(response, "headers", {}).get("Retry-After")
@@ -256,6 +275,8 @@ class SaasSession:
                     continue
                 raise SaasSignInRefused()
             if status == 403:
+                if self._forbidden_is_quota is not None and self._answers_quota(response):
+                    raise SaasQuotaExhausted()
                 raise SaasPermissionMissing()
             if status == 429:
                 if attempt + 1 >= self._max_attempts:

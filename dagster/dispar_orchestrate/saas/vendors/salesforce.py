@@ -83,6 +83,17 @@ _TYPES = {
 }
 
 
+def is_quota_exhausted(body: Any) -> bool:
+    """Whether a 403 answer says the org's API quota is used up: Salesforce answers HTTP 403
+    with `[{"errorCode": "REQUEST_LIMIT_EXCEEDED", ...}]` for the daily request limit (and
+    for too many concurrent requests), not 429 (slice 3 review BLOCKER 8, decision 13). The
+    session then fails the run as `rate_limited`, not retried within the run. The error
+    code is Salesforce's documented REST error code; the limits page itself
+    (developer.salesforce.com) could not be read from the build machine (HTTP 403), so the
+    code is as the reviewer and the developer know it, and `SRC-3-AC1` on a real org is the proof."""
+    return isinstance(body, list) and any(isinstance(e, dict) and e.get("errorCode") == "REQUEST_LIMIT_EXCEEDED" for e in body)
+
+
 def _refuse() -> SaasSetupRefused:
     return SaasSetupRefused("Salesforce has no object by that name")
 

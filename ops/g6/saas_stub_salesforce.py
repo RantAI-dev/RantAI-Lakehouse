@@ -23,8 +23,8 @@ paths (`/services/data/v62.0/...`, `/services/oauth2/token`):
 Failures in Salesforce's shapes: an array of `{message, errorCode}` with 401
 (`INVALID_SESSION_ID`) and 403 (`INSUFFICIENT_ACCESS`), a revoked refresh token is 400
 `{"error": "invalid_grant", ...}`. Real Salesforce answers an exhausted API quota with
-403 `REQUEST_LIMIT_EXCEEDED`, which the product classes as a missing permission (reported
-in the slice 3 handoff); `rate_limit` here answers the generic 429 + `Retry-After` that
+403 `REQUEST_LIMIT_EXCEEDED` (`quota` here; the product reports it as `rate_limited`, not
+retried: slice 3 review BLOCKER 8); `rate_limit` here answers the generic 429 + `Retry-After` that
 `SaasSession` waits out (decision 13, AD9). Every error body carries `STUB-VENDOR-WORDS`.
 
 Objects: `Account` (incremental on `SystemModstamp`, has `IsDeleted`) and `Region__c` (a
@@ -74,6 +74,7 @@ class State:
         self.account_fields = dict(_ACCOUNT_FIELDS)
         self.revoked = False
         self.forbidden = False
+        self.quota_used_up = False
         self.evil_instance = False
         self.rate_limits_left = 0
         self.wanted: list[str] = []
@@ -96,6 +97,9 @@ def _authorised(handler, parsed) -> bool:  # noqa: ANN001
             return False
         if STATE.forbidden:
             stub.send_json(handler, _words("The user does not have access to this resource", "INSUFFICIENT_ACCESS"), 403)
+            return False
+        if STATE.quota_used_up:  # Salesforce's request limit is HTTP 403, not 429 (slice 3 review BLOCKER 8)
+            stub.send_json(handler, _words("TotalRequests Limit exceeded.", "REQUEST_LIMIT_EXCEEDED"), 403)
             return False
         if STATE.rate_limits_left > 0:
             STATE.rate_limits_left -= 1
@@ -215,6 +219,8 @@ def _admin(handler, parsed) -> None:  # noqa: ANN001
             STATE.revoked = bool(body.get("on", True))
         elif action == "forbid":
             STATE.forbidden = bool(body.get("on", True))
+        elif action == "quota":
+            STATE.quota_used_up = bool(body.get("on", True))
         elif action == "rate_limit":
             STATE.rate_limits_left = int(body.get("count", 1))
         elif action == "evil_instance":

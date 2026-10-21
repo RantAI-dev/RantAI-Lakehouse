@@ -391,6 +391,13 @@ def step_salesforce() -> None:
     admin("salesforce", action="rate_limit", count=0)
     _log("salesforce rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
 
+    admin("salesforce", action="quota", on=True)
+    exc = _raises("SaasQuotaExhausted", lambda: _read(module, parts, session, dial, "Region__c"))
+    classified = ingest_errors.classify(exc)
+    _expect((classified.error_class, classified.retried) == ("rate_limited", False), f"salesforce quota: the run report class is {classified}")
+    admin("salesforce", action="quota", on=False)
+    _log("salesforce quota: the 403 REQUEST_LIMIT_EXCEEDED of a used-up API quota fails as rate_limited and is not retried in the run (BLOCKER 8)")
+
     admin("salesforce", action="forbid", on=True)
     exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "Region__c"))
     _expect(ingest_errors.classify(exc).error_class == "permission_missing", "salesforce forbidden: the run report class")

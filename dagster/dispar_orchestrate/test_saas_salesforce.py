@@ -154,6 +154,38 @@ def test_a_refusal_is_a_fixed_failure_without_salesforces_words(api: Salesforce,
     assert ingest_errors.classify(raised.value).error_class == klass
 
 
+def test_a_used_up_api_quota_is_rate_limited_and_not_retried_but_another_403_is_still_a_missing_permission(api: Salesforce, sign_in: list) -> None:
+    """Slice 3 review BLOCKER 8 (decision 13): Salesforce answers its request limit with HTTP 403
+    `REQUEST_LIMIT_EXCEEDED`, not 429."""
+    path = f"/services/data/v{V}/sobjects"
+    api.fail[path] = 403
+    original = api.get
+
+    def quota(url: str, **kw: Any) -> Reply:
+        if urlparse(url).path == path:
+            return Reply(403, [{"message": "TotalRequests Limit exceeded. STUB-VENDOR-WORDS", "errorCode": "REQUEST_LIMIT_EXCEEDED"}])
+        return original(url, **kw)
+
+    api.get = quota  # type: ignore[method-assign]
+    _m, _v, parts, session = open_(api)
+    with pytest.raises(Exception) as raised:
+        salesforce.list_objects(session, parts, DIAL)
+    assert type(raised.value).__name__ == "SaasQuotaExhausted" and "STUB" not in str(raised.value)
+    classified = ingest_errors.classify(raised.value)
+    assert (classified.error_class, classified.retried) == ("rate_limited", False), "the quota is per 24 hours: not retried within the run"
+    api.get = original  # type: ignore[method-assign]
+    _m, _v, parts, session = open_(api)
+    with pytest.raises(Exception) as other:
+        salesforce.list_objects(session, parts, DIAL)
+    assert type(other.value).__name__ == "SaasPermissionMissing"
+
+
+def test_the_quota_check_reads_only_the_error_code() -> None:
+    assert salesforce.is_quota_exhausted([{"errorCode": "REQUEST_LIMIT_EXCEEDED", "message": "x"}])
+    for body in ([], {}, "REQUEST_LIMIT_EXCEEDED", [{"errorCode": "INSUFFICIENT_ACCESS"}], [{"message": "REQUEST_LIMIT_EXCEEDED"}], None):
+        assert not salesforce.is_quota_exhausted(body)
+
+
 # ---- V-Salesforce.3: sign-in ---------------------------------------------------------------------
 
 

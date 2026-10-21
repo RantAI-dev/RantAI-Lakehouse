@@ -24,6 +24,7 @@ modules, and the tests' fake vendor is a small class):
     describe(session, parts, dial, name)     optional -> list[Field] or None; a vendor that
                                                 describes its fields (decision 9); None for
                                                 an object it cannot describe
+    is_quota_exhausted(body)                 optional -> bool; whether a 403 body says the API quota is used up
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
     integration_auth(vendor, secrets, resolve_checked)
@@ -193,6 +194,8 @@ def open_session(
         http_post=http_post,
         refresh_auth=refresh,
         resolve_checked=resolve_checked,
+        # BLOCKER 8: a vendor module that can tell a used-up quota from a missing permission.
+        forbidden_is_quota=getattr(module, "is_quota_exhausted", None),
         **extra,
     )
     if getattr(module, "adopt_suffixes", ()) and dial.get("auth", {}).get("type") == vendors.OAUTH_AUTH_TYPE:

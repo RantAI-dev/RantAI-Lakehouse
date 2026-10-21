@@ -515,7 +515,10 @@ def classify(exc: BaseException) -> Classified:
     for element in _chain(exc):
         found = _classify_one(element)
         if found is not None:
-            return Classified(found, retried=found in RETRIED_CLASSES)
+            # A used-up daily quota (SaasQuotaExhausted) is `rate_limited` but not retried:
+            # waiting minutes would only spend more of the quota (slice 3 BLOCKER 8).
+            retried = found in RETRIED_CLASSES and not isinstance(element, saas_session.SaasQuotaExhausted)
+            return Classified(found, retried=retried)
     return Classified(OTHER, retried=False)
 
 
