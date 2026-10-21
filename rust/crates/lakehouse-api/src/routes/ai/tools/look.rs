@@ -89,6 +89,22 @@ pub(crate) fn merge_format(
             FORMAT_FIELDS.join(", ")
         ));
     }
+    // `PR #199 review M SHOULD-FIX BI-17 3`: a key that is not a formatting
+    // field is refused, not dropped. The tool used to ignore it and answer
+    // `formatted: true`, so a model that sent a title or a measure was told
+    // the chart had changed when it had not.
+    let unknown: Vec<String> = args
+        .keys()
+        .filter(|key| key.as_str() != "chart" && !FORMAT_FIELDS.contains(&key.as_str()))
+        .map(|key| format!("\"{key}\""))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "format_chart changes formatting only: {} {} not a field it changes. Use update_chart to change what the chart shows.",
+            unknown.join(", "),
+            if unknown.len() == 1 { "is" } else { "are" }
+        ));
+    }
     let Ok(mut def) = serde_json::to_value(stored) else {
         return Err("the chart's definition could not be read.".to_owned());
     };
@@ -261,25 +277,35 @@ mod tests {
         );
     }
 
+    /// `PR #199 review M SHOULD-FIX BI-17 3`: a key that is not a formatting
+    /// field is refused, not dropped. The test before this one asserted the
+    /// dropping: it named a title, a mart and a kind, and expected the chart
+    /// to be unchanged and the call to succeed. The tool answered
+    /// `formatted: true`, so a model that sent a title was told the chart had
+    /// changed when it had not.
     #[test]
-    fn nothing_but_the_formatting_fields_is_read_from_the_call() {
-        let before = stored();
+    fn a_key_that_is_not_a_formatting_field_is_refused() {
+        for (key, value) in [
+            ("title", json!("Hijacked")),
+            ("mart", json!("mart_other")),
+            ("kind", json!("pie")),
+            ("dimension", json!("x")),
+            ("measures", json!(["y"])),
+            ("limit", json!(1)),
+            ("click", json!(null)),
+            ("board", json!("b2")),
+        ] {
+            let mut call = json!({ "chart": "c1", "labels": { "show": true } });
+            call[key] = value;
+            let e = merge_format(&stored(), &args(call)).unwrap_err();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        // The formatting fields themselves still go through.
         let after = merge_format(
-            &before,
-            &args(json!({
-                "chart": "c1", "labels": { "show": true },
-                "title": "Hijacked", "mart": "mart_other", "kind": "pie", "dimension": "x",
-                "measures": ["y"], "limit": 1, "click": null, "board": "b2",
-            })),
+            &stored(),
+            &args(json!({ "chart": "c1", "labels": { "show": true } })),
         )
         .unwrap();
-        assert_eq!(after.title, before.title);
-        assert_eq!(after.mart, before.mart);
-        assert_eq!(after.kind, before.kind);
-        assert_eq!(after.dimension, before.dimension);
-        assert_eq!(after.limit, before.limit);
-        assert_eq!(after.click, before.click);
-        assert_eq!(after.board, before.board);
         assert!(after.style.labels.unwrap().show);
     }
 
