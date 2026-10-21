@@ -162,10 +162,15 @@ class SaasSession:
         default = 443 if scheme == "https" else 80
         return f"{scheme}://{host}" if port == default else f"{scheme}://{host}:{port}"
 
-    def adopt_origin(self, url: str) -> None:
+    def adopt_origin(self, url: str, *, as_origin: str | None = None) -> None:
         """Make the host a vendor returned after sign-in the session's origin
         (Salesforce `instance_url`), when it is an `https` host ending in one
         of the suffixes the vendor module named.
+
+        `as_origin` is for the acceptance gate only: `url` is checked by the rule
+        as always, then the session dials `as_origin` (the gate's mock vendor, from
+        `vendors.rebase_for_gate`, which is `url` itself unless the gate-only switch
+        is on) in its place.
 
         # Errors
 
@@ -174,7 +179,7 @@ class SaasSession:
         scheme, host, port = _origin_of(url)
         if scheme != "https" or port != 443 or not any(host.endswith(s) and host != s.lstrip(".") for s in self._adopt_suffixes):
             raise ssrf_guard.SsrfBlocked("the vendor returned a host this connector does not accept")
-        self._origin = (scheme, host, port)
+        self._origin = _origin_of(as_origin) if as_origin else (scheme, host, port)
 
     def _target(self, target: str) -> str:
         if target.startswith("//"):

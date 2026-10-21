@@ -236,6 +236,10 @@ class AuthSession:
         self._refresh_token = secrets.get("refreshToken")
         self._headers: dict | None = None
         self._expires_at: float | None = None
+        # SRC-3 AD3: the `instance_url` a vendor's token answer may carry (Salesforce).
+        # Only the `saas` adapter reads it, and only through `SaasSession.adopt_origin`;
+        # a `rest` connector never does.
+        self.instance_url: str | None = None
 
     @property
     def refreshable(self) -> bool:
@@ -306,6 +310,9 @@ class AuthSession:
         raise ValueError(f"rest adapter does not know auth type {auth_type!r}")
 
     def _with_token(self, body: dict) -> dict:
+        returned = body.get("instance_url")
+        if isinstance(returned, str) and returned:
+            self.instance_url = returned
         expires_in = body.get("expires_in")
         if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and expires_in > 0:
             # A margin, so the token is replaced before the source sees it expire:

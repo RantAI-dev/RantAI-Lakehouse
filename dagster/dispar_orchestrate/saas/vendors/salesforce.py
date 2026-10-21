@@ -40,6 +40,15 @@ Browser sign-in only: Salesforce's username + password + security-token sign-in 
 adopted by the session through `SaasSession.adopt_origin` and the `.salesforce.com` /
 `.force.com` rule (AD3); see `adopt_suffixes` and `adapters/saas.py`. The vendor table
 gives Salesforce no integration credential.
+
+The "who am I" request is the REST Limits resource (`/services/data/vXX.X/limits`),
+which needs only the `api` scope the row asks for; the identity endpoint
+(`/services/oauth2/userinfo`) belongs to the identity scopes (`id`, `openid`), which the
+row does not request. Salesforce's own documentation pages were not readable from the
+build machine (HTTP 403), so the row's addresses, scopes and client authentication
+(`client_secret_post`, PKCE) are Salesforce's published defaults as the developer knew
+them, not re-read on 2026-10-21: they are the first thing the real-account acceptance
+row (`SRC-3-AC1`) checks.
 """
 
 from __future__ import annotations

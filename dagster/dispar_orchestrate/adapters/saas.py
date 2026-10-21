@@ -103,9 +103,11 @@ def _auth(
     connector_id: str | None,
     resolve_checked: Callable[..., ssrf_guard.ResolvedAddress],
     report_refresh_token: Callable[[str], None] | None,
-) -> tuple[Callable[[], dict], Callable[[], None] | None]:
-    """The headers provider of the connector's sign-in, and the function that
-    forgets the access token (for a 401), `None` when there is no token."""
+) -> tuple[Callable[[], dict], Callable[[], None] | None, Callable[[], str | None]]:
+    """The headers provider of the connector's sign-in, the function that
+    forgets the access token (for a 401), `None` when there is no token, and the
+    function that answers the `instance_url` the last token answer carried (only a
+    browser sign-in has one; `None` otherwise)."""
     auth = dial.get("auth") or {}
     kind = auth.get("type")
     if kind == vendors.OAUTH_AUTH_TYPE:
@@ -122,17 +124,17 @@ def _auth(
             resolve_checked=resolve_checked,
             report_refresh_token=report_refresh_token,
         )
-        return session.headers, session.refresh
+        return session.headers, session.refresh, lambda: session.instance_url
     if kind == "integration":
         if vendor.integration is None:
             raise SaasSetupRefused("this vendor does not offer an integration credential")
         build = getattr(module, "integration_headers", None)
         if build is not None:
             headers = build(vendor, secrets)
-            return (lambda: headers), None
+            return (lambda: headers), None, lambda: None
         if tuple(vendor.integration["secretFields"]) == ("token",):
             headers = {"Authorization": f"Bearer {secrets['token']}"}
-            return (lambda: headers), None
+            return (lambda: headers), None, lambda: None
         raise SaasSetupRefused("this build cannot present this vendor's integration credential yet")
     raise SaasSetupRefused("the connector's sign-in kind is not one this vendor offers")
 
@@ -160,7 +162,7 @@ def open_session(
     vendor = vendors.vendor(str(dial.get("vendor", "")))
     module = vendors.module_for(vendor.id)
     parts = _parts(vendor, dial)
-    headers, refresh = _auth(
+    headers, refresh, instance_url = _auth(
         vendor,
         parts,
         module,
@@ -183,6 +185,16 @@ def open_session(
         resolve_checked=resolve_checked,
         **extra,
     )
+    if getattr(module, "adopt_suffixes", ()) and dial.get("auth", {}).get("type") == vendors.OAUTH_AUTH_TYPE:
+        # AD3, decision 8: a vendor whose sign-in returns the host to use (Salesforce)
+        # gets it adopted here, through `adopt_origin` and the vendor's suffix rule
+        # only, BEFORE the first read. The sign-in's first token is asked now (so a
+        # refused sign-in surfaces at open, for these vendors only); the address of the
+        # token request is the table's, and was checked like every host.
+        headers()
+        returned = instance_url()
+        if returned:
+            session.adopt_origin(returned, as_origin=vendors.rebase_for_gate(vendor.id, returned))
     return module, vendor, parts, session
 
 

@@ -1,6 +1,7 @@
-"""`saas/vendors/salesforce.py` (`SRC-3` V-Salesforce.2): objects listed by the
+"""`saas/vendors/salesforce.py` (`SRC-3` V-Salesforce.2 and .3): objects listed by the
 org (custom ones included), how each loads, deletes through `queryAll`, the schema
-before a load. Through the real `SaasSession` over
+before a load, and the browser sign-in with the host Salesforce returns adopted only
+through the `.salesforce.com` / `.force.com` rule. Through the real `SaasSession` over
 a FAKE Salesforce (the REST calls of `test_saas_vendored_salesforce.FakeSalesforce`).
 No network. The loader test runs `load_via_sink` for real on
 `test_load_modes_measurement.Lab`; CI runs it in `dagster-loader-tests`."""
@@ -12,7 +13,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from dispar_orchestrate import ingest_errors, schema_observer
+from dispar_orchestrate import ingest_errors, schema_observer, ssrf_guard
 from dispar_orchestrate import ingest_factory as f
 from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters.sink import load_via_sink
@@ -151,6 +152,91 @@ def test_a_refusal_is_a_fixed_failure_without_salesforces_words(api: Salesforce,
         salesforce.list_objects(session, parts, DIAL)
     assert type(raised.value).__name__ == error and "STUB-VENDOR-WORDS" not in str(raised.value)
     assert ingest_errors.classify(raised.value).error_class == klass
+
+
+# ---- V-Salesforce.3: sign-in ---------------------------------------------------------------------
+
+
+def test_the_browser_sign_in_refreshes_at_the_tables_address_with_the_client_in_the_form_body(api: Salesforce, sign_in: list) -> None:
+    api.rows = [account(1)]
+    read(api, "Account")
+    call = sign_in[0]
+    assert call["url"] == TOKEN_URL
+    assert call["data"] == {"grant_type": "refresh_token", "refresh_token": "not-a-real-refresh-token", "client_id": "app", "client_secret": "not-a-real-secret"}
+    assert {h["Authorization"] for h in api.headers} == {"Bearer a1"}
+
+
+def test_the_returned_instance_url_is_adopted_and_the_reads_go_to_it(monkeypatch: pytest.MonkeyPatch, api: Salesforce) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply("https://acme-pod.my.salesforce.com"))
+    _m, _v, _p, session = open_(api)
+    assert session.origin == "https://acme-pod.my.salesforce.com"
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply("https://acme.example.force.com"))
+    assert open_(api)[3].origin == "https://acme.example.force.com"
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        "https://evil.example.invalid",
+        "https://salesforce.com.evil.example.invalid",
+        "https://evilsalesforce.com",
+        "https://salesforce.com",
+        "http://acme.my.salesforce.com",
+        "https://acme.my.salesforce.com:8443",
+        "https://user@acme.my.salesforce.com",
+    ],
+)
+def test_an_instance_url_outside_the_salesforce_rule_stops_the_run_before_any_read(monkeypatch: pytest.MonkeyPatch, api: Salesforce, returned: str) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply(returned))
+    with pytest.raises(ssrf_guard.SsrfBlocked) as raised:
+        open_(api)
+    assert "evil" not in str(raised.value)
+    assert api.log == [], "nothing was asked of the host Salesforce named"
+
+
+def test_a_sign_in_without_an_instance_url_keeps_the_table_address(monkeypatch: pytest.MonkeyPatch, api: Salesforce) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply(None))
+    assert open_(api)[3].origin == ORIGIN
+
+
+def test_salesforce_offers_no_integration_credential_and_no_password_sign_in(api: Salesforce) -> None:
+    """Decision 4 and the page's decision 3: browser sign-in only."""
+    assert vendors.vendor("salesforce").integration is None
+    with pytest.raises(saas_adapter.SaasSetupRefused):
+        saas_adapter.open_session({"vendor": "salesforce", "account": "acme", "auth": {"type": "integration"}}, {"token": "x"}, resolve_checked=resolver)
+    assert vendors.auth_type_of({"vendor": "salesforce", "auth": {"type": "integration"}}) is None
+
+
+def test_a_revoked_browser_sign_in_is_the_fixed_failure(monkeypatch: pytest.MonkeyPatch, api: Salesforce) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: Reply(400, {"error": "invalid_grant", "error_description": "STUB-VENDOR-WORDS"}))
+    with pytest.raises(Exception) as raised:
+        open_(api)
+    assert ingest_errors.classify(raised.value).error_class == "sign_in_refused" and "STUB" not in str(raised.value)
+    assert api.log == []
+
+
+def test_the_instance_url_is_adopted_under_the_gate_switch_at_the_mock_but_only_after_the_rule(monkeypatch: pytest.MonkeyPatch, api: Salesforce) -> None:
+    monkeypatch.setenv("CONNECTOR_OAUTH_ALLOW_HTTP", "true")
+    monkeypatch.setenv("SAAS_GATE_ORIGINS", '{"salesforce": "http://mock.invalid:8103"}')
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply("https://acme.my.salesforce.com"))
+    assert open_(api)[3].origin == "http://mock.invalid:8103"
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: token_reply("https://evil.example.invalid"))
+    with pytest.raises(ssrf_guard.SsrfBlocked):
+        open_(api)
+
+
+def test_the_vendor_row_is_what_the_documentation_this_build_could_read_says() -> None:
+    """V-Salesforce.3: the facts a test can pin. Salesforce's own documentation pages were not
+    readable from the build machine (see the commit body); the paths are the REST calls
+    `simple-salesforce` 1.12.10 makes and Salesforce's published OAuth endpoints."""
+    row = vendors.vendor("salesforce")
+    assert row.oauth["authorizeUrl"] == "https://{account}.my.salesforce.com/services/oauth2/authorize"
+    assert row.oauth["tokenUrl"] == "https://{account}.my.salesforce.com/services/oauth2/token"
+    assert row.oauth["revocationUrl"] == "https://{account}.my.salesforce.com/services/oauth2/revoke"
+    assert row.oauth["scopes"] == ["api", "refresh_token"]
+    assert row.oauth["clientAuth"] == "post"
+    assert row.whoami == {"method": "GET", "path": f"/services/data/v{V}/limits"}
+    assert row.api_url(row.validate_account("Acme")) == "https://acme.my.salesforce.com"
 
 
 # ---- the whole path: adapter, dlt incremental, merge on Id, real Iceberg -------------------------

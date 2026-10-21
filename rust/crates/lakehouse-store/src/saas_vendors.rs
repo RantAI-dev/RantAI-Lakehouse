@@ -300,7 +300,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         integration: None,
         whoami: Some(Whoami {
             method: "GET",
-            path: "/services/oauth2/userinfo",
+            path: "/services/data/v62.0/limits",
         }),
     },
     SaasVendor {

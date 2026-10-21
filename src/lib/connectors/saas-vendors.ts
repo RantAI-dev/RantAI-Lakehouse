@@ -60,7 +60,7 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "integration": null,
     "whoami": {
       "method": "GET",
-      "path": "/services/oauth2/userinfo"
+      "path": "/services/data/v62.0/limits"
     }
   },
   {

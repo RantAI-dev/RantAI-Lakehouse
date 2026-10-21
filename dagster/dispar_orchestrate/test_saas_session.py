@@ -129,6 +129,19 @@ def test_a_salesforce_host_outside_the_suffixes_stops_the_run(returned: str) -> 
     assert session.origin == ORIGIN, "the origin did not move"
 
 
+def test_the_gate_origin_replaces_an_adopted_host_only_after_the_host_passed_the_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SRC-3 V-Salesforce.3: under the gate the session dials the mock, but the host the
+    vendor returned must still pass the suffix rule first."""
+    monkeypatch.setenv("CONNECTOR_OAUTH_ALLOW_HTTP", "true")
+    session, _ = make(Recorder(), adopt_suffixes=(".salesforce.com", ".force.com"))
+    session.adopt_origin("https://acme.my.salesforce.com", as_origin="http://mock.invalid:8103")
+    assert session.origin == "http://mock.invalid:8103"
+    session, _ = make(Recorder(), adopt_suffixes=(".salesforce.com", ".force.com"))
+    with pytest.raises(ssrf_guard.SsrfBlocked):
+        session.adopt_origin("https://evil.example.invalid", as_origin="http://mock.invalid:8103")
+    assert session.origin == ORIGIN
+
+
 def test_a_session_with_no_adopt_suffixes_adopts_nothing() -> None:
     session, _ = make(Recorder())
     with pytest.raises(ssrf_guard.SsrfBlocked):
