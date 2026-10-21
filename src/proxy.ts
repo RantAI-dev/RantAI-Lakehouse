@@ -29,8 +29,10 @@ async function allowedOrigins(token: EmbedPageToken): Promise<unknown> {
   // on the server before any page code. The `/api` rewrite in next.config.ts
   // applies to a browser navigation, not to a server-side fetch, so this asks
   // the API origin directly. No cookie is forwarded on purpose: the endpoint
-  // is public and takes the embed token in the body, and a visitor with no
-  // session must get the same `frame-ancestors 'none'` answer.
+  // is public and takes the embed token in the body. The answer does not
+  // depend on a session — an embed visitor has none, and gets the board's
+  // allowed sites; `frame-ancestors 'none'` is what a refused token, a board
+  // with no allowed site, or an unreachable API gets.
   const res = await fetch(`${base}/api/embed/frame`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
