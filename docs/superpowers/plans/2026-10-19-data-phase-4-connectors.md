@@ -621,6 +621,124 @@ build, check, clippy or test ran**; the Rust was written and checked with `cargo
   vendor-level steps cover the token request itself.
 - Nothing was shown in a browser.
 
+### Handoff: slice 3 (developer, 2026-10-21)
+
+Salesforce, then Google Analytics 4 (V-Salesforce.1 to .4, V-GA4.1 to .4), one task per commit,
+in that order. Base: `45bb3c42`. Disk was below 8 GB, so **no cargo build, check, clippy or test
+ran and no image was built**; the Rust was written and checked with `cargo fmt --check` only.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-Salesforce.1 | `ec8d5a76` | Salesforce verified source, copied unchanged |
+| V-Salesforce.1 | `32f6c383` | reads only through `SaasSession`; no `simple-salesforce`, no password sign-in (local change 1) |
+| V-Salesforce.1 | `dc0e2617` | `Id` is the primary key of every resource (local change 2, upstream #692) |
+| V-Salesforce.1 | `89623e8d` | deleted records through `queryAll`; cursor `>=` (local change 3) |
+| V-Salesforce.2 | `06af7bd5` | `queried_fields` exposed (local change 4, no behaviour change) |
+| V-Salesforce.2 | `dcafb5c0` | objects (custom ones too), incremental, deletes, describe |
+| V-Salesforce.3 | `07cdde7f` | browser sign-in; `instance_url` adopted through `adopt_origin`; whoami moved |
+| V-Salesforce.4 | `a3d2ebcd` | mock Salesforce and the Salesforce steps of `g6-saas` |
+| V-GA4.1 | `59d57872` | Google Analytics verified source, copied unchanged |
+| V-GA4.1 | `493a5003` | REST endpoints through `SaasSession`; no Google client (local change 1) |
+| V-GA4.1 | `f9d9e110` | merge on the dimensions, lookback, no empty-range request (local change 2) |
+| V-GA4.2 | `ea1fcc9a` | reports as objects, incremental by the date dimension, `ObjectDecl.lag_seconds` |
+| V-GA4.3 | `2dabb179` | browser sign-in and service-account key; the Google row fixed (`access_type=offline`) |
+| V-GA4.4 | `05560cfa` | mock GA4 and the GA4 steps of `g6-saas` |
+
+Both sources are copied from `dlt-hub/verified-sources` at `3957506893a7da821dbcc6acd51c7ca4475d1f53`
+into `saas/vendored/{salesforce,google_analytics}/`, each with `UPSTREAM.md` and the Apache-2.0 licence,
+the copy its own commit. **No new Python library**, so no pin, note or licence entry in `pyproject.toml`
+(`cryptography==50.0.2` was already pinned and signs the GA4 assertion).
+
+**Plan section 8, verified**
+
+- *Item 2 (`simple-salesforce`)*: true for the library, false for our purpose. In 1.12.10 (Apache-2.0) every call,
+  Bulk API included, is `session.request` through `call_salesforce`, so it accepts a `requests.Session`. But that is
+  a plain `requests` session (redirects followed, no address check, no pinning, no bounded 429 wait), and Bulk 1.0 is
+  XML/CSV job traffic that `SaasSession` (JSON) cannot carry. **Chosen**: replace the library's HTTP with `SaasSession`
+  calls (REST describe, REST `query` / `queryAll` paged by `nextRecordsUrl`, same origin); the library is not added.
+- *Item 1 (`google-analytics-data`)*: 0.23.3 (Apache-2.0) has a REST transport on `google.auth.transport.requests.AuthorizedSession`,
+  so its HTTP does go through `getaddrinfo` (the gRPC one does not). But it is Google's own session (redirects, no address check
+  before the credential, own token refresh) and the package requires `google-api-core`, `google-auth`, `grpcio`, `proto-plus`,
+  `protobuf`. **Chosen**: `runReport` and `getMetadata` through `SaasSession.post_json` / `get_json`; nothing added.
+  The wheel was read, never run.
+
+**What was found, per vendor**
+
+- *Salesforce object model*: describe-global lists the queryable sObjects (custom `Foo__c` included, decision 5); `SystemModstamp` is
+  the cursor where the object has it, `IsDeleted` makes it read through `queryAll` (marked, not removed; a purged record is not reported);
+  describe answers the exact list the load selects. Objects without a modstamp are re-read in full with the reason.
+  Decision 3/4: Salesforce has **no integration credential** (the page's second-way list does not name it) and the SOAP sign-in is not offered.
+- *Upstream defects fixed in the copy*: no primary key (#692); `>` on the cursor lost same-millisecond records; the SOQL spliced the cursor
+  text; blob fields in a batch query; Bulk API fallback (gone).
+- *`instance_url` (AD3)*: `open_session` asks the first token for a vendor that names `adopt_suffixes` (Salesforce only) and adopts the
+  returned host through `SaasSession.adopt_origin` and the `.salesforce.com` / `.force.com` rule before any read. A refused sign-in
+  therefore surfaces at open for Salesforce, at the first read for the others. `adopt_origin(as_origin=)` lets the gate dial its mock after the
+  real host passed the same rule.
+- *GA4 objects*: a report is `label = dimension, dimension | metric, metric` (the dial's `objects` and the source object's name); the time
+  dimension is the cursor, the dimensions the key. Columns are typed from `getMetadata` before the load.
+- *GA4 upstream defects fixed*: `append` with no key (rerun stored twice); the last days (Google: "Data processing can take 24-48 hours") never
+  re-read; a start after yesterday asked Google for an empty range. Now `merge` on the dimensions, a 3-day lookback moved to the start of a week/month/year
+  for coarse time dimensions, and no request for an empty range.
+- *Found by a loader test*: `sink._apply_cursor` replaced the resource's own `dlt.sources.incremental(...)` and so **dropped any lag**; dlt then
+  filtered out the re-read rows. `ObjectDecl.lag_seconds` (new, default 0) reaches dlt's `incremental(lag=)` through `adapters/saas.py`, and
+  `_apply_cursor` keeps it from `resource.cursor_lag_seconds` (absent for `sql_database`: unchanged). This is a small edit in shared code
+  (`adapters/sink.py`); the whole `test_sink*.py` and `test_adapters_saas.py` suites pass with it.
+- *Vendor rows checked against official documentation* (URLs in the commit bodies): **GA4**: addresses, scope, revocation and PKCE confirmed;
+  **the row was wrong**: Google returns a refresh token only with `access_type=offline` (and again only with `prompt=consent`), so the authorise
+  address now carries both, in Rust, fixture, Python and console. Service-account assertion (RS256, claims, one hour) confirmed.
+  **Salesforce**: `developer.salesforce.com` answered 403 and `help.salesforce.com` serves an empty script shell to this machine, so the
+  addresses, scopes `api refresh_token` and `client_secret_post` are **not re-verified** (kept as slice 1 wrote them). The whoami moved from
+  `/services/oauth2/userinfo` (an identity-scope endpoint, scopes `id`/`openid` that the row does not request; also not verified in the docs)
+  to `/services/data/v62.0/limits` (needs only `api`) in all four places. The acceptance row `SRC-3-AC1` on a real org is the check.
+
+**Plan mismatches / decisions for the planner**
+
+1. **Salesforce's API quota is HTTP 403 `REQUEST_LIMIT_EXCEEDED`**, as far as the developer knows (not verified: docs unreadable). `SaasSession`
+   maps 403 to `SaasPermissionMissing`, so an exhausted quota would be reported as "permission missing" and not "the vendor limited the rate"
+   (decision 13). The mock uses the generic 429 + `Retry-After`, as AD9 asks. Needs a decision (a Salesforce-specific body check in the session).
+2. **No console field defines a GA4 report.** The dial form holds `account` and the sign-in only; `dial.objects` is where reports live, and nothing
+   in the console writes it. Rust accepts the field. A GA4 connector cannot be set up from the UI until a form field exists (not in Vn.1 to Vn.4).
+3. **The API's connection test cannot present a service-account key** (the probe answers `supported: false`, as for any non-token integration
+   credential). A load reports whether it worked. Rust probe work was out of the constraints of this slice.
+4. **A Salesforce query longer than 12,000 characters** (an sObject with very many fields) is a fixed failure: the query travels in the GET address
+   (Salesforce refuses beyond 16,384 bytes) and `SaasSession` has no POST-for-query. Column choice does not shorten it (it is applied after the read).
+5. **GA4's "yesterday" is UTC**, as upstream had it, while Google's `dateRanges` are in the property's time zone.
+6. Salesforce API version is the constant `62.0` (`settings.API_VERSION`, also in the whoami path); not checked against Salesforce's retirement list.
+7. `rest.AuthSession` gained an `instance_url` attribute (set from a token answer; a `rest` connector never reads it).
+
+**Commands run, with counts**
+
+- `cd dagster && ~/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q` (whole suite, once, on the final tree, loader tests
+  included): **1882 passed, 0 failed** (16m33s); the slice 2 baseline was 1797. New files: `test_saas_vendored_salesforce.py` (15),
+  `test_saas_salesforce.py` (23 cases), `test_saas_vendored_google_analytics.py` (16), `test_saas_ga4.py` (30 cases);
+  `test_saas_session.py` +1.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: all OK;
+  `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: 23 tests OK.
+- The gate's vendor steps against the local stub (`python3 ops/g6/saas_stub.py`, then `g6_saas_test.py --vendors-only`, the checkout's
+  `dispar_orchestrate` first on `PYTHONPATH`): 32 `[saas]` lines, `PASS (22 s)` (HubSpot 7, Zendesk 8, Salesforce 8, GA4 8). The stub answers `/health` with
+  hubspot, salesforce, zendesk (and ga4).
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+  `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f ops/g6/docker-compose.g6-saas.override.yml
+  --profile g6-saas --profile dagster config --quiet`: OK.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+
+- **All Rust of this slice** (two strings in `lakehouse-store/src/saas_vendors.rs`: Salesforce's whoami path and Google's authorise address): formatted,
+  **not compiled, not tested**. The CI test that compares the Rust table with `ops/fixtures/saas_vendors.json` is the check; the Python
+  (`test_saas_vendors.py`, plus the two vendors' row tests) and console (`saas-vendors.test.ts`) comparisons passed.
+- **The product steps of `g6-saas` for Salesforce and GA4 have never run** (no docker stack here), nor has the job's time against the 20 minutes. What CI
+  may show that I could not: whether the API accepts an OAuth connector whose client secret and refresh token are `file:` secrets created through the
+  generic `credential` slots (`secret_key` / `token`), whether `PUT .../ingest-spec` accepts the GA4 report text as a source-object name, whether the Rust
+  probe reaches the mock for the Salesforce `limits` path and GA4 `metadata` path (`gate_rebase`), and the ClickHouse column names (`id`, `name`,
+  `is_deleted`, `sessions_integer`, `date`) and the JSON type of a Bool column.
+- **No real Salesforce org or GA4 property** (decision 11): every shape is from the documentation I could read (GA4) or from the library and my knowledge
+  (Salesforce), modelled in the mocks.
+- **Salesforce's official documentation** (see above) and its quota status code.
+- The GA4 gRPC/REST transport claim was read in the wheel, not run (the package is not installed).
+- Nothing was shown in a browser.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
