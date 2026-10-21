@@ -793,6 +793,57 @@ was built (disk 2.3 to 5 GB free); the Rust was written and checked with `cargo 
 - The report editor was not shown in a browser.
 - Salesforce's own documentation, still unreadable from this machine.
 
+### Handoff: slice 4 (developer, 2026-10-21)
+
+ServiceNow, then Confluence (Vn.1 to Vn.4), base `7ddb2be8`. Disk was 2.2 to 2.3 GB: **no cargo build, check,
+clippy or test ran and no image was built**; Rust was checked with `cargo fmt --check` only.
+
+| Task | Commit | Subject |
+| --- | --- | --- |
+| V-ServiceNow.1 | `df7544f9` | Table API through `SaasSession`, `Link` header paging, `sys_updated_on` cursor, client credentials; `SaasSession.get_json_with_next` |
+| V-ServiceNow.2 | `fab36244` | objects (suggested + by name), declaration from a sample record, describe via `sys_dictionary` |
+| V-ServiceNow.3 + Confluence row | `35c632f3` | vendor-table rows (fixture, Rust, Python, console), probe for ServiceNow client credentials and Confluence Basic |
+| V-ServiceNow.4 | `95de67b7` | mock ServiceNow, vendor-level and product gate steps |
+| V-Confluence.1 to .3 (Python) | `db3757f1` | objects, cursor paging, newest-first incremental, both sign-ins, gateway cloud id (`AccountParts.base_path`, `oauth.apiBase`) |
+| V-Confluence.4 | `12f0f9cf` | mock Confluence, vendor-level and product gate steps (`max_reads`) |
+| docs | `34371707` | limits on the feature page, `docs/CI.md` |
+
+**Choice asked for (plan section 8 item 3).** Both vendors call their endpoints through `SaasSession` directly (as slice 3),
+not a dlt `rest_api` source: dlt's `RESTClient` takes a `requests.Session`, but the address check and pinning before each request,
+credentials only after it, no redirects, the bounded `Retry-After` and the same-origin link rule are in `SaasSession._send`. The records go to the usual dlt resource. No library added.
+
+**Found against the vendors' documentation (URLs in the commit bodies)**
+- *Confluence row was wrong in four ways*: the token endpoint takes JSON (`clientAuth` -> `post_json`); the authorise address needs `audience=api.atlassian.com&prompt=consent`; `read:blogpost:confluence` does not exist (v2 OpenAPI scopes are `read:space|page|comment:confluence`; blog posts use `read:page`); a browser token is accepted only at `api.atlassian.com/ex/confluence/{cloudId}`. The last is a new optional `oauth.apiBase` in the table (fixed host, AD2); the cloud id comes from `accessible-resources`, matched to the site address, validated as a UUID, stored in the new `AccountParts.base_path`. The rotating refresh token uses the existing report path (tested).
+- *ServiceNow row*: addresses and the client-credentials grant (form body) confirmed; revocation is `GET oauth_revoke_token.do?token=`, not RFC 7009, so the table's revocation address is dropped (as Zendesk's).
+- *Confluence incremental (decision 6)*: `/pages`, `/blogposts` and both comment lists sort by `-modified-date` (OpenAPI `PageSortOrder`, `BlogPostSortOrder`, `CommentSortOrder`), so the read walks newest first and stops at the first record older than the cursor; sound because the order is by the cursor's own field. Spaces have no sort/filter by time and are re-read in full.
+- *ServiceNow paging*: by the `Link` header, not offset, because `sysparm_limit` is applied before the access check (a short page is not the last). 
+- *Loader test finding*: dlt cannot apply a lag to a string cursor (`IncrementalCursorInvalidCoercion`), so both vendors load their change time as a timestamp.
+
+**Plan mismatches / decisions for the planner**
+1. **ServiceNow date literal time zone**: the Table API page does not say whether a date in `sysparm_query` is UTC or the user's zone; the cursor therefore lags one day (`LAG_SECONDS`) and the merge removes repeats. Confluence's 300 s lag is our margin, not a documented figure. Both on the feature page.
+2. **No deletes claimed** for either (decision 7): `sys_audit_delete` was not tried (access unknown); Confluence's trashed content just drops out of the listing.
+3. **ServiceNow describe** needs read access to `sys_dictionary`/`sys_db_object`; with 403 it answers `None` (after-load path). Unknown whether ordinary integration roles can read them.
+4. **API connection test for Confluence browser sign-in is `supported: false`** ("not testable", nothing sent): it would need the cloud-id request in Rust. The browser way is proved at vendor level only; the product steps use email + API token. Rust work to add if the planner wants it.
+5. **ServiceNow user + password** (named in the brief as an alternative) is not built: the signed page (decision 3) names client credentials for ServiceNow, and the table's integration slots are `clientId`/`clientSecret`.
+6. `integration_auth` now receives `parts=` (GA4 ignores it). `AccountParts` gained `base_path`. `get_json_with_next` is new on the session.
+7. Which form Atlassian sends for `_links.next` behind the gateway (with or without the `/ex/confluence/<id>` prefix) was not observed; both handled and tested, the mock models the prefix-less one.
+8. Confluence bodies (storage format) are loaded for pages, blog posts and comments; attachments are not.
+9. The `35c632f3` commit holds the ServiceNow row work and the Confluence row work together (same files).
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree, loader tests included; `df -h /` 2.3 GB before): **1942 passed, 0 failed** (16m49s; slice 3 baseline 1886). New: `test_saas_servicenow.py` 30, `test_saas_confluence.py` 17, `test_saas_session.py` +4.
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK; `python3 -m unittest discover -s ops/lint -p 'test_*.py'`: OK.
+- `bun test src/lib/connectors`: 49 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 348 pass, 0 fail. (`bun run typecheck`/`lint` not re-run: only `saas-vendors.ts` changed, one optional field.) `bash scripts/ci/tests/test_required_gate.sh`: 52 passed.
+- Gate vendor-level steps against the local stub (`PORT=18999 python3 ops/g6/saas_stub.py`, then `g6_saas_test.py --vendors-only`, checkout on `PYTHONPATH`): `PASS (32 s)`, six vendors.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **All Rust** (the `OauthPreset.api_base` field and the table rows; the probe's ServiceNow client-credentials exchange, Confluence Basic, the "not testable" arm; four new unit tests and the changed ones): formatted, **not compiled, not tested**. The tests that compare the Rust table with the fixture (`the_table_equals_the_shared_fixture`, serde `skip_serializing_if` for `apiBase`) run in CI.
+- **The product steps of `g6-saas` for ServiceNow and Confluence, and the job's time**, did not run (no docker stack). CI may show: the API's connection test reaching the mock for `/oauth_token.do` and `/wiki/api/v2/spaces` through `gate_rebase`, the Bronze column names (`sys_id`, `modified_at`), whether `incremental_dedup` accepts `modified_at`/`sys_updated_on` timestamps, and the `max_reads` count of 2.
+- **No real ServiceNow instance or Atlassian site** (decision 11): every shape is from the documentation pages read, modelled in the mocks and fakes. Not tried: the dictionary tables, `sys_audit_delete`, the client-credentials grant's set-up, Atlassian's PKCE handling (the product sends PKCE; Atlassian's page does not mention it), the `_links.next` form.
+- Pages not readable from here: none for the points above; ServiceNow's release pages disagree on the revoke prerequisites (noted in the commit).
+- Nothing was shown in a browser; no console change beyond the table copy (the connector form for Confluence/ServiceNow comes from the table).
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
