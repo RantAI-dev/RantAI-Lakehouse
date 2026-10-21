@@ -3518,7 +3518,7 @@ services:
 
   # SRC-3 (T1.12, AD9): the mock vendor server of the SaaS gate, one container
   # for every vendor (each on its own path prefix). Gate-only: its own profile,
-  # started by the `g6-saas` job and nothing else. It holds no data and no
+  # started by the two `g6-saas-*` jobs and nothing else. It holds no data and no
   # credential; it is reachable only on the compose network.
   saas-stub-g6:
     build:

@@ -2371,19 +2371,24 @@ jobs:
         if: always()
         run: docker compose -p src13scaleci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml --profile src13-scale down -v
 
-  # ── SRC-3 (business-app connectors, plan AD9): the gate of the SaaS adapter.
-  # Own job, so no existing connector gate grows: `g6-ingest-other` measured
+  # ── SRC-3 (business-app connectors, plan AD9 amended before slice 6): the gate of
+  # the SaaS adapter, in TWO jobs on the same scripts, selected by `SAAS_GATE_VENDORS`
+  # (`ops/g6/g6_saas_test.py`): `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow)
+  # and `g6-saas-b` (Confluence, SharePoint, Dynamics 365, Workday, NetSuite). One job
+  # with eight vendors took 16m17s of the signed 20 minutes; ten would not fit, and no step
+  # is removed to make them. The jobs run in parallel, each on its own compose project.
+  # Own jobs, so no existing connector gate grows: `g6-ingest-other` measured
   # 14m53s to 18m36s of its 20 minutes (docs/plans/SRC-9-RESULT.md). One mock
   # vendor server (`saas-stub-g6`, profile `g6-saas`) answers for every vendor
   # on the vendor's own port. Since the slice 2 review (BLOCKER 4) the gate goes
   # through the product: connectors created through the API, the API's connection
   # test, discovery and loads through Dagster into Bronze Iceberg, read back through
-  # ClickHouse; so the job runs the Dagster stack as `g6-ingest-other` does, with the
+  # ClickHouse; so each job runs the Dagster stack as `g6-ingest-other` does, with the
   # gate-only switches of `ops/g6/docker-compose.g6-saas.override.yml` on the API and
-  # the code location. Budget: the signed 20 minutes for connector gates; the first CI
-  # runs are its measurement (the job summary has the gate's lines and times). ──
-  g6-saas:
-    name: Rust · SRC-3 business-app connectors
+  # the code location. Budget: the signed 20 minutes for connector gates, per job; the
+  # job summary has the gate's lines and times. ──
+  g6-saas-a:
+    name: Rust · SRC-3 business-app connectors (A)
     needs: [changes, images]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -2391,8 +2396,9 @@ jobs:
     env:
       LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
       LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+      SAAS_GATE_VENDORS: hubspot,zendesk,salesforce,ga4,servicenow
       COMPOSE: >-
-        docker compose -p saasgci -f docker-compose.yml
+        docker compose -p saasagci -f docker-compose.yml
         -f ops/g6/docker-compose.g6.override.yml
         -f ops/g6/docker-compose.g6-saas.override.yml
         --profile g6-saas --profile dagster
@@ -2464,7 +2470,105 @@ jobs:
         shell: bash
         run: |
           {
-            echo '### SRC-3 business-app connectors'
+            echo '### SRC-3 business-app connectors (A: HubSpot, Zendesk, Salesforce, GA4, ServiceNow)'
+            echo '```'
+            grep -E '^\[saas\]' "$RUNNER_TEMP/saas.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: $COMPOSE logs
+
+      - name: Tear down the project
+        if: always()
+        run: $COMPOSE down -v
+
+
+  g6-saas-b:
+    name: Rust · SRC-3 business-app connectors (B)
+    needs: [changes, images]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dagster == 'true' || needs.changes.outputs.stack == 'true' || needs.changes.outputs.all == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LAKEHOUSE_API_IMAGE: rantai-lakehouse-api:ci
+      LAKEHOUSE_DAGSTER_IMAGE: rantai-lakehouse-dagster:ci
+      SAAS_GATE_VENDORS: confluence,sharepoint,dynamics365,workday,netsuite
+      COMPOSE: >-
+        docker compose -p saasbgci -f docker-compose.yml
+        -f ops/g6/docker-compose.g6.override.yml
+        -f ops/g6/docker-compose.g6-saas.override.yml
+        --profile g6-saas --profile dagster
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download image artifacts (lakehouse-api + dagster)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-lakehouse-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+
+      - name: Load images
+        run: |
+          for f in "$RUNNER_TEMP"/images/*.tar.zst; do
+            zstd -dc "$f" | docker load
+          done
+
+      - name: Write CI-only .env
+        # Obviously fake values of a throwaway stack. The mysql/mssql/mariadb/
+        # sftp/mongo values are only here because the g6 override interpolates
+        # `${VAR:?}` for every service, started or not.
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MARIADB_G6_ROOT_PASSWORD=ci-mariadb-not-real-123
+          CONNECTOR_MARIADB_PASSWORD=ci-mariadb-connector-not-real-123
+          SFTP_G6_PASSWORD=ci-sftp-not-real-123
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          PIPELINE_RUN_TOKEN=ci-pipeline-run-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          # PR #216 CI g6-saas: the API's own default is an unreachable host, so discovery and
+          # runs answered 503 "orchestrator could not be reached"; as the other Dagster-backed gates do.
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          UPLOAD_S3_ACCESS_KEY=ci-only-rustfs-access
+          UPLOAD_S3_SECRET_KEY=ci-only-rustfs-secret-0001
+          # SEC-18: docker-compose.yml has no default credentials. CI-ONLY
+          # throwaway values for this job's own throwaway stack; they protect
+          # nothing and are never used outside it.
+          POSTGRES_PASSWORD=ci-only-pg-password-0001
+          RUSTFS_ACCESS_KEY=ci-only-rustfs-access
+          RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
+          LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          EOF
+          # SEC-36: generated per run; no key-shaped literal in the repository.
+          echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
+
+      - name: Build the fixture images (oidc-mock, saas-stub-g6)
+        run: $COMPOSE build oidc-mock saas-stub-g6
+
+      - name: Bring up the API, Dagster and the mock vendor server
+        run: $COMPOSE up -d --no-build lakehouse-api dagster-code-location dagster-webserver dagster-daemon saas-stub-g6
+
+      - name: Gate, business-app connectors
+        shell: bash
+        run: |
+          $COMPOSE run --rm -T --no-deps g6-saas-test-runner 2>&1 | tee "$RUNNER_TEMP/saas.log"
+
+      - name: Add the gate's lines to the job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### SRC-3 business-app connectors (B: Confluence, SharePoint, Dynamics 365, Workday, NetSuite)'
             echo '```'
             grep -E '^\[saas\]' "$RUNNER_TEMP/saas.log" 2>/dev/null || true
             echo '```'
@@ -2813,7 +2917,8 @@ jobs:
       - g6-secret-managers
       - g6-oauth
       - g6-discovery-scale
-      - g6-saas
+      - g6-saas-a
+      - g6-saas-b
       - gold-export
       - g8-governance
       - g8-time-travel
@@ -2862,7 +2967,8 @@ jobs:
           G6_SECRET_MANAGERS_RESULT: ${{ needs.g6-secret-managers.result }}
           G6_OAUTH_RESULT: ${{ needs.g6-oauth.result }}
           G6_DISCOVERY_SCALE_RESULT: ${{ needs.g6-discovery-scale.result }}
-          G6_SAAS_RESULT: ${{ needs.g6-saas.result }}
+          G6_SAAS_A_RESULT: ${{ needs.g6-saas-a.result }}
+          G6_SAAS_B_RESULT: ${{ needs.g6-saas-b.result }}
           GOLD_EXPORT_RESULT: ${{ needs.gold-export.result }}
           G8_GOVERNANCE_RESULT: ${{ needs.g8-governance.result }}
           G8_TIME_TRAVEL_RESULT: ${{ needs.g8-time-travel.result }}

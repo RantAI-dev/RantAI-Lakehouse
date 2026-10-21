@@ -497,6 +497,9 @@ services:
       # refuses unless these are on. The main compose file sets neither.
       CONNECTOR_OAUTH_ALLOW_HTTP: "true"
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
+      # SRC-3 AD9 amended (slice 6): the vendors this job owns, comma separated. `g6-saas-a` and
+      # `g6-saas-b` set it; empty (a local run) means every vendor.
+      SAAS_GATE_VENDORS: ${SAAS_GATE_VENDORS:-}
       PYTHONPATH: /opt/gates
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint: ["/bin/sh", "-c"]

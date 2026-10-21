@@ -1367,16 +1367,43 @@ def step_product(vendor_id: str) -> None:
     _log(f"{vendor_id} product steps took {time.time() - started:.0f} s")
 
 
-def run_vendors() -> None:
+# Slice 6 (AD9 amended, planner addendum of 2026-10-21): the gate runs as two CI jobs on these
+# same scripts, each told which vendors it owns. `g6-saas-a` and `g6-saas-b` split the ten so that
+# neither passes the signed 20 minutes; the lists are in `docs/CI.md` and `.github/workflows/ci.yml`.
+# Unset or empty means every vendor (a local run, `--vendors-only`).
+VENDOR_STEPS = {
+    "hubspot": lambda: step_hubspot(),
+    "zendesk": lambda: step_zendesk(),
+    "salesforce": lambda: step_salesforce(),
+    "ga4": lambda: step_ga4(),
+    "servicenow": lambda: step_servicenow(),
+    "confluence": lambda: step_confluence(),
+    "sharepoint": lambda: step_sharepoint(),
+    "dynamics365": lambda: step_dynamics365(),
+}
+
+
+def selected_vendors() -> list[str]:
+    """The vendor ids this run owns, from `SAAS_GATE_VENDORS` (comma separated) or the first
+    `--vendors=` argument; empty means all. An id the stub does not serve is a failure of the
+    gate's own set-up, not a vendor to skip (principle 2: nothing quietly not run)."""
+    raw = os.environ.get("SAAS_GATE_VENDORS", "")
+    for arg in sys.argv[1:]:
+        if arg.startswith("--vendors="):
+            raw = arg.split("=", 1)[1]
+    chosen = [v.strip() for v in raw.split(",") if v.strip()]
+    unknown = [v for v in chosen if v not in saas_stub.VENDOR_PORTS]
+    if unknown:
+        raise SaasGateFailure(f"SAAS_GATE_VENDORS names vendors the mock does not serve: {unknown}")
+    return chosen or list(saas_stub.VENDOR_PORTS)
+
+
+def run_vendors(vendors: list[str] | None = None) -> None:
     _setup_vendor_environment()
-    step_hubspot()
-    step_zendesk()
-    step_salesforce()
-    step_ga4()
-    step_servicenow()
-    step_confluence()
-    step_sharepoint()
-    step_dynamics365()
+    wanted = vendors if vendors is not None else selected_vendors()
+    for vendor, step in VENDOR_STEPS.items():
+        if vendor in wanted:
+            step()
 
 
 def run() -> None:
@@ -1386,10 +1413,14 @@ def run() -> None:
     step_stub_is_up()
     step_types_are_listed_unsupported()
     _setup_vendor_environment()
+    wanted = selected_vendors()
+    _log(f"this job owns: {', '.join(wanted)}")
     for product_key, spec in PRODUCT_VENDORS.items():
+        if spec.get("vendor", product_key) not in wanted:
+            continue
         admin(spec.get("vendor", product_key), action="reset")
         step_product(product_key)
-    run_vendors()
+    run_vendors(wanted)
 
 
 def main() -> int:
