@@ -52,8 +52,18 @@ def test_every_vendor_refuses_a_value_outside_its_host_pattern(vendor_id: str, v
         vendors.vendor(vendor_id).validate_account(value)
 
 
+def test_workday_accepts_one_to_three_labels_under_its_two_fixed_suffixes() -> None:
+    """Slice 6 review SHOULD-FIX 15."""
+    row = vendors.vendor("workday")
+    for value in ["wd2.workday.com/t", "wd2-impl-services1.workday.com/t", "services1.wd503.myworkday.com/t", "a.b.c.myworkday.com/t_1"]:
+        assert row.validate_account(value).host == value.split("/")[0]
+    assert row.validate_account("Services1.WD503.myworkday.com/acme").host == "services1.wd503.myworkday.com"
+    with pytest.raises(vendors.InvalidAccount):
+        row.validate_account("wd2.workday.org/t")
+
+
 def test_the_near_misses_of_workday_dataverse_and_netsuite_are_refused() -> None:
-    for value in ["wd2.workday.com", "wd2.workday.com/", "wd2.workday.com/a/b", "a.b.workday.com/t",
+    for value in ["wd2.workday.com", "wd2.workday.com/", "wd2.workday.com/a/b", "a.b.c.d.workday.com/t", ".workday.com/t", "a..b.workday.com/t", "a.-b.workday.com/t",
                   "wd2.workday.com.evil.invalid/t", "wd2.example.invalid/t", "wd2.workday.com:443/t"]:  # fmt: skip
         with pytest.raises(vendors.InvalidAccount):
             vendors.vendor("workday").validate_account(value)

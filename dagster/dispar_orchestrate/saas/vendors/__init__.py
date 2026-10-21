@@ -319,6 +319,12 @@ def _is_label(text: str) -> bool:
     )
 
 
+def _is_workday_prefix(prefix: str) -> bool:
+    """One to three DNS labels before a Workday suffix, each valid (slice 6 review SHOULD-FIX 15)."""
+    labels = prefix.split(".")
+    return 1 <= len(labels) <= 3 and all(_is_label(label) for label in labels)
+
+
 def _is_tenant(text: str) -> bool:
     return bool(text) and len(text) <= 64 and all(c.isascii() and (c.isalnum() or c in "-_") for c in text)
 
@@ -371,7 +377,7 @@ def _validate_account(rule: dict[str, Any], account: str) -> AccountParts:
     if kind == "host_tenant":
         host, slash, tenant = account.partition("/")
         lowered = host.lower()
-        if slash and any(lowered.endswith(s) and _is_label(lowered[: -len(s)]) for s in rule["suffixes"]) and _is_tenant(tenant):
+        if slash and any(lowered.endswith(s) and _is_workday_prefix(lowered[: -len(s)]) for s in rule["suffixes"]) and _is_tenant(tenant):
             return AccountParts(f"{lowered}/{tenant}", lowered, tenant)
     raise InvalidAccount()
 

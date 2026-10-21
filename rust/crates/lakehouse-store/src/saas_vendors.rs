@@ -48,7 +48,7 @@ pub enum AccountRule {
     /// Dynamics 365 (slice 5): `<org>.crm<N>.dynamics.com/<tenant>`, a [`Self::DataverseHost`]
     /// and the customer's Microsoft Entra tenant.
     DataverseHostTenant,
-    /// `<host>/<tenant>`: `host` is one label under one of `suffixes`, and
+    /// `<host>/<tenant>`: `host` is one to three labels under one of `suffixes`, and
     /// `tenant` a name of letters, digits, `-` and `_`.
     HostTenant {
         /// The domains the host must end with, each with its leading dot.
@@ -174,6 +174,19 @@ pub const OAUTH_AUTH_TYPE: &str = "oauth2_authorization_code";
 /// connector (`SRC-12` part C).
 pub const OAUTH_SECRET_FIELDS: &[&str] = &["clientSecret", "refreshToken"];
 
+/// One to three DNS labels before a Workday suffix, each a valid label (`SRC-3` slice 6 review
+/// SHOULD-FIX 15). The suffix itself is never taken from the input.
+fn is_workday_prefix(prefix: &str) -> bool {
+    let mut labels = 0;
+    for label in prefix.split('.') {
+        labels += 1;
+        if !is_label(label) {
+            return false;
+        }
+    }
+    labels <= 3
+}
+
 fn is_label(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 63
@@ -290,7 +303,7 @@ impl SaasVendor {
                 let lowered = host.to_ascii_lowercase();
                 let label_ok = suffixes
                     .iter()
-                    .any(|suffix| lowered.strip_suffix(suffix).is_some_and(is_label));
+                    .any(|suffix| lowered.strip_suffix(suffix).is_some_and(is_workday_prefix));
                 (label_ok && is_tenant(tenant))
                     .then(|| AccountParts {
                         account: format!("{lowered}/{tenant}"),
@@ -720,6 +733,25 @@ mod tests {
         }
     }
 
+    /// `SRC-3` slice 6 review SHOULD-FIX 15: Workday tenants are also reached on multi-label hosts.
+    #[test]
+    fn workday_accepts_one_to_three_labels_under_its_two_fixed_suffixes() {
+        let workday = vendor("workday").unwrap();
+        for value in [
+            "wd2.workday.com/t",
+            "wd2-impl-services1.workday.com/t",
+            "services1.wd503.myworkday.com/t",
+            "a.b.c.myworkday.com/t_1",
+        ] {
+            assert!(workday.validate_account(value).is_ok(), "{value:?}");
+        }
+        let parts = workday
+            .validate_account("Services1.WD503.myworkday.com/acme")
+            .unwrap();
+        assert_eq!(parts.host, "services1.wd503.myworkday.com");
+        assert!(workday.validate_account("wd2.workday.org/t").is_err());
+    }
+
     #[test]
     fn workday_dataverse_and_netsuite_refuse_their_own_near_misses() {
         let workday = vendor("workday").unwrap();
@@ -727,7 +759,10 @@ mod tests {
             "wd2.workday.com",
             "wd2.workday.com/",
             "wd2.workday.com/a/b",
-            "a.b.workday.com/t",
+            "a.b.c.d.workday.com/t",
+            ".workday.com/t",
+            "a..b.workday.com/t",
+            "a.-b.workday.com/t",
             "wd2.workday.com.evil.invalid/t",
             "wd2.example.invalid/t",
             "https://wd2.workday.com/t",
