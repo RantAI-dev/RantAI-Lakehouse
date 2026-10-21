@@ -8,6 +8,13 @@ import type { SaasDial } from "@/services/contracts/connectors"
 
 type SignIn = "browser" | "integration"
 
+/** The dial without NetSuite's certificate id (a copy; the server refuses the id with a browser sign-in). */
+function withoutCertificate(dial: SaasDial): SaasDial {
+  const copy = { ...dial }
+  delete copy.certificateId
+  return copy
+}
+
 /**
  * `dial` for the `saas` adapter (`SRC-3`): the vendor is the connector type the
  * person picked, so this form asks for only two things, the one part of the
@@ -43,8 +50,9 @@ export function SaasDialForm({
   }
   const signIn: SignIn = dial.auth.type === "integration" ? "integration" : "browser"
   function setSignIn(next: SignIn) {
+    // The certificate id belongs to NetSuite's integration credential only: the server refuses it with a browser sign-in.
     onChange({
-      ...dial,
+      ...(next === "integration" ? dial : withoutCertificate(dial)),
       vendor: (vendor as SaasVendor).id,
       auth: next === "integration" ? { type: "integration" } : { type: "oauth2_authorization_code", clientId: "" },
     })
@@ -84,6 +92,24 @@ export function SaasDialForm({
           </p>
         ) : null}
       </div>
+
+      {vendor.id === "netsuite" && dial.auth.type === "integration" ? (
+        <div className="space-y-1.5">
+          <Label htmlFor="saas-dial-certificate-id">Certificate ID</Label>
+          <Input
+            id="saas-dial-certificate-id"
+            value={dial.certificateId ?? ""}
+            onChange={(e) => {
+              onChange({ ...withoutCertificate(dial), vendor: vendor.id, ...(e.target.value ? { certificateId: e.target.value } : {}) })
+            }}
+            autoComplete="off"
+          />
+          <p className="text-xs text-muted-foreground">
+            The ID NetSuite shows for the certificate in Setup, Integration, OAuth 2.0 Client Credentials (M2M) Setup.
+            The client ID and the private key are entered as the credential.
+          </p>
+        </div>
+      ) : null}
 
       {dial.auth.type === "oauth2_authorization_code" ? (
         <>

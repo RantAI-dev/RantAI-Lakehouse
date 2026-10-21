@@ -28,6 +28,7 @@ import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import { TableActionsMenu } from "./connector-table-actions"
 import { Ga4ReportEditor } from "./ga4-report-editor"
+import { WorkdayReportEditor } from "./workday-report-editor"
 import { SharepointSitePicker } from "./sharepoint-site-picker"
 import { FINDER_WORDS, finderKind, TableFinder } from "./table-finder"
 import { useColumnPreviews, type PreviewEntry } from "./use-discovery"
@@ -398,8 +399,10 @@ function IngestEditor({
   const isGa4 = adapter === "saas" && spec.dial.vendor === "ga4"
   // Slice 5 review BLOCKER 14: a SharePoint connector's sites are picked, and the picks are the dial's `objects`.
   const isSharepoint = adapter === "saas" && spec.dial.vendor === "sharepoint"
-  const keepsDialObjects = isGa4 || isSharepoint
-  const manualAdd = finder !== "sql" && finder !== "kafka" && !isGa4
+  // Slice 6: a Workday connector's reports are named by owner and name, and are the dial's `objects` too.
+  const isWorkday = adapter === "saas" && spec.dial.vendor === "workday"
+  const keepsDialObjects = isGa4 || isSharepoint || isWorkday
+  const manualAdd = finder !== "sql" && finder !== "kafka" && !isGa4 && !isWorkday
   const savedReports = React.useMemo(
     () => (Array.isArray(spec.dial.objects) ? spec.dial.objects.filter((o: unknown): o is string => typeof o === "string") : []),
     [spec.dial]
@@ -536,6 +539,12 @@ function IngestEditor({
         ? current
         : [...current, { ...newTable(text), target: defaultTarget(connectorName, label), loadMode: "incremental_dedup", incrementalKey: cursor, primaryKey: key }]
     )
+  }
+
+  /** A Workday report: kept in the dial's `objects` and ticked, read in full on every run (the default mode replaces the table). */
+  function addWorkdayReport(text: string) {
+    setReports((current) => (current.includes(text) ? current : [...current, text]))
+    setSelection((current) => (current.some((s) => s.name === text) ? current : [...current, newTable(text, text.slice(text.indexOf("/") + 1))]))
   }
 
   function removeReport(text: string) {
@@ -702,6 +711,7 @@ function IngestEditor({
           wide={page}
         />
       ) : null}
+      {isWorkday ? <WorkdayReportEditor reports={reports} onAdd={addWorkdayReport} onRemove={removeReport} /> : null}
       {isGa4 ? (
         <Ga4ReportEditor connectorId={connectorId} reports={reports} onAdd={addReport} onRemove={removeReport} />
       ) : null}

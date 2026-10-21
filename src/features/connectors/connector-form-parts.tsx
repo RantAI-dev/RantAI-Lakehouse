@@ -213,7 +213,9 @@ function saasCredentialSlots(dial: Record<string, unknown> | null): CredentialSl
   const authType = (dial?.auth as { type?: unknown } | undefined)?.type
   if (authType === "integration" && vendor?.integration) {
     const [first, second] = vendor.integration.secretFields.map((field) => SAAS_FIELD_SLOTS[field] ?? PASSWORD)
-    return { primary: first ?? PASSWORD, secondary: second ?? null }
+    // Slice 6: Workday asks for the integration system user as `user@tenant`, sent exactly as saved.
+    const primary = vendor.id === "workday" && first ? { ...first, label: "Integration system user (as user@tenant)" } : (first ?? PASSWORD)
+    return { primary, secondary: second ?? null }
   }
   return {
     primary: { kind: "secret_key", label: "Client secret" },

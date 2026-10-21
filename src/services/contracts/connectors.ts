@@ -764,6 +764,8 @@ export type SaasDial = {
   /** Objects the person names where the vendor has no listing of them. */
   objects?: string[]
   auth: { type: "oauth2_authorization_code"; clientId: string } | { type: "integration" }
+  /** NetSuite's integration credential only: the id of the certificate uploaded in NetSuite (the assertion's `kid`). */
+  certificateId?: string
 }
 
 /**

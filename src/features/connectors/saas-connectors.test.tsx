@@ -50,6 +50,21 @@ describe("SaasDialForm", () => {
     expect(onChange.mock.calls[0][0]).toEqual(integration("zendesk"))
   })
 
+  it("asks NetSuite's integration credential for its certificate id, and drops it with a browser sign-in (slice 6)", () => {
+    const onChange = mock()
+    render(<SaasDialForm typeName="NetSuite" value={integration("netsuite")} onChange={onChange} />)
+    fireEvent.change(screen.getByLabelText("Certificate ID"), { target: { value: "cert-1" } })
+    expect(onChange.mock.calls[0][0]).toEqual({ ...integration("netsuite"), certificateId: "cert-1" })
+    cleanup()
+    const switched = mock()
+    render(<SaasDialForm typeName="NetSuite" value={{ ...integration("netsuite"), certificateId: "cert-1" }} onChange={switched} />)
+    fireEvent.change(screen.getByLabelText("How it signs in"), { target: { value: "browser" } })
+    expect(switched.mock.calls[0][0]).not.toHaveProperty("certificateId")
+    cleanup()
+    render(<SaasDialForm typeName="Zendesk" value={integration("zendesk")} onChange={mock()} />)
+    expect(screen.queryByLabelText("Certificate ID")).toBeNull()
+  })
+
   it("shows the callback address for the browser sign-in and says when the operator has not set one", () => {
     render(<SaasDialForm typeName="Zendesk" value={oauth("zendesk")} onChange={mock()} oauthCallbackUrl="https://console.example.invalid/cb" />)
     expect(screen.getByTestId("oauth-callback").textContent).toContain("https://console.example.invalid/cb")
@@ -79,6 +94,14 @@ describe("credential slots of a saas connector", () => {
     expect(hubspot.secondary).toBeNull()
     const ga4 = credentialSlotsFor("saas", integration("ga4") as unknown as Record<string, unknown>)
     expect(ga4.primary.multiline).toBe(true)
+  })
+
+  it("Workday asks for the integration system user as user@tenant and NetSuite for a client id and a private key (slice 6)", () => {
+    const workday = credentialSlotsFor("saas", integration("workday") as unknown as Record<string, unknown>)
+    expect([workday.primary.label, workday.secondary?.label]).toEqual(["Integration system user (as user@tenant)", "Password"])
+    const netsuite = credentialSlotsFor("saas", integration("netsuite") as unknown as Record<string, unknown>)
+    expect([netsuite.primary.label, netsuite.secondary?.label]).toEqual(["Client ID", "Private key"])
+    expect(netsuite.secondary?.multiline).toBe(true)
   })
 
   it("every integration vendor yields as many slots as its table row has fields", () => {
