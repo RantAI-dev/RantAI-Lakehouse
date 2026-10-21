@@ -44,7 +44,7 @@ import saas_stub
 
 STUB_URL = os.environ.get("SAAS_STUB_URL", "http://saas-stub-g6:8080")
 
-# The names `0095_saas_connector_types.sql` inserts, and the vendor ids of
+# The names `0095_saas_connector_types.sql` inserts (`0096` flips eight), and the vendor ids of
 # `ops/fixtures/saas_vendors.json` they stand for.
 SAAS_TYPES = (
     "Salesforce",
@@ -73,7 +73,12 @@ def step_stub_is_up() -> None:
     _log("the mock vendor server answers /health")
 
 
-def step_types_are_listed_unsupported() -> None:
+# SRC-3 decision 10, migration 0096: these two are built and pass this gate against their mocks, but stay
+# unsupported until a test on a real account. The other eight of SAAS_TYPES are supported.
+STILL_UNSUPPORTED = ("Workday Reports", "NetSuite")
+
+
+def step_types_are_listed() -> None:
     resp = matrix.API.get(f"{matrix.API_URL}/api/connectors/types", timeout=15)
     if not resp.ok:
         raise SaasGateFailure(f"GET /api/connectors/types answered {resp.status_code}")
@@ -85,14 +90,21 @@ def step_types_are_listed_unsupported() -> None:
         found = types[name]
         if found.get("adapter") != "saas":
             raise SaasGateFailure(f"{name}: adapter {found.get('adapter')!r}, expected 'saas'")
-        if found.get("supported") is not False:
-            raise SaasGateFailure(f"{name}: supported {found.get('supported')!r}; slice 1 has no gate step for it yet")
-        if not (found.get("unsupportedReason") or "").strip():
-            raise SaasGateFailure(f"{name}: unsupported with no reason")
+        reason = (found.get("unsupportedReason") or "").strip()
+        if name in STILL_UNSUPPORTED:
+            if found.get("supported") is not False:
+                raise SaasGateFailure(f"{name}: supported {found.get('supported')!r}; decision 10 keeps it off until a real account")
+            if not reason:
+                raise SaasGateFailure(f"{name}: unsupported with no reason")
+        else:
+            if found.get("supported") is not True:
+                raise SaasGateFailure(f"{name}: supported {found.get('supported')!r}; 0096 flips it and this gate proves it")
+            if reason:
+                raise SaasGateFailure(f"{name}: supported but still carries the reason {reason!r}")
     others = sorted(t["name"] for t in types.values() if t.get("adapter") == "saas" and t["name"] not in SAAS_TYPES)
     if others:
         raise SaasGateFailure(f"types outside the ten have the saas adapter: {others}")
-    _log(f"the ten business-app types are listed, unsupported, with a reason: {', '.join(SAAS_TYPES)}")
+    _log(f"the ten business-app types are listed; supported: {', '.join(n for n in SAAS_TYPES if n not in STILL_UNSUPPORTED)}; unsupported with a reason: {', '.join(STILL_UNSUPPORTED)}")
 
 
 # ---- the vendors' steps ------------------------------------------------------------------------
@@ -1690,7 +1702,7 @@ def run() -> None:
     matrix.step_login()
     matrix.step_ensure_tenant()
     step_stub_is_up()
-    step_types_are_listed_unsupported()
+    step_types_are_listed()
     _setup_vendor_environment()
     wanted = selected_vendors()
     _log(f"this job owns: {', '.join(wanted)}")

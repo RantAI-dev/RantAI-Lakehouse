@@ -24,7 +24,8 @@ use sqlx::PgPool;
 
 /// `0035` seeds sixteen connector types: ten `supported = true` rows with a
 /// named `adapter`, and six `supported = false` roadmap rows. `0095` (`SRC-3`
-/// T1.1) adds the ten business-app types, so there are twenty-six.
+/// T1.1) adds the ten business-app types, so there are twenty-six; `0096`
+/// (T7.1) flips eight of them and adds none.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -39,7 +40,8 @@ async fn seeds_sixteen_connector_types(pool: PgPool) -> sqlx::Result<()> {
 }
 
 /// The ten business-app types of `0095` (`SRC-3` T1.1, AD10): unsupported
-/// until the last slice, with a reason, and with `adapter = 'saas'` from the
+/// until the last slice (`0096` flips eight, see `SAAS_STILL_UNSUPPORTED`),
+/// with a reason, and with `adapter = 'saas'` from the
 /// start, for the reason `0062` gives for Google Sheets: `Dial::parse` already
 /// has their shape, and a connector created with one must open in the edit
 /// page, which resolves the dial form from the adapter. Named, like the rest.
@@ -56,27 +58,27 @@ const SAAS_TYPES: [&str; 10] = [
     "SharePoint",
 ];
 
-/// The unsupported types that carry a reason and keep an adapter.
-const TYPES_WITH_REASON_AND_ADAPTER: [&str; 13] = [
+/// The two `saas` types `0096` (`SRC-3` T7.1, decision 10) leaves
+/// unsupported: built and gate-tested against mocks, waiting for a test on a
+/// real account.
+const SAAS_STILL_UNSUPPORTED: [&str; 2] = ["Workday Reports", "NetSuite"];
+
+/// The unsupported types that carry a reason and keep an adapter: the earlier
+/// named three and the two `saas` types above. The other eight `saas` types
+/// are supported after `0096` and carry no reason.
+const TYPES_WITH_REASON_AND_ADAPTER: [&str; 5] = [
     "Google Sheets",
     "MySQL CDC",
     "SQL Server CDC",
-    "Salesforce",
-    "ServiceNow",
     "Workday Reports",
-    "Google Analytics 4",
-    "HubSpot",
-    "Zendesk",
-    "Confluence",
-    "Dynamics 365",
     "NetSuite",
-    "SharePoint",
 ];
 
-/// Every `supported = false` row other than the thirteen that keep an adapter
+/// Every `supported = false` row other than the five that keep an adapter
 /// has `adapter = NULL` — there is no `Dial::parse` shape yet for a type this
 /// build cannot dial. Google Sheets (`SRC-6` F5, `0062`), `MySQL` CDC / SQL
-/// Server CDC (`SRC-9` decision 8, `0066`) and the ten `saas` types (`0095`)
+/// Server CDC (`SRC-9` decision 8, `0066`) and the two still-unsupported
+/// `saas` types (`0095`, `0096`)
 /// keep their adapter so existing connectors still open. The list is named,
 /// not loosened for other rows.
 #[sqlx::test(migrations = "../../migrations")]
@@ -171,8 +173,8 @@ async fn mysql_and_sql_server_cdc_are_listed_as_unsupported_with_a_reason(
     Ok(())
 }
 
-/// `0062`, `0066` and `0095`: only Google Sheets, `MySQL` CDC, `SQL Server` CDC
-/// and the ten `saas` types carry a reason; the other roadmap rows keep the
+/// `0062`, `0066` and `0096`: only Google Sheets, `MySQL` CDC, `SQL Server` CDC
+/// and the two still-unsupported `saas` types carry a reason; the other roadmap rows keep the
 /// generic "Not available yet" in the console, and supported rows have none.
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_the_named_types_have_an_unsupported_reason(pool: PgPool) -> sqlx::Result<()> {
@@ -191,10 +193,12 @@ async fn only_the_named_types_have_an_unsupported_reason(pool: PgPool) -> sqlx::
     Ok(())
 }
 
-/// `0095` (`SRC-3` T1.1, AD10): the ten business-app types are listed,
-/// unsupported, with the reason "Being built (SRC-3)." and the `saas` adapter.
+/// `0095` and `0096` (`SRC-3` T1.1, T7.1, AD10): the ten business-app types are
+/// listed with the `saas` adapter; the eight with a passing gate are supported
+/// and carry no reason, Workday Reports and `NetSuite` (decision 10) stay
+/// unsupported with a reason that says they wait for a real account.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_ten_business_app_types_are_listed_unsupported_with_the_saas_adapter(
+async fn the_ten_business_app_types_are_listed_and_eight_are_supported(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let types = list_connector_types(&pool)
@@ -205,13 +209,15 @@ async fn the_ten_business_app_types_are_listed_unsupported_with_the_saas_adapter
             .iter()
             .find(|t| t.name == name)
             .expect("the type must be listed");
-        assert!(!found.supported, "{found:?}");
         assert_eq!(found.adapter.as_deref(), Some("saas"), "{found:?}");
-        assert_eq!(
-            found.unsupported_reason.as_deref(),
-            Some("Being built (SRC-3)."),
-            "{found:?}"
-        );
+        if SAAS_STILL_UNSUPPORTED.contains(&name) {
+            assert!(!found.supported, "{found:?}");
+            let reason = found.unsupported_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("real account"), "{found:?}");
+        } else {
+            assert!(found.supported, "{found:?}");
+            assert!(found.unsupported_reason.is_none(), "{found:?}");
+        }
     }
     Ok(())
 }

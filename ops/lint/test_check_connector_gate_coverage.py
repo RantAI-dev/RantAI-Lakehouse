@@ -55,13 +55,16 @@ def entry(gate="g6", steps=None, waiver=None) -> dict:
 
 
 class SupportedTypesTests(unittest.TestCase):
-    def test_the_real_migrations_list_eleven_supported_types_and_not_google_sheets(self) -> None:
+    def test_the_real_migrations_list_nineteen_supported_types_and_not_google_sheets(self) -> None:
         names = check.supported_types(REPO_ROOT / "rust" / "migrations")
-        self.assertEqual(len(names), 11)  # 13 before SRC-9 decision 8 (0066)
+        self.assertEqual(len(names), 19)  # 13 before SRC-9 decision 8 (0066); 11 after it; +8 saas types in 0096 (SRC-3 T7.1)
         self.assertNotIn("MySQL CDC", names)
         self.assertNotIn("SQL Server CDC", names)
         self.assertNotIn("Google Sheets", names)
         self.assertIn("Oracle", names)
+        self.assertIn("Salesforce", names)
+        self.assertNotIn("Workday Reports", names)  # SRC-3 decision 10: waits for a real account
+        self.assertNotIn("NetSuite", names)
 
     def test_inserted_rows_are_supported_by_their_flag_and_a_dash_dash_inside_a_string_is_text(self) -> None:
         names = check.supported_types(migrations(CREATE + INSERT))
