@@ -725,6 +725,109 @@ def step_confluence() -> None:
     _log("confluence forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+def _sharepoint(auth: str = "integration", state_account: str = "acme/00000000-0000-0000-0000-0000000000a1"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import sharepoint as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "sharepoint", "account": state_account, "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        # Entra replaces the refresh token on every refresh: ask the mock which one is current.
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": admin("sharepoint", action="refresh_token")["refresh_token"]}
+    else:
+        dial = {"vendor": "sharepoint", "account": state_account, "auth": {"type": "integration"}}
+        secrets = {"clientId": "sp-app", "clientSecret": "sp-secret"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+SP_ACCOUNT = "acme/00000000-0000-0000-0000-0000000000a1"
+SP_OBJECT = "acme.sharepoint.com,11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222/55555555-5555-4555-8555-555555555555"
+
+
+def _read_state(module, parts, session, dial, state: dict, name: str = SP_OBJECT) -> list[dict]:  # noqa: ANN001
+    decl = module.declaration(session, parts, dial, name)
+    return list(module.read(session, parts, dial, decl, since=None, state=state))
+
+
+def step_sharepoint() -> None:
+    """SharePoint (V-SharePoint.4): connect (client credentials and the browser sign-in, both at the customer's tenant),
+    discover (the lists of the sites, no library), load (the Graph delta feed, its link kept in the state), reload (only
+    the changes, a delete marked), a 410 Gone as a full resync, a new column, rate limit, forbidden and revoked sign-in."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("sharepoint", action="reset")
+
+    for auth in ("integration", "oauth"):
+        _m, vendor, parts, session, _dial = _sharepoint(auth)
+        who = session.get_json(vendor.render(vendor.whoami["path"], parts))
+        _expect(who.get("displayName") == "Team", f"sharepoint connect ({auth}): who-am-i answered {who!r}")
+    _log("sharepoint connect: client credentials (scope .default) and the browser sign-in (refresh grant, the refresh token replaced) both reach Graph through the customer's tenant")
+
+    module, _vendor, parts, session, dial = _sharepoint()
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect(list(declared) == [SP_OBJECT], f"sharepoint discover: {sorted(declared)}")
+    _expect(declared[SP_OBJECT].load_description() == "incremental" and declared[SP_OBJECT].deletes, "sharepoint discover: the list should load incrementally and report deletes")
+    _log("sharepoint discover: one list of the one non-personal site; the document library is not offered (files are not loaded)")
+
+    admin("sharepoint", action="clear_log")
+    state: dict = {}
+    first = _read_state(module, parts, session, dial, state)
+    _expect([r["id"] for r in first] == ["1", "2", "3", "4", "5"], f"sharepoint load: first run read {[r['id'] for r in first]}")
+    _expect(len([line for line in mock_log("sharepoint") if "/delta" in line]) == 3, "sharepoint load: the feed's @odata.nextLink was not followed to the third page")
+    _expect(state.get("delta_link", "").endswith("/delta?token=v5"), f"sharepoint load: the delta link kept is {state!r}")
+    _log("sharepoint load: 5 items over 3 pages of the delta feed; its delta link is kept in the state")
+
+    admin("sharepoint", action="put", id=2, fields={"Title": "item 2 changed"})
+    admin("sharepoint", action="put", id=6)
+    admin("sharepoint", action="delete", id=3)
+    admin("sharepoint", action="clear_log")
+    again = {r["id"]: r for r in _read_state(module, parts, session, dial, state)}
+    _expect(sorted(again) == ["2", "3", "6"], f"sharepoint reload: read {sorted(again)}, expected the changed (2), the deleted (3) and the new (6)")
+    _expect(again["3"]["is_deleted"] is True and set(again["3"]) == {"id", "is_deleted", "modified_at"}, "sharepoint reload: the delete is not marked")
+    _expect(any("token=v5" in line for line in mock_log("sharepoint")), "sharepoint reload: the saved link was not opened")
+    _log("sharepoint reload: only the changed, the new and the deleted item came back by the saved delta link; the delete is marked (is_deleted)")
+
+    admin("sharepoint", action="put", id=7)
+    admin("sharepoint", action="expire", on=True)
+    admin("sharepoint", action="clear_log")
+    resync = _read_state(module, parts, session, dial, state)
+    _expect(sorted(r["id"] for r in resync) == ["1", "2", "4", "5", "6", "7"], f"sharepoint resync: read {sorted(r['id'] for r in resync)}")
+    _expect(state["delta_link"].endswith("/delta?token=v9"), f"sharepoint resync: the new link is {state!r}")
+    admin("sharepoint", action="expire", on=False)
+    _log("sharepoint resync: a 410 Gone on the saved link made a full read from a token-less delta; the new link was kept")
+
+    admin("sharepoint", action="add_field", name="Region")
+    _expect(any("field_Region" in r for r in _read_state(module, parts, session, dial, {})), "sharepoint schema change: the new column is not in the records")
+    _log("sharepoint schema change: the new column arrives in the records; SharePoint has no describe, so the observer reports it after the load (decision 9)")
+
+    admin("sharepoint", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read_state(module, parts, session, dial, None)) >= 1, "sharepoint rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "sharepoint rate limit: the Retry-After was not waited")
+    admin("sharepoint", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read_state(module, parts, session, dial, None))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "sharepoint rate limit: the run report class")
+    admin("sharepoint", action="rate_limit", count=0)
+    _log("sharepoint rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("sharepoint", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read_state(module, parts, session, dial, None))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "sharepoint forbidden: the run report class")
+    admin("sharepoint", action="forbid", on=False)
+    admin("sharepoint", action="revoke", on=True)
+
+    def sign_in_and_read(auth: str) -> list[dict]:
+        m, _v, p, sess, d = _sharepoint(auth)
+        return _read_state(m, p, sess, d, None)
+
+    exc = _raises("OAuthSignInRefused", lambda: sign_in_and_read("integration"))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "sharepoint revoked: the run report class")
+    exc = _raises("OAuthSignInRefused", lambda: sign_in_and_read("oauth"))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "sharepoint revoked: the browser sign-in's run report class")
+    admin("sharepoint", action="revoke", on=False)
+    _log("sharepoint forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def _ga4_row_ids() -> set[str]:
     """`country|date` of every row the mock holds, read from the mock when the step needs it."""
     days = admin("ga4", action="days")["days"]
@@ -805,6 +908,44 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 6},
         ],
         "reads_marker": ("/pages",), "max_reads": 2,
+    },
+    # SharePoint (V-SharePoint.4): both signed ways. Client credentials: the API's connection test and the orchestrator
+    # exchange the app's id and secret at the customer's tenant (the tenant is part of the account, AD2). A list is read by
+    # the Graph delta feed; a delete is marked in Bronze. SharePoint has no describe, so the preview is honestly unsupported.
+    "sharepoint": {
+        "type": "SharePoint", "host": "graph.microsoft.com", "account": SP_ACCOUNT, "label": "SharePoint",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "sp-app", "secondary": "sp-secret"},
+        "object": SP_OBJECT, "target": "saas_gate_sharepoint_tasks", "cursor": "modified_at", "text": "field_title", "key": "id",
+        "columns": "id, field_title, modified_at, is_deleted", "preview_columns": None,
+        "first_ids": {"1", "2", "3", "4", "5"}, "reload_ids": {"1", "2", "3", "4", "5", "6"},
+        "changed_id": "2", "deleted_id": "3",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"Title": "item 2 changed"}},
+            {"action": "put", "id": 6},
+            {"action": "delete", "id": 3},
+        ],
+        "reads_marker": ("token=v",),
+    },
+    # The browser sign-in: the app's secret and a refresh token are files; the mock must not replace the refresh token
+    # (a file cannot take the new one; the vendor-level step covers the replacement).
+    "sharepoint-browser": {
+        "vendor": "sharepoint",
+        "type": "SharePoint", "host": "graph.microsoft.com", "account": SP_ACCOUNT, "label": "SharePoint (browser sign-in)",
+        "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"},
+        "credential": {"source": "file", "primary": "secret_key", "secondary": "token"},
+        "values": {"primary": "stub-client-secret", "secondary": "stub-sp-refresh-0"},
+        "before": [{"action": "rotate", "on": False}],
+        "object": SP_OBJECT, "target": "saas_gate_sharepoint_browser_tasks", "cursor": "modified_at", "text": "field_title", "key": "id",
+        "columns": "id, field_title, modified_at, is_deleted", "preview_columns": None,
+        "first_ids": {"1", "2", "3", "4", "5"}, "reload_ids": {"1", "2", "3", "4", "5", "6"},
+        "changed_id": "2", "deleted_id": "3",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"Title": "item 2 changed"}},
+            {"action": "put", "id": 6},
+            {"action": "delete", "id": 3},
+        ],
+        "reads_marker": ("token=v",),
     },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
@@ -1010,6 +1151,9 @@ def step_product(vendor_id: str) -> None:
         _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
     elif vendor_id == "confluence":
         _expect(len(by_id) == 6, "confluence reload: a page was lost or stored twice")
+    elif vendor_id == "sharepoint":
+        _expect(by_id["3"]["is_deleted"] in (True, 1, "true") and by_id["1"]["is_deleted"] in (False, 0, "false"), "sharepoint reload: the delete is not marked is_deleted in Bronze")
+        _expect(len(by_id) == 6, "sharepoint reload: an item was lost or stored twice")
     elif vendor_id == "servicenow":
         _expect(len(by_id) == 4, "servicenow reload: an incident was lost or stored twice")
     elif vendor_id == "zendesk":
@@ -1029,6 +1173,7 @@ def step_product(vendor_id: str) -> None:
              "salesforce": "the changed and the new record merged on the key, no duplicate; the deleted account says is_deleted (queryAll)",
              "confluence": "the changed and the new page merged on id, no duplicate; the read stopped near the cursor (no delete is claimed)",
              "servicenow": "the changed and the new incident merged on sys_id, no duplicate (no delete is claimed)",
+             "sharepoint": "the changed and the new item merged on id from the saved delta link, no duplicate; the deleted item says is_deleted",
              "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
          }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
 
@@ -1054,6 +1199,7 @@ def run_vendors() -> None:
     step_ga4()
     step_servicenow()
     step_confluence()
+    step_sharepoint()
 
 
 def run() -> None:
