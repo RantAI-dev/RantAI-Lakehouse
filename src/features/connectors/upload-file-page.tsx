@@ -22,7 +22,7 @@ import { useUploadQueue } from "./use-upload-queue"
 import { columnSpecOf } from "@/lib/uploads"
 
 const STEPS: FormStep[] = [
-  { id: "file", label: "File", description: "Choose CSV, TSV, Excel or Parquet files" },
+  { id: "file", label: "File", description: "Choose CSV, TSV, JSON, Avro, Excel or Parquet files" },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
   { id: "review", label: "Review", description: "Load the file" },
@@ -267,7 +267,7 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring CSV, TSV, Excel or Parquet files in as raw tables. Check how the first one is read, name the table, then load it."
+        description="Bring CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables. Check how the first one is read, name the table, then load it."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

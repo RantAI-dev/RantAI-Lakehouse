@@ -9,13 +9,16 @@ import { useRefreshable } from "@/hooks/use-refreshable"
 import {
   UPLOAD_DELIMITERS,
   UPLOAD_ENCODINGS,
+  archiveProblem,
   delimiterLabel,
   encodingLabel,
+  hasFixedDialect,
   headerRowDisplay,
   headerRowFromDisplay,
 } from "@/lib/uploads"
+import { formatBytes } from "@/lib/format"
 import { uploadService } from "@/services"
-import type { UploadParseOptions, UploadPreview } from "@/services/contracts/uploads"
+import type { UploadArchive, UploadParseOptions, UploadPreview } from "@/services/contracts/uploads"
 import type { ServiceError } from "@/services/errors"
 import { Refusal, UploadNotice } from "./upload-parts"
 import { UploadPreviewGrid } from "./upload-preview-grid"
@@ -111,8 +114,11 @@ export function useUploadPreview(uploadId: string | null) {
       setHeaderText(null)
       setTable(null)
     },
-    /** Only a preview of the settings in force, with at least one column, lets the person go on. */
-    ready: settled !== null && settled.columns.length > 0 && headerProblem === null,
+    /**
+     * Only a preview of the settings in force, with at least one column, lets the person
+     * go on; and a zip whose files do not all have the first file's columns does not load.
+     */
+    ready: settled !== null && settled.columns.length > 0 && headerProblem === null && archiveProblem(settled.archive) === null,
   }
 }
 
@@ -141,6 +147,9 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
 
   const workbook = shown?.workbook
   const parquet = shown?.parquet
+  const layout = shown?.layout
+  // JSON, JSON Lines and Avro: the keys or fields are the header, as the footer is for Parquet.
+  const fixedDialect = parquet !== undefined || hasFixedDialect(layout)
   // SEC-17: with no preview yet, the first option says the service detects
   // the value, and it is not one to choose.
   const undecided = { value: "", label: "Detected by the service", disabled: true }
@@ -166,6 +175,16 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
         <UploadNotice>
           This is a Parquet file, so there is nothing to read here: its column names are the header, and each
           column starts with the type the file declares for it. You can change a name or a type below.
+        </UploadNotice>
+      ) : hasFixedDialect(layout) ? (
+        // `DATA-17` slice 4: the same for JSON, JSON Lines and Avro.
+        <UploadNotice>
+          {layout?.format === "avro"
+            ? "This is an Avro file, so there is nothing to read here: its field names are the header, and each column starts with the type the schema declares for it."
+            : `This is ${layout?.format === "jsonl" ? "a JSON Lines" : "a JSON"} file, so there is nothing to read here: the keys of the objects are the header, a key an object lacks is left empty, and each column starts with a type guessed from its values.`}{" "}
+          {layout?.format === "avro"
+            ? "A record, array or map is kept as JSON text in one column. You can change a name or a type below."
+            : "A value that is an object or a list is kept as JSON text in one column. You can change a name or a type below."}
         </UploadNotice>
       ) : (
       <div className={workbook ? "grid gap-4 sm:grid-cols-2" : "grid gap-4 sm:grid-cols-3"}>
@@ -249,6 +268,13 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
         </div>
       </div>
       )}
+      {layout?.compression === "gzip" ? (
+        <UploadNotice>
+          This file is compressed with gzip. It is read as it is once unpacked, and what it unpacks to counts toward
+          the 50 MB limit.
+        </UploadNotice>
+      ) : null}
+      {shown?.archive ? <UploadArchiveList files={shown.archive.files} problem={archiveProblem(shown.archive)} /> : null}
       {workbook ? (
         <UploadNotice>
           Numbers are read as the cell holds them, without its display format (1234.5, not 1,234.50), and dates as
@@ -273,7 +299,7 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
 
       {shown === null ? null : shown.columns.length === 0 ? (
         <p role="alert" className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm">
-          {parquet
+          {fixedDialect
             ? "This file has no columns."
             : "The header row has no columns: it is past the part of the file that was read, or it is an empty line. Choose another header row to go on."}
         </p>
@@ -288,6 +314,46 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
           ) : null}
         </>
       )}
+    </div>
+  )
+}
+
+/**
+ * The files of a zip as rows (`DATA-17` slice 4): name, size once unpacked and how many columns
+ * each has. The first one is what the preview and the column list below show; a file whose
+ * columns differ from it is marked, and Next stays off until the zip is uploaded again.
+ */
+function UploadArchiveList({
+  files,
+  problem,
+}: {
+  readonly files: UploadArchive["files"]
+  readonly problem: string | null
+}) {
+  return (
+    <div className="space-y-2">
+      <ul aria-label="Files in the zip" className="divide-y divide-border overflow-hidden rounded-lg border border-border text-sm">
+        {files.map((file, index) => (
+          <li key={`${index}-${file.name}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
+            <span className="min-w-0 flex-1 basis-40 truncate font-medium" title={file.name}>
+              {file.name}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {formatBytes(file.sizeBytes)} · {file.columns} {file.columns === 1 ? "column" : "columns"}
+            </span>
+            {file.matchesFirst ? (
+              index === 0 ? <span className="text-xs text-muted-foreground">Shown below</span> : null
+            ) : (
+              <span className="text-xs font-medium text-destructive">Different columns</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      {problem !== null ? (
+        <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {problem}
+        </p>
+      ) : null}
     </div>
   )
 }

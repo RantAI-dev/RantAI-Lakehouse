@@ -1,7 +1,16 @@
 "use client"
 
 import type { LucideIcon } from "lucide-react"
-import { Columns3Icon, FileIcon, FileSpreadsheetIcon, FileTextIcon, InfoIcon, TriangleAlertIcon } from "lucide-react"
+import {
+  BracesIcon,
+  Columns3Icon,
+  FileArchiveIcon,
+  FileIcon,
+  FileSpreadsheetIcon,
+  FileTextIcon,
+  InfoIcon,
+  TriangleAlertIcon,
+} from "lucide-react"
 import { ErrorState } from "@/components/patterns/page-states"
 import { Pill } from "@/components/patterns/status-badge"
 import { formatDateTime } from "@/lib/format"
@@ -78,9 +87,15 @@ export function Refusal({ error }: { readonly error: ServiceError }) {
  * over `zinc-900`, 7.1:1 over black), computed from the Tailwind palette
  * values; the app's own card colours were not measured.
  */
+// `DATA-17` slice 4 adds no colour: JSON takes the text tone, Avro (a typed, columnar format
+// like Parquet) the Parquet tone, and an archive the neutral one, so the contrast numbers
+// above are all there are.
 const MARK_TONE = {
   workbook: "bg-emerald-500/12 text-emerald-700 dark:text-emerald-400",
   parquet: "bg-violet-500/12 text-violet-700 dark:text-violet-400",
+  avro: "bg-violet-500/12 text-violet-700 dark:text-violet-400",
+  json: "bg-primary/10 text-primary",
+  archive: "bg-muted text-muted-foreground",
   delimited: "bg-primary/10 text-primary",
   other: "bg-muted text-muted-foreground",
 } as const
@@ -91,11 +106,15 @@ export function FileMark({ name, variant }: { readonly name: string; readonly va
   const Icon =
     kind === "workbook"
       ? FileSpreadsheetIcon
-      : kind === "parquet"
+      : kind === "parquet" || kind === "avro"
         ? Columns3Icon
-        : kind === "delimited"
-          ? FileTextIcon
-          : FileIcon
+        : kind === "json"
+          ? BracesIcon
+          : kind === "archive"
+            ? FileArchiveIcon
+            : kind === "delimited"
+              ? FileTextIcon
+              : FileIcon
   return (
     <span
       aria-hidden

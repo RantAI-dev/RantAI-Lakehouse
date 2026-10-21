@@ -236,6 +236,30 @@ export type UploadPartReceipt = {
 }
 
 /**
+ * What a JSON, JSON Lines, Avro, gzip or zip file is read as (`DATA-17` slice 4).
+ * Mirrors Rust `LayoutView` (`routes/uploads.rs`). `format` is `delimited`, `json`,
+ * `jsonl` or `avro`; `compression` is `none`, `gzip` or `zip`.
+ */
+export type UploadLayout = {
+  format: "delimited" | "json" | "jsonl" | "avro" | string
+  compression: "none" | "gzip" | "zip" | string
+}
+
+/** One file of a zip archive. Mirrors Rust `ArchiveFileView`. */
+export type UploadArchiveFile = {
+  name: string
+  /** Its size once unpacked, as the archive declares it. */
+  sizeBytes: number
+  /** How many columns its header, keys or fields give. */
+  columns: number
+  /** Whether it has the first file's columns, whatever their order. A load needs every file to. */
+  matchesFirst: boolean
+}
+
+/** The files of a zip archive, in the archive's order. */
+export type UploadArchive = { files: UploadArchiveFile[] }
+
+/**
  * `GET /api/uploads/{id}/preview`: what the first bytes of the file contain.
  * Never the size of the file: a preview does not count what it did not read.
  */
@@ -272,6 +296,14 @@ export type UploadPreview = {
    * names (row 1), and none of the three settings is the person's to choose.
    */
   parquet?: UploadParquet
+  /**
+   * Present when the file is JSON, JSON Lines, Avro, gzip or zip: what it is read as. For
+   * JSON and Avro `detected` and `using` read UTF-8 and a comma and the keys or fields are
+   * the header, as for Parquet; a gzip or zip of delimited text keeps the three settings.
+   */
+  layout?: UploadLayout
+  /** Present when the file is a zip: its files, and whether each has the first file's columns. */
+  archive?: UploadArchive
   /** Every column with its name, starting type and date reading (`DATA-18`). */
   columnSpecs: UploadPreviewColumn[]
   /** How many data rows the guess read (at most 10,000, or 16 MiB). */

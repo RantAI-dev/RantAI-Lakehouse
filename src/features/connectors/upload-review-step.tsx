@@ -3,7 +3,15 @@
 import * as React from "react"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { columnTypeLabel, delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
+import {
+  columnTypeLabel,
+  delimiterLabel,
+  encodingLabel,
+  hasFixedDialect,
+  headerRowDisplay,
+  layoutLabel,
+  rawTableFullName,
+} from "@/lib/uploads"
 import type { Upload, UploadLoadMode, UploadOnBadValue, UploadPreviewColumn } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
 import { Refusal } from "./upload-parts"
@@ -83,16 +91,27 @@ export function UploadReviewStep({
                   { label: "Columns", value: String(settled.columns.length) },
                   { label: "Rows in the file", value: formatNumber(settled.parquet.rows) },
                 ]
-              : [
-                  ...(settled?.workbook
-                    ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
-                    : [
-                        { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
-                        { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
-                      ]),
-                  { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
-                  { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
-                ]),
+              : settled?.layout && hasFixedDialect(settled.layout)
+                ? [
+                    { label: "Format", value: layoutLabel(settled.layout) },
+                    { label: "Columns", value: String(settled.columns.length) },
+                  ]
+                : [
+                    ...(settled?.layout
+                      ? [{ label: "Format", value: layoutLabel(settled.layout) }]
+                      : []),
+                    ...(settled?.archive
+                      ? [{ label: "Files in the zip", value: String(settled.archive.files.length) }]
+                      : []),
+                    ...(settled?.workbook
+                      ? [{ label: "Sheet", value: <Wrapped>{settled.workbook.sheet}</Wrapped> }]
+                      : [
+                          { label: "Encoding", value: using ? encodingLabel(using.encoding) : "—" },
+                          { label: "Delimiter", value: using ? delimiterLabel(using.delimiter) : "—" },
+                        ]),
+                    { label: "Header row", value: using ? String(headerRowDisplay(using.headerRow)) : "—" },
+                    { label: "Columns", value: settled ? String(settled.columns.length) : "—" },
+                  ]),
           ]}
         />
         <Group

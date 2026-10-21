@@ -17,7 +17,9 @@ import type {
   UploadColumnSpec,
   UploadColumnType,
   UploadDateFormat,
+  UploadArchive,
   UploadEncoding,
+  UploadLayout,
   UploadPreviewColumn,
   UploadStatus,
 } from "@/services/contracts/uploads"
@@ -229,25 +231,25 @@ export function fileSizeProblem(name: string, sizeBytes: number): string | null 
 }
 
 /**
- * The sentence for a file a person must not send, and the extensions it is
- * for. The words follow the API's `WORKBOOK`, `PARQUET` and `OTHER_BINARY`
- * (`routes/uploads.rs`); the API still decides by content, so a file that
- * passes here can be refused there (a `.parquet` with a binary column, say),
- * and only a name that is clearly neither
- * delimited text, nor an `.xls` / `.xlsx` workbook, nor a `.parquet` file is refused here. The
- * workbook kinds the API does not open (`.xlsm`, `.xlsb`, `.ods`) and
- * archives are refused with the workbook sentence.
+ * The extensions of files a person must not send. The words follow the API's
+ * `WORKBOOK` and `OTHER_BINARY` (`routes/uploads.rs`); the API still decides by
+ * content, so a file that passes here can be refused there (a `.parquet` with a
+ * binary column, say), and only a name that is clearly not a kind it reads is
+ * refused here. The workbook kinds the API does not open (`.xlsm`, `.xlsb`,
+ * `.ods`) and the archives it does not open (anything but `.gz` and `.zip`)
+ * are refused with the workbook-or-archive sentence.
  */
 const WORKBOOK_EXTENSIONS = ["xlsm", "xlsb", "ods"]
-const ARCHIVE_EXTENSIONS = ["zip", "gz", "tgz", "bz2", "xz", "7z", "rar", "tar"]
-const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "avro", "orc", "db", "sqlite"]
+const ARCHIVE_EXTENSIONS = ["tgz", "bz2", "xz", "7z", "rar", "tar"]
+const OTHER_BINARY_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "orc", "db", "sqlite"]
 
 /**
  * Why a file cannot be sent judging by its NAME alone, or `null`. A workbook
- * the API does not read, an archive or another binary is
- * refused at once, before any byte is sent, in words consistent with the
- * API's. `.xls`, `.xlsx` and `.parquet` pass: the API opens them, and refuses
- * one that does not open, in its own sentence. A name with no
+ * the API does not read, an archive it does not read (`.tar`, `.7z` ...) or
+ * another binary is refused at once, before any byte is sent, in words
+ * consistent with the API's. `.xls`, `.xlsx`, `.parquet`, `.json`, `.jsonl`,
+ * `.ndjson`, `.avro`, `.gz` and `.zip` pass: the API opens them, and refuses one
+ * that does not open, in its own sentence. A name with no
  * extension or an unknown one (`.txt`, `.dat`, an extension-less export) is
  * never refused here: it may be delimited text, and the API judges content.
  * Case does not matter.
@@ -257,10 +259,10 @@ export function fileKindProblem(name: string): string | null {
   if (dot < 0) return null
   const extension = name.slice(dot + 1).toLowerCase()
   if (WORKBOOK_EXTENSIONS.includes(extension) || ARCHIVE_EXTENSIONS.includes(extension)) {
-    return `${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first.`
+    return `${name} looks like a workbook or an archive this upload does not read. Excel workbooks must be .xls or .xlsx, and archives .gz or .zip; or save the sheet as .xlsx or CSV first.`
   }
   if (OTHER_BINARY_EXTENSIONS.includes(extension)) {
-    return `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
+    return `${name} is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.`
   }
   return null
 }
@@ -344,8 +346,8 @@ export function rawTableFullName(table: string): string {
   return `bronze.${table}`
 }
 
-/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, CSV or TSV text, or anything else. */
-export type UploadFileKind = "workbook" | "parquet" | "delimited" | "other"
+/** What a chosen file looks like to the eye: an Excel workbook, a Parquet file, a JSON, JSON Lines or Avro file, an archive (gzip, zip), CSV or TSV text, or anything else. */
+export type UploadFileKind = "workbook" | "parquet" | "json" | "avro" | "archive" | "delimited" | "other"
 
 /** The extension of a file name, lower-cased, or `""` when there is none (`.csv` alone and `a.` have none). */
 function extensionOf(name: string): string {
@@ -362,6 +364,9 @@ export function uploadFileKind(name: string): UploadFileKind {
   const extension = extensionOf(name)
   if (extension === "xls" || extension === "xlsx") return "workbook"
   if (extension === "parquet") return "parquet"
+  if (extension === "json" || extension === "jsonl" || extension === "ndjson") return "json"
+  if (extension === "avro") return "avro"
+  if (extension === "gz" || extension === "zip") return "archive"
   if (extension === "csv" || extension === "tsv") return "delimited"
   return "other"
 }
@@ -374,6 +379,42 @@ export function uploadFileLabel(name: string): string | null {
   const extension = extensionOf(name)
   if (extension === "" || extension.length > MAX_LABEL_CHARS || !/^[a-z0-9]+$/.test(extension)) return null
   return extension.toUpperCase()
+}
+
+// ── JSON, Avro, gzip and zip (`DATA-17` slice 4) ──────────────────────────
+
+/** Whether the file has no encoding, delimiter or header row to choose: its keys or fields are the columns. */
+export function hasFixedDialect(layout: UploadLayout | undefined): boolean {
+  return layout !== undefined && layout.format !== "delimited"
+}
+
+/** What a file is read as, in words (`JSON`, `CSV or TSV in a gzip file`), for the Review step. */
+export function layoutLabel(layout: UploadLayout): string {
+  const what =
+    layout.format === "json"
+      ? "JSON"
+      : layout.format === "jsonl"
+        ? "JSON Lines"
+        : layout.format === "avro"
+          ? "Avro"
+          : "CSV or TSV"
+  if (layout.compression === "gzip") return `${what} in a gzip file`
+  if (layout.compression === "zip") return `${what} in a zip archive`
+  return what
+}
+
+/**
+ * Why a zip cannot be loaded as it is, or `null`: a file whose columns differ from the first
+ * file's. The API refuses the same load (`ZIP_COLUMNS_DIFFER`); this tells the person on the
+ * Check step, where Next stays off.
+ */
+export function archiveProblem(archive: UploadArchive | undefined): string | null {
+  if (archive === undefined) return null
+  const different = archive.files.filter((file) => !file.matchesFirst)
+  if (different.length === 0) return null
+  return `${different.length === 1 ? "One file" : `${different.length} files`} of the zip ${
+    different.length === 1 ? "does not have" : "do not have"
+  } the same columns as the first. A zip loads whole, so make the files agree and upload it again.`
 }
 
 // ── Column types (`DATA-18`) ──────────────────────────────────────────────

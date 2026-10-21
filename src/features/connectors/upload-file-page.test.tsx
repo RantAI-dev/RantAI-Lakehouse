@@ -227,7 +227,7 @@ describe("UploadFilePage, first step", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("stock.XLSM")
-    expect(alert.textContent).toContain("not an .xls or .xlsx file")
+    expect(alert.textContent).toContain("looks like a workbook or an archive")
     expect(alert.textContent).toContain("save the sheet as .xlsx or CSV first")
     expect(next().disabled).toBe(true)
     fireEvent.click(next())
@@ -240,12 +240,14 @@ describe("UploadFilePage, first step", () => {
     const facts = new Map(
       screen.getAllByRole("term").map((term) => [term.textContent, term.nextElementSibling?.textContent])
     )
-    expect(facts.get("Accepted")).toBe("CSV, TSV, .xls, .xlsx, .parquet")
+    expect(facts.get("Accepted")).toBe("CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip")
     expect(facts.get("Files")).toContain("Up to 10 at once")
     expect(facts.get("Size")).toBe("Up to 50 MB in all")
-    expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, archives")
+    expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, .tar, .7z and other archives")
     expect(facts.get("Workbooks")).toContain("One sheet is loaded")
-    expect(facts.get("Parquet")).toContain("binary or nested column is refused")
+    expect(facts.get("Parquet and Avro")).toContain("binary column is refused")
+    expect(facts.get("JSON")).toContain("nested value is kept as JSON text")
+    expect(facts.get("Compressed")).toContain("up to 10 files of one format")
     const input = screen.getByLabelText("Choose files") as HTMLInputElement
     expect(input.type).toBe("file")
     expect(input.multiple).toBe(true)
@@ -254,13 +256,17 @@ describe("UploadFilePage, first step", () => {
     expect(input.accept).toContain(".xls")
     expect(input.accept).toContain(".xlsx")
     expect(input.accept).toContain(".parquet")
+    expect(input.accept).toContain(".json")
+    expect(input.accept).toContain(".avro")
+    expect(input.accept).toContain(".gz")
+    expect(input.accept).toContain(".zip")
   })
 
   it("is a drop area with one line, a button labelling the real file input, and the page's subtitle names Excel", () => {
     stubFetch()
     render(<UploadFilePage />)
     expect(screen.getByText("Drop files here, or choose some")).toBeDefined()
-    expect(screen.getByText(/CSV, TSV, Excel or Parquet files in as raw tables/)).toBeDefined()
+    expect(screen.getByText(/CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables/)).toBeDefined()
     const input = screen.getByLabelText("Choose files")
     const button = screen.getByText("Choose files", { selector: "label" })
     expect(button.getAttribute("for")).toBe(input.id)
@@ -325,7 +331,7 @@ describe("UploadFilePage, first step", () => {
     const area = screen.getByText("Drop files here, or choose some").closest("[data-dragging]") as HTMLElement
     fireEvent.drop(area, { dataTransfer: { files: [new File(["x"], "stock.XLSM")] } })
     const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("not an .xls or .xlsx file")
+    expect(alert.textContent).toContain("looks like a workbook or an archive")
     expect(next().disabled).toBe(true)
 
     fireEvent.drop(area, { dataTransfer: { files: [] } })
@@ -828,6 +834,73 @@ describe("UploadFilePage, Check step for a Parquet file", () => {
       mode: "replace",
       onBadValue: "stop",
     })
+  })
+})
+
+describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice 4)", () => {
+  async function open(name: string, over: Partial<UploadPreview>) {
+    url.search = "?id=up-1"
+    stubFetch({
+      get: () => upload({ originalFilename: name }),
+      preview: () => preview({ columns: ["id", "name", "meta"], rows: [["1", "Anna", '{"x":1}']], ...over }),
+    })
+    render(<UploadFilePage />)
+    await screen.findByRole("columnheader", { name: /id/ })
+  }
+
+  it("shows no dialect control for a JSON file and says a nested value is kept as JSON text", async () => {
+    await open("orders.json", { layout: { format: "json", compression: "none" } })
+    expect(screen.queryByLabelText("Encoding")).toBeNull()
+    expect(screen.queryByLabelText("Delimiter")).toBeNull()
+    expect(screen.queryByLabelText("Header row")).toBeNull()
+    const note = screen.getByText(/This is a JSON file/)
+    expect(note.textContent).toContain("kept as JSON text in one column")
+    await waitFor(() => expect(next().disabled).toBe(false))
+  })
+
+  it("says a JSON Lines file is one, and an Avro file starts each column at the type its schema declares", async () => {
+    await open("orders.jsonl", { layout: { format: "jsonl", compression: "none" } })
+    expect(screen.getByText(/This is a JSON Lines file/)).toBeDefined()
+    cleanup()
+    await open("orders.avro", { layout: { format: "avro", compression: "none" } })
+    expect(screen.getByText(/This is an Avro file/).textContent).toContain("the type the schema declares")
+  })
+
+  it("keeps the dialect controls for delimited text in a gzip file and says it is gzip", async () => {
+    await open("orders.csv.gz", { layout: { format: "delimited", compression: "gzip" } })
+    expect(screen.getByLabelText("Encoding")).toBeDefined()
+    expect(screen.getByLabelText("Delimiter")).toBeDefined()
+    expect(screen.getByText(/compressed with gzip/).textContent).toContain("counts toward the 50 MB limit")
+  })
+
+  it("lists the files of a zip, and turns Next off with the reason when one has other columns", async () => {
+    const file = (name: string, matchesFirst: boolean) => ({ name, sizeBytes: 2048, columns: 3, matchesFirst })
+    await open("three.zip", {
+      layout: { format: "delimited", compression: "zip" },
+      archive: { files: [file("a.csv", true), file("sub/b.csv", false), file("c.csv", true)] },
+    })
+    const list = screen.getByRole("list", { name: "Files in the zip" })
+    expect(list.querySelectorAll("li").length).toBe(3)
+    expect(list.textContent).toContain("sub/b.csv")
+    expect(list.textContent).toContain("Different columns")
+    expect(list.textContent).toContain("2.0 KB · 3 columns")
+    expect(screen.getByRole("alert").textContent).toContain("One file of the zip does not have the same columns as the first")
+    expect(next().disabled).toBe(true)
+  })
+
+  it("lets a zip whose files agree go on, and the review names the format and the files", async () => {
+    const file = (name: string) => ({ name, sizeBytes: 10, columns: 3, matchesFirst: true })
+    await open("three.zip", {
+      layout: { format: "delimited", compression: "zip" },
+      archive: { files: [file("a.csv"), file("b.csv")] },
+    })
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+    expect(screen.getByText("CSV or TSV in a zip archive")).toBeDefined()
+    expect(screen.getByText("Files in the zip")).toBeDefined()
   })
 })
 

@@ -14,16 +14,18 @@ const INPUT_ID = "upload-file-input"
 
 /** What the picker suggests. `accept` only steers it; drag and drop is not limited by it, `fileProblem` decides. */
 const ACCEPT =
-  ".csv,.tsv,.txt,.xls,.xlsx,.parquet,text/csv,text/tab-separated-values,text/plain,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.apache.parquet"
+  ".csv,.tsv,.txt,.json,.jsonl,.ndjson,.avro,.gz,.zip,.xls,.xlsx,.parquet,text/csv,text/tab-separated-values,text/plain,application/json,application/gzip,application/zip,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.apache.parquet"
 
 /** The limits as short facts. They repeat what the API and `fileProblem` enforce; the sheet fact repeats the Check step. */
 const FACTS: readonly { label: string; value: string }[] = [
-  { label: "Accepted", value: "CSV, TSV, .xls, .xlsx, .parquet" },
+  { label: "Accepted", value: "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip" },
   { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; the first one is checked and loaded on the next steps` },
   { label: "Size", value: "Up to 50 MB in all" },
-  { label: "Not accepted", value: ".xlsm, .xlsb, .ods, archives" },
+  { label: "Not accepted", value: ".xlsm, .xlsb, .ods, .tar, .7z and other archives" },
   { label: "Workbooks", value: "One sheet is loaded, chosen on the next step" },
-  { label: "Parquet", value: "Each column starts with the type the file declares; a file with a binary or nested column is refused" },
+  { label: "Parquet and Avro", value: "Each column starts with the type the file declares; a file with a binary column is refused" },
+  { label: "JSON", value: "An array of objects (.json) or one object per line (.jsonl); the keys are the columns, and a nested value is kept as JSON text" },
+  { label: "Compressed", value: "A .gz of one text or JSON file, or a .zip of up to 10 files of one format with the same columns; what it unpacks to counts toward the 50 MB" },
 ]
 
 /**

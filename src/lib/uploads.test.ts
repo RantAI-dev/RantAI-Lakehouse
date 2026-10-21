@@ -19,7 +19,10 @@ import {
   columnNameProblem,
   columnSpecOf,
   columnTypeLabel,
+  archiveProblem,
   fileKindProblem,
+  hasFixedDialect,
+  layoutLabel,
   fileProblem,
   fileSizeProblem,
   headerRowDisplay,
@@ -303,11 +306,19 @@ test("retryInput repeats what the load was told, and replaces after a registrati
   assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
 })
 
-test("fileKindProblem refuses a workbook the API does not read, or an archive, by its name, in the API's words", () => {
-  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.zip", "a.gz", "a.7z", "report.final.xlsm"]) {
-    const problem = fileKindProblem(name)
-    assert.ok(problem?.startsWith(`${name} looks like a workbook or a zip archive that is not an .xls or .xlsx file.`), name)
-    assert.ok(problem?.includes("Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded; save the sheet as .xlsx or CSV first."), name)
+test("fileKindProblem refuses a workbook or an archive the API does not read by its name, in the API's words", () => {
+  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.tar", "a.7z", "a.tgz", "a.rar", "report.final.xlsm"]) {
+    assert.equal(
+      fileKindProblem(name),
+      `${name} looks like a workbook or an archive this upload does not read. Excel workbooks must be .xls or .xlsx, and archives .gz or .zip; or save the sheet as .xlsx or CSV first.`,
+      name
+    )
+  }
+})
+
+test("fileKindProblem lets JSON, JSON Lines, Avro, gzip and zip through: the API opens them, and refuses one that does not open", () => {
+  for (const name of ["a.json", "a.JSONL", "a.ndjson", "a.avro", "a.gz", "a.csv.gz", "a.zip", "A.ZIP"]) {
+    assert.equal(fileKindProblem(name), null, name)
   }
 })
 
@@ -323,18 +334,18 @@ test("fileKindProblem lets a .parquet through: the API opens it, and refuses one
   }
 })
 
-test("fileKindProblem refuses other binaries in the API's sentence, which now names Parquet too", () => {
-  for (const name of ["a.pdf", "a.docx", "a.avro", "a.orc", "a.sqlite"]) {
+test("fileKindProblem refuses other binaries in the API's sentence, which lists what is read now", () => {
+  for (const name of ["a.pdf", "a.docx", "a.orc", "a.sqlite"]) {
     assert.equal(
       fileKindProblem(name),
-      `${name} is not a delimited text file, an Excel workbook or a Parquet file. Only .xls and .xlsx workbooks, .parquet files and delimited text files (CSV, TSV) can be uploaded.`
+      `${name} is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.`
     )
   }
 })
 
 test("fileKindProblem ignores the case of the extension", () => {
-  assert.ok(fileKindProblem("DATA.XLSM")?.includes("not an .xls or .xlsx file"))
-  assert.ok(fileKindProblem("Data.OdS")?.includes("not an .xls or .xlsx file"))
+  assert.ok(fileKindProblem("DATA.XLSM")?.includes("looks like a workbook or an archive"))
+  assert.ok(fileKindProblem("Data.OdS")?.includes("looks like a workbook or an archive"))
   assert.equal(fileKindProblem("DATA.PARQUET"), null)
 })
 
@@ -345,7 +356,7 @@ test("fileKindProblem lets through delimited text, unknown extensions and names 
 })
 
 test("fileProblem gives the kind first, then the size, and null for an acceptable file", () => {
-  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("not an .xls or .xlsx file"))
+  assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("looks like a workbook or an archive"))
   assert.ok(fileProblem("a.csv", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
@@ -438,7 +449,7 @@ test("planPick gives a file its own problem: a kind the API does not read, or on
     [],
     [fileOfSize("stock.XLSM", 10), fileOfSize("big.csv", MAX_UPLOAD_BYTES + 1), fileOfSize("ok.csv", 10)]
   )
-  assert.match(candidates[0].problem ?? "", /not an \.xls or \.xlsx file/)
+  assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
   assert.match(candidates[1].problem ?? "", /over the 50 MB limit/)
   assert.equal(candidates[2].problem, null)
 })
@@ -538,4 +549,35 @@ test("a retry sends back the columns and the choice the failed load was told", (
   assert.deepEqual(input?.columns, upload.columns)
   assert.equal(input?.onBadValue, "stop")
   assert.equal("columns" in (retryInput({ ...upload, columns: undefined, onBadValue: undefined }) ?? {}), false)
+})
+
+test("the mark and the label follow the name: JSON, Avro and archives have their own kinds", () => {
+  assert.equal(uploadFileKind("a.json"), "json")
+  assert.equal(uploadFileKind("a.NDJSON"), "json")
+  assert.equal(uploadFileKind("a.avro"), "avro")
+  assert.equal(uploadFileKind("a.csv.gz"), "archive")
+  assert.equal(uploadFileKind("a.zip"), "archive")
+  assert.equal(uploadFileKind("a.csv"), "delimited")
+})
+
+test("layoutLabel says what a file is read as, and only JSON and Avro have no dialect to choose", () => {
+  assert.equal(layoutLabel({ format: "json", compression: "none" }), "JSON")
+  assert.equal(layoutLabel({ format: "jsonl", compression: "gzip" }), "JSON Lines in a gzip file")
+  assert.equal(layoutLabel({ format: "avro", compression: "zip" }), "Avro in a zip archive")
+  assert.equal(layoutLabel({ format: "delimited", compression: "gzip" }), "CSV or TSV in a gzip file")
+  assert.equal(hasFixedDialect(undefined), false)
+  assert.equal(hasFixedDialect({ format: "delimited", compression: "zip" }), false)
+  assert.equal(hasFixedDialect({ format: "json", compression: "none" }), true)
+  assert.equal(hasFixedDialect({ format: "avro", compression: "none" }), true)
+})
+
+test("archiveProblem is null for a zip whose files agree and names how many differ otherwise", () => {
+  const file = (name: string, matchesFirst: boolean) => ({ name, sizeBytes: 1, columns: 3, matchesFirst })
+  assert.equal(archiveProblem(undefined), null)
+  assert.equal(archiveProblem({ files: [file("a.csv", true), file("b.csv", true)] }), null)
+  assert.match(archiveProblem({ files: [file("a.csv", true), file("b.csv", false)] }) ?? "", /^One file of the zip does not have the same columns/)
+  assert.match(
+    archiveProblem({ files: [file("a.csv", true), file("b.csv", false), file("c.csv", false)] }) ?? "",
+    /^2 files of the zip do not have the same columns/
+  )
 })
