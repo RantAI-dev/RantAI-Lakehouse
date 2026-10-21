@@ -438,3 +438,51 @@ verified; the `FINAL` read on the real `bi_board` is not.
   restored; a restored board would lose its withdrawals. Drop the
   `is_deleted` condition: an event for a deleted board is never read and
   costs nothing. Accept: a test with a trashed legacy board.
+
+### Review — PR #201 before merge, 2026-10-21, planner (round F)
+
+Reviewed at `3831f7b5` merged locally with `main` (`c8f6d395`; the branch is
+107 commits behind and merges cleanly). **No BLOCKER.** R-A1, R-A3 and R-A4
+are fixed in code: the embed state is written only by `INSERT` into
+`console.bi_board_embed_event` and every reader (token check, `/api/embed/frame`,
+`embed-info`) aggregates it; the legacy copy is idempotent, includes trashed
+boards, is skipped on a fresh database and fails closed (`ensure_bi_table`
+errors and retries). Slice B returns `orchestrator_unreachable` only for a
+transport error or a 5xx, and merges with `main`'s `ApiError::Gone` without a
+conflict. Before merge, fix these (one commit each, cite
+`PR #201 review F SHOULD-FIX n` at the site and in the commit body):
+
+1. **One clock tolerance.** `lakehouse-bi/src/store.rs` ~1585 keeps its own
+   `DEFAULT_CLOCK_TOLERANCE_SECS = 60` and `get_board_embed_access` (~1640,
+   ~1663) drops withdrawn tokens after `exp + 60`, while the verifier's
+   tolerance is `lakehouse_embed::CLOCK_TOLERANCE_SECONDS`. If that is ever
+   raised, a withdrawn token that the verifier still accepts drops off the
+   withdrawn list and works again. Drop expired entries only when counting
+   toward the cap, not in the list `is_withdrawn` reads (or take the tolerance
+   from `lakehouse_embed`); a test with a tolerance above 60 that fails today.
+2. **Rule 4:** `store.rs` ~1768–1780 re-implements `EmbedAccess::withdraw_token`'s
+   unexpired-then-cap guard; call it (or delete the now test-only methods).
+3. The `#[cfg(test)]` swap of the production `OnceCell` for a `RwLock<bool>`
+   (`store.rs` ~559–566, ~588) means
+   `ensure_bi_table_runs_ddl_at_most_once_per_process` no longer tests the
+   production cache, and its doc ("only test … allowed to exercise
+   `ensure_bi_table`", ~4335) is false now. Make the test exercise the real
+   cache, or say plainly what it pins.
+4. Stale comment, `lakehouse-api/src/routes/embed.rs` ~136: withdrawal is read
+   by aggregating the event table, not "a `FINAL` read" of the board.
+5. `src/proxy.ts`: the last sentence reads as if a visitor with no session
+   always gets `frame-ancestors 'none'`; embed viewers have no session and get
+   the board's allowed sites. Say the answer does not depend on a session.
+6. `# Errors` docs in `lakehouse-dagster/src/lib.rs` (~1149, ~2229, ~2270,
+   ~2344, ~2383, ~2420) still name only `Transport` and `Server`; the non-2xx
+   sites return `DgError::Status`.
+7. `revoke_all_embed_tokens` returns `now` (~1744) but documents "the stored
+   instant"; the cut-off in force is the max over all `revoke_all` events.
+   Return that max (the response's `embedRevokedBefore` must be what is
+   enforced).
+
+Also, one line each (no code): the legacy unparseable list becoming
+`revoke_all(u64::MAX)` is permanent, so say "permanently" where `from_stored`
+said "until saved again"; and the deploy note on the feature page — stop old
+API instances before starting this build (an old instance's withdrawal after
+the copy is never copied).
