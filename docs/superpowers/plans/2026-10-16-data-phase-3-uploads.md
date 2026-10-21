@@ -609,3 +609,56 @@ No `BLOCKER` and no `SHOULD-FIX`.
 
 **Noted:** the session cap can overshoot by one under two simultaneous requests. This is accepted: the cap guards against abuse, not exact accounting.
 
+### Slice 3, round 1 (planner/reviewer, Claude Opus), at `3ed97ae2`, 2026-10-21
+
+**Re-run by the reviewer:**
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy -p lakehouse-api -p lakehouse-store --all-targets -j 4 -- -D warnings` | exit 0 |
+| `cargo test -p lakehouse-store --test uploads` | 53 passed |
+| `cargo test -p lakehouse-api --lib -- upload_ columns` | 201 passed, 1 ignored |
+| `cargo test -p lakehouse-api --test upload_routes -- --test-threads=2` | 118 passed |
+| `cargo test -p lakehouse-api --test route_auth` | 44 passed |
+| `pytest` file ingest, Parquet, typed load, upload types, authored factory | 444 passed, 1 skipped |
+| `ops/lint` (both) | OK |
+| `bun run typecheck` (with a `node_modules` that has `three`) | exit 0 |
+| `bun test` queue, uploads lib, client, `src/features/connectors/` | 419 passed |
+
+**`BLOCKER` 1: a replace that changes a column type purges the table before the new rows are written.**
+
+`_drop_table_if_types_differ` (`adapters/sink.py`) calls `catalog.purge_table` between dlt's normalize and load. If the load then fails, the table, its data files and every snapshot are gone, with no way back, and `DATA-19` pipelines that read the table break. Time travel (`DATA-16`) loses the table's history even when the load succeeds. Section 8 item 5 told the developer to stop and report at exactly this point. Choosing a destructive path is not the developer's call.
+
+**Planner's decision.** Make the type change and the new rows one Iceberg commit.
+
+The planner proved on 2026-10-21 that pyiceberg 0.12.0 does this against a local SQL catalog:
+
+- One `table.transaction()` held `update_schema().delete_column("a")`, then `update_schema().add_column("a", LongType())`, then `overwrite(<new Arrow table>)`.
+- It committed atomically. The table read back with `a: long` and the new rows, and all 3 snapshots were kept.
+- The column moved to the end of the schema. Use `move_before`/`move_after`, or rebuild the order, so the file's column order is kept.
+
+What the fix must do:
+
+1. **Write type-changing replaces through pyiceberg.** For a `replace` whose column types differ from the table's, write through that kind of pyiceberg transaction (the precedent is `SRC-10`'s own history transaction), not through dlt's load. Keep dlt for every other load. Read the Arrow batches the job already builds, and keep memory bounded: append batches inside the one transaction, or stage them, then overwrite.
+2. **Prove it against Lakekeeper's REST catalog.** The g9 step's "replace back to text" already exercises it. In the unit tests, a load that fails inside the transaction leaves the table exactly as it was: same schema, same rows, same current snapshot.
+3. **Never purge or drop the table.** If the atomic path proves impossible against Lakekeeper, stop and report. Do not fall back to a drop.
+4. **Update the handoff** for section 8 item 5, and the feature page's limit line if anything about history changes (the planner edits `docs/core/`).
+
+**Accepted additions** (listed in the handoff):
+
+- The `file_upload.bad_values` column in `0091`.
+- The `float` wire type, for decision 10 ("Floating point (from the file)").
+- The `timezone` flag on timestamp columns, for decision 5.
+- `?table=` on the preview, for decision 9's pre-fill from an existing table.
+- The stricter column-name rule (it matches decision 8).
+- The ninth failure reason.
+- The fixes to the other session's work: the SQL placeholder numbers and the removed `record_column_spec`.
+
+**Not verified, carried to CI:**
+
+- The g9 typed step against a real stack, and whether `g9-upload`'s 25-minute timeout still holds.
+- The real Iceberg write through Lakekeeper.
+
+The branch is pushed for that CI run, with this `BLOCKER` open. It must not merge until the fix is reviewed.
+
