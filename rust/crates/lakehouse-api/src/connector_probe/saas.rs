@@ -84,8 +84,18 @@ pub(super) async fn probe_saas_info(
     let request = Request {
         vendor,
         account: &dial.account,
-        url: SaasVendor::render(&format!("{}{}", vendor.api_base, whoami.path), &parts),
-        token_url: SaasVendor::render(vendor.oauth.token_url, &parts),
+        // Slice 2 review SHOULD-FIX 5: the gate-only mock origin, ignored unless the
+        // gate-only switch is on (`connector_oauth::gate_rebase`).
+        url: connector_oauth::gate_rebase(
+            oauth,
+            vendor.id,
+            &SaasVendor::render(&format!("{}{}", vendor.api_base, whoami.path), &parts),
+        ),
+        token_url: connector_oauth::gate_rebase(
+            oauth,
+            vendor.id,
+            &SaasVendor::render(vendor.oauth.token_url, &parts),
+        ),
         auth: &dial.auth,
     };
     let secrets = Secrets {

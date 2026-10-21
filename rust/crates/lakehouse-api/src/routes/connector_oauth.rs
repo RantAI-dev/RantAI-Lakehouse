@@ -99,6 +99,9 @@ struct App {
     /// How the client proves itself at the token endpoint. Always the body
     /// for a `rest` connector; the vendor table's choice for a `saas` one.
     client_auth: ClientAuth,
+    /// The vendor id of a `saas` connector, for the gate-only mock origin
+    /// (`connector_oauth::gate_rebase`); `None` for a `rest` connector.
+    gate_vendor: Option<&'static str>,
 }
 
 /// The authorization-code settings of `info`, or `None` for a connector that
@@ -136,6 +139,7 @@ fn saas_app_of(info: &ConnectorDialInfo) -> Option<App> {
             .map(|scope| render(scope))
             .collect(),
         client_auth: vendor.oauth.client_auth,
+        gate_vendor: Some(vendor.id),
     })
 }
 
@@ -158,6 +162,7 @@ fn rest_app_of(info: &ConnectorDialInfo) -> Option<App> {
             revocation_url,
             scopes,
             client_auth: ClientAuth::Post,
+            gate_vendor: None,
         }),
         _ => None,
     }
@@ -456,13 +461,21 @@ async fn finish_sign_in(
         ("code_verifier", pending.code_verifier.as_str()),
     ];
     let internal_hosts = state.config.connector_internal_hosts();
+    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin; a no-op unless the
+    // gate-only switch is on, and never for a `rest` connector.
+    let token_url = app.gate_vendor.map_or_else(
+        || app.token_url.clone(),
+        |vendor| {
+            connector_oauth::gate_rebase(state.config.oauth_settings(), vendor, &app.token_url)
+        },
+    );
     let tokens = match app.client_auth {
         ClientAuth::Post => {
             let mut form = exchange.to_vec();
             form.push(("client_id", app.client_id.as_str()));
             form.push(("client_secret", client_secret.expose_secret()));
             connector_oauth::token_request(
-                &app.token_url,
+                &token_url,
                 &form,
                 &internal_hosts,
                 state.config.oauth_settings(),
@@ -476,7 +489,7 @@ async fn finish_sign_in(
             form.push(("client_id", app.client_id.as_str()));
             form.push(("client_secret", client_secret.expose_secret()));
             connector_oauth::token_request_json(
-                &app.token_url,
+                &token_url,
                 &form,
                 &internal_hosts,
                 state.config.oauth_settings(),
@@ -486,7 +499,7 @@ async fn finish_sign_in(
         // `SRC-3` AD8: the client is in the header, not the body.
         ClientAuth::Basic => {
             connector_oauth::token_request_basic(
-                &app.token_url,
+                &token_url,
                 &exchange,
                 &app.client_id,
                 client_secret.expose_secret(),

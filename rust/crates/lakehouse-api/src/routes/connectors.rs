@@ -3345,12 +3345,13 @@ pub struct IngestCredentialBody {
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
+    oauth: crate::connector_oauth::OAuthSettings,
 ) -> Result<(), ApiError> {
     // `SRC-3` AD2: a `saas` dial dials the API host and the token host the
     // vendor table builds from `account`; both are checked, since they can
     // differ (a vendor's sign-in service is not its API).
     let saas_urls: Vec<String> = match dial {
-        Dial::Saas(saas) => saas_dialled_urls(saas),
+        Dial::Saas(saas) => saas_dialled_urls(saas, oauth),
         _ => Vec::new(),
     };
     let host_port: Option<(&str, u16)> = match dial {
@@ -3398,7 +3399,10 @@ async fn check_dial_ssrf(
 /// and token endpoint, built from the vendor table and the account
 /// (`SRC-3` AD2). Empty for a dial whose vendor or account no longer
 /// validates ([`Dial::parse`] has refused both before this runs).
-fn saas_dialled_urls(saas: &lakehouse_store::ingest_spec::SaasDial) -> Vec<String> {
+fn saas_dialled_urls(
+    saas: &lakehouse_store::ingest_spec::SaasDial,
+    oauth: crate::connector_oauth::OAuthSettings,
+) -> Vec<String> {
     use lakehouse_store::saas_vendors::{SaasVendor, vendor};
     let Some(vendor) = vendor(&saas.vendor) else {
         return Vec::new();
@@ -3406,10 +3410,18 @@ fn saas_dialled_urls(saas: &lakehouse_store::ingest_spec::SaasDial) -> Vec<Strin
     let Ok(parts) = vendor.validate_account(&saas.account) else {
         return Vec::new();
     };
-    vec![
-        SaasVendor::render(vendor.api_base, &parts),
-        SaasVendor::render(vendor.oauth.token_url, &parts),
-    ]
+    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin (a no-op unless the
+    // gate-only switch is on), so the save-time check looks at what will be dialled.
+    [vendor.api_base, vendor.oauth.token_url]
+        .iter()
+        .map(|template| {
+            crate::connector_oauth::gate_rebase(
+                oauth,
+                vendor.id,
+                &SaasVendor::render(template, &parts),
+            )
+        })
+        .collect()
 }
 
 /// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will
@@ -3659,7 +3671,12 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     let Some(credential) = credential else {
-        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        check_dial_ssrf(
+            &dial,
+            &state.config.connector_internal_hosts(),
+            state.config.oauth_settings(),
+        )
+        .await?;
         return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
@@ -3731,7 +3748,12 @@ async fn save_with_credentials(
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
-    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    check_dial_ssrf(
+        dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
     // Only after the address is approved: a refused target makes no call to
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;

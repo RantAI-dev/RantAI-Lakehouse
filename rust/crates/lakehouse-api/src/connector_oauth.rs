@@ -255,6 +255,60 @@ fn form_encode(text: &str) -> String {
     out
 }
 
+/// The environment variable the acceptance gate sets to point a vendor at its mock
+/// vendor server: a JSON object of vendor id to a bare `http(s)://host:port`.
+pub const GATE_ORIGINS_ENV: &str = "SAAS_GATE_ORIGINS";
+
+/// `url` with its scheme, host and port replaced by the gate's mock for `vendor_id`
+/// (slice 2 review SHOULD-FIX 5; the Python twin is `saas.vendors.rebase_for_gate`).
+///
+/// This goes round "a vendor's hosts come only from the table" (`SRC-3` AD2), so it is
+/// closed twice: nothing happens unless the gate-only switch
+/// `CONNECTOR_OAUTH_ALLOW_HTTP=true` is on (`settings.allow_http`), and then only for a
+/// vendor the variable names with a bare origin (no userinfo, path or query). Anything
+/// else returns `url` unchanged, so a bad value fails closed to the real host.
+#[must_use]
+pub fn gate_rebase(settings: OAuthSettings, vendor_id: &str, url: &str) -> String {
+    gate_rebase_with(
+        settings,
+        std::env::var(GATE_ORIGINS_ENV).ok().as_deref(),
+        vendor_id,
+        url,
+    )
+}
+
+/// [`gate_rebase`] with the variable's value given, so a test needs no environment.
+#[must_use]
+pub fn gate_rebase_with(
+    settings: OAuthSettings,
+    origins: Option<&str>,
+    vendor_id: &str,
+    url: &str,
+) -> String {
+    let rebased = (|| {
+        if !settings.allow_http {
+            return None;
+        }
+        let table: serde_json::Value = serde_json::from_str(origins?).ok()?;
+        let mock = reqwest::Url::parse(table.get(vendor_id)?.as_str()?).ok()?;
+        let bare = matches!(mock.scheme(), "http" | "https")
+            && mock.host_str().is_some()
+            && mock.username().is_empty()
+            && mock.password().is_none()
+            && matches!(mock.path(), "" | "/")
+            && mock.query().is_none();
+        if !bare {
+            return None;
+        }
+        let real = reqwest::Url::parse(url).ok()?;
+        let mut out = mock;
+        out.set_path(real.path());
+        out.set_query(real.query());
+        Some(out.to_string())
+    })();
+    rebased.unwrap_or_else(|| url.to_owned())
+}
+
 /// The `Authorization` header value of `client_secret_basic` (RFC 6749 2.3.1).
 fn basic_header(client_id: &str, client_secret: &str) -> String {
     let pair = format!("{}:{}", form_encode(client_id), form_encode(client_secret));
@@ -595,6 +649,35 @@ mod tests {
             "{refused:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_gate_rebase_is_ignored_unless_the_gate_only_switch_is_on_and_the_vendor_named() {
+        let origins = Some(r#"{"zendesk": "http://saas-stub-g6:8102"}"#);
+        let real = "https://acme.zendesk.com/oauth/tokens?x=1";
+        let off = OAuthSettings { allow_http: false };
+        assert_eq!(gate_rebase_with(off, origins, "zendesk", real), real);
+        assert_eq!(
+            gate_rebase_with(HTTP, origins, "zendesk", real),
+            "http://saas-stub-g6:8102/oauth/tokens?x=1"
+        );
+        assert_eq!(gate_rebase_with(HTTP, origins, "hubspot", real), real);
+        for odd in [
+            "not json",
+            "[]",
+            r#"{"zendesk": 5}"#,
+            r#"{"zendesk": "ftp://x:1"}"#,
+            r#"{"zendesk": "http://u:p@x:1"}"#,
+            r#"{"zendesk": "http://x:1/prefix"}"#,
+            r#"{"zendesk": "http://x:1/?q=1"}"#,
+        ] {
+            assert_eq!(
+                gate_rebase_with(HTTP, Some(odd), "zendesk", real),
+                real,
+                "{odd}"
+            );
+        }
+        assert_eq!(gate_rebase_with(HTTP, None, "zendesk", real), real);
     }
 
     #[tokio::test]
