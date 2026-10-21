@@ -508,6 +508,11 @@ pub struct SaasDial {
     pub objects: Vec<String>,
     /// How the connector signs in.
     pub auth: SaasAuth,
+    /// `NetSuite` only (`SRC-3` slice 6): the id of the certificate uploaded in `NetSuite`'s "OAuth 2.0
+    /// Client Credentials (M2M) Setup", which goes into the signed assertion's `kid` header. It is a
+    /// name, not a secret and not a destination, so it is not part of the target identity.
+    #[serde(default)]
+    pub certificate_id: Option<String>,
 }
 
 /// A parsed `dial`, one variant per adapter.
@@ -1179,6 +1184,20 @@ fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), I
                     "this vendor does not offer an integration credential; sign in instead",
                 ));
             }
+        }
+    }
+    if let Some(certificate_id) = &dial.certificate_id {
+        // Slice 6: only `NetSuite`'s client-credentials way has a certificate; the id goes into a
+        // JWT header, so it is a short plain name.
+        let plain = !certificate_id.is_empty()
+            && certificate_id.len() <= 128
+            && certificate_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if dial.vendor != "netsuite" || dial.auth != SaasAuth::Integration || !plain {
+            return Err(refuse(
+                "certificateId is only for NetSuite's integration credential and must be a plain name",
+            ));
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -3907,6 +3926,48 @@ mod saas_dial_tests {
         assert!(Dial::parse("saas", &value).is_err());
         value["objects"] = serde_json::json!(["bad\nname"]);
         assert!(Dial::parse("saas", &value).is_err());
+    }
+
+    /// `SRC-3` slice 6: `NetSuite`'s client-credentials way names the certificate uploaded in `NetSuite`
+    /// (the assertion's `kid`); no other vendor or sign-in has one, and it must be a plain name.
+    #[test]
+    fn a_certificate_id_is_for_netsuites_integration_credential_only_and_is_a_plain_name() {
+        let with = |vendor: &str, account: &str, auth: &serde_json::Value, id: &str| {
+            let mut value = dial(vendor, account, auth);
+            value["certificateId"] = serde_json::json!(id);
+            Dial::parse("saas", &value)
+        };
+        assert!(with("netsuite", "1234567_SB1", &integration(), "cert-1.A_b").is_ok());
+        for bad in ["", "a b", "a/b", "a\nb", &"x".repeat(129)] {
+            assert!(
+                with("netsuite", "1234567", &integration(), bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(with("netsuite", "1234567", &oauth(), "cert-1").is_err());
+        assert!(with("zendesk", "acme", &integration(), "cert-1").is_err());
+        // Not part of the target identity: it is a name, not a destination.
+        let a = with("netsuite", "1234567", &integration(), "cert-1").unwrap();
+        let b = with("netsuite", "1234567", &integration(), "cert-2").unwrap();
+        assert_eq!(a.target_identity(), b.target_identity());
+    }
+
+    #[test]
+    fn a_workday_dial_names_host_and_tenant_and_takes_the_integration_users_two_secrets() {
+        let parsed = Dial::parse(
+            "saas",
+            &dial(
+                "workday",
+                "wd2-impl-services1.workday.com/acme_tenant",
+                &integration(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            secret_field_names("saas", parsed.secret_map_auth_type()),
+            Some(["username", "password"].as_slice())
+        );
+        assert!(Dial::parse("saas", &dial("workday", "wd2.workday.com", &integration())).is_err());
     }
 
     #[test]

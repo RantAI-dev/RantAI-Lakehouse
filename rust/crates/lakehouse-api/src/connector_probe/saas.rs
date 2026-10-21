@@ -51,6 +51,14 @@ struct Request<'a> {
     /// wants the resource's `/.default`, slice 5); `None` for a vendor whose row names none.
     scope: Option<String>,
     auth: &'a SaasAuth,
+    /// `NetSuite` only (slice 6): the certificate id from the dial, the assertion's `kid`.
+    certificate_id: Option<&'a str>,
+    /// What the assertion's `aud` claim says: the vendor table's token address for this account,
+    /// never the rebased (gate) one.
+    audience: String,
+    /// How long the who-am-i request may take. [`DIAL_TIMEOUT`], except for `Workday`, whose
+    /// who-am-i is a report that runs before Workday answers.
+    wait: std::time::Duration,
 }
 
 /// Stands for the cloud id in a gateway address until the site list has been read. A valid
@@ -87,12 +95,29 @@ pub(super) async fn probe_saas_info(
     let Ok(parts) = vendor.validate_account(&dial.account) else {
         return Outcome::misconfigured("connector is misconfigured: its account is not valid");
     };
-    let Some(whoami) = vendor.whoami else {
-        return Outcome::not_testable_with(format!(
-            "{} has no generic connection test in this build. A load reports whether the \
-             connection worked.",
-            vendor.label
-        ));
+    // `Workday` has no generic who-am-i: its test runs the first report the connector names and
+    // looks at the status (slice 6, V-Workday.3); every other vendor with none is not testable.
+    let report_path = if vendor.id == "workday" {
+        let Some(path) = workday_report_path(&dial.objects, &parts.tenant) else {
+            return Outcome::not_testable_with(
+                "Workday is tested by running one of the connector's reports. Name a report \
+                 on the connector page first, then test again.",
+            );
+        };
+        Some(path)
+    } else {
+        None
+    };
+    let who_path = match (report_path, vendor.whoami) {
+        (Some(path), _) => path,
+        (None, Some(whoami)) => whoami.path.to_owned(),
+        (None, None) => {
+            return Outcome::not_testable_with(format!(
+                "{} has no generic connection test in this build. A load reports whether the \
+                 connection worked.",
+                vendor.label
+            ));
+        }
     };
     // Slice 4 review BLOCKER 13: a browser sign-in whose vendor table row names its own gateway
     // (`oauth.api_base`) is tested there, at the fixed host of the table, never at the site.
@@ -113,7 +138,7 @@ pub(super) async fn probe_saas_info(
                     || vendor.api_base.to_owned(),
                     |base| base.replace("{cloudId}", CLOUD_ID_PLACEHOLDER)
                 ),
-                whoami.path
+                who_path
             ),
             &parts,
         )),
@@ -129,6 +154,13 @@ pub(super) async fn probe_saas_info(
             .and_then(|integration| integration.scope)
             .map(|scope| SaasVendor::render(scope, &parts)),
         auth: &dial.auth,
+        certificate_id: dial.certificate_id.as_deref(),
+        audience: SaasVendor::render(vendor.oauth.token_url, &parts),
+        wait: if vendor.id == "workday" {
+            WORKDAY_REPORT_WAIT
+        } else {
+            DIAL_TIMEOUT
+        },
     };
     let secrets = Secrets {
         primary: &info.secret_ref,
@@ -136,6 +168,32 @@ pub(super) async fn probe_saas_info(
         resolver,
     };
     probe_saas_at(&request, &secrets, internal_hosts, oauth).await
+}
+
+/// A `Workday` report runs before Workday answers, so its who-am-i may take longer than the other
+/// vendors' (their request is a lookup). Still bounded: a report that takes longer is a failure
+/// of the test, said as one.
+const WORKDAY_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Workday`'s who-am-i: the address of the first named report that is a plain `owner/report`
+/// (the same rule as the orchestrator's `check_report`: nothing that could leave the path),
+/// `/ccx/service/customreport2/<tenant>/<owner>/<report>?format=json`. `None` when no report
+/// is named or the first is not plain.
+fn workday_report_path(objects: &[String], tenant: &str) -> Option<String> {
+    let (owner, report) = objects.first()?.split_once('/')?;
+    let plain = |text: &str, extra: &[char], max: usize| {
+        text.len() <= max
+            && text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && text.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') || extra.contains(&c)
+            })
+            && !text.contains("..")
+    };
+    (plain(owner, &['@'], 100) && plain(report, &[], 150))
+        .then(|| format!("/ccx/service/customreport2/{tenant}/{owner}/{report}?format=json"))
 }
 
 /// The access token for one test, and the refresh token a rotating vendor
@@ -303,6 +361,30 @@ async fn integration_access(
             basic: true,
         });
     }
+    // Slice 6 (V-Workday.3): the integration system user's name and password are HTTP Basic.
+    if request.vendor.id == "workday" && fields == ["username", "password"] {
+        let user = resolve(secrets.resolver, secrets.primary).await?;
+        let Some(secondary) = secrets.secondary else {
+            return Err(Outcome::misconfigured(format!(
+                "connector is misconfigured: the {} password is not saved",
+                request.vendor.label
+            )));
+        };
+        let password = resolve(secrets.resolver, secondary).await?;
+        let pair = format!("{}:{}", user.expose_secret(), password.expose_secret());
+        return Ok(Access {
+            token: SecretValue::new(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                pair,
+            )),
+            rotated: None,
+            basic: true,
+        });
+    }
+    // Slice 6 (`V-NetSuite.3`): the `NetSuite` client credentials are a signed assertion.
+    if request.vendor.id == "netsuite" && fields == ["clientId", "privateKey"] {
+        return certificate_access(request, secrets, internal_hosts, oauth).await;
+    }
     // Slice 4 (V-ServiceNow.3, decision 3): ServiceNow's client credentials are exchanged for a token;
     // slice 5 (V-SharePoint.3, V-Dynamics.3): so are Microsoft Entra's, with the row's `.default` scope.
     if (request.vendor.id == "servicenow" || request.scope.is_some())
@@ -447,6 +529,109 @@ async fn service_account_access(
     let form = [
         ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
         ("assertion", assertion.expose_secret()),
+    ];
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// The claims of `NetSuite`'s client-credentials assertion
+/// (<https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_0312092247.html>):
+/// `iss` the integration's client id, `scope`, `aud` the token address of the account, `iat`, `exp`.
+#[derive(serde::Serialize)]
+struct CertificateClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: u64,
+    exp: u64,
+}
+
+/// The assertion `NetSuite` exchanges for a token: signed with the certificate's private key,
+/// `PS256` for an RSA key and `ES256` for an elliptic-curve key (`NetSuite` does not take `RS256`;
+/// its page shows `PS256` and says the choice follows the certificate and hash), with the
+/// certificate id in the `kid` header. `None` when the key is neither, or cannot sign.
+fn sign_certificate_assertion(
+    request: &Request<'_>,
+    client_id: &str,
+    certificate_id: &str,
+    key: &SecretValue,
+    now: u64,
+) -> Option<SecretValue> {
+    let claims = CertificateClaims {
+        iss: client_id,
+        scope: request.vendor.oauth.scopes.first()?,
+        aud: &request.audience,
+        iat: now,
+        exp: now + ASSERTION_SECONDS,
+    };
+    let pem = key.expose_secret().as_bytes();
+    let (algorithm, encoding) = if let Ok(rsa) = jsonwebtoken::EncodingKey::from_rsa_pem(pem) {
+        (jsonwebtoken::Algorithm::PS256, rsa)
+    } else {
+        (
+            jsonwebtoken::Algorithm::ES256,
+            jsonwebtoken::EncodingKey::from_ec_pem(pem).ok()?,
+        )
+    };
+    let mut header = jsonwebtoken::Header::new(algorithm);
+    header.kid = Some(certificate_id.to_owned());
+    jsonwebtoken::encode(&header, &claims, &encoding)
+        .ok()
+        .map(SecretValue::new)
+}
+
+/// `NetSuite`'s client credentials with a certificate (slice 6, `V-NetSuite.3`, decision 3): the
+/// client id and the private key are resolved only now (after the address check), the key is
+/// signed into an assertion and exchanged at the token address for a bearer token. A missing
+/// certificate id, or a key that cannot sign, is a fixed misconfiguration message that quotes
+/// nothing of the key.
+async fn certificate_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let Some(certificate_id) = request.certificate_id else {
+        return Err(Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite certificate id is not set",
+        ));
+    };
+    let client_id = resolve(secrets.resolver, secrets.primary).await?;
+    let Some(secondary) = secrets.secondary else {
+        return Err(Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite private key is not saved",
+        ));
+    };
+    let key = resolve(secrets.resolver, secondary).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let assertion = sign_certificate_assertion(
+        request,
+        client_id.expose_secret(),
+        certificate_id,
+        &key,
+        now,
+    )
+    .ok_or_else(|| {
+        Outcome::misconfigured(
+            "connector is misconfigured: the NetSuite private key is not a usable RSA or P-256 key",
+        )
+    })?;
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "client_credentials"),
+        (
+            "client_assertion_type",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        ),
+        ("client_assertion", assertion.expose_secret()),
     ];
     let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
         .await
@@ -615,7 +800,7 @@ async fn probe_saas_at(
     } else {
         get.bearer_auth(access.token.expose_secret())
     };
-    let attempt = tokio::time::timeout(DIAL_TIMEOUT, get.send()).await;
+    let attempt = tokio::time::timeout(request.wait, get.send()).await;
     let elapsed = started.elapsed();
     let mut outcome = match attempt {
         // A redirect is reported, never followed; the `Location` is the
@@ -641,7 +826,7 @@ async fn probe_saas_at(
             elapsed,
             format!(
                 "{label} request timed out after {}s",
-                DIAL_TIMEOUT.as_secs()
+                request.wait.as_secs()
             ),
         ),
     };
@@ -658,7 +843,7 @@ mod tests {
     use std::collections::HashMap;
 
     use lakehouse_core::secret::EnvSecretResolver;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -704,6 +889,9 @@ mod tests {
                 .and_then(|integration| integration.scope)
                 .map(|scope| SaasVendor::render(scope, &parts)),
             auth,
+            certificate_id: None,
+            audience: SaasVendor::render(row.oauth.token_url, &parts),
+            wait: DIAL_TIMEOUT,
         }
     }
 
@@ -1468,27 +1656,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_integration_credential_that_is_not_one_token_is_not_testable_yet() {
-        let auth = SaasAuth::Integration;
-        let outcome = probe_saas_at(
-            &request(
-                "workday",
-                "http://127.0.0.1:9/who".to_owned(),
-                String::new(),
-                &auth,
-            ),
-            &Secrets {
-                primary: "env:UNUSED",
-                secondary: None,
-                resolver: &PanicIfCalledResolver,
-            },
-            &InternalHosts::ALL,
-            OAuthSettings::default(),
-        )
-        .await;
-        assert!(!outcome.ok && !outcome.supported);
-        assert!(outcome.message.contains("integration credential"));
+    /// The probe's refusal of an integration credential it cannot present stays as a defence, but
+    /// after slice 6 no vendor in the table reaches it: every shape the table names is one of these
+    /// (PR #216 lesson: a way the page signs must be testable by the API's connection test).
+    #[test]
+    fn every_integration_credential_shape_in_the_table_is_one_the_probe_can_present() {
+        let handled: [&[&str]; 6] = [
+            &["token"],
+            &["email", "apiToken"],
+            &["clientId", "clientSecret"],
+            &["serviceAccountJson"],
+            &["username", "password"],
+            &["clientId", "privateKey"],
+        ];
+        for vendor in saas_vendors::SAAS_VENDORS {
+            if let Some(integration) = vendor.integration {
+                assert!(
+                    handled.contains(&integration.secret_fields),
+                    "{}: {:?} has no arm in integration_access",
+                    vendor.id,
+                    integration.secret_fields
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1661,6 +1851,276 @@ mod tests {
         assert!(!outcome.ok, "{}", outcome.message);
         assert!(outcome.message.contains("not a valid key file"));
         assert!(!outcome.message.contains("secret-looking-text"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Slice 6 (V-Workday.3): the integration user's name and password are HTTP Basic, and the
+    /// test runs the connector's first report (base64 of `isu_gate@acme_tenant:wd-password`).
+    #[tokio::test]
+    async fn workdays_integration_user_is_basic_and_the_test_runs_the_named_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/ccx/service/customreport2/acme_tenant/owner/Headcount",
+            ))
+            .and(query_param("format", "json"))
+            .and(header(
+                "authorization",
+                "Basic aXN1X2dhdGVAYWNtZV90ZW5hbnQ6d2QtcGFzc3dvcmQ=",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("vendor secret text"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("WD_USER".to_owned(), "isu_gate@acme_tenant".to_owned());
+        map.insert("WD_PASSWORD".to_owned(), "wd-password".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let path = workday_report_path(&["owner/Headcount".to_owned()], "acme_tenant").unwrap();
+        let outcome = probe_saas_at(
+            &request(
+                "workday",
+                format!("{}{path}", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:WD_USER",
+                secondary: Some("env:WD_PASSWORD"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("vendor secret text"));
+        assert!(!outcome.message.contains("wd-password"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_workday_user_is_a_fixed_sentence() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("vendor secret text"))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("WD_USER".to_owned(), "isu".to_owned());
+        map.insert("WD_PASSWORD".to_owned(), "bad".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "workday",
+                format!("{}/r?format=json", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:WD_USER",
+                secondary: Some("env:WD_PASSWORD"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && outcome.supported);
+        assert!(
+            outcome.message.contains("refused the sign-in"),
+            "{}",
+            outcome.message
+        );
+        assert!(!outcome.message.contains("vendor secret text"));
+    }
+
+    #[test]
+    fn workdays_who_am_i_is_the_first_report_and_only_a_plain_one() {
+        let tenant = "acme_tenant";
+        assert_eq!(
+            workday_report_path(&["a.b@x/My_Report-1".to_owned(), "z/z".to_owned()], tenant),
+            Some("/ccx/service/customreport2/acme_tenant/a.b@x/My_Report-1?format=json".to_owned())
+        );
+        for bad in [
+            "",
+            "Report",
+            "/Report",
+            "owner/",
+            "owner/../x",
+            "owner/a/b",
+            "o wner/Report",
+            "owner/Report name",
+            "owner/Report?x=1",
+            "owner/%2e%2e",
+            "../owner/Report",
+            "owner/@x",
+        ] {
+            assert_eq!(
+                workday_report_path(&[bad.to_owned()], tenant),
+                None,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(workday_report_path(&[], tenant), None);
+        assert_eq!(
+            workday_report_path(&[format!("owner/{}", "a".repeat(151))], tenant),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn workday_without_a_named_report_is_not_testable_and_reads_no_secret() {
+        let info = |objects: serde_json::Value| ConnectorDialInfo {
+            kind: "Workday Reports".to_owned(),
+            host: String::new(),
+            secret_ref: "env:UNUSED".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("saas".to_owned()),
+            dial: serde_json::json!({
+                "vendor": "workday",
+                "account": "wd2.workday.com/acme",
+                "objects": objects,
+                "auth": {"type": "integration"}
+            }),
+        };
+        // No report named: nothing is sent and no secret is read.
+        let outcome = probe_saas_info(
+            &info(serde_json::json!([])),
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(
+            outcome.message.contains("Name a report"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// Slice 6 (`V-NetSuite.3`, decision 3): the `NetSuite` key is signed into a `PS256` assertion with
+    /// the certificate id as `kid` (checked here with the public half), exchanged for a bearer
+    /// token, and that token reaches the account.
+    #[tokio::test]
+    async fn netsuites_certificate_is_exchanged_for_a_token_with_a_ps256_assertion() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let private_pem = private.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let public_pem = private
+            .to_public_key()
+            .to_pkcs1_pem(LineEnding::LF)
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ns-access", "expires_in": 3600, "token_type": "bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer ns-access"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("NS_CLIENT".to_owned(), "ns-client-id".to_owned());
+        map.insert("NS_KEY".to_owned(), private_pem.to_string());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let mut asked = request(
+            "netsuite",
+            format!("{}/who", server.uri()),
+            format!("{}/token", server.uri()),
+            &auth,
+        );
+        asked.certificate_id = Some("cert-1");
+        let outcome = probe_saas_at(
+            &asked,
+            &Secrets {
+                primary: "env:NS_CLIENT",
+                secondary: Some("env:NS_KEY"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let received = server.received_requests().await.unwrap();
+        let body = String::from_utf8(received[0].body.clone()).unwrap();
+        let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(form["grant_type"], "client_credentials");
+        assert_eq!(
+            form["client_assertion_type"],
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+        let assertion = &form["client_assertion"];
+        let header = jsonwebtoken::decode_header(assertion).unwrap();
+        assert_eq!(header.alg, jsonwebtoken::Algorithm::PS256);
+        assert_eq!(header.kid.as_deref(), Some("cert-1"));
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::PS256);
+        validation.set_audience(&[
+            "https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token",
+        ]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            assertion,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("the assertion verifies against the public half, with the account's own audience");
+        assert_eq!(decoded.claims["iss"], "ns-client-id");
+        assert_eq!(decoded.claims["scope"], "rest_webservices");
+        let span =
+            decoded.claims["exp"].as_u64().unwrap() - decoded.claims["iat"].as_u64().unwrap();
+        assert!(span <= 3600);
+        assert!(!outcome.message.contains("ns-client-id"));
+    }
+
+    /// A certificate id that was never set, or a key that is not one, is a fixed message that
+    /// quotes nothing, and nothing is sent to the token address.
+    #[tokio::test]
+    async fn a_netsuite_credential_without_a_certificate_id_or_a_usable_key_is_misconfigured() {
+        let server = MockServer::start().await;
+        let mut map = HashMap::new();
+        map.insert("NS_CLIENT".to_owned(), "ns-client-id".to_owned());
+        map.insert(
+            "NS_KEY".to_owned(),
+            "not a key, secret-looking-text".to_owned(),
+        );
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        for certificate_id in [None, Some("cert-1")] {
+            let mut asked = request(
+                "netsuite",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            );
+            asked.certificate_id = certificate_id;
+            let outcome = probe_saas_at(
+                &asked,
+                &Secrets {
+                    primary: "env:NS_CLIENT",
+                    secondary: Some("env:NS_KEY"),
+                    resolver: &resolver,
+                },
+                &InternalHosts::ALL,
+                OAuthSettings { allow_http: true },
+            )
+            .await;
+            assert!(!outcome.ok, "{}", outcome.message);
+            assert!(!outcome.message.contains("secret-looking-text"));
+        }
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
