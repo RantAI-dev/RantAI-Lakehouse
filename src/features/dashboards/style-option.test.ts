@@ -217,4 +217,46 @@ describe("reference lines", () => {
     const o = base()
     expect(withReferenceLines(o, [{ kind: "average" }], false, false, empty)).toBe(o)
   })
+
+  test("a computed line for a measure on the right axis is drawn on that axis and widens it only", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const cols = seriesColumns({ kind: "bar", y, breakdown: false }, 2)
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, columns: cols })
+    const ctx = {
+      values: (measure?: string) => rows.map((r) => Number(r[(measure ?? "v") as "v"])),
+      format: (_m: string | undefined, v: number) => String(v),
+    }
+    const out = withReferenceLines(styled.option, [{ kind: "average", measure: "w" }], false, false, ctx, cols) as unknown as {
+      series: { markLine?: { data: { yAxis: number; name?: string }[] } }[]
+      yAxis: { max?: unknown }[]
+    }
+    // The line hangs on the first series of the right axis, not on the first series.
+    expect(out.series[0]!.markLine).toBeUndefined()
+    expect(out.series[1]!.markLine!.data).toEqual([{ yAxis: 4, name: "Average" }])
+    // And only the right axis is widened.
+    expect(out.yAxis[0]!.max).toBeUndefined()
+    expect(typeof out.yAxis[1]!.max).toBe("function")
+  })
+
+  test("a computed line without a measure stays on the first axis", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const cols = seriesColumns({ kind: "bar", y, breakdown: false }, 2)
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, columns: cols })
+    const ctx = {
+      values: (measure?: string) => rows.map((r) => Number(r[(measure ?? "v") as "v"])),
+      format: (_m: string | undefined, v: number) => String(v),
+    }
+    const out = withReferenceLines(styled.option, [{ kind: "average" }], false, false, ctx, cols) as unknown as {
+      series: { markLine?: { data: { yAxis: number; name?: string }[] } }[]
+      yAxis: { max?: unknown }[]
+    }
+    expect(out.series[0]!.markLine!.data).toEqual([{ yAxis: 1400, name: "Average" }])
+    expect(out.series[1]!.markLine).toBeUndefined()
+    expect(typeof out.yAxis[0]!.max).toBe("function")
+    expect(out.yAxis[1]!.max).toBeUndefined()
+  })
 })

@@ -984,6 +984,17 @@ pub fn check_reference_lines(def: &ChartInput) -> Result<(), String> {
             "a chart has at most {MAX_REFERENCE_LINES} reference lines."
         ));
     }
+    // `PR #199 review M BLOCKER 3` (decision M1): a computed line is computed
+    // from the values on screen, and on a chart with a breakdown those values
+    // are the groups side by side, so the average, the median, the minimum,
+    // the maximum and the trend would mix the groups. A goal and a band are
+    // values of their own and stay allowed.
+    if def.breakdown.is_some() && lines.iter().any(|l| l.kind.is_computed()) {
+        return Err(
+            "an average, median, minimum, maximum or trend line cannot be drawn on a chart with a breakdown: it would mix the groups."
+                .to_owned(),
+        );
+    }
     let results = def.measures.result_names();
     for line in lines {
         let check_value = |v: &LineValue| match v {
@@ -1963,6 +1974,36 @@ mod tests {
             assert!(e.contains(why), "{lines}: {e}");
         }
         assert!(serde_json::from_value::<ReferenceLine>(json!({ "kind": "wave" })).is_err());
+    }
+
+    /// `PR #199 review M BLOCKER 3` (decision M1): a computed line would mix
+    /// the groups of a breakdown, so it is refused; a goal and a band stay.
+    #[test]
+    fn a_computed_line_is_refused_on_a_chart_with_a_breakdown() {
+        let with_breakdown =
+            |lines: Value| chart(&json!({ "breakdown": "tahun", "referenceLines": lines })).def;
+        for kind in ["average", "median", "min", "max", "trend"] {
+            let e = check_reference_lines(&with_breakdown(json!([{ "kind": kind }]))).unwrap_err();
+            assert!(e.contains("with a breakdown"), "{kind}: {e}");
+        }
+        // A goal and a band are values of their own: they stay allowed.
+        assert!(
+            check_reference_lines(&with_breakdown(json!([{ "value": 1000, "label": "Goal" }])))
+                .is_ok()
+        );
+        assert!(
+            check_reference_lines(&with_breakdown(
+                json!([{ "kind": "band", "value": 1, "to": 5 }])
+            ))
+            .is_ok()
+        );
+        // A chart without a breakdown keeps every computed line.
+        assert!(
+            check_reference_lines(
+                &chart(&json!({ "referenceLines": [{ "kind": "average" }] })).def
+            )
+            .is_ok()
+        );
     }
 
     #[test]

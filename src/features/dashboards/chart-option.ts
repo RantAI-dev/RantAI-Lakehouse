@@ -570,17 +570,43 @@ export function trendEnds(values: readonly number[]): [number, number] | null {
  * values (a shaded area). Computed lines need `ctx`; when the result was cut
  * off their label ends with "of the N shown", because they describe the rows
  * on screen, not every row of the table.
+ *
+ * `PR #199 review M BLOCKER 4` (decision M2): a computed line is drawn on the
+ * axis of the measure it is computed from, not on the first series: `columns`
+ * says which result column each series draws, and the series' own
+ * `yAxisIndex` says which axis that is. The line hangs on the first series of
+ * that axis and widens that axis only. A plain line and a band are values of
+ * their own and stay on the first axis.
  */
-export function withReferenceLines(option: EChartsOption, lines: readonly ReferenceLine[] | undefined, horizontal: boolean, dark: boolean, ctx?: LineContext): EChartsOption {
+export function withReferenceLines(
+  option: EChartsOption,
+  lines: readonly ReferenceLine[] | undefined,
+  horizontal: boolean,
+  dark: boolean,
+  ctx?: LineContext,
+  columns?: readonly (string | undefined)[],
+): EChartsOption {
   const series = Array.isArray(option.series) ? option.series : [];
   if (!lines?.length || !series.length) return option;
   const fallback = dark ? "#fbbf24" : "#d97706";
   const write = (measure: string | undefined, v: number) => ctx?.format?.(measure, v) ?? formatNumber(v, decimalsFor([v]));
   const shown = ctx ? ctx.values().length : 0;
   const suffix = ctx?.cutOff ? ` of the ${shown} shown` : "";
-  const lineData: object[] = [];
-  const areaData: object[] = [];
-  const reach: number[] = [];
+  // The value axis a series draws on, and the axis of the measure a computed
+  // line describes (`PR #199 review M BLOCKER 4`).
+  const axisOf = (i: number) => Number((series[i] as { yAxisIndex?: number })?.yAxisIndex ?? 0);
+  const axisOfMeasure = (measure?: string) => {
+    if (!measure || !columns) return 0;
+    const i = columns.findIndex((c) => c === measure);
+    return i >= 0 ? axisOf(i) : 0;
+  };
+  type Group = { lineData: object[]; areaData: object[]; reach: number[]; measure?: string };
+  const groups = new Map<number, Group>();
+  const groupOf = (axis: number): Group => {
+    const g = groups.get(axis) ?? { lineData: [], areaData: [], reach: [] };
+    groups.set(axis, g);
+    return g;
+  };
   for (const l of lines) {
     const color = l.color ?? fallback;
     // Only a line with a colour of its own overrides the shared style, so a plain line stays {yAxis, name}.
@@ -588,33 +614,37 @@ export function withReferenceLines(option: EChartsOption, lines: readonly Refere
     const kind = l.kind ?? "value";
     const name = l.label ?? "";
     const at = (v: number) => (horizontal ? { xAxis: v } : { yAxis: v });
+    // A computed line belongs to the axis of its measure; a plain line and a
+    // band stay on the first axis.
+    const computed = kind !== "value" && kind !== "band";
+    const g = groupOf(computed ? axisOfMeasure(l.measure) : 0);
+    if (g.measure === undefined) g.measure = l.measure;
     if (kind === "value" && l.value !== undefined && Number.isFinite(l.value)) {
-      lineData.push({ ...at(l.value), name, ...paint });
-      reach.push(l.value);
+      g.lineData.push({ ...at(l.value), name, ...paint });
+      g.reach.push(l.value);
     } else if (kind === "band" && l.value !== undefined && l.to !== undefined && Number.isFinite(l.value) && Number.isFinite(l.to)) {
-      areaData.push([{ ...at(Math.min(l.value, l.to)), name, itemStyle: { color, opacity: 0.14 }, ...(l.color ? { label: { color } } : {}) }, at(Math.max(l.value, l.to))]);
-      reach.push(l.value, l.to);
+      g.areaData.push([{ ...at(Math.min(l.value, l.to)), name, itemStyle: { color, opacity: 0.14 }, ...(l.color ? { label: { color } } : {}) }, at(Math.max(l.value, l.to))]);
+      g.reach.push(l.value, l.to);
     } else if (kind === "trend" && ctx) {
       const ends = trendEnds(ctx.values(l.measure));
       if (!ends) continue;
       const last = ctx.values(l.measure).length - 1;
       // The result of a horizontal bar chart is drawn bottom-up, so point i sits at index last - i.
       const point = (i: number, v: number) => ({ coord: horizontal ? [v, last - i] : [i, v] });
-      lineData.push([
+      g.lineData.push([
         { ...point(0, ends[0]), name: `${name || LINE_NAME.trend}${suffix}`, ...paint },
         point(last, ends[1]),
       ]);
-      reach.push(ends[0], ends[1]);
+      g.reach.push(ends[0], ends[1]);
     } else if (ctx && LINE_NAME[kind]) {
       const v = computedValue(kind, ctx.values(l.measure));
       if (v === null) continue;
-      lineData.push({ ...at(v), name: `${name || LINE_NAME[kind]}${suffix}`, ...paint });
-      reach.push(v);
+      g.lineData.push({ ...at(v), name: `${name || LINE_NAME[kind]}${suffix}`, ...paint });
+      g.reach.push(v);
     }
   }
-  if (!lineData.length && !areaData.length) return option;
-  const top = Math.max(...reach);
-  const markLine = {
+  if (![...groups.values()].some((g) => g.lineData.length || g.areaData.length)) return option;
+  const markOf = (g: Group) => ({
     silent: true,
     symbol: "none",
     lineStyle: { type: "dashed" as const, width: 1.5, color: fallback },
@@ -622,21 +652,44 @@ export function withReferenceLines(option: EChartsOption, lines: readonly Refere
       color: fallback, fontSize: 11, position: "insideEndTop" as const,
       formatter: (p: { name?: string; value?: unknown }) => {
         // A trend line has two ends and no single value to write.
-        const v = typeof p.value === "number" ? write(undefined, p.value) : "";
+        const v = typeof p.value === "number" ? write(g.measure, p.value) : "";
         return `${p.name ? `${p.name} ` : ""}${v}`.trim();
       },
     },
-    data: lineData,
+    data: g.lineData,
+  });
+  // The first series of an axis carries that axis's lines.
+  const firstOf = (axis: number) => {
+    const i = series.findIndex((_, k) => axisOf(k) === axis);
+    return i < 0 ? 0 : i;
   };
-  const markArea = { silent: true, label: { position: "insideTopLeft" as const, fontSize: 11 }, data: areaData };
-  const widen = (axis: unknown) => {
+  const topOf = (axis: number) => {
+    let top = Number.NEGATIVE_INFINITY;
+    for (const [a, g] of groups) if (a === axis && g.reach.length) top = Math.max(top, ...g.reach);
+    return top;
+  };
+  const widen = (axis: unknown, top: number) => {
     if (!axis || typeof axis !== "object" || (axis as { type?: string }).type !== "value") return axis;
+    if (!Number.isFinite(top)) return axis;
     return { ...(axis as object), max: (range: { max: number }) => Math.max(range.max, top) };
   };
-  const widenAll = (axis: unknown) => (Array.isArray(axis) ? axis.map((a, i) => (i === 0 ? widen(a) : a)) : widen(axis));
+  const valueAxes = horizontal ? option.xAxis : option.yAxis;
+  const widened = Array.isArray(valueAxes)
+    ? valueAxes.map((a, i) => widen(a, topOf(i)))
+    : widen(valueAxes, topOf(0));
+  const outSeries = series.map((s, i) => {
+    const entry = [...groups.entries()].find(([axis, g]) => firstOf(axis) === i && (g.lineData.length || g.areaData.length));
+    if (!entry) return s;
+    const g = entry[1];
+    return {
+      ...s,
+      ...(g.lineData.length ? { markLine: markOf(g) } : {}),
+      ...(g.areaData.length ? { markArea: { silent: true, label: { position: "insideTopLeft" as const, fontSize: 11 }, data: g.areaData } } : {}),
+    };
+  });
   return {
     ...option,
-    series: series.map((s, i) => (i === 0 ? { ...s, ...(lineData.length ? { markLine } : {}), ...(areaData.length ? { markArea } : {}) } : s)),
-    ...(horizontal ? { xAxis: widenAll(option.xAxis) } : { yAxis: widenAll(option.yAxis) }),
+    series: outSeries,
+    ...(horizontal ? { xAxis: widened } : { yAxis: widened }),
   } as EChartsOption;
 }
