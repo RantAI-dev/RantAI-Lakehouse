@@ -8,10 +8,12 @@ the REST describe and query calls as Salesforce documents them, a page at a time
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import pendulum
 import pytest
 
 from dispar_orchestrate import ssrf_guard
@@ -50,6 +52,7 @@ class FakeSalesforce:
         self.queries: list[str] = []
         self.headers: list[dict] = []
         self.deleted_visible = False
+        self.since: Any = None
 
     def get(self, url: str, *, headers: dict, params: dict | None, timeout: float) -> Reply:
         self.headers.append(headers)
@@ -60,6 +63,10 @@ class FakeSalesforce:
         if parsed.path in (f"/services/data/v{V}/query", f"/services/data/v{V}/queryAll"):
             self.queries.append((params or {})["q"])
             self.deleted_visible = parsed.path.endswith("queryAll")
+            self.since = None
+            found = re.search(r"WHERE \w+ >= (\S+)", self.queries[-1])
+            if found:  # the cursor predicate, as Salesforce evaluates it
+                self.since = pendulum.parse(found.group(1))
             return self._page(0)
         if parsed.path == f"/services/data/v{V}/query/01gxx-batches":
             return self._page(int(parse_qs(parsed.query)["start"][0]))
@@ -68,6 +75,8 @@ class FakeSalesforce:
     def _page(self, start: int) -> Reply:
         # `query` hides the recycle bin; `queryAll` shows it (Salesforce's documented difference)
         rows = [r for r in self.rows if self.deleted_visible or not r["IsDeleted"]]
+        if self.since is not None:
+            rows = [r for r in rows if pendulum.parse(r["SystemModstamp"]) >= self.since]
         page = rows[start : start + self.page_size]
         end = start + len(page)
         body: dict[str, Any] = {"totalSize": len(rows), "done": end >= len(rows), "records": page}
@@ -120,9 +129,9 @@ def test_the_query_leaves_out_compound_and_file_body_fields_and_keeps_name() -> 
 
 def test_dates_are_written_in_one_form_and_the_cursor_is_a_literal_salesforce_reads() -> None:
     fake = FakeSalesforce([account(1, "2024-05-01T10:20:30.000+0000")])
-    got = list(records.get_records(session_over(fake), "Account", "2024-05-01T10:20:30.123456Z", "SystemModstamp"))
+    got = list(records.get_records(session_over(fake), "Account", "2024-05-01T10:20:30.000456Z", "SystemModstamp"))
     assert got[0]["SystemModstamp"] == "2024-05-01T10:20:30.000000Z"
-    assert "WHERE SystemModstamp >= 2024-05-01T10:20:30.123Z ORDER BY SystemModstamp ASC" in fake.queries[0]
+    assert "WHERE SystemModstamp >= 2024-05-01T10:20:30.000Z ORDER BY SystemModstamp ASC" in fake.queries[0]
 
 
 @pytest.mark.parametrize("bad", ["Account; DELETE", "Account Where", "../x", "a-b", ""])
