@@ -556,11 +556,24 @@ fn new_public_token() -> String {
 /// and `delete_board` on a 10-chart board issued ~96 DDL statements (~2s).
 /// Caching the *outcome* here (not just documenting the option) makes
 /// repeat calls free, matching the TS.
-#[cfg(not(test))]
-static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+///
+/// PR #201 review F SHOULD-FIX 3: one guard for both builds, an
+/// `AtomicU8` and not a `OnceCell`. A test has to be able to put the guard
+/// back to "not started" and drive the production code path itself; a
+/// `OnceCell` cannot be reset, which is why the test build used to carry a
+/// `RwLock<bool>` stand-in that the production build never had — the test
+/// then pinned the statement count and nothing about the code that runs in
+/// production.
+static BI_TABLE_ENSURED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ENSURE_NOT_STARTED);
 
-#[cfg(test)]
-static BI_TABLE_ENSURED: tokio::sync::RwLock<bool> = tokio::sync::RwLock::const_new(false);
+/// The guard's states: the bootstrap has not run yet, or it has.
+const ENSURE_NOT_STARTED: u8 = 0;
+const ENSURE_DONE: u8 = 1;
+
+/// Serialises the bootstrap itself: one runner at a time, the others wait
+/// for its answer — the same contract as `OnceCell::get_or_try_init`.
+static BI_TABLE_BOOTSTRAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 static TEST_DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -578,25 +591,24 @@ static TEST_DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 ///
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_bi_table(ch: &ChClient) -> Result<(), ChError> {
-    #[cfg(not(test))]
-    {
-        BI_TABLE_ENSURED
-            .get_or_try_init(|| ensure_bi_table_uncached(ch))
-            .await
-            .map(drop)
+    use std::sync::atomic::Ordering;
+    if BI_TABLE_ENSURED.load(Ordering::Acquire) == ENSURE_DONE {
+        return Ok(());
     }
-    #[cfg(test)]
-    {
-        let ensured = *BI_TABLE_ENSURED.read().await;
-        if !ensured {
-            let mut guard = BI_TABLE_ENSURED.write().await;
-            if !*guard {
-                ensure_bi_table_uncached(ch).await?;
-                *guard = true;
-            }
-        }
-        Ok(())
+    let _runner = BI_TABLE_BOOTSTRAP_LOCK.lock().await;
+    if BI_TABLE_ENSURED.load(Ordering::Acquire) == ENSURE_DONE {
+        return Ok(());
     }
+    ensure_bi_table_uncached(ch).await?;
+    BI_TABLE_ENSURED.store(ENSURE_DONE, Ordering::Release);
+    Ok(())
+}
+
+/// Put the DDL guard back to "not started", so a test can count the
+/// statements the bootstrap issues. The production build never resets it.
+#[cfg(test)]
+fn reset_bi_table_guard() {
+    BI_TABLE_ENSURED.store(ENSURE_NOT_STARTED, std::sync::atomic::Ordering::Release);
 }
 
 /// The `bi_board` columns that hold state beyond the board's name, layout
@@ -4303,15 +4315,20 @@ mod tests {
     /// statements on every call): the first call to any public function
     /// must run the DDL bootstrap, but every call after that — across the
     /// whole process, matching the TS's module-level `ensured` flag — must
-    /// be free. `BI_TABLE_ENSURED` is a crate-wide static, so this is the
-    /// only test in the crate allowed to exercise `ensure_bi_table`
-    /// end-to-end (a second such test would observe an already-warm cache
-    /// and could pass for the wrong reason, or race depending on test
-    /// execution order).
+    /// be free.
+    ///
+    /// PR #201 review F SHOULD-FIX 3: what this pins is the number of
+    /// statements the bootstrap issues and that the second call is free,
+    /// against the PRODUCTION guard: the guard is put back to "not started"
+    /// first ([`reset_bi_table_guard`]) and the code under test is the code
+    /// that runs in production. It used to run against a `RwLock<bool>`
+    /// stand-in that only the test build had, so it said nothing about the
+    /// production cache. `TEST_DDL_LOCK` keeps the reset away from the
+    /// other tests that count statements.
     #[tokio::test]
     async fn ensure_bi_table_runs_ddl_at_most_once_per_process() {
         let _lock = TEST_DDL_LOCK.lock().await;
-        *BI_TABLE_ENSURED.write().await = false;
+        reset_bi_table_guard();
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
