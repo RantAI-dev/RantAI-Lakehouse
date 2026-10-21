@@ -170,6 +170,15 @@ export function stylePayload(style: StyleFields, rules: FormatRules): StyleField
 }
 
 /**
+ * The palette a chart draws with when the person chose none: the company
+ * palette in a deployment that has one, the default otherwise
+ * (`BI-17` part A, decision 6). A chart being edited keeps what it has.
+ */
+function paletteOfChoice(companyPalette: readonly string[], isEdit: boolean): string {
+  return !isEdit && companyPalette.length >= 2 ? "company" : "default"
+}
+
+/**
  * The colours of a new chart in a deployment with a company palette
  * (`BI-17` part A, decision 6): the palette the company chose, unless the
  * person chose a palette of their own. A chart being edited keeps what it
@@ -181,9 +190,25 @@ export function withCompanyPalette(
   companyPalette: readonly string[],
   isEdit: boolean
 ): StyleFields {
-  if (isEdit || companyPalette.length < 2) return style
   if (style.colors?.palette) return style
-  return { ...style, colors: { ...style.colors, palette: "company" } }
+  const palette = paletteOfChoice(companyPalette, isEdit)
+  if (palette === "default") return style
+  return { ...style, colors: { ...style.colors, palette } }
+}
+
+/**
+ * The palette the builder shows and the chart draws with: the one the person
+ * chose, or the one a chart with no choice of its own draws with
+ * (`PR #199 review O SHOULD-FIX 4`). A palette the person chose is kept as
+ * it is — including "default", which is stored as a choice of its own, so a
+ * company palette does not take it.
+ */
+export function effectivePalette(
+  style: StyleFields,
+  companyPalette: readonly string[],
+  isEdit: boolean
+): string {
+  return style.colors?.palette ?? paletteOfChoice(companyPalette, isEdit)
 }
 
 /** Whether the chart being edited uses anything in the Format section, so the section opens by itself. */
