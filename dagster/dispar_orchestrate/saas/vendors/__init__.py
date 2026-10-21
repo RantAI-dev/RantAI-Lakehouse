@@ -394,6 +394,7 @@ MODULE_PATHS: dict[str, str] = {
     "hubspot": "dispar_orchestrate.saas.vendors.hubspot",
     "zendesk": "dispar_orchestrate.saas.vendors.zendesk",
     "salesforce": "dispar_orchestrate.saas.vendors.salesforce",
+    "ga4": "dispar_orchestrate.saas.vendors.ga4",
 }
 
 

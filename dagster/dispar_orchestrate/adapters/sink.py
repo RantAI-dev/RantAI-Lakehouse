@@ -719,7 +719,14 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
                 f"load mode {mode!r} is not available for {resource.name!r}: its source cannot filter by a "
                 "cursor before the rows are stamped, so reruns would add the last row again"
             )
-        resource.apply_hints(incremental=dlt.sources.incremental(cursor))
+        # SRC-3 V-GA4.2: a `saas` object whose vendor changes recent records after first
+        # reporting them (Google Analytics: 24 to 48 hours) names the lag its cursor
+        # must step back by (`ObjectDecl.lag_seconds`, set on the resource by
+        # `adapters/saas.py`). Without it the hint below would replace the resource's own
+        # cursor and drop the lag, and dlt would then filter out the re-read rows. A
+        # `sql_database` resource has no such attribute: unchanged for it.
+        lag = getattr(resource, "cursor_lag_seconds", None)
+        resource.apply_hints(incremental=dlt.sources.incremental(cursor, lag=lag))
 
 
 def _abort_pending(pipeline: Any, *, strict: bool = False) -> None:

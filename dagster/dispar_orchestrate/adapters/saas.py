@@ -292,9 +292,11 @@ def build_source(
     if incremental:
 
         @dlt.resource(name=resource_name)
-        def rows(cursor: dlt.sources.incremental = dlt.sources.incremental(decl.cursor)):  # noqa: B008 -- dlt's own pattern
+        def rows(cursor: dlt.sources.incremental = dlt.sources.incremental(decl.cursor, lag=decl.lag_seconds or None)):  # noqa: B008 -- dlt's own pattern
             yield from _records(cursor.last_value)
 
+        # `sink._apply_cursor` re-applies the cursor and reads this to keep the lag.
+        rows.cursor_lag_seconds = decl.lag_seconds or None
         return AdapterBuildResult(source=rows, observed_before_load=observed_before)
 
     def plain() -> Iterator[dict]:

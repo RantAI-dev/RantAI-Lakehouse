@@ -28,6 +28,7 @@ class ObjectDecl:
     cursor: str | None = None
     deletes: bool = False
     full_reason: str | None = None
+    lag_seconds: int = 0
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -36,6 +37,8 @@ class ObjectDecl:
             raise ValueError(f"object {self.name!r} needs a primary key")
         if self.cursor is None and not (self.full_reason or "").strip():
             raise ValueError(f"object {self.name!r} has no cursor and gives no reason it is re-read in full")
+        if self.lag_seconds < 0 or (self.lag_seconds and self.cursor is None):
+            raise ValueError(f"object {self.name!r} has a lag but no cursor, or a negative one")
         if self.cursor is not None and self.full_reason:
             raise ValueError(f"object {self.name!r} has a cursor and also a reason it is re-read in full")
 

@@ -11,7 +11,9 @@ from ..settings import LOOKBACK_DAYS, START_DATE
 from .data_processing import get_report
 
 
-def report_start_date(time_dimension: str, last_value: Any, start_date: str) -> str:
+def report_start_date(
+    time_dimension: str, last_value: Any, start_date: str, lookback_days: int = LOOKBACK_DAYS
+) -> str:
     """
     The first day (`YYYY-MM-DD`) a report is asked for.
 
@@ -25,7 +27,7 @@ def report_start_date(time_dimension: str, last_value: Any, start_date: str) -> 
     if not last_value:
         return start_date or START_DATE
     floor = pendulum.parse(last_value) if isinstance(last_value, str) else pendulum.instance(last_value)
-    floor = floor.subtract(days=LOOKBACK_DAYS)
+    floor = floor.subtract(days=lookback_days)
     unit = {"isoYearIsoWeek": "week", "yearMonth": "month", "year": "year"}.get(time_dimension)
     if unit:
         floor = floor.start_of(unit)
@@ -41,6 +43,7 @@ def basic_report(
     resource_name: str,
     start_date: str,
     last_date: dlt.sources.incremental[DateTime],
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> Iterator[TDataItem]:
     """
     Retrieves the data for a report given dimensions, metrics, and filters required for the report.
@@ -58,6 +61,8 @@ def basic_report(
             Default is taken from dlt state if it exists.
         last_date: Incremental load end date.
             Default is taken from dlt state if it exists.
+        lookback_days: Days re-read before the last value (local change 2). Zero when the
+            caller's own incremental already carries the lag (the connector's `ObjectDecl.lag_seconds`).
 
     Returns:
         Generator of all rows of data in the report.
@@ -69,7 +74,9 @@ def basic_report(
             logger.warning(
                 f"Using the starting date: {last_date.last_value} for incremental report: {resource_name} and ignoring start date passed as argument {start_date}"
             )
-    start_date = report_start_date(last_date.cursor_path, last_date.last_value, start_date)
+    start_date = report_start_date(
+        last_date.cursor_path, last_date.last_value, start_date, lookback_days
+    )
     end_date = pendulum.yesterday().to_date_string()
     if start_date > end_date:
         # Nothing of the report is final yet (the start is after yesterday): Google answers
