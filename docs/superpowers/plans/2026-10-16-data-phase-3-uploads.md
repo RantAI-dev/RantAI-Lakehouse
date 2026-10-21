@@ -692,3 +692,16 @@ What the fix must do:
 
 The branch is pushed for that CI run, with this `BLOCKER` open. It must not merge until the fix is reviewed.
 
+### Slice 3, round 2 (planner/reviewer, Claude Opus), at `340c4000`, 2026-10-21
+
+- **`BLOCKER` 1, fixed in `75a644ad`.** `_replace_changing_types` holds one `table.transaction()`: the schema update, the moves back to the file's order, and an overwrite followed by appends in groups of `RETYPE_FLUSH_BYTES`.
+  - `grep` finds no `purge_table` or `drop_table` call in `adapters/sink.py`.
+  - Data files written by a failed transaction are orphans, which `maintenance.py`'s `remove_orphan_files` reclaims.
+  - **Still CI-only:** the transaction against Lakekeeper's REST catalog, exercised by the g9 "replace back to text" step.
+- **`BLOCKER` 2, fixed in `340c4000`.** The five real-pipeline tests are `loader` and clear the ambient `ICEBERG_CATALOG__*` variables. The reviewer ran them:
+  - with those variables pointing at `lakekeeper:8181`: `pytest -m loader test_typed_load.py`, 5 passed;
+  - the whole unit job's selection, `pytest dispar_orchestrate -m "not loader"`: 1448 passed, 1 skipped.
+- **Open checks on the PR that this branch did not cause:** `cargo audit` and `cargo deny`, red on the new `rustls-webpki`, `webpki-roots` and `webpki-root-certs` advisories (RUSTSEC-2026-0381, -0382 and -0383). They were published after `main`'s last run.
+
+No open `BLOCKER`. The branch is pushed, and g9 is to be read on the PR.
+
