@@ -640,6 +640,91 @@ def step_servicenow() -> None:
     _log("servicenow forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 
 
+def _confluence(auth: str = "integration"):  # noqa: ANN202
+    from dispar_orchestrate.adapters import saas as saas_adapter
+    from dispar_orchestrate.saas.vendors import confluence as _module  # noqa: F401 -- imported for its registration
+
+    if auth == "oauth":
+        dial = {"vendor": "confluence", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        # Atlassian rotates the refresh token on every refresh: ask the mock which one is current.
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": admin("confluence", action="refresh_token")["refresh_token"]}
+    else:
+        dial = {"vendor": "confluence", "account": "acme", "auth": {"type": "integration"}}
+        secrets = {"email": "agent@example.invalid", "apiToken": "stub-api-token"}
+    module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
+    return module, vendor, parts, session, dial
+
+
+def step_confluence() -> None:
+    """Confluence (V-Confluence.4): connect (email + API token at the site; the browser sign-in behind
+    Atlassian's gateway, the cloud id taken from accessible-resources), discover, load (cursor paging by
+    the relative _links.next), reload (newest first, stopping at the cursor), a new property, rate limit,
+    forbidden and revoked sign-in."""
+    from dispar_orchestrate import ingest_errors
+
+    admin("confluence", action="reset")
+
+    module, vendor, parts, session, dial = _confluence()
+    _expect(len(session.get_json(parts.base_path + vendor.whoami["path"])["results"]) == 1, "confluence connect: the spaces call at the site")
+    _b_module, b_vendor, b_parts, b_session, _b_dial = _confluence("oauth")
+    _expect(b_parts.base_path == "/ex/confluence/0f1e2d3c-4b5a-4968-8776-655443322110", f"confluence connect (browser sign-in): the gateway prefix is {b_parts.base_path!r}")
+    _expect(len(b_session.get_json(b_parts.base_path + b_vendor.whoami["path"])["results"]) == 1, "confluence connect (browser sign-in): the spaces call behind the gateway")
+    _log("confluence connect: the email and API token reach the site; the browser sign-in (JSON refresh grant, the refresh token rotated) finds its cloud id and reaches the gateway")
+
+    declared = {d.name: d for d in module.list_objects(session, parts, dial)}
+    _expect(set(declared) == {"spaces", "pages", "blogposts", "comments"}, f"confluence discover: {sorted(declared)}")
+    _expect(declared["pages"].load_description() == "incremental" and declared["spaces"].load_description().startswith("re-read in full: "), "confluence discover: how each object loads")
+    _log("confluence discover: spaces (re-read in full), pages, blogposts and comments (incremental)")
+
+    admin("confluence", action="clear_log")
+    first = _read(module, parts, session, dial, "pages")
+    _expect([r["id"] for r in first] == ["1005", "1004", "1003", "1002", "1001"], f"confluence load: first run read {[r['id'] for r in first]}")
+    _expect(len([line for line in mock_log("confluence") if "/pages" in line]) == 3, "confluence load: the relative _links.next was not followed to the third page")
+    comments = _read(module, parts, session, dial, "comments")
+    _expect([(c["id"], c["comment_type"]) for c in comments] == [("5001", "footer")], f"confluence load: comments {comments!r}")
+    _log("confluence load: 5 pages over 3 cursor pages, newest first, with their bodies; the comment told apart as footer")
+
+    cursor = max(r["modified_at"] for r in first)  # the lag is dlt's; the cursor is given as is
+    admin("confluence", action="put", id=2, fields={"title": "page 2 changed"})
+    admin("confluence", action="put", id=6)
+    admin("confluence", action="clear_log")
+    again = _read(module, parts, session, dial, "pages", since=cursor - timedelta(seconds=1))
+    _expect(sorted(r["id"] for r in again) == ["1002", "1005", "1006"], f"confluence reload: read {[r['id'] for r in again]}, expected the new (6), the changed (2) and the cursor's own (5)")
+    _expect(len([line for line in mock_log("confluence") if "/pages" in line]) == 2, "confluence reload: it did not stop near the cursor")
+    _expect(not declared["pages"].deletes, "confluence reload: a delete is claimed")
+    _log("confluence reload: newest first and stopped at the cursor after 2 of 3 pages; the changed, the new and the cursor record; no delete is claimed")
+
+    admin("confluence", action="add_field", name="labelCount")
+    _expect(any("labelCount" in r for r in _read(module, parts, session, dial, "pages")), "confluence schema change: the new property is not in the records")
+    _log("confluence schema change: the new property arrives in the records; Confluence has no describe, so the observer reports it after the load (decision 9)")
+
+    admin("confluence", action="rate_limit", count=2)
+    started = time.time()
+    _expect(len(_read(module, parts, session, dial, "spaces")) == 1, "confluence rate limit: the read did not come back after the waits")
+    _expect(time.time() - started >= 1.5, "confluence rate limit: the Retry-After was not waited")
+    admin("confluence", action="rate_limit", count=50)
+    exc = _raises("SaasRateLimited", lambda: _read(module, parts, session, dial, "spaces"))
+    _expect(ingest_errors.classify(exc).error_class == "rate_limited", "confluence rate limit: the run report class")
+    admin("confluence", action="rate_limit", count=0)
+    _log("confluence rate limit: 429 with Retry-After waited out; a limit that does not lift fails as rate_limited")
+
+    admin("confluence", action="forbid", on=True)
+    exc = _raises("SaasPermissionMissing", lambda: _read(module, parts, session, dial, "spaces"))
+    _expect(ingest_errors.classify(exc).error_class == "permission_missing", "confluence forbidden: the run report class")
+    admin("confluence", action="forbid", on=False)
+    admin("confluence", action="revoke", on=True)
+    exc = _raises("SaasSignInRefused", lambda: _read(module, parts, session, dial, "spaces"))
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "confluence revoked: the run report class")
+
+    def browser_open() -> None:
+        _confluence("oauth")
+
+    exc = _raises("OAuthSignInRefused", browser_open)
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "confluence revoked: the browser sign-in's run report class")
+    admin("confluence", action="revoke", on=False)
+    _log("confluence forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
+
+
 def _ga4_row_ids() -> set[str]:
     """`country|date` of every row the mock holds, read from the mock when the step needs it."""
     days = admin("ga4", action="days")["days"]
@@ -682,6 +767,23 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 4},
         ],
         "reads_marker": ("%3E%3D",),  # the url-encoded `>=` of the sys_updated_on filter
+    },
+    # Confluence: the email + API token way (the API's connection test sends Basic with the plain email); the
+    # browser sign-in behind Atlassian's gateway is covered by the vendor-level step (its connection test is
+    # honestly "not testable"). Pages have no describe, so the preview is honestly unsupported.
+    "confluence": {
+        "type": "Confluence", "host": "acme.atlassian.net", "account": "acme", "label": "Confluence",
+        "credential": {"source": "file", "primary": "access_key", "secondary": "token"},
+        "values": {"primary": "agent@example.invalid", "secondary": "stub-api-token"},
+        "object": "pages", "target": "saas_gate_confluence_pages", "cursor": "modified_at", "text": "title", "key": "id",
+        "columns": "id, title, modified_at", "preview_columns": None,
+        "first_ids": {str(1000 + i) for i in range(1, 6)}, "reload_ids": {str(1000 + i) for i in range(1, 7)},
+        "changed_id": "1002",
+        "changes": [
+            {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
+            {"action": "put", "id": 6},
+        ],
+        "reads_marker": ("/pages",), "max_reads": 2,  # newest first, stopped at the cursor: 2 of 3 pages
     },
     # Salesforce offers the browser sign-in only (decisions 3 and 4), so the connector holds the app's client
     # secret and a refresh token as files, as `g6-oauth` does, and the product refreshes it at the mock.
@@ -883,6 +985,8 @@ def step_product(vendor_id: str) -> None:
     elif vendor_id == "salesforce":
         _expect(by_id["001STUB003"]["is_deleted"] in (True, 1, "true"), "salesforce reload: the deleted account does not say is_deleted in Bronze")
         _expect(by_id["001STUB001"]["is_deleted"] in (False, 0, "false") and len(by_id) == 4, "salesforce reload: an account was lost or marked")
+    elif vendor_id == "confluence":
+        _expect(len(by_id) == 6, "confluence reload: a page was lost or stored twice")
     elif vendor_id == "servicenow":
         _expect(len(by_id) == 4, "servicenow reload: an incident was lost or stored twice")
     elif vendor_id == "zendesk":
@@ -893,11 +997,14 @@ def step_product(vendor_id: str) -> None:
     seen = mock_log(vendor_id)
     reads = [line for line in seen if any(m in line for m in spec.get("reads_marker", ("/search", "cursor", "incremental")))]
     _expect(reads, f"{vendor_id} reload: the mock saw no incremental request ({seen})")
+    if spec.get("max_reads"):
+        _expect(len(reads) <= spec["max_reads"], f"{vendor_id} reload: {len(reads)} list requests; an incremental read stops near the cursor ({reads})")
     _expect(not any(line == "GET /crm/v3/objects/deals" for line in seen), f"{vendor_id} reload: it listed every deal again")
     _log(f"{vendor_id} reload: "
          + {
              "zendesk": "the changed and the new record merged on the key, no duplicate; the deleted ticket says status = deleted",
              "salesforce": "the changed and the new record merged on the key, no duplicate; the deleted account says is_deleted (queryAll)",
+             "confluence": "the changed and the new page merged on id, no duplicate; the read stopped near the cursor (no delete is claimed)",
              "servicenow": "the changed and the new incident merged on sys_id, no duplicate (no delete is claimed)",
              "ga4": "the corrected last days merged on country + date, no row twice, the run starting at the lagged cursor",
          }.get(vendor_id, "the changed and the new record merged on the key, no duplicate; the archived deal stays (HubSpot reports no deletes)"))
@@ -923,6 +1030,7 @@ def run_vendors() -> None:
     step_salesforce()
     step_ga4()
     step_servicenow()
+    step_confluence()
 
 
 def run() -> None:
