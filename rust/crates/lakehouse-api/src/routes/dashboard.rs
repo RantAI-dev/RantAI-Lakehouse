@@ -895,8 +895,8 @@ pub async fn specs_update(
         )
     })?;
     // The board it left changed too, when the edit moved it.
-    if let Some(old) = old_board.filter(|b| *b != spec.board) {
-        snapshot(ch, &old, &principal).await;
+    if old_board != spec.board {
+        snapshot(ch, &old_board, &principal).await;
     }
     snapshot(ch, &spec.board, &principal).await;
     Ok(ApiJson(

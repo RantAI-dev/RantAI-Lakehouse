@@ -143,7 +143,11 @@ pub(crate) async fn require_chart_board(
         // a dashboard nobody has: the status code then told a caller that the
         // id is unknown, while a private one was refused. Both are refused
         // now, with the same sentence.
-        None | Some((2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
+        //
+        // A dashboard that was purged for good (state 1) is refused like one
+        // in the trash: a chart may not be created on a dashboard that is
+        // gone (`PR #199 review O SHOULD-FIX 2`).
+        None | Some((1 | 2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         Some((_, owner)) if !viewer.sees(&owner) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         _ => Ok(()),
     }
@@ -228,22 +232,24 @@ pub(crate) async fn visible_live_chart_board(
         .map(|()| board))
 }
 
-/// Check that an edit may write chart `id`: it is not in the trash and not on a
-/// board the viewer may not see. Returns the board it is on now, `None` for a
-/// chart that was removed for good.
+/// Check that an edit may write chart `id`: it is not in the trash, not purged
+/// for good, and not on a board the viewer may not see. Returns the board it
+/// is on now.
 ///
 /// # Errors
 ///
-/// [`Gate::Missing`] for a chart that never existed, one in the trash and one
-/// on a board the viewer cannot see: all three answer the same sentence, so
-/// the status code does not tell a caller that a chart of somebody else
-/// exists (`PR #199 review M SHOULD-FIX BI-18 1`); [`Gate::Store`] when the
-/// store is unreachable.
+/// [`Gate::Missing`] for a chart that never existed, one in the trash, one
+/// purged for good and one on a board the viewer cannot see: all four answer
+/// the same sentence, so the status code does not tell a caller that a chart
+/// of somebody else exists (`PR #199 review M SHOULD-FIX BI-18 1`); and so
+/// that an edit cannot bring a purged chart back to life
+/// (`PR #199 review O SHOULD-FIX 2`). [`Gate::Store`] when the store is
+/// unreachable.
 pub(crate) async fn require_editable_chart(
     ch: &ChClient,
     id: &str,
     viewer: &Viewer,
-) -> Result<Option<String>, Gate> {
+) -> Result<String, Gate> {
     let Some((state, board)) = store::chart_row_state(ch, id).await.map_err(Gate::Store)? else {
         // An id that never existed used to be edited into a new chart, so the
         // status code told a caller that the chart is unknown, while one on a
@@ -260,10 +266,13 @@ pub(crate) async fn require_editable_chart(
                     Gate::Missing(_) => Gate::Missing(CHART_NOT_FOUND),
                     other @ Gate::Store(_) => other,
                 })?;
-            Ok(Some(board))
+            Ok(board)
         }
-        2 => Err(Gate::Missing(CHART_NOT_FOUND)),
-        _ => Ok(None),
+        // A chart in the trash (2) can be restored, a purged one (1) is gone
+        // for good: an edit of either would bring it back without a restore,
+        // so both are refused like an id that never existed. Any other state
+        // is refused too (fail closed).
+        _ => Err(Gate::Missing(CHART_NOT_FOUND)),
     }
 }
 

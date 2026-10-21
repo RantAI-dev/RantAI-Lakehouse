@@ -665,6 +665,49 @@ async fn an_edit_of_a_chart_that_does_not_exist_is_refused() {
     assert_eq!(sentence, "this tile does not exist");
 }
 
+/// `PR #199 review O SHOULD-FIX 2`: a dashboard that was purged for good
+/// (state 1) is refused like one in the trash, so a chart is not created on
+/// a dashboard that is gone.
+#[tokio::test]
+async fn a_chart_cannot_be_created_on_a_dashboard_that_was_purged_for_good() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![(
+        &["SELECT is_deleted, owner_id FROM console.bi_board"],
+        vec![state_row(1, "")],
+    )])
+    .await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_purged"),
+        &me,
+    )
+    .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a purged dashboard must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "dashboard not found.");
+}
+
+/// `PR #199 review O SHOULD-FIX 2`: a chart that was purged for good (state
+/// 1) is refused like one in the trash, so an edit cannot bring it back to
+/// life.
+#[tokio::test]
+async fn an_edit_of_a_chart_that_was_purged_for_good_is_refused() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![(
+        &["SELECT is_deleted, board FROM console.bi_chart"],
+        vec![json!({ "is_deleted": 1, "board": "b_draft" })],
+    )])
+    .await;
+    let refused =
+        super::super::dashboard_organise::require_editable_chart(&client(&server), "c_purged", &me)
+            .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a purged chart must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "this tile does not exist");
+}
+
 #[tokio::test]
 async fn deleting_a_hidden_chart_deletes_nothing_and_says_nothing() {
     let server = engine(vec![

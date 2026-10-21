@@ -144,10 +144,11 @@ async fn format_chart(
     }
     let ch = &state.clickhouse;
     let viewer: Viewer = principal.map_or_else(Viewer::anonymous, viewer_of);
-    // A chart in the trash or on somebody else's personal board cannot be edited.
+    // A chart in the trash, one purged for good, or one on somebody else's
+    // personal board cannot be edited, and all three answer like a chart
+    // that never existed.
     match require_editable_chart(ch, &id, &viewer).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return json!({ "error": "chart not found." }),
+        Ok(_) => {}
         Err(crate::routes::dashboard_organise::Gate::Missing(sentence)) => {
             return json!({ "error": sentence });
         }
@@ -237,7 +238,46 @@ async fn set_dashboard_theme(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
     use super::*;
+    use crate::config::Config;
+
+    /// The state the tool reads through: no Postgres, so the reporting
+    /// settings read as their defaults.
+    fn state_for(server: &MockServer) -> AppState {
+        let env = HashMap::from([
+            ("CH_URL".to_owned(), server.uri()),
+            (
+                "DATABASE_URL".to_owned(),
+                "not a connection string".to_owned(),
+            ),
+        ]);
+        AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    /// A `ClickHouse` that answers the chart's own state with these rows and
+    /// every other statement with none.
+    async fn engine(rows: Vec<Value>) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                let sql = String::from_utf8_lossy(&request.body);
+                let rows = if sql.contains("FROM console.bi_chart") {
+                    rows.clone()
+                } else {
+                    Vec::new()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": rows, "rows": rows.len() }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
 
     fn stored() -> ChartInput {
         serde_json::from_value(json!({
@@ -416,5 +456,22 @@ mod tests {
         for field in FORMAT_FIELDS.iter().filter(|f| **f != "referenceLines") {
             assert!(json.get(*field).is_some(), "{field} is not a style field");
         }
+    }
+
+    /// `PR #199 review O SHOULD-FIX 2`: a chart that was purged for good
+    /// (state 1) answers like one that never existed, so the answer does not
+    /// tell the two apart.
+    #[tokio::test]
+    async fn a_purged_chart_answers_like_a_chart_that_never_existed() {
+        let purged = engine(vec![json!({ "is_deleted": 1, "board": "b1" })]).await;
+        let unknown = engine(Vec::new()).await;
+        let call = args(json!({ "chart": "c1", "colors": { "palette": "muted" } }));
+        let purged_reply = Box::pin(format_chart(&state_for(&purged), None, &call)).await;
+        let unknown_reply = Box::pin(format_chart(&state_for(&unknown), None, &call)).await;
+        assert_eq!(
+            purged_reply, unknown_reply,
+            "a purged chart and a chart that never existed answer the same"
+        );
+        assert_eq!(purged_reply["error"], json!("this tile does not exist"));
     }
 }

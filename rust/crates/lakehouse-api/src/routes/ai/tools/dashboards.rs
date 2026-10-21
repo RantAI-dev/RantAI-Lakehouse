@@ -158,8 +158,8 @@ pub(super) async fn update_chart(
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
             Ok(()) => {
-                if let Some(old) = old_board.filter(|b| *b != spec.board) {
-                    snapshot_as(ch, &old, principal).await;
+                if old_board != spec.board {
+                    snapshot_as(ch, &old_board, principal).await;
                 }
                 snapshot_as(ch, &spec.board, principal).await;
                 json!({
