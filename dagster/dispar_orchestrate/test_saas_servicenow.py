@@ -42,6 +42,11 @@ class ServiceNow:
         self.log: list[str] = []
         self.link_to: str | None = None  # make the next link point elsewhere
         self.status: dict[str, int] = {}
+        # the dictionary: table -> (fields it defines, its parent)
+        self.dictionary: dict[str, tuple[list[str], str | None]] = {
+            "incident": (["number", "short_description"], "task"),
+            "task": (["sys_id", "sys_updated_on", "state"], None),
+        }
 
     def get(self, url: str, *, headers: dict, params: dict | None, timeout: float) -> Reply:
         parsed = urlparse(url)
@@ -50,17 +55,27 @@ class ServiceNow:
         self.log.append(f"{table}?{query.get('sysparm_query')}&offset={query.get('sysparm_offset', 0)}")
         if table in self.status:
             return Reply(self.status[table], {"error": {"message": "STUB-VENDOR-WORDS"}})
+        if table == "sys_dictionary":
+            name = re.match(r"name=([a-z_]+)\^", query["sysparm_query"]).group(1)  # type: ignore[union-attr]
+            return Reply(200, {"result": [{"element": e} for e in self.dictionary.get(name, ([], None))[0]] + [{"element": ""}]})
+        if table == "sys_db_object":
+            name = query["sysparm_query"].split("=", 1)[1]
+            parent = self.dictionary.get(name, ([], None))[1]
+            return Reply(200, {"result": [{"super_class.name": parent or ""}]})
         if table not in self.tables:
             return Reply(400, {"error": {"message": "Invalid table STUB-VENDOR-WORDS"}})
         rows = list(self.tables[table])
         match = re.match(r"sys_updated_on>=([^\^]+)\^", query.get("sysparm_query", ""))
         if match:
-            rows = [r for r in rows if r["sys_updated_on"] >= match.group(1)]
-        rows.sort(key=lambda r: (r["sys_updated_on"], r["sys_id"]))
+            rows = [r for r in rows if r.get("sys_updated_on", "") >= match.group(1)]
+        rows.sort(key=lambda r: (r.get("sys_updated_on", ""), r.get("sys_id", "")))
         offset, limit = int(query.get("sysparm_offset", 0)), int(query["sysparm_limit"]) if "sysparm_limit" in query else self.page
         limit = min(limit, self.page)
         chunk = rows[offset : offset + limit]
-        visible = [r for r in chunk if r["sys_id"] not in self.hidden]
+        visible = [r for r in chunk if r.get("sys_id") not in self.hidden]
+        if "sysparm_fields" in query:
+            wanted = query["sysparm_fields"].split(",")
+            visible = [{k: v for k, v in r.items() if k in wanted} for r in visible]
         reply_headers = {}
         if offset + limit < len(rows):
             nxt = self.link_to or ORIGIN
@@ -93,6 +108,11 @@ def api() -> ServiceNow:
 
 def open_(api: ServiceNow, dial: dict = DIAL, secrets: dict = SECRETS):  # noqa: ANN202
     return saas_adapter.open_session(dial, secrets, resolve_checked=resolver, http_get=api.get, sleep=lambda _s: None)
+
+
+def reads(api: ServiceNow) -> list[str]:
+    """The log without the one-record sample `declaration` asks for."""
+    return [line for line in api.log if not line.startswith(tuple(f"{t}?None" for t in api.tables))]
 
 
 def read(api: ServiceNow, name: str = "incident", since: Any = None) -> list[dict]:
@@ -128,7 +148,7 @@ def test_a_first_run_reads_every_record_in_order_across_the_link_header_pages(ap
     api.tables["incident"] = [row(i, f"2026-10-0{i} 10:00:00") for i in range(1, 8)]
     got = read(api)
     assert [r["number"] for r in got] == [f"INC{i:07d}" for i in range(1, 8)]
-    assert api.log[0].startswith("incident?ORDERBYsys_updated_on^ORDERBYsys_id")
+    assert reads(api)[0].startswith("incident?ORDERBYsys_updated_on^ORDERBYsys_id")
 
 
 def test_a_short_page_does_not_end_the_read_because_the_access_check_runs_after_the_limit(api: ServiceNow) -> None:
@@ -141,7 +161,7 @@ def test_a_later_run_asks_only_for_records_updated_since_the_cursor(api: Service
     api.tables["incident"] = [row(i, f"2026-10-0{i} 10:00:00") for i in range(1, 6)]
     got = read(api, since="2026-10-03 10:00:00")
     assert [r["number"] for r in got] == ["INC0000003", "INC0000004", "INC0000005"]
-    assert api.log[0].startswith("incident?sys_updated_on>=2026-10-03 10:00:00^ORDERBYsys_updated_on^ORDERBYsys_id")
+    assert reads(api)[0].startswith("incident?sys_updated_on>=2026-10-03 10:00:00^ORDERBYsys_updated_on^ORDERBYsys_id")
 
 
 def test_the_cursor_may_arrive_as_a_datetime_or_iso_text_and_is_written_in_utc(api: ServiceNow) -> None:
@@ -150,7 +170,7 @@ def test_the_cursor_may_arrive_as_a_datetime_or_iso_text_and_is_written_in_utc(a
     api.tables["incident"] = [row(1, "2026-10-01 10:00:00")]
     read(api, since=datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=2))))
     read(api, since="2026-10-01T10:00:00Z")
-    assert all(line.startswith("incident?sys_updated_on>=2026-10-01 10:00:00^") for line in api.log)
+    assert reads(api) and all(line.startswith("incident?sys_updated_on>=2026-10-01 10:00:00^") for line in reads(api))
 
 
 def test_a_cursor_that_is_not_a_date_is_a_rejected_setting(api: ServiceNow) -> None:
@@ -188,6 +208,74 @@ def test_the_access_failures_have_their_own_fixed_classes(api: ServiceNow) -> No
         with pytest.raises(expected) as err:
             read(api)
         assert "STUB-VENDOR-WORDS" not in str(err.value)
+
+
+# ---- objects: declaration, list, describe ------------------------------------------------------
+
+
+def test_a_table_with_a_change_time_loads_incrementally_and_one_without_is_read_in_full(api: ServiceNow) -> None:
+    api.tables["incident"] = [row(1, "2026-10-01 10:00:00")]
+    api.tables["sys_choice"] = [{"sys_id": "x1", "label": "a"}]
+    module, _v, parts, session = open_(api)
+    assert module.declaration(session, parts, DIAL, "incident").load_description() == "incremental"
+    full = module.declaration(session, parts, DIAL, "sys_choice")
+    assert full.load_description() == "re-read in full: sys_choice has no sys_updated_on field to filter by"
+    assert [r["sys_id"] for r in module.read(session, parts, DIAL, full, since=None)] == ["x1"]
+    assert reads(api)[-1].startswith("sys_choice?ORDERBYsys_id&")
+
+
+def test_a_table_without_sys_id_is_a_rejected_setting_and_an_unknown_one_too(api: ServiceNow) -> None:
+    api.tables["v_odd"] = [{"name": "x"}]
+    module, _v, parts, session = open_(api)
+    for name in ("v_odd", "nothing_here"):
+        with pytest.raises(saas_adapter.SaasSetupRefused):
+            module.declaration(session, parts, DIAL, name)
+
+
+def test_an_empty_table_is_taken_to_be_a_normal_incremental_one(api: ServiceNow) -> None:
+    module, _v, parts, session = open_(api)
+    assert module.declaration(session, parts, DIAL, "incident").incremental
+
+
+def test_the_five_suggested_tables_and_the_ones_named_in_the_dial_are_listed(api: ServiceNow) -> None:
+    module, _v, parts, session = open_(api)
+    names = [d.name for d in module.list_objects(session, parts, {**DIAL, "objects": ["u_custom", "incident"]})]
+    assert names == ["incident", "change_request", "problem", "sys_user", "cmdb_ci", "u_custom"]
+    assert api.log == [], "listing makes no request"
+    with pytest.raises(saas_adapter.SaasSetupRefused):
+        module.list_objects(session, parts, {**DIAL, "objects": ["Bad Name"]})
+
+
+def test_describe_walks_the_parent_tables_and_types_the_change_time(api: ServiceNow) -> None:
+    module, _v, parts, session = open_(api)
+    fields = {f.name: f.type_name for f in module.describe(session, parts, DIAL, "incident")}
+    assert fields == {"number": "text", "short_description": "text", "sys_id": "text", "sys_updated_on": "timestamp", "state": "text"}
+
+
+def test_describe_is_none_when_the_account_may_not_read_the_dictionary(api: ServiceNow) -> None:
+    api.status["sys_dictionary"] = 403
+    module, _v, parts, session = open_(api)
+    assert module.describe(session, parts, DIAL, "incident") is None
+
+
+def test_a_loop_in_the_table_hierarchy_is_refused(api: ServiceNow) -> None:
+    api.dictionary = {"a": (["x"], "b"), "b": (["y"], "a")}
+    module, _v, parts, session = open_(api)
+    with pytest.raises(saas_adapter.SaasSetupRefused):
+        module.describe(session, parts, DIAL, "a")
+
+
+def test_a_described_load_is_observed_before_it_and_keeps_only_the_described_columns(api: ServiceNow) -> None:
+    api.tables["incident"] = [row(1, "2026-10-01 10:00:00", secret_note="x")]
+    seen: list[list[str]] = []
+
+    def gate(table: schema_observer.ReflectedTable) -> schema_observer.Decision:
+        seen.append([c.name for c in table.columns])
+        return schema_observer.Decision(action="load", columns=[c.name for c in table.columns], changes=[])
+
+    built = saas_adapter.build_source(DIAL, SECRETS, [obj()], gate=gate, resolve_checked=resolver, http_get=api.get, sleep=lambda _s: None)
+    assert built is not None and built.observed_before_load and "sys_id" in seen[0]
+    assert all("secret_note" not in r for r in built.source)
 
 
 def accept_all(table: schema_observer.ReflectedTable) -> schema_observer.Decision:

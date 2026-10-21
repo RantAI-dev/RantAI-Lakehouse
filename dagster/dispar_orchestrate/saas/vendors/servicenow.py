@@ -19,6 +19,13 @@ ServiceNow stores everything in tables, so an object is a table name. `incident`
 connector's account may read is added by name (a name is checked to be a plain table
 name before it is used; an unknown table is a rejected setting).
 
+# Schema changes before the load (decision 9)
+
+`describe` reads `sys_dictionary` (and `sys_db_object` for the parent tables), so "ask first"
+and "pause" can hold a table back. Those tables need a role the connector is not promised; when the account may
+not read them `describe` answers `None` and the change is seen after the load, as for the vendors that
+do not describe. Not tried against a real instance.
+
 # Reading (Table API, https://www.servicenow.com/docs/r/xanadu/api-reference/rest-apis/c_TableAPI.html)
 
 `GET /api/now/table/{table}` with `sysparm_query`, `sysparm_limit` and
@@ -74,15 +81,17 @@ from typing import Any
 import requests
 
 from dispar_orchestrate.adapters import rest as rest_adapter
-from dispar_orchestrate.adapters.saas import SaasSetupRefused
+from dispar_orchestrate.adapters.saas import Field, SaasSetupRefused
 from dispar_orchestrate.saas import vendors
 from dispar_orchestrate.saas.objects import ObjectDecl
+from dispar_orchestrate.saas.session import SaasPermissionMissing
 
 TABLE_API = "/api/now/table"
 CURSOR_FIELD = "sys_updated_on"
 KEY_FIELD = "sys_id"
 PAGE_SIZE = 1000
 LAG_SECONDS = 86_400
+MAX_PARENTS = 12
 SUGGESTED = ("incident", "change_request", "problem", "sys_user", "cmdb_ci")
 _TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 
@@ -107,10 +116,92 @@ def _full_reason(name: str) -> str:
     return f"{name} has no {CURSOR_FIELD} field to filter by"
 
 
-def declaration(session: Any, parts: Any, dial: dict, name: str) -> ObjectDecl:
-    """The table's declaration: incremental by `sys_updated_on`, merged on `sys_id`."""
-    check_table(name)
+def _incremental(name: str) -> ObjectDecl:
     return ObjectDecl(name=name, primary_key=(KEY_FIELD,), cursor=CURSOR_FIELD, lag_seconds=LAG_SECONDS)
+
+
+def declaration(session: Any, parts: Any, dial: dict, name: str) -> ObjectDecl:
+    """The table's declaration, from one sample record: incremental by `sys_updated_on` merged
+    on `sys_id`, or re-read in full (with the reason) when the table has no change time.
+
+    The sample asks for the two fields only. A table the account cannot read raises the
+    session's permission failure; a table ServiceNow does not know is a rejected setting; a
+    table with no records, or none this account may see, is taken to be a normal table.
+    """
+    check_table(name)
+    try:
+        body = session.get_json(
+            f"{TABLE_API}/{name}", {"sysparm_limit": 1, "sysparm_fields": f"{KEY_FIELD},{CURSOR_FIELD}", "sysparm_exclude_reference_link": "true"}
+        )
+    except requests.HTTPError as exc:
+        if getattr(exc.response, "status_code", None) in (400, 404):
+            raise _refuse() from None
+        raise
+    found = body.get("result") if isinstance(body, dict) else None
+    if not isinstance(found, list) or not found:
+        return _incremental(name)
+    sample = found[0] if isinstance(found[0], dict) else {}
+    if KEY_FIELD not in sample:
+        raise SaasSetupRefused("this ServiceNow table has no sys_id, so its records cannot be told apart")
+    if CURSOR_FIELD not in sample:
+        return ObjectDecl(name=name, primary_key=(KEY_FIELD,), full_reason=_full_reason(name))
+    return _incremental(name)
+
+
+def list_objects(session: Any, parts: Any, dial: dict) -> list[ObjectDecl]:
+    """The suggested tables and the ones the connector was given by name (decision 5:
+    any table by name; ServiceNow's table list is too large and too access-dependent to
+    offer whole). How each loads is settled when it is read, by `declaration`."""
+    names = [*SUGGESTED, *(n for n in (dial.get("objects") or []) if isinstance(n, str) and n not in SUGGESTED)]
+    return [_incremental(check_table(name)) for name in names]
+
+
+def _table_fields(session: Any, table: str) -> list[str]:
+    rows = session.get_json(
+        f"{TABLE_API}/sys_dictionary",
+        {"sysparm_query": f"name={table}^elementISNOTEMPTY", "sysparm_fields": "element", "sysparm_limit": 10_000, "sysparm_exclude_reference_link": "true"},
+    )
+    return [str(r["element"]) for r in rows.get("result", []) if isinstance(r, dict) and r.get("element")]
+
+
+def _parent_table(session: Any, table: str) -> str | None:
+    rows = session.get_json(
+        f"{TABLE_API}/sys_db_object",
+        {"sysparm_query": f"name={table}", "sysparm_fields": "super_class.name", "sysparm_limit": 1, "sysparm_exclude_reference_link": "true"},
+    )
+    found = rows.get("result") or []
+    parent = found[0].get("super_class.name") if found and isinstance(found[0], dict) else None
+    return check_table(parent) if isinstance(parent, str) and parent else None
+
+
+def describe(session: Any, parts: Any, dial: dict, name: str) -> list[Field] | None:
+    """The table's fields before the load (decision 9), from `sys_dictionary`, which holds
+    the fields a table defines itself, so the table's parents are walked (`sys_db_object`,
+    `super_class`; `incident` extends `task`). `None` (the after-load path) when the account
+    may not read the dictionary, which needs a role this connector is not promised
+    (decision 9 says "where the vendor describes its fields"); every field comes as text
+    because the Table API sends every value as text, except the change time.
+
+    # Errors
+
+    `SaasSetupRefused` when a parent chain is longer than `MAX_PARENTS` (a loop in the answer).
+    """
+    check_table(name)
+    names: list[str] = []
+    table: str | None = name
+    try:
+        for _ in range(MAX_PARENTS):
+            if table is None:
+                break
+            names += _table_fields(session, table)
+            table = _parent_table(session, table)
+        else:
+            raise SaasSetupRefused("ServiceNow answered with a table hierarchy this connector does not read")
+    except SaasPermissionMissing:
+        return None
+    if not names:
+        return None
+    return [Field(n, "timestamp" if n == CURSOR_FIELD else "text", nullable=n != KEY_FIELD) for n in sorted(set(names))]
 
 
 def _stamp(since: Any) -> str:
