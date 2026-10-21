@@ -134,6 +134,16 @@ To be confirmed when the plan is built. Expected from the defaults:
   its export with that status, scrubs its content after 30 days and drops it from
   exports 90 days after a permanent deletion). HubSpot reports no deletes in the
   same read, so a record archived there stays until a full reload.
+- Salesforce: an object with so many fields that its query is longer than about
+  12,000 characters (Salesforce refuses a request address over 16,384 bytes) fails with a
+  fixed message and loads nothing; leaving columns out does not shorten the query. The
+  connector reads Salesforce REST API version 62.0; a move to another version is a reviewed
+  change. A record removed from the recycle bin is not reported as deleted, and a used-up
+  daily API limit fails the run as "the vendor limited the rate" without retrying it the
+  same day.
+- Google Analytics: a report's last three days are read again on every run, because Google
+  may still change them for 24 to 48 hours; the dates are in the property's reporting time
+  zone.
 - Some objects are re-read in full each run; the connector page names them.
 - Workday and NetSuite stay "not supported" until tested on a real account.
 - SharePoint and Confluence files and attachments are not loaded.
