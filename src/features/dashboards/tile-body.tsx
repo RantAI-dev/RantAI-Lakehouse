@@ -312,6 +312,10 @@ function CombinedBody({
   const styled = styleOption(combined.option, {
     kind: spec.kind, y: spec.y, style, locale, decimals,
     columns: Array.isArray(combined.option.series) ? combined.option.series.map((s) => (s as { name?: string }).name) : undefined,
+    // A line or a band at or below zero vanishes on a logarithmic axis, so
+    // the lines are read here too and the tile says so
+    // (`PR #199 review O SHOULD-FIX 8`).
+    referenceLines: cell.referenceLines,
   });
   if (styled.message) {
     return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
