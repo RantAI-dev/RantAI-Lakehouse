@@ -1041,6 +1041,17 @@ projects, both in `ci-required` and `required_gate.sh` (`G6_SAAS_A_RESULT`, `G6_
 - The new console fields were not shown in a browser.
 - Docker images were not built.
 
+### Handoff: slice 6 fix round (developer, 2026-10-21)
+
+- `SHOULD-FIX 15` fixed in the commit "Workday hosts may have one to three labels": Rust table (`is_workday_prefix`) and Python mirror accept one to three labels before
+  `.workday.com` / `.myworkday.com`, each validated as a label; the suffixes are unchanged (fixture and console hold only them, so neither changed; the console does not
+  validate the host). Tests both ways in Rust and Python (accepted: `wd2-impl-services1.workday.com`, `services1.wd503.myworkday.com`, three labels with a mixed-case host
+  lower-cased; refused: four labels, empty label, hyphen-led label, another suffix). Still not checked against Workday's pages.
+- Connector page: now says Workday's connection test runs the first named report once at the vendor (one report run in the customer's tenant per test).
+- Run: `cargo fmt` clean; `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --all-features -- -D warnings` 0 warnings; `cargo test -p lakehouse-store --lib saas_vendors`:
+  **14 passed**; `pytest dispar_orchestrate/test_saas_vendors.py dispar_orchestrate/test_saas_workday.py`: **242 passed**. The whole dagster suite and bun were not re-run (only the Python
+  account rule and its tests changed). Not pushed.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
