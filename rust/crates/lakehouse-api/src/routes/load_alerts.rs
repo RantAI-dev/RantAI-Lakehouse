@@ -83,7 +83,9 @@ use crate::routes::{connectors as connector_routes, uploads as upload_routes};
 use crate::state::AppState;
 
 /// Shown for any orchestrator failure; the cause is logged, not returned.
-const ORCHESTRATOR_UNAVAILABLE: &str = "the orchestrator could not be asked about this run";
+// PR #106 review R3 BLOCKER 10: shared with quality_load
+pub(super) const ORCHESTRATOR_UNAVAILABLE: &str =
+    "the orchestrator could not be asked about this run";
 /// Shown when the alert rules could not be read or delivered to.
 const RULES_UNAVAILABLE: &str = "the alert rules could not be read";
 
@@ -91,6 +93,9 @@ const RULES_UNAVAILABLE: &str = "the alert rules could not be read";
 const CONNECTOR_SOURCE: &str = "Connector runs";
 /// The `source` label of an `alert_instance` written for an upload event.
 const UPLOAD_SOURCE: &str = "File uploads";
+/// The `source` label of an `alert_instance` written for an opened quality
+/// incident (`DATA-14`).
+const QUALITY_SOURCE: &str = "Data quality";
 
 /// Which half of the run sensors an event came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,22 +134,29 @@ impl Outcome {
 }
 
 /// Where a run's dedupe, summary and alerts hang: a connector that exists.
-struct ConnectorRef {
-    id: String,
-    name: String,
+pub(super) struct ConnectorRef {
+    pub(super) id: String,
+    pub(super) name: String,
+    // PR #106 review R3 SHOULD-FIX 13: pass the config through
+    pub(super) config: Value,
 }
 
 /// What looking for the thing a run belongs to found.
-enum Found<T> {
+pub(super) enum Found<T> {
     This(T),
     /// Nothing to do, with the reason the response carries (`{"matched": 0}`
     /// as an unknown job answers today).
     Skip(&'static str),
 }
 
-fn unavailable(what: &'static str, err: impl std::fmt::Display) -> ApiError {
-    tracing::warn!(%err, what, "a run-event dependency failed");
-    ApiError::Unavailable(what.to_owned())
+// PR #106 review R3 BLOCKER 10: classify before surfacing; return fixed message with reference id
+pub(super) fn unavailable(what: &'static str, err: impl std::fmt::Display) -> ApiError {
+    crate::upstream_error::report(
+        &crate::upstream_error::Context::new("run-event dependency", what, what),
+        crate::upstream_error::Class::Unavailable,
+        &err,
+    )
+    .into_api_error(crate::upstream_error::FailedAs::ServiceUnavailable)
 }
 
 fn skipped(reason: &str) -> Value {
@@ -165,7 +177,7 @@ fn run_end(end_time: Option<f64>) -> OffsetDateTime {
 
 /// Read the connector a run belongs to from the run's config, and check it
 /// exists.
-async fn find_connector(
+pub(super) async fn find_connector(
     state: &AppState,
     pool: &PgPool,
     run_id: &str,
@@ -203,6 +215,7 @@ async fn find_connector(
         Some(detail) => Ok(Found::This(ConnectorRef {
             id: detail.connector.id,
             name: detail.connector.name,
+            config,
         })),
         None => Ok(Found::Skip("run config names an unknown connector")),
     }
@@ -210,7 +223,7 @@ async fn find_connector(
 
 /// The orchestrator's status for `run_id`, refused with 409 when it is not
 /// the one the sensor claims, as the pipeline path does.
-async fn confirm_status(
+pub(super) async fn confirm_status(
     state: &AppState,
     run_id: &str,
     outcome: Outcome,
@@ -270,7 +283,7 @@ pub(super) async fn deliver_event(
 
 /// Read the alert rules once. A failure is logged and answered with fixed
 /// text (principle 4).
-async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiError> {
+pub(crate) async fn read_rules(state: &AppState) -> Result<Vec<AlertRule>, ApiError> {
     lakehouse_alerts::load_rules(&state.clickhouse)
         .await
         .map_err(|err| unavailable(RULES_UNAVAILABLE, err))
@@ -308,6 +321,38 @@ async fn deliver_with_rules(
     if let Some(source) = persist_as {
         persist_instances(pool, &attempted, source, scope_id, text).await;
     }
+    attempted.len()
+}
+
+/// Delivers an opened quality incident (`DATA-14`) to the `quality_incident`
+/// rules of its table (or `*`), through the same address-checking sender,
+/// silences and instance records as the connector events. `text` holds the
+/// table, the rule's name, what was measured and a relative console link;
+/// never upstream error text. A rule store that cannot be read is logged and
+/// delivers nothing: the incident is already open and listed. Returns how
+/// many deliveries were attempted.
+// PR #106 review R1 SHOULD-FIX DATA-14 2
+pub(crate) async fn deliver_quality_incident_with_rules(
+    state: &AppState,
+    pool: &PgPool,
+    rules: &[AlertRule],
+    asset: &str,
+    text: &str,
+) -> usize {
+    let http = state.webhook_sender();
+    let email = EmailSender::new(smtp_config(&state.config));
+    let silence = ApiSilenceSource { pg: pool };
+    let attempted = lakehouse_alerts::deliver_quality_incident_to(
+        rules,
+        &http,
+        &email,
+        asset,
+        "Quality incident",
+        text,
+        Some(&silence as &dyn SilenceSource),
+    )
+    .await;
+    persist_instances(pool, &attempted, QUALITY_SOURCE, asset, text).await;
     attempted.len()
 }
 
@@ -1240,11 +1285,14 @@ mod tests {
         assert_eq!(streak(&pool).await, ("healthy".to_owned(), 0));
         let kinds: Vec<(String, i64)> = sqlx::query_as(
             "SELECT kind, count(*) FROM pipeline_run_event \
-             WHERE pipeline_id = 'connector:conn-pg-lakehouse' GROUP BY kind",
+             WHERE pipeline_id = 'connector:conn-pg-lakehouse' \
+             AND kind <> 'quality_load' GROUP BY kind",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
+        // DATA-14 (F4): a successful run also records a `quality_load` dedupe
+        // row for the on-load quality pass; this test is about the alert kinds.
         // SRC-17 F2: a handed-over report leaves two rows, the count and the
         // marker written once the rules were read (`success_alerted`).
         // Before, the single `success` row was all there was. Still no

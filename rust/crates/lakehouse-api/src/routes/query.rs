@@ -9,7 +9,7 @@ use std::time::Instant;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -818,6 +818,7 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
 pub async fn estimate(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
@@ -870,14 +871,33 @@ pub async fn estimate(
         sources
     };
 
-    Ok(ApiJson(estimate_result_json(
+    let mut result = estimate_result_json(
         estimated_bytes,
         cost_min,
         cost_max,
         &json!(sources_out),
         freshness_lag_seconds,
         estimate_error.as_deref(),
-    )))
+    );
+    // DATA-12 part 3: the marks of the tables this ClickHouse query reads,
+    // beside `sources` (which stays a list of names). One batch read; only a
+    // marked source gets an entry, and `sourceMarks` is absent when none is.
+    // This route estimates ClickHouse queries only; a Trino query is not
+    // estimated here and has no sources to mark.
+    // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+    // Only decorate with sourceMarks if catalog_tenant_refusal allows it:
+    if let Ok(None) =
+        crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await
+    {
+        let names = std::collections::HashMap::new();
+        let marks = crate::routes::catalog::certification_marks(&state, &sources_out, &names).await;
+        if !marks.is_empty()
+            && let Some(o) = result.as_object_mut()
+        {
+            o.insert("sourceMarks".to_owned(), json!(marks));
+        }
+    }
+    Ok(ApiJson(result))
 }
 
 /// Build the `/api/query/estimate` response body from already-computed
@@ -1638,7 +1658,7 @@ mod tests {
     fn fixture_user_principal() -> Principal {
         Principal {
             id: PrincipalId::User(Uuid::from_u128(1)),
-            tenant_ids: Vec::new(),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("query:read"),
             provider: "session".to_owned(),
@@ -1903,6 +1923,200 @@ mod tests {
         }
         // The EXPLAIN ESTIMATE numbers are real.
         assert_eq!(v["estimatedBytes"], json!(100));
+    }
+
+    // ── DATA-12 part 3: marks on the sources of an estimate ─────────────
+
+    mod source_marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            env.insert(
+                "CATALOG_TENANT_ID".to_owned(),
+                "11111111-1111-4111-8111-000000000001".to_owned(),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        /// A `ClickHouse` whose `EXPLAIN ESTIMATE` reads one table.
+        async fn clickhouse_reading(database: &str, table: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [],
+                    "data": [{ "database": database, "table": table, "rows": "10" }],
+                    "rows": 1,
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        async fn estimate_of(state: AppState) -> Value {
+            estimate_of_caller(state, fixture_user_principal(), HeaderMap::new()).await
+        }
+
+        async fn estimate_of_caller(
+            state: AppState,
+            principal: Principal,
+            headers: HeaderMap,
+        ) -> Value {
+            let result = estimate(
+                State(state),
+                Extension(principal),
+                headers,
+                Bytes::from_static(br#"{"sql":"SELECT * FROM t"}"#),
+            )
+            .await;
+            let Ok(ApiJson(body)) = result else {
+                panic!("an estimate never errors back to the caller");
+            };
+            body
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_a_deprecated_table_marks_that_source(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use silver.orders_v2".to_owned()),
+                    replacement_asset_id: Some("silver.orders_v2".to_owned()),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+            let ch = clickhouse_reading("silver", "orders").await;
+
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+
+            assert_eq!(
+                body["sources"],
+                json!(["silver.orders"]),
+                "sources stay names"
+            );
+            let mark = &body["sourceMarks"]["silver.orders"];
+            assert_eq!(mark["certification"], json!("deprecated"));
+            assert_eq!(mark["certificationNote"], json!("Use silver.orders_v2"));
+            assert_eq!(mark["replacementAssetId"], json!("silver.orders_v2"));
+        }
+
+        // PR #106 review R1 BLOCKER 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_a_table_with_tags_carries_them_in_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::upsert_annotation(
+                &pool,
+                &lakehouse_store::annotation::AnnotationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    owner: None,
+                    steward: None,
+                    description: None,
+                    tags: vec!["pii".to_owned()],
+                },
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::create_key(
+                &pool,
+                "data_domain",
+                &["finance".to_owned()],
+                "admin",
+            )
+            .await
+            .unwrap();
+            lakehouse_store::governed_tag::set_asset_tags(
+                &pool,
+                "silver.orders",
+                &[("data_domain".to_owned(), "finance".to_owned())],
+                "admin",
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("silver", "orders").await;
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+            let mark = &body["sourceMarks"]["silver.orders"];
+            assert_eq!(mark["tags"], json!(["pii"]));
+            assert_eq!(mark["governedTags"], json!({ "data_domain": "finance" }));
+        }
+
+        // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn caller_outside_catalog_tenant_receives_no_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            lakehouse_store::annotation::set_certification(
+                &pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: "silver.orders".to_owned(),
+                    status: "certified".to_owned(),
+                    note: None,
+                    replacement_asset_id: None,
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let ch = clickhouse_reading("silver", "orders").await;
+            let state = state_for(&pool, &ch.uri());
+
+            // A caller who belongs to retail (not meridian-group catalog tenant):
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let body = estimate_of_caller(state, outside_caller, HeaderMap::new()).await;
+            assert_eq!(body["sources"], json!(["silver.orders"]));
+            assert!(
+                body.get("sourceMarks").is_none(),
+                "marks must be omitted for caller outside catalog tenant"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_query_reading_only_unmarked_tables_has_no_source_marks(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = clickhouse_reading("silver", "plain").await;
+            let body = estimate_of(state_for(&pool, &ch.uri())).await;
+            assert_eq!(body["sources"], json!(["silver.plain"]));
+            assert!(body.get("sourceMarks").is_none());
+        }
     }
 
     // ── `engine: "trino"` (WS2 §4) ──────────────────────────────────────

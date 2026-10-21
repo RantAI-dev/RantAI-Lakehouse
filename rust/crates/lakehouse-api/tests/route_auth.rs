@@ -507,6 +507,190 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
     }
 }
 
+/// `DATA-12` D1: `PUT /api/catalog/{id}/certification` needs
+/// `governance:write`. A seeded Data Engineer holds `catalog:write` (which
+/// edits the details) but not `governance:write`, so the permission
+/// middleware refuses it with a 403 naming `governance:write`, and nothing
+/// is stored. The table-driven loops above cover the new `POLICY_TABLE` row
+/// both ways; this names the case the decision exists for.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_catalog_certification_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/catalog/commerce_orders/certification",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:write alone must not set a certification mark"
+    );
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: governance:write"),
+        "the 403 must come from the permission middleware, not the tenant gate"
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM asset_annotation WHERE asset_id = 'commerce_orders'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count rows");
+    assert_eq!(stored, 0, "a refused write must store nothing");
+}
+
+/// `DATA-13`: `GET /api/governance/lineage/columns` needs `lineage:read`.
+/// A seeded Data Engineer holds `pipeline:*`, `catalog:write` and
+/// `connector:manage` but not `lineage:read`, so the permission middleware
+/// refuses it with a 403 naming the permission. The table-driven loops above
+/// walk the new `POLICY_TABLE` row both ways; this names the case.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_column_lineage() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/lineage/columns?table=serving.x&column=y",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: lineage:read")
+    );
+}
+
+/// `DATA-13`: the other half. A seeded Analyst holds `lineage:read`, so the
+/// permission middleware lets it through to the handler (whatever the
+/// handler then answers for an unreachable `ClickHouse` is not an auth
+/// failure).
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_column_lineage() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/lineage/columns?table=serving.x&column=y",
+        &cookie,
+    )
+    .await;
+    assert!(
+        !matches!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "lineage:read must reach the handler, got {}",
+        resp.status()
+    );
+}
+
+/// `DATA-15` F3: listing, making and ending a grant from an asset's page
+/// need `access:approve`, which only Governance Admin holds. A seeded Data
+/// Engineer is refused by the permission middleware on all three, with the
+/// permission named, and nothing is stored. The table-driven loops cover the
+/// new `POLICY_TABLE` rows both ways; this names the case the rows exist for.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_all_three_catalog_grant_routes() {
+    let TestApp { router, pool } = spin_up().await;
+    for (method, path) in [
+        ("GET", "/api/catalog/commerce_orders/grants"),
+        ("POST", "/api/catalog/commerce_orders/grants"),
+        ("DELETE", "/api/catalog/commerce_orders/grants/grant-x"),
+    ] {
+        let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+        let resp = request_with_cookie(&router, method, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: access:approve"),
+            "{method} {path}: the 403 must come from the permission middleware"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM access_grant")
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+    assert_eq!(stored, 0, "a refused grant must store nothing");
+}
+
+/// `DATA-15` F4: undropping a table needs `governance:write`. A seeded Data
+/// Engineer holds `catalog:write` but not `governance:write`, so the
+/// permission middleware refuses `POST /api/catalog/{id}/restore` with the
+/// permission named.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_denied_the_undrop() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let resp = request_with_cookie(
+        &router,
+        "POST",
+        "/api/catalog/commerce_orders/restore",
+        &cookie,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some("permission_denied: governance:write"),
+    );
+}
+
+/// `DATA-15` F4: the restore status read is `catalog:read`, which a seeded
+/// Analyst holds (and `governance:write` it does not), so the permission
+/// middleware must not refuse it. The first version of this check used the
+/// Data Engineer, who holds `catalog:write` only; CI failed with
+/// `permission_denied: catalog:read` (`DATA-15` CI run).
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_the_restore_status_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/catalog/commerce_orders/restore",
+        &cookie,
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    if resp.status() == StatusCode::FORBIDDEN {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_ne!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("permission_denied: catalog:read"),
+            "catalog:read must pass the permission middleware"
+        );
+    }
+}
+
 /// A seeded Analyst (`catalog:read`) is not denied the two semantic-layer
 /// reads (`GET /api/semantic`, `GET /api/semantic/{asset}`, AI-16): they
 /// reuse the catalog's read permission.
@@ -1776,6 +1960,259 @@ async fn delete_session_writes_an_audit_event() {
          revoked (the request path's {{id}}, never the caller's bearer \
          token)"
     );
+}
+
+// ── Governed tag keys (DATA-12 part 2) ───────────────────────────────────
+
+/// The four `/api/governance/tag-keys` routes, asserted in both directions:
+/// a principal holding ONLY `catalog:read` may list the keys (an editor needs
+/// them to render pickers) and is refused every write; a principal holding
+/// ONLY `governance:write` may define, change and remove keys and is refused
+/// the list, which is a distinct, `catalog:read`-gated route. Each write is
+/// sent with an empty body, so a pass is anything but 401/403 (the handler
+/// then answers 400/404 for the body or key) and a refusal stores nothing.
+#[tokio::test]
+async fn tag_key_routes_are_gated_in_both_directions() {
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
+
+    let writes = [
+        ("POST", "/api/governance/tag-keys", StatusCode::BAD_REQUEST),
+        (
+            "PUT",
+            "/api/governance/tag-keys/data_domain",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "DELETE",
+            "/api/governance/tag-keys/data_domain",
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed =
+        request_with_cookie(&router, "GET", "/api/governance/tag-keys", &reader_cookie).await;
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertions
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "catalog:read alone must be enough to list the tag keys"
+    );
+    for (method, path, _) in writes {
+        let resp = request_with_cookie(&router, method, path, &reader_cookie).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "catalog:read alone must NOT be enough to {method} {path}"
+        );
+    }
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let refused =
+        request_with_cookie(&router, "GET", "/api/governance/tag-keys", &admin_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write alone must NOT be enough to list the tag keys"
+    );
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertions with exact handler status
+    for (method, path, expected) in writes {
+        let resp = request_with_cookie(&router, method, path, &admin_cookie).await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "governance:write must reach handler for {method} {path} (answering {expected})"
+        );
+    }
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM governed_tag_key")
+        .fetch_one(&pool)
+        .await
+        .expect("count keys");
+    assert_eq!(stored, 0, "no empty-bodied request may store a key");
+}
+
+// ── Quality incidents (DATA-14) ─────────────────────────────────────────
+
+/// The two `/api/governance/quality/incidents` routes, asserted in both
+/// directions: any login may list incidents (like the quality rule list), a
+/// principal without `governance:write` is refused the resolve (403) and
+/// nothing changes, and one holding `governance:write` alone is past the gate
+/// (the unknown incident then answers 404, not 401/403).
+#[tokio::test]
+async fn quality_incident_routes_are_gated_in_both_directions() {
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
+    let resolve = "/api/governance/quality/incidents/00000000-0000-4000-8000-000000000000/resolve";
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/quality/incidents",
+        &reader_cookie,
+    )
+    .await;
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertion
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "any login may list incidents"
+    );
+    let refused = request_with_cookie(&router, "POST", resolve, &reader_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to resolve an incident"
+    );
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "POST", resolve, &admin_cookie).await;
+    // PR #106 review R3 SHOULD-FIX 15: empty body answers 400
+    assert_eq!(
+        allowed.status(),
+        StatusCode::BAD_REQUEST,
+        "governance:write must be enough to reach resolve handler which answers 400 on empty body"
+    );
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/governance/quality/incidents")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `DATA-14` (F3): any login may read the schedules, and setting one needs
+/// `governance:write`. A principal without it is refused (403) and nothing is
+/// stored; one with it is past the gate (an empty body then answers 400).
+#[tokio::test]
+async fn quality_schedule_routes_are_gated_in_both_directions() {
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let admin = create_principal_with_permissions(&pool, "governance:write").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("associate test users with catalog tenant");
+    let set = "/api/governance/quality/schedules/silver.orders";
+
+    let reader_cookie = session_cookie_for_user(&pool, reader).await;
+    let listed = request_with_cookie(
+        &router,
+        "GET",
+        "/api/governance/quality/schedules",
+        &reader_cookie,
+    )
+    .await;
+    // PR #106 review R3 SHOULD-FIX 15: strict positive assertion
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "any login may read schedules"
+    );
+    let refused = request_with_cookie(&router, "PUT", set, &reader_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "catalog:read alone must NOT be enough to set a schedule"
+    );
+
+    let admin_cookie = session_cookie_for_user(&pool, admin).await;
+    let allowed = request_with_cookie(&router, "PUT", set, &admin_cookie).await;
+    // PR #106 review R3 SHOULD-FIX 15: empty body answers 400
+    assert_eq!(
+        allowed.status(),
+        StatusCode::BAD_REQUEST,
+        "governance:write must be enough to reach set handler which answers 400 on empty body"
+    );
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM quality_schedule")
+        .fetch_one(&pool)
+        .await
+        .expect("count schedules");
+    assert_eq!(stored, 0, "no empty-bodied request may store a schedule");
+}
+
+/// `DATA-14` (F5): any login may read a table's learning state; an anonymous
+/// caller is refused.
+#[tokio::test]
+async fn the_learning_state_is_readable_by_any_login_and_not_anonymously() {
+    // PR #106 review R2 SHOULD-FIX 1: catalog-tenant caller
+    let mut env = std::collections::HashMap::new();
+    let catalog_tenant = "11111111-1111-4111-8111-000000000001";
+    env.insert("CATALOG_TENANT_ID".to_owned(), catalog_tenant.to_owned());
+    let TestApp { router, pool } = common::spin_up_with_env(&env).await;
+
+    let reader = create_principal_with_permissions(&pool, "catalog:read").await;
+    let tenant_uuid: Uuid = catalog_tenant.parse().unwrap();
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
+        .bind(reader)
+        .bind(tenant_uuid)
+        .execute(&pool)
+        .await
+        .expect("associate test user with catalog tenant");
+    let cookie = session_cookie_for_user(&pool, reader).await;
+    let path = "/api/governance/quality/learning/silver.orders";
+    let read = request_with_cookie(&router, "GET", path, &cookie).await;
+    // PR #106 review R2 SHOULD-FIX 1: restore strict positive assertion
+    assert_eq!(read.status(), StatusCode::OK);
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// SEC-12: the two routes the embed work added are in `POLICY_TABLE` with the

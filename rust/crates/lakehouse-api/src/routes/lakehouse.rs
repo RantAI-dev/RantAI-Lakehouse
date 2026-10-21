@@ -246,6 +246,8 @@ fn snapshot_json(s: &SnapshotDetail) -> Value {
         "parentId": s.parent_id.map(|id| id.to_string()),
         "timestampMs": s.timestamp_ms,
         "operation": s.operation,
+        // `null` where the commit recorded no author (`DATA-15` F5).
+        "author": s.author,
         "summary": {
             "addedRecords": s.added_records,
             "deletedRecords": s.deleted_records,
@@ -1119,6 +1121,7 @@ mod tests {
                 total_records: Some(100),
                 total_data_files: Some(1),
                 stats: TableStats::default(),
+                author: None,
             }],
             schema_versions: vec![lakehouse_iceberg::rest::SchemaVersionDetail {
                 schema_id: 0,
@@ -1181,6 +1184,7 @@ mod tests {
             total_records: None,
             total_data_files: None,
             stats: TableStats::default(),
+            author: None,
         };
 
         let body = snapshot_json(&snapshot);
@@ -1201,12 +1205,37 @@ mod tests {
             total_records: None,
             total_data_files: None,
             stats: TableStats::default(),
+            author: None,
         };
 
         let body = snapshot_json(&snapshot);
 
         assert_eq!(body["id"], json!("1"));
         assert_eq!(body["parentId"], Value::Null);
+    }
+
+    /// `DATA-15` F5: the author is emitted where the commit recorded one and
+    /// is `null` where it did not, never an invented name.
+    #[test]
+    fn snapshot_json_carries_the_author_or_null() {
+        let mut snapshot = SnapshotDetail {
+            id: 1,
+            parent_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            operation: "append".to_owned(),
+            added_records: None,
+            deleted_records: None,
+            total_records: None,
+            total_data_files: None,
+            stats: TableStats::default(),
+            author: None,
+        };
+        assert_eq!(snapshot_json(&snapshot)["author"], Value::Null);
+        snapshot.author = Some("connector conn-x, run 1a2b".to_owned());
+        assert_eq!(
+            snapshot_json(&snapshot)["author"],
+            json!("connector conn-x, run 1a2b")
+        );
     }
 
     #[test]

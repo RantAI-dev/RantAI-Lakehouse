@@ -158,6 +158,7 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: ShieldCheck,
     items: [
       { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
+      { title: "Tag keys", href: "/governance/tag-keys", icon: Tags },
       {
         title: "Classification & Masking",
         href: "/governance/classification",
