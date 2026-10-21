@@ -700,3 +700,17 @@ runs with the push of this review.
   decision 7 ("applied where the vendor reports deletes"); the connector
   page must say a deleted Zendesk ticket stays with `status = deleted`.
   `SHOULD-FIX 7` if the page text does not say so today.
+
+Slice 2 closed (planner, 2026-10-21). PR moved to #216 (opened as the data
+roadmap's account; #214 closed, same branch). CI on `901bbe3a`: 36 of 38
+green. The `g6-saas` job passed in about 4 minutes, with every product step
+for HubSpot and Zendesk real (create, connect, discover, load into Bronze
+read back through ClickHouse, incremental reload with no duplicate, revoked
+sign-in) and every vendor step. The two red checks are `cargo audit` and
+`cargo deny` on RUSTSEC-2026-0381/0382/0383 (`rustls-webpki`,
+`webpki-roots`, `webpki-root-certs`), published after main's last Security
+run; `Cargo.lock` is identical to main's, so main is red on them too. Not
+caused by this PR and not ours to fix (another team's dependency work); it
+needs a backlog item from that team before this PR can merge, because a PR
+touching dependencies may not merge with a dependency check red, and this
+one does not touch them.
