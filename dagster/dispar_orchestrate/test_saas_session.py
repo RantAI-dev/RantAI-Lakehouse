@@ -64,6 +64,24 @@ def test_a_path_and_a_same_origin_link_are_followed() -> None:
 
 
 @pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        (f'<{ORIGIN}/p2>;rel="next",<{ORIGIN}/p9>;rel="last"', f"{ORIGIN}/p2"),
+        (f'<{ORIGIN}/p1>; rel="prev", <{ORIGIN}/p3>; rel=next', f"{ORIGIN}/p3"),
+        (f'<{ORIGIN}/p9>;rel="last"', None),
+        ("garbage", None),
+    ],
+)
+def test_the_next_target_of_a_link_header_is_handed_back_and_not_followed(header: str, expected: str | None) -> None:
+    """ServiceNow pages by `Link: <...>;rel="next"`. The session only reports the target; following it
+    goes through `get_json`, whose same-origin rule is tested below."""
+    http = Recorder(Reply(body={"result": []}, headers={"Link": header}))
+    session, _ = make(http)
+    assert session.get_json_with_next("/api/x") == ({"result": []}, expected)
+    assert http.urls == [f"{ORIGIN}/api/x"]
+
+
+@pytest.mark.parametrize(
     "link",
     [
         "https://evil.example.invalid/steal",

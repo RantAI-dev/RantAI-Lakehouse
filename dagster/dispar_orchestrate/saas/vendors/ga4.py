@@ -238,6 +238,7 @@ def integration_auth(
     secrets: dict[str, str],
     *,
     resolve_checked: Callable[..., Any],
+    parts: Any = None,
     clock: Callable[[], float] | None = None,
 ) -> tuple[Callable[[], dict], Callable[[], None]]:
     """`(headers, refresh)` for a service-account key: a bearer token fetched when first

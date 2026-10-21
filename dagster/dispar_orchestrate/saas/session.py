@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -128,6 +129,16 @@ def _real_get(url: str, *, headers: dict, params: dict | None, timeout: float) -
 
 def _real_post(url: str, *, headers: dict, json: Any, timeout: float) -> Any:
     return requests.post(url, headers=headers, json=json, timeout=timeout, allow_redirects=False)
+
+
+_LINK_NEXT = re.compile(r'<([^>]*)>\s*;[^,]*?\brel\s*=\s*"?next"?', re.IGNORECASE)
+
+
+def _next_link(headers: Any) -> str | None:
+    """The `rel="next"` target of an RFC 8288 `Link` header, or `None`."""
+    raw = (headers or {}).get("Link") or (headers or {}).get("link")
+    found = _LINK_NEXT.search(raw) if isinstance(raw, str) else None
+    return found.group(1) if found else None
 
 
 class SaasSession:
@@ -229,6 +240,20 @@ class SaasSession:
         """
         return self._send("GET", target, params, None)
 
+    def get_json_with_next(self, target: str, params: dict | None = None) -> tuple[Any, str | None]:
+        """Like `get_json`, and the `rel="next"` target of the answer's `Link` header, or
+        `None` (ServiceNow pages by that header; a page can hold fewer records than its
+        limit because the access check runs after the limit, so a short page does not
+        end the read). The target is only handed back: `get_json` applies the same-origin
+        rule when it is followed.
+
+        # Errors
+
+        See `_send`.
+        """
+        body, link = self._send("GET", target, params, None, with_link=True)
+        return body, link
+
     def post_json(self, target: str, body: Any) -> Any:
         """POST `body` as JSON to `target` (same rules as `get_json`) and return
         the answer's JSON. For the vendors whose change filter is a search
@@ -241,7 +266,7 @@ class SaasSession:
         """
         return self._send("POST", target, None, body)
 
-    def _send(self, method: str, target: str, params: dict | None, body: Any) -> Any:
+    def _send(self, method: str, target: str, params: dict | None, body: Any, *, with_link: bool = False) -> Any:
         """One request under the link, address and rate-limit rules.
 
         # Errors
@@ -288,4 +313,6 @@ class SaasSession:
                 continue
             if status >= 400:
                 raise requests.HTTPError(f"HTTP {status}", response=response)
+            if with_link:
+                return response.json(), _next_link(getattr(response, "headers", None))
             return response.json()

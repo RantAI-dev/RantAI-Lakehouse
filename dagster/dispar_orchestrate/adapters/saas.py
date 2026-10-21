@@ -27,7 +27,7 @@ modules, and the tests' fake vendor is a small class):
     is_quota_exhausted(body)                 optional -> bool; whether a 403 body says the API quota is used up
     integration_headers(vendor, secrets)     optional -> dict; an integration
                                                 credential that is not a single token
-    integration_auth(vendor, secrets, resolve_checked)
+    integration_auth(vendor, secrets, resolve_checked, parts)
                                              optional -> (headers(), refresh()); an integration
                                                 credential exchanged for a short-lived token
 
@@ -137,7 +137,7 @@ def _auth(
             # A credential that is exchanged for a short-lived token (Google's service
             # account key): the module gives the headers and the function that forgets
             # the token, and asks for the token through the vendor table's address.
-            headers, refresh = sign_in(vendor, secrets, resolve_checked=resolve_checked)
+            headers, refresh = sign_in(vendor, secrets, resolve_checked=resolve_checked, parts=parts)
             return headers, refresh, lambda: None
         build = getattr(module, "integration_headers", None)
         if build is not None:
