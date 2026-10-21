@@ -78,6 +78,16 @@ describe("formatAxisValue", () => {
   })
 })
 
+describe("a compact number that rounds up to a thousand of its own step", () => {
+  test("999,950 is a million, not \"1,000 K\"", () => {
+    expect(formatValue(999_950, { style: "compact" }, "en-US")).toBe("1 M")
+    expect(formatValue(999_949, { style: "compact" }, "en-US")).toBe("999.9 K")
+    // With two decimals it does not round up, so it stays in thousands.
+    expect(formatValue(999_950, { style: "compact", decimals: 2 }, "en-US")).toBe("999.95 K")
+    expect(formatValue(999_950, { style: "compact", currency: "IDR" }, "id-ID")).toBe("Rp 1,0 M")
+  })
+})
+
 describe("formatDateValue", () => {
   test("auto returns the text as it came", () => {
     expect(formatDateValue("2026-10-15", undefined)).toBe("2026-10-15")
@@ -96,6 +106,13 @@ describe("formatDateValue", () => {
   test("a timestamp takes 12- or 24-hour time", () => {
     expect(formatDateValue("2026-10-05 14:05:09", { style: "iso", hour12: false })).toBe("2026-10-05 14:05")
     expect(formatDateValue("2026-10-05 14:05:09", { style: "iso", hour12: true })).toBe("2026-10-05 2:05 PM")
+  })
+
+  test("a timestamp with no clock of its own follows the locale", () => {
+    // The server's own doc says "absent follows the locale"; the console
+    // forced 24-hour time (`PR #199 review M SHOULD-FIX BI-17 8`).
+    expect(formatDateValue("2026-10-05 14:05:09", { style: "iso" })).toBe("2026-10-05 2:05 PM")
+    expect(formatDateValue("2026-10-05 14:05:09", { style: "iso" }, "id-ID")).toBe("2026-10-05 14.05")
   })
 })
 
