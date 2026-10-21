@@ -59,7 +59,7 @@ And ask the assistant to put charts in a tab, or to start a dashboard from a tem
 ## Limits to tell a customer
 
 - Going back to an older version restores the dashboard as it was, including charts that were changed or deleted since (they come out of the trash). A chart that was already removed from the trash for good cannot come back: the step still works, says which chart it left out, and leaves no empty space. Charts added since move to the trash.
-- Two people saving the same dashboard at the same moment can lose one version: the version number is the last one plus one, so two saves that race write the same number and only one version is kept. Saves of one dashboard are rare and sequential in practice.
+- Two people saving the same dashboard at the same moment can lose one version: the version number is the last one plus one, so two saves that race write the same number and only one version is kept.
 - The trash is emptied after 30 days; nothing older can be restored.
 - A phone layout is per dashboard, not per device.
 
