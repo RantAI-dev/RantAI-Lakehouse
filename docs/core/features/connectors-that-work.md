@@ -73,7 +73,6 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
 - Business-app connectors (`SRC-3`): the eight supported types are tested
   from the console against the vendor; Workday Reports and NetSuite appear as
   not available, with the reason that they wait for a test on a real account.
-  The Sources page header text has not been changed to name business apps.
 
 ## Acceptance checklist
 
@@ -88,7 +87,7 @@ Run on a real deployment. Mark each Pass, Fail, or Not run with the reason.
 | 5 | Edit an Oracle connector; change the password; save | Saved; the page says it was not tested | |
 | 6 | Press Test on an Oracle, a MongoDB, a Kafka and an SFTP connector | Each says it cannot be tested from the console; health does not turn red | |
 | 7 | Open the connector picker | Google Sheets is dimmed, shows its reason, cannot be picked | |
-| 8 | Open Sources | The header does not mention SaaS or federation | |
+| 8 | Open Sources | The header names business apps (since `SRC-3`) and does not mention federation | |
 | 9 | As a user without `connector:manage`, try steps 1 and 5 | Refused | |
 | 10 | Point an object-storage connector at an endpoint that is down; test | A plain failure message with no address or server text in it | |
 

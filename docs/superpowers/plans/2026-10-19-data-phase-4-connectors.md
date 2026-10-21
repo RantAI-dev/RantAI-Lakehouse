@@ -1091,6 +1091,11 @@ Base `933de5e8` (CI 39/39 green). Disk 26 GB free, no other cargo, 8 GB RAM avai
 - The docs state what the gates logged; none of it was tried on a real account.
 - Docs wording on Zendesk/Confluence `post_json` and Workday/NetSuite Basic client authentication is from `ops/fixtures/saas_vendors.json`; the schema-change line for after-load vendors under "Pause" follows decision 9 ("as for other API sources today") and was not re-checked in the code.
 
+### Handoff: slice 7 fix round (developer, 2026-10-21)
+
+- `SHOULD-FIX 16` fixed: the Sources page description now reads "Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing." (`connectors-page.tsx`, its test, comment citing the finding). The header text was removed from `SRC-29` (brand marks for six types remain) and from the limits of `connectors-that-work.md`; its checklist row 8 now expects business apps named and no federation.
+- Run: `bun test src/features/connectors`: 361 pass, 0 fail; `bun run lint`: 0 errors, 6 warnings (none in these files). Not shown in a browser. Not pushed.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
