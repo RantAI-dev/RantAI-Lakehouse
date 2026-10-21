@@ -6,7 +6,7 @@
 | Backlog | `SRC-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-3.md`. This page follows it row by row; anything the spec does not say is a decision below. The spec has no *(proposed)* number; its one *(proposed)* item, dropping a no-code connector builder, is decision 14 |
-| Status | Building, in #214 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing |
+| Status | Building, in #216 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -125,7 +125,7 @@ Reported, not lowered (`AGENTS.md`, step 0):
 
 ## Limits to tell a customer
 
-To be confirmed when the plan is built. Expected from the defaults:
+As built in #216; every point is from documentation and mock vendors, none was tried on a real account:
 
 - Google Analytics loads reports you define, not raw events.
 - Records deleted at the vendor are marked or removed only for Salesforce,

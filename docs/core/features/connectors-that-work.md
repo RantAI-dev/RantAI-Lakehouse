@@ -39,7 +39,10 @@ Found by reading the code on 2026-10-08; evidence is in the plan, section 2.
 - Testing public AWS S3 with no endpoint set (Decision 3).
 - Making Google Sheets work.
 - Table discovery for these types: `SRC-13`. Gate tests for them: `SRC-9`.
-- New connector types: `SRC-3`.
+- New connector types: `SRC-3`, built later in #216; the eight business-app
+  types it makes supported are tested from the console (a real call to the
+  vendor, or "not testable" with the reason), see
+  `business-app-connectors.md`.
 
 ## Asking the assistant
 
@@ -67,6 +70,10 @@ All seven defaults signed by the product owner on 2026-10-08 ("run everything as
   console. A wrong credential shows on the first load, not on save.
 - An object-storage connector is tested only when it has an endpoint.
 - Google Sheets is not available.
+- Business-app connectors (`SRC-3`): the eight supported types are tested
+  from the console against the vendor; Workday Reports and NetSuite appear as
+  not available, with the reason that they wait for a test on a real account.
+  The Sources page header text has not been changed to name business apps.
 
 ## Acceptance checklist
 

@@ -112,7 +112,7 @@ hands-on testing.
 | --- | --- | --- | --- |
 | Connect to common databases | **Partial.** PostgreSQL, MySQL, SQL Server and MongoDB load end to end (gate `ops/g6`). "Test connection" really connects for PostgreSQL, MySQL, SQL Server, REST and S3 storage; other types say unsupported | Yes, all three | Oracle, MariaDB, Teradata (`SRC-4`) |
 | Files and APIs | **Have.** CSV files and REST sources (gate `ops/g6`). Adapters for SFTP, Google Sheets and Oracle exist; *Not verified* end to end | Yes | Verify the three |
-| Business-app connectors (CRM, ads, support tools) | **Missing** | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Large (`SRC-3`) |
+| Business-app connectors (CRM, ads, support tools) | **Partial.** Eight of Databricks' ten generally available ones are supported and gate-tested against mock vendors (`ops/g6`, job `g6-saas`): Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint; each with browser or key sign-in, object and column choice, incremental loads where the vendor has a change filter, and schema-change handling. *Not verified* on any real vendor account. Workday Reports and NetSuite are built and listed unsupported. Pull request #216, not merged or accepted | Yes: Databricks has 10 generally available plus about 45 in beta; Airbyte 602 | Real-account test of all ten (`SRC-27`), the second wave of about 45 (`SRC-26`) |
 | Live change capture | **Partial.** Proven for PostgreSQL (gate `ops/g4`); MySQL and SQL Server exist but are not gate-tested | Yes: PostgreSQL, MySQL, SQL Server, Oracle; MongoDB at Airbyte | MySQL, SQL Server, Oracle, MongoDB (`SRC-4`) |
 | Message queues | **Partial.** Kafka loads into tables; no processing over streams | Yes, with stream processing | Stream processing |
 | Upload a file from the console | **Partial.** One CSV or TSV file of up to 50 MB, every column stored as text; merged (PR #71), not accepted | Yes: Databricks 10 files up to 2 GB with types; Snowflake 250 files of 250 MB | Formats, size, types (`DATA-17`, `DATA-18`) |
@@ -213,7 +213,8 @@ hands-on testing.
 1. Open security findings in the Data module and Query Studio (section 3).
 2. Dashboard depth: filters, calculated fields, formatting, scheduled
    reports.
-3. Business-app connectors.
+3. Business-app connectors: eight of ten built, none tried on a real
+   account (`SRC-3`, `SRC-27`); the second wave is not started.
 4. Query Studio basics: autocomplete, results, saved queries.
 5. Scale beyond one server.
 6. Richer transformations in the console (joins, aggregations).
@@ -227,6 +228,13 @@ Stated plainly, for anyone describing the product to a customer. More detail
 in `README.md` ("Status / Known limitations").
 
 **Data**
+- Business-app connectors (Salesforce, ServiceNow, Google Analytics 4,
+  HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint) have been tried
+  only against mock vendors, not a real account. Workday Reports and
+  NetSuite are not offered until they are. Google Analytics loads reports
+  you define, not raw events; Confluence and SharePoint load pages and list
+  items, not files; a Workday report is read in full each run; several
+  vendors report no deletes (the connector page says which).
 - Curated tables are in open format only when publishing is switched on for
   that table; it is off by default. A published table holds every past
   copy; outside readers must pick the latest. Tables over 5,000,000 rows
@@ -348,7 +356,7 @@ an order in its roadmap phase.
 | Item | Why later |
 | --- | --- |
 | Run on several servers | A stated goal; larger work |
-| Business-app connectors (`SRC-3`): Databricks' ten generally available ones first | Large; `DEC-9` decided 2026-10-19, feature page `features/business-app-connectors.md` awaits its decisions |
+| Business-app connectors, the rest (`SRC-3` follow-ups `SRC-26` to `SRC-31`): the second wave by customer demand, real-account tests | The first ten are built in #216 (eight supported); the second wave of about 45 waits for demand |
 | Parameters, snippets and charts from SQL results (`QS-5`) | The bridge from Query Studio to dashboards, after the basics |
 | Instant copies of a table; self-refreshing tables | Expected by Snowflake users |
 | Open-first Gold: store curated data in Iceberg, serve from a fast copy | Removes publishing entirely; needs a fresh measurement |
