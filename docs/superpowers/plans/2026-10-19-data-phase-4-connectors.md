@@ -564,6 +564,63 @@ to `dagster/pyproject.toml`. `NOTICE` is not touched (slice 7, T7.3).
 - The unit tests of the Rust `Dial::Saas` account rules and the probe are unchanged and were not run.
 - Nothing was shown in a browser.
 
+### Handoff: slice 2 fix round (developer, 2026-10-21)
+
+Findings of the slice 2 review (commit `95199be0`), one commit each, in the order asked
+(Python, console and compose first; Rust last). Disk was below 8 GB all round, so **no cargo
+build, check, clippy or test ran**; the Rust was written and checked with `cargo fmt --check` only.
+
+| Finding | Commit | Subject |
+| --- | --- | --- |
+| SHOULD-FIX 6, SHOULD-FIX 7 | `f5964d7f` | HubSpot v3 note in `UPSTREAM.md`; the connector page says a deleted Zendesk ticket stays with `status = deleted` and HubSpot reports no deletes |
+| BLOCKER 3 | `f3e0668c` | Zendesk browser sign-in through `client_secret_post_json` (table value `post_json`) in Rust, Python, fixture, console; the xfail is a real test; the gate's Zendesk sign-in step runs against a mock `/oauth/tokens` that wants JSON and rotates the refresh token |
+| SHOULD-FIX 5 (Rust half) | `af60d493` | `connector_oauth::gate_rebase`: the API's saas probe, save-time address check and sign-in callback use the gate-only mock origin, under the same switch, with a test |
+| BLOCKER 4 (prerequisite) | `4afd8a24` | the API's connection test learns Zendesk's email + API token (Basic with `<email>/token`); without it the real `connect` step answered "not testable" |
+| BLOCKER 4 | `c427ddf0` | `g6-saas` through the product, once for both vendors |
+
+- **SHOULD-FIX 5, Python half**: already in `slice 2` (`test_the_gate_rebase_does_nothing_unless_the_gate_only_switch_and_the_vendor_are_named`:
+  switch off, switch not exactly `true`, other vendor, seven odd values); the Rust twin test is
+  `the_gate_rebase_is_ignored_unless_the_gate_only_switch_is_on_and_the_vendor_named`.
+- **BLOCKER 3 detail**: the new method is serialised `post_json` (like `post`, `basic`); the Rust arms are the
+  callback exchange, the probe's refresh and `revoke_request`; `rest._token_request(as_json=...)` is used when the
+  row says `post_json`. Zendesk is the only vendor on it (a Rust test and a Python test say so). Cited:
+  developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/.
+- **BLOCKER 4 detail**: `PRODUCT_VENDORS` in `ops/g6/g6_saas_test.py` holds one entry per vendor (HubSpot, Zendesk);
+  `step_product` does create (API), connection test, discovery (list and preview through the orchestrator), load
+  (`ingest_job` into Bronze, read back through ClickHouse), reload (changed, new and deleted/archived records, merged on
+  the key, no duplicate) and a revoked sign-in (API test and run fail, none of the mock's words). The vendor-level steps
+  stay. To let the product reach the mock: `ops/g6/docker-compose.g6-saas.override.yml` (this job only) sets
+  `CONNECTOR_OAUTH_ALLOW_HTTP` and `SAAS_GATE_ORIGINS` on `lakehouse-api` and `dagster-code-location`; the
+  runner gets ClickHouse, Dagster and the credential volume; the CI job now runs `--profile dagster` with the four
+  Dagster services and a 25-minute cut-off (as `g6-ingest-other`). `docs/CI.md` describes it.
+
+**Commands run, with counts**
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, once, final tree): **1797 passed, 0 failed**
+  (15m57s; the strict xfail is gone).
+- `python3 ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK.
+- `bun test src/lib/connectors`: 45 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 339 pass, 0 fail.
+- `bash scripts/ci/tests/test_required_gate.sh`: 52 passed. `python3 -c yaml.safe_load` of `ci.yml`: parses.
+- `docker compose --env-file <fake values> -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml -f
+  ops/g6/docker-compose.g6-saas.override.yml --profile g6-saas --profile dagster config --quiet`: OK.
+- The vendor-level gate steps against the local stub (`g6_saas_test.py --vendors-only`): `PASS`, including the Zendesk
+  browser sign-in with a JSON token request and a rotated refresh token.
+- `cd rust && cargo fmt --check`: clean.
+
+**Not verified, and why**
+- **All Rust of this round** (`PostJson` in `saas_vendors.rs`, `token_request_json`/`post_fields`, the callback, probe and
+  revoke arms, `gate_rebase`, the Zendesk Basic probe and the three new Rust tests): formatted, **not compiled, not tested**.
+  CI compiles and runs them. The existing probe test for "a pair is not testable" was moved from Zendesk to ServiceNow
+  because Zendesk's pair is now tested.
+- **The product steps of the gate and the whole `g6-saas` job have never run** (no docker stack on this machine now);
+  its time against the 20-minute budget is unmeasured. Things CI may show that I could not: whether
+  `POST .../ingest/run` accepts a connector of a type that is `supported = false` (the review says creation is not
+  refused; the run was not checked), the exact JSON field names ClickHouse returns for the Bronze columns, and whether the
+  Zendesk `custom_fields`/`due_at` columns load. If the job cannot fit 20 minutes it will say so in the summary.
+- **Browser sign-in through the product** (the API's callback exchange and refresh with the stored refresh token) is not
+  exercised: it needs a browser, and a `file:` secret cannot hold a rotated refresh token. The Rust tests and the
+  vendor-level steps cover the token request itself.
+- Nothing was shown in a browser.
+
 ## 12. Review
 
 ### Review of slice 1 (planner, 2026-10-19, head `dcd07aa4`)
