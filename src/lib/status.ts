@@ -125,6 +125,23 @@ export const CLASSIFICATION_LABEL: Record<Classification, string> = {
   restricted: "Restricted",
 }
 
+/**
+ * The mark a person with `governance:write` puts on a table (`DATA-12`):
+ * the one to trust, or one to stop using. An asset with no mark has no
+ * value, not a third one.
+ */
+export type CertificationStatus = "certified" | "deprecated"
+
+export const CERTIFICATION_LABEL: Record<CertificationStatus, string> = {
+  certified: "Certified",
+  deprecated: "Deprecated",
+}
+
+export const CERTIFICATION_DESCRIPTION: Record<CertificationStatus, string> = {
+  certified: "A person with governance rights vouched for this table.",
+  deprecated: "This table is on its way out: do not build new work on it.",
+}
+
 /** Agent autonomy levels with their product meaning. */
 export type AutonomyLevel = "L1" | "L2" | "L3" | "L4"
 

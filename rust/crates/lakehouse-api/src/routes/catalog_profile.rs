@@ -262,19 +262,17 @@ fn unsupported(reason: &str) -> Response {
         .into_response()
 }
 
-/// The table behind `id` (see `catalog_source`), or `Ok(None)` when the
-/// asset is real but nothing readable backs it.
-pub(crate) async fn resolve_source(
-    state: &AppState,
-    id: &str,
-) -> Result<Option<ReadSource>, ApiError> {
-    if id.starts_with("silver.") || id.starts_with("serving.") {
-        let (db, table) = split_db_table(id);
-        return catalog_source::clickhouse_source(&state.clickhouse, &db, &table)
-            .await
-            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e));
-    }
-    let slug = SqlLiteral::from(id);
+/// The registry's `table_name` for the Bronze dataset `slug` (empty when the
+/// dataset has no table yet): the Iceberg table the asset page reads.
+/// Shared by [`resolve_source`] and the restore of a dropped table
+/// (`DATA-15` F4), so the registry is asked one way.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when no dataset has that slug; a classified
+/// `ClickHouse` error when the registry cannot be read.
+pub(crate) async fn bronze_table_name(state: &AppState, slug: &str) -> Result<String, ApiError> {
+    let slug = SqlLiteral::from(slug);
     let sql = format!(
         "SELECT table_name FROM lake.`bronze_meta.dataset_sync` WHERE slug = {slug}
          UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_sync` WHERE slug = {slug}
@@ -288,7 +286,23 @@ pub(crate) async fn resolve_source(
     let Some(row) = rows.first() else {
         return Err(ApiError::NotFound("Asset not found".to_owned()));
     };
-    catalog_source::bronze_source(state, str_col(row, "table_name"))
+    Ok(str_col(row, "table_name").to_owned())
+}
+
+/// The table behind `id` (see `catalog_source`), or `Ok(None)` when the
+/// asset is real but nothing readable backs it.
+pub(crate) async fn resolve_source(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<ReadSource>, ApiError> {
+    if id.starts_with("silver.") || id.starts_with("serving.") {
+        let (db, table) = split_db_table(id);
+        return catalog_source::clickhouse_source(&state.clickhouse, &db, &table)
+            .await
+            .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e));
+    }
+    let table_name = bronze_table_name(state, id).await?;
+    catalog_source::bronze_source(state, &table_name)
         .await
         .map_err(|e| upstream_error::ch_error(&upstream_error::DATABASE, &e))
 }

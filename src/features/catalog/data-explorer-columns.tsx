@@ -2,6 +2,7 @@
 
 import type { ColumnDef } from "@tanstack/react-table"
 import {
+  BadgeCheck,
   Boxes,
   CalendarClock,
   Database,
@@ -17,8 +18,9 @@ import { Copyable } from "@/components/copyable"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { AssetRowActions } from "./data-explorer-actions"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { Pill, TierBadge } from "@/components/patterns/status-badge"
+import { CertificationBadge, Pill, TierBadge } from "@/components/patterns/status-badge"
 import { formatBytes } from "@/lib/format"
+import { governedPairLabels } from "./governed-tags"
 import { matchedOnLabel } from "@/lib/palette-search"
 import {
   DATA_LAYER_LABEL,
@@ -55,6 +57,12 @@ const tierOptions = Object.entries(STORAGE_TIER_LABEL).map(([value, label]) => (
   label,
   value,
 }))
+
+// DATA-12: the filter offers the two marks; an unmarked table has none to pick.
+const certificationOptions = [
+  { value: "certified", label: "Certified" },
+  { value: "deprecated", label: "Deprecated" },
+]
 
 const typeOptions = Object.entries(ASSET_TYPE_LABEL).map(([value, label]) => ({
   label,
@@ -95,14 +103,19 @@ export function getDataExplorerColumns({
               enough to push the last columns off a narrow screen on its own.
               The full name is still available on hover and on the detail
               page. */}
-          <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
-            <span
-              className="truncate font-medium tracking-tight text-foreground"
-              title={row.original.name}
-            >
-              {row.original.name}
-            </span>
-          </Copyable>
+          <div className="flex items-center gap-1.5">
+            <Copyable value={row.original.name} className="max-w-[12rem] xl:max-w-[22rem]">
+              <span
+                className="truncate font-medium tracking-tight text-foreground"
+                title={row.original.name}
+              >
+                {row.original.name}
+              </span>
+            </Copyable>
+            {/* DATA-12: the Tags column is hidden on most screens, so the
+                mark rides the name instead of a column of its own. */}
+            <CertificationBadge certification={row.original.certification} />
+          </div>
           {/* Why a search returned this row (DATA-11); only a search with a
               term sends it, and a match on the name needs no reason. */}
           <MatchedOnLine matchedOn={row.original.matchedOn} />
@@ -162,17 +175,27 @@ export function getDataExplorerColumns({
     {
       // Not sortable: the server refuses `tags` as a sort field (a list has
       // no order to sort by), so the header must not offer it. The filter
-      // sends `iLike`, which matches when any tag contains the text.
+      // sends `iLike`, which matches when any tag contains the text. DATA-12
+      // part 2: the filter reads governed pairs too (as `key: value`, the
+      // server's `tags` array filter), so the column shows both kinds.
       id: "tags",
-      accessorFn: (asset) => asset.tags ?? [],
+      accessorFn: (asset) => [...governedPairLabels(asset.governedTags), ...(asset.tags ?? [])],
       header: ({ column }) => <DataTableColumnHeader column={column} label="Tags" />,
       cell: ({ row }) => {
         const tags = row.original.tags ?? []
-        if (tags.length === 0) return <span className="text-muted-foreground">—</span>
+        const governed = governedPairLabels(row.original.governedTags)
+        if (tags.length === 0 && governed.length === 0) {
+          return <span className="text-muted-foreground">—</span>
+        }
         return (
           // Capped so a long list wraps inside the column instead of widening
           // the table (DATA-11 review SHOULD-FIX 7).
           <span className="flex max-w-[14rem] flex-wrap gap-1">
+            {governed.map((pair) => (
+              <Pill key={`governed:${pair}`} tone="info" title="Governed tag">
+                {pair}
+              </Pill>
+            ))}
             {tags.map((tag) => (
               <Pill key={tag} tone="neutral">
                 {tag}
@@ -277,6 +300,26 @@ export function getDataExplorerColumns({
         label: "Size",
         variant: "number",
         icon: HardDrive,
+      },
+    },
+    {
+      // Hidden by default (see `columnVisibility` on the page): the mark is
+      // shown beside the name, and this column exists to filter on it
+      // (`DATA-12`; `certification` is filterable, sortable and groupable on
+      // the server).
+      id: "certification",
+      accessorKey: "certification",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Certification" />
+      ),
+      cell: ({ row }) => <CertificationBadge certification={row.original.certification} />,
+      enableColumnFilter: true,
+      meta: {
+        label: "Certification",
+        variant: "multiSelect",
+        options: certificationOptions,
+        icon: BadgeCheck,
+        enableGrouping: true,
       },
     },
     {

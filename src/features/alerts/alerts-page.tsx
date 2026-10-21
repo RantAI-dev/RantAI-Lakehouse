@@ -36,13 +36,14 @@ import type { QueryKeys } from "@/types/data-table"
 // instead of going through `@/services`.
 import { apiFetch } from "@/services/http"
 import { useAuth } from "@/features/auth/auth-provider"
-import { getRuleColumns, isLoadAlertKind, ruleKindLabel, type Rule } from "@/features/alerts/rules-columns"
+import { getRuleColumns, isLoadAlertKind, isQualityAlertKind, ruleKindLabel, type Rule } from "@/features/alerts/rules-columns"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { alertRuleService, connectorService, metricService } from "@/services"
 import type { Metric } from "@/services/contracts/metrics"
 import {
   LOAD_ALERT_KINDS,
+  QUALITY_ALERT_KIND,
   type AlertRule,
   type SaveAlertRuleInput,
   type AlertRunResult,
@@ -154,6 +155,10 @@ export function alertRuleFormFields(
 } {
   const none = { connector: false, allConnectors: false, note: null }
   if (type === "freshness") return { martMeasure: false, board: false, freshnessTarget: true, ...none };
+  // `DATA-14`: a quality incident rule has a table (`asset`), nothing else; the
+  // table field is shown for it by `isQualityAlertKind`, so this return keeps
+  // its shape.
+  if (isQualityAlertKind(type)) return { martMeasure: false, board: false, freshnessTarget: false, ...none };
   if (type === "pipeline_behind_target") return { martMeasure: false, board: false, freshnessTarget: false, ...none };
   if (type === "alert") return { martMeasure: true, board: false, freshnessTarget: false, ...none };
   if (isLoadAlertKind(type)) {
@@ -177,6 +182,17 @@ export function alertRuleFormFields(
  * kind sends the form as it always did.
  */
 export function alertRuleSaveInput(f: AlertRule): SaveAlertRuleInput {
+  if (isQualityAlertKind(f.type)) {
+    return {
+      name: f.name.trim(),
+      type: f.type,
+      channel: f.channel,
+      target: f.target.trim(),
+      enabled: f.enabled,
+      ...(f.severity ? { severity: f.severity } : {}),
+      asset: (f.asset ?? "").trim(),
+    }
+  }
   if (f.type === "pipeline_behind_target") {
     return {
       name: f.name.trim(),
@@ -527,6 +543,11 @@ function RuleEditDialog({
                       {ruleKindLabel(kind)}
                     </SelectItem>
                   ))}
+                  {/* DATA-14: only an administrator who sees every tenant may save
+                      one (the API enforces it); the form offers what will save. */}
+                  {canSeeAllTenants || isQualityAlertKind(f.type) ? (
+                    <SelectItem value={QUALITY_ALERT_KIND}>{ruleKindLabel(QUALITY_ALERT_KIND)}</SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </div>
@@ -600,6 +621,21 @@ function RuleEditDialog({
             </div>
           ) : null}
           {formFields.note ? <p className="text-xs text-muted-foreground">{formFields.note}</p> : null}
+
+          {isQualityAlertKind(f.type) ? (
+            <div className="grid gap-1.5">
+              <Label>Table (zone.table, or * for every table)</Label>
+              <Input
+                value={f.asset ?? ""}
+                onChange={(e) => setF((prev) => ({ ...prev, asset: e.target.value }))}
+                placeholder="silver.orders"
+              />
+              <p className="text-xs text-muted-foreground">
+                Sent when a quality incident opens on the table: a check that fails, or a load far
+                smaller or later than usual. An incident that is still open is not sent again.
+              </p>
+            </div>
+          ) : null}
 
           {formFields.freshnessTarget ? (
             <div className="grid gap-1.5">
@@ -745,6 +781,10 @@ export function AlertsPage() {
     if (f.type === "alert" && isMetricRule(f) && !f.metric) { setFormErr("Pick a metric."); return; }
     if (alertRuleFormFields(f.type, canSeeAllTenants).connector && !f.connector) {
       setFormErr("Choose a connector.");
+      return;
+    }
+    if (isQualityAlertKind(f.type) && !(f.asset ?? "").trim()) {
+      setFormErr("Name the table, or * for every table.");
       return;
     }
     const saved = await saveAction.run(alertRuleSaveInput(f), edit ? edit.id : null);
