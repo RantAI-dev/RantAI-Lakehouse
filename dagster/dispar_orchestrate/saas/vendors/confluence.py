@@ -79,7 +79,8 @@ CURSOR_FIELD = "modified_at"
 LAG_SECONDS = 300
 PAGE_LIMIT = 100
 SPACE_LIMIT = 250
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# `\Z`, not `$`: `$` also matches before a trailing newline, and this id goes into every request path.
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 # object -> (endpoints it reads, whether it carries a body and a version)
 _ENDPOINTS: dict[str, tuple[tuple[str, ...], bool]] = {

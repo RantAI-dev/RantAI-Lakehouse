@@ -236,7 +236,7 @@ def test_a_site_the_account_cannot_reach_and_a_cloud_id_that_is_not_a_uuid_are_r
     api.sites = [{"id": CLOUD_ID, "url": "https://other.atlassian.net", "scopes": ["read:page:confluence"]}]
     with pytest.raises(saas_adapter.SaasSetupRefused):
         open_(api, OAUTH_DIAL, OAUTH_SECRETS)
-    for bad in ("../../x", CLOUD_ID.upper(), CLOUD_ID + "/x", ""):
+    for bad in ("../../x", CLOUD_ID.upper(), CLOUD_ID + "/x", CLOUD_ID + "\n", ""):
         api.sites = [{"id": bad, "url": SITE, "scopes": ["read:page:confluence"]}]
         with pytest.raises(saas_adapter.SaasSetupRefused):
             open_(api, OAUTH_DIAL, OAUTH_SECRETS)
