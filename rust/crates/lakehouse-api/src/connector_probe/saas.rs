@@ -707,11 +707,15 @@ mod tests {
         }
     }
 
-    /// An account in the shape each vendor's row accepts (slice 5: the Microsoft ones carry a tenant).
+    /// An account in the shape each vendor's row accepts (slice 5: the Microsoft ones carry a tenant;
+    /// PR #216 CI rust test: HubSpot, GA4, Workday and `NetSuite` have their own forms, so every vendor is named).
     fn sample_account(vendor: &str) -> &'static str {
         match vendor {
             "sharepoint" => "acme/00000000-0000-0000-0000-000000000001",
             "dynamics365" => "acme.crm4.dynamics.com/00000000-0000-0000-0000-000000000001",
+            "hubspot" | "ga4" => "123456789",
+            "workday" => "wd2-impl-services1.workday.com/acme_tenant",
+            "netsuite" => "1234567_SB1",
             _ => "acme",
         }
     }
