@@ -108,6 +108,8 @@ def _params(**overrides) -> FileIngestParams:
         upload_id="u-1",
         storage_keys=(KEY,),
         format="delimited",
+        compression="none",
+        max_bytes=50 * 1024 * 1024,
         bronze_table_name="g9_orders",
         load_mode="replace",
         encoding="utf-8",
@@ -260,12 +262,12 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
-def test_there_are_nine_different_failure_reasons_among_them_the_header_row_with_no_columns():
+def test_there_are_ten_different_failure_reasons_among_them_the_header_row_with_no_columns():
     # Review finding C2 made it seven: a header row with no columns has a
     # sentence of its own. SEC-17 made it eight with the column cap. The API
     # counts the same eight against the same file.
     in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
-    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 9
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 10
     assert HEADER_NO_COLUMNS == "The header row has no columns."
     assert HEADER_NO_COLUMNS != HEADER_PAST_END
 
@@ -1273,6 +1275,8 @@ RUN_CONFIG = {
                 "upload_id": "u-1",
                 "storage_keys": [KEY],
                 "format": "delimited",
+                "compression": "none",
+                "max_bytes": 52428800,
                 "bronze_table_name": "g9_orders",
                 "load_mode": "append",
                 "encoding": "utf-16",
@@ -1309,6 +1313,8 @@ def test_the_run_config_the_api_sends_reaches_the_load_as_the_same_settings(monk
             upload_id="u-1",
             storage_keys=(KEY,),
             format="delimited",
+            compression="none",
+            max_bytes=52428800,
             bronze_table_name="g9_orders",
             load_mode="append",
             encoding="utf-16",

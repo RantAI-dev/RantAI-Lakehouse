@@ -2351,6 +2351,8 @@ class TestFileIngestRunConfigReader:
                         "upload_id": "up-1",
                         "storage_keys": ["uploads/t/up-1.csv"],
                         "format": "delimited",
+                        "compression": "none",
+                        "max_bytes": 52428800,
                         "bronze_table_name": "stock_raw",
                         "load_mode": "replace",
                         "encoding": "utf-8",

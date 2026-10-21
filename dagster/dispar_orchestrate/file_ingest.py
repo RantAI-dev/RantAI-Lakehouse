@@ -111,6 +111,7 @@ from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult, l
 from dispar_orchestrate.bronze_catalog import record_ingest_run
 from dispar_orchestrate.connector_catalog import register_loaded_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
+from dispar_orchestrate import upload_formats
 from dispar_orchestrate.upload_types import BadReport, ColumnSpec, cast_batch, check_specs, specs_from_config
 from dispar_orchestrate.parquet_ingest import UnsupportedColumn, check_types, column_names_of, open_parquet, text_batches
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
@@ -169,9 +170,14 @@ TABLE_NAME = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
 # from the API, and fails closed.
 LOAD_MODES = ("replace", "append")
 # What the stored objects are: delimited text (a CSV or TSV, or the text the API
-# converted a workbook to), or a Parquet file, which the job reads natively
-# (`DATA-17` T2.2, `parquet_ingest.py`).
-FORMATS = ("delimited", "parquet")
+# converted a workbook to), a Parquet file, which the job reads natively
+# (`DATA-17` T2.2, `parquet_ingest.py`), or, from slice 4, JSON (a top-level array of
+# objects), JSON Lines or an Avro container (`upload_formats.py`).
+FORMATS = ("delimited", "parquet", "json", "jsonl", "avro")
+# How the object is wrapped (decision 13): `gzip` holds one file of text, JSON or JSON
+# Lines; `zip` holds up to 10 files of one of the formats above except Parquet.
+COMPRESSIONS = ("none", "gzip", "zip")
+GZIP_FORMATS = ("delimited", "json", "jsonl")
 ENCODINGS = ("utf-8", "utf-16")
 DELIMITERS = (",", ";", "\t", "|")
 
@@ -194,6 +200,10 @@ TOO_MANY_COLUMNS = "The file has more than 1,000 columns."
 # `DATA-18`: a load told to stop at a value that does not fit its column's type.
 BAD_VALUES = "Some values do not fit their column's type."
 
+# `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
+# Appended last, so the fixture's order of the first nine is kept.
+TOO_LARGE_UNPACKED = "The file is larger than the upload limit once unpacked."
+
 FAILURE_REASONS = (
     UNREADABLE,
     HEADER_PAST_END,
@@ -204,6 +214,7 @@ FAILURE_REASONS = (
     NOT_REGISTERED,
     TOO_MANY_COLUMNS,
     BAD_VALUES,
+    TOO_LARGE_UNPACKED,
 )
 
 
@@ -251,6 +262,11 @@ class FileIngestParams:
     storage_keys: tuple[str, ...]
     #: What the objects are: one of `FORMATS`.
     format: str
+    #: How they are wrapped: one of `COMPRESSIONS`.
+    compression: str
+    #: The most bytes the load may decode from a gzip or zip file (decision 2: the
+    #: uncompressed size counts toward the cap); the API sends its own cap.
+    max_bytes: int
     #: The raw table. The API checks the naming rule; `_check_settings` checks it again.
     bronze_table_name: str
     #: `replace` or `append`.
@@ -288,7 +304,9 @@ CONFIG_SCHEMA = {
     "storage_keys": Field(
         [str], description="Object keys inside the warehouse bucket, under `uploads/`; the primary file first."
     ),
-    "format": Field(str, description="What the objects are: `delimited` or `parquet`."),
+    "format": Field(str, description="What the objects are: `delimited`, `parquet`, `json`, `jsonl` or `avro`."),
+    "compression": Field(str, description="`none`, `gzip` or `zip`."),
+    "max_bytes": Field(int, description="The most bytes a gzip or zip file may decode to."),
     "bronze_table_name": Field(str, description="The raw table to load into."),
     "load_mode": Field(str, description="`replace` or `append`."),
     "encoding": Field(str, description="`utf-8` or `utf-16`."),
@@ -532,7 +550,10 @@ class TableStream:
                 if len(cells[0]) >= BATCH_ROWS:
                     yield self._table(cells)
                     cells = [[] for _ in range(width)]
-        except LoadFailure:
+        except LoadFailure as caught:
+            # Slice 4: a failure raised by the records themselves (the bytes of a gzip
+            # or zip file passing the cap) is the reason, as the row cap is.
+            self.failure = self.failure or caught
             raise
         except Exception as exc:  # noqa: BLE001 -- the store or the decoder failed mid-read; the detail is the cause
             self.failure = LoadFailure(UNREADABLE)
@@ -701,6 +722,188 @@ def _typed(stream: TableStream | ParquetStream, params: FileIngestParams) -> Tab
     return TypedStream(stream, list(params.columns), params.on_bad_value)
 
 
+def _translated(records: Iterable[Any]) -> Iterator[Any]:
+    """The records of an entry, with what `upload_formats` raises as the failure it is."""
+    try:
+        yield from records
+    except upload_formats.Unpacked as exc:
+        raise LoadFailure(TOO_LARGE_UNPACKED) from exc
+    except upload_formats.Refused as exc:
+        raise LoadFailure(UNREADABLE) from exc
+
+
+def _same_columns(names: list[str], columns: list[str]) -> list[int]:
+    """Where each of `columns` is in `names`: the entries of a zip are matched by name, their
+    order may differ.
+
+    # Errors
+
+    Raises `LoadFailure(LOAD_FAILED)` when the names are not the same set."""
+    if sorted(names) != sorted(columns) or len(set(names)) != len(names):
+        raise LoadFailure(LOAD_FAILED) from ValueError("the files of the archive do not have the same columns")
+    return [names.index(name) for name in columns]
+
+
+def _delimited_entries(entries_of: Callable[[], Any], params: FileIngestParams) -> TableStream:
+    """The first entry's header and rows, then the rows of the others, matched by column
+    name (`DATA-17` slice 4): a gzip file or a zip of delimited text. The entries stay open
+    until the rows have been read (or the stream is dropped).
+
+    # Errors
+
+    As `open_table`; `LoadFailure(NO_ROWS)` for an archive with no entries."""
+    context = entries_of()
+    pairs = iter(context.__enter__())
+    try:
+        first = next(pairs, None)
+        if first is None:
+            raise LoadFailure(NO_ROWS)
+
+        def lines_of(stream: BinaryIO) -> Iterator[str]:
+            return _lines(_text_chunks(_blocks(stream), params.encoding))
+
+        head = open_table(lines_of(first[1]), params.delimiter, params.header_row)
+    except BaseException:
+        context.__exit__(None, None, None)
+        raise
+
+    first_records = head.records
+
+    def records() -> Iterator[list[str]]:
+        try:
+            yield from first_records
+            for _name, stream in pairs:
+                header, rows = read_table(lines_of(stream), params.delimiter, params.header_row)
+                order = _same_columns(_column_names(header), head.columns)
+                width = len(header)
+                for record in rows:
+                    shaped = _shape(record, width)
+                    yield [shaped[index] for index in order]
+        finally:
+            context.__exit__(None, None, None)
+
+    head.records = _translated(records())
+    return head
+
+
+def _json_stream(
+    entries_of: Callable[[], Any], params: FileIngestParams, *, lines: bool
+) -> TableStream:
+    """A JSON array or JSON Lines file (or a zip of them) as a table stream. The columns are
+    the keys of ALL objects in first-seen order, so the file is read twice: once for the keys
+    (which also finds a file that is not JSON, or too large, before anything is written) and
+    once for the rows. A key missing from an object is a null cell (decision 11).
+
+    # Errors
+
+    `LoadFailure`: `NO_ROWS`, `HEADER_NO_COLUMNS` (no object has a key), `TOO_MANY_COLUMNS`,
+    `TOO_MANY_ROWS` or what `upload_formats` refused, as `UNREADABLE` or `TOO_LARGE_UNPACKED`."""
+
+    def objects() -> Iterator[dict[str, Any]]:
+        with entries_of() as entries:
+            for _name, stream in entries:
+                yield from upload_formats.json_objects(stream, lines)
+
+    keys: dict[str, None] = {}
+    count = 0
+    for item in _translated(objects()):
+        count += 1
+        if count > MAX_ROWS:
+            raise LoadFailure(TOO_MANY_ROWS)
+        keys.update(dict.fromkeys(item))
+        if len(keys) > MAX_COLUMNS:
+            raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(f"the objects have more than {MAX_COLUMNS} keys")
+    if count == 0:
+        raise LoadFailure(NO_ROWS)
+    if not keys:
+        raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("no object has a key")
+    names = list(keys)
+
+    def rows() -> Iterator[list[str | None]]:
+        for item in objects():
+            yield [upload_formats.json_text(item.get(name)) for name in names]
+
+    records = _translated(rows())
+    return TableStream(columns=_column_names(names), first=next(records), records=records)  # type: ignore[arg-type]
+
+
+def _avro_stream(entries_of: Callable[[], Any], params: FileIngestParams) -> TableStream:
+    """An Avro container (or a zip of them) as a table stream: the record's fields are the
+    columns, in the schema's order; a record, array or map is JSON text (decision 12).
+
+    # Errors
+
+    `LoadFailure`: `NO_ROWS`, `HEADER_NO_COLUMNS`, `TOO_MANY_COLUMNS`, and what
+    `upload_formats` refused, as `UNREADABLE` or `TOO_LARGE_UNPACKED`."""
+    context = entries_of()
+    entries = context.__enter__()
+    pairs = iter(entries)
+    first = next(pairs, None)
+    try:
+        if first is None:
+            raise LoadFailure(NO_ROWS)
+        reader = upload_formats.avro_reader(first[1])
+        names = [field["name"] for field in reader.writer_schema["fields"]]
+    except upload_formats.Refused as exc:
+        context.__exit__(None, None, None)
+        raise LoadFailure(UNREADABLE) from exc
+    except BaseException:
+        context.__exit__(None, None, None)
+        raise
+    if not names:
+        context.__exit__(None, None, None)
+        raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("the record has no fields")
+    if len(names) > MAX_COLUMNS:
+        context.__exit__(None, None, None)
+        raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(f"the record has {len(names)} fields, more than {MAX_COLUMNS}")
+
+    def records() -> Iterator[list[str | None]]:
+        try:
+            for record in reader:
+                yield [upload_formats.avro_text(record.get(name)) for name in names]
+            for _name, stream in pairs:
+                other = upload_formats.avro_reader(stream)
+                other_names = [field["name"] for field in other.writer_schema["fields"]]
+                order = _same_columns(other_names, names)  # raises LoadFailure
+                for record in other:
+                    yield [upload_formats.avro_text(record.get(other_names[index])) for index in order]
+        finally:
+            context.__exit__(None, None, None)
+
+    stream = _translated(records())
+    first_record = next(stream, None)
+    if first_record is None:
+        raise LoadFailure(NO_ROWS)
+    return TableStream(columns=_column_names(names), first=first_record, records=stream)  # type: ignore[arg-type]
+
+
+def _open_stream(handle: BinaryIO, params: FileIngestParams) -> TableStream | ParquetStream:
+    """Read the object as far as its first data row, whatever its format and wrapping, writing
+    nothing.
+
+    # Errors
+
+    `LoadFailure` as the readers above and `open_table` raise it."""
+    if params.format == "parquet":
+        return open_parquet_stream(handle)
+
+    def entries_of() -> Any:
+        # Each pass over the file spends a new budget: the cap is per read of the file.
+        budget = upload_formats.Budget(params.max_bytes) if params.compression != "none" else None
+        return upload_formats.open_entries(handle, params.compression, budget, params.format)
+
+    try:
+        if params.format == "json" or params.format == "jsonl":
+            return _json_stream(entries_of, params, lines=params.format == "jsonl")
+        if params.format == "avro":
+            return _avro_stream(entries_of, params)
+        return _delimited_entries(entries_of, params)
+    except upload_formats.Unpacked as exc:
+        raise LoadFailure(TOO_LARGE_UNPACKED) from exc
+    except upload_formats.Refused as exc:
+        raise LoadFailure(UNREADABLE) from exc
+
+
 def _checked_key(storage_key: str) -> str:
     """The key, if it is inside the uploads prefix and cannot climb out of it.
 
@@ -853,6 +1056,14 @@ def _check_settings(params: FileIngestParams) -> None:
     problems.extend(check_specs(list(params.columns)))
     if params.format not in FORMATS:
         problems.append(f"format {params.format!r} is not one of {', '.join(FORMATS)}")
+    if params.compression not in COMPRESSIONS:
+        problems.append(f"compression {params.compression!r} is not one of {', '.join(COMPRESSIONS)}")
+    elif params.compression == "gzip" and params.format not in GZIP_FORMATS:
+        problems.append(f"a gzip file holds {', '.join(GZIP_FORMATS)}, not {params.format!r}")
+    elif params.compression == "zip" and params.format == "parquet":
+        problems.append("a zip file does not hold Parquet files")
+    if params.max_bytes <= 0:
+        problems.append(f"max_bytes {params.max_bytes} is not positive")
     if len(params.storage_keys) != 1:
         problems.append(f"storage_keys holds {len(params.storage_keys)} keys; this version loads exactly one file")
     table = params.bronze_table_name
@@ -972,11 +1183,7 @@ def _load(
             raise LoadFailure(UNREADABLE) from exc
         with handle:
             try:
-                if params.format == "parquet":
-                    stream = open_parquet_stream(handle)
-                else:
-                    lines = _lines(_text_chunks(_blocks(handle), params.encoding))
-                    stream = open_table(lines, params.delimiter, params.header_row)
+                stream = _open_stream(handle, params)
             except LoadFailure:
                 raise
             except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause

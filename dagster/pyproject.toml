@@ -38,6 +38,16 @@ dependencies = [
     # installed transitively by `pyiceberg` (25.0.1 in this project's venv on
     # 2026-10-19); named here so a pyiceberg bump cannot silently drop or move it.
     "pyarrow==25.0.1",
+    # `upload_formats.py` (`DATA-17` slice 4, plan AD8): the Avro container files an
+    # upload may be (decision 12). `fastavro` is the Avro library with
+    # wheels for this image's interpreter (1.13.1, installed and tested on 2026-10-21);
+    # it decodes logical types (dates, timestamps, decimals) the way the text rules need.
+    "fastavro==1.13.1",
+    # `upload_formats.py`: a JSON file that is one top-level array is read element by
+    # element, because `json.load` would hold the whole file (a 2 GiB array is the point
+    # of the cap). `ijson` streams it (3.6.0, with its C backend `yajl2_c`, tested on
+    # 2026-10-21) and hands non-integers over as `Decimal`, so `1.50` stays `1.50`.
+    "ijson==3.6.0",
     # Tier 2 ingestion adapters (mongodb, oracle, kafka stream micro-batch,
     # sftp). Verified installable for this image's interpreter
     # (python:3.12-slim, dagster/Dockerfile) via
