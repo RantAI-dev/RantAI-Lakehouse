@@ -136,6 +136,27 @@ describe("data labels and notes", () => {
     expect(html).toContain("w")
     expect(html).not.toContain("1,200")
   })
+
+  test("a note with markup is drawn as text, not as HTML", () => {
+    const style: StyleFields = { annotations: [{ x: "Java", text: '<img src=x onerror="alert(1)">' }] }
+    const { option } = draw("bar", style)
+    const pin = (series(option)[0]!.markPoint as { tooltip: { formatter: (p: { name?: string }) => string } }).tooltip
+    const html = pin.formatter({ name: '<img src=x onerror="alert(1)">' })
+    expect(html).not.toContain("<img")
+    expect(html).toContain("&lt;img")
+  })
+
+  test("the tooltip fields escape the series name and the axis label", () => {
+    const { option } = draw("bar", { tooltip: { fields: ["w"] } }, ["v", "w"])
+    const format = (option.tooltip as { formatter: (p: unknown) => string }).formatter
+    const html = format([
+      { axisValueLabel: '<img src=x onerror="alert(1)">', seriesIndex: 1, seriesName: '<b>name</b>', value: 3 },
+    ])
+    expect(html).not.toContain("<img")
+    expect(html).not.toContain("<b>name</b>")
+    expect(html).toContain("&lt;img")
+    expect(html).toContain("&lt;b&gt;name")
+  })
 })
 
 describe("series columns", () => {

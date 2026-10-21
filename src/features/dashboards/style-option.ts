@@ -1,5 +1,6 @@
 import type { EChartsOption } from "echarts";
 import { interpolate } from "@/lib/chart-palettes";
+import { escapeHtml } from "@/lib/geo-points";
 import type { AxisStyle, StyleFields, ValueFormat } from "@/lib/chart-style";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
 
@@ -234,7 +235,10 @@ function applyNotes(series: Obj[], option: Obj, input: StyleInput): number {
       ...mark,
       symbol: "pin",
       symbolSize: 26,
-      tooltip: { formatter: (p: { name?: string }) => p.name ?? "" },
+      // The note's text is the user's, and the server's check for it allows
+      // `<` and `>`; ECharts sets a tooltip formatter's result as HTML, so
+      // the text is escaped before it goes in (`PR #199 review M BLOCKER 1`).
+      tooltip: { formatter: (p: { name?: string }) => escapeHtml(p.name ?? "") },
       data: [...((mark.data as unknown[] | undefined) ?? []), { name: note.text, coord: horizontal ? [value, at] : [at, value], value }],
     };
   }
@@ -252,10 +256,13 @@ function applyTooltipFields(option: Obj, series: Obj[], cols: (string | undefine
     formatter: (params: unknown) => {
       const list = (Array.isArray(params) ? params : [params]) as { axisValueLabel?: string; seriesIndex: number; marker?: string; seriesName?: string; value?: unknown }[];
       const f = (col?: string) => input.style?.valueFormats?.[col ?? ""] ?? input.style?.format;
+      // The series name and the axis label are warehouse data and ECharts
+      // sets a tooltip formatter's result as HTML, so every text but the
+      // marker's own markup is escaped (`PR #199 review M BLOCKER 1`).
       const lines = list
         .filter((p) => keep.has(cols[p.seriesIndex] ?? ""))
-        .map((p) => `${p.marker ?? ""} ${p.seriesName || cols[p.seriesIndex] || ""}: <b>${typeof p.value === "number" ? formatValue(p.value, f(cols[p.seriesIndex]), input.locale, input.decimals) : String(p.value ?? "")}</b>`);
-      return [list[0]?.axisValueLabel ?? "", ...lines].join("<br/>");
+        .map((p) => `${p.marker ?? ""} ${escapeHtml(p.seriesName || cols[p.seriesIndex] || "")}: <b>${typeof p.value === "number" ? formatValue(p.value, f(cols[p.seriesIndex]), input.locale, input.decimals) : escapeHtml(String(p.value ?? ""))}</b>`);
+      return [escapeHtml(list[0]?.axisValueLabel ?? ""), ...lines].join("<br/>");
     },
   };
   void series;
