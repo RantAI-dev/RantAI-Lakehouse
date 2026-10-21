@@ -230,15 +230,17 @@ class SaasSession:
             raise SaasRateLimited()
         return seconds
 
-    def get_json(self, target: str, params: dict | None = None) -> Any:
+    def get_json(self, target: str, params: dict | None = None, *, headers: dict | None = None) -> Any:
         """GET `target` (a path on the origin, or a same-origin link from an
-        earlier answer) and return its JSON.
+        earlier answer) and return its JSON. `headers` are request headers that are not
+        credentials (Dataverse's `Prefer: odata.maxpagesize=...`, slice 5); the session's
+        own authentication headers win over a name they share.
 
         # Errors
 
         See `_send`: the same for `post_json`.
         """
-        return self._send("GET", target, params, None)
+        return self._send("GET", target, params, None, extra_headers=headers)
 
     def get_json_with_next(self, target: str, params: dict | None = None) -> tuple[Any, str | None]:
         """Like `get_json`, and the `rel="next"` target of the answer's `Link` header, or
@@ -266,7 +268,16 @@ class SaasSession:
         """
         return self._send("POST", target, None, body)
 
-    def _send(self, method: str, target: str, params: dict | None, body: Any, *, with_link: bool = False) -> Any:
+    def _send(
+        self,
+        method: str,
+        target: str,
+        params: dict | None,
+        body: Any,
+        *,
+        with_link: bool = False,
+        extra_headers: dict | None = None,
+    ) -> Any:
         """One request under the link, address and rate-limit rules.
 
         # Errors
@@ -282,7 +293,7 @@ class SaasSession:
         attempt = 0
         while True:
             resolved = self._resolve_checked(host, port)
-            headers = self._auth_headers()
+            headers = {**(extra_headers or {}), **self._auth_headers()}
             with ssrf_guard.pinned_resolution(host, resolved):
                 if method == "POST":
                     response = self._http_post(url, headers=headers, json=body, timeout=_REQUEST_TIMEOUT_SECONDS)
