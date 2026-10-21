@@ -471,5 +471,154 @@
     "facts": [
       {"label": "shown grain", "kind": "text", "values": ["year"]}
     ]
+  },
+  {
+    "id": "dash_create_tab",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Tab Board"}, "id_at": "board.id"}
+    ],
+    "turns": ["Add a tab called Overview to dashboard {board}."],
+    "expect_tool": {"name": "create_tab", "args_contains": {"board": "{board}", "title": "Overview"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Overview"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_rename_tab",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Rename Tab Board"}, "id_at": "board.id"}
+    ],
+    "turns": [
+      "Add a tab called Overview to dashboard {board}.",
+      "Rename the tab Overview of dashboard {board} to Summary."
+    ],
+    "expect_tool": {"name": "rename_tab", "args_contains": {"board": "{board}", "title": "Summary"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Summary"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_move_charts_to_tab",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Move To Tab Board"}, "id_at": "board.id"},
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Tab Chart", "kind": "kpi", "mart": "mart_event", "measures": ["jumlah_event"], "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": [
+      "Add a tab called Maps to dashboard {board}.",
+      "Put chart {chart} on the tab Maps of dashboard {board}."
+    ],
+    "expect_tool": {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{chart}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_move_tab",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Move Tab Board"}, "id_at": "board.id"}
+    ],
+    "turns": [
+      "Add a tab called Overview to dashboard {board}.",
+      "Add a tab called Maps to dashboard {board}.",
+      "Move the tab Maps of dashboard {board} to the first position."
+    ],
+    "expect_tool": {"name": "move_tab", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Overview"}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_delete_tab_approval",
+    "mode": "build",
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Delete Tab Board"}, "id_at": "board.id"}
+    ],
+    "turns": [
+      "Add a tab called Old to dashboard {board}.",
+      "Delete the tab Old of dashboard {board}."
+    ],
+    "expect_approval": "delete_tab",
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Old"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_map_charts_in_separate_tab",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Map Tab Board"}, "id_at": "board.id"},
+      {"name": "map_chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Provinces Map", "kind": "geomap", "mart": "mart_kuliner", "dimension": "wilayah", "measures": ["jumlah_usaha"], "map": "id-provinces", "board": "{board}"}, "id_at": "chart.id"}
+    ],
+    "turns": ["Put the map charts in a separate tab on dashboard {board}."],
+    "expect_tool": {"name": "create_tab", "args_contains": {"board": "{board}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_format_chart",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "chart", "method": "POST", "path": "/api/dashboard/specs", "body": {"title": "Eval Format Chart", "kind": "bar", "mart": "mart_event", "dimension": "tahun", "measures": ["jumlah_event"]}, "id_at": "chart.id"}
+    ],
+    "turns": ["Show the values of chart {chart} in rupiah and add a target line at 1,000."],
+    "expect_tool": {"name": "format_chart", "args_contains": {"chart": "{chart}"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 1000}, "count": 1}
+    ]
+  },
+  {
+    "id": "dash_set_dashboard_theme",
+    "mode": "build",
+    "confirm": true,
+    "setup": [
+      {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Theme Board"}, "id_at": "board.id"}
+    ],
+    "turns": ["Make dashboard {board} use the dark theme."],
+    "expect_tool": {"name": "set_dashboard_theme", "args_contains": {"board": "{board}", "theme": "dark"}},
+    "expect_state": [
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "theme": "dark"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_progress_goal",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Add a progress bar of the total number of events against a goal of 300,000."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"kind": "progress", "goal": 300000}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "progress", "def.goal": 300000}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_histogram_ranges",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Show how the number of events is spread as a histogram with 20 ranges."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"kind": "histogram"}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "histogram"}, "count": 1}
+    ]
+  },
+  {
+    "id": "chart_bullet_target",
+    "mode": "build",
+    "confirm": true,
+    "turns": ["Add a bullet graph of foreign visitors against a target of 1,000."],
+    "expect_tool": {"name": "create_chart", "args_contains": {"kind": "bullet", "goal": 1000}},
+    "expect_state": [
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "bullet", "def.goal": 1000}, "count": 1}
+    ]
   }
 ]
