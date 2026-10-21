@@ -486,3 +486,132 @@ Also, one line each (no code): the legacy unparseable list becoming
 said "until saved again"; and the deploy note on the feature page — stop old
 API instances before starting this build (an old instance's withdrawal after
 the copy is never copied).
+
+### Handoff — round F (developer, MiniMax M3.1 Flash), 2026-10-21
+
+Branch `fix/pr105-review-fixes`. `origin/main` merged in first as `ffa779c1`
+(the branch was 107 commits behind; the merge was clean, no conflict, and
+`cargo check -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster
+--all-targets` passed on it). Every finding below is one commit, in the
+order the review lists them; the fix site carries the same tag as the
+commit body (rule 13).
+
+| Finding | Commit | What it changes |
+| --- | --- | --- |
+| SHOULD-FIX 1 | `8130ae1d047a` | The store's own `DEFAULT_CLOCK_TOLERANCE_SECS = 60` is gone; the aggregate read keeps every withdrawn id and expiry is applied only when counting toward the cap. `get_board_embed_access_at` goes with it (the read takes no instant and no tolerance any more); `get_board_embed_access` is the read. |
+| SHOULD-FIX 2 | `69134d7846ed` | `withdraw_embed_token` calls `EmbedAccess::withdraw_token` instead of re-implementing its unexpired-then-cap guard. The message the caller gets is unchanged (it is the guard's own). |
+| SHOULD-FIX 3 | `4628713cd720` | One DDL guard for both builds: an `AtomicU8` (not started / done) plus a mutex, with `OnceCell::get_or_try_init`'s contract (one runner, the others wait, a failed attempt is not cached). The `RwLock<bool>` stand-in the test build carried is gone; the test drives the production path and its doc says what it pins. |
+| SHOULD-FIX 4 | `52e0916c8cc0` | The comment in `routes/embed.rs` no longer says the withdrawal is read with a `FINAL` read of the board: it is aggregated from `console.bi_board_embed_event`. |
+| SHOULD-FIX 5 | `ef6f4b0ff5d3` | The comment in `src/proxy.ts` says the answer does not depend on a session: an embed visitor has none and gets the board's allowed sites; `frame-ancestors 'none'` is what a refused token, a board with no allowed site, or an unreachable API gets. |
+| SHOULD-FIX 6 | `b20960c959b9` | `find_run_by_run_key` and `run_logs` name `DgError::Status`; the four sites the finding names that cannot return it now say plainly that the HTTP status is not inspected there. |
+| SHOULD-FIX 7 | `6be750144764` | `revoke_all_embed_tokens` answers the cut-off in force — the maximum over every `revoke_all` event, read back after the insert — not the instant the call wrote. |
+| Doc notes | `de9b92d46c51` | `from_stored` says the fail-closed refusal is permanent; the feature page says to stop the old API instances before starting this build. |
+
+**SHOULD-FIX 1, the two choices the finding offers.** The finding offers
+"drop expired entries only when counting toward the cap, not in the list
+`is_withdrawn` reads" OR "take the tolerance from `lakehouse_embed`". The
+first one is what is built: the aggregate keeps every withdrawn id, so the
+list a refusal reads cannot depend on any tolerance at all, and the one
+tolerance left in the crate is the caller's (the API passes the verifier's,
+`lakehouse_embed::CLOCK_TOLERANCE_SECONDS`, for the cap count). The
+second one would have made `lakehouse-bi` depend on `lakehouse-embed`; the
+module doc of `embed_access.rs` says on purpose that it does not, and the
+first choice needs no new dependency.
+
+**SHOULD-FIX 1, the failing test.** `a_withdrawn_token_is_still_refused_after_it_expires`
+(store.rs). It fails without the fix: with the old expiry filter put back
+(60 s, the constant the store kept) it fails — `1 failed; 0 passed` — and
+with the fix it passes. `aggregate_read_maps_rows_to_embed_access` fails
+with the old filter too (2 withdrawn ids instead of 3), and was updated
+with the rule.
+
+**SHOULD-FIX 6, where the finding is not right against the code.** The
+finding names six `# Errors` sites and says the non-2xx sites return
+`DgError::Status`. Two of the six do: `find_run_by_run_key` (it goes
+through `execute`, which turns a non-2xx into `Status`) and `run_logs`
+(it checks the status itself). The other four — `pipeline_run_pipeline_name`,
+`pipeline_run_status`, `run_steps`, `run_config` — never look at the HTTP
+status: they read the body whatever it is (`lib.rs:2237`, `2278`, `2352`,
+`2388` have no `status` check, unlike `1231`, `2439` and `2509`), so they
+cannot return `Status` today, and naming it there would be false. Their
+docs now say that plainly instead. Turning a non-2xx into a `Status` error
+in those four is a behaviour change the finding did not ask for (it would
+also move them into the API's retry class), so it is left to the planner.
+
+**SHOULD-FIX 7, what the answer is.** The cut-off in force is the maximum
+over every `revoke_all` event of the board. The function reads the
+aggregate back after its own insert and answers
+`max(read, now_unix_seconds)`: the read carries another session's larger
+withdrawal, and `now` is the floor for the event this call just wrote
+(should the read not see it). Test: `a_withdraw_all_answers_the_cut_off_in_force`.
+
+**One thing the finding did not ask for.** The module doc of
+`embed_access.rs` still said the state is kept on the board row and read
+with `FINAL` — the same staleness as SHOULD-FIX 4, in the file the first
+doc note names. It is corrected in `de9b92d46c51` (doc only).
+
+**Commands run, in the foreground, with their counts.** Rust, from `rust/`,
+every cargo command through `/home/shiro/rantai/bin/cargo-locked` with
+`-j 2` (the shared `CARGO_TARGET_DIR`; the tool takes the shared lock
+itself).
+
+| command | commit it ran on | result |
+| --- | --- | --- |
+| `cargo-locked check -j 2 -p lakehouse-bi -p lakehouse-api -p lakehouse-dagster --all-targets` | `ffa779c1` (the merge) | finished, no error |
+| `cargo fmt --check` | every commit | exit 0, no diff |
+| `cargo-locked clippy -j 2 -p lakehouse-bi --all-targets -- -D warnings` | `8130ae1d`, `69134d78`, `4628713c`, `6be75014`, `de9b92d4` | exit 0, no warnings |
+| `cargo-locked clippy -j 2 -p lakehouse-api --all-targets -- -D warnings` | `52e0916c` | exit 0, no warnings |
+| `cargo-locked clippy -j 2 -p lakehouse-dagster --all-targets -- -D warnings` | `b20960c9` | exit 0, no warnings |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib embed` | `8130ae1d`, `69134d78`, `de9b92d4` | `26 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `4628713c` | `434 passed; 0 failed; 3 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `6be75014` | `435 passed; 0 failed; 3 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --lib embed` | `8130ae1d`, `52e0916c` | `11 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens` | `8130ae1d`, `69134d78`, `6be75014` | `21 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-dagster --lib` | `b20960c9` | `72 passed; 0 failed; 0 ignored` |
+| `flock /home/shiro/rantai/.heavy.lock bun run typecheck` | `ef6f4b0f` | exit 0, no output |
+
+The failing-test proof, run on `8130ae1d`'s tree with the fix reverted
+(the old 60 s expiry filter put back): `cargo-locked test -j 2 -p
+lakehouse-bi --lib a_withdrawn_token_is_still_refused_after_it_expires` →
+`0 passed; 1 failed` ("the withdrawn id stays in the list"), and
+`--lib embed` → `25 passed; 1 failed` (the aggregate test). The fix was
+restored before the commit.
+
+**The full verification block, on the final commit `de9b92d46c51`.**
+
+| command | result |
+| --- | --- |
+| `cargo fmt --check` | exit 0, no diff |
+| `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings` | exit 0, no warnings |
+| `cargo-locked test -j 2 -p lakehouse-bi --lib` | `435 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out` |
+| `cargo-locked test -j 2 -p lakehouse-api --test embed_tokens --test sec11_guard --test upstream_errors` | `21 passed` / `4 passed` / `6 passed`; 0 failed in each |
+| `cargo-locked test -j 2 -p lakehouse-api --test route_auth` | `54 passed; 0 failed; 0 ignored` (first run; no `53100`/`UnexpectedEof`/"Connection reset" from the shared test database, so there is nothing to re-run alone) |
+| `cargo-locked test -j 2 -p lakehouse-dagster --lib` | `72 passed; 0 failed; 0 ignored` |
+| `cargo-locked test -j 2 -p lakehouse-api --lib embed` (extra) | `11 passed; 0 failed; 0 ignored` |
+| `flock /home/shiro/rantai/.heavy.lock bun run typecheck` (extra) | exit 0, no output |
+| `git status` | clean, nothing generated staged |
+
+**Not verified, and why.**
+
+- Nothing was run against a live `ClickHouse`. The aggregate query, the
+  three event `INSERT`s, the legacy copy and the new "cut-off in force"
+  read are proven against mocks. SHOULD-FIX 7 adds a read after the
+  insert: against a real `ClickHouse` the just-inserted row is visible at
+  once (a `MergeTree` needs no `FINAL` for that), but that is not run
+  here.
+- `bun run lint` and `bun run test` were not run: the PR changes one
+  TypeScript comment, and the plan's scoped check for `src/proxy.ts` is
+  `bun run typecheck` (green).
+- `cargo test --workspace` and the `ops/g*` gates were not run: this PR
+  touches `lakehouse-bi`, `lakehouse-api`, `lakehouse-dagster` and one
+  TypeScript comment; CI runs the workspace suite and the gates need the
+  whole stack up.
+- No `docker compose` change, so no compose run.
+- `EmbedAccess::from_stored` is now used by its own tests only (the legacy
+  copy has its own reader, `legacy_embed_insert`). It stays `pub`, so
+  there is no dead-code warning; it was left in place because the doc note
+  names it.
+- The `lakehouse-bi` crate no longer holds a clock tolerance of its own,
+  but `lakehouse_embed::CLOCK_TOLERANCE_SECONDS` is still the single
+  tolerance (the API passes it in). Raising it is now safe for the
+  withdrawn list: the list does not expire.
