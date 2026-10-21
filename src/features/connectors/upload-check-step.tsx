@@ -19,6 +19,8 @@ import type { UploadParseOptions, UploadPreview } from "@/services/contracts/upl
 import type { ServiceError } from "@/services/errors"
 import { Refusal, UploadNotice } from "./upload-parts"
 import { UploadPreviewGrid } from "./upload-preview-grid"
+import { UploadBadValuesPanel, UploadColumnsEditor } from "./upload-columns"
+import type { ColumnChoices } from "./use-column-choices"
 
 const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -51,11 +53,16 @@ type Settled = { key: string; preview: UploadPreview | null }
 export function useUploadPreview(uploadId: string | null) {
   const [overrides, setOverrides] = React.useState<Partial<UploadParseOptions>>({})
   const [headerText, setHeaderText] = React.useState<string | null>(null)
-  const key = `${uploadId ?? ""}|${overrides.encoding ?? ""}|${JSON.stringify(overrides.delimiter ?? "")}|${overrides.headerRow ?? ""}|${JSON.stringify(overrides.sheet ?? "")}`
+  // A table the file will be added to: its names and types become the columns' (`DATA-18` decision 9).
+  const [table, setTable] = React.useState<string | null>(null)
+  const key = `${uploadId ?? ""}|${table ?? ""}|${overrides.encoding ?? ""}|${JSON.stringify(overrides.delimiter ?? "")}|${overrides.headerRow ?? ""}|${JSON.stringify(overrides.sheet ?? "")}`
 
   const state = useRefreshable<Settled>(async (signal) => {
     if (uploadId === null) return { key, preview: null }
-    return { key, preview: await uploadService.preview(uploadId, overrides, signal) }
+    return {
+      key,
+      preview: await uploadService.preview(uploadId, table === null ? overrides : { ...overrides, table }, signal),
+    }
   }, key)
 
   const settled = state.data !== null && state.data.key === key ? state.data.preview : null
@@ -98,9 +105,11 @@ export function useUploadPreview(uploadId: string | null) {
       const row = headerRowFromDisplay(text)
       if (row !== null) setOverrides((o) => ({ ...o, headerRow: row }))
     },
+    setTable,
     reset: () => {
       setOverrides({})
       setHeaderText(null)
+      setTable(null)
     },
     /** Only a preview of the settings in force, with at least one column, lets the person go on. */
     ready: settled !== null && settled.columns.length > 0 && headerProblem === null,
@@ -118,7 +127,7 @@ function Detected({ text }: { readonly text: string }) {
  * what the API detected; changing one reads the preview again. A preview
  * with no columns says so and the step's "Next" stays off (`view.ready`).
  */
-export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) {
+export function UploadCheckStep({ view, choices }: { readonly view: UploadPreviewView; readonly choices: ColumnChoices }) {
   const { shown, settled } = view
   // SEC-17: a refusal of the reading itself (400, such as "The file has more
   // than 1,000 columns.") with nothing shown yet keeps the controls on screen,
@@ -155,10 +164,8 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
         // no sheet to pick, no encoding or delimiter to get wrong and no
         // header row to find: the three controls would be decoration.
         <UploadNotice>
-          This is a Parquet file, so there is nothing to choose here: its column names are the header, and every
-          column is loaded as text. Each column shows the type the file declares for it. Numbers are written
-          without a display format (1234.5), a decimal keeps its exact digits (12.50), dates are written as
-          2025-09-24, and a timestamp as 2025-09-24T13:30:00, with a trailing Z when the column is in UTC.
+          This is a Parquet file, so there is nothing to read here: its column names are the header, and each
+          column starts with the type the file declares for it. You can change a name or a type below.
         </UploadNotice>
       ) : (
       <div className={workbook ? "grid gap-4 sm:grid-cols-2" : "grid gap-4 sm:grid-cols-3"}>
@@ -244,9 +251,9 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
       )}
       {workbook ? (
         <UploadNotice>
-          Every column is loaded as text. Numbers are written as the cell holds them, without its display format
-          (1234.5, not 1,234.50). Dates are written as 2025-09-24, with the time (2025-09-24 13:30:00) when the
-          cell has one. A formula loads the result the file stored, and a merged cell only its top-left value.
+          Numbers are read as the cell holds them, without its display format (1234.5, not 1,234.50), and dates as
+          2025-09-24, with the time (2025-09-24 13:30:00) when the cell has one. A formula loads the result the file
+          stored, and a merged cell only its top-left value.
         </UploadNotice>
       ) : null}
 
@@ -271,7 +278,15 @@ export function UploadCheckStep({ view }: { readonly view: UploadPreviewView }) 
             : "The header row has no columns: it is past the part of the file that was read, or it is an empty line. Choose another header row to go on."}
         </p>
       ) : (
-        <UploadPreviewGrid preview={shown} stale={settled === null} />
+        <>
+          <UploadPreviewGrid preview={shown} stale={settled === null} />
+          {settled !== null && choices.columns.length > 0 ? (
+            <>
+              <UploadColumnsEditor choices={choices} sampledRows={settled.sampledRows} />
+              <UploadBadValuesPanel choices={choices} sampledRows={settled.sampledRows} />
+            </>
+          ) : null}
+        </>
       )}
     </div>
   )

@@ -4,6 +4,8 @@ import { join } from "node:path"
 import { test } from "node:test"
 import type { Upload } from "@/services/contracts/uploads"
 import {
+  COLUMN_NAME_RULE,
+  COLUMN_TYPES,
   MAX_FILES,
   MAX_TABLE_NAME_CHARS,
   MAX_UPLOAD_BYTES,
@@ -13,6 +15,10 @@ import {
   UPLOAD_ENCODINGS,
   delimiterLabel,
   encodingLabel,
+  columnListProblems,
+  columnNameProblem,
+  columnSpecOf,
+  columnTypeLabel,
   fileKindProblem,
   fileProblem,
   fileSizeProblem,
@@ -28,6 +34,7 @@ import {
   tableNameProblem,
   uploadFileKind,
   uploadFileLabel,
+  withColumnType,
 } from "./uploads"
 
 test("MAX_UPLOAD_BYTES is the API's cap, 50 MiB", () => {
@@ -445,4 +452,90 @@ test("planPick counts the 50 MB of one upload over all its files, and a refused 
   assert.equal(candidates[0].problem, null, "exactly the limit in all")
   assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 50 MB limit for one upload/)
   assert.match(candidates[2].problem ?? "", /c\.csv would bring the files/)
+})
+
+// ── column types (DATA-18) ────────────────────────────────────────────────
+
+test("a typed column name follows the API's rule, word for word", () => {
+  for (const ok of ["a", "qty", "order_id", "a1_b2", "x".repeat(128)]) assert.equal(columnNameProblem(ok), null, ok)
+  for (const bad of ["", "Qty", "1a", "a__b", "a_", "_a", "a-b", "a b", "_dlt_x", "x".repeat(129)]) {
+    assert.equal(columnNameProblem(bad), COLUMN_NAME_RULE, JSON.stringify(bad))
+  }
+  assert.match(COLUMN_NAME_RULE, /joined by single underscores/)
+})
+
+test("the six types are offered in the API's order, and a float is named as it comes from the file", () => {
+  assert.deepEqual(COLUMN_TYPES.map((t) => t.value), ["text", "integer", "decimal", "boolean", "date", "timestamp"])
+  assert.equal(columnTypeLabel("float"), "Floating point (from the file)")
+  assert.equal(columnTypeLabel("integer"), "Integer")
+})
+
+const column = (over: Partial<Parameters<typeof columnSpecOf>[0]> = {}) => ({
+  source: "Qty",
+  name: "qty",
+  type: "text" as const,
+  guessedType: "text" as const,
+  askDateOrder: false,
+  ...over,
+})
+
+test("a list is stopped by a bad or repeated name and by a date reading nobody has answered", () => {
+  assert.deepEqual(columnListProblems([column(), column({ name: "other" })]), [])
+  assert.deepEqual(columnListProblems([column({ name: "Bad Name" })]), [COLUMN_NAME_RULE])
+  assert.deepEqual(columnListProblems([column(), column()]), [COLUMN_NAME_RULE])
+  const asked = columnListProblems([column({ name: "due", type: "date" })])
+  assert.equal(asked.length, 1)
+  assert.match(asked[0], /day first or month first/)
+  assert.deepEqual(columnListProblems([column({ name: "due", type: "date", dateFormat: "dmy" })]), [])
+})
+
+test("what goes to the API keeps the reading only where there is one, and a timestamp always says its zone", () => {
+  assert.deepEqual(columnSpecOf(column({ type: "integer", dateFormat: "iso", timezone: true })), {
+    source: "Qty",
+    name: "qty",
+    type: "integer",
+  })
+  assert.deepEqual(columnSpecOf(column({ type: "date", dateFormat: "mdy" })), {
+    source: "Qty",
+    name: "qty",
+    type: "date",
+    dateFormat: "mdy",
+  })
+  assert.deepEqual(columnSpecOf(column({ type: "timestamp", dateFormat: "iso" })), {
+    source: "Qty",
+    name: "qty",
+    type: "timestamp",
+    dateFormat: "iso",
+    timezone: false,
+  })
+})
+
+test("changing a column's type sheds the reading and zone it no longer has, and starts a date with none chosen", () => {
+  const stamp = column({ type: "timestamp", dateFormat: "dmy", timezone: true })
+  const asInteger = withColumnType(stamp, "integer")
+  assert.equal(asInteger.dateFormat, undefined)
+  assert.equal(asInteger.timezone, undefined)
+  const asDate = withColumnType(column(), "date")
+  assert.equal(asDate.dateFormat, undefined, "a person says how it is read")
+  assert.equal(withColumnType(stamp, "date").dateFormat, "dmy", "a reading already chosen is kept")
+})
+
+test("a retry sends back the columns and the choice the failed load was told", () => {
+  const upload = {
+    id: "up-1",
+    originalFilename: "a.csv",
+    sizeBytes: 1,
+    uploadedBy: "Ana",
+    status: "failed",
+    createdAt: "",
+    updatedAt: "",
+    parseOptions: { encoding: "utf-8" as const, delimiter: ",", headerRow: 0 },
+    bronzeTable: "t",
+    columns: [{ source: "Qty", name: "qty", type: "integer" as const }],
+    onBadValue: "stop" as const,
+  }
+  const input = retryInput(upload)
+  assert.deepEqual(input?.columns, upload.columns)
+  assert.equal(input?.onBadValue, "stop")
+  assert.equal("columns" in (retryInput({ ...upload, columns: undefined, onBadValue: undefined }) ?? {}), false)
 })

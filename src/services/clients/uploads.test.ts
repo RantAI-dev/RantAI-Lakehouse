@@ -172,6 +172,32 @@ describe("uploadService requests", () => {
     expect(err.message).toBe("Some pieces have not arrived: 2.")
   })
 
+  it("checks a column list: the reading in force and the columns, as JSON, stored by nobody", async () => {
+    const calls = stubFetch(() => json({ sampledRows: 3, count: 1, byColumn: [{ column: "qty", count: 1 }], rows: [{ row: 2, column: "qty", value: "abc" }] }))
+    const columns = [{ source: "Qty", name: "qty", type: "integer" as const }]
+    const result = await uploadService.check("up-1", { options: { encoding: "utf-8", delimiter: "\t", headerRow: 2 }, columns })
+    expect(result.count).toBe(1)
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up-1/check")
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(init.body as string)).toEqual({ encoding: "utf-8", delimiter: "\t", headerRow: 2, columns })
+    await uploadService.check("up-1", { columns })
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual({ columns })
+  })
+
+  it("shows the API's sentence when a column list is refused by the check", async () => {
+    stubFetch(() => json({ error: "The column list has 1 columns but the file has 2." }, 400))
+    const err = await rejection(uploadService.check("up-1", { columns: [] }))
+    expect(err.status).toBe(400)
+    expect(err.message).toBe("The column list has 1 columns but the file has 2.")
+  })
+
+  it("asks for a preview of the columns of a table the file will be added to", async () => {
+    const calls = stubFetch(() => json({}))
+    await uploadService.preview("up-1", { headerRow: 0, table: "stock_raw" })
+    expect(calls[0]!.url).toBe("/api/uploads/up-1/preview?headerRow=0&table=stock_raw")
+  })
+
   it("asks for a preview with no query when nothing is overridden", async () => {
     const calls = stubFetch(() => json({}))
     await uploadService.preview("up-1")

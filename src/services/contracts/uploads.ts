@@ -19,6 +19,54 @@
 export type UploadStatus = "receiving" | "uploaded" | "ingesting" | "ingested" | "failed" | string
 
 /**
+ * A column's type (`DATA-18`, decision 2): the six a person chooses among, and
+ * `float`, which only a file that carries one (Parquet) starts with, shown as
+ * "Floating point (from the file)" (decision 10). Mirrors Rust `ColumnType`
+ * (`lakehouse-api/src/upload_types.rs`).
+ */
+export type UploadColumnType = "text" | "integer" | "decimal" | "boolean" | "date" | "timestamp" | "float"
+
+/** How a date is read: ISO `2026-10-16`, day first `16/10/2026`, or month first `10/16/2026`. */
+export type UploadDateFormat = "iso" | "dmy" | "mdy"
+
+/**
+ * One column of a load as a person confirmed it (`columns` of the ingest body and
+ * of the check). `source` is the file's own name for it, for display; the load
+ * matches columns by position. `dateFormat` is required for `date` and
+ * `timestamp` and refused for the others; `timezone` is required for `timestamp`
+ * (whether its values carry a zone and are stored as instants in UTC) and
+ * refused for the others.
+ */
+export type UploadColumnSpec = {
+  source: string
+  name: string
+  type: UploadColumnType
+  dateFormat?: UploadDateFormat
+  timezone?: boolean
+}
+
+/** A column of a preview: a spec, what the guess said, and the question a date may need. */
+export type UploadPreviewColumn = UploadColumnSpec & {
+  /** The type the guess (or the file's own type) gave; `type` differs when the table decides. */
+  guessedType: UploadColumnType
+  /** Every sampled value could be read day first or month first: Load stays off until `dateFormat` is chosen. */
+  askDateOrder: boolean
+}
+
+/** What the guess found wrong with the values of a column list: all counted, the first 100 listed (decision 6). */
+export type UploadBadValues = {
+  count: number
+  byColumn: { column: string; count: number }[]
+  rows: { row: number; column: string; value: string }[]
+}
+
+/** `POST /api/uploads/{id}/check`'s response: how many rows were read, and the values that do not fit. */
+export type UploadCheck = UploadBadValues & { sampledRows: number }
+
+/** What to do with a value that does not fit: `stop` the load (pre-selected) or load it as empty (`null`). */
+export type UploadOnBadValue = "null" | "stop"
+
+/**
  * What a load does with the rows a table already holds: `replace` swaps them
  * for the file's, `append` adds the file's after them. Mirrors Rust
  * `LoadMode` in `lakehouse-store/src/uploads.rs` (an upload has these two;
@@ -116,6 +164,12 @@ export type Upload = {
   updatedAt: string
   /** What the last load was told to use. Absent until a load was requested. */
   parseOptions?: UploadParseOptions
+  /** The column list the last load was told; absent for a load with no list (every column text). */
+  columns?: UploadColumnSpec[]
+  /** What the last load did with a value that does not fit; set when `columns` is. */
+  onBadValue?: UploadOnBadValue
+  /** The values the last load found that did not fit its column's type; absent when none. */
+  badValues?: UploadBadValues
   /** The raw table the last load targeted. */
   bronzeTable?: string
   loadMode?: UploadLoadMode | string
@@ -218,6 +272,12 @@ export type UploadPreview = {
    * names (row 1), and none of the three settings is the person's to choose.
    */
   parquet?: UploadParquet
+  /** Every column with its name, starting type and date reading (`DATA-18`). */
+  columnSpecs: UploadPreviewColumn[]
+  /** How many data rows the guess read (at most 10,000, or 16 MiB). */
+  sampledRows: number
+  /** The names and types are those of the table the file will be added to, not a guess. */
+  fromTable?: boolean
 }
 
 /**
@@ -229,6 +289,10 @@ export type IngestUploadInput = UploadParseOptions & {
   bronzeTable: string
   /** `replace` when absent. */
   mode?: UploadLoadMode
+  /** The columns as confirmed; with `onBadValue`. Left out, every column is loaded as text. */
+  columns?: UploadColumnSpec[]
+  /** Required with `columns`, refused without. */
+  onBadValue?: UploadOnBadValue
 }
 
 /** `POST /api/uploads/{id}/ingest`'s response: the upload, now `ingesting`, and the run carrying the load out. */
@@ -286,9 +350,18 @@ export interface UploadService {
    */
   preview(
     id: string,
-    options?: Partial<UploadParseOptions>,
+    options?: Partial<UploadParseOptions> & { table?: string },
     signal?: AbortSignal
   ): Promise<UploadPreview>
+  /**
+   * `POST /api/uploads/{id}/check`: applies a column list to the sample and lists
+   * the values that do not fit. Stores nothing. The reading is the one in force.
+   */
+  check(
+    id: string,
+    input: { options?: Partial<UploadParseOptions>; columns: UploadColumnSpec[] },
+    signal?: AbortSignal
+  ): Promise<UploadCheck>
   /** `POST /api/uploads/{id}/ingest`: starts the load. 409 for a table the upload may not load into. */
   ingest(id: string, input: IngestUploadInput, signal?: AbortSignal): Promise<IngestUploadResponse>
   /** `DELETE /api/uploads/{id}` (204): removes the file and its entry. Never the table. 409 while loading. */

@@ -17,7 +17,9 @@ import { DuplicateNotice, LoadFailure } from "./upload-parts"
 import { UploadReviewStep } from "./upload-review-step"
 import { UploadRunView } from "./upload-run-view"
 import { UploadTableStep } from "./upload-table-step"
+import { useColumnChoices } from "./use-column-choices"
 import { useUploadQueue } from "./use-upload-queue"
+import { columnSpecOf } from "@/lib/uploads"
 
 const STEPS: FormStep[] = [
   { id: "file", label: "File", description: "Choose CSV, TSV, Excel or Parquet files" },
@@ -68,6 +70,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const [mode, setMode] = React.useState<UploadLoadMode>("replace")
 
   const view = useUploadPreview(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null)
+  const choices = useColumnChoices(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null, view)
   // The tenant's uploads, to know whether the table named was created by one
   // (only then is there a choice to make). If the list cannot be read, no
   // choice is offered and the load replaces, as it does for a new table.
@@ -82,6 +85,11 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const offersMode = uploads.status === "success" && isUploadedTable(tableName, uploads.data)
   const effectiveMode: UploadLoadMode = offersMode ? mode : "replace"
   const nameProblem = tableName === "" ? null : tableNameProblem(tableName)
+  // Adding to a table that exists: its names and types are the columns' (`DATA-18` decision 9).
+  const { setTable } = view
+  React.useEffect(() => {
+    setTable(offersMode && effectiveMode === "append" ? tableName : null)
+  }, [offersMode, effectiveMode, tableName, setTable])
 
   function reset() {
     setUpload(null)
@@ -126,6 +134,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       ...(sheet !== undefined ? { sheet } : {}),
       bronzeTable: tableName,
       mode: effectiveMode,
+      // `DATA-18`: the columns as chosen, with what to do with a value that does not fit.
+      ...(choices.columns.length > 0 ? { columns: choices.columns.map(columnSpecOf), onBadValue: choices.onBadValue } : {}),
     })
     if (started !== null) setRun(started.upload)
   }
@@ -149,10 +159,10 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     step === FILE_STEP
       ? upload !== null || primary?.state === "received"
       : step === CHECK_STEP
-        ? view.ready
+        ? view.ready && choices.ready
         : step === TABLE_STEP
           ? tableName !== "" && nameProblem === null
-          : view.ready && tableName !== "" && nameProblem === null
+          : view.ready && choices.ready && tableName !== "" && nameProblem === null
 
   // The files after the first are not part of this load (a later slice lets
   // one load take several): say where they go, and that they need the page.
@@ -213,7 +223,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           onChooseAnother={reset}
         />
       ) : null}
-      {step === CHECK_STEP ? <UploadCheckStep view={view} /> : null}
+      {step === CHECK_STEP ? <UploadCheckStep view={view} choices={choices} /> : null}
       {step === TABLE_STEP ? (
         <UploadTableStep
           tableName={tableName}
@@ -230,6 +240,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           tableName={tableName}
           offersMode={offersMode}
           mode={effectiveMode}
+          columns={choices.columns}
+          onBadValue={choices.onBadValue}
           error={ingest.error}
         />
       ) : null}

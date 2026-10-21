@@ -1,5 +1,6 @@
 import type {
   CreateUploadResponse,
+  UploadCheck,
   IngestUploadInput,
   IngestUploadResponse,
   Upload,
@@ -131,14 +132,32 @@ export const uploadService: UploadService = {
     // A parameter that is sent must be valid (the API refuses an empty one
     // rather than detect), so only what the caller chose is sent.
     const query = new URLSearchParams()
-    const chosen: Partial<UploadParseOptions> = options ?? {}
+    const chosen: Partial<UploadParseOptions> & { table?: string } = options ?? {}
     if (chosen.encoding !== undefined) query.set("encoding", chosen.encoding)
     if (chosen.delimiter !== undefined) query.set("delimiter", chosen.delimiter)
     if (chosen.headerRow !== undefined) query.set("headerRow", String(chosen.headerRow))
     if (chosen.sheet !== undefined) query.set("sheet", chosen.sheet)
+    if (chosen.table !== undefined) query.set("table", chosen.table)
     const text = query.toString()
     return readJson<UploadPreview>(
       await apiFetch(uploadUrl(id, `/preview${text === "" ? "" : `?${text}`}`), { signal })
+    )
+  },
+  async check(id, input, signal) {
+    const options = input.options ?? {}
+    return readJson<UploadCheck>(
+      await apiFetch(uploadUrl(id, "/check"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(options.encoding !== undefined ? { encoding: options.encoding } : {}),
+          ...(options.delimiter !== undefined ? { delimiter: options.delimiter } : {}),
+          ...(options.headerRow !== undefined ? { headerRow: options.headerRow } : {}),
+          ...(options.sheet !== undefined ? { sheet: options.sheet } : {}),
+          columns: input.columns,
+        }),
+        signal,
+      })
     )
   },
   async ingest(id, input: IngestUploadInput, signal) {

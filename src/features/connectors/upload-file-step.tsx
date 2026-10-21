@@ -23,7 +23,7 @@ const FACTS: readonly { label: string; value: string }[] = [
   { label: "Size", value: "Up to 50 MB in all" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, archives" },
   { label: "Workbooks", value: "One sheet is loaded, chosen on the next step" },
-  { label: "Parquet", value: "Every column is loaded as text; a file with a binary or nested column is refused" },
+  { label: "Parquet", value: "Each column starts with the type the file declares; a file with a binary or nested column is refused" },
 ]
 
 /**

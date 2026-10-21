@@ -12,6 +12,7 @@ import { rawTableFullName, retryInput } from "@/lib/uploads"
 import { uploadService } from "@/services"
 import type { Upload } from "@/services/contracts/uploads"
 import { FileMark, LoadFailure, Refusal, UploadStatusPill } from "./upload-parts"
+import { BadValuesList } from "./upload-columns"
 
 /** How often the upload is read again after "Load", while it is loading. */
 const POLL_MS = 2000
@@ -137,6 +138,7 @@ export function UploadRunView({
                 </HealthTile>
               ) : null}
             </div>
+            {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
             <div className="flex flex-wrap gap-2">
               {upload.assetId !== undefined ? (
                 <Button size="sm" render={<Link href={`/data/assets/${encodeURIComponent(upload.assetId)}`} />}>
@@ -156,6 +158,7 @@ export function UploadRunView({
               <p className="mb-1 text-sm font-medium">The load{table ? ` into ${table}` : ""} failed.</p>
               <LoadFailure upload={upload} />
             </div>
+            {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
             {retry.error !== null ? <Refusal error={retry.error} /> : null}
             <div className="flex flex-wrap gap-2">
               <Button size="sm" disabled={input === null || retry.status === "pending"} onClick={tryAgain}>
@@ -180,5 +183,25 @@ export function UploadRunView({
         ) : null}
       </div>
     </SectionCard>
+  )
+}
+
+/**
+ * What the load found that did not fit its column's type (`DATA-18` decision 6):
+ * the count and the first 100. A load told to stop wrote nothing; one told to load
+ * them as empty wrote those cells as empty.
+ */
+function BadValuesReport({ upload }: { readonly upload: Upload }) {
+  const bad = upload.badValues
+  if (bad === undefined) return null
+  const stopped = upload.status === "failed"
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-muted/30 p-3" aria-label="Values that did not fit">
+      <p className="text-sm font-medium">
+        {formatNumber(bad.count)} {bad.count === 1 ? "value" : "values"} did not fit their column&apos;s type.{" "}
+        {stopped ? "The load stopped and wrote nothing." : "They were loaded as empty."}
+      </p>
+      <BadValuesList bad={bad} />
+    </div>
   )
 }

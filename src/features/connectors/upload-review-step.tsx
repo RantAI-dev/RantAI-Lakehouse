@@ -3,10 +3,12 @@
 import * as React from "react"
 import { MetadataList, type MetadataItem } from "@/components/patterns/metadata-list"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
-import type { Upload, UploadLoadMode } from "@/services/contracts/uploads"
+import { columnTypeLabel, delimiterLabel, encodingLabel, headerRowDisplay, rawTableFullName } from "@/lib/uploads"
+import type { Upload, UploadLoadMode, UploadOnBadValue, UploadPreviewColumn } from "@/services/contracts/uploads"
 import type { UploadPreviewView } from "./upload-check-step"
 import { Refusal } from "./upload-parts"
+
+const DATE_WORDS = { iso: "year first", dmy: "day first", mdy: "month first" } as const
 
 function Group({ title, items }: { readonly title: string; readonly items: MetadataItem[] }) {
   return (
@@ -36,6 +38,8 @@ export function UploadReviewStep({
   tableName,
   offersMode,
   mode,
+  columns,
+  onBadValue,
   error,
 }: {
   readonly upload: Upload
@@ -45,6 +49,10 @@ export function UploadReviewStep({
   readonly offersMode: boolean
   /** The mode that will be sent (`replace` unless the choice was offered and made). */
   readonly mode: UploadLoadMode
+  /** The columns as chosen: names and types. */
+  readonly columns: readonly UploadPreviewColumn[]
+  /** What happens to a value that does not fit. */
+  readonly onBadValue: UploadOnBadValue
   readonly error: React.ComponentProps<typeof Refusal>["error"] | null
 }) {
   const { settled } = view
@@ -94,14 +102,28 @@ export function UploadReviewStep({
             ...(offersMode
               ? [{ label: "Rows already in it", value: mode === "append" ? "Add to its rows" : "Replace its rows" }]
               : []),
-            { label: "Column types", value: "Text" },
+          ]}
+        />
+        <Group
+          title="Columns"
+          items={[
+            ...columns.map((column, index) => ({
+              label: column.name || `Column ${index + 1}`,
+              value: (
+                <Wrapped>
+                  {columnTypeLabel(column.type)}
+                  {column.dateFormat !== undefined ? `, read ${DATE_WORDS[column.dateFormat]}` : ""}
+                </Wrapped>
+              ),
+            })),
+            { label: "A value that does not fit", value: onBadValue === "stop" ? "Stops the load" : "Is loaded as empty" },
           ]}
         />
       </div>
       <p className="text-sm text-muted-foreground">
         Load reads <span className="break-words font-medium text-foreground">{upload.originalFilename}</span> with these
-        settings and writes its rows to <span className="break-all font-mono text-foreground">{full}</span>, every column as
-        text. {rowsSentence} You can follow it on the next page.
+        settings and writes its rows to <span className="break-all font-mono text-foreground">{full}</span>, each column with the
+        type listed above. {rowsSentence} You can follow it on the next page.
       </p>
       {error !== null ? <Refusal error={error} /> : null}
     </div>

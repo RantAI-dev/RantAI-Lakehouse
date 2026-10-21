@@ -14,7 +14,11 @@ import type { Candidate } from "@/lib/upload-queue"
 import type {
   IngestUploadInput,
   Upload,
+  UploadColumnSpec,
+  UploadColumnType,
+  UploadDateFormat,
   UploadEncoding,
+  UploadPreviewColumn,
   UploadStatus,
 } from "@/services/contracts/uploads"
 
@@ -320,7 +324,13 @@ export function retryInput(upload: Upload): IngestUploadInput | null {
       : upload.loadMode === "append"
         ? "append"
         : "replace"
-  return { ...parseOptions, bronzeTable, mode }
+  // `DATA-18`: what the load was told about the columns goes back with it, or a retry
+  // would load everything as text.
+  const withColumns =
+    upload.columns !== undefined && upload.onBadValue !== undefined
+      ? { columns: upload.columns, onBadValue: upload.onBadValue }
+      : {}
+  return { ...parseOptions, bronzeTable, mode, ...withColumns }
 }
 
 /**
@@ -364,4 +374,83 @@ export function uploadFileLabel(name: string): string | null {
   const extension = extensionOf(name)
   if (extension === "" || extension.length > MAX_LABEL_CHARS || !/^[a-z0-9]+$/.test(extension)) return null
   return extension.toUpperCase()
+}
+
+// ── Column types (`DATA-18`) ──────────────────────────────────────────────
+
+/** The six types a person chooses among (decision 2), in the order the select lists them. */
+export const COLUMN_TYPES: readonly { value: UploadColumnType; label: string }[] = [
+  { value: "text", label: "Text" },
+  { value: "integer", label: "Integer" },
+  { value: "decimal", label: "Decimal" },
+  { value: "boolean", label: "Boolean" },
+  { value: "date", label: "Date" },
+  { value: "timestamp", label: "Timestamp" },
+]
+
+/** A type on screen. `float` only comes from a file that carries one (decision 10). */
+export function columnTypeLabel(type: UploadColumnType): string {
+  if (type === "float") return "Floating point (from the file)"
+  return COLUMN_TYPES.find((t) => t.value === type)?.label ?? type
+}
+
+/** How a date is read, as the select lists it. */
+export const DATE_FORMATS: readonly { value: UploadDateFormat; label: string }[] = [
+  { value: "iso", label: "Year first (2026-10-16)" },
+  { value: "dmy", label: "Day first (16/10/2026)" },
+  { value: "mdy", label: "Month first (10/16/2026)" },
+]
+
+/** The API's sentence for a column name that breaks the rule (`NAME_RULE` in `upload_types.rs`). */
+export const COLUMN_NAME_RULE =
+  "Column names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters, and each name is used once."
+
+const COLUMN_NAME = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/
+
+/** Why a typed column name is refused, or `null`: the API's rule, which this repeats so the person is told while typing. */
+export function columnNameProblem(name: string): string | null {
+  return COLUMN_NAME.test(name) && name.length <= 128 && !name.startsWith("_dlt") ? null : COLUMN_NAME_RULE
+}
+
+/**
+ * What stops a column list from being loaded, as sentences: a name that breaks the
+ * rule or is used twice, and a date or timestamp whose reading is still a question
+ * ("day first or month first?", decision 4). Empty when the list may go on.
+ */
+export function columnListProblems(columns: readonly UploadPreviewColumn[]): string[] {
+  const problems: string[] = []
+  const seen = new Set<string>()
+  for (const column of columns) {
+    if (columnNameProblem(column.name) !== null) problems.push(COLUMN_NAME_RULE)
+    else if (seen.has(column.name)) problems.push(COLUMN_NAME_RULE)
+    seen.add(column.name)
+    if ((column.type === "date" || column.type === "timestamp") && column.dateFormat === undefined) {
+      problems.push(`Say how the dates of ${column.name || column.source} are read: day first or month first.`)
+    }
+  }
+  return [...new Set(problems)]
+}
+
+/** What goes to the API for a column: the spec, without what the screen keeps for itself. */
+export function columnSpecOf(column: UploadPreviewColumn): UploadColumnSpec {
+  const dated = column.type === "date" || column.type === "timestamp"
+  return {
+    source: column.source,
+    name: column.name,
+    type: column.type,
+    ...(dated && column.dateFormat !== undefined ? { dateFormat: column.dateFormat } : {}),
+    ...(column.type === "timestamp" ? { timezone: column.timezone ?? false } : {}),
+  }
+}
+
+/** The column as it is after a change of type: a type that has no date reading or zone sheds them, one that has takes the guess's or a default. */
+export function withColumnType(column: UploadPreviewColumn, type: UploadColumnType): UploadPreviewColumn {
+  const dated = type === "date" || type === "timestamp"
+  const { dateFormat, timezone, ...rest } = column
+  return {
+    ...rest,
+    type,
+    ...(dated ? { dateFormat: dateFormat ?? undefined } : {}),
+    ...(type === "timestamp" ? { timezone: timezone ?? false } : {}),
+  }
 }
