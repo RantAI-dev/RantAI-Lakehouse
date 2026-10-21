@@ -1245,3 +1245,27 @@ vendor list: `g6-saas-a` (HubSpot, Zendesk, Salesforce, GA4, ServiceNow) and
 are in `ci-required` and `scripts/ci/required_gate.sh` (with its test),
 `docs/CI.md`, and slice 7's `coverage.json` names the job each type is
 proven in. No step is removed to fit the budget.
+
+### Review of slice 6 (planner, 2026-10-21, head `26ada479`)
+
+Read: the handoff, the gate split, both vendor modules, the probe arms, the
+NetSuite assertion, the Workday host rule. Accepted: the split exactly as
+amended AD9 (both jobs required, no step removed); PS256/ES256 for NetSuite
+per Oracle's page; the optional `certificateId` (NetSuite's `kid`, not part
+of the identity); per-vendor request timeouts; empty keys for objects read
+in full; the Workday connection test running the first named report (the
+connector page must say a test runs one report at the vendor).
+
+- **Decision 9 not met for NetSuite** (no SuiteQL column listing exists):
+  reported, not lowered. NetSuite's schema changes are seen after the load,
+  stated on the page; it is listed under "Spec targets this feature does not
+  meet" as well, and told to the product owner. NetSuite stays unsupported
+  (decision 10), so nothing ships with it.
+- `SHOULD-FIX 15`. The Workday host rule accepts one label under
+  `workday.com` or `myworkday.com`; Workday tenants are also reached on
+  multi-label hosts under those domains. Accept up to three DNS labels
+  under the two fixed suffixes, each label validated, never another suffix;
+  tests both ways. (Unverified against Workday's own pages, which are not
+  readable from here; `SRC-3-AC1` on a real tenant decides.)
+- Not verified and open for CI: the two gate jobs and their times, the four
+  new product entries, the `ingest_spec.rs` tests.
