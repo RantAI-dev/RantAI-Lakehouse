@@ -160,6 +160,21 @@ async fn access_token(
                     )
                     .await
                 }
+                // Slice 2 review BLOCKER 3 (`client_secret_post_json`): as `Post`, a JSON body.
+                ClientAuth::PostJson => {
+                    connector_oauth::token_request_json(
+                        &request.token_url,
+                        &[
+                            form[0],
+                            form[1],
+                            ("client_id", client_id),
+                            ("client_secret", client_secret.expose_secret()),
+                        ],
+                        internal_hosts,
+                        oauth,
+                    )
+                    .await
+                }
                 // `SRC-3` AD8: the client is in the header, not the body.
                 ClientAuth::Basic => {
                     connector_oauth::token_request_basic(

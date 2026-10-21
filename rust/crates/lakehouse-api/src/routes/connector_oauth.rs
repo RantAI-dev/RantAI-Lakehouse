@@ -469,6 +469,20 @@ async fn finish_sign_in(
             )
             .await
         }
+        // Slice 2 review BLOCKER 3 (`client_secret_post_json`): the same fields as
+        // `Post`, as a JSON body (Zendesk's token endpoint requires it).
+        ClientAuth::PostJson => {
+            let mut form = exchange.to_vec();
+            form.push(("client_id", app.client_id.as_str()));
+            form.push(("client_secret", client_secret.expose_secret()));
+            connector_oauth::token_request_json(
+                &app.token_url,
+                &form,
+                &internal_hosts,
+                state.config.oauth_settings(),
+            )
+            .await
+        }
         // `SRC-3` AD8: the client is in the header, not the body.
         ClientAuth::Basic => {
             connector_oauth::token_request_basic(
@@ -777,7 +791,7 @@ mod tests {
         assert_eq!(app.token_url, "https://acme.zendesk.com/oauth/tokens");
         assert_eq!(app.revocation_url, None);
         assert_eq!(app.scopes, ["read"]);
-        assert_eq!(app.client_auth, ClientAuth::Post);
+        assert_eq!(app.client_auth, ClientAuth::PostJson);
 
         let sf = app_of(&info("saas", oauth_dial("salesforce", "acme"))).unwrap();
         assert_eq!(

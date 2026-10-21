@@ -30,7 +30,7 @@ export type SaasVendor = {
     tokenUrl: string
     revocationUrl: string | null
     scopes: readonly string[]
-    clientAuth: "post" | "basic"
+    clientAuth: "post" | "basic" | "post_json"
   }
   /** The integration credential, when the vendor offers one (Salesforce does not: decision 4). */
   integration: { secretKey: string; secretFields: readonly string[] } | null
@@ -205,7 +205,7 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
       "scopes": [
         "read"
       ],
-      "clientAuth": "post"
+      "clientAuth": "post_json"
     },
     "integration": {
       "secretKey": "integration:zendesk",

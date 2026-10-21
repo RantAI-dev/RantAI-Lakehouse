@@ -17,8 +17,9 @@
 
 Pages are capped at `STATE.page_cap` (3) however large `per_page` is, so a handful of
 records shows the paging. Credentials are placeholders: an e-mail and an API token that
-are only strings here. Zendesk's browser sign-in is NOT mocked: the product cannot do it
-yet (plan section 11, slice 2 handoff).
+are only strings here. The browser sign-in is mocked at `POST /oauth/tokens`, which like
+Zendesk's takes a JSON body (a form body is refused with 400, as the real endpoint would
+fail it) and rotates the refresh token: the old one stops working.
 """
 from __future__ import annotations
 
@@ -32,6 +33,8 @@ import saas_stub as stub
 EMAIL = "agent@example.invalid"
 API_TOKEN = "stub-api-token"
 USER_ID = 7
+CLIENT_ID = "stub-client"
+CLIENT_SECRET = "stub-client-secret"
 
 
 def _iso(ts: int) -> str:
@@ -61,6 +64,8 @@ class State:
         self.users = [{"id": i, "name": f"user {i}", "updated_at": _iso(base + 100 * i), "generated_timestamp": base + 100 * i} for i in range(1, 5)]
         self.groups = [{"id": i, "name": f"group {i}"} for i in range(1, 8)]
         self.revoked = False
+        self.refresh_token = "stub-zd-refresh-0"
+        self.rotations = 0
         self.forbidden = False
         self.rate_limits_left = 0
         self.extra_field: str | None = None
@@ -79,7 +84,8 @@ def _gate(handler, parsed) -> bool:  # noqa: ANN001
     expected = "Basic " + base64.b64encode(f"{EMAIL}/token:{API_TOKEN}".encode()).decode()
     with stub.STATE_LOCK:
         STATE.log.append(f"{handler.command} {parsed.path}")
-        if STATE.revoked or handler.headers.get("Authorization") != expected:
+        bearer = f"Bearer stub-zd-access-{STATE.rotations}"
+        if STATE.revoked or handler.headers.get("Authorization") not in (expected, bearer):
             stub.send_json(handler, _words("Couldn't authenticate you"), 401)
             return False
         if STATE.forbidden:
@@ -163,6 +169,33 @@ def _groups(handler, parsed) -> None:  # noqa: ANN001
     stub.send_json(handler, body)
 
 
+def _token(handler, parsed) -> None:  # noqa: ANN001
+    """`POST /oauth/tokens`, the refresh grant. JSON in, as Zendesk requires; each refresh
+    issues a new access and refresh token and retires the old ones."""
+    with stub.STATE_LOCK:
+        STATE.log.append(f"POST {parsed.path}")
+    body = None
+    if "application/json" in (handler.headers.get("Content-Type") or ""):
+        try:
+            body = stub.read_json(handler)
+        except ValueError:
+            body = None
+    else:
+        stub.read_body(handler)
+    with stub.STATE_LOCK:
+        ok = (
+            isinstance(body, dict) and not STATE.revoked and body.get("grant_type") == "refresh_token"
+            and body.get("refresh_token") == STATE.refresh_token
+            and body.get("client_id") == CLIENT_ID and body.get("client_secret") == CLIENT_SECRET
+        )  # fmt: skip
+        if not ok:
+            return stub.send_json(handler, {"error": "invalid_grant", "error_description": "STUB-VENDOR-WORDS"}, 400)
+        STATE.rotations += 1
+        STATE.refresh_token = f"stub-zd-refresh-{STATE.rotations}"
+        out = {"access_token": f"stub-zd-access-{STATE.rotations}", "refresh_token": STATE.refresh_token, "expires_in": 1800, "scope": "read", "token_type": "bearer"}
+    stub.send_json(handler, out)
+
+
 def _admin(handler, parsed) -> None:  # noqa: ANN001
     """The gate's remote control over the mock's state; not a Zendesk route."""
     if handler.command == "GET":
@@ -182,6 +215,8 @@ def _admin(handler, parsed) -> None:  # noqa: ANN001
         elif action == "delete":  # a delete at Zendesk: the ticket stays, with status deleted
             ts = int(time.time()) - int(body.get("age_seconds", 120))
             STATE.tickets = [_ticket(t["id"], ts, status="deleted") if t["id"] == int(body["id"]) else t for t in STATE.tickets]
+        elif action == "refresh_token":  # tell the gate which refresh token is current
+            return stub.send_json(handler, {"refresh_token": STATE.refresh_token})
         elif action == "add_field":
             STATE.extra_field = body["name"]
         elif action == "revoke":
@@ -201,5 +236,6 @@ stub.ROUTES[("GET", "/zendesk/api/v2/incremental/ticket_events.json")] = _time_b
 stub.ROUTES[("GET", "/zendesk/api/v2/incremental/tickets/cursor.json")] = _cursor_based("tickets")
 stub.ROUTES[("GET", "/zendesk/api/v2/incremental/users/cursor.json")] = _cursor_based("users")
 stub.ROUTES[("GET", "/zendesk/api/v2/groups.json")] = _groups
+stub.ROUTES[("POST", "/zendesk/oauth/tokens")] = _token
 stub.ROUTES[("GET", "/__admin/zendesk")] = _admin
 stub.ROUTES[("POST", "/__admin/zendesk")] = _admin

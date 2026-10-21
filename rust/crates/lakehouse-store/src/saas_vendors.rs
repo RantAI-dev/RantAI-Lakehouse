@@ -59,6 +59,10 @@ pub enum ClientAuth {
     Post,
     /// HTTP Basic `Authorization` header (`SRC-3` AD8: `NetSuite` needs it).
     Basic,
+    /// `client_secret_post_json`: the same fields as `Post`, as a JSON object body
+    /// (slice 2 review BLOCKER 3: Zendesk's `POST /oauth/tokens` "must be formatted
+    /// as JSON", <https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/>).
+    PostJson,
 }
 
 /// A vendor's sign-in in the browser (OAuth authorisation code with PKCE,
@@ -415,7 +419,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             token_url: "https://{account}.zendesk.com/oauth/tokens",
             revocation_url: None,
             scopes: &["read"],
-            client_auth: ClientAuth::Post,
+            client_auth: ClientAuth::PostJson,
         },
         integration: Some(Integration {
             secret_key: "integration:zendesk",
@@ -702,5 +706,15 @@ mod tests {
             .map(|v| v.id)
             .collect();
         assert_eq!(basic, ["netsuite"]);
+    }
+
+    #[test]
+    fn only_zendesk_signs_in_with_a_json_token_request() {
+        let json: Vec<_> = SAAS_VENDORS
+            .iter()
+            .filter(|v| v.oauth.client_auth == ClientAuth::PostJson)
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(json, ["zendesk"]);
     }
 }

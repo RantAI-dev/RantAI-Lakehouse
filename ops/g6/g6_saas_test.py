@@ -229,12 +229,18 @@ def step_hubspot() -> None:
     admin("hubspot", action="revoke", on=False)
 
 
-def _zendesk(secrets: dict | None = None):  # noqa: ANN202
+def _zendesk(auth: str = "integration"):  # noqa: ANN202
     from dispar_orchestrate.adapters import saas as saas_adapter
     from dispar_orchestrate.saas.vendors import zendesk as _module  # noqa: F401 -- imported for its registration
 
-    dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "integration"}}
-    secrets = secrets or {"email": "agent@example.invalid", "apiToken": "stub-api-token"}
+    if auth == "oauth":
+        dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "stub-client"}}
+        # Zendesk rotates the refresh token on every refresh: ask the mock which one is current.
+        current = admin("zendesk", action="refresh_token")["refresh_token"]
+        secrets = {"clientSecret": "stub-client-secret", "refreshToken": current}
+    else:
+        dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "integration"}}
+        secrets = {"email": "agent@example.invalid", "apiToken": "stub-api-token"}
     module, vendor, parts, session = saas_adapter.open_session(dial, secrets)
     return module, vendor, parts, session, dial
 
@@ -251,7 +257,9 @@ def step_zendesk() -> None:
     who = session.get_json(vendor.whoami["path"])
     _expect(who["user"]["id"] == 7, f"zendesk connect: the account it reached is {who!r}")
     _log("zendesk connect: the email and API token reach user 7")
-    _log("zendesk connect (browser sign-in): NOT RUN. Zendesk's token request must be JSON and the product's is form-encoded (plan section 11, slice 2 handoff); the mock has no OAuth either")
+    _b_module, b_vendor, _b_parts, b_session, _b_dial = _zendesk("oauth")
+    _expect(b_session.get_json(b_vendor.whoami["path"])["user"]["id"] == 7, "zendesk connect (browser sign-in): not the account")
+    _log("zendesk connect (browser sign-in): the refresh grant with the client in a JSON body reaches user 7 (the refresh token rotated)")
 
     declared = {d.name: d for d in module.list_objects(session, parts, dial)}
     _expect({"tickets", "users", "ticket_events", "organizations", "groups"} <= set(declared), "zendesk discover: the objects are not listed")
@@ -305,6 +313,13 @@ def step_zendesk() -> None:
     admin("zendesk", action="revoke", on=True)
     exc = _raises("SaasSignInRefused", lambda: _read(module, parts, session, dial, "groups"))
     _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "zendesk revoked: the run report class")
+
+    def browser_read() -> None:
+        r_module, _v, r_parts, r_session, r_dial = _zendesk("oauth")
+        _read(r_module, r_parts, r_session, r_dial, "groups")
+
+    exc = _raises("OAuthSignInRefused", browser_read)
+    _expect(ingest_errors.classify(exc).error_class == "sign_in_refused", "zendesk revoked: the browser sign-in's run report class")
     admin("zendesk", action="revoke", on=False)
     _log("zendesk forbidden and revoked sign-in: the fixed failures, none of the vendor's words")
 

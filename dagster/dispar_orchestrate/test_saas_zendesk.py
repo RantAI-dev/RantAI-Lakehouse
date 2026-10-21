@@ -203,16 +203,13 @@ def test_the_vendor_row_is_what_zendesks_documentation_says() -> None:
     assert row.oauth["authorizeUrl"] == "https://{account}.zendesk.com/oauth/authorizations/new"
     assert row.oauth["tokenUrl"] == "https://{account}.zendesk.com/oauth/tokens"
     assert row.oauth["scopes"] == ["read"], "read: all GET endpoints, the incremental exports included"
+    assert row.oauth["clientAuth"] == "post_json", "POST /oauth/tokens must be formatted as JSON"
     assert row.oauth["revocationUrl"] is None, "Zendesk revokes with DELETE /api/v2/oauth/tokens/{id}, not RFC 7009"
     assert row.whoami == {"method": "GET", "path": "/api/v2/users/me.json"}
     assert row.integration == {"secretKey": "integration:zendesk", "secretFields": ["email", "apiToken"]}
     assert row.api_url(row.validate_account("Acme")) == "https://acme.zendesk.com", "a sub-domain, never a host a person types"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Zendesk's POST /oauth/tokens must be JSON; SRC-12's token request is form-encoded (plan section 11, slice 2 handoff)",
-)
 def test_the_browser_sign_in_sends_zendesks_token_request_as_json(api: Zendesk, monkeypatch: pytest.MonkeyPatch) -> None:
     sent: list[dict] = []
 
@@ -227,7 +224,24 @@ def test_the_browser_sign_in_sends_zendesks_token_request_as_json(api: Zendesk, 
     )
     api.groups = [{"id": 1}]
     list(module.read(session, parts, dial, module.declaration(session, parts, dial, "groups"), since=None))
-    assert "json" in sent[0] and "data" not in sent[0]
+    call = sent[0]
+    assert call["url"] == "https://acme.zendesk.com/oauth/tokens" and "data" not in call
+    assert call["json"] == {
+        "grant_type": "refresh_token", "refresh_token": "r", "client_id": "app", "client_secret": "s",
+    }, "client_secret_post_json: the client is in the JSON body (slice 2 review BLOCKER 3)"  # fmt: skip
+    assert {h["Authorization"] for h in api.headers} == {"Bearer a"}
+
+
+def test_a_revoked_browser_sign_in_is_the_fixed_failure(api: Zendesk, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.post", lambda url, **kw: Reply(400, {"error": "invalid_grant STUB-VENDOR-WORDS"}))
+    dial = {"vendor": "zendesk", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "app"}}
+    module, _v, parts, session = saas_adapter.open_session(
+        dial, {"clientSecret": "s", "refreshToken": "r"}, resolve_checked=resolver, http_get=api.get, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception) as raised:
+        list(module.read(session, parts, dial, module.declaration(session, parts, dial, "groups"), since=None))
+    assert ingest_errors.classify(raised.value).error_class == "sign_in_refused" and "STUB" not in str(raised.value)
+    assert api.headers == []
 
 
 # ---- the whole path: adapter, dlt incremental, merge on the key, real Iceberg -------------------

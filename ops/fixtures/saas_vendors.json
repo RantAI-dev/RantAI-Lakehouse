@@ -168,7 +168,7 @@
         "scopes": [
           "read"
         ],
-        "clientAuth": "post"
+        "clientAuth": "post_json"
       },
       "integration": {
         "secretKey": "integration:zendesk",

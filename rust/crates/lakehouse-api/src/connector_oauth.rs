@@ -274,11 +274,34 @@ async fn post_form(
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<reqwest::Response, TokenFailure> {
+    post_fields(url, form, basic, false, internal_hosts, settings).await
+}
+
+/// [`post_form`], and with `json` the same fields as a JSON object body
+/// (`client_secret_post_json`, slice 2 review BLOCKER 3: Zendesk's
+/// `POST /oauth/tokens` "must be formatted as JSON",
+/// <https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/>).
+async fn post_fields(
+    url: &str,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    json: bool,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<reqwest::Response, TokenFailure> {
     let client = client_for(url, internal_hosts, settings).await?;
-    let mut request = client
+    let request = client
         .post(url)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(form);
+        .header(reqwest::header::ACCEPT, "application/json");
+    let mut request = if json {
+        let object: serde_json::Map<String, serde_json::Value> = form
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect();
+        request.json(&object)
+    } else {
+        request.form(form)
+    };
     if let Some((client_id, client_secret)) = basic {
         // The header carries the secret: it is built here, used once, and
         // dropped with the request, never logged.
@@ -349,7 +372,23 @@ pub async fn token_request(
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<Tokens, TokenFailure> {
-    token_request_inner(url, form, None, internal_hosts, settings).await
+    token_request_inner(url, form, None, false, internal_hosts, settings).await
+}
+
+/// [`token_request`] with the form sent as a JSON body (`client_secret_post_json`,
+/// slice 2 review BLOCKER 3): `form` carries `client_id` and `client_secret` as for
+/// `client_secret_post`; only the encoding differs.
+///
+/// # Errors
+///
+/// As [`token_request`].
+pub async fn token_request_json(
+    url: &str,
+    form: &[(&str, &str)],
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    token_request_inner(url, form, None, true, internal_hosts, settings).await
 }
 
 /// [`token_request`] with the client authenticating by HTTP Basic
@@ -371,6 +410,7 @@ pub async fn token_request_basic(
         url,
         form,
         Some((client_id, client_secret)),
+        false,
         internal_hosts,
         settings,
     )
@@ -381,10 +421,11 @@ async fn token_request_inner(
     url: &str,
     form: &[(&str, &str)],
     basic: Option<(&str, &str)>,
+    json: bool,
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<Tokens, TokenFailure> {
-    let response = post_form(url, form, basic, internal_hosts, settings).await?;
+    let response = post_fields(url, form, basic, json, internal_hosts, settings).await?;
     let Some(bytes) = read_capped(response).await else {
         tracing::warn!("OAuth token answer was too long or could not be read");
         return Err(TokenFailure::Unavailable);
@@ -432,8 +473,11 @@ pub async fn revoke_request(
         ("token_type_hint", "refresh_token"),
     ];
     match client_auth {
-        ClientAuth::Post => {
-            post_form(
+        // `PostJson` has no revocation address in the table (Zendesk revokes with a
+        // DELETE, not RFC 7009); if one is ever added it is sent as JSON like the
+        // token request.
+        ClientAuth::Post | ClientAuth::PostJson => {
+            post_fields(
                 url,
                 &[
                     token_fields[0],
@@ -442,6 +486,7 @@ pub async fn revoke_request(
                     ("client_secret", client_secret.expose_secret()),
                 ],
                 None,
+                client_auth == ClientAuth::PostJson,
                 internal_hosts,
                 settings,
             )
@@ -466,7 +511,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const HTTP: OAuthSettings = OAuthSettings { allow_http: true };
@@ -550,6 +595,39 @@ mod tests {
             "{refused:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_json_client_authentication_sends_the_same_fields_as_a_json_body() {
+        // Slice 2 review BLOCKER 3: Zendesk's token endpoint "must be formatted as JSON".
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(serde_json::json!({
+                "grant_type": "refresh_token", "refresh_token": "refresh-1",
+                "client_id": "app", "client_secret": "s3cret"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tokens = token_request_json(
+            &format!("{}/token", server.uri()),
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "refresh-1"),
+                ("client_id", "app"),
+                ("client_secret", "s3cret"),
+            ],
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokens.refresh_token.unwrap().expose_secret(), "refresh-2");
     }
 
     #[tokio::test]

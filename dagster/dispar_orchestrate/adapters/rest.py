@@ -152,11 +152,20 @@ def _basic_client_header(client_id: str, client_secret: str) -> str:
 
 
 def _token_request(
-    token_url: str, form: dict[str, str], *, resolve_checked, basic: tuple[str, str] | None = None
+    token_url: str,
+    form: dict[str, str],
+    *,
+    resolve_checked,
+    basic: tuple[str, str] | None = None,
+    as_json: bool = False,
 ) -> dict:
     """POST `form` to `token_url` and return the answer's JSON object. `basic`
     is `(client_id, client_secret)` for a provider that takes the client in an
     `Authorization: Basic` header (SRC-3 AD8); `form` then carries neither.
+    `as_json` sends `form` as a JSON body instead of a form body, with the client in
+    it (`client_secret_post_json`, slice 2 review BLOCKER 3: Zendesk's
+    `POST /oauth/tokens` "must be formatted as JSON",
+    https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/).
 
     WS3 plan review Z5: `tokenUrl` is as caller-supplied as `baseUrl`, so it
     gets the same resolve_checked + pin + no-redirects discipline, plus an
@@ -180,7 +189,8 @@ def _token_request(
         # `headers` only when asked for: a `rest` connector's request is exactly
         # what it was before SRC-3.
         extra = {"headers": {"Authorization": _basic_client_header(*basic)}} if basic else {}
-        resp = requests.post(token_url, data=form, timeout=_TOKEN_TIMEOUT_SECONDS, allow_redirects=False, **extra)
+        body_arg = {"json": form} if as_json else {"data": form}
+        resp = requests.post(token_url, timeout=_TOKEN_TIMEOUT_SECONDS, allow_redirects=False, **body_arg, **extra)
     if 300 <= resp.status_code < 400:
         # Not `_refuse_redirect`: its message carries the Location, which is
         # the provider's text.
@@ -288,6 +298,8 @@ class AuthSession:
                         "client_secret": secrets["clientSecret"],
                     },
                     resolve_checked=self._resolve_checked,
+                    # `client_secret_post_json` (BLOCKER 3): same fields, JSON body.
+                    as_json=auth.get("clientAuth") == "post_json",
                 )
             self._keep_rotated(body.get("refresh_token"))
             return self._with_token(body)
