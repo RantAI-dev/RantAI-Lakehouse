@@ -1083,7 +1083,22 @@ pub async fn boards_create(
     };
     let duplicated = parsed.duplicate.is_some();
     let mut board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer).await
+        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer)
+            .await
+            .map_err(|err| match err {
+                store::DuplicateError::Copy(cause) => {
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+                store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+                    // The half-built copy that could not be taken back is the
+                    // operator's problem: it is reported under a reference id
+                    // (the raw text goes to the log, never to a response) and
+                    // the caller's own error is kept
+                    // (`PR #199 review O SHOULD-FIX 3`).
+                    let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+            })?
     } else {
         store::create_board_in(
             &state.clickhouse,
@@ -1094,8 +1109,8 @@ pub async fn boards_create(
             &folder_owner,
         )
         .await
-    }
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?
+    };
     if duplicated {
         // A copy lands next to the original and is private from its first
         // insert, so moving it into another folder is a change of place, not

@@ -1986,6 +1986,71 @@ async fn a_duplicate_that_cannot_be_finished_leaves_no_copy_behind() {
     );
 }
 
+/// `PR #199 review O SHOULD-FIX 3`: a copy that could not be finished and
+/// could not be taken back says so: the cleanup failure is reported and the
+/// copy's own error is kept.
+#[tokio::test]
+async fn a_duplicate_whose_cleanup_fails_reports_the_cleanup_failure() {
+    use wiremock::matchers::{body_string_contains, method};
+    let server = MockServer::start().await;
+    // The half-built copy cannot be taken back: the wipe of its charts fails.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted)",
+        ))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    // The chart's own statement fails, so the copy cannot be finished.
+    Mock::given(method("POST"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [board_row("b1", "u_owner")], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_chart FINAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [chart_row("c1", "b1", "mart_a", None)], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0
+        })))
+        .mount(&server)
+        .await;
+    let ch = client(&server);
+    let err =
+        lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+            .await
+            .expect_err("the chart's statement fails");
+    match err {
+        lakehouse_bi::store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+            assert!(
+                matches!(cause, lakehouse_bi::store::BiError::Clickhouse(_)),
+                "the copy's own error is kept: {cause:?}"
+            );
+            assert!(
+                matches!(cleanup, lakehouse_clickhouse::ChError::Server(_)),
+                "the cleanup failure is carried out: {cleanup:?}"
+            );
+        }
+        other @ lakehouse_bi::store::DuplicateError::Copy(_) => {
+            panic!("a cleanup that failed must be reported, not dropped: {other:?}")
+        }
+    }
+}
+
 /// `PR #199 review M SHOULD-FIX BI-18 3`: a save that arrives after the
 /// dashboard was deleted must not write a blank row over its trash entry: the
 /// dashboard would come back to life as an empty shell.

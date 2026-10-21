@@ -51,6 +51,36 @@ pub enum BiError {
     Clickhouse(#[from] ChError),
 }
 
+/// Why a duplicate failed.
+///
+/// The copy's own error is what the caller gets. A half-built copy that
+/// could not be taken back is a second, separate failure: it is carried out
+/// of this module so the caller can report it — the operator has to see it —
+/// while the copy's error is kept (`PR #199 review O SHOULD-FIX 3`).
+#[derive(Debug, Error)]
+pub enum DuplicateError {
+    /// The copy failed and the half-built copy was taken back.
+    #[error(transparent)]
+    Copy(#[from] BiError),
+    /// The copy failed and the half-built copy could not be taken back, so it
+    /// is still there: the operator's problem, and the copy's own error is
+    /// what the caller gets.
+    #[error("{cause}")]
+    CopyAndCleanup {
+        /// Why the copy failed: what the caller gets.
+        cause: BiError,
+        /// Why the half-built copy could not be taken back: what the operator
+        /// has to see.
+        cleanup: ChError,
+    },
+}
+
+impl From<ChError> for DuplicateError {
+    fn from(err: ChError) -> Self {
+        Self::Copy(BiError::from(err))
+    }
+}
+
 const IDENT_ALLOWED: fn(&str) -> bool = |s| Ident::new(s).is_ok();
 
 /// The `ChartKind`s `specFromInput` accepts, mirroring the TS `KINDS` array.
@@ -2659,14 +2689,16 @@ fn plan_duplicate(
 ///
 /// # Errors
 ///
-/// Returns [`BiError::Validation`] if the source board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+/// Returns [`DuplicateError::Copy`] if the source board does not exist or a
+/// `ClickHouse` failure stopped the copy, and
+/// [`DuplicateError::CopyAndCleanup`] when the half-built copy could not be
+/// taken back either (`PR #199 review O SHOULD-FIX 3`).
 pub async fn duplicate_board(
     ch: &ChClient,
     id: &str,
     created_by: &str,
     viewer: &Viewer,
-) -> Result<Board, BiError> {
+) -> Result<Board, DuplicateError> {
     ensure_bi_table(ch).await?;
     // The built-in board has a row only once its layout was first saved. A
     // board `viewer` may not see is "not found", like one that never was.
@@ -2676,7 +2708,11 @@ pub async fn duplicate_board(
             name: "Main".to_owned(),
             ..shell_board(DEFAULT_BOARD_ID)
         },
-        None => return Err(BiError::Validation("dashboard not found.".to_owned())),
+        None => {
+            return Err(DuplicateError::Copy(BiError::Validation(
+                "dashboard not found.".to_owned(),
+            )));
+        }
     };
     let stored = list_stored_charts(ch, viewer).await?;
     let charts: Vec<_> = stored.into_iter().filter(|c| c.board == id).collect();
@@ -2711,9 +2747,17 @@ pub async fn duplicate_board(
     for chart in &plan.charts {
         if let Err(err) = insert_chart(ch, chart).await {
             // A copy that could not be finished is taken back, so no
-            // half-built dashboard is left behind.
-            let _ = wipe_board(ch, &new_board.id).await;
-            return Err(err.into());
+            // half-built dashboard is left behind. A cleanup that fails as
+            // well is not dropped: it is carried out with the copy's own
+            // error, which is what the caller gets
+            // (`PR #199 review O SHOULD-FIX 3`).
+            return Err(match wipe_board(ch, &new_board.id).await {
+                Ok(()) => DuplicateError::Copy(err.into()),
+                Err(cleanup) => DuplicateError::CopyAndCleanup {
+                    cause: err.into(),
+                    cleanup,
+                },
+            });
         }
     }
     let (new_layout, new_phone) = (plan.layout, plan.phone_layout);
@@ -2738,8 +2782,16 @@ pub async fn duplicate_board(
     )
     .await
     {
-        let _ = wipe_board(ch, &new_board.id).await;
-        return Err(err.into());
+        // The copy that could not be saved is taken back, so no half-built
+        // dashboard is left behind; a cleanup that fails as well is carried
+        // out with the copy's own error (`PR #199 review O SHOULD-FIX 3`).
+        return Err(match wipe_board(ch, &new_board.id).await {
+            Ok(()) => DuplicateError::Copy(err.into()),
+            Err(cleanup) => DuplicateError::CopyAndCleanup {
+                cause: err.into(),
+                cleanup,
+            },
+        });
     }
     Ok(Board {
         owner_id: Some(owner_id).filter(|o| !o.is_empty()),
