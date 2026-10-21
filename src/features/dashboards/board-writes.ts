@@ -1,5 +1,5 @@
 import { readableErrorMessage } from "@/lib/notify-message";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import type { LayoutMap } from "@/services";
 import { apiFetch } from "@/services/http";
 
 /**

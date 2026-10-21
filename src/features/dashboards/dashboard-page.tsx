@@ -31,7 +31,8 @@ import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
   TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
-import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
+import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
+import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";

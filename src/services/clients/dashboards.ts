@@ -1,4 +1,4 @@
-import type { Board } from "./bi-store"
+import type { Board } from "../contracts/dashboards"
 import type {
   CreateBoardInput,
   DashboardFolder,

@@ -15,7 +15,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
-import type { Board } from "@/services/clients/bi-store"
+import type { Board } from "@/services"
 import { PrivateBadge } from "./private-badge"
 
 export type BoardRowActions = {

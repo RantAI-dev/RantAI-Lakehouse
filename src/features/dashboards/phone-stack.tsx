@@ -3,7 +3,7 @@
 import { ArrowDown, ArrowUp, Minus, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { movePhoneTile, resizePhoneTile } from "@/lib/dashboard-tabs";
-import type { PhoneTile } from "@/services/clients/bi-store";
+import type { PhoneTile } from "@/services";
 import type { GridItem } from "./dashboard-grid";
 import { SectionTile, TileCard, isSectionKind } from "./tile-card";
 

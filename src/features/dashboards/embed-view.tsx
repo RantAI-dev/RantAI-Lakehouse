@@ -11,7 +11,7 @@ import { TileBody } from "./tile-body";
 import { OwnFiltersMarker, ownFilters } from "./filters/own-filters-marker";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { selectedTab } from "@/lib/dashboard-tabs";
-import type { BoardTab, LayoutMap, PhoneTile } from "@/services/clients/bi-store";
+import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";

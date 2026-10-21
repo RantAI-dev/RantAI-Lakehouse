@@ -54,7 +54,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { notifyError, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { dashboardService } from "@/services"
-import type { Board } from "@/services/clients/bi-store"
+import type { Board } from "@/services"
 import { notifyDashboardsChanged } from "./dashboard-events"
 import {
   BoardActionsMenu,
