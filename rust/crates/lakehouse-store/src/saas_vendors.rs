@@ -63,7 +63,9 @@ pub enum ClientAuth {
     /// `client_id` and `client_secret` in the form body (`SRC-12`'s only
     /// method until `SRC-3`).
     Post,
-    /// HTTP Basic `Authorization` header (`SRC-3` AD8: `NetSuite` needs it).
+    /// HTTP Basic `Authorization` header (`SRC-3` AD8: `NetSuite` documents it; `Workday`'s
+    /// token endpoint is modelled on the same, slice 6, *not verified*: its documentation is
+    /// behind a login).
     Basic,
     /// `client_secret_post_json`: the same fields as `Post`, as a JSON object body
     /// (slice 2 review BLOCKER 3: Zendesk's `POST /oauth/tokens` "must be formatted
@@ -409,7 +411,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             token_url: "https://{host}/ccx/oauth2/{tenant}/token",
             revocation_url: None,
             scopes: &[],
-            client_auth: ClientAuth::Post,
+            client_auth: ClientAuth::Basic,
             api_base: None,
         },
         integration: Some(Integration {
@@ -889,13 +891,13 @@ mod tests {
     }
 
     #[test]
-    fn only_netsuite_signs_in_with_basic_client_authentication() {
+    fn only_workday_and_netsuite_sign_in_with_basic_client_authentication() {
         let basic: Vec<_> = SAAS_VENDORS
             .iter()
             .filter(|v| v.oauth.client_auth == ClientAuth::Basic)
             .map(|v| v.id)
             .collect();
-        assert_eq!(basic, ["netsuite"]);
+        assert_eq!(basic, ["workday", "netsuite"]);
     }
 
     #[test]

@@ -116,7 +116,7 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
       "tokenUrl": "https://{host}/ccx/oauth2/{tenant}/token",
       "revocationUrl": null,
       "scopes": [],
-      "clientAuth": "post"
+      "clientAuth": "basic"
     },
     "integration": {
       "secretKey": "integration:workday",
