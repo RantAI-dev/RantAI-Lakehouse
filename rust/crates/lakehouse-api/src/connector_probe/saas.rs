@@ -138,6 +138,16 @@ async fn access_token(
     oauth: OAuthSettings,
 ) -> Result<Access, Outcome> {
     match request.auth {
+        // Atlassian's browser sign-in is only accepted at `api.atlassian.com/ex/confluence/{cloudId}`,
+        // and the cloud id comes from a second request this build does not make: "unsupported,
+        // honestly" (slice 4, V-Confluence.3). Nothing is sent to the vendor.
+        SaasAuth::Oauth2AuthorizationCode { .. } if request.vendor.oauth.api_base.is_some() => {
+            Err(Outcome::not_testable_with(format!(
+                "{}'s browser sign-in is used through a gateway address that the connection test \
+                 does not reach yet. A load reports whether the connection worked.",
+                request.vendor.label
+            )))
+        }
         SaasAuth::Oauth2AuthorizationCode { client_id } => {
             refreshed_access(request, client_id, secrets, internal_hosts, oauth).await
         }
@@ -238,22 +248,26 @@ async fn integration_access(
         .vendor
         .integration
         .map_or(&[][..], |integration| integration.secret_fields);
-    // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with
-    // `<email>/token` as the user name
-    // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>).
-    if request.vendor.id == "zendesk" && fields == ["email", "apiToken"] {
+    // Slice 2 (V-Zendesk.3): Zendesk's email + API token is HTTP Basic with `<email>/token` as
+    // the user name
+    // (<https://developer.zendesk.com/api-reference/introduction/security-and-auth/>); slice 4
+    // (V-Confluence.3): Atlassian's is HTTP Basic with the email as the user name
+    // (<https://developer.atlassian.com/cloud/confluence/basic-auth-for-rest-apis/>).
+    if matches!(request.vendor.id, "zendesk" | "confluence") && fields == ["email", "apiToken"] {
         let email = resolve(secrets.resolver, secrets.primary).await?;
         let Some(secondary) = secrets.secondary else {
-            return Err(Outcome::misconfigured(
-                "connector is misconfigured: the Zendesk API token is not saved",
-            ));
+            return Err(Outcome::misconfigured(format!(
+                "connector is misconfigured: the {} API token is not saved",
+                request.vendor.label
+            )));
         };
         let api_token = resolve(secrets.resolver, secondary).await?;
-        let pair = format!(
-            "{}/token:{}",
-            email.expose_secret(),
-            api_token.expose_secret()
-        );
+        let user = if request.vendor.id == "zendesk" {
+            format!("{}/token", email.expose_secret())
+        } else {
+            email.expose_secret().to_owned()
+        };
+        let pair = format!("{user}:{}", api_token.expose_secret());
         return Ok(Access {
             token: SecretValue::new(base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
@@ -262,6 +276,10 @@ async fn integration_access(
             rotated: None,
             basic: true,
         });
+    }
+    // Slice 4 (V-ServiceNow.3, decision 3): ServiceNow's client credentials are exchanged for a token.
+    if request.vendor.id == "servicenow" && fields == ["clientId", "clientSecret"] {
+        return client_credentials_access(request, secrets, internal_hosts, oauth).await;
     }
     // Slice 3 review BLOCKER 10 (decision 3): Google's service-account key is exchanged for a token.
     if request.vendor.id == "ga4" && fields == ["serviceAccountJson"] {
@@ -276,6 +294,39 @@ async fn integration_access(
     }
     Ok(Access {
         token: resolve(secrets.resolver, secrets.primary).await?,
+        rotated: None,
+        basic: false,
+    })
+}
+
+/// ServiceNow's client-credentials grant (<https://www.servicenow.com/docs/r/platform-security/authentication/client-credentials-grant-workflow.html>):
+/// the client id and secret are resolved only now (after the address check) and sent in the
+/// form body of the token request, the address being the vendor table's for this instance.
+async fn client_credentials_access(
+    request: &Request<'_>,
+    secrets: &Secrets<'_>,
+    internal_hosts: &InternalHosts,
+    oauth: OAuthSettings,
+) -> Result<Access, Outcome> {
+    let client_id = resolve(secrets.resolver, secrets.primary).await?;
+    let Some(secondary) = secrets.secondary else {
+        return Err(Outcome::misconfigured(format!(
+            "connector is misconfigured: the {} client secret is not saved",
+            request.vendor.label
+        )));
+    };
+    let client_secret = resolve(secrets.resolver, secondary).await?;
+    let started = Instant::now();
+    let form = [
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id.expose_secret()),
+        ("client_secret", client_secret.expose_secret()),
+    ];
+    let tokens = connector_oauth::token_request(&request.token_url, &form, internal_hosts, oauth)
+        .await
+        .map_err(|failure| token_failure_outcome(&failure, started.elapsed()))?;
+    Ok(Access {
+        token: tokens.access_token,
         rotated: None,
         basic: false,
     })
@@ -794,12 +845,129 @@ mod tests {
         assert!(!outcome.message.contains("zd-token"));
     }
 
+    /// `SRC-3` slice 4: Atlassian's email + API token is Basic with the plain email as the user
+    /// (base64 of `agent@example.invalid:cf-token`).
+    #[tokio::test]
+    async fn confluences_email_and_api_token_are_sent_as_basic_with_the_plain_email() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header(
+                "authorization",
+                "Basic YWdlbnRAZXhhbXBsZS5pbnZhbGlkOmNmLXRva2Vu",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("CF_EMAIL".to_owned(), "agent@example.invalid".to_owned());
+        map.insert("CF_TOKEN".to_owned(), "cf-token".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "confluence",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:CF_EMAIL",
+                secondary: Some("env:CF_TOKEN"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        assert!(!outcome.message.contains("cf-token"));
+    }
+
+    /// `SRC-3` slice 4: ServiceNow's client credentials go to the token address in the form body
+    /// and the access token it returns is the bearer of the who-am-i request.
+    #[tokio::test]
+    async fn servicenows_client_credentials_are_exchanged_for_a_bearer_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "expires_in": 1800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/who"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut map = HashMap::new();
+        map.insert("SN_ID".to_owned(), "client".to_owned());
+        map.insert("SN_SECRET".to_owned(), "sn-secret".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let auth = SaasAuth::Integration;
+        let outcome = probe_saas_at(
+            &request(
+                "servicenow",
+                format!("{}/who", server.uri()),
+                format!("{}/token", server.uri()),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SN_ID",
+                secondary: Some("env:SN_SECRET"),
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings { allow_http: true },
+        )
+        .await;
+        assert!(outcome.ok && outcome.supported, "{}", outcome.message);
+        let body = String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body)
+            .into_owned();
+        assert!(body.contains("grant_type=client_credentials"), "{body}");
+        assert!(!outcome.message.contains("sn-secret"));
+    }
+
+    /// `SRC-3` slice 4: Atlassian's browser sign-in is not testable here, and nothing is sent.
+    #[tokio::test]
+    async fn confluences_browser_sign_in_is_not_testable_and_sends_nothing() {
+        let server = MockServer::start().await;
+        let resolver = resolver();
+        let auth = SaasAuth::Oauth2AuthorizationCode {
+            client_id: "app".to_owned(),
+        };
+        let outcome = probe_saas_at(
+            &request(
+                "confluence",
+                format!("{}/who", server.uri()),
+                String::new(),
+                &auth,
+            ),
+            &Secrets {
+                primary: "env:SAAS_TEST_SECRET",
+                secondary: None,
+                resolver: &resolver,
+            },
+            &InternalHosts::ALL,
+            OAuthSettings::default(),
+        )
+        .await;
+        assert!(!outcome.ok && !outcome.supported);
+        assert!(outcome.message.contains("gateway address"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn an_integration_credential_that_is_not_one_token_is_not_testable_yet() {
         let auth = SaasAuth::Integration;
         let outcome = probe_saas_at(
             &request(
-                "servicenow",
+                "workday",
                 "http://127.0.0.1:9/who".to_owned(),
                 String::new(),
                 &auth,

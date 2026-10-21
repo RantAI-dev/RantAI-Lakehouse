@@ -80,6 +80,13 @@ pub struct OauthPreset {
     pub scopes: &'static [&'static str],
     /// How the token request carries the client's credentials.
     pub client_auth: ClientAuth,
+    /// The API's base address for a browser sign-in, when it is not [`SaasVendor::api_base`]:
+    /// Atlassian's OAuth tokens are accepted only at `api.atlassian.com/ex/confluence/{cloudId}`,
+    /// not at the customer's `<site>.atlassian.net`. A fixed vendor host from this table (AD2),
+    /// never one taken from a response; `{cloudId}` is the one placeholder that only the
+    /// orchestrator fills, after the sign-in, from the vendor's list of accessible sites.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<&'static str>,
 }
 
 /// The second way to connect: the vendor's integration credential
@@ -296,6 +303,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             revocation_url: Some("https://{account}.my.salesforce.com/services/oauth2/revoke"),
             scopes: &["api", "refresh_token"],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: None,
         whoami: Some(Whoami {
@@ -313,9 +321,12 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         oauth: OauthPreset {
             authorize_url: "https://{account}.service-now.com/oauth_auth.do",
             token_url: "https://{account}.service-now.com/oauth_token.do",
-            revocation_url: Some("https://{account}.service-now.com/oauth_revoke_token.do"),
+            // ServiceNow revokes by GET `oauth_revoke_token.do?token=...`, not RFC 7009's POST
+            // (<https://www.servicenow.com/docs/r/8yND1KuvF7tjP~F577YThQ/hMCUQrOe2CEAjaIJdG03MA>).
+            revocation_url: None,
             scopes: &[],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:servicenow",
@@ -341,6 +352,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             revocation_url: None,
             scopes: &[],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:workday",
@@ -361,6 +373,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             revocation_url: Some("https://oauth2.googleapis.com/revoke"),
             scopes: &["https://www.googleapis.com/auth/analytics.readonly"],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:ga4",
@@ -397,6 +410,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
                 "oauth",
             ],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:hubspot",
@@ -420,6 +434,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             revocation_url: None,
             scopes: &["read"],
             client_auth: ClientAuth::PostJson,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:zendesk",
@@ -438,17 +453,20 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
         account_label: "Site name (the part before .atlassian.net)",
         api_base: "https://{account}.atlassian.net",
         oauth: OauthPreset {
-            authorize_url: "https://auth.atlassian.com/authorize",
+            // `audience` and `prompt=consent` are required by Atlassian 3LO
+            // (<https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/>).
+            authorize_url: "https://auth.atlassian.com/authorize?audience=api.atlassian.com&prompt=consent",
             token_url: "https://auth.atlassian.com/oauth/token",
             revocation_url: None,
             scopes: &[
                 "read:page:confluence",
                 "read:space:confluence",
                 "read:comment:confluence",
-                "read:blogpost:confluence",
                 "offline_access",
             ],
-            client_auth: ClientAuth::Post,
+            // Atlassian's token endpoint takes a JSON body (same page).
+            client_auth: ClientAuth::PostJson,
+            api_base: Some("https://api.atlassian.com/ex/confluence/{cloudId}"),
         },
         integration: Some(Integration {
             secret_key: "integration:confluence",
@@ -472,6 +490,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             revocation_url: None,
             scopes: &["https://{account}/user_impersonation", "offline_access"],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:dynamics365",
@@ -497,6 +516,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
             ),
             scopes: &["rest_webservices"],
             client_auth: ClientAuth::Basic,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:netsuite",
@@ -523,6 +543,7 @@ pub const SAAS_VENDORS: &[SaasVendor] = &[
                 "offline_access",
             ],
             client_auth: ClientAuth::Post,
+            api_base: None,
         },
         integration: Some(Integration {
             secret_key: "integration:sharepoint",
@@ -709,12 +730,27 @@ mod tests {
     }
 
     #[test]
-    fn only_zendesk_signs_in_with_a_json_token_request() {
+    fn only_confluence_has_its_own_browser_api_address_and_it_is_a_fixed_https_host() {
+        let own: Vec<_> = SAAS_VENDORS
+            .iter()
+            .filter(|v| v.oauth.api_base.is_some())
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(own, ["confluence"]);
+        let base = vendor("confluence").unwrap().oauth.api_base.unwrap();
+        assert!(base.starts_with("https://api.atlassian.com/ex/confluence/"));
+        // `{cloudId}` is the only placeholder, and the host part has none.
+        assert_eq!(base.matches('{').count(), 1);
+        assert!(base.ends_with("/{cloudId}"));
+    }
+
+    #[test]
+    fn only_zendesk_and_confluence_sign_in_with_a_json_token_request() {
         let json: Vec<_> = SAAS_VENDORS
             .iter()
             .filter(|v| v.oauth.client_auth == ClientAuth::PostJson)
             .map(|v| v.id)
             .collect();
-        assert_eq!(json, ["zendesk"]);
+        assert_eq!(json, ["zendesk", "confluence"]);
     }
 }

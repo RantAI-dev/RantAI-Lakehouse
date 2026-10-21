@@ -304,3 +304,28 @@ def test_a_second_run_merges_the_changed_incident_and_stores_none_twice(lab: Lab
     run()
     rows = {r["number"]: r["short_description"] for r in lab.rows("snow_incident")}
     assert len(lab.rows("snow_incident")) == 6 and rows["INC0000002"] == "changed", "merged on sys_id: no duplicate"
+
+
+# ---- sign-in: the vendor table's row (checked against ServiceNow's documentation, 2026-10-21) -----
+
+
+def test_the_vendor_row_names_the_instances_oauth_addresses_and_no_rfc_7009_revocation() -> None:
+    row_ = vendors.vendor("servicenow")
+    parts = row_.validate_account("acme")
+    assert row_.render(row_.oauth["authorizeUrl"], parts) == "https://acme.service-now.com/oauth_auth.do"
+    assert row_.token_url(parts) == "https://acme.service-now.com/oauth_token.do"
+    # ServiceNow revokes by GET `oauth_revoke_token.do?token=...`, which the product's RFC 7009 call is not.
+    assert row_.oauth["revocationUrl"] is None and row_.oauth["clientAuth"] == "post"
+    assert row_.integration == {"secretKey": "integration:servicenow", "secretFields": ["clientId", "clientSecret"]}
+    assert row_.whoami["path"].startswith("/api/now/table/sys_user?")
+
+
+def test_the_browser_sign_in_refreshes_at_the_instances_token_address(api: ServiceNow) -> None:
+    api.tables["incident"] = [row(1, "2026-10-01 10:00:00")]
+    dial = {"vendor": "servicenow", "account": "acme", "auth": {"type": "oauth2_authorization_code", "clientId": "app"}}
+    secrets = {"clientSecret": SECRETS["clientSecret"], "refreshToken": "refresh-1"}
+    TOKEN_POSTS.clear()
+    module, _v, parts, session = saas_adapter.open_session(dial, secrets, resolve_checked=resolver, http_get=api.get, sleep=lambda _s: None)
+    assert [r["number"] for r in module.read(session, parts, dial, module.declaration(session, parts, dial, "incident"), since=None)] == ["INC0000001"]
+    assert TOKEN_POSTS[0]["url"] == "https://acme.service-now.com/oauth_token.do"
+    assert TOKEN_POSTS[0]["data"]["grant_type"] == "refresh_token" and TOKEN_POSTS[0]["data"]["client_id"] == "app"

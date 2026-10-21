@@ -31,6 +31,8 @@ export type SaasVendor = {
     revocationUrl: string | null
     scopes: readonly string[]
     clientAuth: "post" | "basic" | "post_json"
+    /** The API's base address after a browser sign-in, when it is not `apiBase` (Atlassian's gateway). */
+    apiBase?: string
   }
   /** The integration credential, when the vendor offers one (Salesforce does not: decision 4). */
   integration: { secretKey: string; secretFields: readonly string[] } | null
@@ -75,7 +77,7 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "oauth": {
       "authorizeUrl": "https://{account}.service-now.com/oauth_auth.do",
       "tokenUrl": "https://{account}.service-now.com/oauth_token.do",
-      "revocationUrl": "https://{account}.service-now.com/oauth_revoke_token.do",
+      "revocationUrl": null,
       "scopes": [],
       "clientAuth": "post"
     },
@@ -229,17 +231,17 @@ export const SAAS_VENDORS: readonly SaasVendor[] = [
     "accountLabel": "Site name (the part before .atlassian.net)",
     "apiBase": "https://{account}.atlassian.net",
     "oauth": {
-      "authorizeUrl": "https://auth.atlassian.com/authorize",
+      "authorizeUrl": "https://auth.atlassian.com/authorize?audience=api.atlassian.com&prompt=consent",
       "tokenUrl": "https://auth.atlassian.com/oauth/token",
       "revocationUrl": null,
       "scopes": [
         "read:page:confluence",
         "read:space:confluence",
         "read:comment:confluence",
-        "read:blogpost:confluence",
         "offline_access"
       ],
-      "clientAuth": "post"
+      "clientAuth": "post_json",
+      "apiBase": "https://api.atlassian.com/ex/confluence/{cloudId}"
     },
     "integration": {
       "secretKey": "integration:confluence",
