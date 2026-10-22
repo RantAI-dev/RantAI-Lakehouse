@@ -271,7 +271,9 @@ def login(api) -> None:
     if tenant is None:
         raise HarnessFailure(f"tenant {GATE_TENANT_SLUG!r} does not exist")
     if tenant["id"] not in mine:
-        _expect(api.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}", timeout=15), 204, "join tenant")
+        # `add_user_to_tenant` (routes/identity.rs) answers 200 with the user, not 204;
+        # run 39799040001 stopped here. ops/g9/upload_test.py accepts any `.ok` for it.
+        _expect(api.put(f"{API_URL}/api/identity/users/{me['id']}/tenants/{tenant['id']}", timeout=15), 200, "join tenant")
     api.headers["X-Tenant"] = tenant["id"]
 
 
