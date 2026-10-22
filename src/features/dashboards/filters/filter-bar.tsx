@@ -9,6 +9,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { filterLabel, isActiveFilter, isRequiredColumn } from "@/lib/dashboard-filter-state";
+import { withTies } from "@/lib/dashboard-tabs";
+import type { BoardTab } from "@/services";
 import type { FilterDef, FilterField } from "@/services/clients/bi-store";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filter-editors";
 
@@ -39,6 +41,29 @@ function RequiredRow({ column, checked, onChange }: { column: string; checked: b
   );
 }
 
+/**
+ * "Applies to": every tab, or the tabs ticked (BI-18 part C). A filter tied
+ * to tabs is not given to the tiles of the others, and those tiles do not
+ * report it as skipped. Takes effect with "Save as default" like `required`.
+ */
+function AppliesToRow({ tabs, value, onChange }: { tabs: BoardTab[]; value: string[] | undefined; onChange: (chosen: string[]) => void }) {
+  const chosen = value ?? [];
+  const toggle = (id: string) => onChange(chosen.includes(id) ? chosen.filter((c) => c !== id) : [...chosen, id]);
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1 border-t border-border pt-2 text-xs text-muted-foreground">
+      <span className="mr-1">Applies to</span>
+      <button type="button" aria-pressed={chosen.length === 0}
+              className={cn("rounded-full border px-2 py-0.5", chosen.length === 0 ? "border-primary bg-primary/10 text-foreground" : "border-border")}
+              onClick={() => onChange([])}>All tabs</button>
+      {tabs.map((t) => (
+        <button key={t.id} type="button" aria-pressed={chosen.includes(t.id)}
+                className={cn("max-w-32 truncate rounded-full border px-2 py-0.5", chosen.includes(t.id) ? "border-primary bg-primary/10 text-foreground" : "border-border")}
+                onClick={() => toggle(t.id)}>{t.title}</button>
+      ))}
+    </div>
+  );
+}
+
 function Editor({ kind, ...props }: EditorProps & { kind: string }) {
   if (kind === "number") return <NumberEditor {...props} />;
   if (kind === "date" || kind === "datetime") return <DateEditor {...props} />;
@@ -52,9 +77,11 @@ function Editor({ kind, ...props }: EditorProps & { kind: string }) {
  * upward; the page decides what to do with it.
  */
 export function FilterBar({
-  board, fields, filters, savedFilters, onChange, dirty, canSaveDefault, saving, onSaveDefault, onReset,
+  board, fields, filters, savedFilters, onChange, dirty, canSaveDefault, saving, onSaveDefault, onReset, tabs,
 }: {
   board: string;
+  /** The dashboard's tabs; with more than one, an editor can tie a filter to some of them. */
+  tabs?: BoardTab[];
   fields: FilterField[];
   filters: FilterDef[];
   /** The board's saved default; its `required` flags decide which chips cannot be removed. */
@@ -73,6 +100,8 @@ export function FilterBar({
   const [query, setQuery] = React.useState("");
   // Required for a filter being added; it only becomes the default's with "Save as default".
   const [newRequired, setNewRequired] = React.useState(false);
+  const [newTies, setNewTies] = React.useState<string[]>([]);
+  const tieable = canSaveDefault && (tabs?.length ?? 0) > 1;
   const kindOf = (column: string) => fields.find((f) => f.column === column)?.kind ?? "text";
   const active = filters.filter(isActiveFilter);
   // Only filters that restrict something take their column out of the list.
@@ -83,10 +112,12 @@ export function FilterBar({
   // An editor builds a fresh filter; the `required` flag is not its to change
   // (BI-18 round two), so it is carried over from the filter it replaces.
   const replace = (old: FilterDef, next: FilterDef) =>
-    onChange(filters.map((f) => (f === old ? { ...next, ...(old.required ? { required: true } : {}) } : f)));
+    onChange(filters.map((f) => (f === old ? { ...next, ...(old.required ? { required: true } : {}), ...(old.tabs?.length ? { tabs: old.tabs } : {}) } : f)));
+  const setTies = (old: FilterDef, chosen: string[]) =>
+    onChange(filters.map((f) => (f === old ? withTies(f, tabs ?? [], chosen) : f)));
   const setRequired = (old: FilterDef, required: boolean) =>
     onChange(filters.map((f) => (f === old ? { ...f, required: required || undefined } : f)));
-  const closeAdd = () => { setAddOpen(false); setPicked(null); setQuery(""); setNewRequired(false); };
+  const closeAdd = () => { setAddOpen(false); setPicked(null); setQuery(""); setNewRequired(false); setNewTies([]); };
 
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -101,6 +132,8 @@ export function FilterBar({
           // No remove control while the saved default requires this column.
           onRemove={isRequiredColumn(f.column, savedFilters) ? undefined : () => onChange(filters.filter((x) => x !== f))}
           onToggleRequired={canSaveDefault ? (required) => setRequired(f, required) : undefined}
+          tabs={tieable ? tabs : undefined}
+          onTies={(chosen) => setTies(f, chosen)}
         />
       ))}
 
@@ -122,9 +155,14 @@ export function FilterBar({
                 column={picked.column}
                 others={others(picked.column)}
                 initial={blankFilter(picked.column, picked.kind)}
-                onApply={(next) => { onChange([...filters, newRequired ? { ...next, required: true } : next]); closeAdd(); }}
+                onApply={(next) => {
+                  const tied = withTies(newRequired ? { ...next, required: true } : next, tabs ?? [], newTies);
+                  onChange([...filters, tied]);
+                  closeAdd();
+                }}
               />
               {canSaveDefault ? <RequiredRow column={picked.column} checked={newRequired} onChange={setNewRequired} /> : null}
+              {tieable && tabs ? <AppliesToRow tabs={tabs} value={newTies} onChange={setNewTies} /> : null}
             </>
           ) : (
             <>
@@ -166,7 +204,7 @@ export function FilterBar({
 }
 
 function FilterChip({
-  filter, kind, board, others, onApply, onRemove, onToggleRequired,
+  filter, kind, board, others, onApply, onRemove, onToggleRequired, tabs, onTies,
 }: {
   filter: FilterDef;
   kind: string;
@@ -177,6 +215,9 @@ function FilterChip({
   onRemove?: () => void;
   /** Present for a caller who may save the default; the flag takes effect with "Save as default". */
   onToggleRequired?: (required: boolean) => void;
+  /** Present for an editor of a dashboard with several tabs (BI-18 part C). */
+  tabs?: BoardTab[];
+  onTies: (chosen: string[]) => void;
 }) {
   const [open, setOpen] = React.useState(false);
   const label = filterLabel(filter, kind);
@@ -204,6 +245,7 @@ function FilterChip({
           {open && onToggleRequired ? (
             <RequiredRow column={filter.column} checked={filter.required === true} onChange={onToggleRequired} />
           ) : null}
+          {open && tabs ? <AppliesToRow tabs={tabs} value={filter.tabs} onChange={onTies} /> : null}
         </PopoverContent>
       </Popover>
       {onRemove ? (

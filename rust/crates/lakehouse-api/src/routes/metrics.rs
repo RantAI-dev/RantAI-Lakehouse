@@ -198,13 +198,15 @@ async fn usage_of(
     ch: &ChClient,
     pick: impl Fn(&[store::StoredChartSpec]) -> Vec<String>,
     metrics_naming: Vec<String>,
+    viewer: &lakehouse_bi::access::Viewer,
 ) -> Result<Usage, ApiError> {
-    let charts = store::list_stored_charts(ch)
+    // BI-18 part C, part 2: a chart on somebody's personal board still counts
+    // as a use (deleting would break it) but is neither named nor listed.
+    let seen = crate::routes::dashboard_organise::Seen::read(ch, viewer)
         .await
         .map_err(|failure| classify_ch(&failure))?;
-    let boards = store::list_boards(ch)
-        .await
-        .map_err(|failure| classify_ch(&failure))?;
+    let hidden_use = !pick(&seen.hidden_charts()).is_empty();
+    let (charts, boards) = (seen.charts, seen.boards);
     let ids = pick(&charts);
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let board_name = |id: &str| {
@@ -233,16 +235,24 @@ async fn usage_of(
         }
     }
     dashboards.sort();
+    let mut named = fields::name_charts(&charts, &boards, &id_refs);
+    if hidden_use {
+        named.push(crate::routes::dashboard_organise::HIDDEN_USE.to_owned());
+    }
     Ok(Usage {
         alerts: Vec::new(),
-        charts: fields::name_charts(&charts, &boards, &id_refs),
+        charts: named,
         chart_rows,
         metrics: metrics_naming,
         dashboards,
     })
 }
 
-async fn metric_usage(ch: &ChClient, m: &MetricDef) -> Result<Usage, ApiError> {
+async fn metric_usage(
+    ch: &ChClient,
+    m: &MetricDef,
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Result<Usage, ApiError> {
     let (kind, source, name) = (m.source_kind, m.source_id.clone(), m.name.clone());
     // BI-2: a rule that watches the metric uses it too. A rule list that cannot
     // be read refuses the delete (nothing can be shown to be unused).
@@ -271,13 +281,18 @@ async fn metric_usage(ch: &ChClient, m: &MetricDef) -> Result<Usage, ApiError> {
                 .collect()
         },
         Vec::new(),
+        viewer,
     )
     .await?;
     used.alerts = alerts;
     Ok(used)
 }
 
-async fn segment_usage(ch: &ChClient, s: &SegmentDef) -> Result<Usage, ApiError> {
+async fn segment_usage(
+    ch: &ChClient,
+    s: &SegmentDef,
+    viewer: &lakehouse_bi::access::Viewer,
+) -> Result<Usage, ApiError> {
     let (kind, source, name) = (s.source_kind, s.source_id.clone(), s.name.clone());
     let named_by: Vec<String> = metrics::list_metrics(ch)
         .await
@@ -299,6 +314,7 @@ async fn segment_usage(ch: &ChClient, s: &SegmentDef) -> Result<Usage, ApiError>
                 .collect()
         },
         named_by,
+        viewer,
     )
     .await
 }
@@ -335,6 +351,7 @@ async fn source_reads(ch: &ChClient, shown: &[MetricDef]) -> Vec<SourceRead> {
 /// A fixed 422/503 for a database failure.
 pub async fn list(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -359,7 +376,13 @@ pub async fn list(
         .collect();
     // The counts and the SQL sources' titles are a courtesy: when they cannot
     // be read the list still answers.
-    let charts = store::list_stored_charts(ch).await.unwrap_or_default();
+    // The count is of the charts the caller may see (BI-18 part C, part 2).
+    let charts = store::list_stored_charts(
+        ch,
+        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+    )
+    .await
+    .unwrap_or_default();
     let titles: std::collections::HashMap<String, String> = lakehouse_bi::sources::list_sources(ch)
         .await
         .unwrap_or_default()
@@ -516,6 +539,7 @@ pub async fn update(
 /// a chart uses it.
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -525,7 +549,12 @@ pub async fn delete(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("metric '{id}' not found.")))?;
-    let used = metric_usage(ch, &current).await?;
+    let used = metric_usage(
+        ch,
+        &current,
+        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+    )
+    .await?;
     if !used.is_empty() {
         return Err(ApiError::Conflict(format!(
             "the metric is still used by {}.",
@@ -546,6 +575,7 @@ pub async fn delete(
 /// 404 for an unknown id; a fixed 422/503 for a database failure.
 pub async fn usage(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -553,7 +583,12 @@ pub async fn usage(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound("metric not found.".to_owned()))?;
-    let used = metric_usage(ch, &current).await?;
+    let used = metric_usage(
+        ch,
+        &current,
+        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+    )
+    .await?;
     Ok(ApiJson(json!({
         "metric": current.name,
         "charts": used.chart_rows,
@@ -827,6 +862,7 @@ pub async fn update_segment(
 /// a chart or a metric does.
 pub async fn delete_segment(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let ch = &state.clickhouse;
@@ -836,7 +872,12 @@ pub async fn delete_segment(
         .await
         .map_err(|failure| classify_ch(&failure))?
         .ok_or_else(|| ApiError::NotFound(format!("segment '{id}' not found.")))?;
-    let used = segment_usage(ch, &current).await?;
+    let used = segment_usage(
+        ch,
+        &current,
+        &crate::routes::calc_fields::viewer_or_anonymous(principal.as_ref()),
+    )
+    .await?;
     if !used.is_empty() {
         return Err(ApiError::Conflict(format!(
             "the segment is still used by {}.",
@@ -852,7 +893,90 @@ pub async fn delete_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::Usage;
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::{Value, json};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{Usage, usage_of};
+    use crate::routes::dashboard_organise::HIDDEN_USE;
+
+    fn chart(id: &str, board: &str) -> Value {
+        let spec = json!({ "id": id, "title": id, "kind": "bar", "mart": "m", "sql": "SELECT 1", "x": "d", "y": "v" });
+        let def =
+            json!({ "title": id, "mart": "m", "kind": "bar", "dimension": "d", "measures": ["v"] });
+        json!({
+            "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+            "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+        })
+    }
+
+    async fn answer(server: &MockServer, needles: &[&str], data: Vec<Value>) {
+        let mut mock = Mock::given(method("POST"));
+        for needle in needles {
+            mock = mock.and(body_string_contains(*needle));
+        }
+        mock.respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "meta": [], "data": data, "rows": data.len() })),
+        )
+        .mount(server)
+        .await;
+    }
+
+    /// BI-18 part C, part 2: a chart on somebody's personal board uses a metric
+    /// as much as any other, so a delete is blocked, but the caller is not told
+    /// which board or chart it is: only that something they cannot see uses it.
+    #[tokio::test]
+    async fn a_chart_the_caller_cannot_see_blocks_a_delete_without_being_named() {
+        let server = MockServer::start().await;
+        let mine = "owner_id != '' AND owner_id != 'u_me'";
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL", mine],
+            vec![chart("c_public", "b_public")],
+        )
+        .await;
+        answer(
+            &server,
+            &["FROM console.bi_chart FINAL"],
+            vec![chart("c_public", "b_public"), chart("c_secret", "b_draft")],
+        )
+        .await;
+        answer(&server, &["FROM console.bi_board FINAL"], vec![]).await;
+        let ch =
+            lakehouse_clickhouse::ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let pick = |charts: &[lakehouse_bi::store::StoredChartSpec]| -> Vec<String> {
+            charts.iter().map(|c| c.spec.id.clone()).collect()
+        };
+
+        let me = lakehouse_bi::access::Viewer::user("u_me", false);
+        let used = usage_of(&ch, pick, Vec::new(), &me).await.unwrap();
+        assert!(!used.is_empty());
+        assert_eq!(
+            used.chart_rows.len(),
+            1,
+            "only the chart they may see is listed"
+        );
+        assert!(
+            used.charts.iter().any(|c| c.contains("c_public")),
+            "{:?}",
+            used.charts
+        );
+        assert!(
+            used.charts.contains(&HIDDEN_USE.to_owned()),
+            "{:?}",
+            used.charts
+        );
+        assert!(!used.sentence().contains("c_secret"), "{}", used.sentence());
+
+        // An administrator sees every space: both charts are named, no marker.
+        let admin = lakehouse_bi::access::Viewer::user("u_admin", true);
+        let used = usage_of(&ch, pick, Vec::new(), &admin).await.unwrap();
+        assert_eq!(used.chart_rows.len(), 2);
+        assert!(!used.charts.contains(&HIDDEN_USE.to_owned()));
+    }
 
     /// BI-2 (T3): a metric watched by an alert rule cannot be deleted, and the
     /// refusal names the rule.

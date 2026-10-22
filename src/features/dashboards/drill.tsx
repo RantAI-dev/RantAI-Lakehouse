@@ -1,10 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { ArrowDownToLine, ChevronLeft, ChevronRight, Filter, Table2 } from "lucide-react";
+import { ArrowDownToLine, ChevronLeft, ChevronRight, Filter, StickyNote, Table2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ErrorWithReference } from "@/components/error-reference";
+import { Input } from "@/components/ui/input";
 import { RowsTable } from "@/components/patterns/rows-table";
 import { useService } from "@/hooks/use-service";
 import { SkippedFiltersMarker } from "./filters/skipped-marker";
@@ -26,7 +27,7 @@ export type DrillTarget = {
 
 /** The menu at the cursor after clicking a data point: filter by it, or see its rows. */
 export function DrillMenu({
-  drill, onClose, onFilter, onRecords, drillDown,
+  drill, onClose, onFilter, onRecords, drillDown, onAddNote,
 }: {
   readonly drill: DrillTarget;
   readonly onClose: () => void;
@@ -36,6 +37,8 @@ export function DrillMenu({
   readonly onRecords?: () => void;
   /** BI-10: go one level down a hierarchy, or the plain reason it cannot be done. Absent when the column is in no hierarchy. */
   readonly drillDown?: { readonly label: string; readonly onSelect: () => void } | { readonly reason: string };
+  /** BI-17: pin a note on this point. Present only in edit mode, for a user who may change the chart. */
+  readonly onAddNote?: () => void;
 }) {
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -69,6 +72,11 @@ export function DrillMenu({
           <p className="flex items-start gap-2 px-2.5 py-1.5 text-xs text-muted-foreground">
             <ArrowDownToLine className="mt-0.5 size-3.5 shrink-0" aria-hidden /> Cannot drill down: {drillDown.reason}
           </p>
+        ) : null}
+        {onAddNote ? (
+          <button role="menuitem" onClick={onAddNote} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
+            <StickyNote className="size-4" /> Add note…
+          </button>
         ) : null}
         {onRecords ? (
           <button role="menuitem" onClick={onRecords} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
@@ -211,5 +219,31 @@ function RecordDetail({
         <div className="h-40 animate-pulse rounded bg-muted/40" />
       )}
     </>
+  );
+}
+
+/** The text of a note to pin on a point (`BI-17`): plain text, at most 140 characters. */
+export function NoteDialog({ point, saving, error, onSave, onClose }: {
+  readonly point: string;
+  readonly saving?: boolean;
+  readonly error?: string | null;
+  readonly onSave: (text: string) => void;
+  readonly onClose: () => void;
+}) {
+  const [text, setText] = React.useState("");
+  const clean = text.trim();
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader><DialogTitle>Add a note to {point}</DialogTitle></DialogHeader>
+        <Input autoFocus value={text} maxLength={140} aria-label="Note" placeholder="Plain text, up to 140 characters"
+          onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && clean) onSave(clean); }} />
+        {error ? <p role="alert" className="text-xs text-destructive">{error}</p> : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+          <Button size="sm" disabled={!clean || saving} onClick={() => onSave(clean)}>{saving ? "Saving…" : "Save"}</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

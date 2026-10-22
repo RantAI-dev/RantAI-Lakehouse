@@ -1,17 +1,23 @@
-import type { Board } from "./bi-store"
+import type { Board } from "../contracts/dashboards"
 import type {
   CreateBoardInput,
   DashboardFolder,
   DashboardService,
   JoinSuggestions,
+  RestoredItem,
+  RevertResult,
   SaveSqlSourceInput,
+  ShortcutItem,
+  Shortcuts,
   SqlSource,
   SqlSourcePreview,
+  TrashList,
   UpdateBoardInput,
+  VersionHistory,
 } from "../contracts/dashboards"
 import type { EmbedInfo } from "../contracts/dashboards"
 import { apiFetch } from "../http"
-import { ServiceError } from "../errors"
+import { ServiceError, type ServiceErrorCode } from "../errors"
 
 /**
  * DashboardService NYATA — board disimpan di ClickHouse
@@ -31,18 +37,40 @@ import { ServiceError } from "../errors"
  * with the server's message naming what is blocking it.
  */
 
+/**
+ * The service error code for a status: 401 and 403 are a permission, 404 is
+ * "not found", a 5xx is the service being unavailable, the rest is a request
+ * the server refused. One rule for every call here.
+ */
+function codeFor(status: number): ServiceErrorCode {
+  if (status === 401 || status === 403) return "permission_denied"
+  if (status === 404) return "not_found"
+  if (status >= 500) return "unavailable"
+  return "invalid_request"
+}
+
 async function readJson<T>(res: Response): Promise<T> {
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`)
+    throw new ServiceError(codeFor(res.status), json?.error ?? `Gagal (${res.status})`)
+  }
+  return json as T
+}
+
+/**
+ * A dashboard write's answer (BI-18 part C review fix (SHOULD-FIX) R19): the
+ * answer is checked, and a refusal throws with the server's sentence. A
+ * refusal without one says the status. The `code:` prefix the server may put
+ * in front of its sentence is for the log: the page shows the readable
+ * sentence (`readableErrorMessage`).
+ */
+async function checkedWrite<T>(res: Response): Promise<T> {
+  const json = await res.json().catch(() => null)
+  if (!res.ok) {
+    throw new ServiceError(
+      codeFor(res.status),
+      json?.error ?? `The change was refused (${res.status}).`
+    )
   }
   return json as T
 }
@@ -55,15 +83,7 @@ async function request<T>(
   const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? "permission_denied"
-        : res.status === 404
-          ? "not_found"
-          : res.status >= 500
-            ? "unavailable"
-            : "invalid_request"
-    throw new ServiceError(kind, json?.error ?? fallbackMessage)
+    throw new ServiceError(codeFor(res.status), json?.error ?? fallbackMessage)
   }
   return json as T
 }
@@ -79,7 +99,7 @@ async function writeBoard(
     body: JSON.stringify(body),
     signal,
   })
-  const json = await readJson<{ board?: Board }>(res)
+  const json = await checkedWrite<{ board?: Board }>(res)
   // PUT hanya mengembalikan `{ok:true}`; POST mengembalikan board barunya.
   return json.board ?? ({ id: String(body.id ?? ""), name: "" } as Board)
 }
@@ -110,7 +130,31 @@ export const clickhouseDashboardService: DashboardService = {
       method: "DELETE",
       signal,
     })
-    await readJson<unknown>(res)
+    await checkedWrite<unknown>(res)
+  },
+  /**
+   * Save the tile layout of a dashboard (`PUT /api/dashboard/boards`). The
+   * console's own write; it needs `dashboard:write`.
+   */
+  async saveBoardLayout(id, layout, signal) {
+    const res = await apiFetch("/api/dashboard/boards", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ id, layout }),
+      signal,
+    })
+    await checkedWrite<unknown>(res)
+  },
+  /**
+   * Delete one saved chart card (`DELETE /api/dashboard/specs`). It needs
+   * `dashboard:write`.
+   */
+  async deleteChart(id, signal) {
+    const res = await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<unknown>(res)
   },
 
   async listSqlSources(signal) {
@@ -258,5 +302,75 @@ export const clickhouseDashboardService: DashboardService = {
       "The token could not be withdrawn"
     )
     return json.withdrawn ?? ""
+  },
+
+  // BI-18 part C, part 2. The server's sentences are fixed and ours (a revert
+  // that cannot be done says which chart and why), so they are shown as they come.
+  async listVersions(board, signal) {
+    return request<VersionHistory>(
+      `/api/dashboard/versions?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "Version history could not be loaded"
+    )
+  },
+  async revertToVersion(board, version, signal) {
+    return request<RevertResult>(
+      "/api/dashboard/versions/revert",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ board, version }), signal },
+      "That version could not be restored"
+    )
+  },
+  async listTrash(signal) {
+    return request<TrashList>(
+      "/api/dashboard/trash",
+      { cache: "no-store", signal },
+      "The trash could not be loaded"
+    )
+  },
+  async restoreFromTrash(kind, id, signal) {
+    const json = await request<{ restored: RestoredItem }>(
+      "/api/dashboard/trash/restore",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "It could not be restored"
+    )
+    return json.restored
+  },
+  async ensurePersonalSpace(signal) {
+    const json = await request<{ folder: DashboardFolder }>(
+      "/api/dashboard/personal",
+      { method: "POST", signal },
+      "The personal space could not be opened"
+    )
+    return json.folder
+  },
+  async shortcuts(signal) {
+    const json = await request<Partial<Shortcuts>>(
+      "/api/dashboard/shortcuts",
+      { cache: "no-store", signal },
+      "Favourites could not be loaded"
+    )
+    return { favourites: json.favourites ?? [], recent: json.recent ?? [] }
+  },
+  async setFavourite(kind, id, on, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/favourites",
+      { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ kind, id, on }), signal },
+      "The favourite could not be saved"
+    )
+  },
+  async touchRecent(kind, id, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/recent",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ kind, id }), signal },
+      "Recent items could not be saved"
+    )
+  },
+  async searchItems(text, signal): Promise<ShortcutItem[]> {
+    const json = await request<{ hits?: ShortcutItem[] }>(
+      `/api/dashboard/search?q=${encodeURIComponent(text)}`,
+      { cache: "no-store", signal },
+      "Search is unavailable"
+    )
+    return json.hits ?? []
   },
 }

@@ -3,6 +3,14 @@
 //! §4, stage 1: folders only; no per-folder permissions, no personal
 //! folders (boards have no owner column yet), no revision history.
 //!
+//! # The personal space (`BI-18` part C, part 2)
+//!
+//! A folder with an `owner_id` is one user's personal space: created on first
+//! use ([`ensure_personal_folder`], with an id derived from the owner so two
+//! first uses are one folder), at the root, holding dashboards only (no
+//! subfolders, no rename, no delete). [`crate::access::Viewer`] decides who
+//! sees it: its owner, and a principal with `identity:write`.
+//!
 //! Stored in `console.bi_folder` with the same versioned-insert / tombstone
 //! semantics as `bi_board` (see [`crate::store::ensure_bi_table`]). A board
 //! or source points at its folder with `folder_id`; `""` is the root.
@@ -23,6 +31,7 @@ use lakehouse_core::ident::SqlLiteral;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::access::Viewer;
 use crate::store::{ensure_bi_table, random_hex};
 
 /// Deepest a folder may sit: a folder at the root is depth 1.
@@ -46,6 +55,10 @@ pub struct Folder {
     /// When this version was saved (`ClickHouse`-formatted).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub updated_at: Option<String>,
+    /// The principal id whose personal space this is; `""` for an ordinary
+    /// folder, which is left off the wire.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub owner_id: String,
 }
 
 /// Why a folder cannot be created, renamed or moved as asked. Every message
@@ -195,37 +208,114 @@ pub fn new_folder_id() -> String {
     format!("f_{}", random_hex(4))
 }
 
-const FOLDER_COLS: &str = "id, name, parent_id, created_by, toString(created_at) AS updated_at";
+const FOLDER_COLS: &str =
+    "id, name, parent_id, created_by, owner_id, toString(created_at) AS updated_at";
 
 fn row_str<'a>(row: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Every live folder, by name.
+fn row_to_folder(r: &serde_json::Map<String, Value>) -> Folder {
+    Folder {
+        id: row_str(r, "id").to_owned(),
+        name: row_str(r, "name").to_owned(),
+        parent_id: row_str(r, "parent_id").to_owned(),
+        created_by: row_str(r, "created_by").to_owned(),
+        updated_at: Some(row_str(r, "updated_at").to_owned()),
+        owner_id: row_str(r, "owner_id").to_owned(),
+    }
+}
+
+/// Every live folder `viewer` may see, by name: the ordinary ones, and the
+/// personal spaces the viewer owns (all of them for a viewer who sees all).
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn list_folders(ch: &ChClient) -> Result<Vec<Folder>, ChError> {
+pub async fn list_folders(ch: &ChClient, viewer: &Viewer) -> Result<Vec<Folder>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
             &format!(
-                "SELECT {FOLDER_COLS} FROM console.bi_folder FINAL WHERE is_deleted = 0 ORDER BY name"
+                "SELECT {FOLDER_COLS} FROM console.bi_folder FINAL WHERE is_deleted = 0{} ORDER BY name",
+                viewer.owner_clause()
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.iter().map(row_to_folder).collect())
+}
+
+/// The owner of folder `id`: `""` for the root, an ordinary folder or an
+/// unknown id (the caller checks existence separately).
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn folder_owner(ch: &ChClient, id: &str) -> Result<String, ChError> {
+    if id.is_empty() {
+        return Ok(String::new());
+    }
+    ensure_bi_table(ch).await?;
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT {FOLDER_COLS} FROM console.bi_folder FINAL WHERE is_deleted = 0 AND id = {} LIMIT 1",
+                SqlLiteral::from(id)
             ),
             None,
         )
         .await?;
     Ok(rows
-        .iter()
-        .map(|r| Folder {
-            id: row_str(r, "id").to_owned(),
-            name: row_str(r, "name").to_owned(),
-            parent_id: row_str(r, "parent_id").to_owned(),
-            created_by: row_str(r, "created_by").to_owned(),
-            updated_at: Some(row_str(r, "updated_at").to_owned()),
-        })
-        .collect())
+        .first()
+        .map(|r| row_str(r, "owner_id").to_owned())
+        .unwrap_or_default())
+}
+
+/// The id of the personal space of `owner`: derived from the principal id, so
+/// two first uses at once write the same row and `ReplacingMergeTree` keeps
+/// one.
+#[must_use]
+pub fn personal_folder_id(owner: &str) -> String {
+    let compact: String = owner
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(32)
+        .collect();
+    format!("fp_{compact}")
+}
+
+/// The personal space of `owner` (a principal id, never empty), creating it
+/// on first use. `display_name` only labels it for an administrator who sees
+/// everyone's.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn ensure_personal_folder(
+    ch: &ChClient,
+    owner: &str,
+    display_name: &str,
+) -> Result<Folder, ChError> {
+    let id = personal_folder_id(owner);
+    let mine = list_folders(ch, &Viewer::user(owner, false)).await?;
+    if let Some(found) = mine.into_iter().find(|f| f.id == id) {
+        return Ok(found);
+    }
+    let name: String = format!("Personal space of {}", display_name.trim())
+        .chars()
+        .take(MAX_FOLDER_NAME_CHARS)
+        .collect();
+    let folder = Folder {
+        id,
+        name,
+        parent_id: String::new(),
+        created_by: owner.to_owned(),
+        updated_at: None,
+        owner_id: owner.to_owned(),
+    };
+    save_folder(ch, &folder).await?;
+    Ok(folder)
 }
 
 /// Save (create, rename or move) a folder. The caller has already applied
@@ -237,11 +327,12 @@ pub async fn list_folders(ch: &ChClient) -> Result<Vec<Folder>, ChError> {
 pub async fn save_folder(ch: &ChClient, folder: &Folder) -> Result<(), ChError> {
     ensure_bi_table(ch).await?;
     let sql = format!(
-        "INSERT INTO console.bi_folder (id, name, parent_id, created_by) VALUES ({}, {}, {}, {})",
+        "INSERT INTO console.bi_folder (id, name, parent_id, created_by, owner_id) VALUES ({}, {}, {}, {}, {})",
         SqlLiteral::from(folder.id.as_str()),
         SqlLiteral::from(folder.name.as_str()),
         SqlLiteral::from(folder.parent_id.as_str()),
         SqlLiteral::from(folder.created_by.as_str()),
+        SqlLiteral::from(folder.owner_id.as_str()),
     );
     ch.exec(&sql, None).await
 }
@@ -273,6 +364,7 @@ mod tests {
             parent_id: parent.to_owned(),
             created_by: String::new(),
             updated_at: None,
+            owner_id: String::new(),
         }
     }
 

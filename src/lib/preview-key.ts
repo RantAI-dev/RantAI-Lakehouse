@@ -24,6 +24,10 @@ export type PreviewInputs = {
   params: string
   /** BI-13: the chart's other questions and how its own series is drawn, as they would be sent. */
   layers: string
+  /** BI-16 part B: the goal, bands, histogram ranges and card address as typed. */
+  types: string
+  /** BI-17 part A: the style as it would be sent (formats, colours, axes, labels, notes, tooltip, conditional colours). */
+  style: string
 }
 
 export function previewKey(inputs: PreviewInputs): string {

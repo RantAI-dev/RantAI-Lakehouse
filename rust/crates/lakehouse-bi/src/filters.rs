@@ -152,6 +152,13 @@ pub struct FilterDef {
     /// has no column and so never becomes a predicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment: Option<String>,
+    /// `BI-18` part C: the ids of the dashboard tabs this filter applies to.
+    /// Absent (or empty) means every tab, which is what a filter saved before
+    /// tabs existed means. Meaningful only on a board's filters; the server
+    /// never reads it when building SQL, only when choosing which filters a
+    /// tile gets ([`FilterDef::applies_on`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<String>>,
 }
 
 #[allow(
@@ -181,6 +188,7 @@ impl FilterDef {
             max_exclusive: false,
             required: false,
             segment: None,
+            tabs: None,
         }
     }
 
@@ -213,6 +221,19 @@ impl FilterDef {
         }
     }
 
+    /// Whether a tile on `tab` is given this filter (`BI-18` part C). A filter
+    /// with no ties applies on every tab, and so does one on a board with no
+    /// tabs (`tab` is `None`): a tile on a tab the filter is not tied to
+    /// simply does not get it, which is not a skip and is never reported as
+    /// one.
+    #[must_use]
+    pub fn applies_on(&self, tab: Option<&str>) -> bool {
+        match (&self.tabs, tab) {
+            (Some(ties), Some(tab)) if !ties.is_empty() => ties.iter().any(|t| t == tab),
+            _ => true,
+        }
+    }
+
     /// Check the filter is well-formed: the fields its op needs are present
     /// and parse. It does not know the column's type; that is checked per
     /// relation when the predicate is built.
@@ -222,6 +243,17 @@ impl FilterDef {
     /// A message for the caller, naming what is wrong. It never echoes the
     /// offending value.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ties) = &self.tabs {
+            if ties.len() > crate::layout::MAX_TABS {
+                return Err(format!(
+                    "a filter is tied to at most {} tabs",
+                    crate::layout::MAX_TABS
+                ));
+            }
+            for tab in ties {
+                crate::layout::check_tab_id(tab)?;
+            }
+        }
         if let Some(name) = &self.segment {
             // A reference carries nothing but the name.
             if Ident::new(name.clone()).is_err() || !self.column.is_empty() {
@@ -633,5 +665,43 @@ mod tests {
         ] {
             assert_eq!(ColumnKind::from_clickhouse_type(ty), want, "{ty}");
         }
+    }
+
+    #[test]
+    fn a_filter_tied_to_tabs_round_trips_and_a_legacy_one_keeps_its_bytes() {
+        let legacy = r#"{"column":"kawasan","values":["Asia"]}"#;
+        assert!(parse(legacy).tabs.is_none());
+        assert_eq!(serde_json::to_string(&parse(legacy)).unwrap(), legacy);
+        let tied = r#"{"column":"kawasan","values":["Asia"],"tabs":["t_a","t_b"]}"#;
+        let f = parse(tied);
+        assert_eq!(
+            f.tabs.as_deref(),
+            Some(&["t_a".to_owned(), "t_b".to_owned()][..])
+        );
+        assert_eq!(serde_json::to_string(&f).unwrap(), tied);
+        assert!(f.validate().is_ok());
+        assert!(f.applies_on(Some("t_b")) && !f.applies_on(Some("t_c")));
+    }
+
+    #[test]
+    fn a_tie_must_be_a_short_list_of_well_formed_tab_ids() {
+        let with = |tabs: &str| {
+            parse(&format!(
+                r#"{{"column":"kawasan","values":["a"],"tabs":{tabs}}}"#
+            ))
+            .validate()
+        };
+        assert!(with(r#"["ok_1"]"#).is_ok());
+        assert!(with("[]").is_ok(), "an empty list is no tie");
+        assert!(with(r#"["a b"]"#).is_err());
+        assert!(with(r#"[""]"#).is_err());
+        let many = format!(
+            "[{}]",
+            (0..21)
+                .map(|i| format!("\"t{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(with(&many).is_err());
     }
 }

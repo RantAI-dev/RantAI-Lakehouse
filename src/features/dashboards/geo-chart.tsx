@@ -9,6 +9,7 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { readView, stepZoom, ZOOM_MAX, ZOOM_MIN } from "@/lib/geo-view";
 import { EChart } from "./echart";
 import { ensureMap, mapEntry } from "./echarts-maps";
+import type { ValueFormat } from "@/lib/chart-style";
 import { buildGeoOption, regionNamesFor, resolveMapId } from "./geo-option";
 
 type Row = Record<string, unknown>;
@@ -23,8 +24,10 @@ const CONTROL_BUTTON_CLASS = "border-border bg-background/85 shadow-xs backdrop-
  * map first (local GeoJSON) and says plainly when it cannot be drawn: an id
  * the console has no map for, or a GeoJSON file that is missing.
  */
-export function GeoChart({ spec, rows, dark, onDataClick }: {
+export function GeoChart({ spec, rows, dark, onDataClick, format, locale, byValue }: {
   spec: ChartRenderSpec; rows: Row[]; dark: boolean; onDataClick?: ChartClickHandler;
+  /** BI-17: the chart's number format, the deployment's locale and the colour range of a map. */
+  format?: ValueFormat; locale?: string; byValue?: string[];
 }) {
   const mapId = resolveMapId(spec);
   const entry = mapEntry(mapId);
@@ -57,13 +60,14 @@ export function GeoChart({ spec, rows, dark, onDataClick }: {
   }
   // A different map or kind starts from its own fit: the old pan and zoom
   // are coordinates of another map.
-  return <ReadyMap key={`${spec.kind}:${mapId}`} spec={spec} rows={rows} dark={dark} onDataClick={onDataClick} />;
+  return <ReadyMap key={`${spec.kind}:${mapId}`} spec={spec} rows={rows} dark={dark} onDataClick={onDataClick} format={format} locale={locale} byValue={byValue} />;
 }
 
-function ReadyMap({ spec, rows, dark, onDataClick }: {
+function ReadyMap({ spec, rows, dark, onDataClick, format, locale, byValue }: {
   spec: ChartRenderSpec; rows: Row[]; dark: boolean; onDataClick?: ChartClickHandler;
+  format?: ValueFormat; locale?: string; byValue?: string[];
 }) {
-  const { option, notices } = React.useMemo(() => buildGeoOption(spec, rows, dark), [spec, rows, dark]);
+  const { option, notices } = React.useMemo(() => buildGeoOption(spec, rows, dark, { format, locale, byValue }), [spec, rows, dark, format, locale, byValue]);
   // A region is drilled by the spelling the column stores, which only the
   // rows know (geo-option.ts `regionNamesFor`); computed once per data load.
   const regionNames = React.useMemo(() => regionNamesFor(spec, rows), [spec, rows]);

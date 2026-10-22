@@ -69,6 +69,13 @@ export const connectorService = postgresConnectorService
 // itself still calls `/api/dashboard/*` directly for charts/layout/filters.
 // No mock ever existed for this service.
 export const dashboardService = clickhouseDashboardService
+/**
+ * The dashboard types the console's features use. They live in the contract
+ * (`services/contracts/dashboards`), not in a client, and are exported here so
+ * a feature imports them from `@/services` and not from a client
+ * (`PR #199 review M SHOULD-FIX BI-16 7`).
+ */
+export type { Board, BoardTab, LayoutMap, PhoneTile, TileBox } from "./contracts/dashboards"
 /** Calculated fields of a mart or SQL source (BI-8). */
 export const calcFieldService = calcFieldClientService
 /** Reusable metrics and segments (BI-2). */
@@ -104,6 +111,13 @@ export const homeService = homeClientService
 // The deployment's report time zone and first day of the week over
 // `/api/settings/reporting` (BI-9).
 export const settingsService = settingsClientService
+/**
+ * The reporting settings a caller sends (the report time zone, the first day
+ * of the week, the number locale, the company palette, the fonts and the
+ * content sites). The contract owns the shape, and it is exported here so a
+ * feature imports it from `@/services` (`PR #199 review M SHOULD-FIX BI-17 7`).
+ */
+export type { ReportingSettingsInput } from "./contracts/settings"
 // The words a user defined for the chat (`PUT /api/ai/terms`), stored when
 // they pick an answer to a question the chat asked. No mock ever existed.
 export const chatTermService = chatTermClientService

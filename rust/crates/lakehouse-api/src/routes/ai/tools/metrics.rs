@@ -91,12 +91,17 @@ async fn find(state: &AppState, args: &Map<String, Value>) -> Result<metrics::Me
         .ok_or_else(|| json!({ "error": "no metric has that name; call list_metrics" }))
 }
 
-async fn list_metrics(state: &AppState, args: &Map<String, Value>) -> Value {
+async fn list_metrics(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let q = match serde_json::from_value(Value::Object(route_args(args))) {
         Ok(q) => q,
         Err(_unparsed) => return json!({ "error": "give mart or sqlSource, or nothing for all" }),
     };
-    let listed = api_result_to_value(routes::list(State(state.clone()), Query(q)).await).await;
+    let who = principal.cloned().map(Extension);
+    let listed = api_result_to_value(routes::list(State(state.clone()), who, Query(q)).await).await;
     // Names, labels, descriptions and sources: what the model needs to choose
     // one. The formula is for describe_metric.
     let rows: Vec<Value> = listed["metrics"]
@@ -120,13 +125,18 @@ async fn list_metrics(state: &AppState, args: &Map<String, Value>) -> Value {
     json!({ "metrics": rows })
 }
 
-async fn describe_metric(state: &AppState, args: &Map<String, Value>) -> Value {
+async fn describe_metric(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let found = match find(state, args).await {
         Ok(m) => m,
         Err(e) => return e,
     };
+    let who = principal.cloned().map(Extension);
     let usage =
-        api_result_to_value(routes::usage(State(state.clone()), Path(found.id.clone())).await)
+        api_result_to_value(routes::usage(State(state.clone()), who, Path(found.id.clone())).await)
             .await;
     json!({ "metric": found, "usage": usage })
 }
@@ -216,8 +226,8 @@ pub(super) async fn run(
     args: &Map<String, Value>,
 ) -> Value {
     match name {
-        "list_metrics" => list_metrics(state, args).await,
-        "describe_metric" => describe_metric(state, args).await,
+        "list_metrics" => list_metrics(state, principal, args).await,
+        "describe_metric" => describe_metric(state, principal, args).await,
         "query_metric" => query_metric(state, principal, args).await,
         "create_metric" => {
             let who = principal.cloned().map(Extension);
@@ -238,7 +248,8 @@ pub(super) async fn run(
                 Ok(q) => q,
                 Err(_unparsed) => return json!({ "error": "id is required" }),
             };
-            api_result_to_value(routes::delete(State(state.clone()), Query(q)).await).await
+            let who = principal.cloned().map(Extension);
+            api_result_to_value(routes::delete(State(state.clone()), who, Query(q)).await).await
         }
         other => json!({ "error": format!("unknown tool: {other}") }),
     }
