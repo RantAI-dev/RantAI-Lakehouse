@@ -803,6 +803,50 @@ job at a time, no `cargo clean`):
 **Incidents.** None with other sessions: no `pgrep -f` loops that could match other processes (my first wait loop did match
 itself and I stopped it by its task id), no cargo job of mine ran beside another, `df` showed 13 to 17 GB free throughout.
 
+### Slice 5, round 2 (developer)
+
+Fix of `BLOCKER` 5 (commit "test(uploads): a column the first file does not fit gives no verdict ..."). The code's rule
+(`group.rs`, no verdict on a column the first file's own sample does not fit) is kept; the test
+`a_whole_number_fits_a_decimal_column_but_a_decimal_does_not_fit_an_integer_one` was stale. It now asserts the
+no-verdict case for a first file holding `1.5` over an `Integer` column, and uses a first file holding `1` for the conflict.
+
+Run on the final commit of this fix, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`,
+no other cargo running, 9.3 GB free disk, 7 GB available memory:
+- `cargo test -p lakehouse-api --lib`: **2456 passed, 0 failed, 18 ignored**.
+- `cargo test -p lakehouse-api --test route_auth`: **55 passed**. `--test upload_routes`: **140 passed**.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --locked -- -D warnings`: clean. `cargo fmt --check`: clean.
+
+### Handoff: slice 6 (developer)
+
+**Commits.** `test(uploads): the large-upload harness adds a JSON Lines file and a gzipped CSV ... (T6.1)`;
+`docs(changelog): DATA-17 and DATA-18 slices 2, 3, 4 and the large-file harness (T6.3 developer part)`; this entry.
+
+**T6.1 (prepared, not run).** `ops/g9/large_upload.py` now also generates and loads a JSON Lines file (`--jsonl-mb`) and a
+gzipped CSV that unpacks to `--gzip-mb` (the old `--gzip` flag, refused until slice 4, is gone); the workflow
+`g9-upload-large.yml` takes `jsonl_mb` and `gzip_mb`. Full size is `csv_mb=2048 parquet_mb=1945 parquet_files=10
+jsonl_mb=2048 gzip_mb=2048`; the defaults stay 200. Nothing was measured and nothing is claimed.
+
+**What T6.1 needs, and a mismatch for the planner.** The plan runs T6.1 before T6.2 raises the cap, but the API refuses a
+session above `MAX_SESSION_BYTES` (50 MiB, `routes/uploads/sessions.rs:96`; the plan calls it `MAX_UPLOAD_BYTES`, which is the
+separate `POST /api/uploads` cap), and the gzip/zip unpack check uses `MAX_UPLOAD_BYTES`. So no dispatch above 50 MiB can
+succeed, the 200 MiB default included. The planner must decide how the measured build carries a raised cap (for example a
+throwaway branch that raises both constants to 2 GiB and is dispatched, then T6.2 sets the final value). Also: the harness loads
+each Parquet file into its own table, because 10 files in one load would pass the job's `MAX_ROWS` (2,000,000, all files together);
+whether to measure one load of ten files is the planner's call with T6.2's `MAX_ROWS` decision.
+
+**T6.2.** Not changed: `MAX_SESSION_BYTES`, `MAX_UPLOAD_BYTES`, `src/lib/uploads.ts` and `MAX_ROWS` wait for the measured numbers.
+
+**T6.3.** `CHANGELOG.md`: entries for slices 2, 3, 4 and the harness (slices 1 and 5 had them). Feature pages, PRODUCT, BACKLOG, ADR: the planner's.
+
+**Commands run.**
+- `python -m pytest ops/g9/test_large_upload.py` (dagster venv): 8 passed (3 new); `py_compile ops/g9/large_upload.py` ok; workflow YAML parses.
+- `cd dagster && python -m pytest dispar_orchestrate -q -x` (foreground, whole suite): **1775 passed, 1 skipped** in 16m37s.
+- `check_intra_package_imports.py` and `check_bare_iceberg_count.py`: OK.
+
+**Not verified.** The harness on a stack (JSON Lines and gzip loads through the real ingest, `memory.peak` reads on a runner);
+that ingest of JSON Lines/gzip needs no preview call first (`upload_test.py` calls it, the harness does not); `bun` checks and
+Rust (no TypeScript or Rust file changed after the round-2 run); `cargo test --workspace`. Disk was 5.9 GB free at the end.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
