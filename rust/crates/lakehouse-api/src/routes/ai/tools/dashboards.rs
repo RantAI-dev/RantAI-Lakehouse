@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use super::arg_str;
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
-    viewer_of, visible_live_chart_board,
+    viewer_of,
 };
 use crate::routes::support::is_numeric_type;
 use crate::upstream_error;
@@ -367,10 +367,9 @@ pub(super) async fn delete_chart(
     // BI-18 part C, part 2: a chart the person cannot see is answered like one
     // that does not exist, and nothing is deleted. A deleted chart goes to the
     // trash, restorable for 30 days.
-    let board = match visible_live_chart_board(ch, &id, &viewer_for(principal)).await {
-        Ok(Some(board)) => board,
-        Ok(None) => return json!({ "deleted": true, "id": id }),
-        Err(err) => return refused(err),
+    let board = match require_editable_chart(ch, &id, &viewer_for(principal)).await {
+        Ok(board) => board,
+        Err(gate) => return refused(gate),
     };
     let by = principal.map_or("Assistant", |p| p.display_name.as_str());
     match store::delete_chart(ch, &id, by).await {
@@ -553,9 +552,32 @@ mod tests {
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("c_private"));
-        let _ = delete_chart(&ch, Some(&person(7)), &args).await;
+        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        assert_eq!(reply["error"], json!("this tile does not exist"), "{reply}");
+        assert!(reply.get("deleted").is_none(), "{reply}");
         let all = sent(&server).await;
         assert!(writes(&all).is_empty(), "{:?}", writes(&all));
+    }
+
+    /// A chart that is not there at all is refused like one the person may not
+    /// see: the same sentence, and no "deleted" that says the chart is gone.
+    #[tokio::test]
+    async fn the_assistant_refuses_to_delete_a_chart_that_is_not_there() {
+        let server = MockServer::start().await;
+        rows(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            Vec::new(),
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = Map::new();
+        args.insert("id".to_owned(), json!("c_missing"));
+        let reply = delete_chart(&ch, Some(&person(7)), &args).await;
+        assert_eq!(reply["error"], json!("this tile does not exist"), "{reply}");
+        assert!(reply.get("deleted").is_none(), "{reply}");
+        assert!(writes(&sent(&server).await).is_empty());
     }
 
     #[tokio::test]
