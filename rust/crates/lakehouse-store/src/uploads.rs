@@ -102,6 +102,15 @@
 //!
 //! All four return `None` or `false` when they change nothing; the caller
 //! re-reads the row to tell "gone" from "not in that state".
+//!
+//! # Several files, one load (`DATA-17` slice 5, `0092_upload_loaded_with.sql`)
+//!
+//! A load of several files is one claim of a primary upload plus the others
+//! ([`mark_group_within_limits`]); the others carry `loaded_with = <primary>`. The
+//! primary alone has the run, and [`mark_finished`] settles the others with it. The
+//! load limits count a load once ([`loads_under_limits`] skips rows with
+//! `loaded_with`). A later claim of any of the files lets go of the files it led, and
+//! deleting a primary leaves the others with no pointer (`ON DELETE SET NULL`).
 
 use serde::Serialize;
 use serde_json::Value;
@@ -257,6 +266,11 @@ pub struct Upload {
     /// the last load found any (bounded: 100 values of 200 characters).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bad_values: Option<Json<Value>>,
+    /// The primary upload of the load this file belongs to, set on every OTHER file of
+    /// a load of several files (`DATA-17` slice 5, `0092_upload_loaded_with.sql`);
+    /// `None` for a file that loaded alone and for the primary itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_with: Option<String>,
     /// When the bytes were stored.
     #[serde(serialize_with = "ser_ts")]
     pub created_at: OffsetDateTime,
@@ -269,7 +283,7 @@ pub struct Upload {
 const COLS: &str = "id, original_filename, storage_key, content_type, size_bytes, sha256, \
                     uploaded_by, tenant_id, status, parse_options, bronze_table, load_mode, \
                     row_count, run_id, error, declared_size, multipart_id, parts_digest, column_spec, on_bad_value, \
-                    bad_values, created_at, updated_at";
+                    bad_values, loaded_with, created_at, updated_at";
 
 /// Everything needed to record a file whose bytes are already stored.
 ///
@@ -708,7 +722,8 @@ pub async fn mark_ingesting(
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
          bronze_table = $3, load_mode = $4, run_id = $5, error = NULL, row_count = NULL, \
-         column_spec = NULL, on_bad_value = NULL, bad_values = NULL, updated_at = now() \
+         column_spec = NULL, on_bad_value = NULL, bad_values = NULL, loaded_with = NULL, \
+         updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
     Ok(sqlx::query_as(&sql)
@@ -734,7 +749,7 @@ const LOAD_COUNTS_FOR_HOURS: i32 = 6;
 /// total. Both are at least 1; the API reads them from its configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadLimits {
-    /// Loads (`ingesting` rows) one `uploaded_by` may have at once.
+    /// Loads (`ingesting` rows that lead a load) one `uploaded_by` may have at once.
     pub per_user: i64,
     /// Loads any `uploaded_by` may have at once, together.
     pub total: i64,
@@ -750,6 +765,10 @@ pub enum MarkOutcome {
     NotMarked,
     /// A limit was reached; nothing was changed.
     LimitReached,
+    /// A load of several files: one of the other files could not be taken (it is
+    /// loading, being received, gone or another tenant's), so nothing was changed.
+    /// Only [`mark_group_within_limits`] answers it.
+    GroupNotMarked,
 }
 
 /// Whether `uploaded_by` (the person recorded on upload `id`) and the
@@ -784,7 +803,7 @@ async fn under_limits(
            count(*) FILTER (WHERE uploaded_by = \
              (SELECT uploaded_by FROM file_upload WHERE id = $1)), \
            count(*) \
-         FROM file_upload WHERE status = 'ingesting' \
+         FROM file_upload WHERE status = 'ingesting' AND loaded_with IS NULL \
            AND updated_at > now() - make_interval(hours => $2)",
     )
     .bind(id)
@@ -792,6 +811,22 @@ async fn under_limits(
     .fetch_one(conn)
     .await?;
     Ok(mine < limits.per_user && all < limits.total)
+}
+
+/// What a claim writes on the rows it takes: the reading, the table and mode, and the
+/// column list (`DATA-18`) the load was told.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadClaim<'a> {
+    /// What the load was told to use (encoding, delimiter, header row, sheet).
+    pub parse_options: &'a Value,
+    /// The raw table the load targets.
+    pub bronze_table: &'a str,
+    /// Replace or append.
+    pub load_mode: LoadMode,
+    /// The column list the load was told; `None` is every column text.
+    pub column_spec: Option<&'a Value>,
+    /// What to do with a value that does not fit; set exactly when `column_spec` is.
+    pub on_bad_value: Option<&'a str>,
 }
 
 /// [`mark_ingesting`] with the load limits of `SEC-17`: counts the
@@ -810,6 +845,8 @@ async fn under_limits(
 /// statement as the claim, so a row is never left `ingesting` with half of
 /// what its load was told.
 ///
+/// This is [`mark_group_within_limits`] for a load of one file.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] on a database failure.
@@ -823,6 +860,46 @@ pub async fn mark_ingesting_within_limits(
     column_spec: Option<&Value>,
     on_bad_value: Option<&str>,
 ) -> Result<MarkOutcome, StoreError> {
+    let claim = LoadClaim {
+        parse_options,
+        bronze_table,
+        load_mode,
+        column_spec,
+        on_bad_value,
+    };
+    mark_group_within_limits(pool, id, &[], &claim, limits).await
+}
+
+/// Claim the primary upload `id` AND the `also` uploads for one load of several files
+/// (`DATA-17` slice 5, plan AD4), in the one transaction and under the one lock of
+/// [`mark_ingesting_within_limits`].
+///
+/// A load is ONE place against the limits, however many files it holds: the count
+/// skips rows that carry `loaded_with`, because the files after the first would
+/// otherwise make a ten-file load count ten times and `SEC-17`'s four per person
+/// would refuse it.
+///
+/// - Every row that takes part first lets go of the files it led before
+///   (`loaded_with` of those becomes NULL), so a group's label never counts files
+///   of an earlier load.
+/// - The primary is claimed exactly as [`mark_ingesting_within_limits`] claims it,
+///   with `loaded_with = NULL`.
+/// - Each of `also` takes the same reading, table, mode and column list, with
+///   `loaded_with = id`. It must be of the primary's tenant and neither
+///   `ingesting` nor `receiving`; if any one is not, nothing is changed
+///   ([`MarkOutcome::GroupNotMarked`]). The caller has already settled and
+///   checked them: this is the answer when one of them changed in between.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn mark_group_within_limits(
+    pool: &PgPool,
+    id: &str,
+    also: &[String],
+    claim: &LoadClaim<'_>,
+    limits: LoadLimits,
+) -> Result<MarkOutcome, StoreError> {
     let mut tx = pool.begin().await?;
     // `hashtext()` keys the lock on a constant string; the prefix keeps it
     // apart from the other advisory locks keyed on bare strings.
@@ -833,25 +910,60 @@ pub async fn mark_ingesting_within_limits(
         tx.rollback().await?;
         return Ok(MarkOutcome::LimitReached);
     }
+    let mut taking: Vec<String> = Vec::with_capacity(also.len() + 1);
+    taking.push(id.to_owned());
+    taking.extend(also.iter().cloned());
+    sqlx::query("UPDATE file_upload SET loaded_with = NULL WHERE loaded_with = ANY($1)")
+        .bind(&taking)
+        .execute(&mut *tx)
+        .await?;
     let sql = format!(
         "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
          bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
+         loaded_with = NULL, \
          run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
          WHERE id = $1 AND status <> 'ingesting' RETURNING {COLS}"
     );
     let marked: Option<Upload> = sqlx::query_as(&sql)
         .bind(id)
-        .bind(Json(parse_options.clone()))
-        .bind(bronze_table)
-        .bind(load_mode.as_str())
-        .bind(column_spec.map(|spec| Json(spec.clone())))
-        .bind(on_bad_value)
+        .bind(Json(claim.parse_options.clone()))
+        .bind(claim.bronze_table)
+        .bind(claim.load_mode.as_str())
+        .bind(claim.column_spec.map(|spec| Json(spec.clone())))
+        .bind(claim.on_bad_value)
         .fetch_optional(&mut *tx)
         .await?;
+    let Some(marked) = marked else {
+        tx.commit().await?;
+        return Ok(MarkOutcome::NotMarked);
+    };
+    if !also.is_empty() {
+        // Same tenant as the primary, read from the primary's own row: a file of
+        // another tenant, or of none, is never taken, whatever the caller sent.
+        let taken = sqlx::query(
+            "UPDATE file_upload SET status = 'ingesting', parse_options = $2, \
+             bronze_table = $3, load_mode = $4, column_spec = $5, on_bad_value = $6, \
+             loaded_with = $7, \
+             run_id = NULL, error = NULL, row_count = NULL, bad_values = NULL, updated_at = now() \
+             WHERE id = ANY($1) AND status NOT IN ('ingesting', 'receiving') \
+               AND tenant_id = (SELECT tenant_id FROM file_upload WHERE id = $7)",
+        )
+        .bind(also)
+        .bind(Json(claim.parse_options.clone()))
+        .bind(claim.bronze_table)
+        .bind(claim.load_mode.as_str())
+        .bind(claim.column_spec.map(|spec| Json(spec.clone())))
+        .bind(claim.on_bad_value)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if usize::try_from(taken.rows_affected()).ok() != Some(also.len()) {
+            tx.rollback().await?;
+            return Ok(MarkOutcome::GroupNotMarked);
+        }
+    }
     tx.commit().await?;
-    Ok(marked.map_or(MarkOutcome::NotMarked, |row| {
-        MarkOutcome::Marked(Box::new(row))
-    }))
+    Ok(MarkOutcome::Marked(Box::new(marked)))
 }
 
 /// Keep the report of values that did not fit on the upload the load belongs to
@@ -922,6 +1034,10 @@ pub async fn attach_run(
 /// `row_count` is kept only for a load that succeeded, and `None` stays
 /// `None` (not measured), never `0`. A failed load stores no count.
 ///
+/// The files that loaded with this one (`loaded_with = id`, `DATA-17` slice 5) and are
+/// still `ingesting` end in the same transaction, with the same reason; settling the
+/// primary is how a load of several files is settled.
+///
 /// Returns `None` when no row changed: no such upload, it is not
 /// `ingesting`, or it is `ingesting` under another run.
 ///
@@ -944,13 +1060,31 @@ pub async fn mark_finished(
          WHERE id = $1 AND status = 'ingesting' AND run_id IS NOT DISTINCT FROM $2 \
          RETURNING {COLS}"
     );
-    Ok(sqlx::query_as(&sql)
+    let mut tx = pool.begin().await?;
+    let settled: Option<Upload> = sqlx::query_as(&sql)
         .bind(id)
         .bind(run_id)
         .bind(error)
         .bind(row_count)
-        .fetch_optional(pool)
-        .await?)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if settled.is_some() {
+        // `DATA-17` slice 5: the files that loaded with this one end as it ends, in the
+        // same transaction, with its reason. Their own row count is not measured (the
+        // job reports one total, kept on the primary), so it stays NULL, never 0.
+        sqlx::query(
+            "UPDATE file_upload \
+             SET status = CASE WHEN $2::text IS NULL THEN 'ingested' ELSE 'failed' END, \
+                 error = $2, row_count = NULL, updated_at = now() \
+             WHERE loaded_with = $1 AND status = 'ingesting'",
+        )
+        .bind(id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(settled)
 }
 
 /// Delete an upload: its row goes. The caller deletes the upload's object
@@ -1083,6 +1217,10 @@ pub struct ClaimedTable {
     pub upload_id: String,
     /// The upload's original file name, when the row still exists.
     pub original_filename: Option<String>,
+    /// How many other files loaded with that upload (`loaded_with`, `DATA-17`
+    /// slice 5), so lineage can say "<file> and N more". Counted only among the
+    /// claim's own tenant's files.
+    pub also_loaded: i64,
 }
 
 /// Every claim `tenant_id` holds, with the file name of the upload that
@@ -1108,8 +1246,14 @@ pub async fn list_claims(
     pool: &PgPool,
     tenant_id: Option<Uuid>,
 ) -> Result<Vec<ClaimedTable>, StoreError> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT c.bronze_table, c.upload_id, f.original_filename \
+    // The count is of files of the claim's own tenant: `ingest` takes only files of
+    // the primary's tenant, and the equality here is what keeps a count from ever
+    // reaching across tenants if a row said otherwise (SEC-35, fail closed: a claim
+    // with no tenant counts nothing).
+    let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT c.bronze_table, c.upload_id, f.original_filename, \
+                (SELECT count(*) FROM file_upload g \
+                  WHERE g.loaded_with = c.upload_id AND g.tenant_id = c.tenant_id) \
            FROM upload_table_claim c \
            LEFT JOIN file_upload f ON f.id = c.upload_id \
           WHERE ($1::uuid IS NULL OR c.tenant_id = $1) \
@@ -1121,10 +1265,11 @@ pub async fn list_claims(
     Ok(rows
         .into_iter()
         .map(
-            |(bronze_table, upload_id, original_filename)| ClaimedTable {
+            |(bronze_table, upload_id, original_filename, also_loaded)| ClaimedTable {
                 bronze_table,
                 upload_id,
                 original_filename,
+                also_loaded,
             },
         )
         .collect())

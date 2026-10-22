@@ -6473,3 +6473,744 @@ async fn the_new_kinds_complete_by_pieces_with_the_same_checks() {
         assert_eq!(upload["status"], "uploaded", "{name}: {upload}");
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Several files into one table (DATA-17 slice 5)
+// ════════════════════════════════════════════════════════════════════════
+
+const STOCK_A: &[u8] = b"id,name,qty\n1,bolt,10\n2,nut,20\n";
+/// The same columns in another order.
+const STOCK_B: &[u8] = b"qty,id,name\n30,3,screw\n40,4,washer\n";
+const STOCK_C: &[u8] = b"id,name,qty\n5,pin,50\n";
+/// One column more.
+const STOCK_D: &[u8] = b"id,name,qty,notes\n6,rivet,60,fragile\n";
+
+impl Stack {
+    async fn compare(&self, who: &Caller, id: &str, body: Value) -> Reply {
+        self.send(
+            who,
+            "POST",
+            &format!("/api/uploads/{id}/compare"),
+            Payload::Json(body),
+        )
+        .await
+    }
+
+    /// Upload `files` (name, bytes) as `who` and return their ids, in order.
+    async fn upload_all(&self, who: &Caller, files: &[(&str, &[u8])]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (name, bytes) in files {
+            ids.push(id_of(&self.upload(who, name, bytes).await));
+        }
+        ids
+    }
+
+    /// `(status, loaded_with, error, row_count)` of an upload.
+    async fn group_state(&self, id: &str) -> (String, Option<String>, Option<String>, Option<i64>) {
+        sqlx::query_as(
+            "SELECT status, loaded_with, error, row_count FROM file_upload WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.app.pool)
+        .await
+        .unwrap()
+    }
+}
+
+/// The files the comparison lists, by upload id, with what differs in each.
+fn mismatches_of(reply: &Reply) -> Vec<(String, Vec<String>, Vec<String>)> {
+    reply.json["mismatches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let list = |key: &str| {
+                m[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            (
+                m["uploadId"].as_str().unwrap().to_owned(),
+                list("missing"),
+                list("extra"),
+            )
+        })
+        .collect()
+}
+
+/// Decision 4: columns are matched by name and their order may differ; a file whose columns
+/// differ is listed with what it lacks and what it adds. The answer carries the file's name.
+#[tokio::test]
+async fn the_comparison_lists_a_file_with_other_columns_and_passes_one_in_another_order() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[
+                ("a.csv", STOCK_A),
+                ("b.csv", STOCK_B),
+                ("c.csv", STOCK_C),
+                ("d.csv", STOCK_D),
+            ],
+        )
+        .await;
+
+    let reply = stack
+        .compare(
+            &bayu,
+            &ids[0],
+            json!({ "alsoUploads": [ids[1], ids[2], ids[3]] }),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        mismatches_of(&reply),
+        vec![(ids[3].clone(), vec![], vec!["notes".to_owned()])],
+        "only the file with an extra column is listed"
+    );
+    assert_eq!(reply.json["mismatches"][0]["file"], "d.csv");
+    assert_eq!(reply.json["mismatches"][0]["typeConflicts"], json!([]));
+
+    let missing = stack
+        .compare(&bayu, &ids[3], json!({ "alsoUploads": [ids[0]] }))
+        .await;
+    assert_eq!(
+        mismatches_of(&missing),
+        vec![(ids[0].clone(), vec!["notes".to_owned()], vec![])],
+        "from the other side the same column is missing"
+    );
+    assert!(
+        stack.dagster.received_requests().await.unwrap().is_empty(),
+        "a comparison launches nothing"
+    );
+    assert_eq!(
+        stack.status_of(&ids[0]).await.0,
+        "uploaded",
+        "and claims nothing"
+    );
+}
+
+/// A value that does not fit the first file's type is a type conflict, unless the person made
+/// that column text (the column list the console sends), which every value fits.
+#[tokio::test]
+async fn a_value_that_does_not_fit_the_first_files_type_is_a_type_conflict_until_the_column_is_text()
+ {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[
+                ("a.csv", STOCK_A),
+                ("n.csv", b"id,name,qty\n7,cap,n/a\n8,cog,5\n"),
+            ],
+        )
+        .await;
+
+    let guessed = stack
+        .compare(&bayu, &ids[0], json!({ "alsoUploads": [ids[1]] }))
+        .await;
+    assert_eq!(guessed.status, StatusCode::OK, "{}", guessed.text);
+    assert_eq!(
+        guessed.json["mismatches"],
+        json!([{
+            "uploadId": ids[1], "file": "n.csv", "missing": [], "extra": [],
+            "typeConflicts": [{ "column": "qty", "expected": "integer", "found": "text" }]
+        }])
+    );
+
+    let columns = json!([
+        { "source": "id", "name": "id", "type": "integer" },
+        { "source": "name", "name": "name", "type": "text" },
+        { "source": "qty", "name": "qty", "type": "text" },
+    ]);
+    let as_text = stack
+        .compare(
+            &bayu,
+            &ids[0],
+            json!({ "alsoUploads": [ids[1]], "columns": columns }),
+        )
+        .await;
+    assert_eq!(as_text.status, StatusCode::OK, "{}", as_text.text);
+    assert_eq!(as_text.json["mismatches"], json!([]));
+
+    let wrong_width = stack
+        .compare(
+            &bayu,
+            &ids[0],
+            json!({ "alsoUploads": [ids[1]], "columns": [{ "source": "id", "name": "id", "type": "integer" }] }),
+        )
+        .await;
+    assert_eq!(
+        wrong_width.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        wrong_width.text
+    );
+}
+
+/// A load of three files, one in another column order: one launch whose config lists the
+/// three objects (the primary first), every file `ingesting` and pointing at the primary,
+/// the table claimed once by the primary, the audit event naming the others. The single-file
+/// config keys are all still there (AD5).
+#[tokio::test]
+async fn three_files_are_one_launch_with_every_object_listed_and_every_file_claimed() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[("a.csv", STOCK_A), ("b.csv", STOCK_B), ("c.csv", STOCK_C)],
+        )
+        .await;
+
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1], ids[2]]);
+    let reply = stack.ingest(&bayu, &ids[0], body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(reply.json["runId"], "run-g");
+    assert_eq!(reply.json["upload"]["id"], ids[0].as_str());
+    assert!(reply.json["upload"].get("loadedWith").is_none());
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    assert_eq!(launches.len(), 1, "one ingest call, one run");
+    let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
+    assert_eq!(
+        config["storage_keys"],
+        json!([
+            format!("uploads/{GROUP}/{}.csv", ids[0]),
+            format!("uploads/{GROUP}/{}.csv", ids[1]),
+            format!("uploads/{GROUP}/{}.csv", ids[2]),
+        ])
+    );
+    assert_eq!(config["upload_id"], ids[0].as_str());
+    assert_eq!(config["bronze_table_name"], "stock_raw");
+    assert_eq!(config["format"], "delimited");
+
+    for (position, id) in ids.iter().enumerate() {
+        let state = stack.group_state(id).await;
+        assert_eq!(state.0, "ingesting", "{id}");
+        let expected = (position > 0).then(|| ids[0].clone());
+        assert_eq!(state.1, expected, "{id} loaded with");
+    }
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "stock_raw".to_owned(),
+            Some(GROUP.parse::<Uuid>().unwrap()),
+            ids[0].clone()
+        )],
+        "the table is claimed once, by the primary"
+    );
+    let shown = stack.get(&bayu, &format!("/api/uploads/{}", ids[1])).await;
+    assert_eq!(shown.json["loadedWith"], ids[0].as_str());
+    assert_eq!(shown.json["bronzeTable"], "stock_raw");
+
+    let audit = stack.audit_actions().await;
+    let ingests: Vec<_> = audit.iter().filter(|a| a.0 == "upload.ingest").collect();
+    assert_eq!(ingests.len(), 1);
+    assert_eq!(ingests[0].3["alsoUploads"], json!([ids[1], ids[2]]));
+}
+
+/// A fourth file with an extra column is refused with the list, the file named, and
+/// nothing is claimed, marked or launched (decision 4).
+#[tokio::test]
+async fn a_file_with_an_extra_column_refuses_the_whole_load_with_the_list() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-x").await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[
+                ("a.csv", STOCK_A),
+                ("b.csv", STOCK_B),
+                ("c.csv", STOCK_C),
+                ("d.csv", STOCK_D),
+            ],
+        )
+        .await;
+
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1], ids[2], ids[3]]);
+    let reply = stack.ingest(&bayu, &ids[0], body).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    let message = reply.json["error"].as_str().unwrap();
+    assert!(message.contains("d.csv (extra notes)"), "{message}");
+    assert!(
+        !message.contains("b.csv") && !message.contains("c.csv"),
+        "{message}"
+    );
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty()
+    );
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
+    for id in &ids {
+        assert_eq!(
+            stack.group_state(id).await,
+            ("uploaded".to_owned(), None, None, None)
+        );
+    }
+}
+
+/// The ingest of one file is what it was: no `alsoUploads`, one key, no pointer anywhere, the
+/// audit event without the new key.
+#[tokio::test]
+async fn a_load_of_one_file_is_unchanged_by_the_group_columns() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let id = id_of(&stack.upload(&bayu, "a.csv", STOCK_A).await);
+
+    let reply = stack.ingest(&bayu, &id, ingest_body("stock_raw")).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    assert_eq!(
+        launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"]["storage_keys"],
+        json!([format!("uploads/{GROUP}/{id}.csv")])
+    );
+    assert!(stack.group_state(&id).await.1.is_none());
+    let audit = stack.audit_actions().await;
+    assert!(
+        audit
+            .iter()
+            .find(|a| a.0 == "upload.ingest")
+            .unwrap()
+            .3
+            .get("alsoUploads")
+            .is_none()
+    );
+}
+
+/// Settling: when the run ends, the list settles every file of the load from the one recorded
+/// result: the primary has the total, the others have no count of their own (not measured,
+/// never 0), and a failure carries the one reason to all.
+#[tokio::test]
+async fn the_files_of_a_load_end_together_with_the_reason_or_total_of_the_one_run() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let ids = stack
+        .upload_all(&bayu, &[("a.csv", STOCK_A), ("b.csv", STOCK_B)])
+        .await;
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1]]);
+    assert_eq!(
+        stack.ingest(&bayu, &ids[0], body).await.status,
+        StatusCode::OK
+    );
+
+    mount_run_status(&stack.dagster, "SUCCESS").await;
+    mount_results(
+        &stack.ch,
+        &json!([result_row(&ids[0], "succeeded", Some(4), "", 0)]),
+    )
+    .await;
+
+    // Reading the OTHER file settles the whole load, through the primary.
+    let other = stack.get(&bayu, &format!("/api/uploads/{}", ids[1])).await;
+    assert_eq!(other.status, StatusCode::OK, "{}", other.text);
+    assert_eq!(other.json["status"], "ingested");
+    assert!(
+        other.json.get("rows").is_none(),
+        "its own count is not measured"
+    );
+    assert_eq!(other.json["loadedWith"], ids[0].as_str());
+    let primary = stack.group_state(&ids[0]).await;
+    assert_eq!((primary.0.as_str(), primary.3), ("ingested", Some(4)));
+}
+
+#[tokio::test]
+async fn a_failed_run_fails_every_file_of_the_load_with_one_reason() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let ids = stack
+        .upload_all(
+            &bayu,
+            &[("a.csv", STOCK_A), ("b.csv", STOCK_B), ("c.csv", STOCK_C)],
+        )
+        .await;
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1], ids[2]]);
+    assert_eq!(
+        stack.ingest(&bayu, &ids[0], body).await.status,
+        StatusCode::OK
+    );
+
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    mount_results(
+        &stack.ch,
+        &json!([result_row(
+            &ids[0],
+            "failed",
+            None,
+            "The file has no rows below the header row.",
+            0
+        )]),
+    )
+    .await;
+    let list = stack.get(&bayu, "/api/uploads").await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.text);
+
+    for id in &ids {
+        let state = stack.group_state(id).await;
+        assert_eq!(state.0, "failed", "{id}");
+        assert_eq!(
+            state.2.as_deref(),
+            Some("The file has no rows below the header row.")
+        );
+        assert_eq!(state.3, None);
+    }
+}
+
+/// A file left `ingesting` with a primary that is not loading (a claim that never finished)
+/// is failed after the two minutes a claim with no run gets, and not before.
+#[tokio::test]
+async fn a_file_whose_primary_is_not_loading_is_failed_after_two_minutes_and_not_before() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let ids = stack
+        .upload_all(&bayu, &[("a.csv", STOCK_A), ("b.csv", STOCK_B)])
+        .await;
+    stack.claim(GROUP, "stock_raw", &ids[0]).await;
+    let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
+    uploads::mark_ingesting(
+        &stack.app.pool,
+        &ids[1],
+        &options,
+        "stock_raw",
+        LoadMode::Replace,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    sqlx::query("UPDATE file_upload SET loaded_with = $1 WHERE id = $2")
+        .bind(&ids[0])
+        .bind(&ids[1])
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+
+    let young = stack.get(&bayu, &format!("/api/uploads/{}", ids[1])).await;
+    assert_eq!(
+        young.json["status"], "ingesting",
+        "a younger orphan is not an orphan yet"
+    );
+
+    sqlx::query("UPDATE file_upload SET updated_at = now() - interval '3 minutes' WHERE id = $1")
+        .bind(&ids[1])
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    let old = stack.get(&bayu, &format!("/api/uploads/{}", ids[1])).await;
+    assert_eq!(old.json["status"], "failed", "{}", old.text);
+    assert_eq!(old.json["error"], "The load was not started.");
+}
+
+/// A load of several files is one place against the limits: with four loads allowed per
+/// person, a ten-file load is refused by none of its files, and a fifth LOAD is.
+#[tokio::test]
+async fn ten_files_are_one_load_for_the_per_person_limit() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let mut files = Vec::new();
+    for n in 0..10 {
+        files.push((
+            format!("f{n}.csv"),
+            format!("id,name,qty\n{n},x,1\n").into_bytes(),
+        ));
+    }
+    let mut ids = Vec::new();
+    for (name, bytes) in &files {
+        ids.push(id_of(&stack.upload(&bayu, name, bytes).await));
+    }
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!(ids[1..]);
+
+    let reply = stack.ingest(&bayu, &ids[0], body).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let loading = stack.group_state(&ids[9]).await;
+    assert_eq!(loading.0, "ingesting");
+    // Another load of the same person still has its place (4 allowed, 1 used).
+    let extra = id_of(&stack.upload(&bayu, "z.csv", STOCK_C).await);
+    let again = stack.ingest(&bayu, &extra, ingest_body("other_raw")).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+}
+
+/// The list of other files is checked before anything is read: more than nine, a repeat, the
+/// upload itself, something that is not a list, and an id that is not text are each a 400, and
+/// asking nobody.
+#[tokio::test]
+async fn a_bad_list_of_other_files_is_400_and_asks_nobody() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let ids = stack
+        .upload_all(&bayu, &[("a.csv", STOCK_A), ("b.csv", STOCK_B)])
+        .await;
+    let ten: Vec<String> = (0..10).map(|n| format!("up-{n}")).collect();
+    for also in [
+        json!(ten),
+        json!([ids[1], ids[1]]),
+        json!([ids[0]]),
+        json!("up-1"),
+        json!([7]),
+        json!({ "a": 1 }),
+    ] {
+        let mut body = ingest_body("stock_raw");
+        body["alsoUploads"] = also.clone();
+        let reply = stack.ingest(&bayu, &ids[0], body).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{also}: {}",
+            reply.text
+        );
+        let compared = stack
+            .compare(&bayu, &ids[0], json!({ "alsoUploads": also }))
+            .await;
+        assert_eq!(
+            compared.status,
+            StatusCode::BAD_REQUEST,
+            "{also}: {}",
+            compared.text
+        );
+    }
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty());
+}
+
+/// A file that is unknown, of another tenant, or of a tenant the caller is not in is one
+/// sentence, so the answer is no oracle; a file of another tenant the caller IS in is refused
+/// too (one load never mixes tenants).
+#[tokio::test]
+async fn a_file_of_another_tenant_or_an_unknown_one_is_the_same_404_and_a_load_never_mixes_tenants()
+{
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let mine = id_of(&stack.upload(&bayu, "a.csv", STOCK_A).await);
+    let theirs = id_of(&stack.upload(&andi, "b.csv", STOCK_B).await);
+    // Bayu belongs to two tenants; this file is in the other one.
+    let logistics = stack.caller("bayu@meridian.example", Some(LOGISTICS)).await;
+    let sibling = id_of(&stack.upload(&logistics, "c.csv", STOCK_C).await);
+
+    let mut answers = Vec::new();
+    for other in [theirs.as_str(), sibling.as_str(), "up-does-not-exist"] {
+        let compared = stack
+            .compare(&bayu, &mine, json!({ "alsoUploads": [other] }))
+            .await;
+        assert_eq!(
+            compared.status,
+            StatusCode::NOT_FOUND,
+            "{other}: {}",
+            compared.text
+        );
+        let mut body = ingest_body("stock_raw");
+        body["alsoUploads"] = json!([other]);
+        let ingested = stack.ingest(&bayu, &mine, body).await;
+        assert_eq!(
+            ingested.status,
+            StatusCode::NOT_FOUND,
+            "{other}: {}",
+            ingested.text
+        );
+        assert_eq!(compared.json, ingested.json);
+        answers.push(compared.json);
+    }
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "{answers:?}"
+    );
+    assert!(
+        requests_containing(&stack.dagster, "launchRun")
+            .await
+            .is_empty()
+    );
+    assert!(stack.claims().await.is_empty());
+    assert_eq!(stack.group_state(&mine).await.0, "uploaded");
+    assert_eq!(stack.group_state(&theirs).await.0, "uploaded");
+}
+
+/// A file still being received, or already loading, cannot be taken; and nothing of the load
+/// is claimed when one cannot.
+#[tokio::test]
+async fn a_file_that_is_being_received_or_loading_cannot_be_loaded_with_another() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let mine = id_of(&stack.upload(&bayu, "a.csv", STOCK_A).await);
+    let receiving = stack.session(&bayu, "big.csv", 1024).await;
+    stack
+        .seed_loading(GROUP, "up-busy", "busy_raw", Some("run-0"), "1 minute")
+        .await;
+
+    for (other, expected) in [
+        (receiving.as_str(), "still being received"),
+        ("up-busy", "already being loaded"),
+    ] {
+        let mut body = ingest_body("stock_raw");
+        body["alsoUploads"] = json!([other]);
+        let reply = stack.ingest(&bayu, &mine, body).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::CONFLICT,
+            "{other}: {}",
+            reply.text
+        );
+        assert!(
+            reply.json["error"].as_str().unwrap().contains(expected),
+            "{}",
+            reply.text
+        );
+    }
+    assert_eq!(stack.group_state(&mine).await.0, "uploaded");
+    assert!(stack.claims().await.iter().all(|c| c.0 != "stock_raw"));
+}
+
+/// One load is one kind of file: a CSV and a workbook, or a CSV and JSON Lines, are refused;
+/// and the files together are under the cap, which counts all of them.
+#[tokio::test]
+async fn files_of_two_kinds_or_together_over_the_cap_are_refused() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let csv = id_of(&stack.upload(&bayu, "a.csv", STOCK_A).await);
+    let lines = id_of(
+        &stack
+            .upload(&bayu, "b.jsonl", b"{\"id\":1,\"name\":\"a\",\"qty\":2}\n")
+            .await,
+    );
+    let sheet = id_of(&stack.upload(&bayu, "c.xlsx", &workbook("stock.xlsx")).await);
+    let second = id_of(&stack.upload(&bayu, "d.csv", STOCK_C).await);
+
+    for other in [&lines, &sheet] {
+        let compared = stack
+            .compare(&bayu, &csv, json!({ "alsoUploads": [other] }))
+            .await;
+        assert_eq!(
+            compared.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            compared.text
+        );
+        assert!(
+            compared.json["error"]
+                .as_str()
+                .unwrap()
+                .contains("same kind of file")
+        );
+    }
+
+    // 30 MB and 30 MB are each under the cap and together over it.
+    sqlx::query("UPDATE file_upload SET size_bytes = 31457280 WHERE id = ANY($1)")
+        .bind(vec![csv.clone(), second.clone()])
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([second]);
+    let reply = stack.ingest(&bayu, &csv, body).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "The files together are larger than the 50 MB limit."
+    );
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+}
+
+/// Parquet files load together too: each footer is checked and each is listed, unconverted.
+#[tokio::test]
+async fn parquet_files_load_together_without_conversion() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-p").await;
+    let first = id_of(
+        &stack
+            .upload(&bayu, "a.parquet", &parquet_file("types.parquet"))
+            .await,
+    );
+    let second = id_of(
+        &stack
+            .upload(&bayu, "b.parquet", &parquet_file("types.parquet"))
+            .await,
+    );
+
+    let compared = stack
+        .compare(&bayu, &first, json!({ "alsoUploads": [second] }))
+        .await;
+    assert_eq!(compared.status, StatusCode::OK, "{}", compared.text);
+    assert_eq!(compared.json["mismatches"], json!([]));
+
+    let mut body = ingest_body("typed_raw");
+    body["alsoUploads"] = json!([second]);
+    let reply = stack.ingest(&bayu, &first, body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let launches = requests_containing(&stack.dagster, "launchRun").await;
+    let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
+    assert_eq!(config["format"], "parquet");
+    assert_eq!(
+        config["storage_keys"],
+        json!([
+            format!("uploads/{GROUP}/{first}.parquet"),
+            format!("uploads/{GROUP}/{second}.parquet"),
+        ]),
+        "unconverted: the job reads the Parquet objects themselves"
+    );
+}
+
+/// Loading a file alone again, or its primary alone, lets the group go: the label of lineage
+/// and the pointer follow the LAST load.
+#[tokio::test]
+async fn a_pointer_to_the_primary_goes_when_the_primary_loads_again_alone() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-g").await;
+    let ids = stack
+        .upload_all(&bayu, &[("a.csv", STOCK_A), ("b.csv", STOCK_B)])
+        .await;
+    let mut body = ingest_body("stock_raw");
+    body["alsoUploads"] = json!([ids[1]]);
+    assert_eq!(
+        stack.ingest(&bayu, &ids[0], body).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        stack.group_state(&ids[1]).await.1.as_deref(),
+        Some(ids[0].as_str())
+    );
+    // The load ends (settled by hand: the run is not what this test is about).
+    uploads::mark_finished(&stack.app.pool, &ids[0], Some("run-g"), None, Some(4))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let again = stack.ingest(&bayu, &ids[0], ingest_body("stock_raw")).await;
+
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+    let state = stack.group_state(&ids[1]).await;
+    assert_eq!((state.0.as_str(), state.1), ("ingested", None));
+}

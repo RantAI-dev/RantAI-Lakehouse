@@ -112,6 +112,22 @@ pub(super) async fn own_table_columns(
     }
 }
 
+/// The columns a preview starts from, as a column list: what the Check step sends back
+/// when a person edits nothing. Used by the comparison of several files to give the first
+/// file's types without a list.
+pub(super) fn starting_specs(sample: &Sample) -> Vec<ColumnSpec> {
+    spec_views(sample, None)
+        .into_iter()
+        .map(|view| ColumnSpec {
+            source: view.source,
+            name: view.name,
+            column_type: view.column_type,
+            date_format: view.date_format,
+            timezone: view.timezone,
+        })
+        .collect()
+}
+
 /// The columns of a preview: names from the load's own cleaning, types from the
 /// guess, the file's declared types, or the table.
 pub(super) fn spec_views(sample: &Sample, table: Option<&TableColumns>) -> Vec<SpecView> {

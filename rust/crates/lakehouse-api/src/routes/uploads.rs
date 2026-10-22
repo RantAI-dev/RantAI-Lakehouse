@@ -123,7 +123,7 @@ use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
 use lakehouse_store::uploads::{
-    self, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload,
+    self, LoadClaim, LoadLimits, LoadMode, MarkOutcome, NewUpload, TableClaim, Upload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -148,6 +148,7 @@ use crate::upload_store::{PREFIX, UploadStore};
 use crate::upload_workbook::{self, WorkbookError, WorkbookInfo};
 
 pub(super) mod columns;
+pub(super) mod group;
 pub(super) mod sessions;
 
 use columns::{ColumnPlan, Sample, SpecView};
@@ -256,6 +257,9 @@ const BODY_NOT_AN_OBJECT: &str = "The request body must be a JSON object.";
 /// console must say the same one; it does not exist yet.
 const TABLE_NAME_RULE: &str = "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters.";
 const MODE_RULE: &str = "mode must be replace or append.";
+const ALSO_UPLOADS_RULE: &str =
+    "alsoUploads must be a list of at most 9 upload ids, each used once, none of them this upload.";
+const OTHER_BUSY: &str = "One of the other files is already being loaded.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";
 const HEADER_ROW_RULE: &str = "headerRow must be a whole number, 0 or more.";
@@ -1040,6 +1044,46 @@ impl<'a> Settler<'a> {
         if row.status != "ingesting" {
             return row;
         }
+        if let Some(primary_id) = row.loaded_with.clone() {
+            return self.settle_with_primary(row, &primary_id).await;
+        }
+        self.settle_own(row).await
+    }
+
+    /// A file of a load of several files has no run of its own (`DATA-17` slice 5): it ends
+    /// when the primary ends, in the transaction that settles the primary
+    /// ([`uploads::mark_finished`]). So settling it is settling the primary and reading it
+    /// again. A file whose primary is gone or no longer loading was left by a claim that
+    /// never finished; it is failed after the same two minutes a claim with no run is
+    /// ([`STALE_CLAIM`]), and not before, because the primary's claim is written in the same
+    /// transaction as its own and a younger orphan is not an orphan yet.
+    async fn settle_with_primary(&mut self, row: Upload, primary_id: &str) -> Upload {
+        let primary = match uploads::get(self.pool, primary_id).await {
+            Ok(primary) => primary,
+            Err(err) => {
+                tracing::warn!(%err, upload_id = %row.id, "the primary of a loading file could not be read");
+                return row;
+            }
+        };
+        if let Some(primary) =
+            primary.filter(|p| p.status == "ingesting" && p.loaded_with.is_none())
+        {
+            self.settle_own(primary).await;
+            return uploads::get(self.pool, &row.id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(row);
+        }
+        if claim_is_stale(row.updated_at, OffsetDateTime::now_utc()) {
+            return self
+                .record(row, None, &Outcome::Failed(NOT_STARTED.to_owned()))
+                .await;
+        }
+        row
+    }
+
+    async fn settle_own(&mut self, row: Upload) -> Upload {
         let Some(run_id) = row.run_id.clone() else {
             return if claim_is_stale(row.updated_at, OffsetDateTime::now_utc()) {
                 self.record(row, None, &Outcome::Failed(NOT_STARTED.to_owned()))
@@ -1818,6 +1862,9 @@ struct IngestRequest {
     /// The columns as confirmed and what to do with a value that does not fit
     /// (`DATA-18`); `None`: every column text.
     columns: Option<ColumnPlan>,
+    /// The other files of a load of several files (`DATA-17` slice 5), at most 9, as
+    /// named; empty for a load of one file.
+    also_uploads: Vec<String>,
 }
 
 /// Why a raw table name is refused, or `None` (review finding C1).
@@ -1873,8 +1920,9 @@ fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str,
 
 /// Validate the body of `POST /api/uploads/{id}/ingest`: `bronzeTable`,
 /// `mode` (optional, `replace` by default), `encoding`, `delimiter`,
-/// `headerRow` and, optional, `sheet`. All are checked; the load uses exactly
-/// what was confirmed and nothing is guessed (ADR 0014, decision 3).
+/// `headerRow` and, optional, `sheet`, `columns` with `onBadValue`, and `alsoUploads`
+/// (`DATA-17` slice 5). All are checked; the load uses exactly what was confirmed
+/// and nothing is guessed (ADR 0014, decision 3).
 ///
 /// For a `conversion` (a workbook or a Parquet file) the dialect is not the
 /// user's to choose: the converted text is always UTF-8 with commas, `encoding`
@@ -1926,6 +1974,16 @@ fn parse_ingest_request(
         Some(_) => return Err(bad(SHEET_RULE)),
     };
     let columns = columns::parse_column_plan(&fields)?;
+    let also_uploads = match fields.get("alsoUploads") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .map(|id| id.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| bad(ALSO_UPLOADS_RULE))?,
+        Some(_) => return Err(bad(ALSO_UPLOADS_RULE)),
+    };
+    group::check_also_list(&also_uploads)?;
     Ok(IngestRequest {
         table: table.to_owned(),
         mode,
@@ -1934,6 +1992,7 @@ fn parse_ingest_request(
         header_row,
         sheet,
         columns,
+        also_uploads,
     })
 }
 
@@ -2078,11 +2137,13 @@ async fn record_audit(pool: &PgPool, event: NewAuditEvent) {
 /// The run config `file_ingest_job` takes: `ops.ingest_uploaded_file.config`
 /// (plan T7). `load_key` is the object the job reads: the upload's own, or the
 /// converted sheet of a workbook ([`converted_key`]). The config schema is
-/// closed, so nothing about the sheet can be added here.
+/// closed, so nothing about the sheet can be added here. `load_keys` lists every
+/// file of the load, the primary first (`DATA-17` slice 5, plan AD5); the
+/// `bronze_table_name` path the `DATA-19` sensor reads does not move.
 fn run_config(
     upload_id: &str,
     request: &IngestRequest,
-    load_key: &str,
+    load_keys: &[String],
     (format, compression): (&str, &str),
 ) -> Value {
     let (columns, on_bad_value) = columns::run_config_columns(request.columns.as_ref());
@@ -2091,7 +2152,7 @@ fn run_config(
             "ingest_uploaded_file": {
                 "config": {
                     "upload_id": upload_id,
-                    "storage_keys": [load_key],
+                    "storage_keys": load_keys,
                     "format": format,
                     "compression": compression,
                     "max_bytes": MAX_UPLOAD_BYTES,
@@ -2180,14 +2241,14 @@ async fn launch(
     pool: &PgPool,
     claimed: &Upload,
     request: &IngestRequest,
-    load_key: &str,
+    load_keys: &[String],
     kind: (&str, &str),
 ) -> Result<String, ApiError> {
     let failure = match state
         .dagster
         .launch_run_with_config(
             FILE_INGEST_JOB,
-            &run_config(&claimed.id, request, load_key, kind),
+            &run_config(&claimed.id, request, load_keys, kind),
         )
         .await
     {
@@ -2279,10 +2340,165 @@ async fn convert_upload(
     Ok(Converted { key, sheet })
 }
 
+/// Claim the upload, and the other files of its load, as `ingesting`: the reading, the table,
+/// the mode and the column list are written by the claim itself, so a row is never
+/// `ingesting` with half of what its load was told (`DATA-18`).
+///
+/// `SEC-17`: the count and the marks are one locked transaction, so two starts at the same
+/// moment cannot both take the last place. `DATA-17` slice 5: the other files are claimed in
+/// the same transaction, so a load of several files is never half taken.
+///
+/// # Errors
+///
+/// 429 when a limit is reached; 409 when this upload was claimed by another request, or one of
+/// the other files was taken or went away since the checks; 404 when this upload went away.
+async fn claim_load(
+    pool: &PgPool,
+    row: &Upload,
+    request: &IngestRequest,
+    converted: Option<&Converted>,
+    limits: LoadLimits,
+) -> ApiResult<Upload> {
+    let mut parse_options = json!({
+        "encoding": request.encoding.as_str(),
+        "delimiter": request.delimiter.to_string(),
+        "headerRow": request.header_row,
+    });
+    if let (
+        Value::Object(map),
+        Some(Converted {
+            sheet: Some(sheet), ..
+        }),
+    ) = (&mut parse_options, converted)
+    {
+        map.insert("sheet".to_owned(), json!(sheet));
+    }
+    let (column_spec, on_bad_value) = columns::claim_fields(request.columns.as_ref());
+    let outcome = uploads::mark_group_within_limits(
+        pool,
+        &row.id,
+        &request.also_uploads,
+        &LoadClaim {
+            parse_options: &parse_options,
+            bronze_table: &request.table,
+            load_mode: request.mode,
+            column_spec: column_spec.as_ref(),
+            on_bad_value,
+        },
+        limits,
+    )
+    .await?;
+    Ok(match outcome {
+        MarkOutcome::Marked(claimed) => *claimed,
+        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
+        MarkOutcome::GroupNotMarked => {
+            // One of the other files was taken, or went away, since the checks.
+            return Err(ApiError::Conflict(OTHER_BUSY.to_owned()).into());
+        }
+        MarkOutcome::NotMarked => {
+            // Lost the race to another request, or the upload went away.
+            return Err(match uploads::get(pool, &row.id).await? {
+                Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
+                None => not_found(),
+            }
+            .into());
+        }
+    })
+}
+
+/// The reading the request confirmed, as the preview takes it.
+fn reading_of(request: &IngestRequest) -> PreviewQuery {
+    PreviewQuery {
+        encoding: Some(request.encoding.as_str().to_owned()),
+        delimiter: Some(request.delimiter.to_string()),
+        header_row: Some(request.header_row.to_string()),
+        sheet: request.sheet.clone(),
+        table: None,
+    }
+}
+
+/// `DATA-17` slice 5, decision 4: refuse a load whose other files cannot go into the
+/// first file's table, with the list `compare` gives ([`group::refusal`]). Nothing to
+/// check for one file.
+///
+/// # Errors
+///
+/// 400 with the list, or what [`group::mismatches`] answers.
+async fn check_group(
+    state: &AppState,
+    first: &Upload,
+    others: &[group::Member],
+    request: &IngestRequest,
+) -> Result<(), ApiError> {
+    if others.is_empty() {
+        return Ok(());
+    }
+    // No column list is every column text, which every value fits.
+    let typing = request
+        .columns
+        .as_ref()
+        .map_or(group::Typing::Text, |plan| {
+            group::Typing::Plan(&plan.columns)
+        });
+    let found = group::mismatches(state, first, others, &reading_of(request), &typing).await?;
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(group::refusal(&found))
+    }
+}
+
+/// The objects the job reads, the primary's first: each file's own object, or its converted
+/// sheet when it is a workbook (a Parquet file's footer is checked, and it is read as it is).
+/// A refusal here claims nothing.
+///
+/// # Errors
+///
+/// As [`convert_upload`] and [`check_parquet_footer`].
+async fn load_keys_of(
+    state: &AppState,
+    row: &Upload,
+    converted: Option<&Converted>,
+    others: &[group::Member],
+    request: &IngestRequest,
+) -> Result<Vec<String>, ApiError> {
+    let mut keys = Vec::with_capacity(1 + others.len());
+    keys.push(converted.map_or_else(|| row.storage_key.clone(), |done| done.key.clone()));
+    for other in others {
+        keys.push(match other.conversion {
+            Some(Conversion::Workbook) => {
+                convert_upload(
+                    state,
+                    &other.row,
+                    Conversion::Workbook,
+                    request.sheet.as_deref(),
+                )
+                .await?
+                .key
+            }
+            Some(Conversion::Parquet) => {
+                check_parquet_footer(state, &other.row).await?;
+                other.row.storage_key.clone()
+            }
+            None => other.row.storage_key.clone(),
+        });
+    }
+    Ok(keys)
+}
+
 /// `POST /api/uploads/{id}/ingest` — load this file into a raw table, with
 /// the encoding, delimiter and header row the user confirmed. Body
 /// `{ bronzeTable, mode?, encoding, delimiter, headerRow, sheet? }`; `mode` is
 /// `replace` (default) or `append`. Returns `{ upload, runId }`.
+///
+/// # Several files (`DATA-17` slice 5)
+///
+/// `alsoUploads` (at most 9 upload ids of the same tenant and the same kind of file, none
+/// being received) makes one load of all of them into the one table: one run, whose config
+/// lists every file's object in `storage_keys`, this upload first. The other files are
+/// settled with this one ([`Settler`]); the response is for this upload. The columns of the
+/// others are compared with this one's first ([`group`]) and a load whose files differ is
+/// refused with the list before anything is claimed. The cap counts the files together.
 ///
 /// For a workbook, `encoding` and `delimiter` are not read and `sheet` picks
 /// the sheet (the default one when absent): the sheet is converted, stored as
@@ -2323,8 +2539,11 @@ async fn convert_upload(
 /// have, a sheet or file over the cell limit, an empty sheet or a Parquet
 /// file with no rows, and for a header with more than 1,000 columns under the
 /// confirmed reading (`SEC-17`, checked before any claim); 404
-/// for an unknown upload or another tenant's; 409 when this upload is still
-/// being received (`DATA-17`), is already loading, another is loading into that table, a connector loads it, or the
+/// for an unknown upload or another tenant's, or an unknown or other tenant's file of
+/// `alsoUploads`; 400 also for more than nine of them, a file of another kind, the files
+/// together over the cap and files whose columns differ; 409 when this upload (or one of
+/// `alsoUploads`) is still being received (`DATA-17`), is already loading, another is
+/// loading into that table, a connector loads it, or the
 /// name cannot be used ([`TABLE_NOT_FREE`]: another tenant's connector loads
 /// it, another tenant holds the claim, the table exists and nobody claimed it,
 /// or another tenant won the claim a moment ago); 422 when the orchestrator
@@ -2356,6 +2575,15 @@ pub async fn ingest(
     let Some(tenant_id) = row.tenant_id else {
         return Err(not_found().into());
     };
+    let others = group::members(
+        &state,
+        pool,
+        &principal,
+        &row,
+        &request.also_uploads,
+        group::kind_of(conversion, layout),
+    )
+    .await?;
     let limits = check_within_limits_and_column_cap(&state, pool, &row, &request, layout).await?;
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
@@ -2363,6 +2591,9 @@ pub async fn ingest(
     }
     // `DATA-18`: the column list is checked before anything is claimed.
     columns::plan_columns(&state, &row, &request, conversion).await?;
+    // `DATA-17` slice 5: the other files have the first one's columns, or the load is
+    // refused with the list, before anything is claimed (decision 4).
+    check_group(&state, &row, &others, &request).await?;
     let converted = match conversion {
         Some(Conversion::Workbook) => Some(
             convert_upload(&state, &row, Conversion::Workbook, request.sheet.as_deref()).await?,
@@ -2376,9 +2607,7 @@ pub async fn ingest(
         }
         None => None,
     };
-    let load_key = converted
-        .as_ref()
-        .map_or(row.storage_key.as_str(), |done| done.key.as_str());
+    let load_keys = load_keys_of(&state, &row, converted.as_ref(), &others, &request).await?;
     let kind = job_kind(conversion, layout);
     // Review finding B4: the name is claimed here, in one statement the
     // database arbitrates, and not before. `false` is a tenant that took the
@@ -2389,50 +2618,9 @@ pub async fn ingest(
         return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
-    let mut parse_options = json!({
-        "encoding": request.encoding.as_str(),
-        "delimiter": request.delimiter.to_string(),
-        "headerRow": request.header_row,
-    });
-    if let (
-        Value::Object(map),
-        Some(Converted {
-            sheet: Some(sheet), ..
-        }),
-    ) = (&mut parse_options, &converted)
-    {
-        map.insert("sheet".to_owned(), json!(sheet));
-    }
-    // `SEC-17`: counts and marks in one locked transaction, so two starts at
-    // the same moment cannot both take the last place.
-    // `DATA-18`: the column list is written by the claim itself, so a row is
-    // never `ingesting` with half of what its load was told.
-    let (column_spec, on_bad_value) = columns::claim_fields(request.columns.as_ref());
-    let claimed = match uploads::mark_ingesting_within_limits(
-        pool,
-        &row.id,
-        &parse_options,
-        &request.table,
-        request.mode,
-        limits,
-        column_spec.as_ref(),
-        on_bad_value,
-    )
-    .await?
-    {
-        MarkOutcome::Marked(claimed) => *claimed,
-        MarkOutcome::LimitReached => return Err(too_many_uploads().into()),
-        MarkOutcome::NotMarked => {
-            // Lost the race to another request, or the upload went away.
-            return Err(match uploads::get(pool, &row.id).await? {
-                Some(_) => ApiError::Conflict(ALREADY_LOADING.to_owned()),
-                None => not_found(),
-            }
-            .into());
-        }
-    };
+    let claimed = claim_load(pool, &row, &request, converted.as_ref(), limits).await?;
 
-    let run_id = launch(&state, pool, &claimed, &request, load_key, kind).await?;
+    let run_id = launch(&state, pool, &claimed, &request, &load_keys, kind).await?;
     let attached = finish_launch_and_audit(
         pool,
         &principal,
@@ -2482,6 +2670,11 @@ async fn finish_launch_and_audit(
         "table": request.table,
         "mode": request.mode.as_str(),
     });
+    if let (Value::Object(map), false) = (&mut args, request.also_uploads.is_empty()) {
+        // `DATA-17` slice 5: the other files of the load, so the audit trail of the
+        // primary says which uploads went into the table with it.
+        map.insert("alsoUploads".to_owned(), json!(request.also_uploads));
+    }
     if let Value::Object(map) = &mut args {
         match (converted, conversion) {
             (
@@ -2982,6 +3175,7 @@ mod tests {
                 header_row: 0,
                 sheet: None,
                 columns: None,
+                also_uploads: Vec::new(),
             }
         );
         let mut full = valid();
@@ -3168,6 +3362,36 @@ mod tests {
     }
 
     #[test]
+    fn the_other_files_are_read_from_the_body_and_the_config_lists_every_object_primary_first() {
+        let mut with_others = valid();
+        with_others["alsoUploads"] = json!(["up-2", "up-3"]);
+        let request = parse_ingest_request(&body(&with_others), None, None).unwrap();
+        assert_eq!(request.also_uploads, ["up-2", "up-3"]);
+        let keys = [
+            "uploads/t/up-1.csv",
+            "uploads/t/up-2.csv",
+            "uploads/t/up-3.csv",
+        ]
+        .map(str::to_owned);
+        let config = run_config("up-1", &request, &keys, ("delimited", "none"));
+        let job = &config["ops"]["ingest_uploaded_file"]["config"];
+        assert_eq!(job["storage_keys"], json!(keys));
+        assert_eq!(job["upload_id"], "up-1");
+        assert_eq!(
+            job["bronze_table_name"], "stock_raw",
+            "the DATA-19 sensor path does not move"
+        );
+        let mut null_list = valid();
+        null_list["alsoUploads"] = Value::Null;
+        assert!(
+            parse_ingest_request(&body(&null_list), None, None)
+                .unwrap()
+                .also_uploads
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn the_job_is_told_the_converted_object_and_the_fixed_dialect() {
         let request = parse_ingest_request(
             &body(&json!({ "bronzeTable": "stock_raw", "headerRow": 1, "sheet": "Stock" })),
@@ -3178,7 +3402,7 @@ mod tests {
         let config = run_config(
             "up-1",
             &request,
-            "uploads/t/up-1.xlsx.converted.csv",
+            &["uploads/t/up-1.xlsx.converted.csv".to_owned()],
             ("delimited", "none"),
         );
         let job = &config["ops"]["ingest_uploaded_file"]["config"];

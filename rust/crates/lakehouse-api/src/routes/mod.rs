@@ -840,6 +840,11 @@ fn uploads_router(state: &AppState) -> Router<AppState> {
             "/api/uploads/{id}/ingest",
             axum::routing::post(uploads::ingest),
         )
+        // DATA-17 slice 5: which other files can load into one table with this one.
+        .route(
+            "/api/uploads/{id}/compare",
+            axum::routing::post(uploads::group::compare),
+        )
         // DATA-17: the pieces of a chunked upload. Only the piece route takes
         // a large body, and its own limit (a piece plus 64 KiB); the other
         // routes keep axum's 2 MB default.
