@@ -1355,7 +1355,9 @@ mod tests {
         let draft = draft.expect("the draft is refused");
         assert_eq!(
             draft["error"],
-            json!("a value format names 'revenue', which the chart does not return."),
+            json!(
+                "a value format names 'revenue', which the chart does not return; it returns: price, province, target, visitors."
+            ),
             "{draft}"
         );
         assert_eq!(saved["error"], draft["error"], "{saved}");

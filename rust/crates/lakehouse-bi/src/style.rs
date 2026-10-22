@@ -55,6 +55,9 @@ pub const MAX_CONDITIONAL_RULES: usize = 20;
 pub const MAX_ENTRIES: usize = 50;
 /// Longest name of a measure, column or series used as a key.
 const MAX_KEY_LEN: usize = 120;
+/// Most names a refusal lists: a chart with more columns would drown the
+/// sentence, so the rest is counted instead of listed.
+const MAX_LISTED_NAMES: usize = 20;
 
 /// The palettes the console ships. `company` (the deployment's own, set in
 /// Admin > Settings) is also accepted; whether one is set is the console's
@@ -845,7 +848,8 @@ pub fn check_style_names<S: std::hash::BuildHasher>(
             Ok(())
         } else {
             Err(format!(
-                "{what} names '{name}', which the chart does not return."
+                "{what} names '{name}', which the chart does not return; it returns: {}.",
+                returns_list(&known)
             ))
         }
     };
@@ -866,6 +870,26 @@ pub fn check_style_names<S: std::hash::BuildHasher>(
         }
     }
     Ok(())
+}
+
+/// The names the chart returns, in one list: sorted, at most
+/// [`MAX_LISTED_NAMES`] of them, and a count of the ones left out.
+///
+/// A refusal that names a column the chart does not have is only useful when
+/// it says what the chart does have, so the names are there to pick from. A
+/// chart with many columns would drown the sentence, so the list stops and
+/// counts the rest.
+fn returns_list(known: &HashSet<&str>) -> String {
+    let mut names: Vec<&str> = known.iter().copied().collect();
+    names.sort_unstable();
+    let listed = names.len().min(MAX_LISTED_NAMES);
+    let mut list = names[..listed].join(", ");
+    if names.len() > listed {
+        list.push_str(", and ");
+        list.push_str(&(names.len() - listed).to_string());
+        list.push_str(" more");
+    }
+    list
 }
 
 /// Key a chart's series colours by the name the chart draws (`BI-18` part C
@@ -1138,6 +1162,40 @@ mod tests {
         let bad_rule = chart(&json!({"kind": "table", "conditional": [
             {"column": "nope", "rule": {"type": "contains", "text": "x"}, "color": "#000000"}]}));
         assert!(check_style_names(&bad_rule, &cols).is_err());
+    }
+
+    /// A refusal that names a column the chart does not have says what the
+    /// chart does have, so the model picks a name that is there instead of
+    /// guessing another one.
+    #[test]
+    fn the_refusal_lists_the_names_the_chart_returns() {
+        let cols: HashSet<String> = ["province", "visitors", "rooms"].map(str::to_owned).into();
+        let bad = chart(&json!({"valueFormats": {"ghost": {"style": "number"}}}));
+        let e = check_style_names(&bad, &cols).unwrap_err();
+        assert_eq!(
+            e,
+            "a value format names 'ghost', which the chart does not return; it returns: province, rooms, visitors."
+        );
+    }
+
+    /// A chart with many columns would drown the sentence, so the list stops
+    /// at twenty names and says how many are left out.
+    #[test]
+    fn the_refusal_counts_the_names_it_leaves_out() {
+        let mut cols: HashSet<String> = ["province", "visitors"].map(str::to_owned).into();
+        for i in 0..23 {
+            cols.insert(format!("col{i:02}"));
+        }
+        let bad = chart(&json!({"valueFormats": {"ghost": {"style": "number"}}}));
+        let e = check_style_names(&bad, &cols).unwrap_err();
+        let listed: Vec<String> = (0..20).map(|i| format!("col{i:02}")).collect();
+        assert_eq!(
+            e,
+            format!(
+                "a value format names 'ghost', which the chart does not return; it returns: {}, and 5 more.",
+                listed.join(", ")
+            )
+        );
     }
 
     fn colours_of(extra: &serde_json::Value) -> ChartInput {
