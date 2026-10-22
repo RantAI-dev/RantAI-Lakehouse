@@ -601,13 +601,18 @@ mod tests {
         );
         let integer = [spec("n", ColumnType::Integer)];
         let fractional = sample(&["n"], &[&["2.5"]]);
-        let conflicts = compare_samples(
-            &first,
-            &integer,
-            &fractional,
-            &[spec("n", ColumnType::Decimal)],
-        )
-        .2;
+        let other = [spec("n", ColumnType::Decimal)];
+        // PR #186 review BLOCKER 5: the first file's own `1.5` does not fit the `Integer`
+        // column it was given, so there is no verdict on that column (the rule that keeps
+        // two identical files from ever conflicting); the conflict needs a first file
+        // whose own sample fits.
+        assert!(
+            compare_samples(&first, &integer, &fractional, &other)
+                .2
+                .is_empty()
+        );
+        let fits = sample(&["n"], &[&["1"]]);
+        let conflicts = compare_samples(&fits, &integer, &fractional, &other).2;
         assert_eq!(conflicts.len(), 1);
     }
 
