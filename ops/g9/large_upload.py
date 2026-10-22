@@ -247,9 +247,11 @@ def login(api) -> None:
     if not resp.ok:
         raise HarnessFailure(f"login failed: {resp.status_code} {resp.text[:300]}")
     if resp.json().get("mustChangePassword"):
+        # `change_password` (routes/auth.rs) answers `StatusCode::NO_CONTENT`: 204, exactly.
+        # g9-upload-large run 39795803595 expected 200 and stopped here.
         _expect(
             api.post(f"{API_URL}/api/auth/change-password", json={"newPassword": AUTH_PASSWORD}, timeout=15),
-            200,
+            204,
             "forced password rotation",
         )
         _expect(
