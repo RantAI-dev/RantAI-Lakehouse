@@ -290,6 +290,7 @@ pub async fn update(
 /// any chart still reads it, 422/503 on a `ClickHouse` failure.
 pub async fn delete(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id =
@@ -306,17 +307,30 @@ pub async fn delete(
     {
         return Err(ApiError::NotFound(format!("SQL source '{id}' not found.")).into());
     }
-    let charts = store::list_stored_charts(ch)
+    // BI-18 part C, part 2: a chart on somebody's personal board still blocks
+    // the delete (it would break), but it is not named: the caller is told
+    // only about the charts they may see.
+    let all = store::list_stored_charts(ch, &lakehouse_bi::access::Viewer::system())
         .await
         .map_err(|err| classify_ch_error(&err))?;
-    let users = sources::charts_using_source(&charts, &id);
-    if !users.is_empty() {
-        return Err(ApiError::Conflict(format!(
-            "SQL source is still used by {} chart(s): {}",
-            users.len(),
-            users.join(", ")
-        ))
-        .into());
+    if !sources::charts_using_source(&all, &id).is_empty() {
+        let mine = store::list_stored_charts(
+            ch,
+            &crate::routes::dashboard_organise::viewer_of(&principal),
+        )
+        .await
+        .map_err(|err| classify_ch_error(&err))?;
+        let users = sources::charts_using_source(&mine, &id);
+        let message = if users.is_empty() {
+            "SQL source is still used by a dashboard you cannot see.".to_owned()
+        } else {
+            format!(
+                "SQL source is still used by {} chart(s): {}",
+                users.len(),
+                users.join(", ")
+            )
+        };
+        return Err(ApiError::Conflict(message).into());
     }
     sources::delete_source(ch, &id)
         .await

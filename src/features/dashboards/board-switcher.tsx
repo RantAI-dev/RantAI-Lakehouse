@@ -43,6 +43,7 @@ export function BoardSwitcher({
   activeName,
   onSelect,
   onCreate,
+  badge,
 }: {
   boards: BoardOption[];
   folders: FolderLike[];
@@ -50,6 +51,13 @@ export function BoardSwitcher({
   activeName: string;
   onSelect: (id: string) => void;
   onCreate: () => void;
+  /**
+   * Shown beside the name, on the name's own line. It lives here, not beside the
+   * switcher, because with a folder path above the name the switcher is two
+   * lines tall and a badge centred on it floats above the title (BI-18 part C
+   * review fix (SHOULD-FIX) R16).
+   */
+  badge?: React.ReactNode;
 }) {
   const ordered = groupBoardsByFolder(folders, boards, false).flatMap((section) => section.boards);
   const item = (b: BoardOption) => {
@@ -83,6 +91,7 @@ export function BoardSwitcher({
           {activePath}
         </Link>
       ) : null}
+    <span className="flex min-w-0 items-center gap-2">
     <DropdownMenu>
       {/* `asChild`, not `render`: this menu comes from the design system,
           which wraps radix — the local `@/components/ui` primitives wrap
@@ -120,6 +129,8 @@ export function BoardSwitcher({
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+    {badge ? <span className="shrink-0">{badge}</span> : null}
+    </span>
     </span>
   );
 }

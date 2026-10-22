@@ -1,30 +1,33 @@
 //! Who may use a dashboard's signed embed, and who may frame it (`SEC-12`).
 //!
-//! Three things are kept with the board (`console.bi_board`, three columns
-//! beside `embed_enabled`):
+//! Three things make up a board's access state:
 //!
 //! - **`revoked_before`**: "withdraw all". A Unix-seconds instant; a token
 //!   whose `iat` is at or before it is refused.
-//! - **`withdrawn`**: "withdraw one". A small list of `(jti, exp)`. A token
-//!   carrying a listed `jti` is refused for this board only. An entry is
-//!   dropped once the token could no longer be accepted anyway, which is
-//!   `exp` plus the clock tolerance, not `exp` alone: the verifier accepts a
-//!   token up to 60 seconds past its `exp`, so dropping the record at `exp`
-//!   would let the token back in for that minute.
+//! - **`withdrawn`**: "withdraw one". A list of `(jti, exp)`. A token
+//!   carrying a listed `jti` is refused for this board only. The list is
+//!   not where a token expires: the verifier accepts a token up to its `exp`
+//!   plus the clock tolerance, so an entry that expires would still have to
+//!   be refused while the verifier honours it (PR #201 review F SHOULD-FIX
+//!   1). The cap that bounds the list counts only the entries that could
+//!   still be accepted.
 //! - **`origins`**: the sites allowed to frame the embed pages.
 //!
-//! # Why on the board
+//! # Where the state lives
 //!
-//! The board is read with `FINAL` on every `POST /api/embed/data`, so a
-//! withdrawal written by the Share dialog is seen by the next request. There
-//! is no cache in between (see the plan, section 7). Putting the state in
-//! the board row also means deleting a board deletes its withdrawals.
+//! In `console.bi_board_embed_event`, an append-only table the state is
+//! written to and read back by aggregation (PR #105 review SHOULD-FIX 1).
+//! It was on the board row once, and a dashboard save (a full-row `INSERT`
+//! into a `ReplacingMergeTree`) could write the old state back: a token
+//! withdrawn in between worked again. The events are aggregated on every
+//! request, so there is no cache in between (see the plan, section 7) and a
+//! withdrawal takes effect on the next request.
 //!
 //! # Limits
 //!
 //! `revoked_before` is the API server's clock at the moment of withdrawal,
 //! compared with the `iat` the customer's server wrote. A token minted by a
-//! clock that runs ahead of ours by up to the 60-second tolerance carries an
+//! clock that runs ahead of ours by up to the clock tolerance carries an
 //! `iat` later than the withdrawal and survives "withdraw all" until it
 //! expires; the maximum lifetime bounds that. Withdraw one by `jti` is
 //! exact.
@@ -33,6 +36,10 @@ use serde::{Deserialize, Serialize};
 
 /// At most this many allowed origins per dashboard.
 pub const MAX_ORIGINS: usize = 20;
+
+/// The most sites an administrator may list as allowed content sites for
+/// image and web cards (`BI-16` part B, decision 4).
+pub const MAX_CONTENT_SITES: usize = 50;
 
 /// At most this many individually withdrawn tokens kept per dashboard. The
 /// list only needs to hold tokens that are still within their lifetime; past
@@ -67,8 +74,10 @@ impl EmbedAccess {
     /// Fails closed (principle 3): a withdrawn-tokens column that does not
     /// parse is something this code never writes, and ignoring it would
     /// silently re-admit withdrawn tokens, so every token is refused instead
-    /// (`revoked_before` is set to its maximum) until the board is saved
-    /// again. An origins column that does not parse allows no site.
+    /// (`revoked_before` is set to its maximum) — permanently, not until the
+    /// board is saved again (PR #201 review F doc note: the legacy columns
+    /// are never written again, so nothing saves that board again). An
+    /// origins column that does not parse allows no site.
     #[must_use]
     pub fn from_stored(revoked_before: u64, withdrawn_json: &str, origins_json: &str) -> Self {
         let withdrawn_json = withdrawn_json.trim();
@@ -182,6 +191,55 @@ pub fn validate_origins(raw: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Validate the administrator's list of sites images and web pages may come
+/// from (`BI-16` part B, decision 4).
+///
+/// The same entry grammar and normal form as [`validate_origins`] (it calls
+/// the same [`normalize_origin`], rule 4: no second parser), with two
+/// differences: at most [`MAX_CONTENT_SITES`] entries, and `https` only, with
+/// no `http://localhost` exception, because a card loads the site into every
+/// viewer's browser.
+///
+/// # Errors
+///
+/// A message naming the first entry that is not acceptable, or the limit.
+pub fn validate_content_sites(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let origin = normalize_origin(entry)?;
+        if !origin.starts_with("https://") {
+            let shown: String = entry.chars().take(80).collect();
+            return Err(format!(
+                "\"{shown}\" is not an allowed site: write it as https://host or https://host:port"
+            ));
+        }
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    if out.len() > MAX_CONTENT_SITES {
+        return Err(format!(
+            "at most {MAX_CONTENT_SITES} content sites can be allowed."
+        ));
+    }
+    Ok(out)
+}
+
+/// The origin (`https://host[:port]`, normal form) of an address, or `None`
+/// when it is not an `https` address with a valid host. Used to compare a
+/// card's address with the allowed content sites; it goes through
+/// [`normalize_origin`] so both sides are written the same way.
+#[must_use]
+pub fn https_origin_of(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // User-info is how `https://allowed.example@evil.example/` hides the host.
+    if authority.contains('@') {
+        return None;
+    }
+    normalize_origin(&format!("https://{authority}")).ok()
+}
+
 fn normalize_origin(raw: &str) -> Result<String, String> {
     let shown: String = raw.chars().take(80).collect();
     let bad = |why: &str| Err(format!("\"{shown}\" is not an allowed site: {why}"));
@@ -245,6 +303,35 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn content_sites_are_https_only_and_capped_at_fifty() {
+        assert_eq!(
+            validate_content_sites(&strings(&["https://Img.Example", "https://img.example"])),
+            Ok(strings(&["https://img.example"]))
+        );
+        assert!(validate_content_sites(&strings(&["http://localhost"])).is_err());
+        assert!(validate_content_sites(&strings(&["http://a.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://*.example"])).is_err());
+        assert!(validate_content_sites(&strings(&["https://a.example/path"])).is_err());
+        let fifty: Vec<String> = (0..50).map(|i| format!("https://s{i}.example")).collect();
+        assert_eq!(validate_content_sites(&fifty).unwrap().len(), 50);
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("https://s{i}.example")).collect();
+        assert!(validate_content_sites(&fifty_one).is_err());
+    }
+
+    #[test]
+    fn the_origin_of_an_address_ignores_the_path_and_refuses_user_info() {
+        assert_eq!(
+            https_origin_of("https://Img.Example:8443/a/b.png?x=1#f").as_deref(),
+            Some("https://img.example:8443")
+        );
+        assert_eq!(https_origin_of("http://img.example/a.png"), None);
+        assert_eq!(https_origin_of("https://ok.example@evil.example/"), None);
+        assert_eq!(https_origin_of("https://[::1]/"), None);
+        assert_eq!(https_origin_of("//img.example/a.png"), None);
+        assert_eq!(https_origin_of("https:///a.png"), None);
     }
 
     #[test]

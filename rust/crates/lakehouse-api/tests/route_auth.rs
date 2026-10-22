@@ -2388,6 +2388,69 @@ async fn hierarchies_are_read_with_dashboard_read_and_defined_with_dashboard_wri
     }
 }
 
+/// BI-18 part C, part 2: history, the trash, the personal space, favourites,
+/// recent items and search. Going back, restoring and creating the personal
+/// space edit dashboards and need `dashboard:write` (restoring needs the
+/// permission that deletes); everything else is read with `dashboard:read`.
+/// Asserted both ways for every route: the right principal gets past the gate,
+/// a principal holding only the other permission is refused, and so is one
+/// holding neither.
+#[tokio::test]
+async fn history_trash_personal_space_favourites_and_search_have_the_right_permissions() {
+    let TestApp { router, pool } = spin_up().await;
+    let reader = common::create_principal_with_permissions(&pool, "dashboard:read").await;
+    let reader = common::session_cookie_for_user(&pool, reader).await;
+    let writer = common::create_principal_with_permissions(&pool, "dashboard:write").await;
+    let writer = common::session_cookie_for_user(&pool, writer).await;
+    let neither = common::create_principal_with_permissions(&pool, "query:read").await;
+    let neither = common::session_cookie_for_user(&pool, neither).await;
+    for (method, path, needs) in [
+        ("GET", "/api/dashboard/versions", "dashboard:read"),
+        ("POST", "/api/dashboard/versions/revert", "dashboard:write"),
+        ("GET", "/api/dashboard/trash", "dashboard:read"),
+        ("POST", "/api/dashboard/trash/restore", "dashboard:write"),
+        ("GET", "/api/dashboard/shortcuts", "dashboard:read"),
+        ("PUT", "/api/dashboard/favourites", "dashboard:read"),
+        ("POST", "/api/dashboard/recent", "dashboard:read"),
+        ("GET", "/api/dashboard/search", "dashboard:read"),
+        ("POST", "/api/dashboard/personal", "dashboard:write"),
+    ] {
+        assert_eq!(
+            POLICY_TABLE
+                .iter()
+                .find(|(m, p, _)| *m == method && *p == path)
+                .map(|(_, _, policy)| *policy),
+            Some(Policy::RequiresPermission(needs)),
+            "{method} {path}"
+        );
+        let (allowed, other) = if needs == "dashboard:read" {
+            (&reader, &writer)
+        } else {
+            (&writer, &reader)
+        };
+        let resp = request_with_cookie(&router, method, path, allowed).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {path}: the right principal must get past the gate, got {}",
+            resp.status()
+        );
+        // `dashboard:write` and `dashboard:read` are separate grants: neither
+        // implies the other, so the other one is refused too.
+        let resp = request_with_cookie(&router, method, path, other).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} (other)"
+        );
+        let resp = request_with_cookie(&router, method, path, &neither).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} (neither)"
+        );
+    }
+}
+
 /// BI-11: parameters are read with `dashboard:read` and defined, changed and
 /// deleted with `dashboard:write`. Asserted both ways for every method: a
 /// reader gets past the gate on `GET` and is refused on the writes, a writer

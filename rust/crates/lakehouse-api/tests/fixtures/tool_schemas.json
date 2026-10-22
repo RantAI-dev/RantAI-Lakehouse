@@ -185,7 +185,12 @@
               "gauge",
               "table",
               "pivot",
-              "text"
+              "text",
+              "progress",
+              "histogram",
+              "bullet",
+              "image",
+              "web"
             ]
           },
           "sqlSource": {
@@ -484,6 +489,19 @@
             "items": {
               "type": "object",
               "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "value",
+                    "average",
+                    "median",
+                    "min",
+                    "max",
+                    "trend",
+                    "band"
+                  ],
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                },
                 "value": {
                   "oneOf": [
                     {
@@ -502,18 +520,43 @@
                       ]
                     }
                   ],
-                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line"
+                },
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "band only: the other edge"
                 },
                 "label": {
                   "type": "string",
                   "description": "at most 60 characters"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb"
+                },
+                "measure": {
+                  "type": "string",
+                  "description": "a computed line: which value of the chart it describes (a result name); default the first"
                 }
-              },
-              "required": [
-                "value"
-              ]
+              }
             },
-            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
+            "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen"
           },
           "filters": {
             "type": "array",
@@ -1261,6 +1304,426 @@
               "size"
             ],
             "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count"
+          },
+          "format": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "style": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "number",
+                      "percent",
+                      "currency",
+                      "scientific",
+                      "compact"
+                    ],
+                    "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10
+                  },
+                  "thousands": {
+                    "type": "boolean",
+                    "description": "group thousands (default true)"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                  },
+                  "currencyDisplay": {
+                    "type": "string",
+                    "enum": [
+                      "symbol",
+                      "code"
+                    ]
+                  },
+                  "prefix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  },
+                  "suffix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart"
+          },
+          "valueFormats": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "style": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "number",
+                    "percent",
+                    "currency",
+                    "scientific",
+                    "compact"
+                  ],
+                  "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                },
+                "decimals": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 10
+                },
+                "thousands": {
+                  "type": "boolean",
+                  "description": "group thousands (default true)"
+                },
+                "currency": {
+                  "type": "string",
+                  "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                },
+                "currencyDisplay": {
+                  "type": "string",
+                  "enum": [
+                    "symbol",
+                    "code"
+                  ]
+                },
+                "prefix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                },
+                "suffix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                }
+              }
+            },
+            "description": "a number format per value, keyed by the value's result name; replaces `format` for that value"
+          },
+          "dateFormat": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "style": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "short",
+                  "medium",
+                  "long",
+                  "iso",
+                  "monthYear"
+                ]
+              },
+              "hour12": {
+                "type": "boolean"
+              },
+              "abbreviate": {
+                "type": "boolean",
+                "description": "short month and day names"
+              }
+            },
+            "description": "how dates and timestamps are written"
+          },
+          "colors": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "palette": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "bright",
+                  "muted",
+                  "sequential-blue",
+                  "diverging-red-blue",
+                  "company"
+                ]
+              },
+              "series": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "series name (or the value's result name) to #rrggbb; \"make the bars green\" is the chart's value name with a green"
+              },
+              "byValue": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {
+                  "type": "string"
+                },
+                "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)"
+              }
+            },
+            "description": "colours; a field given here replaces the whole colors setting"
+          },
+          "axes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "x": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y2": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "rightValues": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)"
+              }
+            },
+            "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot"
+          },
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "show": {
+                "type": "boolean"
+              }
+            },
+            "description": "write each value on its bar or point, in its format"
+          },
+          "annotations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "string",
+                  "description": "the category or date the note is pinned to, as the chart shows it"
+                },
+                "series": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "plain text, at most 140 characters"
+                }
+              },
+              "required": [
+                "x",
+                "text"
+              ]
+            },
+            "description": "short notes pinned to points (bar, hbar, line, area, stacked, combo, waterfall)"
+          },
+          "tooltip": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "show only these of the chart's values in the tooltip (result names)"
+          },
+          "conditional": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "object",
+                  "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb; not for a range"
+                },
+                "target": {
+                  "type": "string",
+                  "enum": [
+                    "cell",
+                    "text"
+                  ]
+                }
+              },
+              "required": [
+                "column",
+                "rule"
+              ]
+            },
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "goal": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "measure": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "measure"
+                ]
+              }
+            ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension"
+          },
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "number"
+            },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)"
+          },
+          "histogram": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "the width of each range"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "at most this many ranges"
+              }
+            },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order"
+          },
+          "url": {
+            "type": "string",
+            "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused"
+          },
+          "alt": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "image only (required): a short description of the picture for screen readers"
           }
         },
         "required": [
@@ -1319,7 +1782,12 @@
               "gauge",
               "table",
               "pivot",
-              "text"
+              "text",
+              "progress",
+              "histogram",
+              "bullet",
+              "image",
+              "web"
             ]
           },
           "sqlSource": {
@@ -1615,6 +2083,19 @@
             "items": {
               "type": "object",
               "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "value",
+                    "average",
+                    "median",
+                    "min",
+                    "max",
+                    "trend",
+                    "band"
+                  ],
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                },
                 "value": {
                   "oneOf": [
                     {
@@ -1633,18 +2114,43 @@
                       ]
                     }
                   ],
-                  "description": "where on the value axis: a number, or {param: <a number parameter>}"
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line"
+                },
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "band only: the other edge"
                 },
                 "label": {
                   "type": "string",
                   "description": "at most 60 characters"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb"
+                },
+                "measure": {
+                  "type": "string",
+                  "description": "a computed line: which value of the chart it describes (a result name); default the first"
                 }
-              },
-              "required": [
-                "value"
-              ]
+              }
             },
-            "description": "up to 5 horizontal lines on the value axis (bar, hbar, line, area, stacked, combo), for example a target. Use a parameter for a line the viewer can move"
+            "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen"
           },
           "filters": {
             "type": "array",
@@ -2392,12 +2898,931 @@
               "size"
             ],
             "description": "pointmap and geoheat only: group the points into square cells of latitude and longitude and draw one mark per cell at its centre, with the cell's value and point count"
+          },
+          "format": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "style": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "number",
+                      "percent",
+                      "currency",
+                      "scientific",
+                      "compact"
+                    ],
+                    "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10
+                  },
+                  "thousands": {
+                    "type": "boolean",
+                    "description": "group thousands (default true)"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                  },
+                  "currencyDisplay": {
+                    "type": "string",
+                    "enum": [
+                      "symbol",
+                      "code"
+                    ]
+                  },
+                  "prefix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  },
+                  "suffix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart"
+          },
+          "valueFormats": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "style": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "number",
+                    "percent",
+                    "currency",
+                    "scientific",
+                    "compact"
+                  ],
+                  "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                },
+                "decimals": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 10
+                },
+                "thousands": {
+                  "type": "boolean",
+                  "description": "group thousands (default true)"
+                },
+                "currency": {
+                  "type": "string",
+                  "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                },
+                "currencyDisplay": {
+                  "type": "string",
+                  "enum": [
+                    "symbol",
+                    "code"
+                  ]
+                },
+                "prefix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                },
+                "suffix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                }
+              }
+            },
+            "description": "a number format per value, keyed by the value's result name; replaces `format` for that value"
+          },
+          "dateFormat": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "style": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "short",
+                  "medium",
+                  "long",
+                  "iso",
+                  "monthYear"
+                ]
+              },
+              "hour12": {
+                "type": "boolean"
+              },
+              "abbreviate": {
+                "type": "boolean",
+                "description": "short month and day names"
+              }
+            },
+            "description": "how dates and timestamps are written"
+          },
+          "colors": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "palette": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "bright",
+                  "muted",
+                  "sequential-blue",
+                  "diverging-red-blue",
+                  "company"
+                ]
+              },
+              "series": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "series name (or the value's result name) to #rrggbb; \"make the bars green\" is the chart's value name with a green"
+              },
+              "byValue": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {
+                  "type": "string"
+                },
+                "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)"
+              }
+            },
+            "description": "colours; a field given here replaces the whole colors setting"
+          },
+          "axes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "x": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y2": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "rightValues": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)"
+              }
+            },
+            "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot"
+          },
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "show": {
+                "type": "boolean"
+              }
+            },
+            "description": "write each value on its bar or point, in its format"
+          },
+          "annotations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "string",
+                  "description": "the category or date the note is pinned to, as the chart shows it"
+                },
+                "series": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "plain text, at most 140 characters"
+                }
+              },
+              "required": [
+                "x",
+                "text"
+              ]
+            },
+            "description": "short notes pinned to points (bar, hbar, line, area, stacked, combo, waterfall)"
+          },
+          "tooltip": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "show only these of the chart's values in the tooltip (result names)"
+          },
+          "conditional": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "object",
+                  "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb; not for a range"
+                },
+                "target": {
+                  "type": "string",
+                  "enum": [
+                    "cell",
+                    "text"
+                  ]
+                }
+              },
+              "required": [
+                "column",
+                "rule"
+              ]
+            },
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "goal": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "measure": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "measure"
+                ]
+              }
+            ],
+            "description": "progress (required) and bullet (optional target): a number, or {\"measure\": <column>} for a second value of the same source, which must also be the second entry of `measures`. A progress bar takes one value in `measures` and no dimension"
+          },
+          "bands": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "number"
+            },
+            "description": "bullet only: 1 to 3 rising upper limits of the bands behind the bar (for example poor, fair, good)"
+          },
+          "histogram": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "the width of each range"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "at most this many ranges"
+              }
+            },
+            "description": "histogram only: give a width or a count, not both; leave out for about 20 ranges chosen automatically. The number column is `dimension`; a histogram takes no measures, breakdown, limit or order"
+          },
+          "url": {
+            "type": "string",
+            "description": "image and web only (required): an https address on a site an administrator allows in Admin > Settings; any other address is refused"
+          },
+          "alt": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "image only (required): a short description of the picture for screen readers"
           }
         },
         "required": [
           "id",
           "title",
           "kind"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "format_chart",
+      "description": "Change only how a saved chart looks: number and date formats (rupiah, percent, compact, decimals), colours (a palette, a colour per series, colour by value), axes, data labels, reference lines (a target at 1,000, an average, a trend, a band), notes, tooltip fields and, for a table or KPI, conditional colours. Send ONLY the fields that change: a field you give replaces that field, null removes it, and everything you leave out stays as it is (the data, the title, the filters and the other formatting). list_charts gives the ids. To change what the chart shows, use update_chart.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "chart": {
+            "type": "string",
+            "description": "the id of the chart (list_charts)"
+          },
+          "format": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "style": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "number",
+                      "percent",
+                      "currency",
+                      "scientific",
+                      "compact"
+                    ],
+                    "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10
+                  },
+                  "thousands": {
+                    "type": "boolean",
+                    "description": "group thousands (default true)"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                  },
+                  "currencyDisplay": {
+                    "type": "string",
+                    "enum": [
+                      "symbol",
+                      "code"
+                    ]
+                  },
+                  "prefix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  },
+                  "suffix": {
+                    "type": "string",
+                    "description": "at most 16 characters"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "how every number of the chart is written (the number format). null removes it. Changing it with format_chart keeps everything else of the chart"
+          },
+          "valueFormats": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "style": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "number",
+                    "percent",
+                    "currency",
+                    "scientific",
+                    "compact"
+                  ],
+                  "description": "percent multiplies by 100 (0.125 is 12.5%); compact is 1.2 K, 3.4 M, 5 B, 2 T; auto is how it looked before"
+                },
+                "decimals": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 10
+                },
+                "thousands": {
+                  "type": "boolean",
+                  "description": "group thousands (default true)"
+                },
+                "currency": {
+                  "type": "string",
+                  "description": "an ISO 4217 code such as IDR or USD, upper case; with the currency or compact style. Rupiah is IDR"
+                },
+                "currencyDisplay": {
+                  "type": "string",
+                  "enum": [
+                    "symbol",
+                    "code"
+                  ]
+                },
+                "prefix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                },
+                "suffix": {
+                  "type": "string",
+                  "description": "at most 16 characters"
+                }
+              }
+            },
+            "description": "a number format per value, keyed by the value's result name; replaces `format` for that value"
+          },
+          "dateFormat": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "style": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "short",
+                  "medium",
+                  "long",
+                  "iso",
+                  "monthYear"
+                ]
+              },
+              "hour12": {
+                "type": "boolean"
+              },
+              "abbreviate": {
+                "type": "boolean",
+                "description": "short month and day names"
+              }
+            },
+            "description": "how dates and timestamps are written"
+          },
+          "colors": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "palette": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "bright",
+                  "muted",
+                  "sequential-blue",
+                  "diverging-red-blue",
+                  "company"
+                ]
+              },
+              "series": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "series name (or the value's result name) to #rrggbb; \"make the bars green\" is the chart's value name with a green"
+              },
+              "byValue": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "items": {
+                  "type": "string"
+                },
+                "description": "colour by value: 2 or 3 #rrggbb stops (one value, no breakdown; bar, hbar, pie, treemap, geomap)"
+              }
+            },
+            "description": "colours; a field given here replaces the whole colors setting"
+          },
+          "axes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "x": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "y2": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "at most 60 characters"
+                  },
+                  "show": {
+                    "type": "boolean"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  },
+                  "log": {
+                    "type": "boolean",
+                    "description": "logarithmic scale; every value must be above zero"
+                  },
+                  "rotate": {
+                    "type": "integer",
+                    "enum": [
+                      0,
+                      45,
+                      90
+                    ],
+                    "description": "label rotation, category axis"
+                  }
+                }
+              },
+              "rightValues": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "result names drawn against a second Y axis (bar, line, area, combo with at least two values)"
+              }
+            },
+            "description": "axis titles, limits, log scale, label rotation, hiding; bar, hbar, line, area, stacked, combo, scatter, bubble, waterfall, boxplot"
+          },
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "show": {
+                "type": "boolean"
+              }
+            },
+            "description": "write each value on its bar or point, in its format"
+          },
+          "annotations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "string",
+                  "description": "the category or date the note is pinned to, as the chart shows it"
+                },
+                "series": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "plain text, at most 140 characters"
+                }
+              },
+              "required": [
+                "x",
+                "text"
+              ]
+            },
+            "description": "short notes pinned to points (bar, hbar, line, area, stacked, combo, waterfall)"
+          },
+          "tooltip": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "show only these of the chart's values in the tooltip (result names)"
+          },
+          "conditional": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "rule": {
+                  "type": "object",
+                  "description": "{type:\"compare\",op:lt|le|gt|ge|eq|ne,value}, {type:\"between\",from,to}, {type:\"contains\",text} or {type:\"range\",colors:[2 or 3 #rrggbb]}"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb; not for a range"
+                },
+                "target": {
+                  "type": "string",
+                  "enum": [
+                    "cell",
+                    "text"
+                  ]
+                }
+              },
+              "required": [
+                "column",
+                "rule"
+              ]
+            },
+            "description": "table, pivot and kpi only: colour a cell or the value by a rule, for example below 1,000 in red"
+          },
+          "referenceLines": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "value",
+                    "average",
+                    "median",
+                    "min",
+                    "max",
+                    "trend",
+                    "band"
+                  ],
+                  "description": "value (default): a line at `value`; average, median, min, max: computed from the rows the chart shows; trend: a linear trend over them; band: a shaded band from `value` to `to`"
+                },
+                "value": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "where on the value axis: a number, or {param: <a number parameter>}. Required for kind value and band; leave out for a computed line"
+                },
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "param": {
+                          "type": "string",
+                          "description": "the name of a parameter from list_parameters"
+                        }
+                      },
+                      "required": [
+                        "param"
+                      ]
+                    }
+                  ],
+                  "description": "band only: the other edge"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "at most 60 characters"
+                },
+                "color": {
+                  "type": "string",
+                  "description": "#rrggbb"
+                },
+                "measure": {
+                  "type": "string",
+                  "description": "a computed line: which value of the chart it describes (a result name); default the first"
+                }
+              }
+            },
+            "description": "up to 5 marks on the value axis (bar, hbar, line, area, stacked, combo), for example a target at 1,000, the average, a trend or a band. Use a parameter for a line the viewer can move. A computed line describes the rows on screen"
+          }
+        },
+        "required": [
+          "chart"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_dashboard_theme",
+      "description": "Set a dashboard's theme and font for its tiles, wherever it is shown (the console, public links, embeds). theme: auto follows the console, light or dark fixes it. font: one of the fonts an administrator allows (inter, ibm-plex-sans, source-serif, jetbrains-mono, system), or an empty string for the console's own. Not for the built-in dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "the dashboard id (list_boards)"
+          },
+          "theme": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "light",
+              "dark"
+            ]
+          },
+          "font": {
+            "type": "string",
+            "enum": [
+              "",
+              "inter",
+              "ibm-plex-sans",
+              "source-serif",
+              "jetbrains-mono",
+              "system"
+            ]
+          }
+        },
+        "required": [
+          "board"
         ]
       }
     }
@@ -2506,6 +3931,146 @@
         },
         "required": [
           "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_tab",
+      "description": "Add a tab to a dashboard (board). On a dashboard with no tabs the first tab holds every chart already on it, so to separate some charts create a second tab as well and then move_charts_to_tab. The built-in dashboard has no tabs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string",
+            "description": "dashboard id from list_boards"
+          },
+          "title": {
+            "type": "string",
+            "description": "1 to 60 characters"
+          }
+        },
+        "required": [
+          "board",
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "rename_tab",
+      "description": "Rename a tab of a dashboard. The tab keeps its id, so charts and filters stay on it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title, from list_boards"
+          },
+          "title": {
+            "type": "string",
+            "description": "the new title, 1 to 60 characters"
+          }
+        },
+        "required": [
+          "board",
+          "tab",
+          "title"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "move_charts_to_tab",
+      "description": "Put charts of a dashboard on one of its tabs, below what is already there. Charts are picked by id (list_charts); every one must be on this dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title"
+          },
+          "chartIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "ids of the charts to move"
+          }
+        },
+        "required": [
+          "board",
+          "tab",
+          "chartIds"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "move_tab",
+      "description": "Change the order of a dashboard's tabs. Give `tabs` (every tab, in the new order) or `tab` with `position` (1 is first). Tab ids, titles and the charts on each stay as they are.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tabs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "every tab's id or title, in the new order"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title, to move to `position`"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "where the tab goes, 1 for first"
+          }
+        },
+        "required": [
+          "board"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_tab",
+      "description": "Delete a tab of a dashboard. Its charts move to the first remaining tab (none are deleted); a filter tied to it is tied to that tab instead. Needs human approval before it runs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "board": {
+            "type": "string"
+          },
+          "tab": {
+            "type": "string",
+            "description": "the tab's id or its title"
+          }
+        },
+        "required": [
+          "board",
+          "tab"
         ]
       }
     }

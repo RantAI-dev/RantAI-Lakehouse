@@ -9,7 +9,7 @@
 /** Mirrors `lakehouse_bi::folders::MAX_FOLDER_DEPTH`. */
 export const MAX_FOLDER_DEPTH = 4
 
-export type FolderLike = { id: string; name: string; parentId: string }
+export type FolderLike = { id: string; name: string; parentId: string; ownerId?: string }
 export type BoardLike = { id: string; name: string; folderId?: string | null }
 
 export type FolderNode<B extends BoardLike> = {

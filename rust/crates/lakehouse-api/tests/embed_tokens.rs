@@ -40,7 +40,67 @@ const BOARD: &str = "b_embed";
 #[derive(Clone)]
 struct FakeCh {
     boards: Arc<Mutex<Vec<Value>>>,
+    events: Arc<Mutex<Vec<Value>>>,
     log: Arc<Mutex<Vec<String>>>,
+}
+
+fn seed_events_from_board(b: &Value) -> Vec<Value> {
+    let mut events = Vec::new();
+    let id = b["id"].as_str().unwrap_or_default();
+
+    let revoked_before = match &b["embed_revoked_before"] {
+        Value::String(s) => s.parse::<u64>().unwrap_or(0),
+        Value::Number(n) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    };
+    if revoked_before > 0 {
+        events.push(json!({
+            "board_id": id,
+            "kind": "revoke_all",
+            "revoked_before": revoked_before.to_string(),
+            "jti": "",
+            "exp": "0",
+            "origins_json": "[]",
+        }));
+    }
+
+    let origins_str = match &b["embed_origins_json"] {
+        Value::String(s) => s.as_str(),
+        _ => "[]",
+    };
+    if origins_str != "[]" && !origins_str.is_empty() {
+        events.push(json!({
+            "board_id": id,
+            "kind": "origins",
+            "revoked_before": "0",
+            "jti": "",
+            "exp": "0",
+            "origins_json": origins_str,
+        }));
+    }
+
+    let jti_str = match &b["embed_revoked_jti_json"] {
+        Value::String(s) => s.as_str(),
+        _ => "[]",
+    };
+    if let Ok(parsed) = serde_json::from_str::<Value>(jti_str)
+        && let Some(arr) = parsed.as_array()
+    {
+        for item in arr {
+            let jti = item["jti"].as_str().unwrap_or_default();
+            let exp = item["exp"].as_u64().unwrap_or(0);
+            events.push(json!({
+                "board_id": id,
+                "kind": "withdraw",
+                "revoked_before": "0",
+                "jti": jti,
+                "exp": exp.to_string(),
+                "origins_json": "[]",
+            }));
+        }
+    }
+
+    events
 }
 
 fn board_row(id: &str, overrides: &Value) -> Value {
@@ -64,8 +124,13 @@ impl FakeCh {
     }
 
     fn with_boards(boards: Vec<Value>) -> Self {
+        let mut events = Vec::new();
+        for b in &boards {
+            events.extend(seed_events_from_board(b));
+        }
         Self {
             boards: Arc::new(Mutex::new(boards)),
+            events: Arc::new(Mutex::new(events)),
             log: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -73,6 +138,34 @@ impl FakeCh {
     /// Change a field of a board between two requests, as a write by another
     /// session would.
     fn set(&self, id: &str, field: &str, value: &Value) {
+        if field == "embed_revoked_before" {
+            let val = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => "0".to_string(),
+            };
+            self.events.lock().unwrap().push(json!({
+                "board_id": id,
+                "kind": "revoke_all",
+                "revoked_before": val,
+                "jti": "",
+                "exp": "0",
+                "origins_json": "[]",
+            }));
+        } else if field == "embed_origins_json" {
+            let val = match value {
+                Value::String(s) => s.clone(),
+                _ => "[]".to_string(),
+            };
+            self.events.lock().unwrap().push(json!({
+                "board_id": id,
+                "kind": "origins",
+                "revoked_before": "0",
+                "jti": "",
+                "exp": "0",
+                "origins_json": val,
+            }));
+        }
         for b in self.boards.lock().unwrap().iter_mut() {
             if b["id"] == id {
                 b[field] = value.clone();
@@ -84,10 +177,72 @@ impl FakeCh {
         self.log.lock().unwrap().clone()
     }
 
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): record the embed event an
+    /// `INSERT INTO console.bi_board_embed_event` carries, so a later read
+    /// of the aggregate sees it. Split out of [`Respond::respond`] for the
+    /// line limit.
+    fn record_embed_event(&self, sql: &str) {
+        let Some(pos) = sql.find("VALUES (") else {
+            return;
+        };
+        let rest = &sql[pos + "VALUES (".len()..];
+        let rest = rest.trim_end().trim_end_matches(')');
+        let parts: Vec<&str> = rest.splitn(4, ", ").collect();
+        if sql.contains("'origins'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let origins_json = parts[2].trim_matches('\'').replace("\\\"", "\"");
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "origins",
+                "revoked_before": "0",
+                "jti": "",
+                "exp": "0",
+                "origins_json": origins_json,
+            }));
+        } else if sql.contains("'revoke_all'") && parts.len() >= 3 {
+            let board_id = parts[0].trim_matches('\'');
+            let revoked_before = parts[2].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "revoke_all",
+                "revoked_before": revoked_before,
+                "jti": "",
+                "exp": "0",
+                "origins_json": "[]",
+            }));
+        } else if sql.contains("'withdraw'") && parts.len() >= 4 {
+            let board_id = parts[0].trim_matches('\'');
+            let jti = parts[2].trim_matches('\'');
+            let exp = parts[3].trim();
+            self.events.lock().unwrap().push(json!({
+                "board_id": board_id,
+                "kind": "withdraw",
+                "revoked_before": "0",
+                "jti": jti,
+                "exp": exp,
+                "origins_json": "[]",
+            }));
+        }
+    }
+
     fn inserts_into_board(&self) -> Vec<String> {
         self.statements()
             .into_iter()
-            .filter(|s| s.starts_with("INSERT INTO console.bi_board"))
+            // The board table only: a content edit also writes a row of
+            // `bi_board_version` (BI-18 part C, part 2), whose name starts the same.
+            .filter(|s| {
+                s.starts_with("INSERT INTO console.bi_board (")
+                    || s.starts_with("INSERT INTO console.bi_board ")
+            })
+            .collect()
+    }
+
+    /// SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is
+    /// written to the append-only event table and never to the board row.
+    fn inserts_into_embed_events(&self) -> Vec<String> {
+        self.statements()
+            .into_iter()
+            .filter(|s| s.starts_with("INSERT INTO console.bi_board_embed_event"))
             .collect()
     }
 
@@ -109,7 +264,50 @@ impl Respond for FakeCh {
             let n = data.len();
             ResponseTemplate::new(200).set_body_json(json!({ "meta": [], "data": data, "rows": n }))
         };
-        if sql.contains("FROM console.bi_board") {
+        // The state lookup every board edit makes first (BI-18 part C, part 2):
+        // live, and nobody's personal board.
+        if sql.starts_with("SELECT is_deleted, owner_id FROM console.bi_board") {
+            let found: Vec<Value> = self
+                .boards
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| {
+                    let id = b["id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("WHERE id = '{id}'"))
+                })
+                .map(|b| json!({ "is_deleted": 0, "owner_id": b["owner_id"].as_str().unwrap_or("") }))
+                .collect();
+            return rows(found);
+        }
+        // SEC-12 (PR #105 review SHOULD-FIX 1): the embed access state is read
+        // by aggregating the append-only event table, never from the row.
+        if sql.contains("FROM console.bi_board_embed_event") {
+            let found: Vec<Value> = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    let id = e["board_id"].as_str().unwrap_or_default();
+                    sql.contains(&format!("board_id='{id}'"))
+                })
+                .cloned()
+                .collect();
+            return rows(found);
+        }
+        // And it is written there too: the event table is the only writer of
+        // the embed access state.
+        if sql.starts_with("INSERT INTO console.bi_board_embed_event") {
+            self.record_embed_event(&sql);
+            return ResponseTemplate::new(200).set_body_string(
+                "Ok.
+",
+            );
+        }
+        // A chart read names the boards table too (its sub-selects), so it is
+        // not the board read.
+        if sql.contains("FROM console.bi_board") && !sql.contains("FROM console.bi_chart") {
             let found: Vec<Value> = self
                 .boards
                 .lock()
@@ -128,7 +326,10 @@ impl Respond for FakeCh {
         if sql.contains("FROM console.bi_chart") {
             return rows(vec![]);
         }
-        ResponseTemplate::new(200).set_body_string("Ok.\n")
+        ResponseTemplate::new(200).set_body_string(
+            "Ok.
+",
+        )
     }
 }
 
@@ -478,13 +679,13 @@ async fn withdrawing_one_token_stores_its_jti_and_keeps_the_rest_of_the_board_st
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["withdrawn"], "to-withdraw");
-    let inserts = fake.inserts_into_board();
+    let inserts = fake.inserts_into_embed_events();
     assert_eq!(inserts.len(), 1, "{inserts:?}");
     let insert = &inserts[0];
     assert!(insert.contains("to-withdraw"), "{insert}");
-    // The full-row INSERT carries the existing state forward.
-    assert!(insert.contains(", 1234, "), "{insert}");
-    assert!(insert.contains("https://app.customer.example"), "{insert}");
+    // SEC-12 (PR #105 review SHOULD-FIX 1): withdrawing does not touch the
+    // board row.
+    assert!(fake.inserts_into_board().is_empty());
 }
 
 #[tokio::test]
@@ -579,14 +780,17 @@ async fn withdraw_all_writes_the_instant_and_an_unrelated_edit_does_not_reset_it
     assert_eq!(status, StatusCode::OK, "{body}");
     let stored = body["embedRevokedBefore"].as_u64().expect("the instant");
     assert!((before..=now_secs()).contains(&stored), "{stored}");
+    let event_inserts = fake.inserts_into_embed_events();
+    assert_eq!(event_inserts.len(), 1);
     assert!(
-        fake.inserts_into_board()[0].contains(&format!(", {stored}, ")),
-        "{:?}",
-        fake.inserts_into_board()
+        event_inserts[0].contains(&format!(", {stored}")),
+        "{event_inserts:?}"
     );
+    // SEC-12 (PR #105 review SHOULD-FIX 1): revoke_all inserts into the
+    // event table and does not touch bi_board.
+    assert!(fake.inserts_into_board().is_empty());
 
-    // A rename afterwards (the board now reads back with that instant)
-    // writes it again rather than resetting it to 0.
+    // A rename afterwards writes the board row, but contains none of the embed columns.
     fake.set(BOARD, "embed_revoked_before", &json!(stored.to_string()));
     let (status, _) = as_user(
         &app,
@@ -600,7 +804,9 @@ async fn withdraw_all_writes_the_instant_and_an_unrelated_edit_does_not_reset_it
     .await;
     assert_eq!(status, StatusCode::OK);
     let last = fake.inserts_into_board().pop().unwrap();
-    assert!(last.contains(&format!(", {stored}, ")), "{last}");
+    assert!(!last.contains("embed_revoked_before"), "{last}");
+    assert!(!last.contains("embed_revoked_jti_json"), "{last}");
+    assert!(!last.contains("embed_origins_json"), "{last}");
 }
 
 #[tokio::test]
@@ -654,7 +860,8 @@ async fn allowed_sites_are_validated_normalised_and_stored() {
         body["embedOrigins"],
         json!(["https://app.customer.example", "http://localhost:3000"])
     );
-    assert!(fake.inserts_into_board()[0].contains("https://app.customer.example"));
+    assert!(fake.inserts_into_embed_events()[0].contains("https://app.customer.example"));
+    assert!(fake.inserts_into_board().is_empty());
 
     for bad in [
         json!(["https://*.customer.example"]),
@@ -666,11 +873,15 @@ async fn allowed_sites_are_validated_normalised_and_stored() {
                 .collect::<Vec<_>>()
         ),
     ] {
-        let writes = fake.inserts_into_board().len();
+        let writes = fake.inserts_into_embed_events().len();
         let (status, body) = put_origins(&app, "dashboard:write", bad).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body["error"].is_string());
-        assert_eq!(fake.inserts_into_board().len(), writes, "nothing written");
+        assert_eq!(
+            fake.inserts_into_embed_events().len(),
+            writes,
+            "nothing written"
+        );
     }
 }
 

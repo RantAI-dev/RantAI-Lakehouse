@@ -12,6 +12,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
@@ -116,7 +117,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         return token_refused();
     };
 
-    let board = match store::get_board(&state.clickhouse, &board_id).await {
+    let board = match store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await {
         Ok(b) => b,
         Err(err) => {
             return (
@@ -133,10 +134,14 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         )
             .into_response();
     };
-    // SEC-12: withdrawal is read from the board on every request (a `FINAL`
-    // read, no cache in this process), so "withdraw all" and "withdraw one"
-    // take effect on the next request. A token with no `iat` cannot get here
-    // (`verify_embed` refuses it); `NEG_INFINITY` would be refused if it did.
+    // SEC-12: withdrawal is read on every request — the board's embed events
+    // are aggregated on each read, with no cache in this process — so
+    // "withdraw all" and "withdraw one" take effect on the next request. A
+    // token with no `iat` cannot get here (`verify_embed` refuses it);
+    // `NEG_INFINITY` would be refused if it did.
+    // PR #201 review F SHOULD-FIX 4: the withdrawal is not read from the
+    // board row any more (it lives in `console.bi_board_embed_event`), so
+    // this is an aggregation of that table, not a `FINAL` read of the board.
     if board.embed_access.is_withdrawn(
         claims.iat.unwrap_or(f64::NEG_INFINITY),
         claims.jti.as_deref(),
@@ -151,6 +156,13 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts ride in the
+    // payload's `reporting` object like the zone, so an embed formats as the
+    // console does.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let payload = render_board_payload(
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
@@ -161,7 +173,10 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     )
     .await;
     match payload {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -222,7 +237,7 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
         let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
             return Ok(Vec::new());
         };
-        let board = store::get_board(&state.clickhouse, &board_id).await?;
+        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await?;
         return Ok(board
             .filter(|b| {
                 b.embed_enabled.unwrap_or(false)
@@ -392,6 +407,13 @@ pub async fn public_dashboard(
         Ok(t) => t,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
+    // BI-17 part A: the number locale, company palette and fonts ride in the
+    // payload's `reporting` object like the zone, so an embed formats as the
+    // console does.
+    let format = match crate::routes::settings::format_settings(&state).await {
+        Ok(f) => f,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let payload = render_board_payload(
         &state.clickhouse,
         &PolicyEngineObligations::from_state(&state),
@@ -402,7 +424,10 @@ pub async fn public_dashboard(
     )
     .await;
     match payload {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
@@ -429,16 +454,10 @@ fn embed_rendered(original: &StoredChartSpec, effective: &StoredChartSpec) -> Va
 
 /// The board's tile layout as the payload carries it.
 fn layout_json(board: &Board) -> Value {
-    board.layout.as_ref().map_or_else(
-        || json!({}),
-        |l| {
-            let mut m = serde_json::Map::new();
-            for (k, b) in l {
-                m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
-            }
-            Value::Object(m)
-        },
-    )
+    board
+        .layout
+        .as_ref()
+        .map_or_else(|| json!({}), crate::routes::dashboard::layout_to_json)
 }
 
 /// The calculated fields of every source.
@@ -500,6 +519,62 @@ async fn board_columns(
     Ok(std::collections::HashMap::new())
 }
 
+/// The filters the tile of `chart_id` is given (`BI-18` part C): the tabs and
+/// the layout choose, as on the dashboard. The locked embed `params` have no
+/// tie and so apply on every tab.
+fn tile_filters<'a>(
+    board: &Board,
+    filters: &'a [FilterDef],
+    chart_id: &str,
+) -> std::borrow::Cow<'a, [FilterDef]> {
+    let no_tiles = lakehouse_bi::store::LayoutMap::new();
+    lakehouse_bi::layout::filters_for_chart(
+        filters,
+        board.tabs.as_deref().unwrap_or_default(),
+        board.layout.as_ref().unwrap_or(&no_tiles),
+        chart_id,
+    )
+}
+
+/// The `{ board, layout, charts, results }` payload of an embed or a public
+/// link, with the board's tabs and phone layout when it has them (`BI-18` part
+/// C; left off otherwise so an older board's payload is unchanged).
+fn board_body(
+    board: &Board,
+    charts: &[Value],
+    results: &serde_json::Map<String, Value>,
+    time: &lakehouse_bi::grain::TimeContext,
+) -> Value {
+    let mut body = json!({
+        "board": { "id": board.id, "name": board.name },
+        "layout": layout_json(board),
+        "charts": charts,
+        "results": results,
+        // BI-9: the zone and first day the buckets were cut with, so the
+        // page labels them the same way.
+        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
+    });
+    // BI-17 part A (D13): the theme and font apply wherever the dashboard is
+    // shown, so a public link and a signed embed carry them.
+    if let Some(board_obj) = body["board"].as_object_mut() {
+        if let Some(theme) = &board.theme {
+            board_obj.insert("theme".to_owned(), json!(theme));
+        }
+        if let Some(font) = &board.font {
+            board_obj.insert("font".to_owned(), json!(font));
+        }
+    }
+    if let Some(map) = body.as_object_mut() {
+        if let Some(tabs) = board.tabs.as_ref().filter(|t| !t.is_empty()) {
+            map.insert("tabs".to_owned(), json!(tabs));
+        }
+        if let Some(phone) = board.phone_layout.as_ref().filter(|p| !p.is_empty()) {
+            map.insert("phoneLayout".to_owned(), json!(phone));
+        }
+    }
+    body
+}
+
 /// Shared `{ board, layout, charts, results }` assembly for both
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
@@ -514,7 +589,9 @@ async fn render_board_payload(
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
-    let stored = store::list_stored_charts(ch).await?;
+    // An embed or a public link is read by nobody in particular: a chart in the
+    // trash or on a personal board is not in it (BI-18 part C, part 2).
+    let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
     let field_catalog = catalog_or_empty(ch).await;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
@@ -567,6 +644,7 @@ async fn render_board_payload(
         read: &read,
     };
     for original in &stored_for_board {
+        let tile_filters = tile_filters(board, filters, &original.spec.id);
         let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
         let c = match &effective {
             Ok(e) => &**e,
@@ -576,7 +654,7 @@ async fn render_board_payload(
                 continue;
             }
         };
-        match stored_chart_sql(c, &[], filters, &cols, &sources, &read) {
+        match stored_chart_sql(c, &[], &tile_filters, &cols, &sources, &read) {
             Ok(filtered) => {
                 let (id, mut val) = run_spec_sql(
                     ch,
@@ -598,7 +676,11 @@ async fn render_board_payload(
                     (&roles, &placeholders, obligations),
                 )
                 .await;
-                crate::routes::layers::annotate_layers(&layer_ctx, &mut val, c, filtered.grain)
+                let tile_ctx = crate::routes::layers::LayerContext {
+                    filters: &tile_filters,
+                    ..layer_ctx
+                };
+                crate::routes::layers::annotate_layers(&tile_ctx, &mut val, c, filtered.grain)
                     .await;
                 annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
                 results.insert(id, val);
@@ -611,17 +693,7 @@ async fn render_board_payload(
         charts_out.push(embed_rendered(original, c));
     }
 
-    let layout = layout_json(board);
-
-    Ok(json!({
-        "board": { "id": board.id, "name": board.name },
-        "layout": layout,
-        "charts": charts_out,
-        "results": results,
-        // BI-9: the zone and first day the buckets were cut with, so the
-        // page labels them the same way.
-        "reporting": { "timeZone": time.zone(), "weekStart": time.week_start().as_str() },
-    }))
+    Ok(board_body(board, &charts_out, &results, time))
 }
 
 #[cfg(test)]
@@ -741,11 +813,16 @@ mod typed_filters {
             refresh_seconds: None,
             grain: None,
             params: None,
+            tabs: None,
+            phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
@@ -775,6 +852,7 @@ mod typed_filters {
             .iter()
             .find(|s| s.contains("FROM serving.mart_a WHERE"))
             .unwrap_or_else(|| panic!("tile query not sent: {sent:?}"));
+        assert_chart_read_as_nobody(&sent);
         assert!(
             tile.contains("(visitors >= 100 AND visitors <= 900)"),
             "{tile}"
@@ -782,6 +860,154 @@ mod typed_filters {
         assert!(
             tile.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub') > 0"),
             "{tile}"
+        );
+    }
+
+    /// BI-18 part C, part 2: an embed reads as nobody in particular, so the chart
+    /// read leaves out a personal board's charts and the trash.
+    fn assert_chart_read_as_nobody(sent: &[String]) {
+        let read = sent
+            .iter()
+            .find(|s| s.contains("FROM console.bi_chart FINAL"))
+            .expect("the charts were read");
+        assert!(read.contains("owner_id != '' AND owner_id != ''"), "{read}");
+        assert!(read.contains("is_deleted = 0"), "{read}");
+        assert!(read.contains("is_deleted = 2"), "{read}");
+    }
+
+    /// Two charts, `c1` on `mart_a` and `c2` on `mart_b`, both with `kab` and
+    /// `visitors`; every other statement succeeds with no rows.
+    async fn mount_two_marts(server: &MockServer) {
+        let row = |id: &str, mart: &str| {
+            let spec = json!({
+                "id": id, "title": id, "kind": "bar", "mart": mart,
+                "sql": "SELECT 1", "x": "kab", "y": "visitors"
+            });
+            let def = json!({
+                "title": id, "mart": mart, "kind": "bar",
+                "dimension": "kab", "measures": ["visitors"]
+            });
+            json!({
+                "id": id, "board": "b1", "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+                "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+            })
+        };
+        answer(
+            server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            vec![row("c1", "mart_a"), row("c2", "mart_b")],
+        )
+        .await;
+        let mut cols = Vec::new();
+        for table in ["mart_a", "mart_b"] {
+            cols.push(json!({ "table": table, "name": "kab", "type": "String" }));
+            cols.push(json!({ "table": table, "name": "visitors", "type": "UInt32" }));
+        }
+        answer(
+            server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": [], "rows": 0 })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// BI-18 part C: on an embed or a public link a filter tied to one tab is
+    /// not given to the tiles of the other, and the payload carries the tabs,
+    /// the tile tabs and the phone layout.
+    #[tokio::test]
+    async fn a_tied_filter_and_the_tabs_reach_a_public_link() {
+        let server = MockServer::start().await;
+        mount_two_marts(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let filters: Vec<FilterDef> = serde_json::from_str(
+            r#"[{"column":"kab","op":"contains","text":"ub","tabs":["t_a"]}]"#,
+        )
+        .unwrap();
+        let layout: lakehouse_bi::store::LayoutMap = serde_json::from_value(json!({
+            "c1": { "x": 0, "y": 0, "w": 6, "h": 4, "tab": "t_a" },
+            "c2": { "x": 0, "y": 0, "w": 6, "h": 4, "tab": "t_b" },
+        }))
+        .unwrap();
+        let tabs = vec![
+            lakehouse_bi::layout::Tab {
+                id: "t_a".to_owned(),
+                title: "A".to_owned(),
+            },
+            lakehouse_bi::layout::Tab {
+                id: "t_b".to_owned(),
+                title: "B".to_owned(),
+            },
+        ];
+        let board = Board {
+            id: "b1".to_owned(),
+            name: "B".to_owned(),
+            description: None,
+            created_by: None,
+            layout: Some(layout),
+            filters: Some(filters.clone()),
+            refresh_seconds: None,
+            grain: None,
+            params: None,
+            tabs: Some(tabs),
+            phone_layout: Some(vec![lakehouse_bi::layout::PhoneTile {
+                id: "c2".to_owned(),
+                h: 5,
+            }]),
+            theme: Some("dark".to_owned()),
+            font: Some("inter".to_owned()),
+            created_at: None,
+            updated_at: None,
+            public_token: None,
+            embed_enabled: None,
+            folder_id: None,
+            owner_id: None,
+            embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
+        };
+        let body = render_board_payload(
+            &ch,
+            &PolicyEngineObligations::new(None, &ch),
+            &board,
+            "b1",
+            &filters,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["tabs"][1]["id"], "t_b");
+        assert_eq!(body["phoneLayout"][0], json!({ "id": "c2", "h": 5 }));
+        assert_eq!(body["layout"]["c2"]["tab"], "t_b");
+        // BI-17 part A (D13): the theme and font go out with the embed.
+        assert_eq!(body["board"]["theme"], "dark");
+        assert_eq!(body["board"]["font"], "inter");
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let on_a = sent
+            .iter()
+            .find(|s| s.contains("FROM serving.mart_a WHERE"))
+            .unwrap();
+        assert!(
+            on_a.contains("positionCaseInsensitiveUTF8(toString(kab), 'ub')"),
+            "{on_a}"
+        );
+        // c2 is on t_b: the filter tied to t_a is not given, so it runs its stored SQL.
+        assert!(
+            sent.iter()
+                .all(|s| !s.contains("FROM serving.mart_b WHERE")),
+            "{sent:?}"
         );
     }
 
@@ -838,11 +1064,16 @@ mod typed_filters {
             refresh_seconds: None,
             grain: None,
             params: None,
+            tabs: None,
+            phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
         let locked: Vec<FilterDef> =
@@ -930,11 +1161,16 @@ mod typed_filters {
             refresh_seconds: None,
             grain: Some("month".to_owned()),
             params: None,
+            tabs: None,
+            phone_layout: None,
+            theme: None,
+            font: None,
             created_at: None,
             updated_at: None,
             public_token: None,
             embed_enabled: None,
             folder_id: None,
+            owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
         let time = lakehouse_bi::grain::TimeContext::new(

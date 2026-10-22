@@ -65,9 +65,14 @@ pub struct ColumnSetting {
     /// One of `auto`, `number`, `percent`, `currency`, `date`, `link`, `image`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub format: Option<String>,
-    /// Digits after the point, 0 to 6.
+    /// Digits after the point, 0 to [`crate::style::MAX_DECIMALS`] (`BI-17`
+    /// part A widened it from 6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub decimals: Option<u8>,
+    /// The ISO 4217 code of a `currency` column (`BI-17` part A); absent is
+    /// `IDR`, what a currency column always showed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub currency: Option<String>,
     /// Column width in pixels, 60 to 800.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub width: Option<u32>,
@@ -103,8 +108,26 @@ impl ColumnSetting {
                 COLUMN_FORMATS.join(", ")
             ));
         }
-        if self.decimals.is_some_and(|d| d > 6) {
-            return Err(format!("decimals of '{column}' must be 0 to 6."));
+        if self
+            .decimals
+            .is_some_and(|d| d > crate::style::MAX_DECIMALS)
+        {
+            return Err(format!(
+                "decimals of '{column}' must be 0 to {}.",
+                crate::style::MAX_DECIMALS
+            ));
+        }
+        if let Some(code) = &self.currency {
+            if self.format.as_deref() != Some("currency") {
+                return Err(format!(
+                    "a currency code is only for a currency column ('{column}')."
+                ));
+            }
+            if !crate::style::is_currency(code) {
+                return Err(format!(
+                    "'{code}' is not a currency code: use an ISO 4217 code such as IDR or USD."
+                ));
+            }
         }
         if self.width.is_some_and(|w| !(60..=800).contains(&w)) {
             return Err(format!("the width of '{column}' must be 60 to 800 pixels."));
@@ -1035,14 +1058,21 @@ mod tests {
         let c = cols(&["a"]);
         plan_rows(
             &fields(
-                r#"{"columns":["a"],"columnSettings":{"a":{"label":"Visitors","format":"currency","decimals":2,"width":120,"wrap":true,"hidden":false}}}"#,
+                r#"{"columns":["a"],"columnSettings":{"a":{"label":"Visitors","format":"currency","currency":"USD","decimals":2,"width":120,"wrap":true,"hidden":false}}}"#,
             ),
+            &c,
+        )
+        .unwrap();
+        plan_rows(
+            &fields(r#"{"columns":["a"],"columnSettings":{"a":{"decimals":10}}}"#),
             &c,
         )
         .unwrap();
         for bad in [
             r#"{"columns":["a"],"columnSettings":{"a":{"format":"emoji"}}}"#,
-            r#"{"columns":["a"],"columnSettings":{"a":{"decimals":7}}}"#,
+            r#"{"columns":["a"],"columnSettings":{"a":{"decimals":11}}}"#,
+            r#"{"columns":["a"],"columnSettings":{"a":{"format":"currency","currency":"ZZZ"}}}"#,
+            r#"{"columns":["a"],"columnSettings":{"a":{"format":"number","currency":"IDR"}}}"#,
             r#"{"columns":["a"],"columnSettings":{"a":{"width":59}}}"#,
             r#"{"columns":["a"],"columnSettings":{"a":{"width":801}}}"#,
             r#"{"columns":["a"],"columnSettings":{"a":{"label":""}}}"#,

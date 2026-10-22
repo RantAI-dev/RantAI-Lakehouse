@@ -626,6 +626,20 @@ class WhereMatchTests(unittest.TestCase):
                  "where": {"kind": "line", "def.grain": "month"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
 
+    def test_a_path_with_an_index_reads_the_element_at_that_place_in_a_list(self) -> None:
+        # `tabs[0].title` is the first tab's title, so a case can check the
+        # order the tabs are in (`PR #199 review O SHOULD-FIX 1`).
+        board = {"id": "b-1", "tabs": [{"id": "t_1", "title": "Maps"}, {"id": "t_2", "title": "Overview"}]}
+        self.assertEqual(m.dig(board, "tabs[0].title"), ["Maps"])
+        self.assertEqual(m.dig(board, "tabs[1].title"), ["Overview"])
+        # An index past the end of the list finds nothing, as an absent field does.
+        self.assertEqual(m.dig(board, "tabs[2].title"), [])
+
+    def test_a_where_key_with_an_index_matches_only_the_board_in_that_order(self) -> None:
+        board = {"id": "b-1", "tabs": [{"id": "t_1", "title": "Maps"}, {"id": "t_2", "title": "Overview"}]}
+        self.assertTrue(m.where_matches(board, {"id": "b-1", "tabs[0].title": "Maps"}))
+        self.assertFalse(m.where_matches(board, {"id": "b-1", "tabs[0].title": "Overview"}))
+
     def test_the_three_grain_and_table_keys_resolve_against_a_real_spec_item(self) -> None:
         # The three cases that could never pass (P1) must now resolve against
         # the shape the route returns, so a perfect assistant can match them.
@@ -1299,6 +1313,52 @@ class DashboardCasesTests(unittest.TestCase):
                 continue
             self.assertIs(case.get("confirm"), True, case["id"])
             self.assertIn("expect_state", case, case["id"])
+
+    def test_a_case_that_checks_a_tab_confirms_the_write_that_creates_it(self) -> None:
+        # A tab is written only when the harness confirms the assistant's
+        # draft, so a case that checks for a tab the assistant creates needs
+        # `confirm`: without it the tab is never written and the case can
+        # never pass (`PR #199 review O BLOCKER 3`).
+        cases = json.loads((HERE / "dashboard_cases.json").read_text())
+        for case in cases:
+            checks_a_tab = any(
+                "tabs[]" in json.dumps(check.get("where", {}))
+                for check in case.get("expect_state", [])
+            )
+            if not checks_a_tab:
+                continue
+            self.assertIs(case.get("confirm"), True, case["id"])
+
+    def test_the_map_case_expects_the_map_chart_to_be_moved_to_the_tab_it_names(self) -> None:
+        # The case asked for "a separate tab" and checked only that the board
+        # exists, so it passed whatever the assistant did with the map chart
+        # (`PR #199 review O SHOULD-FIX 1`).
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["dash_map_charts_in_separate_tab"]
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{map_chart}"}},
+        )
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
+            case["expect_state"],
+        )
+        # The tab is named in the request, so the check can name it too.
+        self.assertIn("called Maps", case["turns"][0])
+
+    def test_the_move_tab_case_checks_the_order_the_tabs_are_in(self) -> None:
+        # Two tabs and a move: the order is the result, so it is checked
+        # (`PR #199 review O SHOULD-FIX 1`).
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["dash_move_tab"]
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "tabs[0].title": "Maps"}, "count": 1},
+            case["expect_state"],
+        )
+        # "Maps" was the second tab and is asked for first, so it is the first.
+        self.assertIn("first position", case["turns"][2])
 
     def test_the_two_chained_write_cases_ask_for_the_chart_in_a_second_turn(self) -> None:
         # One message cannot carry both writes: the board or the field waits

@@ -839,15 +839,86 @@ pub enum LineValue {
     Param(ParamRef),
 }
 
+/// What a reference line marks (`BI-17` part A, decision D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineKind {
+    /// A fixed value or a number parameter; what every line was before.
+    #[default]
+    Value,
+    /// The average of the rows the chart shows.
+    Average,
+    /// Their median.
+    Median,
+    /// Their lowest value.
+    Min,
+    /// Their highest value.
+    Max,
+    /// A linear trend (least squares) over the shown points.
+    Trend,
+    /// A band between two values, `value` and `to`.
+    Band,
+}
+
+impl LineKind {
+    /// Whether the console computes the line from the rows on screen.
+    #[must_use]
+    pub fn is_computed(self) -> bool {
+        matches!(
+            self,
+            Self::Average | Self::Median | Self::Min | Self::Max | Self::Trend
+        )
+    }
+
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes a reference"
+    )]
+    fn is_value(&self) -> bool {
+        *self == Self::Value
+    }
+}
+
 /// A reference line drawn on the value axis.
+///
+/// `kind`, `to`, `color` and `measure` are `BI-17` part A; all are left out of
+/// the stored JSON at their defaults, so a line saved before reads and writes
+/// back as it was. `value` is absent only on a computed line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceLine {
-    /// Where.
-    pub value: LineValue,
+    /// Where; the lower edge of a band. Absent on a computed line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<LineValue>,
+    /// What it marks.
+    #[serde(default, skip_serializing_if = "LineKind::is_value")]
+    pub kind: LineKind,
+    /// The upper edge of a band.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<LineValue>,
     /// Its label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `#rrggbb`; absent follows the palette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Which value a computed line describes, by result name; absent is the
+    /// first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<String>,
+}
+
+impl ReferenceLine {
+    /// The line's parameters, if its value or its upper edge is one.
+    pub fn params(&self) -> impl Iterator<Item = &ParamRef> {
+        [self.value.as_ref(), self.to.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| match v {
+                LineValue::Param(p) => Some(p),
+                LineValue::Fixed(_) => None,
+            })
+    }
 }
 
 /// Kinds that can draw reference lines: the ones with a value axis.
@@ -877,9 +948,111 @@ fn takes_param_slots(def: &ChartInput) -> bool {
             | ChartKind::Geoheat
             | ChartKind::Boxplot
             | ChartKind::Text
+            | ChartKind::Heading
+            | ChartKind::Divider
+            | ChartKind::Section
+            | ChartKind::Image
+            | ChartKind::Web
+            | ChartKind::Progress
+            | ChartKind::Histogram
+            | ChartKind::Bullet
     ) && def.shape.steps.is_none()
         && def.shape.groupings.is_none()
         && !def.tables.is_rows_mode(def.kind)
+}
+
+/// Check a chart's reference lines: the kinds that take them, how many, and
+/// the shape of each (`BI-17` part A extends `BI-11`'s checks to the computed
+/// lines and bands).
+///
+/// # Errors
+///
+/// The sentence to show.
+pub fn check_reference_lines(def: &ChartInput) -> Result<(), String> {
+    let lines = def.shape.reference_lines.as_deref().unwrap_or_default();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    if !takes_reference_lines(def.kind) {
+        return Err(
+            "reference lines are for a bar, horizontal bar, line, area, stacked or combo chart."
+                .to_owned(),
+        );
+    }
+    if lines.len() > MAX_REFERENCE_LINES {
+        return Err(format!(
+            "a chart has at most {MAX_REFERENCE_LINES} reference lines."
+        ));
+    }
+    // `PR #199 review M BLOCKER 3` (decision M1): a computed line is computed
+    // from the values on screen, and on a chart with a breakdown those values
+    // are the groups side by side, so the average, the median, the minimum,
+    // the maximum and the trend would mix the groups. A goal and a band are
+    // values of their own and stay allowed.
+    if def.breakdown.is_some() && lines.iter().any(|l| l.kind.is_computed()) {
+        return Err(
+            "an average, median, minimum, maximum or trend line cannot be drawn on a chart with a breakdown: it would mix the groups."
+                .to_owned(),
+        );
+    }
+    let results = def.measures.result_names();
+    for line in lines {
+        let check_value = |v: &LineValue| match v {
+            LineValue::Fixed(v) if !(v.is_finite() && v.abs() < MAX_NUMBER) => {
+                Err("a reference line value must be a finite number.".to_owned())
+            }
+            LineValue::Param(p) if !valid_name(&p.param) => {
+                Err("a reference line names an invalid parameter.".to_owned())
+            }
+            _ => Ok(()),
+        };
+        match (line.kind, &line.value, &line.to) {
+            (LineKind::Value, None, _) => {
+                return Err("a reference line needs a value.".to_owned());
+            }
+            (LineKind::Band, None, _) | (LineKind::Band, _, None) => {
+                return Err("a band needs a value and a second value.".to_owned());
+            }
+            (kind, Some(_), _) if kind.is_computed() => {
+                return Err("an average, median, minimum, maximum or trend line is computed: leave its value out.".to_owned());
+            }
+            (kind, _, Some(_)) if kind != LineKind::Band => {
+                return Err("a second value is only for a band.".to_owned());
+            }
+            _ => {}
+        }
+        for v in [&line.value, &line.to].into_iter().flatten() {
+            check_value(v)?;
+        }
+        if let (Some(LineValue::Fixed(a)), Some(LineValue::Fixed(b))) = (&line.value, &line.to)
+            && a >= b
+        {
+            return Err("a band starts at its lower value.".to_owned());
+        }
+        if let Some(c) = &line.color
+            && !crate::formatting::is_hex_color(c)
+        {
+            return Err("a reference line colour must look like #1a2b3c.".to_owned());
+        }
+        if let Some(m) = &line.measure {
+            if !line.kind.is_computed() {
+                return Err("a measure is only for a computed reference line.".to_owned());
+            }
+            if !results.contains(m) && !m.contains('{') {
+                return Err(format!(
+                    "the reference line describes '{m}', which is not one of the chart's values."
+                ));
+            }
+        }
+        if let Some(label) = &line.label
+            && (label.chars().count() > MAX_LINE_LABEL_LEN || label.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "a reference line label is at most {MAX_LINE_LABEL_LEN} characters."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check the parameter-related fields of a chart (the kind and shape rules,
@@ -889,39 +1062,7 @@ fn takes_param_slots(def: &ChartInput) -> bool {
 ///
 /// The sentence to show.
 pub fn check_chart_shape(def: &ChartInput) -> Result<(), String> {
-    let lines = def.shape.reference_lines.as_deref().unwrap_or_default();
-    if !lines.is_empty() {
-        if !takes_reference_lines(def.kind) {
-            return Err(
-                "reference lines are for a bar, horizontal bar, line, area, stacked or combo chart."
-                    .to_owned(),
-            );
-        }
-        if lines.len() > MAX_REFERENCE_LINES {
-            return Err(format!(
-                "a chart has at most {MAX_REFERENCE_LINES} reference lines."
-            ));
-        }
-        for line in lines {
-            match &line.value {
-                LineValue::Fixed(v) if !(v.is_finite() && v.abs() < MAX_NUMBER) => {
-                    return Err("a reference line value must be a finite number.".to_owned());
-                }
-                LineValue::Param(p) if !valid_name(&p.param) => {
-                    return Err("a reference line names an invalid parameter.".to_owned());
-                }
-                _ => {}
-            }
-            if let Some(label) = &line.label
-                && (label.chars().count() > MAX_LINE_LABEL_LEN
-                    || label.chars().any(char::is_control))
-            {
-                return Err(format!(
-                    "a reference line label is at most {MAX_LINE_LABEL_LEN} characters."
-                ));
-            }
-        }
-    }
+    check_reference_lines(def)?;
     if (!slots(def).is_empty() || matches!(def.limit, Some(Limit::Param(_))))
         && !takes_param_slots(def)
     {
@@ -1064,9 +1205,7 @@ pub fn chart_param_names(def: &ChartInput) -> BTreeSet<String> {
         out.insert(p.param.clone());
     }
     for line in def.shape.reference_lines.iter().flatten() {
-        if let LineValue::Param(p) = &line.value {
-            out.insert(p.param.clone());
-        }
+        out.extend(line.params().map(|p| p.param.clone()));
     }
     out
 }
@@ -1225,35 +1364,58 @@ pub fn resolve_chart(
     Ok(out)
 }
 
-/// A reference line with its value resolved.
+/// A reference line with its values resolved.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResolvedLine {
-    /// Where.
-    pub value: f64,
+    /// What it marks; left out for a plain line.
+    #[serde(skip_serializing_if = "LineKind::is_value")]
+    pub kind: LineKind,
+    /// Where (the lower edge of a band); absent on a computed line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    /// The upper edge of a band.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<f64>,
     /// Its label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `#rrggbb`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// The value a computed line describes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measure: Option<String>,
 }
 
 /// The reference lines of `def` with the values of this read. A line whose
 /// parameter is missing or is not a number is left out.
 #[must_use]
 pub fn reference_lines(def: &ChartInput, params: &ParamValues) -> Vec<ResolvedLine> {
+    let resolve = |v: &LineValue| match v {
+        LineValue::Fixed(v) => Some(*v),
+        LineValue::Param(p) => match params.get(&p.param).map(|r| &r.value) {
+            Some(ParamValue::Number(n)) => Some(*n),
+            _ => None,
+        },
+    };
     def.shape
         .reference_lines
         .iter()
         .flatten()
         .filter_map(|line| {
-            let value = match &line.value {
-                LineValue::Fixed(v) => *v,
-                LineValue::Param(p) => match params.get(&p.param).map(|r| &r.value) {
-                    Some(ParamValue::Number(n)) => *n,
-                    _ => return None,
-                },
-            };
+            let value = line.value.as_ref().map(&resolve);
+            let to = line.to.as_ref().map(&resolve);
+            // A parameter that is missing or not a number drops the line.
+            if value == Some(None) || to == Some(None) {
+                return None;
+            }
             Some(ResolvedLine {
-                value,
+                kind: line.kind,
+                value: value.flatten(),
+                to: to.flatten(),
                 label: line.label.clone(),
+                color: line.color.clone(),
+                measure: line.measure.clone(),
             })
         })
         .collect()
@@ -1745,15 +1907,117 @@ mod tests {
             lines,
             vec![
                 ResolvedLine {
-                    value: 250.0,
-                    label: Some("Goal".to_owned())
+                    kind: LineKind::Value,
+                    value: Some(250.0),
+                    to: None,
+                    label: Some("Goal".to_owned()),
+                    color: None,
+                    measure: None,
                 },
                 ResolvedLine {
-                    value: 7.5,
-                    label: None
+                    kind: LineKind::Value,
+                    value: Some(7.5),
+                    to: None,
+                    label: None,
+                    color: None,
+                    measure: None,
                 },
             ]
         );
+    }
+
+    /// Plan T2: a line saved before `kind` existed is a plain line.
+    #[test]
+    fn an_old_reference_line_reads_as_a_value_line_and_writes_back_unchanged() {
+        // Numbers are f64 on both sides, as before this branch.
+        let old = json!([{ "value": 5.0, "label": "Goal" }, { "value": { "param": "t" } }]);
+        let c = chart(&json!({ "referenceLines": old }));
+        let lines = c.def.shape.reference_lines.as_ref().unwrap();
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.kind == LineKind::Value && l.to.is_none())
+        );
+        assert_eq!(serde_json::to_value(lines).unwrap(), old);
+    }
+
+    #[test]
+    fn computed_lines_and_bands_are_checked() {
+        let ok =
+            |lines: Value| check_reference_lines(&chart(&json!({ "referenceLines": lines })).def);
+        assert!(ok(json!([{ "kind": "average" }, { "kind": "trend", "measure": "visitors", "color": "#112233" }])).is_ok());
+        assert!(ok(json!([{ "kind": "band", "value": 1, "to": 5 }])).is_ok());
+        assert!(
+            ok(json!([{ "kind": "band", "value": { "param": "a" }, "to": { "param": "b" } }]))
+                .is_ok()
+        );
+        for (lines, why) in [
+            (json!([{ "kind": "average", "value": 3 }]), "is computed"),
+            (json!([{ "kind": "band", "value": 1 }]), "a band needs"),
+            (
+                json!([{ "kind": "band", "value": 5, "to": 1 }]),
+                "lower value",
+            ),
+            (json!([{ "value": 1, "to": 5 }]), "only for a band"),
+            (json!([{ "label": "x" }]), "needs a value"),
+            (json!([{ "kind": "median", "color": "red" }]), "#1a2b3c"),
+            (
+                json!([{ "kind": "max", "measure": "ghost" }]),
+                "not one of the chart's values",
+            ),
+            (
+                json!([{ "value": 1, "measure": "visitors" }]),
+                "only for a computed",
+            ),
+        ] {
+            let e = ok(lines.clone()).unwrap_err();
+            assert!(e.contains(why), "{lines}: {e}");
+        }
+        assert!(serde_json::from_value::<ReferenceLine>(json!({ "kind": "wave" })).is_err());
+    }
+
+    /// `PR #199 review M BLOCKER 3` (decision M1): a computed line would mix
+    /// the groups of a breakdown, so it is refused; a goal and a band stay.
+    #[test]
+    fn a_computed_line_is_refused_on_a_chart_with_a_breakdown() {
+        let with_breakdown =
+            |lines: Value| chart(&json!({ "breakdown": "tahun", "referenceLines": lines })).def;
+        for kind in ["average", "median", "min", "max", "trend"] {
+            let e = check_reference_lines(&with_breakdown(json!([{ "kind": kind }]))).unwrap_err();
+            assert!(e.contains("with a breakdown"), "{kind}: {e}");
+        }
+        // A goal and a band are values of their own: they stay allowed.
+        assert!(
+            check_reference_lines(&with_breakdown(json!([{ "value": 1000, "label": "Goal" }])))
+                .is_ok()
+        );
+        assert!(
+            check_reference_lines(&with_breakdown(
+                json!([{ "kind": "band", "value": 1, "to": 5 }])
+            ))
+            .is_ok()
+        );
+        // A chart without a breakdown keeps every computed line.
+        assert!(
+            check_reference_lines(
+                &chart(&json!({ "referenceLines": [{ "kind": "average" }] })).def
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_resolved_band_carries_both_edges_and_a_computed_line_none() {
+        let defs = [validate_def(&base("hi", ParamType::Number, json!(9))).unwrap()];
+        let c = chart(&json!({ "referenceLines": [
+            { "kind": "band", "value": 1, "to": { "param": "hi" }, "color": "#112233" },
+            { "kind": "average", "measure": "visitors" },
+        ]}));
+        let lines = reference_lines(&c.def, &set(&defs, &json!({})));
+        assert_eq!(lines[0].value, Some(1.0));
+        assert_eq!(lines[0].to, Some(9.0));
+        let out = serde_json::to_value(&lines[1]).unwrap();
+        assert_eq!(out, json!({ "kind": "average", "measure": "visitors" }));
     }
 
     #[test]

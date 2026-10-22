@@ -72,4 +72,17 @@ describe("a tile with more questions on its chart", () => {
     expect(screen.getByText("No data.")).toBeTruthy()
     expect(drawn).toHaveLength(0)
   })
+
+  // PR #199 review O SHOULD-FIX 8: the layered path has to read the reference
+  // lines too, or a line at or below zero vanishes on a logarithmic axis.
+  it("says so when a line at or below zero would vanish on a logarithmic axis", () => {
+    const spec = {
+      ...SPEC,
+      def: { ...(SPEC.def as Record<string, unknown>), axes: { y: { log: true } } },
+    } as unknown as ChartRenderSpec
+    const cell: Rows = { ...CELL, referenceLines: [{ value: 0 }] }
+    render(<TileBody spec={spec} cell={cell} dark={false} loading={false} />)
+    expect(screen.getByText("A logarithmic axis cannot show zero or negative values.")).toBeTruthy()
+    expect(drawn).toHaveLength(0)
+  })
 })

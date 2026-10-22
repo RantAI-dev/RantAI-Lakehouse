@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import type { ColumnDef } from "@tanstack/react-table"
-import { Copy, FolderInput, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
+import { Copy, FolderInput, MoreHorizontal, Pencil, Star, Trash2 } from "lucide-react"
 
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { Pill } from "@/components/patterns/status-badge"
@@ -15,14 +15,23 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
-import type { Board } from "@/services/clients/bi-store"
+import type { Board } from "@/services"
+import { PrivateBadge } from "./private-badge"
 
 export type BoardRowActions = {
-  onRename: (board: Board) => void
-  onDuplicate: (board: Board) => void
-  onDelete: (board: Board) => void
+  /**
+   * The write actions are absent when the viewer lacks `dashboard:write`
+   * (BI-18 part C review fix (SHOULD-FIX) R27); the menu then offers only
+   * what the viewer can do.
+   */
+  onRename?: (board: Board) => void
+  onDuplicate?: (board: Board) => void
+  onDelete?: (board: Board) => void
   /** Absent when the viewer may not file dashboards (`dashboard:write`). */
   onMove?: (board: Board) => void
+  /** BI-18 part C, part 2: whether the caller marked the board as a favourite. */
+  isFavourite?: (board: Board) => boolean
+  onToggleFavourite?: (board: Board) => void
 }
 
 /**
@@ -54,21 +63,35 @@ export function BoardActionsMenu({
         <MoreHorizontal className="size-4" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
-        <DropdownMenuItem onClick={() => actions.onRename(b)}>
-          <Pencil className="size-4" /> Rename
-        </DropdownMenuItem>
+        {actions.onRename ? (
+          <DropdownMenuItem onClick={() => actions.onRename?.(b)}>
+            <Pencil className="size-4" /> Rename
+          </DropdownMenuItem>
+        ) : null}
+        {actions.onToggleFavourite ? (
+          <DropdownMenuItem onClick={() => actions.onToggleFavourite?.(b)}>
+            <Star className="size-4" />
+            {actions.isFavourite?.(b) ? "Remove from favourites" : "Add to favourites"}
+          </DropdownMenuItem>
+        ) : null}
         {actions.onMove ? (
           <DropdownMenuItem onClick={() => actions.onMove?.(b)}>
             <FolderInput className="size-4" /> Move to folder…
           </DropdownMenuItem>
         ) : null}
-        <DropdownMenuItem onClick={() => actions.onDuplicate(b)}>
-          <Copy className="size-4" /> Duplicate
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem variant="destructive" onClick={() => actions.onDelete(b)}>
-          <Trash2 className="size-4" /> Delete
-        </DropdownMenuItem>
+        {actions.onDuplicate ? (
+          <DropdownMenuItem onClick={() => actions.onDuplicate?.(b)}>
+            <Copy className="size-4" /> Duplicate
+          </DropdownMenuItem>
+        ) : null}
+        {actions.onDelete ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onClick={() => actions.onDelete?.(b)}>
+              <Trash2 className="size-4" /> Delete
+            </DropdownMenuItem>
+          </>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -84,9 +107,11 @@ export function BoardActionsMenu({
  */
 export function ShareBadges({ board }: { readonly board: Board }) {
   const isPublic = Boolean(board.publicToken)
-  if (!isPublic && !board.embedEnabled) return null
+  const isPrivate = Boolean(board.ownerId)
+  if (!isPublic && !board.embedEnabled && !isPrivate) return null
   return (
     <span className="flex flex-wrap gap-1">
+      {isPrivate ? <PrivateBadge /> : null}
       {isPublic ? <Pill tone="warning">Public</Pill> : null}
       {board.embedEnabled ? <Pill tone="neutral">Embed</Pill> : null}
     </span>

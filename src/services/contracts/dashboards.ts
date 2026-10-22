@@ -1,4 +1,4 @@
-import type { Board } from "../clients/bi-store"
+import type { FilterDef } from "../clients/bi-store"
 
 /**
  * Kontrak untuk halaman DAFTAR dashboard (`/dashboards/browse`) dan untuk
@@ -18,6 +18,62 @@ import type { Board } from "../clients/bi-store"
  * `serving` marts) a chart can read instead of one mart. Authoring needs the
  * `dashboard:sql` permission; listing needs `dashboard:read`.
  */
+/** Tile position on the grid canvas (12 columns). Key = chartId. */
+export type TileBox = {
+  x: number; y: number; w: number; h: number;
+  /** The tab this tile sits on (BI-18 part C). Absent: the first tab, or no tabs. */
+  tab?: string;
+};
+/** A tab of a dashboard (BI-18 part C); `id` is stable across renames. Mirrors `lakehouse_bi::layout::Tab`. */
+export type BoardTab = { id: string; title: string };
+/** A tile in the phone layout: its place in the one column and its height in rows. */
+export type PhoneTile = { id: string; h: number };
+export type LayoutMap = Record<string, TileBox>;
+export type Board = {
+  id: string;
+  name: string;
+  /** Satu kalimat tujuan board, tampil di halaman daftar dashboard. */
+  description?: string;
+  /** Nama tampilan pembuat board. Kosong untuk board lama / tanpa login. */
+  createdBy?: string;
+  /** Folder this board is filed in; empty or null = no folder. */
+  folderId?: string | null;
+  /** The principal whose personal space holds this board (BI-18 part C, part 2); absent when it is shared. */
+  ownerId?: string;
+  layout?: LayoutMap;
+  filters?: FilterDef[];
+  /** BI-18 part C: absent when the dashboard has no tabs. */
+  tabs?: BoardTab[];
+  /** BI-18 part C: the order and heights of the tiles below 640 px, when an editor saved them. */
+  phoneLayout?: PhoneTile[];
+  /**
+   * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
+   * 1800, 3600). Absent when none was saved; BI-18·B.
+   */
+  refreshSeconds?: number;
+  /** BI-17 part A: the dashboard's own theme (`light` or `dark`) and font id; absent follows the console. */
+  theme?: string;
+  font?: string;
+  createdAt?: string;
+  /**
+   * Kapan board terakhir ditulis.
+   *
+   * Nilainya sama dengan `createdAt`, dan itu disengaja: tabelnya
+   * `ReplacingMergeTree(created_at)`, jadi `created_at` adalah kolom versi
+   * yang ditulis ulang `now()` setiap kali board di-rename / layout
+   * disimpan / filter diubah. Jadi sejak awal isinya memang "terakhir
+   * diubah", cuma namanya saja "created". Di UI, labeli **"Updated"** —
+   * jangan pernah "Created", karena itu klaim yang tidak benar.
+   */
+  updatedAt?: string;
+  /** Jumlah tile di board ini; dihitung server, bukan kolom tersimpan. */
+  chartCount?: number;
+  /** `true` hanya untuk board bawaan (`default`) yang tidak bisa dihapus. */
+  builtin?: boolean;
+  publicToken?: string;
+  embedEnabled?: boolean;
+};
+
 export type DashboardService = {
   /** Semua board, board bawaan (`default`) di urutan pertama. */
   listBoards(signal?: AbortSignal): Promise<Board[]>
@@ -26,6 +82,16 @@ export type DashboardService = {
   duplicateBoard(id: string, signal?: AbortSignal): Promise<Board>
   updateBoard(input: UpdateBoardInput, signal?: AbortSignal): Promise<void>
   deleteBoard(id: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Save the tile layout of a dashboard (`PUT /api/dashboard/boards`). The
+   * console's own write; it needs `dashboard:write`.
+   */
+  saveBoardLayout(id: string, layout: LayoutMap, signal?: AbortSignal): Promise<void>
+  /**
+   * Delete one saved chart card (`DELETE /api/dashboard/specs`). It needs
+   * `dashboard:write`.
+   */
+  deleteChart(id: string, signal?: AbortSignal): Promise<void>
 
   listSqlSources(signal?: AbortSignal): Promise<SqlSource[]>
   createSqlSource(input: SaveSqlSourceInput, signal?: AbortSignal): Promise<SqlSource>
@@ -85,7 +151,102 @@ export type DashboardService = {
    * carries no `jti`. Resolves to the withdrawn `jti`. Needs `dashboard:write`.
    */
   revokeEmbedToken(board: string, token: string, signal?: AbortSignal): Promise<string>
+
+  /**
+   * BI-18 part C, part 2. The last versions of a dashboard, newest first
+   * (`GET /api/dashboard/versions`). Needs `dashboard:read`. The built-in
+   * dashboard keeps none.
+   */
+  listVersions(board: string, signal?: AbortSignal): Promise<VersionHistory>
+  /**
+   * Write a stored version back (`POST /api/dashboard/versions/revert`). Needs
+   * `dashboard:write`. A version that no longer holds against today's rules is
+   * refused with a sentence naming why; nothing is changed then.
+   */
+  revertToVersion(board: string, version: number, signal?: AbortSignal): Promise<RevertResult>
+  /** Deleted dashboards and charts the caller may see (`GET /api/dashboard/trash`). */
+  listTrash(signal?: AbortSignal): Promise<TrashList>
+  /** Bring one back (`POST /api/dashboard/trash/restore`). Needs `dashboard:write`. */
+  restoreFromTrash(kind: ItemKind, id: string, signal?: AbortSignal): Promise<RestoredItem>
+  /** The caller's personal space, created on first use. Needs `dashboard:write`. */
+  ensurePersonalSpace(signal?: AbortSignal): Promise<DashboardFolder>
+  /** The caller's favourites and recent dashboards and charts. */
+  shortcuts(signal?: AbortSignal): Promise<Shortcuts>
+  setFavourite(kind: ItemKind, id: string, on: boolean, signal?: AbortSignal): Promise<void>
+  /** Note that the caller opened an item (best effort). */
+  touchRecent(kind: ItemKind, id: string, signal?: AbortSignal): Promise<void>
+  /** Dashboards and charts whose name contains `text`, across what the caller may read. */
+  searchItems(text: string, signal?: AbortSignal): Promise<ShortcutItem[]>
 }
+
+/** What a favourite, a recent item, a search hit or a trash entry points at. */
+export type ItemKind = "board" | "chart"
+
+/** One version of a dashboard (`lakehouse_bi::versions::VersionEntry`). */
+export type VersionEntry = {
+  version: number
+  /** Display name of whoever made the change. */
+  author: string
+  /** When, as the store formats it. */
+  at: string
+  /** What changed against the version before, in a few words. */
+  summary: string
+  charts: number
+}
+
+export type VersionHistory = { versions: VersionEntry[]; keep: number }
+
+export type RevertResult = {
+  restoredFrom: number
+  /** The new version the revert wrote; `null` when the content was already that. */
+  version: number | null
+  /** Charts added since that moved to the trash. */
+  chartsRemoved: number
+  /** Titles of charts the version had that were in the trash: the revert took them out of it. */
+  chartsRestored: string[]
+  /** Titles of charts the version had that were removed from the trash for good: they could not come back. */
+  chartsGone: string[]
+  /** Titles of charts the version had that now sit on another dashboard: they are not on this one any more. */
+  chartsMoved: string[]
+}
+
+/** `lakehouse_bi::trash::TrashItem`. */
+export type TrashItem = {
+  kind: ItemKind
+  id: string
+  name: string
+  /** For a chart, the dashboard it was on. */
+  board: string
+  boardName: string
+  /** For a chart: whether that dashboard is `live`, in the `trash` or `gone`. */
+  boardState: "" | "live" | "trash" | "gone"
+  deletedBy: string
+  deletedAt: string
+  expiresAt: string
+  personal: boolean
+}
+
+export type TrashList = { items: TrashItem[]; retentionDays: number }
+
+export type RestoredItem = {
+  kind: ItemKind
+  id: string
+  /** For a dashboard, how many charts came back with it. */
+  charts: number
+  boardState: "" | "live" | "trash" | "gone"
+}
+
+/** A favourite, a recent item or a search hit (`lakehouse_bi::items::Entry`). */
+export type ShortcutItem = {
+  kind: ItemKind
+  id: string
+  name: string
+  /** For a chart, the dashboard it is on. */
+  board?: string
+  boardName?: string
+}
+
+export type Shortcuts = { favourites: ShortcutItem[]; recent: ShortcutItem[] }
 
 /**
  * `GET /api/dashboard/embed-info` (`embed_info_body`,
@@ -191,6 +352,12 @@ export type DashboardFolder = {
   parentId: string
   createdBy: string
   updatedAt?: string
+  /**
+   * The principal whose personal space this is (BI-18 part C, part 2); absent
+   * for an ordinary folder. A personal space holds dashboards only and cannot
+   * be renamed, moved or deleted.
+   */
+  ownerId?: string
 }
 
 /**

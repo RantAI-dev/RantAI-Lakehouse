@@ -249,10 +249,18 @@ def api_get(cfg: Config, session: requests.Session, path: str) -> Any:
 
 
 def dig(value: Any, path: str) -> list[Any]:
-    """`a.b[].c` style lookup; `[]` fans out over a list."""
+    """`a.b[].c` style lookup; `[]` fans out over a list and `[N]` takes the
+    Nth element of one (`tabs[0].title` is the first tab's title, which is
+    how a case checks the order the tabs are in)."""
     current = [value]
     for part in path.split("."):
         fan = part.endswith("[]")
+        index: int | None = None
+        if not fan:
+            match = re.search(r"\[(\d+)\]$", part)
+            if match:
+                index = int(match.group(1))
+                part = part[: match.start()]
         key = part[:-2] if fan else part
         nxt: list[Any] = []
         for item in current:
@@ -262,7 +270,10 @@ def dig(value: Any, path: str) -> list[Any]:
                 continue
             if fan and isinstance(item, list):
                 nxt.extend(item)
-            elif not fan:
+            elif index is not None:
+                if isinstance(item, list) and index < len(item):
+                    nxt.append(item[index])
+            else:
                 nxt.append(item)
         current = nxt
     return current
