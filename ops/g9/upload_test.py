@@ -85,6 +85,17 @@ is `DATA-19`
    another delimiter previews again; a load request for it answers 400 with the
    same sentence, before any table name is claimed. The upload is deleted.
 
+9. Several files into one table (`DATA-17` slice 5, decision 4): it uploads three
+   CSV files with the same columns, one of them with its columns in another order,
+   and a fourth with an extra column. The comparison lists only the fourth, with the
+   extra column named. A load of all four is refused (400) with the file named, and
+   nothing is claimed or marked. A load of the first three is accepted as ONE run:
+   the table holds every row of the three files, each value under its own column
+   (the reordered file proves columns are matched by name), the row count is the
+   sum, there is one `ingest_run` row, the other two files settle as `ingested`
+   with `loadedWith` naming the first, and lineage says "<first file> and 2 more".
+   The four uploads are deleted at the end; the table stays.
+
 Exit code 0 and `[g9] PASS` when every step holds; otherwise `[g9] FAILED:
 <reason>` on stderr and exit code 1.
 
@@ -984,6 +995,110 @@ def step_new_formats(api, base_table: str, state: dict) -> None:
     print("[g9] formats: a gzip bomb and a zip bomb were refused and nothing was stored")
 
 
+# DATA-17 (slice 5): several files into one table.
+SEVERAL_FILES = [
+    ("stock_a.csv", "id,name,qty\n1,bolt,10\n2,nut,20\n"),
+    # The same columns in another order: matched by name, not by position.
+    ("stock_b.csv", "qty,id,name\n30,3,screw\n40,4,washer\n"),
+    ("stock_c.csv", "id,name,qty\n5,pin,50\n"),
+]
+EXTRA_COLUMN_FILE = ("stock_d.csv", "id,name,qty,notes\n6,rivet,60,fragile\n")
+SEVERAL_ROWS = [("1", "bolt", "10"), ("2", "nut", "20"), ("3", "screw", "30"), ("4", "washer", "40"), ("5", "pin", "50")]
+
+
+def _upload_one(api, name: str, text: str, state: dict) -> str:
+    resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, text.encode(), "text/csv")}, timeout=60)
+    upload_id = _expect(resp, 201, f"POST /api/uploads ({name})").json()["id"]
+    state.setdefault("others", []).append(upload_id)
+    return upload_id
+
+
+def step_several_files(api, base_table: str, state: dict) -> None:
+    """Three CSV files, one with its columns in another order, load into one table with every
+    row, and a fourth with an extra column is refused with the list (DATA-17 AC, decision 4)."""
+    table = f"{base_table}_many"
+    ids = [_upload_one(api, name, text, state) for name, text in SEVERAL_FILES]
+    extra_id = _upload_one(api, EXTRA_COLUMN_FILE[0], EXTRA_COLUMN_FILE[1], state)
+    first = ids[0]
+
+    # The comparison lists the file with the extra column, and only it.
+    compared = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/compare", json={"alsoUploads": ids[1:] + [extra_id]}, timeout=60),
+        200,
+        "POST .../compare",
+    ).json()
+    listed = [(m["uploadId"], m["file"], m["missing"], m["extra"]) for m in compared["mismatches"]]
+    if listed != [(extra_id, EXTRA_COLUMN_FILE[0], [], ["notes"])]:
+        raise G9Failure(f"only {EXTRA_COLUMN_FILE[0]} (extra column notes) should be listed, got {compared}")
+
+    # A load that includes it is refused with the same list, and claims and marks nothing.
+    body = {"bronzeTable": table, "mode": "replace", "encoding": "utf-8", "delimiter": ",", "headerRow": 0}
+    refused = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "alsoUploads": ids[1:] + [extra_id]}, timeout=60),
+        400,
+        "POST .../ingest with a file of other columns",
+    ).json()
+    if EXTRA_COLUMN_FILE[0] not in refused.get("error", "") or "notes" not in refused.get("error", ""):
+        raise G9Failure(f"the refusal should name {EXTRA_COLUMN_FILE[0]} and the column notes, got {refused}")
+    after_refusal = _expect(api.get(f"{API_URL}/api/uploads/{first}", timeout=30), 200, "GET first upload").json()
+    if after_refusal.get("status") != "uploaded":
+        raise G9Failure(f"a refused load must leave the first file untouched, it is {after_refusal.get('status')!r}")
+
+    # The three that match load as one run.
+    launched = _expect(
+        api.post(f"{API_URL}/api/uploads/{first}/ingest", json={**body, "alsoUploads": ids[1:]}, timeout=60),
+        200,
+        "POST .../ingest (three files)",
+    ).json()
+    if not launched.get("runId"):
+        raise G9Failure(f"an accepted load should return a run id, got {launched}")
+    settled = _settle(api, first, "three files into one table")
+    if settled.get("status") != "ingested":
+        raise G9Failure(f"the load of three files failed: {settled.get('error')!r}")
+    if settled.get("rows") != len(SEVERAL_ROWS):
+        raise G9Failure(f"the first file carries the total, {len(SEVERAL_ROWS)} rows, got {settled.get('rows')!r}")
+    for other in ids[1:]:
+        current = _expect(api.get(f"{API_URL}/api/uploads/{other}", timeout=30), 200, "GET an upload of the load").json()
+        if current.get("status") != "ingested" or current.get("loadedWith") != first or "rows" in current:
+            raise G9Failure(f"{other} should be ingested, loaded with {first} and carry no count of its own, got {current}")
+
+    # Every row of every file, each value under its own column.
+    _wait_for(f"{table} holds {len(SEVERAL_ROWS)} rows", lambda: count_rows(api, table) == len(SEVERAL_ROWS), VISIBLE_TIMEOUT_S, retry_failures=True)
+    body_rows = run_query(api, f"SELECT id, name, qty FROM {QUERY_DB}.`bronze.{table}` WHERE 1 ORDER BY id")["rows"]
+    got = [(str(r["id"]), str(r["name"]), str(r["qty"])) for r in body_rows]
+    if got != SEVERAL_ROWS:
+        raise G9Failure(f"the table holds {got}, the three files say {SEVERAL_ROWS}")
+
+    # One run, one outcome row, filed under the first file.
+    runs = _expect(
+        api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{first}"}, timeout=30), 200, "GET ingest-runs"
+    ).json()
+    if len(runs) != 1 or runs[0].get("status") != "succeeded" or runs[0].get("rows") != len(SEVERAL_ROWS):
+        raise G9Failure(f"one succeeded ingest_run with {len(SEVERAL_ROWS)} rows was expected, found {runs}")
+    for other in ids[1:]:
+        extra_runs = _expect(
+            api.get(f"{API_URL}/api/governance/ingest-runs", params={"connectorId": f"upload:{other}"}, timeout=30), 200, "GET ingest-runs"
+        ).json()
+        if extra_runs:
+            raise G9Failure(f"the other files of a load have no run of their own, {other} has {extra_runs}")
+
+    # Lineage names the first file and how many came with it.
+    lineage = _expect(
+        api.get(f"{API_URL}/api/governance/lineage", params={"focus": f"bronze.{table}"}, timeout=60), 200, "GET lineage"
+    ).json()
+    node = next((n for n in lineage.get("nodes", []) if n.get("id") == f"upload:{first}"), None)
+    if node is None or node.get("label") != f"{SEVERAL_FILES[0][0]} and 2 more":
+        raise G9Failure(f"lineage should label the upload '{SEVERAL_FILES[0][0]} and 2 more', got {node}")
+    print(f"[g9] several files: {len(SEVERAL_ROWS)} rows of 3 files in {table}; {EXTRA_COLUMN_FILE[0]} was refused with its extra column")
+
+    for upload_id in ids + [extra_id]:
+        _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, "DELETE an upload of the load")
+    state["others"] = []
+    left = count_rows(api, table)
+    if left != len(SEVERAL_ROWS):
+        raise G9Failure(f"deleting the uploads should keep the table's {len(SEVERAL_ROWS)} rows, it holds {left}")
+
+
 def step_create_pipeline_over_uploaded_table(api, requests, table: str, silver_table: str) -> str:
     """Author a `bronze.<table>` -> `silver.<silver_table>` pipeline whose
     `dependsOn` names `file_ingest_job`, exactly the body the console's
@@ -1334,6 +1449,7 @@ def main() -> int:
         step_parquet(api, table, state)
         step_typed_columns(api, table, state)
         step_new_formats(api, table, state)
+        step_several_files(api, table, state)
         step_feeds_a_pipeline(api, requests, table, upload_id, using, expected, state)
     except (G9Failure, requests.RequestException) as exc:
         reason = str(exc) if isinstance(exc, G9Failure) else f"{type(exc).__name__}: {exc}"
@@ -1349,13 +1465,14 @@ def _clean_up_upload(api, state: dict) -> None:
     out, so a failed gate does not leave a file in the bucket and a row in the
     list. The table and its claim stay, as after a pass. An upload that is
     still loading answers 409 and stays."""
-    if not state["upload_id"] or state["deleted"]:
-        return
-    try:
-        resp = api.delete(f"{API_URL}/api/uploads/{state['upload_id']}", timeout=30)
-        print(f"[g9] cleanup: DELETE upload {state['upload_id']} answered {resp.status_code}", file=sys.stderr)
-    except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
-        print(f"[g9] cleanup: upload {state['upload_id']} was not deleted ({type(exc).__name__})", file=sys.stderr)
+    # DATA-17 slice 5: the files of a load of several are in `others`.
+    pending = [] if not state["upload_id"] or state["deleted"] else [state["upload_id"]]
+    for upload_id in pending + list(state.get("others", [])):
+        try:
+            resp = api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30)
+            print(f"[g9] cleanup: DELETE upload {upload_id} answered {resp.status_code}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 -- the failure that matters is the one already reported
+            print(f"[g9] cleanup: upload {upload_id} was not deleted ({type(exc).__name__})", file=sys.stderr)
 
 
 if __name__ == "__main__":
