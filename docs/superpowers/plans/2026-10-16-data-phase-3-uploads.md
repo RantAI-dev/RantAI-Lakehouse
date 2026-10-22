@@ -703,6 +703,104 @@ Commands run, in `/home/hv/lakehouse-phase3-uploads`:
 - The full Rust workspace run and the TypeScript block (`bun run typecheck`, `lint`, `test`): not run for this round; the change touched one Rust file in `lakehouse-api` (a constant, an array length and a count) and no TypeScript. CI carries them.
 - No Rust test pins `stringify_cell` turning a NULL into `""`. The route is shared by every consumer of Query Studio, so it was not changed; the gate's comment and the CHANGELOG say what it does.
 
+### Slice 5 (developer)
+
+Developer (Claude Sonnet 5.5), branch `feat/data-phase-3-uploads`, `DATA-17` T5.1 to T5.4 (several files into one table).
+Started at `2d2fd5eb` (slice 4 closed). No Opus involvement in the code. Migration `0092` (no duplicate numbers:
+`ls rust/migrations | cut -c1-4 | sort | uniq -d` prints nothing; `origin/main` ends at `0087`).
+
+**Commits**, in order:
+
+- `939dafbd` feat(uploads): several files load into one table through one ingest call (T5.1: migration, store, `group.rs`, `compare`, `alsoUploads`, settling, lineage)
+- `c8b82469` feat(uploads): the job reads the files of one load in order, matched by column name (T5.2)
+- `4a05edc6` feat(frontend): the Check step lists the files of one load and keeps Load off until the ones that differ are removed (T5.3, with the `CHANGELOG.md` line)
+- `99ace1c6` test(uploads): the G9 gate loads three CSVs into one table and refuses a fourth with an extra column (T5.4)
+- this entry
+
+**What was built.**
+- *API.* `POST /api/uploads/{id}/compare` (`connector:manage`; in `POLICY_TABLE` and in the Data Engineer / Analyst loop of
+  `tests/route_auth.rs`, which is what asserts it in both directions) answers `{mismatches: [{uploadId, file, missing, extra,
+  typeConflicts: [{column, expected, found}]}]}`. `ingest` takes `alsoUploads` (at most 9, each once, none the upload itself, same
+  tenant, same kind of file, none being received, together under the cap), settles them, compares them again and refuses with the
+  files and columns named (a 400 whose sentence lists them: `ApiError` carries a message and nothing else). All the files are
+  claimed in one transaction (`mark_group_within_limits`); the run config's `storage_keys` lists every object, the primary first;
+  `bronze_table_name` has not moved and the config is as closed as before. The Settler settles a file through its primary;
+  `mark_finished` ends the files that loaded with it in the same transaction. Lineage labels the table's upload "<first file> and
+  N more".
+- *Job.* `storage_keys` takes 1 to 10 different objects; every reader takes them in order (delimited, JSON, JSON Lines and Avro as one
+  sequence of entries, so a zip's way of matching columns by name now spans uploads; Parquet by a second pass over the footers);
+  the unpacked-bytes budget and the row cap are those of the whole load; the report is kept beside the primary. No new failure
+  reason (`FAILURE_REASONS`, the shared fixture and `JOB_FAILURE_REASONS` are untouched).
+- *Console.* The Check step shows the first file's preview and column list, then the other files with the mark or the mismatch
+  lines and a Remove button; Next and Load are off while a file differs, is still being sent, or the comparison failed; Review says
+  "N files into `bronze.<table>`"; one run view; "Try again" sends the same files; the Uploaded files list says "Loaded with ...".
+- *Gate.* `step_several_files` (see the commit).
+
+**Deviations and choices, for the planner.**
+1. *`loaded_with` is `TEXT`, not `UUID`.* The plan names the column `UUID`, but `file_upload.id` is `TEXT` (`up-<uuid>`,
+   `0057_upload.sql`), so a UUID column cannot hold the primary's id. It is `TEXT REFERENCES file_upload (id) ON DELETE SET NULL`
+   (deleting a primary that finished must neither fail nor strand the others) with a partial index. The behaviour is the plan's; the
+   migration header says why. I did not stop for this: no behaviour depends on the type.
+2. *Every file of a load is a `file_upload` row in `ingesting`*, with `run_id` NULL and `loaded_with` = the primary, from the claim
+   until the primary settles them. That keeps a file from being deleted or loaded elsewhere meanwhile (both already refuse an
+   `ingesting` row). The `SEC-17` counts skip rows with `loaded_with`, so ten files are one place against the limit of four. The
+   other files carry no `row_count` of their own (the job reports one total, kept on the primary): NULL, "not measured", never 0;
+   the console says "Counted with the first file".
+3. *`compare` takes more than `{alsoUploads}`.* Optional `encoding`, `delimiter`, `headerRow`, `sheet` (the reading the load will
+   use, applied to every file: a file read under another delimiter has other columns) and `columns` (the first file's column list
+   as the person has it, which decides the types). Without them the files are read as detected and the starting guess decides.
+   `ingest` compares under its own request, with no column list meaning every column text (nothing to conflict).
+4. *A type conflict blocks Load like a missing or extra column* (the plan lists `typeConflicts` in the same answer and says
+   "mismatched files"; decision 4 itself names only columns). It is judged on the sample (the first 10,000 rows) and only for a column
+   the FIRST file's own sample fits: found by the Parquet route test, where two copies of the same file conflicted over declared
+   types whose text is wider than the type (a `uint64`, a nanosecond timestamp). If you would rather it only inform, `groupProblem`
+   and `UploadGroupView.ready` are the two places.
+5. *A zip whose own files differ, as a member of a load*, is a 400 with `ZIP_COLUMNS_DIFFER` and the file's name, not a mismatch
+   entry (the archive view does not say which columns). Workbooks load together too (the same `sheet` for all, each converted
+   beside its original) and Parquet files are footer-checked; a workbook with a CSV, or any two kinds, is refused with "same kind
+   of file".
+6. *The cap counts the stored sizes of the files together* (50 MiB until slice 6) at the API; the console's `planPick` already
+   refused a pick over it. The job's budget still counts unpacked bytes of gzip and zip across the whole load.
+7. *Console limits of this slice:* only the files after the first can be removed on Check (the first is changed with "Choose
+   different files"); a page reloaded with `?id=` on a first file learns its other files from the list (`loadedWith`), not from the
+   queue; a page opened on an OTHER file does not offer "Try again" (it would replace the table with that file's rows) and points at
+   the first file.
+8. *Observation, not mine to fix (slice 3):* for a typed load of a WORKBOOK the job writes the bad-values report beside the
+   converted object (`<storage_key>.converted.csv.bad-values.json`, `storage_keys[0]`), while the API reads
+   `<storage_key>.bad-values.json` (`columns::keep_report`), so that report is never kept. A Parquet or text file is unaffected.
+
+**Commands run, with counts** (`CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target`, `CARGO_INCREMENTAL=0`, `-j 2`, one cargo
+job at a time, no `cargo clean`):
+- `cargo fmt --check` (workspace): clean.
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets --locked -- -D warnings`: clean (final code; it first caught `ingest` at
+  109 of 100 lines, fixed by extracting `claim_load`).
+- `cargo test -p lakehouse-api --locked --lib` (unfiltered): **2455 passed**, 18 ignored, 0 failed.
+- `cargo test -p lakehouse-api --locked --test upload_routes -- --test-threads=2`: **140 passed** (125 + 15 new). A first run
+  failed two of the new tests on my mistakes (a fixture name that does not exist; the Parquet type-conflict case of deviation 4);
+  a second run, while the Python suite ran beside it, failed 10 tests with Postgres "No space left on device" on its shared memory
+  and pool time-outs (the test container, not the code; none of them mine); the run above was alone on the machine.
+- `cargo test -p lakehouse-api --locked --test route_auth`: **55 passed**.
+- `cargo test -p lakehouse-store --locked` (whole crate): **31 targets, 723 passed**, among them `tests/uploads.rs` 59 (+5 new).
+- `cd dagster && python -m pytest dispar_orchestrate -q` (whole suite, unfiltered): **1775 passed, 1 skipped** in 17 min.
+  `test_several_files.py` alone: 15 passed; it fails when the Parquet `select` is removed and when the budget is made per file.
+- `bun run typecheck`: clean. `bun run lint`: 0 errors (9 warnings, none in a file of this slice). `bun run test`: **2390 passed,
+  1 skipped, 0 failed**; `upload-file-page.test.tsx` 76 (it fails 4 tests when `group.ready` is taken out of `canProceed`).
+- `python3 ops/lint/check_intra_package_imports.py` and `check_bare_iceberg_count.py`: OK. `python3 -m py_compile ops/g9/upload_test.py`: exit 0.
+
+**Not verified.**
+- **`Rust · G9 file upload` on a real stack.** There is none on this machine; the new step was only compiled. It assumes
+  `GET /api/governance/lineage?focus=bronze.<table>` finds the upload node by the bronze node's label (the unit test of
+  `matches_focus` covers `label == focus`, the route was not run) and that `ingest_run.rows` is the sink's total (5). The gate's time
+  grew by an unmeasured amount (one load of three tiny files and four uploads); `timeout-minutes` was not touched.
+- `cargo test --workspace` and `cargo clippy --workspace --all-features`: not run; only `lakehouse-store` and `lakehouse-api` changed
+  (no dependency, no `Cargo.lock` change), and both were tested as above. CI carries the rest.
+- Browser QA of the Check step with several files (the page tests use `happy-dom` and a stubbed `fetch`); the product owner's
+  checklist `DATA-17-AC1` (ten Parquet files, 1.9 GiB) needs slice 6.
+- A load of ten real files through Dagster and `dlt` into Lakekeeper: the job is tested with fakes for the sink, as in slices 2 to 4.
+
+**Incidents.** None with other sessions: no `pgrep -f` loops that could match other processes (my first wait loop did match
+itself and I stopped it by its task id), no cargo job of mine ran beside another, `df` showed 13 to 17 GB free throughout.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
