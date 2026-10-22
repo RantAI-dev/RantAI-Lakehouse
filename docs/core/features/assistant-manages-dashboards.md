@@ -6,7 +6,7 @@
 | Backlog | `AI-1`, `AI-2`, `AI-20` |
 | Spec | `docs/core/specs/ai-1.md`, `docs/core/specs/ai-2.md`; `AI-20` has no spec (it is a follow-up from PR #104 review SHOULD-FIX 11) |
 | Status | Decisions signed 2026-10-15 (two decisions); the rest are planner defaults, owner to confirm at QA |
-| Plan | `plans/20-the-assistant-renames-arranges-and-filters-dashboards.md` |
+| Plan | Plan files are not kept in the repository. |
 
 ## Problem
 
@@ -23,7 +23,7 @@ grain answers from the chart's own grain or not at all.
 1. Ask the assistant to rename a board: "rename this dashboard to 'Q3
    review'".
 2. Ask the assistant to delete a board; the assistant asks for it through
-   Confirm, names the board, and says its charts go too.
+   an Approval, names the board, and says its charts go too.
 3. Ask the assistant to arrange the tiles by plain instruction: "make the
    revenue chart half width and put the funnel next to it", "put the
    conversion rate on top". Only the tiles the person names move.
@@ -56,7 +56,7 @@ grain answers from the chart's own grain or not at all.
 
 Six tools cover the things a person can already do to a dashboard from the
 console: rename it, delete it, arrange its tiles, move a chart, change the
-filters this viewer sees, and save a board's default filters. Five of the six
+filters this viewer sees, and save a board's default filters. Four of the six
 call the same route handler the console calls, so validation, permissions,
 audit and the console's own refusals all carry through unchanged.
 
@@ -79,6 +79,19 @@ audit and the console's own refusals all carry through unchanged.
 - `save_board_filters` (`dashboard:write`, WriteLow): saves the board's
   default; refused on the built-in Main board; only used when the
   person asks to save or to make it the default for everyone.
+
+The chart tools say what they did. `delete_chart` refuses a chart that does
+not exist or that the person cannot see ("this tile does not exist"),
+instead of reporting a delete that never happened. `update_chart` keeps the
+formatting and the board the call leaves out, so changing a chart's title
+does not move it to another board or cost it its colours; a change of the
+chart's kind resets the formatting, because the old formatting does not fit
+the new kind. `list_charts` names each chart's board and its tab, so the
+assistant can read what an update keeps.
+
+A dashboard filter that names a saved segment is refused: a board filter
+names a column, and a saved segment belongs to a chart's or a metric's own
+filters.
 
 The dashboard page applies a `set_board_view_filters` result when the
 chat reply's trace holds the step for the board on screen: it writes the
