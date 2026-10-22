@@ -445,6 +445,23 @@ fn upstream_error_json(err: &lakehouse_clickhouse::ChError) -> Value {
     crate::upstream_error::report_ch(&crate::upstream_error::DATABASE, err).to_json()
 }
 
+/// Refuse a filter that is a reference to a saved segment.
+///
+/// A dashboard filter names a column and is handed to the tiles that have
+/// it. A saved segment belongs to a chart's or a metric's own filters, where
+/// it stands for that segment's filters. `validate_filters` accepts such a
+/// reference (it has no column to check), so a board filter naming one would
+/// be saved, the board would look filtered and the tiles would not change.
+/// The refusal says where a segment belongs.
+fn segment_filter_refusal(filters: &[FilterDef]) -> Option<&'static str> {
+    let names_a_segment = filters
+        .iter()
+        .any(|filter| filter.segment.is_some() && filter.column.is_empty());
+    names_a_segment.then_some(
+        "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters.",
+    )
+}
+
 /// `set_board_view_filters`: validate filters and hand them to the page.
 /// Writes nothing. The console route does not need to be called: there is
 /// no board write here. The "no-op on success" invariant is what makes
@@ -455,6 +472,9 @@ fn upstream_error_json(err: &lakehouse_clickhouse::ChError) -> Value {
 /// (an `in` with no values, a `between` with neither bound, a text
 /// op with no text) is dropped from the payload the page applies, so
 /// the user never sees a chip that does nothing.
+///
+/// A filter that names a saved segment is refused before any of that: a
+/// dashboard filter names a column.
 pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
     let board = arg_str(args, "board");
     if board.is_empty() {
@@ -467,6 +487,9 @@ pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
         Ok(f) => f,
         Err(err) => return json!({ "error": format!("filters: {err}") }),
     };
+    if let Some(msg) = segment_filter_refusal(&parsed) {
+        return json!({ "error": msg });
+    }
     if let Err(msg) = validate_filters(&parsed) {
         return json!({ "error": msg });
     }
@@ -489,6 +512,9 @@ pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
 /// (plan 20 Decisions, line 71-73). Only the shape decode (`serde`
 /// parsing the args into `Vec<FilterDef>`) is the tool's job; an
 /// unparseable shape is the only thing the tool reports on its own.
+///
+/// A filter that names a saved segment is refused before the board is
+/// touched: a dashboard filter names a column.
 pub(super) async fn save_board_filters(
     state: &AppState,
     principal: Option<&Principal>,
@@ -508,6 +534,9 @@ pub(super) async fn save_board_filters(
         Ok(f) => f,
         Err(err) => return json!({ "error": format!("filters: {err}") }),
     };
+    if let Some(msg) = segment_filter_refusal(&parsed) {
+        return json!({ "error": msg });
+    }
     api_result_to_value(
         dashboard::boards_update(
             State(state.clone()),
@@ -695,6 +724,27 @@ mod tests {
             err.contains("fuzzy_match"),
             "expected the unknown op to be named in the refusal, got: {err}"
         );
+    }
+
+    /// `set_board_view_filters`: a filter that names a saved segment is
+    /// refused. A dashboard filter names a column and is handed to the tiles
+    /// that have it; a saved segment belongs to a chart's or a metric's own
+    /// filters, where it stands for that segment's filters. A board filter
+    /// naming one would be accepted and change nothing, so the page would
+    /// look filtered and the tiles would not be.
+    #[test]
+    fn set_board_view_filters_refuses_a_filter_that_names_a_saved_segment() {
+        let mut args = Map::new();
+        args.insert("board".to_owned(), Value::String("b-view".to_owned()));
+        args.insert("filters".to_owned(), json!([{ "segment": "x" }]));
+        let out = set_board_view_filters(&args);
+        assert_eq!(
+            out["error"],
+            json!(
+                "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters."
+            )
+        );
+        assert!(out.get("applyViewFilters").is_none(), "{out}");
     }
 
     // ── Merge of main into phase 3: the board tools keep phase 3's rules ──
@@ -1034,6 +1084,30 @@ mod tests {
         .await;
         let error = reply["error"].as_str().unwrap_or_default();
         assert!(error.contains("at most 20"), "{reply}");
+        assert_eq!(writes(&sent(&server).await), 0);
+    }
+
+    /// `save_board_filters`: a filter that names a saved segment is refused
+    /// and nothing is written. A dashboard filter names a column; a saved
+    /// segment belongs to a chart's or a metric's own filters, where it
+    /// stands for that segment's filters.
+    #[tokio::test]
+    async fn save_board_filters_refuses_a_filter_that_names_a_saved_segment() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = run(
+            &state,
+            Some(&person()),
+            "save_board_filters",
+            &args_of(&json!({ "board": "b1", "filters": [{ "segment": "x" }] })),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!(
+                "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters."
+            )
+        );
         assert_eq!(writes(&sent(&server).await), 0);
     }
 
