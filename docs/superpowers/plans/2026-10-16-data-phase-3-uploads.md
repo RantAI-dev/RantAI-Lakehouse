@@ -849,3 +849,43 @@ merge: `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets -
 `cargo test -p lakehouse-api --lib`: 2447 passed, 18 ignored (up from 2318 and 15: `main`'s BI tests);
 `--test route_auth`: 55 passed. No TypeScript or Python file conflicted, so no console or Dagster check was
 run for this commit; the PR's CI carries the rest.
+
+### Slice 4, round 2 (planner/reviewer, Claude Opus), at `d30d9506`, 2026-10-22
+
+The PR's `Rust · G9 file upload` job is **red** on the merged head: the gate's own new step, `step_new_formats`,
+fails on the first file. The gate's message:
+
+```
+[g9] FAILED: orders.json: the table holds [['1', 'Anna', '1.5', 'true', '["a","b"]', '{"x":1,"y":"z"}', '', ''],
+['2', 'Budi', '12', 'false', '[]', '{}', '', 'only here'], ['3', 'Citra é', '0.25', 'true', '["c"]', '{"x":2}', '', '']],
+the fixture says [['1', 'Anna', '1.5', 'true', '["a","b"]', '{"x":1,"y":"z"}', None, None], ['2', 'Budi', '12',
+'false', '[]', '{}', None, 'only here'], ['3', 'Citra é', '0.25', 'true', '["c"]', '{"x":2}', None, None]]
+```
+
+- **`BLOCKER` 4.** A key that is missing from a JSON object (and a `null` value) is written as an empty string
+  instead of a null, so decision 11 ("a key missing from a row is empty (null)") is not what the table holds. The
+  fixture, the API's preview and the product decision all say null; the gate is right to fail. The gate must not
+  be weakened to expect `''` (rule 2).
+  - What the reviewer measured, so the developer does not repeat it:
+    - The job's own stream is right: running `file_ingest._json_stream` over `ops/fixtures/uploads/formats/orders.json`
+      gives the Arrow batch `note: None, extra: None` (`dagster/dispar_orchestrate/file_ingest.py:824`, `upload_formats.py:235`).
+    - `dlt` 1.30.0 keeps the null: the same Arrow batch through `dlt.resource(...)` with the
+      `data_type: text` hint and a local filesystem destination lands in the parquet as a null, and dlt's own
+      schema file says the column is `text, nullable: True`.
+    - `pyiceberg` 0.12.0 maps a **nullable** Arrow field to an **optional** Iceberg field and a non-nullable one
+      to a **required** field (`_pyarrow_to_schema_without_ids`).
+    - The typed path (decision 9/11 of `upload-column-types.md`) writes real nulls, and the gate's typed step
+      sees `Nullable(...)` columns in ClickHouse: `qty IS NULL` found its row.
+  - So the empty string either was written, or the field of the Bronze table is required and ClickHouse shows a
+    null in a required `String` as `''`. The next step is to say which: the gate's new step should print the
+    table's column types the way the typed step prints them (one line, the same helper), so the next CI run
+    shows `Nullable(String)` against `String`.
+  - The fix belongs where the null is lost, and it must hold for JSON, JSON Lines and Avro (a union with null is
+    the same case). The product decision does not change; only the code does.
+- **`SHOULD-FIX` 1 is still open** (the generic reason for a column list that does not match the file), to be
+  fixed in the same sitting.
+- The gate never ran before: the handoff said it was *not verified* (no stack on the developer's machine). This
+  is that gate's first run, and it found a real defect — the reason the gate exists.
+
+No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
+gate is read again on the PR.
