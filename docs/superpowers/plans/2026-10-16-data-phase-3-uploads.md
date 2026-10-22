@@ -972,5 +972,15 @@ the reviewer re-ran the scoped block itself:
 
 No open `BLOCKER` in the code. The gate is read on the PR at the new head; if it is green, slice 4 is closed.
 
+**Slice 4 closed, 2026-10-22, at `2d2fd5eb`:** the PR's `Rust · G9 file upload` is green (7m 6s) with the new
+`step_new_formats`, so the five formats load and read back, the two bombs are refused and the nulls are nulls.
+No open `BLOCKER`.
+
+**A check red on the PR that this branch did not cause:** `Rust · SRC-11 connector operations` fails on a clock,
+not on a wrong result — "c. auto-disable: timed out after 150s waiting for the connector to be paused by the
+failures (last error: None)", after the three failed runs it waits for. The same job fails on `main`'s own
+`232df0c8` (PR #199's head) and passes on the merge commit `d9443753`, so it is a flake on a slow runner. It is
+written down as `DATA-30` in `docs/core/BACKLOG.md`, as the rule asks, and the job was re-run on the PR.
+
 No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
 gate is read again on the PR.
