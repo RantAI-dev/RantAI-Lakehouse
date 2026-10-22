@@ -4,12 +4,14 @@
 
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
+use lakehouse_bi::layout::tab_of;
 use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, ChartInput};
 use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
+use super::look::FORMAT_FIELDS;
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
     viewer_of,
@@ -40,6 +42,107 @@ pub(super) fn refused(gate: Gate) -> Value {
 /// this boundary — `spec_from_input` validates for real).
 fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
     serde_json::from_value(Value::Object(args.clone())).map_err(|e| e.to_string())
+}
+
+/// The call's args with the formatting the call does not name filled in from
+/// the stored chart: a field the call names replaces the stored one (`null`
+/// clears it), a field the call leaves out is kept.
+///
+/// The merge is done on the raw args, key by key, because the `merge_format`
+/// of `look.rs` refuses every key that is not a formatting one and this
+/// merges into a call that names a title and measures too.
+fn args_with_kept_formatting(args: &Map<String, Value>, stored: &ChartInput) -> Map<String, Value> {
+    let mut merged = args.clone();
+    let Ok(stored) = serde_json::to_value(stored) else {
+        return merged;
+    };
+    let Some(fields) = stored.as_object() else {
+        return merged;
+    };
+    for key in FORMAT_FIELDS {
+        if merged.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = fields.get(key) {
+            merged.insert(key.to_owned(), value.clone());
+        }
+    }
+    merged
+}
+
+/// What a call carries over from the chart it changes: the call's own
+/// arguments with the formatting the call does not name filled in, and
+/// whether the stored formatting was kept.
+struct KeptFormatting {
+    /// The stored formatting was kept: the call does not change the kind.
+    kept: bool,
+    /// The call's arguments, with the kept formatting filled in.
+    args: Map<String, Value>,
+}
+
+/// The formatting a call does not name, carried over from the stored chart.
+///
+/// The stored chart is read as `viewer`, so a chart the caller may not see
+/// is not carried over. An `id` of `None` names no chart, so there is
+/// nothing to carry over from and the call is used as it came.
+///
+/// # Errors
+///
+/// The error is the reply the caller sends: the fixed upstream error when
+/// the store cannot be read, or the call's own parse error when the args
+/// are not a chart.
+async fn kept_formatting(
+    ch: &ChClient,
+    viewer: &Viewer,
+    id: Option<&str>,
+    args: &Map<String, Value>,
+) -> Result<KeptFormatting, Value> {
+    let stored = match id {
+        Some(id) => match store::list_stored_charts(ch, viewer).await {
+            Ok(all) => all.into_iter().find(|c| c.spec.id == id),
+            Err(err) => {
+                return Err(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json());
+            }
+        },
+        None => None,
+    };
+    let call = match parse_chart_input(args) {
+        Ok(i) => i,
+        Err(e) => return Err(json!({ "error": e })),
+    };
+    let Some(stored) = stored else {
+        return Ok(KeptFormatting {
+            kept: true,
+            args: args.clone(),
+        });
+    };
+    // A kind the call changes takes other formatting (colours are for
+    // charts, a second axis for a bar): the stored formatting is dropped
+    // rather than carried into a kind that would refuse it.
+    if stored.def.kind != call.kind {
+        return Ok(KeptFormatting {
+            kept: false,
+            args: args.clone(),
+        });
+    }
+    Ok(KeptFormatting {
+        kept: true,
+        args: args_with_kept_formatting(args, &stored.def),
+    })
+}
+
+/// The tab a chart sits on, when the board it is on has tabs: the tab its
+/// tile names, or the board's first one.
+fn tab_of_chart<'a>(board: &'a store::Board, chart_id: &str) -> Option<&'a str> {
+    let tabs = board.tabs.as_deref().unwrap_or_default();
+    if tabs.is_empty() {
+        return None;
+    }
+    // `tab_of` reads the layout to find the tile's own tab; a board with no
+    // layout has no tile, so every chart sits on the first tab.
+    let empty = store::LayoutMap::new();
+    let layout = board.layout.as_ref().unwrap_or(&empty);
+    tab_of(tabs, layout, chart_id)
 }
 
 pub(super) async fn create_chart(
@@ -121,7 +224,20 @@ pub(super) async fn check_chart_draft(
     if id.as_deref().is_some_and(str::is_empty) {
         return Some(json!({ "error": "id is required" }));
     }
-    let input = match parse_chart_input(args) {
+    // The stored chart is read as the server (`Viewer::system()`): this check
+    // has no principal of its own. It only answers whether the draft builds;
+    // `update_chart` reads the chart again as the caller and refuses a chart
+    // the caller may not edit, and a chart id is never listed to a caller who
+    // cannot see the chart.
+    let viewer = Viewer::system();
+    // The same carry-over `update_chart` does, so the card and the save
+    // agree. A chart that is not found, or one in the trash, is checked as it
+    // came.
+    let kept = match Box::pin(kept_formatting(ch, &viewer, id.as_deref(), args)).await {
+        Ok(kept) => kept,
+        Err(reply) => return Some(reply),
+    };
+    let input = match parse_chart_input(&kept.args) {
         Ok(i) => i,
         Err(e) => return Some(json!({ "error": e })),
     };
@@ -141,19 +257,41 @@ pub(super) async fn update_chart(
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
-    let input = match parse_chart_input(args) {
-        Ok(i) => i,
-        Err(e) => return json!({ "error": e }),
-    };
+    // The gate comes before the args are parsed: the carry-over below needs
+    // the chart's stored definition and the board it is on.
     // BI-18 part C, part 2: a chart in the trash or on somebody else's
     // personal board cannot be edited, nor moved onto such a board.
     let viewer = viewer_for(principal);
     let old_board = match require_editable_chart(ch, &id, &viewer).await {
         Ok(board) => board,
-        Err(err) => return refused(err),
+        Err(gate) => return refused(gate),
+    };
+    // The stored chart, read as the caller: the gate above has refused a
+    // chart the caller may not see, so this reads only what the caller may.
+    // The read is boxed, so this future does not carry every chart on the
+    // board.
+    let kept = match Box::pin(kept_formatting(ch, &viewer, Some(id.as_str()), args)).await {
+        Ok(kept) => kept,
+        Err(reply) => return reply,
+    };
+    let formatting_kept = kept.kept;
+    let mut input = match parse_chart_input(&kept.args) {
+        Ok(i) => i,
+        Err(e) => return json!({ "error": e }),
     };
     if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
         return refused(err);
+    }
+    // The chart stays on the board it is on when the call does not name one:
+    // without this it would move to the built-in dashboard.
+    if input
+        .board
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        input.board = Some(old_board.clone());
     }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", Some(id), time).await {
         Ok(spec) => match store::insert_chart(ch, &spec).await {
@@ -162,13 +300,21 @@ pub(super) async fn update_chart(
                     snapshot_as(ch, &old_board, principal).await;
                 }
                 snapshot_as(ch, &spec.board, principal).await;
-                json!({
+                let mut reply = json!({
                     "updated": true,
                     "id": spec.spec.id,
                     "title": spec.spec.title,
                     "kind": spec.spec.kind,
                     "mart": spec.spec.mart,
-                })
+                    "board": spec.board,
+                    "formattingKept": formatting_kept,
+                });
+                if !formatting_kept {
+                    reply["note"] = json!(
+                        "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
+                    );
+                }
+                reply
             }
             Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
         },
@@ -269,22 +415,35 @@ pub(super) async fn suggest_dashboard(ch: &ChClient) -> Value {
 }
 
 pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) -> Value {
-    match store::list_stored_charts(ch, &viewer_for(principal)).await {
-        Ok(charts) => {
-            let out: Vec<Value> = charts
-                .iter()
-                .map(|c| {
-                    json!({
-                        "id": c.spec.id, "title": c.spec.title, "kind": c.spec.kind,
-                        "mart": c.spec.mart, "sqlSource": c.spec.sql_source,
-                        "source": c.source,
-                    })
-                })
-                .collect();
-            json!({ "total": out.len(), "charts": out })
+    let viewer = viewer_for(principal);
+    let charts = match store::list_stored_charts(ch, &viewer).await {
+        Ok(charts) => charts,
+        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+    };
+    // The boards, for the tab each chart sits on. A board the viewer may not
+    // see is not in the list, so its charts are listed without a tab.
+    let boards = match store::list_boards(ch, &viewer).await {
+        Ok(boards) => boards,
+        Err(err) => return upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+    };
+    let mut out = Vec::with_capacity(charts.len());
+    for c in &charts {
+        let mut entry = json!({
+            "id": c.spec.id, "title": c.spec.title, "kind": c.spec.kind,
+            "mart": c.spec.mart, "sqlSource": c.spec.sql_source,
+            "source": c.source,
+            "board": c.board,
+        });
+        let tab = match boards.iter().find(|b| b.id == c.board) {
+            Some(board) => tab_of_chart(board, &c.spec.id),
+            None => None,
+        };
+        if let Some(tab) = tab {
+            entry["tab"] = json!(tab);
         }
-        Err(err) => upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json(),
+        out.push(entry);
     }
+    json!({ "total": out.len(), "charts": out })
 }
 
 /// The two read tools that say what a chart can be built on beyond one mart:
@@ -509,15 +668,23 @@ mod tests {
             .iter()
             .filter(|s| s.contains("FROM console.bi_board FINAL WHERE is_deleted = 0"))
             .collect();
+        // `list_charts` reads the boards too, for the tabs of the charts, so
+        // the person's read comes twice and the anonymous one last.
+        assert_eq!(boards.len(), 3, "{boards:#?}");
         assert!(
             boards[0].contains(&format!("(owner_id = '' OR owner_id = '{id}')")),
             "{}",
             boards[0]
         );
         assert!(
-            boards[1].contains("(owner_id = '' OR owner_id = '')"),
+            boards[1].contains(&format!("(owner_id = '' OR owner_id = '{id}')")),
             "{}",
             boards[1]
+        );
+        assert!(
+            boards[2].contains("(owner_id = '' OR owner_id = '')"),
+            "{}",
+            boards[2]
         );
         let charts: Vec<&String> = all
             .iter()
@@ -993,5 +1160,248 @@ mod tests {
         )
         .await;
         assert_eq!(web["created"], json!(true), "{web}");
+    }
+
+    // ── The chart tools say what they did ──────────────────────────────
+
+    /// The document the store keeps for a chart: its spec and the definition
+    /// it was built from.
+    fn stored_document(def: Value) -> String {
+        let mut document = json!({
+            "spec": {
+                "id": "c_1",
+                "title": "Visitors",
+                "kind": "bar",
+                "mart": "mart_x",
+                "sql": "SELECT province, sum(visitors) AS visitors FROM serving.mart_x GROUP BY province",
+                "x": "province",
+                "y": "visitors",
+            },
+            "hasYear": false,
+        });
+        document["def"] = def;
+        document.to_string()
+    }
+
+    /// A server with one stored chart on the board `b_board`, over the mart
+    /// `mart_x`: the chart's own row, the stored document and the board it is
+    /// on.
+    async fn stored_chart_server(def: Value) -> MockServer {
+        let server = mart_server().await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, board FROM console.bi_chart",
+            vec![json!({ "is_deleted": 0, "board": "b_board" })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_chart FINAL WHERE is_deleted = 0",
+            vec![json!({
+                "id": "c_1",
+                "spec_json": stored_document(def),
+                "board": "b_board",
+                "created_by": "ai",
+                "created_at": "2026-10-22 00:00:00",
+            })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "SELECT is_deleted, owner_id FROM console.bi_board",
+            vec![json!({ "is_deleted": 0, "owner_id": "" })],
+        )
+        .await;
+        server
+    }
+
+    /// The call that renames a chart and names nothing else; `extra` adds the
+    /// fields the call names besides the title.
+    fn rename_call(extra: Value) -> Map<String, Value> {
+        let mut args = arguments(json!({
+            "id": "c_1",
+            "title": "Visitors 2024",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+        }));
+        for (name, value) in arguments(extra) {
+            args.insert(name, value);
+        }
+        args
+    }
+
+    /// The row the store wrote for the chart.
+    fn chart_row(all: &[String]) -> String {
+        writes(all)
+            .into_iter()
+            .find(|s| s.contains("INTO console.bi_chart"))
+            .unwrap_or_else(|| panic!("no chart row was written: {all:#?}"))
+            .clone()
+    }
+
+    /// A stored chart with a number format and a palette, updated with a new
+    /// title and no formatting and no board, keeps both and keeps its board.
+    #[tokio::test]
+    async fn an_update_that_names_no_formatting_keeps_the_formatting_and_the_board() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "format": { "style": "number", "decimals": 0 },
+            "colors": { "palette": "muted" },
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &rename_call(json!({})),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["formattingKept"], json!(true), "{reply}");
+        assert_eq!(reply["board"], json!("b_board"), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("\"palette\":\"muted\""), "{row}");
+        assert!(row.contains("\"decimals\":0"), "{row}");
+    }
+
+    /// A call that clears a colour clears it and keeps the rest of the
+    /// formatting.
+    #[tokio::test]
+    async fn an_update_that_clears_a_colour_keeps_the_number_format() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "format": { "style": "number", "decimals": 0 },
+            "colors": { "palette": "muted" },
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &rename_call(json!({ "colors": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("muted"), "{row}");
+        assert!(row.contains("\"decimals\":0"), "{row}");
+    }
+
+    /// A call that changes the kind drops the formatting: a colour is for a
+    /// chart, and the reply says the formatting was reset.
+    #[tokio::test]
+    async fn an_update_that_changes_the_kind_resets_the_formatting() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "format": { "style": "number", "decimals": 0 },
+            "colors": { "palette": "muted" },
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &rename_call(json!({ "kind": "table" })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["formattingKept"], json!(false), "{reply}");
+        assert!(reply["note"].is_string(), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(!row.contains("muted"), "{row}");
+        assert!(!row.contains("\"decimals\":0"), "{row}");
+    }
+
+    /// The card and the save agree: a partial update whose kept formatting no
+    /// longer fits the call is refused by both, with the same sentence.
+    #[tokio::test]
+    async fn the_draft_check_and_the_update_refuse_a_partial_update_whose_kept_formatting_no_longer_fits()
+     {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "valueFormats": { "revenue": { "style": "number" } },
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let args = rename_call(json!({}));
+        let time = lakehouse_bi::grain::TimeContext::default();
+        let draft = check_chart_draft(&ch, &args, Some("c_1".to_owned()), &time).await;
+        let saved = update_chart(&ch, Some(&person(7)), &args, &time).await;
+        let draft = draft.expect("the draft is refused");
+        assert_eq!(
+            draft["error"],
+            json!("a value format names 'revenue', which the chart does not return."),
+            "{draft}"
+        );
+        assert_eq!(saved["error"], draft["error"], "{saved}");
+    }
+
+    /// A chart is listed with the board it is on and the tab it sits on: a
+    /// tile that names no tab sits on the board's first one.
+    #[tokio::test]
+    async fn the_assistant_lists_a_chart_with_the_board_and_the_tab_it_sits_on() {
+        let server = MockServer::start().await;
+        rows_first(
+            &server,
+            "FROM console.bi_chart FINAL WHERE is_deleted = 0",
+            vec![json!({
+                "id": "c_1",
+                "spec_json": stored_document(json!({
+                    "title": "Visitors",
+                    "kind": "bar",
+                    "mart": "mart_x",
+                    "dimension": "province",
+                    "measures": ["visitors"],
+                    "board": "b_board",
+                })),
+                "board": "b_board",
+                "created_by": "ai",
+                "created_at": "2026-10-22 00:00:00",
+            })],
+        )
+        .await;
+        rows_first(
+            &server,
+            "FROM console.bi_board FINAL WHERE is_deleted = 0",
+            vec![json!({
+                "id": "b_board",
+                "name": "Sales",
+                "owner_id": "",
+                "tabs_json": "[{\"id\":\"tab_a\",\"title\":\"A\"},{\"id\":\"tab_b\",\"title\":\"B\"}]",
+                "layout_json": "{\"c_1\":{\"x\":0,\"y\":0,\"w\":2,\"h\":2}}",
+            })],
+        )
+        .await;
+        rest(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = list_charts(&ch, Some(&person(7))).await;
+        let chart = &reply["charts"][0];
+        assert_eq!(chart["board"], json!("b_board"), "{reply}");
+        assert_eq!(chart["tab"], json!("tab_a"), "{reply}");
     }
 }
