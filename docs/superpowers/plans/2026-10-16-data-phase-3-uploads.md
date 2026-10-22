@@ -319,7 +319,9 @@ its handoff.
 ### Slice 5: several files into one table
 
 - **T5.1 API.**
-  - Migration `0092_upload_loaded_with.sql`: `file_upload.loaded_with UUID`.
+  - Migration `0092_upload_loaded_with.sql`: `file_upload.loaded_with TEXT` (the plan said `UUID`; the
+    code is right — `file_upload.id` is `TEXT` (`up-<uuid>`) — so the column follows the key it points at, with a
+    foreign key and `ON DELETE SET NULL`).
   - New `POST /api/uploads/{id}/compare` `{alsoUploads}` → `{mismatches: [{uploadId, file, missing, extra, typeConflicts}]}`. It goes in `POLICY_TABLE` and `route_auth.rs`.
   - `ingest` accepts `alsoUploads` (≤ 9, same tenant, same format, not `receiving`) and re-checks, refusing with the same list (decision 4).
   - The run config's `storage_keys` lists every file. The Settler settles every row with `loaded_with` = the primary.
@@ -1079,6 +1081,49 @@ not on a wrong result — "c. auto-disable: timed out after 150s waiting for the
 failures (last error: None)", after the three failed runs it waits for. The same job fails on `main`'s own
 `232df0c8` (PR #199's head) and passes on the merge commit `d9443753`, so it is a flake on a slow runner. It is
 written down as `DATA-30` in `docs/core/BACKLOG.md`, as the rule asks, and the job was re-run on the PR.
+
+**The PR is green at `2e776cdf`:** the `SRC-11` job passed on the next run at the same code, which is what a
+flake looks like, and `Rust · G9 file upload` is green with slice 4's new step.
+
+### Slice 5, round 1 (planner/reviewer, Claude Opus), at `37f6b5b6`, 2026-10-22
+
+The developer built T5.1 to T5.4 in four commits (`939dafbd` API, `c8b82469` job, `4a05edc6` console, `99ace1c6`
+gate) and handed them over in `37f6b5b6`. The reviewer read the diff and re-ran the block itself.
+
+- **`BLOCKER` 5.** The branch's own Rust suite is red on the final commit.
+  `cargo test -p lakehouse-api --lib` gives **2455 passed, 1 failed, 18 ignored**:
+  `routes::uploads::group::tests::a_whole_number_fits_a_decimal_column_but_a_decimal_does_not_fit_an_integer_one`
+  (left 0, right 1). The code and the test disagree about one rule: the code reports a type conflict only for a
+  column the **first** file's own sample fits (`group.rs:270-280`, "no verdict on those"), and the test still
+  expects a conflict for a first file whose own value (`1.5`) does not fit the column it was given (`Integer`).
+  The rule was changed on purpose — two identical files must never conflict — so the test is the stale side; it
+  is to be updated with that reason in the commit, or the rule changed back, and the suite must be green on the
+  final commit. The handoff said the suite was green (2455 passed); on the same commit it is not, so the counts
+  are to be quoted again from a run on the final commit (rule 7).
+- The reviewer's own runs at `37f6b5b6`: `cargo fmt --check` clean; `cargo clippy -p lakehouse-store -p
+  lakehouse-api --all-targets --locked -- -D warnings` clean; `--lib`: 2455 passed, 1 failed, 18 ignored (the
+  failure above); `--test upload_routes`: **140 passed**; `--test route_auth`: **55 passed**; the
+  `lakehouse-store` suites pass. The developer's counts match everywhere but the lib suite.
+- The route is in `POLICY_TABLE` (`connector:manage`, `policy.rs:820`) and pinned in `tests/route_auth.rs`
+  both ways (`route_auth.rs:1258`), with the analyst half of the test proving the gate is the one that refuses.
+- The plan's `loaded_with UUID` against the code's `TEXT`: the code is right, because `file_upload.id` is `TEXT`
+  (`up-<uuid>`), and the plan line is corrected above. The migration's header says why, and the foreign key
+  with `ON DELETE SET NULL` keeps a deleted primary from stranding the other files.
+- Accepted as the developer states them: every file of a load is an `ingesting` row until the primary settles
+  it, and the `SEC-17` counts skip rows with `loaded_with`, so ten files count as one load; the other files
+  carry no row count of their own, the primary carries the total; `compare` also takes the reading and the
+  column list, so the types the other files must fit are the person's; a type conflict blocks Load like a
+  missing or extra column, but only for a column the first file's own sample fits.
+- The gate's new step assumes the lineage route finds the bronze table by `focus=bronze.<table>` and looks for
+  the node `upload:<first>`; the label the code writes is `"{name} and {N} more"` (`lineage.rs`), and
+  `matches_focus` takes a qualified name, so the assumption reads as right — but only CI can prove it, and the
+  step has never run.
+- **A gap the developer found, which predates this slice and is not ours to fix here:** a typed load of a
+  workbook writes its bad-values report beside the *converted* object, while the API reads it beside the
+  *original* — so the report of a typed workbook load is not read. It is written down as `DATA-31`.
+
+No other open `BLOCKER`. The slice 5 commits are not pushed yet: they wait for `BLOCKER` 5, so that CI runs once
+on a head that is green.
 
 No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
 gate is read again on the PR.
