@@ -839,3 +839,13 @@ Every count matches the handoff.
 No open `BLOCKER`. One `SHOULD-FIX` open, assigned to slice 5's sitting; the zip-of-Parquet decision is signed
 (decision 13 amended, `DATA-28` holds the future slice). The branch is pushed, and the PR's CI is to be read at
 the new head.
+
+**Merge with `main` (2026-10-21, `2d3e279e`),** after `main` took the BI phase 3 (151 commits). Three files
+conflicted; each was resolved hunk by hunk, keeping both sides: `rust/crates/lakehouse-api/src/main.rs` keeps
+this branch's `spawn_upload_session_sweep` and `main`'s `spawn_trash_sweep` as two functions, both called
+(`main.rs:183,188`); `CHANGELOG.md` keeps this branch's upload entry and `main`'s four BI entries under
+**Added**; `docs/core/BACKLOG.md` keeps `main`'s ready-to-start list with `DATA-28` added to it. After the
+merge: `cargo fmt --check` clean; `cargo clippy -p lakehouse-api --all-targets --locked -- -D warnings` clean;
+`cargo test -p lakehouse-api --lib`: 2447 passed, 18 ignored (up from 2318 and 15: `main`'s BI tests);
+`--test route_auth`: 55 passed. No TypeScript or Python file conflicted, so no console or Dagster check was
+run for this commit; the PR's CI carries the rest.
