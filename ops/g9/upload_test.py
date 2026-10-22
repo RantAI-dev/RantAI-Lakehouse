@@ -945,11 +945,22 @@ def step_new_formats(api, base_table: str, state: dict) -> None:
         if loaded.get("rows") != len(expected["rows"]) or loaded.get("bronzeTable") != table:
             raise G9Failure(f"{name}: the load settled with rows {loaded.get('rows')!r} in {loaded.get('bronzeTable')!r}, expected {len(expected['rows'])} in {table!r}")
         _wait_for(f"{table} holds its rows", lambda: count_rows(api, table) == len(expected["rows"]), VISIBLE_TIMEOUT_S, retry_failures=True)
-        got = run_query(api, f"SELECT {', '.join(names)} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
-        got_rows = sorted(([r[c] for c in names] for r in got), key=lambda row: str(row[0]))
+        # PR #186 review BLOCKER 4: `/api/query/run` answers every cell as text and renders a
+        # NULL as "" (`stringify_cell`), so a value read through it cannot tell a missing key
+        # (decision 11: null) from an empty string. Each column is asked `isNull` beside its
+        # value, and a cell is None only where ClickHouse says it is NULL. Nothing is loosened:
+        # a table that held "" where the fixture says null still fails here.
+        flags = ", ".join(f"isNull({c}) AS is_null_{i}" for i, c in enumerate(names))
+        got = run_query(api, f"SELECT {', '.join(names)}, {flags} FROM {QUERY_DB}.`bronze.{table}` WHERE 1")["rows"]
+        got_rows = sorted(
+            ([None if r[f"is_null_{i}"] == "1" else r[c] for i, c in enumerate(names)] for r in got),
+            key=lambda row: str(row[0]),
+        )
         want_rows = sorted(expected["rows"], key=lambda row: str(row[0]))
+        types = _types_of(api, table, names)
         if got_rows != want_rows:
-            raise G9Failure(f"{name}: the table holds {got_rows}, the fixture says {want_rows}")
+            raise G9Failure(f"{name}: the table holds {got_rows}, the fixture says {want_rows}; the columns are {types}")
+        print(f"[g9] formats: {name} columns are {types}")
         print(f"[g9] formats: {name} loaded {len(want_rows)} rows into {table}")
         _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, f"DELETE {name}")
         state["deleted"] = True

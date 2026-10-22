@@ -318,6 +318,32 @@ def test_the_rows_counted_before_the_load_are_the_rows_that_are_loaded(name, dat
     assert all(list(row) == parsed.columns for row in loaded)
 
 
+# PR #186 review BLOCKER 4: decision 11 says a key missing from a JSON object (and a `null`, and an
+# Avro union's null) is a NULL cell, never an empty string. The fixtures hold a missing key, a `null` and
+# an Avro union with null, so this is the level where the job could drop one: the Arrow batch it hands
+# to dlt.
+FORMATS = REPO_ROOT / "ops" / "fixtures" / "uploads" / "formats"
+NULL_FORMATS = [("orders.json", "json"), ("orders.jsonl", "jsonl"), ("orders.avro", "avro")]
+
+
+@pytest.mark.parametrize("name,kind", NULL_FORMATS, ids=[name for name, _ in NULL_FORMATS])
+def test_a_missing_key_a_json_null_and_an_avro_union_null_reach_dlt_as_arrow_nulls_and_not_as_empty_text(name, kind):
+    expected = json.loads((FORMATS / f"{name}.expected.json").read_text(encoding="utf-8"))
+    params = _params(format=kind, compression="none")
+    with (FORMATS / name).open("rb") as handle:
+        stream = file_ingest._open_stream(handle, params)
+        batches = list(stream.batches())
+    assert stream.columns == expected["columns"]
+    table = pa.concat_tables(batches)
+    got = [list(row) for row in zip(*(table.column(c).to_pylist() for c in stream.columns))]
+    assert got == expected["rows"], "every cell is the fixture's value, a null where the fixture says null"
+    assert any(None in row for row in expected["rows"]), "the fixture must hold a null for this test to mean anything"
+    for column in stream.columns:
+        wanted = [row[stream.columns.index(column)] for row in expected["rows"]]
+        assert table.column(column).null_count == wanted.count(None), column
+        assert table.schema.field(column).type == pa.string()
+
+
 # ── Decoding ─────────────────────────────────────────────────────────────
 
 

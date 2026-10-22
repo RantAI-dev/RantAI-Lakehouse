@@ -217,6 +217,49 @@ def test_v6_the_six_types_reach_iceberg_as_declared(local_catalog, tmp_path):
     assert {s.name: s.iceberg_type() for s in specs} == {n: fields[n] for n in values}
 
 
+def _required_flags(directory: str) -> dict[str, bool]:
+    latest = sorted(glob.glob(directory + "/**/*.metadata.json", recursive=True))[-1]
+    meta = json.load(open(latest))
+    current = next(s for s in meta["schemas"] if s["schema-id"] == meta["current-schema-id"])
+    return {f["name"]: f["required"] for f in current["fields"]}
+
+
+@loader
+@pytest.mark.parametrize("name,kind", [("orders.json", "json"), ("orders.jsonl", "jsonl"), ("orders.avro", "avro")])
+def test_pr_186_review_blocker_4_a_missing_key_is_an_optional_field_and_a_null_in_the_iceberg_table(
+    local_catalog, tmp_path, name, kind
+):
+    # The job's own resource (`_text_resource`, every column declared `text`) through dlt into a
+    # local Iceberg table: the level between the Arrow batch and the catalog, where a null could
+    # become "" or a field could become `required`. Measured with dlt 1.30.0 and pyiceberg 0.12.0:
+    # neither does. (The Rust API's `/api/query/run` renders a NULL as "" -- `stringify_cell` --
+    # which is what turned the first run of the gate red; the gate now asks `isNull`.)
+    from pathlib import Path
+
+    from dispar_orchestrate import file_ingest
+
+    expected = json.loads(
+        (Path(__file__).resolve().parents[2] / "ops" / "fixtures" / "uploads" / "formats" / f"{name}.expected.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    params = _params(format=kind, compression="none", bronze_table_name="t")
+    directory = str(tmp_path)
+    with (Path(__file__).resolve().parents[2] / "ops" / "fixtures" / "uploads" / "formats" / name).open("rb") as handle:
+        stream = file_ingest._open_stream(handle, params)
+        resource = file_ingest._text_resource(stream, "t")
+        resource.add_map(_stamp_ingested_at)
+        pipeline = _local_pipeline(directory)
+        pipeline.run(resource, table_name="t", write_disposition="replace", loader_file_format="parquet", table_format="iceberg")
+    assert not any(_required_flags(directory)[column] for column in stream.columns), "every text column may be empty"
+    table = sink_module.history.open_table(pipeline, "t", sync=False).scan().to_arrow()
+    rows = sorted(
+        ([row[column] for column in stream.columns] for row in table.to_pylist()), key=lambda row: str(row[0])
+    )
+    assert rows == sorted(expected["rows"], key=lambda row: str(row[0])), "a null stays a null, an empty text stays empty"
+    assert any(None in row for row in rows)
+
+
 def _text_table(directory: str):
     """A local Iceberg table of three text columns and two rows, loaded by dlt."""
     first = pa.table({
