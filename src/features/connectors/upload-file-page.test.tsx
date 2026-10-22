@@ -26,7 +26,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { formatBytes } from "@/lib/format"
 import { MAX_UPLOAD_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
-import type { Upload, UploadPreview } from "@/services/contracts/uploads"
+import type { Upload, UploadColumnSpec, UploadPreview } from "@/services/contracts/uploads"
 import { UploadFilePage } from "./upload-file-page"
 
 const originalFetch = global.fetch
@@ -1539,7 +1539,7 @@ describe("UploadFilePage, several files into one table", () => {
     await within(list).findByText("Same columns")
     await waitFor(() => expect(next().disabled).toBe(false))
     const last = sent(calls, "POST", /compare$/).pop()
-    expect((last?.body as { columns: { name: string; type: string }[] }).columns).toEqual([
+    expect((last?.body as { columns: UploadColumnSpec[] }).columns).toEqual([
       { source: "sku", name: "sku", type: "text" },
       { source: "qty", name: "qty", type: "text" },
     ])
