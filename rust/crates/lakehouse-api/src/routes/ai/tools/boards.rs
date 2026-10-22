@@ -2,7 +2,7 @@
 //! `delete_board`, `arrange_board`, `move_chart`, `set_board_view_filters`
 //! and `save_board_filters`.
 //!
-//! Five of the six route through the same console route handlers
+//! Four of the six route through the same console route handlers
 //! `calc_fields::run` calls (`routes::dashboard::{boards_update,
 //! boards_delete}`) so the assistant gets every check the
 //! console already runs — `board_edit_allowed`, `validate_filters`, the
@@ -21,7 +21,7 @@
 //!
 //! One seam is not that: `move_chart` saves the chart itself through
 //! `store::spec_from_input` + `store::insert_chart`, not through
-//! `routes::dashboard::specs_update`. Plan 20 has it save on the new
+//! `routes::dashboard::specs_update`. It saves on the new
 //! board *before* removing the tile from the old one, so a failure
 //! leaves the chart readable rather than on two boards, and that
 //! ordering needs the two writes split. `spec_from_input` still runs
@@ -29,19 +29,19 @@
 //! the `specs_update` handler later would not reach this path, and that
 //! is the one place to look when it changes.
 //!
-//! Plan 20 assigns two new rules to the tool (not the handler), and
+//! Two rules are the tool's own (not the handler's), and
 //! because they are tool-specific they live here:
 //!
 //! - `arrange_board` checks each box is on the 12-column grid and is for
-//!   a chart that is currently on that board (plan 20 Decisions, lines
-//!   74-77). The console's drag UI cannot produce an out-of-grid box or
+//!   a chart that is currently on that board (feature page decision 3).
+//!   The console's drag UI cannot produce an out-of-grid box or
 //!   an off-board chart, a model can. The handler `boards_update` is
 //!   still the save path; the `board_edit_allowed` /
 //!   folder-`ensure_folder_exists` checks inside it are unchanged.
 //! - `move_chart` removes the chart's tile from the old board's layout,
-//!   which `specs_update` does not do (plan 20 Decisions, lines 79-80:
-//!   "Read first whether `spec_from_input` or `insert_chart` already
-//!   does the latter; do it once"). They do not, so the tool does it.
+//!   which `specs_update` does not do (feature page decision 4).
+//!   Neither `spec_from_input` nor `insert_chart` does it, so the tool
+//!   does it.
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -61,9 +61,9 @@ use crate::routes::dashboard_organise::{
 };
 use crate::state::AppState;
 
-/// The grid `arrange_board` lays tiles on. Plan 20 Decisions, lines 74-77.
+/// The grid `arrange_board` lays tiles on (feature page decision 3).
 const GRID_COLUMNS: i32 = 12;
-/// Smallest width/height a tool may set. Plan 20 Decisions, lines 74-77.
+/// Smallest width/height a tool may set (feature page decision 3).
 const MIN_TILE_SIDE: i32 = 1;
 
 fn arg_str(args: &Map<String, Value>, key: &str) -> String {
@@ -164,8 +164,8 @@ pub(super) async fn delete_board(
 ///
 /// The `Err` arm carries the *classified* upstream-error JSON, not
 /// the raw `ChError` text, so no host / port / table name ever
-/// reaches the model (plan 20 Decisions, line 73: "no upstream text
-/// reaches the model"). Callers return the `Value` verbatim; the
+/// reaches the model (feature page decision 2: no upstream text
+/// reaches the model). Callers return the `Value` verbatim; the
 /// caller is the boundary that hands a tool result to the chat loop.
 async fn read_layout(state: &AppState, board: &str, viewer: &Viewer) -> Result<LayoutMap, Value> {
     match store::get_board(&state.clickhouse, board, viewer).await {
@@ -177,7 +177,7 @@ async fn read_layout(state: &AppState, board: &str, viewer: &Viewer) -> Result<L
 
 /// `arrange_board`: takes only the tiles that change; refuses off-board
 /// charts, out-of-grid boxes, and tiles with `w` or `h` below 1
-/// (plan 20 Decisions, lines 74-77); merges into the current layout;
+/// (feature page decision 3); merges into the current layout;
 /// saves through `boards_update` with `layout`. Layout is replaced whole
 /// — last write wins, as in the console.
 pub(super) async fn arrange_board(
@@ -220,7 +220,7 @@ pub(super) async fn arrange_board(
         Err(json) => return json,
     };
 
-    // Plan 20 Decisions, lines 74-77: a chart id not on the board is
+    // Feature page decision 3: a chart id not on the board is
     // refused; the others (those already in the layout being moved,
     // or stored charts assigned to this board) keep their boxes. A
     // chart id present in the current layout is accepted: the call
@@ -270,7 +270,7 @@ pub(super) async fn arrange_board(
 
 /// Parse one `arrange_board` tile map into validated `(chart_id, box)`
 /// pairs, refusing any box outside the grid or with a side below 1
-/// (plan 20 Decisions, lines 74-77). The bound checks are CPU-only so
+/// (feature page decision 3). The bound checks are CPU-only so
 /// they are unit-testable without `ClickHouse`.
 fn parse_arrange_tiles(tiles_obj: &Map<String, Value>) -> Result<Vec<(String, TileBox)>, String> {
     let mut incoming: Vec<(String, TileBox)> = Vec::with_capacity(tiles_obj.len());
@@ -282,7 +282,7 @@ fn parse_arrange_tiles(tiles_obj: &Map<String, Value>) -> Result<Vec<(String, Ti
             return Err(format!("tile {chart_id} needs x, y, w, h as numbers"));
         };
         if box_.w < MIN_TILE_SIDE || box_.h < MIN_TILE_SIDE {
-            // Plan 20 Decisions, lines 74-77: a box with w or h below 1
+            // Feature page decision 3: a box with w or h below 1
             // is refused. The console drag UI cannot produce one.
             return Err(format!(
                 "tile {chart_id}: w and h must be at least {MIN_TILE_SIDE}"
@@ -297,7 +297,7 @@ fn parse_arrange_tiles(tiles_obj: &Map<String, Value>) -> Result<Vec<(String, Ti
             // always fits in `i64` and the comparison is exact.
             || i64::from(box_.x) + i64::from(box_.w) > i64::from(GRID_COLUMNS)
         {
-            // Plan 20 Decisions, lines 74-77: a box outside the
+            // Feature page decision 3: a box outside the
             // 12-column grid is refused.
             return Err(format!(
                 "tile {chart_id}: box must fit within the {GRID_COLUMNS}-column grid"
@@ -424,7 +424,7 @@ pub(super) async fn move_chart(
         return json!(upstream_error_json(&err));
     }
 
-    // Plan 20 Decisions, lines 79-80: remove the chart's tile from the old
+    // Feature page decision 4: remove the chart's tile from the old
     // board's layout. `specs_update` does not do this. A board with no tile
     // for it is left as it is; a failure here is logged and swallowed (the
     // chart has moved), and leaves a stale tile on the old board, which is
@@ -445,16 +445,36 @@ fn upstream_error_json(err: &lakehouse_clickhouse::ChError) -> Value {
     crate::upstream_error::report_ch(&crate::upstream_error::DATABASE, err).to_json()
 }
 
+/// Refuse a filter that is a reference to a saved segment.
+///
+/// A dashboard filter names a column and is handed to the tiles that have
+/// it. A saved segment belongs to a chart's or a metric's own filters, where
+/// it stands for that segment's filters. `validate_filters` accepts such a
+/// reference (it has no column to check), so a board filter naming one would
+/// be saved, the board would look filtered and the tiles would not change.
+/// The refusal says where a segment belongs.
+fn segment_filter_refusal(filters: &[FilterDef]) -> Option<&'static str> {
+    let names_a_segment = filters
+        .iter()
+        .any(|filter| filter.segment.is_some() && filter.column.is_empty());
+    names_a_segment.then_some(
+        "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters.",
+    )
+}
+
 /// `set_board_view_filters`: validate filters and hand them to the page.
 /// Writes nothing. The console route does not need to be called: there is
 /// no board write here. The "no-op on success" invariant is what makes
 /// this `Read` (a viewer can do it; ask mode offers it).
 ///
-/// Runs both `validate_filters` AND `without_inert` before returning
-/// (plan 20 Decisions, line 82): a view filter that filters nothing
+/// Runs both `validate_filters` AND `without_inert` before returning:
+/// a view filter that filters nothing
 /// (an `in` with no values, a `between` with neither bound, a text
 /// op with no text) is dropped from the payload the page applies, so
 /// the user never sees a chip that does nothing.
+///
+/// A filter that names a saved segment is refused before any of that: a
+/// dashboard filter names a column.
 pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
     let board = arg_str(args, "board");
     if board.is_empty() {
@@ -467,6 +487,9 @@ pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
         Ok(f) => f,
         Err(err) => return json!({ "error": format!("filters: {err}") }),
     };
+    if let Some(msg) = segment_filter_refusal(&parsed) {
+        return json!({ "error": msg });
+    }
     if let Err(msg) = validate_filters(&parsed) {
         return json!({ "error": msg });
     }
@@ -486,9 +509,12 @@ pub(super) fn set_board_view_filters(args: &Map<String, Value>) -> Value {
 /// all run inside `boards_update` (`routes/dashboard.rs:1145` /
 /// `:1155` / `:1163` / `:1204` / `:1217`). The tool does NOT duplicate
 /// them — the principle is to call the route, not re-implement it
-/// (plan 20 Decisions, line 71-73). Only the shape decode (`serde`
+/// (feature page decision 2). Only the shape decode (`serde`
 /// parsing the args into `Vec<FilterDef>`) is the tool's job; an
 /// unparseable shape is the only thing the tool reports on its own.
+///
+/// A filter that names a saved segment is refused before the board is
+/// touched: a dashboard filter names a column.
 pub(super) async fn save_board_filters(
     state: &AppState,
     principal: Option<&Principal>,
@@ -508,6 +534,9 @@ pub(super) async fn save_board_filters(
         Ok(f) => f,
         Err(err) => return json!({ "error": format!("filters: {err}") }),
     };
+    if let Some(msg) = segment_filter_refusal(&parsed) {
+        return json!({ "error": msg });
+    }
     api_result_to_value(
         dashboard::boards_update(
             State(state.clone()),
@@ -550,8 +579,8 @@ mod tests {
     }
 
     /// `arrange_board`'s CPU-only bounds checks: the off-by-one grid
-    /// edge, `w` or `h` below 1, and an out-of-grid box. Plan 20
-    /// Decisions, lines 74-77.
+    /// edge, `w` or `h` below 1, and an out-of-grid box (feature page
+    /// decision 3).
     #[test]
     fn parse_arrange_tiles_accepts_a_box_that_fits_the_grid() {
         let mut tiles = Map::new();
@@ -614,7 +643,7 @@ mod tests {
 
     /// `tile_box_from` parses every component as an `i32`, so `x` and
     /// `w` can both reach `i32::MAX`. The horizontal-extent check must
-    /// refuse such a box (plan 20 Decisions, lines 74-77) — an `i32`
+    /// refuse such a box (feature page decision 3) — an `i32`
     /// sum overflows in debug (panicking in the request handler) and
     /// wraps in release to a large negative, where the negative then
     /// fails `> GRID_COLUMNS` and the off-grid box is silently
@@ -695,6 +724,27 @@ mod tests {
             err.contains("fuzzy_match"),
             "expected the unknown op to be named in the refusal, got: {err}"
         );
+    }
+
+    /// `set_board_view_filters`: a filter that names a saved segment is
+    /// refused. A dashboard filter names a column and is handed to the tiles
+    /// that have it; a saved segment belongs to a chart's or a metric's own
+    /// filters, where it stands for that segment's filters. A board filter
+    /// naming one would be accepted and change nothing, so the page would
+    /// look filtered and the tiles would not be.
+    #[test]
+    fn set_board_view_filters_refuses_a_filter_that_names_a_saved_segment() {
+        let mut args = Map::new();
+        args.insert("board".to_owned(), Value::String("b-view".to_owned()));
+        args.insert("filters".to_owned(), json!([{ "segment": "x" }]));
+        let out = set_board_view_filters(&args);
+        assert_eq!(
+            out["error"],
+            json!(
+                "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters."
+            )
+        );
+        assert!(out.get("applyViewFilters").is_none(), "{out}");
     }
 
     // ── Merge of main into phase 3: the board tools keep phase 3's rules ──
@@ -1034,6 +1084,30 @@ mod tests {
         .await;
         let error = reply["error"].as_str().unwrap_or_default();
         assert!(error.contains("at most 20"), "{reply}");
+        assert_eq!(writes(&sent(&server).await), 0);
+    }
+
+    /// `save_board_filters`: a filter that names a saved segment is refused
+    /// and nothing is written. A dashboard filter names a column; a saved
+    /// segment belongs to a chart's or a metric's own filters, where it
+    /// stands for that segment's filters.
+    #[tokio::test]
+    async fn save_board_filters_refuses_a_filter_that_names_a_saved_segment() {
+        let server = MockServer::start().await;
+        let state = state_on(&server, false).await;
+        let reply = run(
+            &state,
+            Some(&person()),
+            "save_board_filters",
+            &args_of(&json!({ "board": "b1", "filters": [{ "segment": "x" }] })),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!(
+                "a dashboard filter names a column; a saved segment belongs to a chart's or a metric's own filters."
+            )
+        );
         assert_eq!(writes(&sent(&server).await), 0);
     }
 
