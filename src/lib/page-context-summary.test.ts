@@ -164,3 +164,27 @@ test("BI-18 part C: summarizeTabs names each tab with its id, the open one and t
   )
   assert.equal(summarizeTabs(tabs, () => "t_1", ["a"]), '"Overview" (id t_1; charts a); "Maps" (id t_2; no charts)')
 })
+
+test("summarizeTabs stays inside its budget: it counts the charts per tab when their ids do not fit, and keeps the ids when they do", () => {
+  const tabs = [
+    { id: "t_1", title: "Overview" },
+    { id: "t_2", title: "Maps" },
+    { id: "t_3", title: "Detail" },
+  ]
+  const on = (id: string) => (id === "m" || id === "n" ? "t_2" : "t_1")
+  const ids = ["a", "b", "c", "m", "n"]
+  const hint = "; list_charts gives each chart's tab"
+  // The chart ids do not fit in 60 characters, so each tab carries a count.
+  const capped = summarizeTabs(tabs, on, ids, "t_1", { maxChars: 60 })
+  assert.match(capped, /3 charts/)
+  assert.doesNotMatch(capped, /charts a, b, c/)
+  assert.ok(capped.endsWith(hint), capped)
+  assert.ok(capped.length <= 60 + hint.length, capped)
+  // With room to spare the ids stay and no hint is added.
+  const full = summarizeTabs(tabs, on, ids, "t_1", { maxChars: 600 })
+  assert.equal(
+    full,
+    '"Overview" (id t_1, open; charts a, b, c); "Maps" (id t_2; charts m, n); "Detail" (id t_3; no charts)'
+  )
+  assert.doesNotMatch(full, /list_charts/)
+})
