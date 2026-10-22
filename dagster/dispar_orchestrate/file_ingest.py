@@ -56,6 +56,21 @@ converter used to write, so the table is what it was when the API converted the
 file; the same row, column and cell caps apply, and a binary or nested column is
 refused (`UNREADABLE`, the API having refused the same file at upload).
 
+# Several files, one table (`DATA-17` slice 5, plan AD4)
+
+`storage_keys` lists the objects of ONE load, the primary upload's first, and the
+job reads them in that order through the same readers and the same caster as
+one file: it is one run, one pipeline and one table. Columns are matched by NAME,
+after the names are cleaned (`_column_names`), and their order may differ from
+file to file; the columns and their order are the first file's. A file whose
+names are not the first file's fails the load (`LOAD_FAILED`, nothing written):
+the API has listed that mismatch before the load and refuses it, so reaching it
+here means another caller launched the job, or a file changed. The row cap and
+the unpacked-bytes budget (`max_bytes`) are those of the whole load, not of each
+file (feature page decision 1: the cap counts all of a load's files), and the row
+count a load reports is the sum. The API records one outcome, under the primary's
+`upload:<id>`, and settles every file of the load from it.
+
 # Every column is text, and dlt has to be told
 
 Decision 6 of the feature page says every column is text. Plain rows do not
@@ -95,8 +110,8 @@ import itertools
 import json
 import re
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, BinaryIO
@@ -117,6 +132,10 @@ from dispar_orchestrate.parquet_ingest import UnsupportedColumn, check_types, co
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 JOB_NAME = "file_ingest_job"
+
+#: The most files one load takes (feature page decision 5). The API refuses more; the job
+#: checks it again because another caller may launch the job.
+MAX_LOAD_FILES = 10
 
 # `ingest_run.connector_id` of an upload's run: what the API asks for.
 CONNECTOR_PREFIX = "upload:"
@@ -264,8 +283,8 @@ class FileIngestParams:
     #: `file_upload.id`. The outcome is filed under `upload:<id>`.
     upload_id: str
     #: Object keys in the warehouse bucket, `uploads/<tenant id>/<upload id>[.<ext>]`,
-    #: built by the API from server-generated parts only; the primary file first.
-    #: One key until a load can take several files (a later slice of `DATA-17`).
+    #: built by the API from server-generated parts only; the primary file first. One to
+    #: `MAX_LOAD_FILES` of them, each a different object (`DATA-17` slice 5).
     storage_keys: tuple[str, ...]
     #: What the objects are: one of `FORMATS`.
     format: str
@@ -309,7 +328,8 @@ class FileIngestParams:
 CONFIG_SCHEMA = {
     "upload_id": Field(str, description="`file_upload.id`; the outcome is recorded under `upload:<id>`."),
     "storage_keys": Field(
-        [str], description="Object keys inside the warehouse bucket, under `uploads/`; the primary file first."
+        [str],
+        description="Object keys inside the warehouse bucket, under `uploads/`: one to ten files of one load, the primary first.",
     ),
     "format": Field(str, description="What the objects are: `delimited`, `parquet`, `json`, `jsonl` or `avro`."),
     "compression": Field(str, description="`none`, `gzip` or `zip`."),
@@ -600,14 +620,20 @@ def open_table(source: str | Iterable[str], delimiter: str, header_row: int) -> 
 
 @dataclass
 class ParquetStream:
-    """A Parquet file read in batches, with the interface of `TableStream`:
+    """Parquet files read in batches, with the interface of `TableStream`:
     `columns` (cleaned as a header would be), `batches()`, `row_count` and
-    `failure`. The text of every value is `parquet_ingest`'s."""
+    `failure`. The text of every value is `parquet_ingest`'s.
+
+    `others` are the files after the first of a load of several (`DATA-17` slice 5), each
+    with where its columns are in the first file's order: their batches are put in that order,
+    so the table is the first file's whatever order the others wrote their columns in.
+    """
 
     parquet_file: Any
     columns: list[str]
     row_count: int = 0
     failure: LoadFailure | None = field(default=None, repr=False)
+    others: list[tuple[Any, list[int]]] = field(default_factory=list)
 
     def hints(self) -> list[dict[str, Any]]:
         """dlt column hints: every column text."""
@@ -617,22 +643,30 @@ class ParquetStream:
         """The Iceberg type each column is written as."""
         return {name: "string" for name in self.columns}
 
+    def _files(self) -> Iterator[tuple[Any, list[int] | None]]:
+        yield self.parquet_file, None
+        yield from self.others
+
     def batches(self) -> Iterator[pa.Table]:
-        """The rows as tables of `string` columns, at most `BATCH_ROWS` each.
+        """The rows of every file, in order, as tables of `string` columns, at most
+        `BATCH_ROWS` each.
 
         # Errors
 
         Raises `LoadFailure(TOO_MANY_ROWS)` (also kept in `failure`) before the
-        batch that would pass `MAX_ROWS`, and `LoadFailure(UNREADABLE)` when the
-        store or the file fails while it is read.
+        batch that would pass `MAX_ROWS` (the rows of all the files together), and
+        `LoadFailure(UNREADABLE)` when the store or a file fails while it is read.
         """
         try:
-            for batch in text_batches(self.parquet_file, BATCH_ROWS):
-                if self.row_count + batch.num_rows > MAX_ROWS:
-                    self.failure = LoadFailure(TOO_MANY_ROWS)
-                    raise self.failure
-                self.row_count += batch.num_rows
-                yield batch.rename_columns(self.columns)
+            for parquet_file, order in self._files():
+                for batch in text_batches(parquet_file, BATCH_ROWS):
+                    if self.row_count + batch.num_rows > MAX_ROWS:
+                        self.failure = LoadFailure(TOO_MANY_ROWS)
+                        raise self.failure
+                    self.row_count += batch.num_rows
+                    if order is not None:
+                        batch = batch.select(order)
+                    yield batch.rename_columns(self.columns)
         except LoadFailure:
             raise
         except Exception as exc:  # noqa: BLE001 -- the store or a page failed mid-read; the detail is the cause
@@ -641,15 +675,13 @@ class ParquetStream:
             raise self.failure from exc
 
 
-def open_parquet_stream(handle: Any) -> ParquetStream:
-    """Open a Parquet file as far as its footer, writing nothing.
+def _open_one_parquet(handle: Any) -> tuple[Any, list[str], int]:
+    """A Parquet file as far as its footer: the file, its column names and its row count.
 
     # Errors
 
-    Raises `LoadFailure` with `UNREADABLE` (the file does not open, or a column
-    has no text form: binary or nested), `HEADER_NO_COLUMNS` (no columns),
-    `TOO_MANY_COLUMNS` or `NO_ROWS`.
-    """
+    Raises `LoadFailure` with `UNREADABLE` (the file does not open, or a column has no text
+    form: binary or nested), `HEADER_NO_COLUMNS` or `TOO_MANY_COLUMNS`."""
     try:
         parquet_file = open_parquet(handle)
         names = column_names_of(parquet_file)
@@ -664,9 +696,30 @@ def open_parquet_stream(handle: Any) -> ParquetStream:
         check_types(parquet_file)
     except UnsupportedColumn as exc:
         raise LoadFailure(UNREADABLE) from exc
+    return parquet_file, names, rows
+
+
+def open_parquet_stream(handle: Any, *more: Any) -> ParquetStream:
+    """Open a Parquet file, and the files that load with it, as far as their footers,
+    writing nothing. The columns are the first file's; the others are matched to them by
+    name (`DATA-17` slice 5).
+
+    # Errors
+
+    Raises `LoadFailure` with `UNREADABLE` (a file does not open, or a column has no text
+    form: binary or nested), `HEADER_NO_COLUMNS`, `TOO_MANY_COLUMNS`, `NO_ROWS` (no file has a
+    row) or `LOAD_FAILED` (the names of a later file are not the first file's).
+    """
+    parquet_file, names, rows = _open_one_parquet(handle)
+    columns = _column_names(names)
+    others: list[tuple[Any, list[int]]] = []
+    for extra in more:
+        other_file, other_names, other_rows = _open_one_parquet(extra)
+        others.append((other_file, _same_columns(_column_names(other_names), columns)))
+        rows += other_rows
     if rows == 0:
         raise LoadFailure(NO_ROWS)
-    return ParquetStream(parquet_file=parquet_file, columns=_column_names(names))
+    return ParquetStream(parquet_file=parquet_file, columns=columns, others=others)
 
 
 class TypedStream:
@@ -886,20 +939,47 @@ def _avro_stream(entries_of: Callable[[], Any], params: FileIngestParams) -> Tab
     return TableStream(columns=_column_names(names), first=first_record, records=stream)  # type: ignore[arg-type]
 
 
-def _open_stream(handle: BinaryIO, params: FileIngestParams) -> TableStream | ParquetStream:
-    """Read the object as far as its first data row, whatever its format and wrapping, writing
-    nothing.
+@contextmanager
+def _entries_across(
+    handles: Sequence[BinaryIO], compression: str, budget: upload_formats.Budget | None, file_format: str
+) -> Iterator[Iterator[tuple[str, BinaryIO]]]:
+    """The entries of every stored object of a load, one object after the other, as one
+    sequence of `(name, stream)`: a zip's files, a gzip file's one stream, a plain object's
+    one stream. The budget is spent by all of them (`DATA-17` slice 5: the cap counts all of a
+    load's files). Closing it closes the object being read.
+
+    # Errors
+
+    What `upload_formats.open_entries` raises, as the entries are reached."""
+
+    def chained() -> Iterator[tuple[str, BinaryIO]]:
+        for handle in handles:
+            with upload_formats.open_entries(handle, compression, budget, file_format) as entries:
+                yield from entries
+
+    chain = chained()
+    try:
+        yield chain
+    finally:
+        chain.close()
+
+
+def _open_stream(handle: BinaryIO, params: FileIngestParams, more: Sequence[BinaryIO] = ()) -> TableStream | ParquetStream:
+    """Read the object, and the objects that load with it (`more`, the files after the
+    first), as far as the first data row, whatever the format and wrapping, writing nothing.
 
     # Errors
 
     `LoadFailure` as the readers above and `open_table` raise it."""
     if params.format == "parquet":
-        return open_parquet_stream(handle)
+        return open_parquet_stream(handle, *more)
+    handles = [handle, *more]
 
     def entries_of() -> Any:
-        # Each pass over the file spends a new budget: the cap is per read of the file.
+        # Each pass over the files spends a new budget: the cap is per read of the files, and
+        # one budget serves all of them.
         budget = upload_formats.Budget(params.max_bytes) if params.compression != "none" else None
-        return upload_formats.open_entries(handle, params.compression, budget, params.format)
+        return _entries_across(handles, params.compression, budget, params.format)
 
     try:
         if params.format == "json" or params.format == "jsonl":
@@ -1073,8 +1153,10 @@ def _check_settings(params: FileIngestParams) -> None:
         problems.append("a zip file does not hold Parquet files")
     if params.max_bytes <= 0:
         problems.append(f"max_bytes {params.max_bytes} is not positive")
-    if len(params.storage_keys) != 1:
-        problems.append(f"storage_keys holds {len(params.storage_keys)} keys; this version loads exactly one file")
+    if not 1 <= len(params.storage_keys) <= MAX_LOAD_FILES:
+        problems.append(f"storage_keys holds {len(params.storage_keys)} keys; a load takes 1 to {MAX_LOAD_FILES} files")
+    if len(set(params.storage_keys)) != len(params.storage_keys):
+        problems.append("storage_keys names a file twice")
     table = params.bronze_table_name
     # Review finding C1: the upload rule first, the same one the API refuses
     # with; dlt is asked only about a name that passed it. The SQL that
@@ -1180,29 +1262,33 @@ def _load(
     write_report: Callable[..., None],
 ) -> LoadSummary:
     _check_settings(params)
-    key = _checked_key(params.storage_keys[0])
+    keys = [_checked_key(key) for key in params.storage_keys]
+    key = keys[0]
     try:
         sink_config = load_config()
     except Exception as exc:  # noqa: BLE001 -- e.g. an unreadable token file; nothing was read or written
         raise LoadFailure(LOAD_FAILED) from exc
-    with _unbounded_csv_fields():
-        try:
-            handle = open_object(sink_config, key)
-        except Exception as exc:  # noqa: BLE001 -- no such object, or no way to reach the store
-            raise LoadFailure(UNREADABLE) from exc
-        with handle:
+    with _unbounded_csv_fields(), ExitStack() as opened:
+        handles: list[BinaryIO] = []
+        for each in keys:
             try:
-                stream = _open_stream(handle, params)
-            except LoadFailure:
-                raise
-            except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause
+                handle = open_object(sink_config, each)
+            except Exception as exc:  # noqa: BLE001 -- no such object, or no way to reach the store
                 raise LoadFailure(UNREADABLE) from exc
-            stream = _typed(stream, params)
-            log.info(f"upload {params.upload_id}: {len(stream.columns)} columns to load, streaming")
-            try:
-                result = _write(stream, params, sink_config, load)
-            finally:
-                _keep_report(stream, key, sink_config, write_report, log, params)
+            handles.append(opened.enter_context(handle))
+        try:
+            stream = _open_stream(handles[0], params, handles[1:])
+        except LoadFailure:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- every other failure here is an unreadable file; the detail is the cause
+            raise LoadFailure(UNREADABLE) from exc
+        stream = _typed(stream, params)
+        files = f" across {len(keys)} files" if len(keys) > 1 else ""
+        log.info(f"upload {params.upload_id}: {len(stream.columns)} columns to load{files}, streaming")
+        try:
+            result = _write(stream, params, sink_config, load)
+        finally:
+            _keep_report(stream, key, sink_config, write_report, log, params)
     log.info(f"upload {params.upload_id}: {stream.row_count} rows read")
     if result.rows is not None and result.rows != stream.row_count:
         log.warning(
