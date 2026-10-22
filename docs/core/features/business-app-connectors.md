@@ -6,7 +6,7 @@
 | Backlog | `SRC-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-3.md`. This page follows it row by row; anything the spec does not say is a decision below. The spec has no *(proposed)* number; its one *(proposed)* item, dropping a no-code connector builder, is decision 14 |
-| Status | Building, in #216 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing |
+| Status | Building, in #216 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing Product owner's browser check on the QA instance of #216 passed on 2026-10-22 (picker, the ten forms, the Sources header, refusal of a foreign host, the GA4 report editor, the SharePoint site picker, a connection test failing in fixed words); the rows needing real vendor accounts wait for decision 11 |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -224,7 +224,7 @@ per vendor; record the vendor with the result.
 | `SRC-3-AC7` | Revoke the app's access at the vendor; run again | The run fails with a plain message to sign in again; no vendor text | Not run |
 | `SRC-3-AC8` | Sign in as a user without `connector:manage` and try to add or change one | Refused; the page says access is missing | Not run |
 | `SRC-3-AC9` | Pause the connector | No run starts until it is resumed | Not run |
-| `SRC-3-AC10` | Look at Workday and NetSuite in the picker before their real-account row passes | Listed as not supported, with the reason | Not run |
+| `SRC-3-AC10` | Look at Workday and NetSuite in the picker before their real-account row passes | Listed as not supported, with the reason | Pass 2026-10-22 (product owner, QA instance of #216) |
 | `SRC-3-AC11` | (operator) Open the CI run of the pull request | The SaaS gate passed for all ten | Not run |
 
 **Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
