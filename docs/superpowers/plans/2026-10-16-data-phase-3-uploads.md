@@ -793,3 +793,48 @@ No open `BLOCKER`. The branch is pushed, and g9 is to be read on the PR.
 
 
 **Slice 3 closed, 2026-10-21:** `BLOCKER` 3 (the reasons test expected 8; fixed in `3e304b5d`). `main` merged in as `724fd45d`. PR #186 CI on `724fd45d` is green, the `g9-upload` typed steps included. No open `BLOCKER`.
+
+### Slice 4, round 1 (planner/reviewer, Claude Opus), at `60255b3b`, 2026-10-21
+
+The reviewer re-ran the block on the same commit. `cargo fmt --check` clean;
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` clean; `cargo test -p lakehouse-api
+--lib`: 2318 passed, 15 ignored; `--test upload_routes`: 125 passed; `--test route_auth`: 54 passed;
+`pytest dispar_orchestrate -m "not loader"`: 1485 passed, 1 skipped; `bun run typecheck` clean; `bun run lint`
+0 errors, 8 warnings (pre-existing); the whole `bun test`: 2080 passed, 1 skipped; both `ops/lint` checks OK.
+Every count matches the handoff.
+
+- **`SHOULD-FIX` 1 (deviation 4).** A JSON key that first appears after the sampled rows is a column the preview
+  did not show; the console then sends the preview's column list, and the job fails with the generic
+  "The load into the table failed." (`file_ingest.py:718`). Nobody can act on that sentence. Add one fixed
+  reason that says the file's columns are not the ones the preview showed — an eleventh entry in
+  `JOB_FAILURE_REASONS` and the shared fixture — and fix in the next sitting, citing this review.
+- **Decision for the product owner (deviation 1).** Decision 13 (signed 2026-10-16) says "zip: up to 10 files of
+  one supported format other than Excel", which a zip of Parquet files satisfies; the code refuses it (a Parquet
+  footer cannot be read by range inside a deflated zip entry, and the job would re-decompress an entry for every
+  seek). The reviewer recommends amending decision 13 to "other than Excel and Parquet" and putting a
+  zip-of-Parquet slice in `docs/core/BACKLOG.md`; building it in this phase is the other option. The feature
+  page's limits and the gate follow that decision once signed.
+- **Accepted with reasons, as reported in the handoff.** Avro codecs `null` and `deflate` with fixed sentences
+  (the image does not carry `snappy`/`zstandard` packages); the preview's shortest number form and sorted Avro
+  map keys (documented on both sides); `__MACOSX/` ignored (macOS archives would otherwise never load); a
+  nameless `.gz` classed by its first decoded byte; readers now also claim format-like names (a text file named
+  `.json` used to load as CSV); `max_bytes` is the one constant slice 6 changes; a zip's files as one stream
+  (the several-files page stays slice 5, decision for `alsoUploads` included).
+- Verified at the code: bomb checks run at POST and at a session's completion (`routes/uploads.rs:831,836`,
+  `routes/uploads/sessions.rs:608,613`) and `refuse_and_remove` deletes the object and the row; the unpacked
+  counters stop at the cap; the preview's readers are bounded (16 MiB gzip prefix, 256 KiB per later zip file);
+  `MAX_ZIP_FILES = 10` holds in both the listing and the counting; the fixture's tenth reason agrees with both
+  sides. `Cargo.lock` gains three dependency edges and no crate, as the handoff says.
+- **`cargo test --workspace` is not completed locally.** The first run died while linking with the disk at 100%
+  ("No space left on device"); a second run with `CARGO_PROFILE_TEST_DEBUG=0` linked everything but, under the
+  same disk pressure, 62 targets failed to build or to reach the test database — every failure the reviewer
+  re-ran alone passes (`ai_tool`: 22 passed; `lakehouse-store --test sessions`: 9 passed; `lakehouse-test-support
+  --lib` has no tests and links). CI's `Rust · test (stable)` runs the same workspace test on the PR and is the
+  verification this entry leans on, as does `g9-upload` on a real stack and `cargo audit`/`deny` on the three
+  new dependency edges.
+- Incidents in the handoff are recorded: the `pgrep -f` self-match that killed another session's shell, and the
+  working-tree cut of `tests/upload_routes.rs` that was restored before any commit. The reviewer's own disk
+  cleanups (stale per-worktree `target/` caches, contrary to this file's settings) are recorded here.
+
+No open `BLOCKER`. One `SHOULD-FIX` open, assigned to slice 5's sitting; the zip-of-Parquet decision belongs to
+the product owner. The branch is pushed, and the PR's CI is to be read at the new head.
