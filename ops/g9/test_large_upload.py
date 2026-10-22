@@ -39,7 +39,7 @@ def test_a_generated_csv_has_the_size_and_row_count_it_reports(tmp_path):
 def test_a_generated_parquet_file_reaches_its_size_and_holds_the_rows_it_reports(tmp_path):
     path = tmp_path / "a.parquet"
     rows = lu.write_parquet(path, 2 * lu.MIB)
-    assert path.stat().st_size >= 2 * lu.MIB
+    assert 0.5 * 2 * lu.MIB <= path.stat().st_size <= 2 * lu.MIB
     assert pq.ParquetFile(path).metadata.num_rows == rows
 
 
@@ -134,3 +134,32 @@ def test_the_report_has_one_row_per_phase_and_says_na_for_what_it_could_not_read
     assert "200" in lines[1] and "1,000,000" in lines[1] and "5.0" in lines[1]
     assert lines[1].split().count("n/a") == 2
     assert "5,120" in lines[-1]
+
+
+@pytest.mark.parametrize("target", [1 * lu.MIB, 3 * lu.MIB, 7 * lu.MIB + 12_345])
+def test_no_generated_file_is_larger_than_the_size_asked_for(tmp_path, target):
+    """g9-upload-large run 39803084936: a 2048 MiB CSV came out a header over the API's cap."""
+    import gzip
+
+    csv = tmp_path / "a.csv"
+    lu.write_csv(csv, target)
+    assert csv.stat().st_size <= target
+    jsonl = tmp_path / "a.jsonl"
+    lu.write_jsonl(jsonl, target)
+    assert jsonl.stat().st_size <= target
+    parquet = tmp_path / "a.parquet"
+    lu.write_parquet(parquet, target)
+    assert 0.5 * target <= parquet.stat().st_size <= target
+    gz = tmp_path / "a.csv.gz"
+    lu.write_csv_gz(gz, target)
+    with gzip.open(gz, "rb") as handle:
+        unpacked = sum(len(chunk) for chunk in iter(lambda: handle.read(1 << 20), b""))
+    assert unpacked <= target
+
+
+def test_the_row_arithmetic_never_exceeds_the_target_at_the_planned_sizes():
+    for total in (50 * lu.MIB, 200 * lu.MIB, 2048 * lu.MIB):
+        cell, rows = lu.row_width(total)
+        assert len(lu._csv_header(10)) + rows * (10 * cell + 10) <= total
+        cell, rows = lu.jsonl_width(total)
+        assert rows * (10 * cell + 10 * len('"c0":"",') + 2) <= total

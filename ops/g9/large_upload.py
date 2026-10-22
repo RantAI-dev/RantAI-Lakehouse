@@ -88,13 +88,19 @@ class HarnessFailure(Exception):
 # ── Files ────────────────────────────────────────────────────────────────
 
 
+def _csv_header(columns: int) -> str:
+    return ",".join(f"c{n}" for n in range(columns)) + "\n"
+
+
 def row_width(total_bytes: int, columns: int = 10) -> tuple[int, int]:
-    """(characters per cell, rows) so that `columns` cells of that width, plus
-    separators, make about `total_bytes` in at most `TARGET_ROWS` rows."""
+    """(characters per cell, rows) so that the header and `rows` rows of `columns` cells
+    of that width, plus separators, make at most `total_bytes` (never over: the API
+    refuses a session above its cap, g9-upload-large run 39803084936) in at most
+    `TARGET_ROWS` rows."""
     per_row = max(columns * 12, total_bytes // TARGET_ROWS + 1)
     cell = max(8, (per_row - columns) // columns)
     row_bytes = columns * cell + columns  # cells and separators/newline
-    return cell, max(1, total_bytes // row_bytes)
+    return cell, max(1, (total_bytes - len(_csv_header(columns))) // row_bytes)
 
 
 def _random_cells(count: int, width: int) -> list[str]:
@@ -105,9 +111,9 @@ def _random_cells(count: int, width: int) -> list[str]:
 
 
 def write_csv(path: Path, total_bytes: int, columns: int = 10) -> int:
-    """A CSV of about `total_bytes` bytes, written in blocks. Returns its rows."""
+    """A CSV of at most `total_bytes` bytes, written in blocks. Returns its rows."""
     cell, rows = row_width(total_bytes, columns)
-    header = ",".join(f"c{n}" for n in range(columns)) + "\n"
+    header = _csv_header(columns)
     written = 0
     with path.open("w", encoding="utf-8", newline="") as out:
         out.write(header)
@@ -127,7 +133,7 @@ def jsonl_width(total_bytes: int, columns: int = 10) -> tuple[int, int]:
     overhead = columns * len('"c0":"",') + 2  # keys, quotes, colons, commas, braces, newline
     per_row = max(columns * 20 + overhead, total_bytes // TARGET_ROWS + 1)
     cell = max(8, (per_row - overhead) // columns)
-    return cell, max(1, total_bytes // (columns * cell + overhead))
+    return cell, max(1, total_bytes // (columns * cell + overhead))  # exact per line: never over
 
 
 def write_jsonl(path: Path, total_bytes: int, columns: int = 10) -> int:
@@ -148,12 +154,12 @@ def write_jsonl(path: Path, total_bytes: int, columns: int = 10) -> int:
 
 
 def write_csv_gz(path: Path, unpacked_bytes: int, columns: int = 10) -> int:
-    """A gzipped CSV that unpacks to about `unpacked_bytes` bytes, streamed through
+    """A gzipped CSV that unpacks to at most `unpacked_bytes` bytes, streamed through
     gzip so the plain file is never on disk. Returns its rows."""
     import gzip
 
     cell, rows = row_width(unpacked_bytes, columns)
-    header = ",".join(f"c{n}" for n in range(columns)) + "\n"
+    header = _csv_header(columns)
     written = 0
     with gzip.open(path, "wt", encoding="utf-8", newline="", compresslevel=6) as out:
         out.write(header)
@@ -167,18 +173,25 @@ def write_csv_gz(path: Path, unpacked_bytes: int, columns: int = 10) -> int:
 
 
 def write_parquet(path: Path, total_bytes: int, columns: int = 10) -> int:
-    """A Parquet file of about `total_bytes` bytes on disk. Returns its rows."""
+    """A Parquet file of at most `total_bytes` bytes on disk (it stops before the row
+    group that would cross it, leaving room for the footer). Returns its rows."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     cell, _ = row_width(total_bytes, columns)
     schema = pa.schema([(f"c{n}", pa.string()) for n in range(columns)])
+    per_row = columns * cell
+    # A group is at most a quarter of the target, so a small target still gets rows.
+    batch = max(1, min(50_000, total_bytes // 4 // per_row))
+    footer_room = 64 * 1024
     rows = 0
-    with pq.ParquetWriter(path, schema, compression="snappy") as writer:
-        while path.stat().st_size < total_bytes and rows < JOB_MAX_ROWS - 50_000:
-            n = 50_000
-            writer.write_table(pa.table({f"c{k}": _random_cells(n, cell) for k in range(columns)}, schema=schema))
-            rows += n
+    biggest = batch * per_row  # the raw size bounds a group until one has been measured
+    with path.open("wb") as sink, pq.ParquetWriter(sink, schema, compression="snappy") as writer:
+        while sink.tell() + biggest + footer_room <= total_bytes and rows + batch <= JOB_MAX_ROWS - 50_000:
+            before = sink.tell()
+            writer.write_table(pa.table({f"c{k}": _random_cells(batch, cell) for k in range(columns)}, schema=schema))
+            biggest = max(sink.tell() - before, 1)
+            rows += batch
     return rows
 
 
@@ -388,6 +401,7 @@ def render(phases: list[Phase], names: list[str], free_bytes: int | None) -> str
 
 def run_phase(api, name: str, path: Path, rows: int, table: str, dialect: bool, sampler: Sampler) -> Phase:
     size = path.stat().st_size
+    print(f"[large] {name}: declares {size:,} bytes ({size / MIB:,.2f} MiB)")
     started = time.time()
     with sampler:
         upload = send_in_pieces(api, path, path.name)
