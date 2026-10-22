@@ -886,6 +886,17 @@ the fixture says [['1', 'Anna', '1.5', 'true', '["a","b"]', '{"x":1,"y":"z"}', N
   fixed in the same sitting.
 - The gate never ran before: the handoff said it was *not verified* (no stack on the developer's machine). This
   is that gate's first run, and it found a real defect — the reason the gate exists.
+- **What the defect turned out to be.** The job, `dlt` and the table were right: the Arrow batch carries the
+  nulls, `dlt` 1.30.0 keeps them, `pyiceberg` 0.12.0 makes the field optional, and the table holds a null. The
+  gate read the table through `POST /api/query/run`, and that route answers every cell as text and renders a
+  NULL as `""` (`routes/query.rs::stringify_cell`), so the read could not tell a missing key from an empty
+  string. The fix is in the gate (it asks `isNull` beside each value now, and a table that really held `''`
+  still fails) and in tests that pin the null end to end: the Arrow batch against the shared fixture, and the
+  job's own resource through `dlt` into a local Iceberg table, where the fields must be optional and the nulls
+  must read back as `None`. The reviewer ran both: 4 unit tests and 3 loader tests pass.
+- The gap that is left in the product, and is not this phase's: the query route cannot express a null. It is
+  written down as `DATA-29` in `docs/core/BACKLOG.md`. The console shows an empty cell for a missing key, which
+  is what decision 11 promises the user.
 
 No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
 gate is read again on the PR.
