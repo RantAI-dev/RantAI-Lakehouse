@@ -652,6 +652,57 @@ exited; whoever owned it may need to re-run what it was doing. My own loop (PID 
 (2) A bad index in a Python edit cut `tests/upload_routes.rs` to 1,133 lines in the working tree; it was restored
 from `HEAD` and the slice's edits re-applied before any commit, so no commit holds the damage.
 
+### Slice 4, round 2 (developer)
+
+Commits, on `feat/data-phase-3-uploads`, in order:
+
+- `8c7383ed` fix(uploads): the G9 formats step tells a NULL from an empty string, and tests pin the null end to end (`BLOCKER` 4)
+- `4ea465f1` fix(uploads): a column list that is not the file's has a reason of its own (`SHOULD-FIX` 1)
+
+**`BLOCKER` 4: what it was, and it was not the job.** The null is not lost in the job, in `dlt`, in `pyiceberg`
+or in the table. It is lost by the reader the gate used. `POST /api/query/run` answers every cell as text and
+renders a SQL NULL as an empty string (`stringify_cell`, `rust/crates/lakehouse-api/src/routes/query.rs:626`,
+used for both engines at `:335` and `:647`), so a value read through it cannot tell a missing key from `''`.
+The typed step never saw this because it asks `IS NULL` in SQL. Decision 11 holds as written and no product
+behaviour changed. Measured here, on 2026-10-22, with dlt 1.30.0 and pyiceberg 0.12.0, through the job's own
+`_open_stream` and `_text_resource` into a local Iceberg table (the harness of `test_typed_load.py`), for
+`orders.json`, `orders.jsonl` and `orders.avro`: every field is `required: False` (all nine columns), and the
+table read back through `pyiceberg` holds `None` exactly where the fixture says `null`. This is the answer to
+"which of the two": neither an empty string written by the job nor a required field.
+
+- `ops/g9/upload_test.py` (`step_new_formats`): each column is read with `isNull(column)` beside it and a cell is
+  `None` only where ClickHouse says NULL. A table that held `''` where the fixture says null still fails. The
+  expectation is the fixture's, unchanged (rule 2). The table's column types are read with the existing
+  `_types_of` helper, put into the failure message and printed as one `[g9] formats:` line per format, so the
+  next CI run shows `Nullable(String)` against `String`.
+- Tests at the levels where a null could be lost: `test_file_ingest.py` (the Arrow batch of the three fixtures
+  has nulls exactly where the fixture does, type `string`) and `test_typed_load.py` (`loader`: the job's
+  `_text_resource` through `dlt` into a local Iceberg table, no required field, nulls read back as `None`).
+  Checked that they bite: with `upload_formats.json_text` made to return `""` for `None`, four of the six cases
+  fail (JSON and JSON Lines, at both levels; Avro goes through `avro_text`), and the file was restored.
+- `CHANGELOG.md`, **Fixed**: one entry that says the cause plainly, including that a query through the route
+  still sees `''` for a NULL cell.
+
+**`SHOULD-FIX` 1.** `COLUMNS_NOT_PREVIEWED = "The file's columns are not the ones the preview showed."`, the
+eleventh entry of `FAILURE_REASONS`, of `ops/fixtures/upload_load_failure_reasons.json` and of the API's
+`JOB_FAILURE_REASONS` (now `[&str; 11]`; its fixture test and the count in it follow). `_typed` raises it where
+it raised `LOAD_FAILED` for a list of another length; the settings and naming failures keep `LOAD_FAILED`. The
+existing test that expected `LOAD_FAILED` for a short list now expects the new reason (it pinned the behaviour
+being changed); a new test loads a JSON file whose key first appears in row 3 with the preview's one-column
+list, and with the full list.
+
+Commands run, in `/home/hv/lakehouse-phase3-uploads`:
+
+- `cd dagster && /home/hv/.cache/rantai-dagster-venv/bin/python -m pytest dispar_orchestrate -q` (whole suite, unfiltered, after both commits): **1760 passed, 1 skipped** in 17 min. (Before that, while iterating: the two files with `-k "blocker_4 or arrow_nulls"`: 6 passed; both files whole: 227 passed, 1 skipped.)
+- `python3 ops/lint/check_intra_package_imports.py`: OK. `python3 ops/lint/check_bare_iceberg_count.py`: OK. `python3 -m py_compile ops/g9/upload_test.py`: exit 0.
+- `cd rust && cargo fmt --check -p lakehouse-api`: clean. `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-src6-target cargo clippy -p lakehouse-api --all-targets --locked -- -D warnings`: clean, after touching the crate's sources (26 min, a fresh build in this worktree). `cargo test -p lakehouse-api --lib --locked uploads::tests`: **36 passed**, among them `the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture` and `a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows`.
+
+**Not verified:**
+
+- **`Rust · G9 file upload` on a real stack.** There is none on this machine. The gate's new read (`isNull` beside each value, then the types) has been compiled only (`py_compile`), never run. If ClickHouse showed a NULL of an optional `String` as something other than NULL for `isNull`, the gate would still fail, and now with the column types in the message. The local measurements above are `dlt` and `pyiceberg` against a filesystem catalog, not Lakekeeper and ClickHouse.
+- The full Rust workspace run and the TypeScript block (`bun run typecheck`, `lint`, `test`): not run for this round; the change touched one Rust file in `lakehouse-api` (a constant, an array length and a count) and no TypeScript. CI carries them.
+- No Rust test pins `stringify_cell` turning a NULL into `""`. The route is shared by every consumer of Query Studio, so it was not changed; the gate's comment and the CHANGELOG say what it does.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
