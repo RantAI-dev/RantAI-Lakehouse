@@ -1171,3 +1171,24 @@ on a head that is green.
 
 No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
 gate is read again on the PR.
+
+### Slice 5, round 2 and slice 6 (planner, 2026-10-22, at `5e84dbd2`)
+
+Taken over by this planner session at the product owner's request (the
+previous planner session was stopped; its two stuck leftovers, a 3.5-hour
+pytest and a 3-hour clippy, were ended). `BLOCKER 5` is closed: the stale
+test now asserts the no-verdict rule, and the lib suite is green on the
+final commit (2456 passed, quoted from a run on that commit).
+
+**The cap-versus-measurement order (the developer's mismatch).** The API
+refuses an upload session above `MAX_SESSION_BYTES` (50 MiB) and checks an
+unpacked gzip or zip against `MAX_UPLOAD_BYTES` (the separate cap of
+`POST /api/uploads`), so T6.1 cannot measure 2 GiB before T6.2 raises them.
+Decision: T6.1 measures on a **throwaway branch** `measure/data-17-cap`, cut
+from this branch's head, whose only commit raises `MAX_SESSION_BYTES` and the
+unpack check's cap to 2 GiB and lifts `MAX_ROWS` (so ten Parquet files can be
+measured as one load as well as one by one). That branch is never merged and
+is deleted after the run; `g9-upload-large` is dispatched on it at the full
+sizes of T6.1. T6.2 then sets the shipped values here from the RESULT,
+including a separate constant for the unpacked-size check so that `POST
+/api/uploads` keeps 50 MiB (the unpack check must not read the small cap).
