@@ -19,7 +19,7 @@ import pytest
 
 from dispar_orchestrate.adapters import sink as sink_module
 from dispar_orchestrate.adapters.sink import SinkResult, _stamp_ingested_at
-from dispar_orchestrate.file_ingest import BAD_VALUES, LOAD_FAILED, LoadFailure
+from dispar_orchestrate.file_ingest import BAD_VALUES, COLUMNS_NOT_PREVIEWED, LOAD_FAILED, LoadFailure
 from dispar_orchestrate.test_file_ingest import KEY, _Harness, _fails_with, _params
 from dispar_orchestrate.upload_types import ColumnSpec
 
@@ -99,7 +99,9 @@ def test_the_report_that_cannot_be_written_never_changes_how_the_load_ended():
 
 def test_a_column_list_that_does_not_match_the_file_or_the_naming_rule_fails_before_anything_is_written():
     harness = _Harness(raw=CSV)
-    failure = _fails_with(harness, LOAD_FAILED, _params(columns=COLUMNS[:2], on_bad_value="null"))
+    # PR #186 review SHOULD-FIX 1: a column list of another length has a reason of its own
+    # (it was the generic LOAD_FAILED); the naming-rule and settings failures below keep LOAD_FAILED.
+    failure = _fails_with(harness, COLUMNS_NOT_PREVIEWED, _params(columns=COLUMNS[:2], on_bad_value="null"))
     assert "2 columns and the file has 4" in str(failure.__cause__)
     assert harness.loads == [] or harness.loads[0]["rows"] == []
     bad_name = (spec("Qty", "integer"),) + COLUMNS[1:]
@@ -107,6 +109,21 @@ def test_a_column_list_that_does_not_match_the_file_or_the_naming_rule_fails_bef
     _fails_with(again, LOAD_FAILED, _params(columns=bad_name, on_bad_value="null"))
     assert again.reads == [], "refused before the object was opened"
     _fails_with(_Harness(raw=CSV), LOAD_FAILED, _params(columns=COLUMNS, on_bad_value="ignore"))
+
+
+def test_pr_186_review_should_fix_1_a_json_key_the_preview_did_not_show_fails_with_the_reason_that_says_so():
+    # The preview samples the first rows, so `late` (first seen in row 3) is not in its column list;
+    # the console sends that list and the job, which reads every row, finds one column more.
+    raw = b'[{"a": "1"}, {"a": "2"}, {"a": "3", "late": "x"}]'
+    previewed = (spec("a", "text"),)
+    harness = _Harness(raw=raw)
+    failure = _fails_with(harness, COLUMNS_NOT_PREVIEWED, _params(format="json", columns=previewed, on_bad_value="null"))
+    assert "1 columns and the file has 2" in str(failure.__cause__)
+    assert harness.registered == []
+    assert [row["error"] for row in harness.recorded] == [COLUMNS_NOT_PREVIEWED]
+    # With the full list the same file loads.
+    full = (spec("a", "text"), spec("late", "text"))
+    assert _Harness(raw=raw).run(_params(format="json", columns=full, on_bad_value="null")).parsed_rows == 3
 
 
 def test_a_parquet_file_is_cast_from_the_text_the_api_converter_wrote():

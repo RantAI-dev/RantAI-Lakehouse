@@ -58,7 +58,7 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   ten the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   eleven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
 //!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
@@ -301,10 +301,10 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these ten (review finding
+// shows a recorded reason only when it is one of these eleven (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same ten as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same eleven as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
@@ -324,10 +324,13 @@ const JOB_TOO_MANY_COLUMNS: &str = "The file has more than 1,000 columns.";
 const JOB_BAD_VALUES: &str = "Some values do not fit their column's type.";
 // `DATA-17` slice 4 (decision 2): the decoded bytes of a gzip or zip file passed the cap.
 const JOB_TOO_LARGE_UNPACKED: &str = "The file is larger than the upload limit once unpacked.";
+// PR #186 review SHOULD-FIX 1: the column list sent with the load is not the file's (a JSON key that
+// first appears after the rows the preview sampled), so the person is told to look at the preview again.
+const JOB_COLUMNS_NOT_PREVIEWED: &str = "The file's columns are not the ones the preview showed.";
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 10] = [
+const JOB_FAILURE_REASONS: [&str; 11] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
     JOB_HEADER_NO_COLUMNS,
@@ -338,6 +341,7 @@ const JOB_FAILURE_REASONS: [&str; 10] = [
     JOB_TOO_MANY_COLUMNS,
     JOB_BAD_VALUES,
     JOB_TOO_LARGE_UNPACKED,
+    JOB_COLUMNS_NOT_PREVIEWED,
 ];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -3355,8 +3359,8 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the eight the API knows (six before finding C2). Each of the
-    /// eight is kept; text that is near one of them, text with detail added,
+    /// one of the eleven the API knows (six before finding C2). Each of the
+    /// eleven is kept; text that is near one of them, text with detail added,
     /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
@@ -3391,9 +3395,9 @@ mod tests {
         }
     }
 
-    /// Review findings B6 and C2: the ten reasons the API knows are the
-    /// ten in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
-    /// `DATA-17` slice 4 the tenth) the job's own tests assert its constants against
+    /// Review findings B6 and C2: the eleven reasons the API knows are the
+    /// eleven in the file (Phase 3 slice 3 review BLOCKER 3: `DATA-18` added the ninth;
+    /// `DATA-17` slice 4 the tenth; PR #186 review SHOULD-FIX 1 the eleventh) the job's own tests assert its constants against
     /// too, in the same order, so the two sides cannot drift apart
     /// unnoticed. Read here from test code only, with `include_str!`, so the
     /// release build of the API depends on nothing outside `rust/`.
@@ -3409,7 +3413,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 10, "ten different reasons");
+        assert_eq!(distinct.len(), 11, "eleven different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"

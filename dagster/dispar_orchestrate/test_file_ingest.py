@@ -48,6 +48,7 @@ from dispar_orchestrate.file_ingest import (
     LOAD_FAILED,
     NO_ROWS,
     NOT_REGISTERED,
+    COLUMNS_NOT_PREVIEWED,
     TABLE_NAME,
     TOO_MANY_COLUMNS,
     TOO_MANY_ROWS,
@@ -262,14 +263,16 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
-def test_there_are_ten_different_failure_reasons_among_them_the_header_row_with_no_columns():
+def test_there_are_eleven_different_failure_reasons_among_them_the_header_row_with_no_columns():
     # Review finding C2 made it seven: a header row with no columns has a
-    # sentence of its own. SEC-17 made it eight with the column cap. The API
-    # counts the same eight against the same file.
+    # sentence of its own. SEC-17 made it eight with the column cap, DATA-18 nine,
+    # DATA-17 slice 4 ten, and PR #186 review SHOULD-FIX 1 eleven (a column list that is
+    # not the file's). The API counts the same eleven against the same file.
     in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
-    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 10
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 11
     assert HEADER_NO_COLUMNS == "The header row has no columns."
     assert HEADER_NO_COLUMNS != HEADER_PAST_END
+    assert COLUMNS_NOT_PREVIEWED == "The file's columns are not the ones the preview showed."
 
 
 def test_the_row_cap_in_the_sentence_is_the_row_cap_the_job_enforces():

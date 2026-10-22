@@ -183,7 +183,7 @@ DELIMITERS = (",", ";", "\t", "|")
 
 # The reasons a failed load records, in the order of
 # `ops/fixtures/upload_load_failure_reasons.json` (review finding B6): the
-# API shows a recorded reason only when it is one of these nine, and
+# API shows a recorded reason only when it is one of these (`FAILURE_REASONS`), and
 # `test_file_ingest.py` asserts this list against that file.
 UNREADABLE = "The stored file could not be read."
 HEADER_PAST_END = "The header row is past the end of the file."
@@ -204,6 +204,12 @@ BAD_VALUES = "Some values do not fit their column's type."
 # Appended last, so the fixture's order of the first nine is kept.
 TOO_LARGE_UNPACKED = "The file is larger than the upload limit once unpacked."
 
+# PR #186 review SHOULD-FIX 1: the column list the console sent has another number of columns
+# than the file the job read. A JSON file whose key first appears after the sampled rows is the
+# case: the preview did not show that column, so the list is one short. Appended last, so the
+# fixture's order of the first ten is kept.
+COLUMNS_NOT_PREVIEWED = "The file's columns are not the ones the preview showed."
+
 FAILURE_REASONS = (
     UNREADABLE,
     HEADER_PAST_END,
@@ -215,6 +221,7 @@ FAILURE_REASONS = (
     TOO_MANY_COLUMNS,
     BAD_VALUES,
     TOO_LARGE_UNPACKED,
+    COLUMNS_NOT_PREVIEWED,
 )
 
 
@@ -716,7 +723,9 @@ def _typed(stream: TableStream | ParquetStream, params: FileIngestParams) -> Tab
     if not params.columns:
         return stream
     if len(params.columns) != len(stream.columns):
-        raise LoadFailure(LOAD_FAILED) from ValueError(
+        # PR #186 review SHOULD-FIX 1: a reason a person can act on (preview again), not the
+        # generic "The load into the table failed.".
+        raise LoadFailure(COLUMNS_NOT_PREVIEWED) from ValueError(
             f"the column list has {len(params.columns)} columns and the file has {len(stream.columns)}"
         )
     return TypedStream(stream, list(params.columns), params.on_bad_value)
