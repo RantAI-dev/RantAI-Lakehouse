@@ -49,6 +49,7 @@ export function UploadReviewStep({
   columns,
   onBadValue,
   error,
+  otherFiles,
 }: {
   readonly upload: Upload
   readonly view: UploadPreviewView
@@ -62,23 +63,33 @@ export function UploadReviewStep({
   /** What happens to a value that does not fit. */
   readonly onBadValue: UploadOnBadValue
   readonly error: React.ComponentProps<typeof Refusal>["error"] | null
+  /** The names of the files loaded with the first (`DATA-17` slice 5); empty for a load of one file. */
+  readonly otherFiles: readonly string[]
 }) {
   const { settled } = view
   const using = settled?.using
   const full = rawTableFullName(tableName)
+  const files = otherFiles.length + 1
+  const several = files > 1
   const rowsSentence =
     mode === "append"
-      ? "The rows already in the table stay, and this file's are added after them."
-      : "Any rows the table already holds are replaced by this file's."
+      ? `The rows already in the table stay, and ${several ? "these files'" : "this file's"} are added after them.`
+      : `Any rows the table already holds are replaced by ${several ? "these files'" : "this file's"}.`
 
   return (
     <div className="space-y-4">
       <div className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-muted/30">
         <Group
-          title="File"
+          title={several ? "Files" : "File"}
           items={[
-            { label: "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
-            { label: "Size", value: formatBytes(upload.sizeBytes) },
+            { label: several ? "First file" : "Name", value: <Wrapped>{upload.originalFilename}</Wrapped> },
+            ...(several
+              ? [
+                  { label: "Files", value: `${files} files into ${full}` },
+                  ...otherFiles.map((name, index) => ({ label: `File ${index + 2}`, value: <Wrapped>{name}</Wrapped> })),
+                ]
+              : []),
+            { label: several ? "Size of the first" : "Size", value: formatBytes(upload.sizeBytes) },
             { label: "Uploaded", value: formatDateTime(upload.createdAt) },
           ]}
         />
@@ -140,9 +151,15 @@ export function UploadReviewStep({
         />
       </div>
       <p className="text-sm text-muted-foreground">
-        Load reads <span className="break-words font-medium text-foreground">{upload.originalFilename}</span> with these
-        settings and writes its rows to <span className="break-all font-mono text-foreground">{full}</span>, each column with the
-        type listed above. {rowsSentence} You can follow it on the next page.
+        Load reads{" "}
+        {several ? (
+          <span className="font-medium text-foreground">{files} files, the first of them {upload.originalFilename},</span>
+        ) : (
+          <span className="break-words font-medium text-foreground">{upload.originalFilename}</span>
+        )}{" "}
+        with these settings and writes {several ? "their" : "its"} rows to{" "}
+        <span className="break-all font-mono text-foreground">{full}</span>, each column with the type listed above.{" "}
+        {rowsSentence} You can follow it on the next page.
       </p>
       {error !== null ? <Refusal error={error} /> : null}
     </div>

@@ -192,6 +192,51 @@ describe("uploadService requests", () => {
     expect(err.message).toBe("The column list has 1 columns but the file has 2.")
   })
 
+  it("compares the other files with the first: their ids, the reading and the column list when there is one", async () => {
+    const mismatch = { uploadId: "up-2", file: "b.csv", missing: [], extra: ["notes"], typeConflicts: [] }
+    const calls = stubFetch(() => json({ mismatches: [mismatch] }))
+    const columns = [{ source: "Qty", name: "qty", type: "integer" as const }]
+    const result = await uploadService.compare("up-1", {
+      alsoUploads: ["up-2", "up-3"],
+      options: { encoding: "utf-8", delimiter: ";", headerRow: 1, sheet: "Stock" },
+      columns,
+    })
+    expect(result.mismatches).toEqual([mismatch])
+    const { url, init } = calls[0]!
+    expect(url).toBe("/api/uploads/up-1/compare")
+    expect(init.method).toBe("POST")
+    expect(JSON.parse(init.body as string)).toEqual({
+      alsoUploads: ["up-2", "up-3"],
+      encoding: "utf-8",
+      delimiter: ";",
+      headerRow: 1,
+      sheet: "Stock",
+      columns,
+    })
+    await uploadService.compare("up-1", { alsoUploads: ["up-2"] })
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual({ alsoUploads: ["up-2"] })
+  })
+
+  it("shows the API's sentence when a comparison is refused, and a missing file as not found", async () => {
+    stubFetch(() => json({ error: "One of the other files was not found." }, 404))
+    const err = await rejection(uploadService.compare("up-1", { alsoUploads: ["up-9"] }))
+    expect(err.status).toBe(404)
+    expect(err.code).toBe("not_found")
+    expect(err.message).toBe("One of the other files was not found.")
+  })
+
+  it("sends the other files with a load", async () => {
+    const calls = stubFetch(() => json({ upload: UPLOAD, runId: "run-1" }))
+    await uploadService.ingest("up-1", {
+      encoding: "utf-8",
+      delimiter: ",",
+      headerRow: 0,
+      bronzeTable: "stock",
+      alsoUploads: ["up-2"],
+    })
+    expect(JSON.parse(calls[0]!.init.body as string)).toMatchObject({ bronzeTable: "stock", alsoUploads: ["up-2"] })
+  })
+
   it("asks for a preview of the columns of a table the file will be added to", async () => {
     const calls = stubFetch(() => json({}))
     await uploadService.preview("up-1", { headerRow: 0, table: "stock_raw" })

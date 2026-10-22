@@ -83,6 +83,23 @@ describe("UploadsPanel", () => {
     expect(within(rowOf("fresh.csv")).getByText("Not measured")).toBeDefined()
   })
 
+  it("says a file of a load of several files was loaded with the first, and that its rows are counted there", async () => {
+    stubFetch(() => [
+      upload({ id: "up-1", originalFilename: "stock_a.csv", status: "ingested", bronzeTable: "stock", assetId: "stock", rows: 5 }),
+      upload({ id: "up-2", originalFilename: "stock_b.csv", status: "ingested", bronzeTable: "stock", assetId: "stock", loadedWith: "up-1" }),
+    ])
+    render(<UploadsPanel />)
+    await screen.findByText("stock_b.csv")
+
+    const second = within(rowOf("stock_b.csv"))
+    expect(second.getByText("Loaded with stock_a.csv")).toBeDefined()
+    expect(second.getByText("Counted with the first file")).toBeDefined()
+    expect(second.queryByText("Not measured")).toBeNull()
+    const first = within(rowOf("stock_a.csv"))
+    expect(first.queryByText(/Loaded with/)).toBeNull()
+    expect(first.getByText("5")).toBeDefined()
+  })
+
   it("shows a file still being received as Receiving, with the size it announced, and offers no Load", async () => {
     stubFetch(() => [
       upload({ id: "up-5", originalFilename: "big.csv", status: "receiving", sizeBytes: 0, declaredSize: 20 * 1024 * 1024 }),

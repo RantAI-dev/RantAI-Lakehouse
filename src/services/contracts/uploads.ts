@@ -195,6 +195,13 @@ export type Upload = {
    * `ingested`.
    */
   assetId?: string
+  /**
+   * `DATA-17` slice 5: the id of the upload this file was loaded WITH, when its last load
+   * took several files into one table. Set on every file of the load but the first (the
+   * one that has the run and the row count); absent for a file that loaded alone and for
+   * the first file itself. A file loaded with others has no `rows` of its own.
+   */
+  loadedWith?: string
 }
 
 /**
@@ -312,6 +319,32 @@ export type UploadPreview = {
   fromTable?: boolean
 }
 
+/** A column both files have, whose values in the other file do not fit the first file's type. */
+export type UploadTypeConflict = {
+  column: string
+  /** The first file's type for it. */
+  expected: UploadColumnType
+  /** The type the other file's own values give. */
+  found: UploadColumnType
+}
+
+/**
+ * A file that cannot load into one table with the first one (`DATA-17` slice 5, decision 4):
+ * the columns it lacks, the ones it adds, and the columns whose values do not fit the first
+ * file's type. The names are those the load gives the columns, and their order does not matter.
+ * Mirrors Rust `Mismatch` (`routes/uploads/group.rs`).
+ */
+export type UploadMismatch = {
+  uploadId: string
+  file: string
+  missing: string[]
+  extra: string[]
+  typeConflicts: UploadTypeConflict[]
+}
+
+/** `POST /api/uploads/{id}/compare`'s response: the files that cannot load with the first, in the order asked; empty when all can. */
+export type UploadCompare = { mismatches: UploadMismatch[] }
+
 /**
  * The `POST /api/uploads/{id}/ingest` body. All of it is what the user
  * confirmed: the API loads with exactly these settings and guesses nothing.
@@ -325,6 +358,12 @@ export type IngestUploadInput = UploadParseOptions & {
   columns?: UploadColumnSpec[]
   /** Required with `columns`, refused without. */
   onBadValue?: UploadOnBadValue
+  /**
+   * `DATA-17` slice 5: the other files of a load of several files into this table (at most 9,
+   * the upload in the path is the first). The API compares their columns with the first
+   * file's again and refuses the load with the list when they differ.
+   */
+  alsoUploads?: string[]
 }
 
 /** `POST /api/uploads/{id}/ingest`'s response: the upload, now `ingesting`, and the run carrying the load out. */
@@ -394,6 +433,16 @@ export interface UploadService {
     input: { options?: Partial<UploadParseOptions>; columns: UploadColumnSpec[] },
     signal?: AbortSignal
   ): Promise<UploadCheck>
+  /**
+   * `POST /api/uploads/{id}/compare` (`DATA-17` slice 5): which of `alsoUploads` cannot load
+   * into one table with this upload. The reading and the column list are what the Check step has
+   * so far, so the types the others must fit are the person's. Stores nothing.
+   */
+  compare(
+    id: string,
+    input: { alsoUploads: string[]; options?: Partial<UploadParseOptions>; columns?: UploadColumnSpec[] },
+    signal?: AbortSignal
+  ): Promise<UploadCompare>
   /** `POST /api/uploads/{id}/ingest`: starts the load. 409 for a table the upload may not load into. */
   ingest(id: string, input: IngestUploadInput, signal?: AbortSignal): Promise<IngestUploadResponse>
   /** `DELETE /api/uploads/{id}` (204): removes the file and its entry. Never the table. 409 while loading. */

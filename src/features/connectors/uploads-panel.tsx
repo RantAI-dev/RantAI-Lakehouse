@@ -113,6 +113,12 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
                     {upload.status === "failed" && upload.error ? (
                       <p className="max-w-64 whitespace-normal text-xs text-destructive">{upload.error}</p>
                     ) : null}
+                    {upload.loadedWith !== undefined ? (
+                      // `DATA-17` slice 5: a file of a load of several files; the first has the run and the count.
+                      <p className="max-w-64 whitespace-normal text-xs text-muted-foreground">
+                        Loaded with {uploads.find((u) => u.id === upload.loadedWith)?.originalFilename ?? "the first file"}
+                      </p>
+                    ) : null}
                   </div>
                 </TableCell>
                 <TableCell>
@@ -129,7 +135,9 @@ export function UploadsPanel({ pollMs = POLL_MS }: { readonly pollMs?: number })
                 </TableCell>
                 <TableCell>
                   {upload.rows === undefined ? (
-                    <span className="text-muted-foreground">Not measured</span>
+                    <span className="text-muted-foreground">
+                      {upload.loadedWith !== undefined ? "Counted with the first file" : "Not measured"}
+                    </span>
                   ) : (
                     formatNumber(upload.rows)
                   )}

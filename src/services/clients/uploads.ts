@@ -1,6 +1,7 @@
 import type {
   CreateUploadResponse,
   UploadCheck,
+  UploadCompare,
   IngestUploadInput,
   IngestUploadResponse,
   Upload,
@@ -155,6 +156,24 @@ export const uploadService: UploadService = {
           ...(options.headerRow !== undefined ? { headerRow: options.headerRow } : {}),
           ...(options.sheet !== undefined ? { sheet: options.sheet } : {}),
           columns: input.columns,
+        }),
+        signal,
+      })
+    )
+  },
+  async compare(id, input, signal) {
+    const options = input.options ?? {}
+    return readJson<UploadCompare>(
+      await apiFetch(uploadUrl(id, "/compare"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alsoUploads: input.alsoUploads,
+          ...(options.encoding !== undefined ? { encoding: options.encoding } : {}),
+          ...(options.delimiter !== undefined ? { delimiter: options.delimiter } : {}),
+          ...(options.headerRow !== undefined ? { headerRow: options.headerRow } : {}),
+          ...(options.sheet !== undefined ? { sheet: options.sheet } : {}),
+          ...(input.columns !== undefined ? { columns: input.columns } : {}),
         }),
         signal,
       })

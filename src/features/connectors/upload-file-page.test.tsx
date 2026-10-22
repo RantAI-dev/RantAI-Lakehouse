@@ -106,6 +106,8 @@ type Routes = {
   preview?: (query: URLSearchParams) => UploadPreview | Response
   /** `POST /api/uploads/{id}/check`: gets the body the page sent. */
   check?: (body: { columns: { name: string; type: string }[] }) => unknown | Response
+  /** `POST /api/uploads/{id}/compare` (several files into one table): gets the body the page sent; the default finds no mismatch. */
+  compare?: (body: { alsoUploads: string[]; columns?: { name: string; type: string }[] }) => unknown | Response
   ingest?: Response
 }
 
@@ -158,6 +160,10 @@ function stubFetch(routes: Routes = {}): Call[] {
     if (target.pathname.endsWith("/preview") && routes.preview) return reply(routes.preview(target.searchParams))
     if (target.pathname.endsWith("/check") && method === "POST" && routes.check) {
       return reply(routes.check(body as { columns: { name: string; type: string }[] }))
+    }
+    if (target.pathname.endsWith("/compare") && method === "POST") {
+      const asked = body as { alsoUploads: string[]; columns?: { name: string; type: string }[] }
+      return reply(routes.compare ? routes.compare(asked) : { mismatches: [] })
     }
     if (target.pathname.endsWith("/ingest") && method === "POST" && routes.ingest) return routes.ingest
     if (/^\/api\/uploads\/[^/]+$/.test(target.pathname) && method === "GET" && routes.get) {
@@ -486,12 +492,12 @@ describe("UploadFilePage, first step", () => {
     expect(notice.textContent).toMatch(/Oct.*2026|2026.*Oct/)
   })
 
-  it("says the others are still being sent on the next steps, and where the ones that arrived are loaded from", async () => {
+  it("lists the other files on the Check step: being sent first, then compared with the first one", async () => {
     let release: (() => void) | null = null
     const held = new Promise<void>((resolve) => {
       release = resolve
     })
-    stubFetch({
+    const calls = stubFetch({
       part: async (id, n) => {
         // The second file's piece is held back.
         if (id === "up-2") await held
@@ -500,15 +506,25 @@ describe("UploadFilePage, first step", () => {
       preview: () => preview(),
     })
     render(<UploadFilePage />)
-    chooseFiles([CSV(), new File(["a,b\n1,2\n"], "second.csv")])
+    chooseFiles([CSV(), new File(["qty,sku\n1,a\n"], "second.csv")])
     await waitFor(() => expect(next().disabled).toBe(false))
     fireEvent.click(next())
     await screen.findByLabelText("Encoding")
 
-    expect(screen.getByText(/1 other file is still being sent/)).toBeDefined()
+    const list = screen.getByRole("list", { name: "Files in this load" })
+    expect(within(list).getByText("Being sent")).toBeDefined()
+    expect(screen.getByText(/Load waits until it arrives/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+    expect(sent(calls, "POST", /compare$/)).toEqual([])
     release!()
-    await waitFor(() => expect(screen.getByText(/1 other file has arrived/)).toBeDefined())
-    expect(screen.getByText(/load the other from Uploaded files/)).toBeDefined()
+    await within(list).findByText("Same columns")
+    expect(sent(calls, "POST", /\/api\/uploads\/up-1\/compare$/)[0].body).toMatchObject({
+      alsoUploads: ["up-2"],
+      encoding: "utf-8",
+      delimiter: ",",
+      headerRow: 0,
+    })
+    await waitFor(() => expect(next().disabled).toBe(false))
   })
 
   it("takes a file out of the list, and removes the unfinished upload from the API", async () => {
@@ -1447,5 +1463,169 @@ describe("UploadFilePage, column types", () => {
       expect(within(report).getByText("abc")).toBeDefined()
       cleanup()
     }
+  })
+})
+
+
+describe("UploadFilePage, several files into one table", () => {
+  const THIRD = () => new File(["sku,qty,notes\na,1,x\n"], "third.csv", { type: "text/csv" })
+  const SECOND = () => new File(["qty,sku\n1,a\n"], "second.csv", { type: "text/csv" })
+
+  /** Picks the files, goes to Check and waits for the comparison the API answers with `compare`. */
+  async function openCheck(files: File[], routes: Routes = {}) {
+    const calls = stubFetch({ preview: () => preview(), ...routes })
+    render(<UploadFilePage pollMs={20} />)
+    chooseFiles(files)
+    await waitFor(() => expect(sent(calls, "POST", /complete$/).length).toBe(files.length))
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Encoding")
+    return calls
+  }
+
+  const differing = (uploadId: string, file: string) => ({
+    mismatches: [{ uploadId, file, missing: [], extra: ["notes"], typeConflicts: [] }],
+  })
+
+  it("marks a file whose columns differ with what is extra, and keeps Next off until it is removed", async () => {
+    const calls = await openCheck([CSV(), SECOND(), THIRD()], {
+      compare: (asked) => (asked.alsoUploads.includes("up-3") ? differing("up-3", "third.csv") : { mismatches: [] }),
+    })
+    const list = screen.getByRole("list", { name: "Files in this load" })
+    await within(list).findByText("Different columns")
+    expect(within(list).getByText("Same columns")).toBeDefined()
+    expect(within(list).getByText("Not in the first file: notes")).toBeDefined()
+    expect(screen.getByText("3 files load into one table. Their columns are matched by name, in any order.")).toBeDefined()
+    expect(screen.getByText(/One file does not have the columns of the first/)).toBeDefined()
+    expect(next().disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove third.csv" }))
+    await waitFor(() => expect(next().disabled).toBe(false))
+    expect(within(screen.getByRole("list", { name: "Files in this load" })).queryByText("third.csv")).toBeNull()
+    // The comparison was asked again, for the file that is left.
+    const asked = sent(calls, "POST", /compare$/).map((c) => (c.body as { alsoUploads: string[] }).alsoUploads)
+    expect(asked[asked.length - 1]).toEqual(["up-2"])
+  })
+
+  it("lists the type conflicts of a file, and asks again with the column list when a type is changed", async () => {
+    const calls = await openCheck([CSV(), SECOND()], {
+      compare: (asked) =>
+        asked.columns?.some((c) => c.name === "qty" && c.type === "text")
+          ? { mismatches: [] }
+          : {
+              mismatches: [
+                {
+                  uploadId: "up-2",
+                  file: "second.csv",
+                  missing: [],
+                  extra: [],
+                  typeConflicts: [{ column: "qty", expected: "integer", found: "text" }],
+                },
+              ],
+            },
+      preview: () => ({
+        ...preview(),
+        columnSpecs: [
+          { source: "sku", name: "sku", type: "text", guessedType: "text", askDateOrder: false },
+          { source: "qty", name: "qty", type: "integer", guessedType: "integer", askDateOrder: false },
+        ],
+      }),
+    })
+    const list = screen.getByRole("list", { name: "Files in this load" })
+    await within(list).findByText(/qty: the first file reads it as integer, here it looks like text/)
+    expect(next().disabled).toBe(true)
+
+    fireEvent.change(screen.getByLabelText("Type of qty"), { target: { value: "text" } })
+    await within(list).findByText("Same columns")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    const last = sent(calls, "POST", /compare$/).pop()
+    expect((last?.body as { columns: { name: string; type: string }[] }).columns).toEqual([
+      { source: "sku", name: "sku", type: "text" },
+      { source: "qty", name: "qty", type: "text" },
+    ])
+  })
+
+  it("does not go on when the comparison itself fails, and compares again on request", async () => {
+    let failing = true
+    await openCheck([CSV(), SECOND()], {
+      compare: () => (failing ? json({ error: "One of the other files was not found." }, 404) : { mismatches: [] }),
+    })
+    expect((await screen.findByRole("alert")).textContent).toBe("One of the other files was not found.")
+    expect(next().disabled).toBe(true)
+    failing = false
+    fireEvent.click(screen.getByRole("button", { name: "Compare again" }))
+    await within(screen.getByRole("list", { name: "Files in this load" })).findByText("Same columns")
+    await waitFor(() => expect(next().disabled).toBe(false))
+  })
+
+  it("reviews N files into the table, loads with the other files named, and shows one run", async () => {
+    const started = upload({ status: "ingesting", bronzeTable: "stock", parseOptions: OPTIONS, loadMode: "replace" })
+    const calls = await openCheck([CSV(), SECOND()], {
+      get: (n) => (n < 3 ? started : { ...started, status: "ingested", rows: 6, assetId: "stock" }),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    await within(screen.getByRole("list", { name: "Files in this load" })).findByText("Same columns")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    await screen.findByRole("button", { name: "Load" })
+
+    const value = (label: string) =>
+      screen.getAllByRole("term").find((term) => term.textContent === label)?.nextElementSibling?.textContent
+    expect(value("Files")).toBe("2 files into bronze.stock")
+    expect(value("File 2")).toBe("second.csv")
+    expect(screen.getByText(/^Load reads/).textContent).toContain("2 files, the first of them stock.csv")
+    expect(screen.getByText(/^Load reads/).textContent).toContain("Any rows the table already holds are replaced by these files'.")
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }))
+    await screen.findByText("Load finished")
+    const post = calls.find((c) => c.url.endsWith("/up-1/ingest"))
+    expect(post?.body).toMatchObject({ bronzeTable: "stock", alsoUploads: ["up-2"] })
+    expect(screen.getByText(/2 files load into one table\. With stock\.csv:/)).toBeDefined()
+    expect(screen.getByText("Rows in all the files")).toBeDefined()
+    expect(screen.getByRole("button", { name: "Upload other files" })).toBeDefined()
+  })
+
+  it("tries a failed load of several files again with the same files", async () => {
+    const started = upload({ status: "ingesting", bronzeTable: "stock", parseOptions: OPTIONS, loadMode: "replace" })
+    const failed = { ...started, status: "failed", error: "The load into the table failed." }
+    const calls = await openCheck([CSV(), SECOND()], {
+      get: (n) => (n < 3 ? started : failed),
+      ingest: json({ upload: started, runId: "run-1" }),
+    })
+    await within(screen.getByRole("list", { name: "Files in this load" })).findByText("Same columns")
+    await waitFor(() => expect(next().disabled).toBe(false))
+    fireEvent.click(next())
+    await screen.findByLabelText("Table name")
+    fireEvent.click(next())
+    fireEvent.click(await screen.findByRole("button", { name: "Load" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Try again" }))
+
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/up-1/ingest")).length).toBe(2))
+    const retry = calls.filter((c) => c.url.endsWith("/up-1/ingest"))[1]
+    expect(retry.body).toMatchObject({ bronzeTable: "stock", alsoUploads: ["up-2"] })
+  })
+
+  it("opened on a file that was loaded with another, does not retry it alone and points at the first file", async () => {
+    url.search = "?id=up-2"
+    const second = upload({
+      id: "up-2",
+      originalFilename: "second.csv",
+      status: "ingesting",
+      bronzeTable: "stock",
+      parseOptions: OPTIONS,
+      loadMode: "replace",
+      loadedWith: "up-1",
+    })
+    stubFetch({
+      get: (n) => (n === 1 ? second : { ...second, status: "failed", error: "The load into the table failed." }),
+      list: [upload({ id: "up-1", originalFilename: "stock.csv" }), second],
+    })
+    render(<UploadFilePage pollMs={20} />)
+
+    await screen.findByText("Load failed")
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull()
+    expect(screen.getByText("Open the first file").closest("a")?.getAttribute("href")).toBe("/connectors/upload?id=up-1")
   })
 })

@@ -20,6 +20,7 @@ import type {
   UploadArchive,
   UploadEncoding,
   UploadLayout,
+  UploadMismatch,
   UploadPreviewColumn,
   UploadStatus,
 } from "@/services/contracts/uploads"
@@ -316,8 +317,11 @@ export function planPick(
  * the catalog (`REGISTRATION_FAILED_REASON`): its rows ARE in the table, so a
  * retry with `append` would write them twice. That retry replaces, whatever
  * the first load chose.
+ *
+ * `alsoUploads` are the other files of a load of several files (`DATA-17` slice 5), which the
+ * upload row of the first file does not list: the screen knows them (the files it loaded with).
  */
-export function retryInput(upload: Upload): IngestUploadInput | null {
+export function retryInput(upload: Upload, alsoUploads: readonly string[] = []): IngestUploadInput | null {
   const { parseOptions, bronzeTable } = upload
   if (parseOptions === undefined || bronzeTable === undefined) return null
   const mode =
@@ -332,7 +336,9 @@ export function retryInput(upload: Upload): IngestUploadInput | null {
     upload.columns !== undefined && upload.onBadValue !== undefined
       ? { columns: upload.columns, onBadValue: upload.onBadValue }
       : {}
-  return { ...parseOptions, bronzeTable, mode, ...withColumns }
+  // `DATA-17` slice 5: a load of several files is retried with the same files.
+  const withOthers = alsoUploads.length > 0 ? { alsoUploads: [...alsoUploads] } : {}
+  return { ...parseOptions, bronzeTable, mode, ...withColumns, ...withOthers }
 }
 
 /**
@@ -415,6 +421,46 @@ export function archiveProblem(archive: UploadArchive | undefined): string | nul
   return `${different.length === 1 ? "One file" : `${different.length} files`} of the zip ${
     different.length === 1 ? "does not have" : "do not have"
   } the same columns as the first. A zip loads whole, so make the files agree and upload it again.`
+}
+
+// ── Several files into one table (`DATA-17` slice 5) ──────────────────────
+
+/**
+ * What differs in a file that cannot load with the first one, as short lines for the list:
+ * the columns it lacks, the ones it adds, and each column whose values do not fit the first
+ * file's type. The names are those the load gives the columns.
+ */
+export function mismatchLines(mismatch: UploadMismatch): string[] {
+  const lines: string[] = []
+  if (mismatch.missing.length > 0) lines.push(`Missing: ${mismatch.missing.join(", ")}`)
+  if (mismatch.extra.length > 0) lines.push(`Not in the first file: ${mismatch.extra.join(", ")}`)
+  for (const conflict of mismatch.typeConflicts) {
+    lines.push(
+      `${conflict.column}: the first file reads it as ${columnTypeLabel(conflict.expected).toLowerCase()}, here it looks like ${columnTypeLabel(conflict.found).toLowerCase()}`
+    )
+  }
+  return lines
+}
+
+/**
+ * Why Load stays off for a load of several files, or `null` (decision 4): a file still being
+ * sent is not in the load yet, and a file whose columns differ must be removed.
+ */
+export function groupProblem(input: {
+  readonly pending: number
+  readonly mismatched: number
+}): string | null {
+  if (input.mismatched > 0) {
+    return `${input.mismatched === 1 ? "One file does" : `${input.mismatched} files do`} not have the columns of the first. Remove ${
+      input.mismatched === 1 ? "it" : "them"
+    } to load the rest.`
+  }
+  if (input.pending > 0) {
+    return `${input.pending === 1 ? "One file is" : `${input.pending} files are`} still being sent. Load waits until ${
+      input.pending === 1 ? "it arrives" : "they arrive"
+    }.`
+  }
+  return null
 }
 
 // ── Column types (`DATA-18`) ──────────────────────────────────────────────

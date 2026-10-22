@@ -27,7 +27,9 @@ import {
   fileSizeProblem,
   headerRowDisplay,
   headerRowFromDisplay,
+  groupProblem,
   isUploadedTable,
+  mismatchLines,
   planPick,
   rawTableFullName,
   retryInput,
@@ -304,6 +306,40 @@ test("retryInput repeats what the load was told, and replaces after a registrati
   // A load nobody recorded the settings of is not guessed at.
   assert.equal(retryInput(upload({ status: "failed" })), null)
   assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
+})
+
+test("retryInput sends the other files of a load of several files back with it, and nothing for a load of one", () => {
+  const options = { encoding: "utf-8" as const, delimiter: ",", headerRow: 0 }
+  const failed = upload({ status: "failed", parseOptions: options, bronzeTable: "stock", loadMode: "replace" })
+  assert.deepEqual(retryInput(failed, ["up-2", "up-3"]), {
+    ...options,
+    bronzeTable: "stock",
+    mode: "replace",
+    alsoUploads: ["up-2", "up-3"],
+  })
+  assert.equal("alsoUploads" in (retryInput(failed, []) ?? {}), false)
+  assert.equal("alsoUploads" in (retryInput(failed) ?? {}), false)
+})
+
+test("mismatchLines says what a file lacks, what it adds and which columns do not fit, and nothing for a file that matches", () => {
+  const base = { uploadId: "up-2", file: "b.csv", missing: [], extra: [], typeConflicts: [] }
+  assert.deepEqual(mismatchLines(base), [])
+  assert.deepEqual(mismatchLines({ ...base, missing: ["name", "qty"], extra: ["notes"] }), [
+    "Missing: name, qty",
+    "Not in the first file: notes",
+  ])
+  assert.deepEqual(mismatchLines({ ...base, typeConflicts: [{ column: "qty", expected: "integer", found: "text" }] }), [
+    "qty: the first file reads it as integer, here it looks like text",
+  ])
+})
+
+test("groupProblem keeps Load off for a file that differs before one still being sent, and says nothing when all is well", () => {
+  assert.equal(groupProblem({ pending: 0, mismatched: 0 }), null)
+  assert.match(groupProblem({ pending: 0, mismatched: 1 }) ?? "", /^One file does not have the columns of the first\. Remove it/)
+  assert.match(groupProblem({ pending: 0, mismatched: 3 }) ?? "", /^3 files do not have the columns of the first\. Remove them/)
+  assert.match(groupProblem({ pending: 1, mismatched: 0 }) ?? "", /^One file is still being sent\. Load waits until it arrives/)
+  assert.match(groupProblem({ pending: 2, mismatched: 0 }) ?? "", /^2 files are still being sent\. Load waits until they arrive/)
+  assert.match(groupProblem({ pending: 2, mismatched: 1 }) ?? "", /^One file does not have/)
 })
 
 test("fileKindProblem refuses a workbook or an archive the API does not read by its name, in the API's words", () => {

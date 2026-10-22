@@ -19,7 +19,7 @@ const ACCEPT =
 /** The limits as short facts. They repeat what the API and `fileProblem` enforce; the sheet fact repeats the Check step. */
 const FACTS: readonly { label: string; value: string }[] = [
   { label: "Accepted", value: "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip" },
-  { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; the first one is checked and loaded on the next steps` },
+  { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; they load into one table when their columns match, in any order` },
   { label: "Size", value: "Up to 50 MB in all" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, .tar, .7z and other archives" },
   { label: "Workbooks", value: "One sheet is loaded, chosen on the next step" },

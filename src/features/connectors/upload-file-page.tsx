@@ -18,6 +18,7 @@ import { UploadReviewStep } from "./upload-review-step"
 import { UploadRunView } from "./upload-run-view"
 import { UploadTableStep } from "./upload-table-step"
 import { useColumnChoices } from "./use-column-choices"
+import { useUploadGroup } from "./use-upload-group"
 import { useUploadQueue } from "./use-upload-queue"
 import { columnSpecOf } from "@/lib/uploads"
 
@@ -25,7 +26,7 @@ const STEPS: FormStep[] = [
   { id: "file", label: "File", description: "Choose CSV, TSV, JSON, Avro, Excel or Parquet files" },
   { id: "check", label: "Check", description: "How the file is read" },
   { id: "table", label: "Table", description: "Name the raw table" },
-  { id: "review", label: "Review", description: "Load the file" },
+  { id: "review", label: "Review", description: "Load the files" },
 ]
 
 const FILE_STEP = 0
@@ -53,9 +54,11 @@ function setAddress(pathname: string, id: string | null) {
  * person is, in the API's own sentence.
  *
  * Files are sent in pieces from the moment they are picked (`DATA-17`, the
- * upload queue), up to ten at a time. The next steps carry on with the first
- * file that arrives; the rest are loaded from the list of uploaded files until
- * a load can take several (a later slice of the same item).
+ * upload queue), up to ten at a time. The next steps show the first file that
+ * arrives; the others load WITH it into the one table when their columns match
+ * (`DATA-17` slice 5, decision 4): the Check step lists each with the comparison,
+ * Load stays off until a file whose columns differ is removed, and Review and the
+ * run view say it is one load of N files.
  */
 function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; readonly pollMs?: number }) {
   const pathname = usePathname()
@@ -68,6 +71,8 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     () => initial?.bronzeTable ?? (initial ? suggestTableName(initial.originalFilename) : "")
   )
   const [mode, setMode] = React.useState<UploadLoadMode>("replace")
+  // The files a started load took with the first, kept for "Try again" and the run view.
+  const [together, setTogether] = React.useState<readonly { id: string; name: string }[] | null>(null)
 
   const view = useUploadPreview(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null)
   const choices = useColumnChoices(run === null && step !== FILE_STEP ? (upload?.id ?? null) : null, view)
@@ -81,6 +86,17 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
   const ingest = useServiceAction((signal, id: string, input: IngestUploadInput) =>
     uploadService.ingest(id, input, signal)
   )
+
+  // The files after the first that are part of this load: not refused, and not the first itself.
+  const others = queue.files.filter((f) => f.state !== "refused" && f.key !== primary?.key && f.result?.id !== upload?.id)
+  const group = useUploadGroup({
+    primaryId: run === null && step !== FILE_STEP ? (upload?.id ?? null) : null,
+    others,
+    reading: view.settled?.using ?? null,
+    sheet: view.settled?.workbook?.sheet,
+    columns: choices.columns,
+    columnsValid: choices.problems.length === 0,
+  })
 
   const offersMode = uploads.status === "success" && isUploadedTable(tableName, uploads.data)
   const effectiveMode: UploadLoadMode = offersMode ? mode : "replace"
@@ -100,6 +116,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     setRun(null)
     setTableName("")
     setMode("replace")
+    setTogether(null)
     view.reset()
     ingest.reset()
     setAddress(pathname, null)
@@ -136,14 +153,27 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
       mode: effectiveMode,
       // `DATA-18`: the columns as chosen, with what to do with a value that does not fit.
       ...(choices.columns.length > 0 ? { columns: choices.columns.map(columnSpecOf), onBadValue: choices.onBadValue } : {}),
+      // `DATA-17` slice 5: the other files of the load. The API compares their columns again.
+      ...(group.ids.length > 0 ? { alsoUploads: group.ids } : {}),
     })
-    if (started !== null) setRun(started.upload)
+    if (started !== null) {
+      setTogether(group.files.filter((f) => f.uploadId !== null).map((f) => ({ id: f.uploadId ?? "", name: f.name })))
+      setRun(started.upload)
+    }
   }
 
   if (run !== null) {
+    // A page opened with `?id=` on a load of several files learns them from the list: the files
+    // that were loaded with this one point at it (`loadedWith`).
+    const loadedWith =
+      together ??
+      (uploads.status === "success"
+        ? uploads.data.filter((u) => u.loadedWith === run.id).map((u) => ({ id: u.id, name: u.originalFilename }))
+        : [])
     return (
       <UploadRunView
         initial={run}
+        together={loadedWith}
         pollMs={pollMs}
         onReset={reset}
         onChangeSettings={(latest) => {
@@ -159,31 +189,19 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
     step === FILE_STEP
       ? upload !== null || primary?.state === "received"
       : step === CHECK_STEP
-        ? view.ready && choices.ready
+        ? view.ready && choices.ready && group.ready
         : step === TABLE_STEP
           ? tableName !== "" && nameProblem === null
-          : view.ready && choices.ready && tableName !== "" && nameProblem === null
-
-  // The files after the first are not part of this load (a later slice lets
-  // one load take several): say where they go, and that they need the page.
-  const others = queue.files.filter((f) => f.state !== "refused" && f.result?.id !== upload?.id)
-  const stillSending = others.filter((f) => f.state !== "received").length
-  const arrived = others.length - stillSending
+          : view.ready && choices.ready && group.ready && tableName !== "" && nameProblem === null
 
   const notices =
     upload !== null && step !== FILE_STEP ? (
       <div className="space-y-3">
         {duplicate !== null ? <DuplicateNotice earlier={duplicate} /> : null}
-        {stillSending > 0 ? (
+        {group.pending > 0 ? (
           <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
-            {stillSending === 1 ? "1 other file is" : `${stillSending} other files are`} still being sent. Keep this page
-            open until {stillSending === 1 ? "it arrives" : "they arrive"}.
-          </p>
-        ) : null}
-        {arrived > 0 ? (
-          <p className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
-            {arrived === 1 ? "1 other file has" : `${arrived} other files have`} arrived. This load takes the first file;
-            load {arrived === 1 ? "the other" : "each of the others"} from Uploaded files on the Sources page.
+            Keep this page open until {group.pending === 1 ? "the other file arrives" : "the other files arrive"}: they
+            load with the first.
           </p>
         ) : null}
         {upload.status === "failed" ? (
@@ -223,7 +241,9 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           onChooseAnother={reset}
         />
       ) : null}
-      {step === CHECK_STEP ? <UploadCheckStep view={view} choices={choices} /> : null}
+      {step === CHECK_STEP && upload !== null ? (
+        <UploadCheckStep view={view} choices={choices} first={upload} group={group} onRemoveFile={queue.remove} />
+      ) : null}
       {step === TABLE_STEP ? (
         <UploadTableStep
           tableName={tableName}
@@ -243,6 +263,7 @@ function UploadWizard({ initial, pollMs }: { readonly initial: Upload | null; re
           columns={choices.columns}
           onBadValue={choices.onBadValue}
           error={ingest.error}
+          otherFiles={group.files.map((f) => f.name)}
         />
       ) : null}
     </FormStepLayout>
@@ -267,7 +288,7 @@ export function UploadFilePage({ pollMs }: { readonly pollMs?: number }) {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Upload file"
-        description="Bring CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables. Check how the first one is read, name the table, then load it."
+        description="Bring CSV, TSV, JSON, Avro, Excel or Parquet files, or a gzip or zip of them, in as raw tables. Files with the same columns can load into one table together. Check how the first one is read, name the table, then load."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel

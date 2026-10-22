@@ -18,12 +18,14 @@ import {
 } from "@/lib/uploads"
 import { formatBytes } from "@/lib/format"
 import { uploadService } from "@/services"
-import type { UploadArchive, UploadParseOptions, UploadPreview } from "@/services/contracts/uploads"
+import type { Upload, UploadArchive, UploadParseOptions, UploadPreview } from "@/services/contracts/uploads"
 import type { ServiceError } from "@/services/errors"
+import { UploadFilesList } from "./upload-files-list"
 import { Refusal, UploadNotice } from "./upload-parts"
 import { UploadPreviewGrid } from "./upload-preview-grid"
 import { UploadBadValuesPanel, UploadColumnsEditor } from "./upload-columns"
 import type { ColumnChoices } from "./use-column-choices"
+import type { UploadGroupView } from "./use-upload-group"
 
 const SELECT_CLASS = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -132,8 +134,25 @@ function Detected({ text }: { readonly text: string }) {
  * Step 2: how the file is read, and what that makes of it. Each control says
  * what the API detected; changing one reads the preview again. A preview
  * with no columns says so and the step's "Next" stays off (`view.ready`).
+ *
+ * With files after the first (`DATA-17` slice 5) the step also lists them, each with the mark of
+ * the comparison or the columns that differ, and a way to take it out (`UploadFilesList`); the
+ * preview and the column list stay the first file's.
  */
-export function UploadCheckStep({ view, choices }: { readonly view: UploadPreviewView; readonly choices: ColumnChoices }) {
+export function UploadCheckStep({
+  view,
+  choices,
+  first,
+  group,
+  onRemoveFile,
+}: {
+  readonly view: UploadPreviewView
+  readonly choices: ColumnChoices
+  /** The first file of the load, whose preview this is. */
+  readonly first: Upload
+  readonly group: UploadGroupView
+  readonly onRemoveFile: (key: string) => void
+}) {
   const { shown, settled } = view
   // SEC-17: a refusal of the reading itself (400, such as "The file has more
   // than 1,000 columns.") with nothing shown yet keeps the controls on screen,
@@ -168,6 +187,7 @@ export function UploadCheckStep({ view, choices }: { readonly view: UploadPrevie
 
   return (
     <div className="space-y-4">
+      <UploadFilesList first={first} group={group} onRemove={onRemoveFile} />
       {parquet ? (
         // A Parquet file has one table and its own column names, so there is
         // no sheet to pick, no encoding or delimiter to get wrong and no
