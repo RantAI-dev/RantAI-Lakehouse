@@ -123,6 +123,10 @@ jobs:
           AUTH_BOOTSTRAP_PASSWORD: ci-password-not-real-123
           ICEBERG_QUERY_DB: icecat_api
         run: |
+          # Fail closed: without pipefail the pipe into `tee` takes tee's exit
+          # status and a failed harness reports a green job (g9-upload-large
+          # run 39795803595).
+          set -o pipefail
           python3 -m pip install --quiet requests pyarrow
           python3 ops/g9/large_upload.py \
             --csv-mb "${{ inputs.csv_mb }}" \
