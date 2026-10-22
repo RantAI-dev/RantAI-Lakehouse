@@ -811,9 +811,9 @@ Every count matches the handoff.
 - **Decision for the product owner (deviation 1).** Decision 13 (signed 2026-10-16) says "zip: up to 10 files of
   one supported format other than Excel", which a zip of Parquet files satisfies; the code refuses it (a Parquet
   footer cannot be read by range inside a deflated zip entry, and the job would re-decompress an entry for every
-  seek). The reviewer recommends amending decision 13 to "other than Excel and Parquet" and putting a
-  zip-of-Parquet slice in `docs/core/BACKLOG.md`; building it in this phase is the other option. The feature
-  page's limits and the gate follow that decision once signed.
+  seek). Decided 2026-10-21, the product owner: decision 13 is amended to "other than Excel and Parquet" and a
+  zip-of-Parquet slice waits in `docs/core/BACKLOG.md` as `DATA-28`; the code and its fixed sentence already
+  match the amended decision (`upload_formats.rs:204` names CSV, TSV, text, JSON, JSON Lines or Avro). Signed.
 - **Accepted with reasons, as reported in the handoff.** Avro codecs `null` and `deflate` with fixed sentences
   (the image does not carry `snappy`/`zstandard` packages); the preview's shortest number form and sorted Avro
   map keys (documented on both sides); `__MACOSX/` ignored (macOS archives would otherwise never load); a
@@ -836,5 +836,6 @@ Every count matches the handoff.
   working-tree cut of `tests/upload_routes.rs` that was restored before any commit. The reviewer's own disk
   cleanups (stale per-worktree `target/` caches, contrary to this file's settings) are recorded here.
 
-No open `BLOCKER`. One `SHOULD-FIX` open, assigned to slice 5's sitting; the zip-of-Parquet decision belongs to
-the product owner. The branch is pushed, and the PR's CI is to be read at the new head.
+No open `BLOCKER`. One `SHOULD-FIX` open, assigned to slice 5's sitting; the zip-of-Parquet decision is signed
+(decision 13 amended, `DATA-28` holds the future slice). The branch is pushed, and the PR's CI is to be read at
+the new head.
