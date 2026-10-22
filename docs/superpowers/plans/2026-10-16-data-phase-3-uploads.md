@@ -949,5 +949,28 @@ the fixture says [['1', 'Anna', '1.5', 'true', '["a","b"]', '{"x":1,"y":"z"}', N
   written down as `DATA-29` in `docs/core/BACKLOG.md`. The console shows an empty cell for a missing key, which
   is what decision 11 promises the user.
 
+**Round 2 read by the reviewer, at `7a918a09`, 2026-10-22.** The developer's two commits fix both findings, and
+the reviewer re-ran the scoped block itself:
+
+- `8c7383ed` (`BLOCKER` 4): the cause is the gate's reader, not the load. `POST /api/query/run` answers every
+  cell as text and renders a NULL as `""` (`routes/query.rs:626`), so the gate could not tell a missing key from
+  an empty string. The gate now reads `isNull(column)` beside every value (a table that really held `''` still
+  fails — the expectation is the fixture's, unchanged) and prints the table's column types. Two tests pin the
+  null at the levels where it could be lost: the Arrow batch against the shared fixture, and the job's own
+  resource through `dlt` into a local Iceberg table (every field optional, the nulls read back as `None`).
+  The developer also checked that the tests bite (with `json_text` made to return `""`, four of six cases fail).
+- `4ea465f1` (`SHOULD-FIX` 1): an eleventh fixed reason, "The file's columns are not the ones the preview
+  showed.", in the job's `FAILURE_REASONS`, in the shared fixture and in the API's `JOB_FAILURE_REASONS`; the
+  naming and settings failures keep the generic reason.
+- The reviewer's own runs, on the same commits: `pytest dispar_orchestrate -q`: **1760 passed, 1 skipped**;
+  `cargo test -p lakehouse-api --locked --test upload_routes`: **125 passed**; `--lib uploads::tests`: **36
+  passed**; `--test route_auth`: **55 passed**; `cargo clippy -p lakehouse-api --all-targets --locked -- -D
+  warnings`: clean; `cargo fmt --check`: clean; both `ops/lint` checks OK; `py_compile` on the gate: exit 0.
+  The developer had the same counts.
+- Not verified, and it can only be verified in CI: the gate on a real stack (there is none on this machine), the
+  full Rust workspace run and the TypeScript block.
+
+No open `BLOCKER` in the code. The gate is read on the PR at the new head; if it is green, slice 4 is closed.
+
 No open `BLOCKER` other than 4. The branch stays as it is; the developer fixes 4 and `SHOULD-FIX` 1, and the
 gate is read again on the PR.
