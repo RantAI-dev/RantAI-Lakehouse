@@ -12,8 +12,10 @@ is where its numbers are read; nothing here decides a limit.
    share no code, so the few lines are copied).
 2. Generates its files at run time, on disk, in a scratch directory (no file is
    committed): a CSV of `--csv-mb` MiB (2048 by default), `--parquet-files`
-   Parquet files of `--parquet-mb` MiB in all (1945 MiB in 10 files by default).
-   A gzipped CSV joins them once slice 4 can read one (`--gzip`, refused until then).
+   Parquet files of `--parquet-mb` MiB in all (1945 MiB in 10 files by default), a
+   JSON Lines file of `--jsonl-mb` MiB (2048) and a gzipped CSV that unpacks to
+   `--gzip-mb` MiB (2048; the file sent is smaller, the unpacked size is what the
+   cap counts, feature page decision 2). Slice 6 (T6.1) names these four.
    The rows are sized so that a file stays under the job's 2,000,000-row cap
    (`file_ingest.MAX_ROWS`): wide rows of random text, which also compress
    poorly, so the Parquet files reach the size asked for.
@@ -108,6 +110,52 @@ def write_csv(path: Path, total_bytes: int, columns: int = 10) -> int:
     header = ",".join(f"c{n}" for n in range(columns)) + "\n"
     written = 0
     with path.open("w", encoding="utf-8", newline="") as out:
+        out.write(header)
+        block = 20_000
+        while written < rows:
+            n = min(block, rows - written)
+            cells = [_random_cells(n, cell) for _ in range(columns)]
+            out.write("".join(",".join(c[i] for c in cells) + "\n" for i in range(n)))
+            written += n
+    return rows
+
+
+def jsonl_width(total_bytes: int, columns: int = 10) -> tuple[int, int]:
+    """(characters per value, rows) so that lines of `columns` keys `"cN":"..."` make
+    about `total_bytes` in at most `TARGET_ROWS` rows. Base64 text needs no escaping,
+    so a value is exactly `cell` characters."""
+    overhead = columns * len('"c0":"",') + 2  # keys, quotes, colons, commas, braces, newline
+    per_row = max(columns * 20 + overhead, total_bytes // TARGET_ROWS + 1)
+    cell = max(8, (per_row - overhead) // columns)
+    return cell, max(1, total_bytes // (columns * cell + overhead))
+
+
+def write_jsonl(path: Path, total_bytes: int, columns: int = 10) -> int:
+    """A JSON Lines file (one object per line) of about `total_bytes` bytes. Returns its rows."""
+    cell, rows = jsonl_width(total_bytes, columns)
+    keys = [f'"c{n}":"' for n in range(columns)]
+    written = 0
+    with path.open("w", encoding="utf-8", newline="") as out:
+        block = 20_000
+        while written < rows:
+            n = min(block, rows - written)
+            cells = [_random_cells(n, cell) for _ in range(columns)]
+            out.write(
+                "".join("{" + ",".join(f'{keys[k]}{cells[k][i]}"' for k in range(columns)) + "}\n" for i in range(n))
+            )
+            written += n
+    return rows
+
+
+def write_csv_gz(path: Path, unpacked_bytes: int, columns: int = 10) -> int:
+    """A gzipped CSV that unpacks to about `unpacked_bytes` bytes, streamed through
+    gzip so the plain file is never on disk. Returns its rows."""
+    import gzip
+
+    cell, rows = row_width(unpacked_bytes, columns)
+    header = ",".join(f"c{n}" for n in range(columns)) + "\n"
+    written = 0
+    with gzip.open(path, "wt", encoding="utf-8", newline="", compresslevel=6) as out:
         out.write(header)
         block = 20_000
         while written < rows:
@@ -264,9 +312,11 @@ def send_in_pieces(api, path: Path, filename: str) -> dict:
     return _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/complete", timeout=600), 200, "complete").json()
 
 
-def load_and_wait(api, upload_id: str, table: str, *, parquet: bool) -> dict:
+def load_and_wait(api, upload_id: str, table: str, *, dialect: bool) -> dict:
+    """`dialect` is True for a delimited file (a CSV, or a gzipped one), which needs its
+    reading; Parquet and JSON Lines carry their own layout and send none."""
     body: dict = {"bronzeTable": table, "mode": "replace"}
-    if not parquet:
+    if dialect:
         body.update({"encoding": "utf-8", "delimiter": ",", "headerRow": 0})
     _expect(api.post(f"{API_URL}/api/uploads/{upload_id}/ingest", json=body, timeout=120), 200, "ingest")
     deadline = time.time() + LOAD_TIMEOUT_S
@@ -332,13 +382,13 @@ def render(phases: list[Phase], names: list[str], free_bytes: int | None) -> str
     return "\n".join(out)
 
 
-def run_phase(api, name: str, path: Path, rows: int, table: str, parquet: bool, sampler: Sampler) -> Phase:
+def run_phase(api, name: str, path: Path, rows: int, table: str, dialect: bool, sampler: Sampler) -> Phase:
     size = path.stat().st_size
     started = time.time()
     with sampler:
         upload = send_in_pieces(api, path, path.name)
         sent = time.time()
-        loaded = load_and_wait(api, upload["id"], table, parquet=parquet)
+        loaded = load_and_wait(api, upload["id"], table, dialect=dialect)
     counted = count_rows(api, table)
     if counted != rows:
         raise HarnessFailure(f"{table}: the file held {rows:,} rows and the table holds {counted:,}")
@@ -353,13 +403,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv-mb", type=int, default=2048, help="size of the CSV in MiB (0 skips it)")
     parser.add_argument("--parquet-files", type=int, default=10)
     parser.add_argument("--parquet-mb", type=int, default=1945, help="MiB of Parquet in all (0 skips them)")
-    parser.add_argument("--gzip", action="store_true", help="a gzipped CSV (needs slice 4)")
+    parser.add_argument("--jsonl-mb", type=int, default=2048, help="size of the JSON Lines file in MiB (0 skips it)")
+    parser.add_argument("--gzip-mb", type=int, default=2048, help="MiB a gzipped CSV unpacks to (0 skips it)")
     parser.add_argument("--containers", default="", help="NAME=container,NAME=container to sample")
     parser.add_argument("--scratch", default="", help="a directory for the generated files")
     args = parser.parse_args(argv)
-    if args.gzip:
-        print("[large] --gzip: the API cannot read a gzipped file until slice 4 of DATA-17", file=sys.stderr)
-        return 2
     containers = dict(pair.split("=", 1) for pair in args.containers.split(",") if "=" in pair)
     try:
         import requests
@@ -379,7 +427,19 @@ def main(argv: list[str] | None = None) -> int:
             path = scratch / f"large-{suffix}.csv"
             rows = write_csv(path, args.csv_mb * MIB)
             print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
-            phases.append(run_phase(api, "csv", path, rows, f"g9_large_{suffix}_csv", False, sampler))
+            phases.append(run_phase(api, "csv", path, rows, f"g9_large_{suffix}_csv", True, sampler))
+            path.unlink()
+        if args.jsonl_mb > 0:
+            path = scratch / f"large-{suffix}.jsonl"
+            rows = write_jsonl(path, args.jsonl_mb * MIB)
+            print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
+            phases.append(run_phase(api, "jsonl", path, rows, f"g9_large_{suffix}_jsonl", False, sampler))
+            path.unlink()
+        if args.gzip_mb > 0:
+            path = scratch / f"large-{suffix}.csv.gz"
+            rows = write_csv_gz(path, args.gzip_mb * MIB)
+            print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB gzipped, {rows:,} rows")
+            phases.append(run_phase(api, "csv.gz", path, rows, f"g9_large_{suffix}_gz", True, sampler))
             path.unlink()
         if args.parquet_mb > 0 and args.parquet_files > 0:
             each = args.parquet_mb * MIB // args.parquet_files
@@ -387,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
                 path = scratch / f"large-{suffix}-{n}.parquet"
                 rows = write_parquet(path, each)
                 print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
-                phases.append(run_phase(api, f"parquet {n + 1}/{args.parquet_files}", path, rows, f"g9_large_{suffix}_pq{n}", True, sampler))
+                phases.append(run_phase(api, f"parquet {n + 1}/{args.parquet_files}", path, rows, f"g9_large_{suffix}_pq{n}", False, sampler))
                 path.unlink()
     except HarnessFailure as exc:
         print(f"[large] FAILED: {exc}", file=sys.stderr)

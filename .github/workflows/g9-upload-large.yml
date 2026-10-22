@@ -1,4 +1,9 @@
-# DATA-17 T2.3: the large-file upload harness (ops/g9/large_upload.py), run by hand.
+# DATA-17 T2.3 / T6.1: the large-file upload harness (ops/g9/large_upload.py), run by hand.
+#
+# FULL SIZE (T6.1): csv_mb=2048 parquet_mb=1945 parquet_files=10 jsonl_mb=2048
+# gzip_mb=2048. The API refuses a session above its MAX_SESSION_BYTES (50 MiB until
+# T6.2 sets the cap), so the build under test must carry a raised cap; see the
+# "Slice 6" handoff of docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md.
 #
 # A workflow of its own, started only with "Run workflow", for three reasons:
 #
@@ -33,6 +38,14 @@ on:
       parquet_files:
         description: "Number of Parquet files"
         default: "10"
+        type: string
+      jsonl_mb:
+        description: "Size of the generated JSON Lines file in MiB (0 skips it). 2048 is the 2 GiB of the plan."
+        default: "200"
+        type: string
+      gzip_mb:
+        description: "MiB a generated gzipped CSV unpacks to (0 skips it). The cap counts the unpacked size."
+        default: "200"
         type: string
 
 permissions:
@@ -115,6 +128,8 @@ jobs:
             --csv-mb "${{ inputs.csv_mb }}" \
             --parquet-mb "${{ inputs.parquet_mb }}" \
             --parquet-files "${{ inputs.parquet_files }}" \
+            --jsonl-mb "${{ inputs.jsonl_mb }}" \
+            --gzip-mb "${{ inputs.gzip_mb }}" \
             --scratch "$RUNNER_TEMP/large" \
             --containers "api=g9large-lakehouse-api-1,dagster=g9large-dagster-code-location-1" \
             | tee "$RUNNER_TEMP/large-upload.txt"

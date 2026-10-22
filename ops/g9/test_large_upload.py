@@ -43,6 +43,36 @@ def test_a_generated_parquet_file_reaches_its_size_and_holds_the_rows_it_reports
     assert pq.ParquetFile(path).metadata.num_rows == rows
 
 
+def test_json_lines_rows_are_sized_to_stay_under_the_jobs_row_cap_for_any_file_size():
+    for total in (50 * lu.MIB, 200 * lu.MIB, 2048 * lu.MIB):
+        cell, rows = lu.jsonl_width(total)
+        assert rows <= lu.JOB_MAX_ROWS, total
+        assert abs(rows * (10 * cell + 10 * len('"c0":"",') + 2) - total) < total * 0.02
+
+
+def test_a_generated_json_lines_file_has_the_size_and_row_count_it_reports(tmp_path):
+    path = tmp_path / "a.jsonl"
+    rows = lu.write_jsonl(path, 3 * lu.MIB)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == rows
+    first = json.loads(lines[0])
+    assert list(first) == [f"c{n}" for n in range(10)]
+    assert all(isinstance(v, str) for v in first.values())
+    assert abs(path.stat().st_size - 3 * lu.MIB) < 0.05 * 3 * lu.MIB
+
+
+def test_a_generated_gzipped_csv_unpacks_to_the_size_and_rows_it_reports(tmp_path):
+    import gzip
+
+    path = tmp_path / "a.csv.gz"
+    rows = lu.write_csv_gz(path, 3 * lu.MIB)
+    with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    assert len(text.splitlines()) == rows + 1
+    assert abs(len(text.encode("utf-8")) - 3 * lu.MIB) < 0.05 * 3 * lu.MIB
+    assert path.stat().st_size < len(text)
+
+
 class _Stub(BaseHTTPRequestHandler):
     sessions: dict = {}
 
