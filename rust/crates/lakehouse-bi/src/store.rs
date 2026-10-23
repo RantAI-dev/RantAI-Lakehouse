@@ -2434,6 +2434,35 @@ pub async fn withdraw_embed_token(
     Ok(())
 }
 
+/// The public links that live dashboards carried in their own row before
+/// `BI-19` part A moved links to Postgres (migration `0098`): `(board id,
+/// token)` for every live dashboard with a non-empty `public_token`, outside
+/// the personal space. Read once, at start, to copy them (feature A2); nothing
+/// else reads that column any more.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub async fn legacy_public_links(ch: &ChClient) -> Result<Vec<(String, String)>, ChError> {
+    ensure_bi_table(ch).await?;
+    let sql = format!(
+        "SELECT id, public_token FROM console.bi_board FINAL \
+         WHERE is_deleted = 0 AND public_token != ''{}",
+        Viewer::anonymous().owner_clause()
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                row_str(r, "id").to_owned(),
+                row_str(r, "public_token").to_owned(),
+            )
+        })
+        .filter(|(id, token)| !id.is_empty() && !token.is_empty())
+        .collect())
+}
+
 /// Fetch a board by its public share token (read-only, no auth). `None` if
 /// blank or not shared. Ports `getBoardByToken`.
 ///

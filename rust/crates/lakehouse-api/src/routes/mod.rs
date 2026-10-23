@@ -34,6 +34,7 @@ mod dashboard_sources;
 pub(crate) mod drill;
 mod embed;
 mod pdf_export;
+pub mod public_links;
 mod render;
 pub mod report_runner;
 mod reports;

@@ -185,6 +185,9 @@ async fn run() -> anyhow::Result<()> {
     // RPT-1 D3: the scheduled-report runner (a tick every minute, a daily
     // 90-day cleanup of deliveries).
     routes::report_runner::spawn(&state);
+    // BI-19 part A (D2): the public links dashboards carried before links
+    // moved to Postgres, copied once, each expiring in 30 days.
+    routes::public_links::spawn_legacy_copy(&state);
 
     let app = routes::router(state);
 
