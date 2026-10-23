@@ -81,6 +81,15 @@ Rows 5 to 9 are beyond the spec.
   change; tables with a change that waits keep waiting (`SRC-16`).
 - A column added at the source is filled from the run that first sees it;
   older rows are empty in it (spec: backfill is later).
+- Business-app connectors (`SRC-3`): Salesforce, HubSpot, ServiceNow and
+  Dynamics 365 describe their fields, so a change is found before the load and
+  "ask first" and "pause" hold the load back, as for a SQL source. Zendesk,
+  Confluence, SharePoint, Workday Reports and NetSuite do not describe
+  their fields (NetSuite's SuiteQL lists no table columns; `SRC-28`), so a
+  change is found after the load, as for files and REST, and under "Pause"
+  the connector stops after the run that loaded it. Google Analytics 4 loads
+  the dimensions and metrics you choose in the report; a custom dimension added
+  at the property is checked against the property's metadata before it is used. Gate-tested against mock vendors only.
 
 ## Acceptance checklist
 

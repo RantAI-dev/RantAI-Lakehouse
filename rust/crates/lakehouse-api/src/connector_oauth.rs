@@ -30,14 +30,17 @@
 //!   (`connector_secret_store`).
 //!
 //! The client authenticates in the request body (`client_secret_post`, RFC
-//! 6749 section 2.3.1). A provider that accepts only HTTP Basic client
-//! authentication is not supported by this build; the connection test says
-//! the token request was refused rather than guessing.
+//! 6749 section 2.3.1) unless the caller asks for HTTP Basic
+//! (`client_secret_basic`, section 2.3.1 too): `SRC-3` AD8 added it for the
+//! business-app vendors that accept nothing else (`token_request_basic`,
+//! [`revoke_request`]'s `client_auth`). The vendor table says which a vendor
+//! needs (`saas_vendors::ClientAuth`); a `rest` connector always uses the body.
 
 use std::time::Duration;
 
 use base64::Engine as _;
 use lakehouse_core::secret::SecretValue;
+use lakehouse_store::saas_vendors::ClientAuth;
 use serde::Deserialize;
 use sha2::Digest as _;
 
@@ -237,23 +240,131 @@ async fn read_capped(mut response: reqwest::Response) -> Option<Vec<u8>> {
     }
 }
 
-/// POST `form` to `url` and classify the status.
+/// `text` as RFC 6749 appendix B asks for a client id or secret that goes into
+/// a Basic header: every byte outside `A-Za-z0-9-._~` is percent-encoded.
+fn form_encode(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// The environment variable the acceptance gate sets to point a vendor at its mock
+/// vendor server: a JSON object of vendor id to a bare `http(s)://host:port`.
+pub const GATE_ORIGINS_ENV: &str = "SAAS_GATE_ORIGINS";
+
+/// `url` with its scheme, host and port replaced by the gate's mock for `vendor_id`
+/// (slice 2 review SHOULD-FIX 5; the Python twin is `saas.vendors.rebase_for_gate`).
+///
+/// This goes round "a vendor's hosts come only from the table" (`SRC-3` AD2), so it is
+/// closed twice: nothing happens unless the gate-only switch
+/// `CONNECTOR_OAUTH_ALLOW_HTTP=true` is on (`settings.allow_http`), and then only for a
+/// vendor the variable names with a bare origin (no userinfo, path or query). Anything
+/// else returns `url` unchanged, so a bad value fails closed to the real host.
+#[must_use]
+pub fn gate_rebase(settings: OAuthSettings, vendor_id: &str, url: &str) -> String {
+    gate_rebase_with(
+        settings,
+        std::env::var(GATE_ORIGINS_ENV).ok().as_deref(),
+        vendor_id,
+        url,
+    )
+}
+
+/// [`gate_rebase`] with the variable's value given, so a test needs no environment.
+#[must_use]
+pub fn gate_rebase_with(
+    settings: OAuthSettings,
+    origins: Option<&str>,
+    vendor_id: &str,
+    url: &str,
+) -> String {
+    let rebased = (|| {
+        if !settings.allow_http {
+            return None;
+        }
+        let table: serde_json::Value = serde_json::from_str(origins?).ok()?;
+        let mock = reqwest::Url::parse(table.get(vendor_id)?.as_str()?).ok()?;
+        let bare = matches!(mock.scheme(), "http" | "https")
+            && mock.host_str().is_some()
+            && mock.username().is_empty()
+            && mock.password().is_none()
+            && matches!(mock.path(), "" | "/")
+            && mock.query().is_none();
+        if !bare {
+            return None;
+        }
+        let real = reqwest::Url::parse(url).ok()?;
+        let mut out = mock;
+        out.set_path(real.path());
+        out.set_query(real.query());
+        Some(out.to_string())
+    })();
+    rebased.unwrap_or_else(|| url.to_owned())
+}
+
+/// The `Authorization` header value of `client_secret_basic` (RFC 6749 2.3.1).
+fn basic_header(client_id: &str, client_secret: &str) -> String {
+    let pair = format!("{}:{}", form_encode(client_id), form_encode(client_secret));
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(pair)
+    )
+}
+
+/// POST `form` to `url` and classify the status. `basic` is the client's id
+/// and secret for `client_secret_basic`; with `None` the caller has put them
+/// in `form` (or the request carries none).
 async fn post_form(
     url: &str,
     form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<reqwest::Response, TokenFailure> {
+    post_fields(url, form, basic, false, internal_hosts, settings).await
+}
+
+/// [`post_form`], and with `json` the same fields as a JSON object body
+/// (`client_secret_post_json`, slice 2 review BLOCKER 3: Zendesk's
+/// `POST /oauth/tokens` "must be formatted as JSON",
+/// <https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/>).
+async fn post_fields(
+    url: &str,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    json: bool,
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<reqwest::Response, TokenFailure> {
     let client = client_for(url, internal_hosts, settings).await?;
-    let sent = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        client
-            .post(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .form(form)
-            .send(),
-    )
-    .await;
+    let request = client
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    let mut request = if json {
+        let object: serde_json::Map<String, serde_json::Value> = form
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect();
+        request.json(&object)
+    } else {
+        request.form(form)
+    };
+    if let Some((client_id, client_secret)) = basic {
+        // The header carries the secret: it is built here, used once, and
+        // dropped with the request, never logged.
+        request = request.header(
+            reqwest::header::AUTHORIZATION,
+            basic_header(client_id, client_secret),
+        );
+    }
+    let sent = tokio::time::timeout(REQUEST_TIMEOUT, request.send()).await;
     let response = match sent {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
@@ -315,7 +426,60 @@ pub async fn token_request(
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<Tokens, TokenFailure> {
-    let response = post_form(url, form, internal_hosts, settings).await?;
+    token_request_inner(url, form, None, false, internal_hosts, settings).await
+}
+
+/// [`token_request`] with the form sent as a JSON body (`client_secret_post_json`,
+/// slice 2 review BLOCKER 3): `form` carries `client_id` and `client_secret` as for
+/// `client_secret_post`; only the encoding differs.
+///
+/// # Errors
+///
+/// As [`token_request`].
+pub async fn token_request_json(
+    url: &str,
+    form: &[(&str, &str)],
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    token_request_inner(url, form, None, true, internal_hosts, settings).await
+}
+
+/// [`token_request`] with the client authenticating by HTTP Basic
+/// (`client_secret_basic`, `SRC-3` AD8): `form` must not carry `client_id` or
+/// `client_secret`; they go in the `Authorization` header.
+///
+/// # Errors
+///
+/// As [`token_request`].
+pub async fn token_request_basic(
+    url: &str,
+    form: &[(&str, &str)],
+    client_id: &str,
+    client_secret: &str,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    token_request_inner(
+        url,
+        form,
+        Some((client_id, client_secret)),
+        false,
+        internal_hosts,
+        settings,
+    )
+    .await
+}
+
+async fn token_request_inner(
+    url: &str,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    json: bool,
+    internal_hosts: &InternalHosts,
+    settings: OAuthSettings,
+) -> Result<Tokens, TokenFailure> {
+    let response = post_fields(url, form, basic, json, internal_hosts, settings).await?;
     let Some(bytes) = read_capped(response).await else {
         tracing::warn!("OAuth token answer was too long or could not be read");
         return Err(TokenFailure::Unavailable);
@@ -347,26 +511,52 @@ pub async fn token_request(
 ///
 /// As [`token_request`]. A provider answers 200 for a token it does not
 /// know, so a `Refused` here means the client credentials were refused.
+/// `client_auth` is how the client proves itself: in the body or by HTTP
+/// Basic (`SRC-3` AD8).
 pub async fn revoke_request(
     url: &str,
     token: &SecretValue,
     client_id: &str,
     client_secret: &SecretValue,
+    client_auth: ClientAuth,
     internal_hosts: &InternalHosts,
     settings: OAuthSettings,
 ) -> Result<(), TokenFailure> {
-    post_form(
-        url,
-        &[
-            ("token", token.expose_secret()),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", client_id),
-            ("client_secret", client_secret.expose_secret()),
-        ],
-        internal_hosts,
-        settings,
-    )
-    .await
+    let token_fields = [
+        ("token", token.expose_secret()),
+        ("token_type_hint", "refresh_token"),
+    ];
+    match client_auth {
+        // `PostJson` has no revocation address in the table (Zendesk revokes with a
+        // DELETE, not RFC 7009); if one is ever added it is sent as JSON like the
+        // token request.
+        ClientAuth::Post | ClientAuth::PostJson => {
+            post_fields(
+                url,
+                &[
+                    token_fields[0],
+                    token_fields[1],
+                    ("client_id", client_id),
+                    ("client_secret", client_secret.expose_secret()),
+                ],
+                None,
+                client_auth == ClientAuth::PostJson,
+                internal_hosts,
+                settings,
+            )
+            .await
+        }
+        ClientAuth::Basic => {
+            post_form(
+                url,
+                &token_fields,
+                Some((client_id, client_secret.expose_secret())),
+                internal_hosts,
+                settings,
+            )
+            .await
+        }
+    }
     .map(|_| ())
 }
 
@@ -375,7 +565,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const HTTP: OAuthSettings = OAuthSettings { allow_http: true };
@@ -459,6 +649,68 @@ mod tests {
             "{refused:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_gate_rebase_is_ignored_unless_the_gate_only_switch_is_on_and_the_vendor_named() {
+        let origins = Some(r#"{"zendesk": "http://saas-stub-g6:8102"}"#);
+        let real = "https://acme.zendesk.com/oauth/tokens?x=1";
+        let off = OAuthSettings { allow_http: false };
+        assert_eq!(gate_rebase_with(off, origins, "zendesk", real), real);
+        assert_eq!(
+            gate_rebase_with(HTTP, origins, "zendesk", real),
+            "http://saas-stub-g6:8102/oauth/tokens?x=1"
+        );
+        assert_eq!(gate_rebase_with(HTTP, origins, "hubspot", real), real);
+        for odd in [
+            "not json",
+            "[]",
+            r#"{"zendesk": 5}"#,
+            r#"{"zendesk": "ftp://x:1"}"#,
+            r#"{"zendesk": "http://u:p@x:1"}"#,
+            r#"{"zendesk": "http://x:1/prefix"}"#,
+            r#"{"zendesk": "http://x:1/?q=1"}"#,
+        ] {
+            assert_eq!(
+                gate_rebase_with(HTTP, Some(odd), "zendesk", real),
+                real,
+                "{odd}"
+            );
+        }
+        assert_eq!(gate_rebase_with(HTTP, None, "zendesk", real), real);
+    }
+
+    #[tokio::test]
+    async fn post_json_client_authentication_sends_the_same_fields_as_a_json_body() {
+        // Slice 2 review BLOCKER 3: Zendesk's token endpoint "must be formatted as JSON".
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(serde_json::json!({
+                "grant_type": "refresh_token", "refresh_token": "refresh-1",
+                "client_id": "app", "client_secret": "s3cret"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1", "refresh_token": "refresh-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tokens = token_request_json(
+            &format!("{}/token", server.uri()),
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "refresh-1"),
+                ("client_id", "app"),
+                ("client_secret", "s3cret"),
+            ],
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokens.refresh_token.unwrap().expose_secret(), "refresh-2");
     }
 
     #[tokio::test]
@@ -586,6 +838,7 @@ mod tests {
             &SecretValue::new("refresh-1"),
             "app",
             &SecretValue::new("s3cret"),
+            ClientAuth::Post,
             &InternalHosts::ALL,
             HTTP,
         )
@@ -605,11 +858,81 @@ mod tests {
             &SecretValue::new("refresh-1"),
             "app",
             &SecretValue::new("s3cret"),
+            ClientAuth::Post,
             &InternalHosts::ALL,
             HTTP,
         )
         .await
         .unwrap_err();
         assert_eq!(err, TokenFailure::Unavailable);
+    }
+
+    /// `SRC-3` AD8: `client_secret_basic` puts the client in the header, never
+    /// in the body, and encodes it as RFC 6749 appendix B asks.
+    #[tokio::test]
+    async fn basic_client_authentication_sends_the_client_in_the_header_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        token_request_basic(
+            &format!("{}/token", server.uri()),
+            &[("grant_type", "refresh_token"), ("refresh_token", "r")],
+            "app id",
+            "s3cret:+",
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        let seen = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(
+            !body.contains("client_id") && !body.contains("client_secret"),
+            "{body}"
+        );
+        let header = seen[0]
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "app%20id:s3cret%3A%2B");
+    }
+
+    #[tokio::test]
+    async fn basic_revocation_sends_the_client_in_the_header_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .and(body_string_contains("token=refresh-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        revoke_request(
+            &format!("{}/revoke", server.uri()),
+            &SecretValue::new("refresh-1"),
+            "app",
+            &SecretValue::new("s3cret"),
+            ClientAuth::Basic,
+            &InternalHosts::ALL,
+            HTTP,
+        )
+        .await
+        .unwrap();
+        let seen = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(!body.contains("client_secret"), "{body}");
+        assert!(seen[0].headers.get("authorization").is_some());
     }
 }
