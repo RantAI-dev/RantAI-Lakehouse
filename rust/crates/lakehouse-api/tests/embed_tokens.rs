@@ -1068,6 +1068,75 @@ async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
     );
 }
 
+/// `PR #233 review SHOULD-FIX 1`: the frame answer and the embed payload
+/// narrow the deployment's content sites with one rule, over the same cards.
+/// The chart with no board is on the default board for both, so the policy a
+/// page is served can never disagree with the cards that page carries.
+#[tokio::test]
+async fn the_frame_answer_and_the_payload_agree_on_a_boards_content_sites() {
+    let fake = FakeCh::with_charts(
+        vec![
+            board_row(BOARD, &json!({})),
+            board_row("default", &json!({})),
+        ],
+        vec![
+            card_row("c1", BOARD, "https://Img.Example/logo.png"),
+            // The chart with no board is on the default board (`BI-18` part C).
+            card_row("c2", "", "https://Default.Example/a.png"),
+            card_row("c3", "b_other", "https://elsewhere.example/a.png"),
+        ],
+    );
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec![
+            "https://img.example".to_owned(),
+            "https://default.example".to_owned(),
+            "https://elsewhere.example".to_owned(),
+        ],
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+
+    // The same board through both routes: the answer and the payload agree,
+    // and neither carries the site of a card on another board.
+    let jwt = token_issued(5.0, None);
+    let (status, payload) = embed_data(&app, &jwt).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["reporting"]["contentSites"],
+        json!(["https://img.example"])
+    );
+    let (status, framing) = frame(&app, json!({ "jwt": jwt })).await;
+    assert_eq!(status, StatusCode::OK, "{framing}");
+    assert_eq!(
+        framing["contentSites"], payload["reporting"]["contentSites"],
+        "{framing}"
+    );
+
+    // The default board carries the chart with no board, and only that one.
+    let iat = unix_now().floor();
+    let default = token("default", iat, iat + 3600.0, None);
+    let (status, payload) = embed_data(&app, &default).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["reporting"]["contentSites"],
+        json!(["https://default.example"])
+    );
+    let (status, framing) = frame(&app, json!({ "jwt": default })).await;
+    assert_eq!(status, StatusCode::OK, "{framing}");
+    assert_eq!(
+        framing["contentSites"], payload["reporting"]["contentSites"],
+        "{framing}"
+    );
+}
+
 /// `SEC-47`: a board with no card, or a deployment that never saved a site,
 /// adds nothing — the page keeps `img-src 'self' data: blob:`.
 #[tokio::test]

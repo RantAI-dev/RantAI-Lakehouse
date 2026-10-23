@@ -170,11 +170,16 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &board_id,
         &filters,
         &time,
+        &format,
     )
     .await;
     match payload {
-        Ok(mut body) => {
-            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
+        Ok((mut body, content_sites)) => {
+            crate::routes::settings::add_formatting_for_anonymous(
+                &mut body,
+                &format,
+                &content_sites,
+            );
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
@@ -212,10 +217,12 @@ struct FrameBody {
 /// for whether a token is good.
 ///
 /// `contentSites` is the deployment's list (`BI-16` part B) narrowed to the
-/// sites of *this board's* image and web cards, the same list the board's
-/// payload carries to an embed (`add_formatting_for_anonymous`): the whole
-/// deployment list would tell whoever reads a shared link which sites the
-/// deployment allows (`PR #199 review M SHOULD-FIX BI-16 1`, decision M6).
+/// sites of *this board's* image and web cards, with the same selection and
+/// the same helper the board's payload uses
+/// ([`crate::routes::settings::content_sites_of_cards`], `PR #233 review
+/// SHOULD-FIX 1`): the whole deployment list would tell whoever reads a shared
+/// link which sites the deployment allows (`PR #199 review M SHOULD-FIX BI-16
+/// 1`, decision M6).
 /// A store failure is a `500` with the fixed database message, and the caller
 /// treats anything but `200` as "no site".
 pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Response {
@@ -287,12 +294,34 @@ async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Boa
     Ok(None)
 }
 
+/// The stored charts of `board_id` as an embed or a public link shows them: a
+/// chart with no board is on the default board (`BI-18` part C).
+///
+/// `PR #233 review SHOULD-FIX 1`: the payload ([`render_board_payload`]) and
+/// the frame answer's content sites ([`board_content_sites`]) select the
+/// board's cards here and only here, so the page and its policy cannot
+/// disagree about which cards are on the board.
+fn board_cards<'a>(stored: &'a [StoredChartSpec], board_id: &str) -> Vec<&'a StoredChartSpec> {
+    stored
+        .iter()
+        .filter(|c| {
+            if c.board.is_empty() {
+                board_id == store::DEFAULT_BOARD_ID
+            } else {
+                c.board == board_id
+            }
+        })
+        .collect()
+}
+
 /// The deployment's content sites that one of `board`'s image or web cards
 /// uses, in the order the settings list has them.
 ///
 /// The chart read is the one `render_board_payload` already needs for an
-/// embed, and the same "no board on the chart is the default board" rule:
-/// a card that is not on this board must not widen this page's `img-src`.
+/// embed; the selection and the narrowing are the payload's own
+/// ([`board_cards`], [`crate::routes::settings::content_sites_of_cards`]), so
+/// a card that is not on this board cannot widen this page's `img-src` and a
+/// card the payload shows is never refused by the policy.
 async fn board_content_sites(state: &AppState, board: &Board) -> Result<Vec<String>, ApiError> {
     let format = crate::routes::settings::format_settings(state).await?;
     if format.content_sites.is_empty() {
@@ -304,29 +333,10 @@ async fn board_content_sites(state: &AppState, board: &Board) -> Result<Vec<Stri
             upstream_error::report_ch(&upstream_error::DATABASE, &err)
                 .into_api_error(upstream_error::FailedAs::Internal)
         })?;
-    let mut used: Vec<String> = Vec::new();
-    for chart in stored.iter().filter(|c| {
-        if c.board.is_empty() {
-            board.id == store::DEFAULT_BOARD_ID
-        } else {
-            c.board == board.id
-        }
-    }) {
-        let Some(url) = chart.def.types.url.as_deref() else {
-            continue;
-        };
-        let Some(origin) = lakehouse_bi::embed_access::https_origin_of(url) else {
-            continue;
-        };
-        if !used.contains(&origin) {
-            used.push(origin);
-        }
-    }
-    Ok(format
-        .content_sites
-        .into_iter()
-        .filter(|site| used.contains(site))
-        .collect())
+    Ok(crate::routes::settings::content_sites_of_cards(
+        &board_cards(&stored, &board.id),
+        &format,
+    ))
 }
 
 /// Body of `POST /api/dashboard/embed-revoke`.
@@ -494,11 +504,16 @@ pub async fn public_dashboard(
         &board_id,
         &filters,
         &time,
+        &format,
     )
     .await;
     match payload {
-        Ok(mut body) => {
-            crate::routes::settings::add_formatting_for_anonymous(&mut body, &format);
+        Ok((mut body, content_sites)) => {
+            crate::routes::settings::add_formatting_for_anonymous(
+                &mut body,
+                &format,
+                &content_sites,
+            );
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         Err(err) => (
@@ -652,6 +667,11 @@ fn board_body(
 /// [`data`] and [`public_dashboard`]: every stored chart belonging to
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
 /// neither route accepts a `year` parameter).
+///
+/// Also returns the content sites of the board's image and web cards
+/// ([`crate::routes::settings::content_sites_of_cards`], over the same
+/// selection), so the payload and the frame answer for that board narrow the
+/// deployment's list the same way (`PR #233 review SHOULD-FIX 1`).
 async fn render_board_payload(
     ch: &ChClient,
     obligations: &PolicyEngineObligations<'_>,
@@ -659,23 +679,15 @@ async fn render_board_payload(
     board_id: &str,
     filters: &[FilterDef],
     time: &lakehouse_bi::grain::TimeContext,
-) -> Result<Value, lakehouse_clickhouse::ChError> {
+    format: &crate::routes::settings::FormatSettings,
+) -> Result<(Value, Vec<String>), lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
     // An embed or a public link is read by nobody in particular: a chart in the
     // trash or on a personal board is not in it (BI-18 part C, part 2).
     let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
     let field_catalog = catalog_or_empty(ch).await;
-    let stored_for_board: Vec<&StoredChartSpec> = stored
-        .iter()
-        .filter(|c| {
-            if c.board.is_empty() {
-                board_id == "default"
-            } else {
-                c.board == board_id
-            }
-        })
-        .collect();
+    let stored_for_board = board_cards(&stored, board_id);
 
     let cols = board_columns(ch, &stored_for_board, filters, &field_catalog).await?;
 
@@ -766,7 +778,10 @@ async fn render_board_payload(
         charts_out.push(embed_rendered(original, c));
     }
 
-    Ok(board_body(board, &charts_out, &results, time))
+    Ok((
+        board_body(board, &charts_out, &results, time),
+        crate::routes::settings::content_sites_of_cards(&stored_for_board, format),
+    ))
 }
 
 #[cfg(test)]
@@ -899,13 +914,14 @@ mod typed_filters {
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
 
-        let body = render_board_payload(
+        let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
             &board,
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::settings::FormatSettings::default(),
         )
         .await
         .unwrap();
@@ -1045,13 +1061,14 @@ mod typed_filters {
             owner_id: None,
             embed_access: lakehouse_bi::embed_access::EmbedAccess::default(),
         };
-        let body = render_board_payload(
+        let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
             &board,
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::settings::FormatSettings::default(),
         )
         .await
         .unwrap();
@@ -1152,13 +1169,14 @@ mod typed_filters {
         let locked: Vec<FilterDef> =
             serde_json::from_str(r#"[{"column":"kab","values":["b","c"]}]"#).unwrap();
 
-        let body = render_board_payload(
+        let (body, _) = render_board_payload(
             &ch,
             &PolicyEngineObligations::new(None, &ch),
             &board,
             "b1",
             &locked,
             &lakehouse_bi::grain::TimeContext::default(),
+            &crate::routes::settings::FormatSettings::default(),
         )
         .await
         .unwrap();
@@ -1258,6 +1276,7 @@ mod typed_filters {
             "b1",
             &[],
             &time,
+            &crate::routes::settings::FormatSettings::default(),
         )
         .await
         .unwrap();
