@@ -11,6 +11,8 @@
  * untouched, so nothing inside them is ever treated as a keyword.
  */
 
+import { tokenizeSql, type SqlToken } from "./sql-text"
+
 /** Clauses that start a new line. Longest first, so "GROUP BY" wins over "GROUP". */
 const BREAK_BEFORE = [
   "LEFT OUTER JOIN",
@@ -59,77 +61,13 @@ const INLINE_KEYWORDS = [
   "USING",
 ]
 
-const WORD = /[A-Za-z0-9_]/
-
-type Token = { text: string; word: boolean }
-
-/** Split into words, quoted/comment runs (kept verbatim), and everything else. */
-function tokenize(sql: string): Token[] {
-  const tokens: Token[] = []
-  let i = 0
-  while (i < sql.length) {
-    const char = sql[i]
-    const two = sql.slice(i, i + 2)
-
-    if (two === "--" || char === "#") {
-      const end = sql.indexOf("\n", i)
-      const stop = end === -1 ? sql.length : end
-      tokens.push({ text: sql.slice(i, stop), word: false })
-      i = stop
-      continue
-    }
-    if (two === "/*") {
-      const end = sql.indexOf("*/", i + 2)
-      const stop = end === -1 ? sql.length : end + 2
-      tokens.push({ text: sql.slice(i, stop), word: false })
-      i = stop
-      continue
-    }
-    if (char === "'" || char === '"' || char === "`") {
-      let j = i + 1
-      while (j < sql.length) {
-        if (sql[j] === "\\") {
-          j += 2
-          continue
-        }
-        if (sql[j] === char) {
-          if (sql[j + 1] === char) {
-            j += 2
-            continue
-          }
-          j += 1
-          break
-        }
-        j += 1
-      }
-      tokens.push({ text: sql.slice(i, j), word: false })
-      i = j
-      continue
-    }
-    if (WORD.test(char)) {
-      let j = i
-      while (j < sql.length && WORD.test(sql[j])) j += 1
-      tokens.push({ text: sql.slice(i, j), word: true })
-      i = j
-      continue
-    }
-    if (/\s/.test(char)) {
-      i += 1
-      continue
-    }
-    tokens.push({ text: char, word: false })
-    i += 1
-  }
-  return tokens
-}
-
 /** The clause starting at `index`, as its canonical upper-case text. */
-function clauseAt(tokens: Token[], index: number): string | null {
+function clauseAt(tokens: SqlToken[], index: number): string | null {
   for (const clause of BREAK_BEFORE) {
     const parts = clause.split(" ")
     const matches = parts.every((part, k) => {
       const token = tokens[index + k]
-      return token?.word && token.text.toUpperCase() === part
+      return token?.kind === "word" && token.text.toUpperCase() === part
     })
     if (matches) return clause
   }
@@ -143,7 +81,7 @@ function clauseAt(tokens: Token[], index: number): string | null {
  */
 export function formatSql(sql: string): string {
   if (!sql.trim()) return sql
-  const tokens = tokenize(sql)
+  const tokens = tokenizeSql(sql)
   let out = ""
   let i = 0
 
@@ -169,7 +107,7 @@ export function formatSql(sql: string): string {
     }
     const token = tokens[i]
     let text = token.text
-    if (token.word && INLINE_KEYWORDS.includes(text.toUpperCase())) {
+    if (token.kind === "word" && INLINE_KEYWORDS.includes(text.toUpperCase())) {
       text = text.toUpperCase()
     }
     if (needsSpace(text)) out += " "
