@@ -1192,3 +1192,22 @@ is deleted after the run; `g9-upload-large` is dispatched on it at the full
 sizes of T6.1. T6.2 then sets the shipped values here from the RESULT,
 including a separate constant for the unpacked-size check so that `POST
 /api/uploads` keeps 50 MiB (the unpack check must not read the small cap).
+
+### T6.1 measured; slice 2 reopened (planner, 2026-10-23, at `82993674`)
+
+`docs/plans/DATA-17-RESULT.md` (CI run 39903340840): the API stays flat
+(growth under 50 MiB at every size), but the job grows with the upload's
+bytes at three to five times its size, every format (CSV 2 GiB: +9.75 GiB).
+
+- **`BLOCKER 6` (slice 2, AD2: "the job streams").** The job does not hold
+  memory flat; the plan's design and the 2 GB target both depend on it.
+  Product owner's decision on 2026-10-23: fix the streaming first, then
+  measure again and set the cap from that ("Perbaiki streaming dulu"), not
+  ship a smaller cap now. Find where the memory goes (the reader, the dlt
+  extract and normalize, the Arrow buffers, the Iceberg write), with a
+  profile at a size this VM can hold (256 MiB), make each format stream in
+  bounded batches, and add a test that fails when a load's peak grows with
+  the file's size. Then the same graded run on the throwaway branch, and the
+  RESULT document gets the new table beside the old one.
+- T6.2 (the caps, the job's unpacked cap sent from `run_config`, the Parquet
+  cell rule, the refusal text) waits for that second measurement.
