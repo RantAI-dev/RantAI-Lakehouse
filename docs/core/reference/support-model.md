@@ -62,7 +62,7 @@ Where to look before escalating. Pages are in the Monitoring module.
 
 | Symptom | Look at |
 | --- | --- |
-| Pages return errors, service appears up | Services; application database reachability (`docs/OPERATIONS.md`, "Postgres-down is quiet") |
+| Pages return errors, service appears up | Services; application database reachability (`docs/OPERATIONS.md`, "Postgres: unreachable is loud, a mismatched schema refuses to start") |
 | Data is stale | Ingestion (CDC); the pipeline's run history; Alerts |
 | A pipeline failed | The pipeline's run inspector; Alerts |
 | Queries are slow | Workloads; Table Maintenance |
