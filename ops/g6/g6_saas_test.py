@@ -166,6 +166,34 @@ def _markers(spec: dict, key: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _saved_delta_link(state: dict, object_name: str) -> str:
+    """The delta link `state` keeps for `object_name`, refusing any other shape.
+
+    PR #216 final review BLOCKER 19 (round 3): SHOULD-FIX 24 (`d612215c`) stores
+    `{"link": ..., "object": ...}` under `delta_link`, but the SharePoint step
+    still read the value as a bare string, so the gate died with an
+    `AttributeError` instead of a named failure. The object name is checked here
+    too: the step then proves the link is tied to the list it just read, not
+    merely that some link was kept.
+    """
+    saved = state.get("delta_link")
+    if not isinstance(saved, dict):
+        raise SaasGateFailure(
+            f"{object_name}: the saved delta link is not an object with a link and "
+            f"an object name (PR #216 final review BLOCKER 19, round 3): {state!r}"
+        )
+    _expect(
+        isinstance(saved.get("link"), str) and bool(saved["link"]),
+        f"{object_name}: the saved delta link has no link string: {state!r}",
+    )
+    _expect(
+        saved.get("object") == object_name,
+        f"{object_name}: the saved delta link belongs to {saved.get('object')!r}, "
+        f"not this list (PR #216 final review SHOULD-FIX 24): {state!r}",
+    )
+    return saved["link"]
+
+
 def _raises(expected: str, call) -> Exception:  # noqa: ANN001
     """The exception `call` raises, which must be of the class named `expected`
     and must not hold any word the mock's error bodies carry."""
@@ -817,7 +845,10 @@ def step_sharepoint() -> None:
     first = _read_state(module, parts, session, dial, state)
     _expect([r["id"] for r in first] == ["1", "2", "3", "4", "5"], f"sharepoint load: first run read {[r['id'] for r in first]}")
     _expect(len([line for line in mock_log("sharepoint") if "/delta" in line]) == 3, "sharepoint load: the feed's @odata.nextLink was not followed to the third page")
-    _expect(state.get("delta_link", "").endswith("/delta?token=v5"), f"sharepoint load: the delta link kept is {state!r}")
+    # PR #216 final review BLOCKER 19 (round 3): SHOULD-FIX 24 keeps the link with the list it
+    # belongs to, so read both through the helper and assert the object the gate just loaded.
+    link = _saved_delta_link(state, SP_OBJECT)
+    _expect(link.endswith("/delta?token=v5"), f"sharepoint load: the delta link kept is {state!r}")
     _log("sharepoint load: 5 items over 3 pages of the delta feed; its delta link is kept in the state")
 
     admin("sharepoint", action="put", id=2, fields={"Title": "item 2 changed"})
@@ -835,7 +866,10 @@ def step_sharepoint() -> None:
     admin("sharepoint", action="clear_log")
     resync = _read_state(module, parts, session, dial, state)
     _expect(sorted(r["id"] for r in resync) == ["1", "2", "4", "5", "6", "7"], f"sharepoint resync: read {sorted(r['id'] for r in resync)}")
-    _expect(state["delta_link"].endswith("/delta?token=v9"), f"sharepoint resync: the new link is {state!r}")
+    # PR #216 final review BLOCKER 19 (round 3): the resync must keep the new link under the same
+    # object name (SHOULD-FIX 24), not any link that happens to be there.
+    link = _saved_delta_link(state, SP_OBJECT)
+    _expect(link.endswith("/delta?token=v9"), f"sharepoint resync: the new link is {state!r}")
     admin("sharepoint", action="expire", on=False)
     _log("sharepoint resync: a 410 Gone on the saved link made a full read from a token-less delta; the new link was kept")
 
