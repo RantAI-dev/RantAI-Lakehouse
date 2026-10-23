@@ -1461,3 +1461,81 @@ a reload a saved list shows its ids until "Find objects" runs; add it to
 Each fix cites its number at the site and in the commit (rule 13); each
 new test fails without its fix. Then the full verification block once,
 and a Handoff below.
+
+### Handoff: final review fix round (developer, 2026-10-23)
+
+Fixes for the "Final review before merge" findings, one finding per commit, on
+`feat/data-phase-4-connectors` with `main` merged in. Every new test was run
+against the source reverted (or with the checked line removed) first and failed
+there, then passed with the fix.
+
+| Commit | Finding | Subject |
+| --- | --- | --- |
+| `aa07bdd7` | BLOCKER 17 | fix(dagster): a delta-link read is merged, not filtered by the cursor |
+| `39dda8be` | BLOCKER 18 | fix: a business app merges on its key, never plain incremental |
+| `7ad32332` | BLOCKER 19 | fix(gate): prove the reload asked from the cursor, not from the start |
+| `4a8bcbca` | SHOULD-FIX 20 | test(ci): the skipped discovery-scale case checks one variable |
+| `a2d040f0` | SHOULD-FIX 21 | fix(dagster): HubSpot declares the search lag instead of stepping back by hand |
+| `8cf298ef` | SHOULD-FIX 22 | fix(dagster,frontend): GA4 period lag and the API's own report limits |
+| `b262d448` | SHOULD-FIX 23 | fix(dagster): fixed failures for an undecodable host, a bad Retry-After and a bad body |
+| `d612215c` | SHOULD-FIX 24 | fix(dagster): a saved delta link is tied to the object it belongs to |
+| `5127dd29` | SHOULD-FIX 25 | fix(api,store,frontend): revocation under the gate, NetSuite's certificate, sign-in in the identity |
+| `1c88b555` | SHOULD-FIX 26 | docs: the gate docstring, DEC-9's build, the follow-up range and the Zendesk note |
+
+Commands run on the final tree, with counts:
+
+- `cd rust && cargo fmt --check`: clean.
+- `cargo-locked clippy -j 2 --workspace --all-targets --all-features -- -D warnings`: 0 warnings.
+- `cargo-locked test -j 2 -p lakehouse-store`: **731 passed, 0 failed** across its
+  31 test binaries.
+- `cargo-locked test -j 2 -p lakehouse-api --lib a_saas_sign_out_is_rebased`: 1 passed.
+- `cargo-locked test -j 2 -p lakehouse-api --test connector_oauth_flow signing_out_revokes_at_the_provider_and_removes_the_token`: 1 passed (a database was available).
+- Scoped checks per commit: `cargo test -p lakehouse-store` filtered to
+  `saas_dial_tests`, `saas_objects_take_incremental` and
+  `the_saas_target_identity` (all passed); `cargo clippy -p lakehouse-store` and
+  `-p lakehouse-api --all-targets -- -D warnings` (0 warnings).
+- `cd dagster && python -m pytest dispar_orchestrate -q`: **2140 passed, 33
+  subtests passed, 0 failed** (16m59s).
+- `bun run typecheck`: 0 errors. `bun run lint`: 0 errors, 9 warnings (all
+  pre-existing, none in the files touched).
+- `bun test src/features/connectors/`: **362 pass, 0 fail**. `bun test
+  src/lib/connectors/`: **54 pass, 1 skip, 0 fail**.
+- `python3 ops/lint/check_intra_package_imports.py`,
+  `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK (19
+  supported types covered, 0 waived).
+- `bash scripts/ci/tests/test_required_gate.sh`: **56 passed, 0 failed**.
+- `python3 -m py_compile ops/g6/g6_saas_test.py ops/g6/saas_stub_salesforce.py
+  ops/g6/saas_stub_zendesk.py`: OK.
+
+**Not verified, and why**
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  machine does not run for this task; only the three edited files compile, and
+  no unit test of the stubs exists. CI decides whether BLOCKER 19's checks pass
+  on the mock (the marker-absence rule for every vendor, the Zendesk value
+  comparison, the revoked run's `sign_in_refused` class).
+- **The full Rust workspace test suite has not run** (the reviewer runs it).
+  Only `-p lakehouse-store` in full and the two `lakehouse-api` cases above did.
+- **A `saas` sign-out under the gate origin has no end-to-end test.** The
+  rebased URL is unit-tested (`revocation_url`), and the existing `rest`
+  sign-out flow test passes; the gate's own job does not sign out, and a
+  flow test would need the process-wide `SAAS_GATE_ORIGINS` variable (the
+  suite deliberately avoids `std::env::set_var`). The call site is one line
+  and the test fails when that helper is a no-op.
+- **BLOCKER 19 changed the shared gate script's log capture** (an extra
+  `clear_log` before the first load). This is reviewed by reading it; CI is
+  the first run.
+- Nothing was shown in a browser, and no vendor account was used.
+
+**Decisions taken where the review left a choice**
+
+- SHOULD-FIX 22: the dimensions/metrics limits were read from Google on
+  2026-10-23 — the v1beta discovery document on `RunReportRequest` (9
+  dimensions, 10 metrics) and the "Create a report" guide (9 dimensions). The
+  period lag covers the grain's own length plus the 3-day lookback.
+- SHOULD-FIX 25: the test that asserted a sign-in-kind change was not a
+  re-point now asserts it is, as the finding says; the reason is in the test
+  and the commit.
+- BLOCKER 18: the Rust side can only refuse plain `incremental`; the
+  `primaryKey`-vs-vendor-key check is Python only because the declared keys
+  live in the Python vendor modules, as the finding allows.
