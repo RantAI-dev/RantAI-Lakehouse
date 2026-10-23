@@ -100,12 +100,23 @@ Rows 1 to 4 are the spec's checklist, in its order.
 | 9 | Refresh a table "removing old rows", then "keeping" | First: the table holds exactly the source's rows. Second: by its mode, merged or added | Pass 2026-10-23 (product owner) |
 | 10 | Clear a table | It is empty; the next incremental run loads everything again | Pass 2026-10-23 (product owner) |
 | 11 | Query a deduplicated table from Query Studio after two merges | One row per key and a correct count | Pass 2026-10-23 (product owner) |
-
 | 12 | In "history" mode, run twice with nothing changed at the source, then query the table | No new rows; one current row per key; closed rows keep their times | Pass 2026-10-23 (product owner) |
 
 **Accepted by:** product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 Exceptions, each with an owner and a date:
+
+- Row 8 (and row 1, which includes it): accepted as Pass, with a gap the
+  product owner's run could not show. In "replace and deduplicate" the
+  console offers no field for the cursor column; it shows one only for the
+  two incremental modes
+  (`src/features/connectors/connector-ingest-panel.tsx`, read on `main` at
+  `309e1a58`). Without a cursor the load keeps the last row read for each
+  key, as the mode's hint says, not the one with the highest cursor value;
+  a cursor can be set only through the API. Found in the planner's
+  pre-check of 2026-10-16, on a source where the last row read and the
+  highest cursor differ. Owner: product owner. Date: 2026-10-23.
+  Follow-up: `SRC-32`.
 
 ## After acceptance
 
