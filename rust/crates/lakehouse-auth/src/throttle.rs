@@ -107,6 +107,57 @@ pub async fn record_failure(
     key: &str,
     policy: &ThrottlePolicy,
 ) -> Result<Option<OffsetDateTime>, AuthError> {
+    let Some((failures, locked)) = bump(pool, key, policy).await? else {
+        return Ok(None);
+    };
+    let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
+    if failures >= max {
+        Ok(locked)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Count one sign-in attempt for `key` BEFORE its password is verified
+/// (SEC-49). Same single atomic UPSERT, window, lock-expiry reset and lock
+/// rule as [`record_failure`] (they share `bump`), so concurrent calls
+/// serialise on the row in Postgres and each gets its own count: 20
+/// simultaneous calls see 1 to 20, never the same number twice.
+///
+/// Counting after the Argon2 check let any number of simultaneous guesses
+/// pass the lock check before the first failure was written. The caller
+/// verifies a password only while the returned count is within
+/// [`ThrottlePolicy::max_failures`]; a count above it is refused without a
+/// hash. A correct password then calls [`clear`], as before.
+///
+/// Returns `(count, locked_until)`: the count after this call, and
+/// `Some(locked_until)` once `count >= max_failures` (the call that reaches
+/// the limit sets the lock), otherwise `None`.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn record_attempt(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<(u32, Option<OffsetDateTime>), AuthError> {
+    let Some((count, locked)) = bump(pool, key, policy).await? else {
+        return Ok((0, None));
+    };
+    let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
+    let locked = if count >= max { locked } else { None };
+    Ok((u32::try_from(count).unwrap_or(0), locked))
+}
+
+/// The one UPSERT behind [`record_failure`] and [`record_attempt`]
+/// (SEC-49: shared so the two cannot drift apart). Returns the row's
+/// `(failures, locked_until)` after the write.
+async fn bump(
+    pool: &PgPool,
+    key: &str,
+    policy: &ThrottlePolicy,
+) -> Result<Option<(i32, Option<OffsetDateTime>)>, AuthError> {
     let now = OffsetDateTime::now_utc();
     let window_interval = format!("{} seconds", policy.window.whole_seconds());
     let lockout_interval = format!("{} seconds", policy.lockout.whole_seconds());
@@ -154,15 +205,34 @@ pub async fn record_failure(
     .bind(&lockout_interval)
     .fetch_optional(pool)
     .await?;
-    let Some((failures, locked)) = row else {
-        return Ok(None);
-    };
-    let max: i32 = i32::try_from(policy.max_failures).unwrap_or(i32::MAX);
-    if failures >= max {
-        Ok(locked)
-    } else {
-        Ok(None)
-    }
+    Ok(row)
+}
+
+/// Give back one count taken by [`record_attempt`] when the try ended in a
+/// storage error rather than a verdict on the password (SEC-49). Counting
+/// before the check would otherwise let database hiccups walk a real user
+/// toward a lockout (review blocker 1, 2026-10-03). A row left with no
+/// count and no lock is deleted, so a storage failure leaves no row. One
+/// statement; it never goes below zero.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn refund_attempt(pool: &PgPool, key: &str) -> Result<(), AuthError> {
+    sqlx::query(
+        "WITH gone AS ( \
+           DELETE FROM login_throttle \
+           WHERE key_hash = $1 AND failures <= 1 AND locked_until IS NULL \
+           RETURNING 1 \
+         ) \
+         UPDATE login_throttle SET failures = failures - 1 \
+         WHERE key_hash = $1 AND failures > 1 \
+           AND NOT EXISTS (SELECT 1 FROM gone)",
+    )
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Clear the throttle row for `key` — called on a successful login so the
