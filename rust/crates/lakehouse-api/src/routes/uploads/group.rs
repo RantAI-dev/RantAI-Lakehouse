@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 
 use super::columns::{self, Sample};
 use super::{
-    ALREADY_LOADING, Conversion, MAX_UPLOAD_BYTES, PreviewQuery, STILL_RECEIVING, Settler,
+    ALREADY_LOADING, Conversion, MAX_UNPACKED_BYTES, PreviewQuery, STILL_RECEIVING, Settler,
     ZIP_COLUMNS_DIFFER, conversion_of, job_kind, layout_unless_converted, not_found, pool,
     preview_with_sample,
 };
@@ -164,7 +164,9 @@ pub(super) async fn members(
         total = total.saturating_add(row.size_bytes);
         found.push(Member { row, conversion });
     }
-    if total > i64::try_from(MAX_UPLOAD_BYTES).unwrap_or(i64::MAX) {
+    // Plan T6.2 item 2: the files of one load add up to at most the unpacked cap
+    // (`MAX_UPLOAD_BYTES` is the size of one `POST /api/uploads` file).
+    if total > i64::try_from(MAX_UNPACKED_BYTES).unwrap_or(i64::MAX) {
         return Err(ApiError::BadRequest(TOO_LARGE_TOGETHER.to_owned()));
     }
     Ok(found)

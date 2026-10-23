@@ -161,6 +161,18 @@ use columns::{ColumnPlan, Sample, SpecView};
 /// and means 50 MiB, as the plan words it.
 pub(super) const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 
+/// The most bytes a gzip or zip file, or the files of one load together, may
+/// unpack to or add up to: 2 GiB, exactly 2,147,483,648. Its own constant and
+/// not [`MAX_UPLOAD_BYTES`], which means the `POST /api/uploads` file size
+/// only: the API's gzip and zip check, the grouped-load total
+/// (`group::members`) and the `max_bytes` that [`run_config`] sends to the
+/// job all read this one, so the three cannot disagree. Before it, the job was
+/// told 50 MiB and refused any gzip above that once unpacked, a size the
+/// session path already took (found in the measurement of
+/// `docs/plans/DATA-17-RESULT.md`). A bomb is decoded by range and counted,
+/// never held, so the size costs time and not memory. Plan T6.2, item 2.
+pub(super) const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// What `DefaultBodyLimit` allows the `POST /api/uploads` request as a whole:
 /// the cap plus 1 MiB for the multipart framing around the file. Applied to
 /// that route only (`routes::uploads_router`); every other route keeps
@@ -206,9 +218,10 @@ const STALE_CLAIM: time::Duration = time::Duration::minutes(2);
 /// and a loading upload can be neither deleted nor loaded again.
 ///
 /// One hour is a bound chosen to be well past any load of a file at the
-/// [`MAX_UPLOAD_BYTES`] cap, not a measurement: no load of a file that size has
-/// been timed. It only has to be long enough that a run which is merely slow,
-/// or about to start, is not failed under its own feet.
+/// [`MAX_UNPACKED_BYTES`] cap, not a measurement of the bound itself: the loads
+/// of `docs/plans/DATA-17-RESULT.md` took under two minutes at 2 GiB on one
+/// runner, so an hour leaves a wide margin. It only has to be long enough that a
+/// run which is merely slow, or about to start, is not failed under its own feet.
 const UNKNOWN_RUN_BOUND: time::Duration = time::Duration::hours(1);
 
 /// How long a read waits for the orchestrator or for `ClickHouse` while it
@@ -829,7 +842,7 @@ pub async fn create(
     // A workbook or a Parquet file is opened before anything is stored: only
     // what opens is kept. (A Parquet file is opened by its footer; a page that
     // cannot be decoded is found when the file is converted.)
-    let cap = u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX);
+    let cap = MAX_UNPACKED_BYTES;
     let (workbook, parquet) = match accepted {
         Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => (None, None),
         // `DATA-17` slice 4 (decision 2): what a gzip or zip file unpacks to counts toward
@@ -2155,7 +2168,7 @@ fn run_config(
                     "storage_keys": load_keys,
                     "format": format,
                     "compression": compression,
-                    "max_bytes": MAX_UPLOAD_BYTES,
+                    "max_bytes": MAX_UNPACKED_BYTES,
                     "bronze_table_name": request.table,
                     "load_mode": request.mode.as_str(),
                     "encoding": request.encoding.as_str(),
@@ -3059,6 +3072,15 @@ mod tests {
             "The file is larger than the 50 MB limit."
         );
         assert!(check_file(&over[..MAX_UPLOAD_BYTES], "x.csv").is_ok());
+    }
+
+    /// Plan T6.2 item 2: the unpacked cap (what the job is told, and what a gzip,
+    /// a zip or a grouped load may add up to) is 2 GiB and is not the 50 MiB of
+    /// one `POST /api/uploads` file.
+    #[test]
+    fn the_unpacked_cap_is_2_gib_and_is_not_the_cap_of_a_whole_file() {
+        assert_eq!(MAX_UNPACKED_BYTES, 2_147_483_648);
+        assert_ne!(MAX_UNPACKED_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
     }
 
     #[test]

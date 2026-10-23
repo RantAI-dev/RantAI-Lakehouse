@@ -63,9 +63,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    Accepted, CreateResponse, EMPTY_FILE, MAX_UPLOAD_BYTES, NO_TENANT, TOO_LARGE, UploadView,
-    blocking, classify_head, display_name, not_found, pool, record_audit, sha256_hex, storage_key,
-    upload_audit_event,
+    Accepted, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES, NO_TENANT,
+    TOO_LARGE, UploadView, blocking, classify_head, display_name, not_found, pool, record_audit,
+    sha256_hex, storage_key, upload_audit_event,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -606,7 +606,7 @@ async fn open_whole(
         workbook: None,
         parquet: None,
     };
-    let cap = u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX);
+    let cap = MAX_UNPACKED_BYTES;
     match accepted {
         Accepted::Text | Accepted::Json | Accepted::JsonLines | Accepted::Avro => {
             return Ok(nothing());

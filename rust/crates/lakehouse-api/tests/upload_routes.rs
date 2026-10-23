@@ -78,6 +78,12 @@ const CAP: usize = 50 * 1024 * 1024;
 /// here and pinned by that module's own test.
 const SESSION_CAP: usize = 2 * 1024 * 1024 * 1024;
 
+/// `MAX_UNPACKED_BYTES` of `routes::uploads`: 2 GiB, the same number as
+/// [`SESSION_CAP`] and a constant of its own. It is the `max_bytes` the job is
+/// told (it was `MAX_UPLOAD_BYTES`, 52,428,800, so the job refused a gzip above
+/// 50 MiB unpacked) and the most a gzip, a zip or a grouped load may add up to.
+const UNPACKED_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
         "{}/../../../ops/fixtures/uploads/{name}",
@@ -1797,7 +1803,7 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
             "storage_keys": [format!("uploads/{GROUP}/{id}.xls")],
             "format": "delimited",
             "compression": "none",
-            "max_bytes": 52_428_800,
+            "max_bytes": UNPACKED_CAP,
             "bronze_table_name": "sap_stock",
             "load_mode": "append",
             "encoding": "utf-16",
@@ -4227,7 +4233,7 @@ async fn a_workbook_ingest_stores_the_converted_sheet_beside_the_original_and_la
             "storage_keys": [converted],
             "format": "delimited",
             "compression": "none",
-            "max_bytes": 52_428_800,
+            "max_bytes": UNPACKED_CAP,
             "bronze_table_name": "quirks_raw",
             "load_mode": "replace",
             "encoding": "utf-8",
@@ -4647,7 +4653,7 @@ async fn a_parquet_ingest_converts_nothing_and_launches_the_job_on_the_original_
             "storage_keys": [original],
             "format": "parquet",
             "compression": "none",
-            "max_bytes": 52_428_800,
+            "max_bytes": UNPACKED_CAP,
             "bronze_table_name": "orders_raw",
             "load_mode": "replace",
             "encoding": "utf-8",
@@ -6148,11 +6154,6 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     zip_of(entries, false)
 }
 
-/// A zip of deflated entries, built by hand (the method byte, and `flate2` for the data).
-fn deflated_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    zip_of(entries, true)
-}
-
 fn zip_of(entries: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = 0xffff_ffff_u32;
@@ -6372,7 +6373,7 @@ async fn the_job_is_told_the_format_and_the_wrapper_of_each_new_kind() {
         let config = &launches[0]["variables"]["cfg"]["ops"]["ingest_uploaded_file"]["config"];
         assert_eq!(config["format"], format, "{name}");
         assert_eq!(config["compression"], compression, "{name}");
-        assert_eq!(config["max_bytes"], 52_428_800, "{name}");
+        assert_eq!(config["max_bytes"], UNPACKED_CAP, "{name}");
         assert_eq!(config["encoding"], "utf-8", "{name}");
         assert_eq!(config["delimiter"], ",", "{name}");
         assert_eq!(config["header_row"], 0, "{name}");
@@ -6386,16 +6387,22 @@ async fn the_job_is_told_the_format_and_the_wrapper_of_each_new_kind() {
 }
 
 #[tokio::test]
-async fn a_gzip_or_zip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
+async fn a_gzip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
-    // 51 MiB of text that packs into a few tens of KiB: over the 50 MB cap once unpacked.
-    let mut big = b"id,name\n".to_vec();
-    big.resize(51 * MIB, b'a');
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    std::io::Write::write_all(&mut encoder, &big).unwrap();
+    // One byte more than the unpacked cap (2 GiB), made in 1 MiB blocks and never held
+    // whole: it packs into a couple of MiB. Plan T6.2 item 2: the cap moved from 50 MiB.
+    // (The zip check shares the cap and `count`; its refusal is pinned by the
+    // `upload_formats` tests, which take the cap as a parameter, since a 2 GiB zip entry
+    // could only be built in memory here.)
+    let block = vec![b'a'; MIB];
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    for _ in 0..2048 {
+        std::io::Write::write_all(&mut encoder, &block).unwrap();
+    }
+    std::io::Write::write_all(&mut encoder, b"a").unwrap();
     let bomb = encoder.finish().unwrap();
-    assert!(bomb.len() < 200 * 1024, "the setup: a small file");
+    assert!(bomb.len() < 8 * MIB, "the setup: a small file");
     let unpacked = "The file is larger than the upload limit once unpacked.";
 
     assert_eq!(
@@ -6411,14 +6418,6 @@ async fn a_gzip_or_zip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(reply.json["error"], unpacked);
     assert_eq!(stack.row_count(&id).await, 0);
-
-    // A zip whose one file unpacks past the cap.
-    let zipped = deflated_zip(&[("a.csv", &big)]);
-    assert!(zipped.len() < 200 * 1024, "the setup: a small file");
-    assert_eq!(
-        refusal_of(&stack, &bayu, "bomb.zip", zipped).await,
-        unpacked
-    );
 }
 
 #[tokio::test]
@@ -7129,8 +7128,9 @@ async fn files_of_two_kinds_or_together_over_the_cap_are_refused() {
         );
     }
 
-    // 30 MB and 30 MB are each under the cap and together over it.
-    sqlx::query("UPDATE file_upload SET size_bytes = 31457280 WHERE id = ANY($1)")
+    // 1.5 GiB and 1.5 GiB are each under the cap and together over it (the
+    // sizes are written to the rows; no such file is stored).
+    sqlx::query("UPDATE file_upload SET size_bytes = 1610612736 WHERE id = ANY($1)")
         .bind(vec![csv.clone(), second.clone()])
         .execute(&stack.app.pool)
         .await
