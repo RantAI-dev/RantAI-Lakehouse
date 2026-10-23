@@ -533,7 +533,9 @@ pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) ->
             entry["referenceLines"] = serde_json::to_value(lines).unwrap_or(Value::Null);
         }
         // The names its series can take: the keys a series colour and a
-        // value format are stored under.
+        // value format are stored under. A chart with a breakdown draws one
+        // series per data value, so the name it draws is the measure and
+        // not a series.
         entry["seriesNames"] = json!(store::drawn_names(&c.spec.y));
         let tab = match boards.iter().find(|b| b.id == c.board) {
             Some(board) => tab_of_chart(board, &c.spec.id),

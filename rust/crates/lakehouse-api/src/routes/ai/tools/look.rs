@@ -1,5 +1,7 @@
 //! Formatting tools (`BI-17` part A, with `AI-8`): `format_chart` and
-//! `set_dashboard_theme`.
+//! `set_dashboard_theme`, and the helpers the chart tools share: the field
+//! whose shape is wrong (`wrong_field`) and the refusal of a layer that names
+//! no data source (`check_layers_name_a_source`).
 //!
 //! # Posture
 //!
@@ -10,8 +12,11 @@
 //! `null` clears one, a field not named is kept), and saves the whole chart
 //! through the same builder and the same checks as `update_chart`
 //! (`spec_from_input`, `lakehouse_bi::style::check_style`), so the assistant
-//! cannot save what the console's builder would refuse and a refusal is the
-//! console's own sentence. It does not relabel the chart's author.
+//! cannot save what the console's builder would refuse and a refusal from the
+//! store is the console's own sentence. A layer that names no data source is
+//! refused in the assistant's own words: the store applies the console's check
+//! in `lakehouse_bi::layers`, which names the console's arguments, while a
+//! model sends `mart` or `sqlSource`. It does not relabel the chart's author.
 //!
 //! `set_dashboard_theme` saves a dashboard's theme and font through the console
 //! route's own handler (`routes::dashboard::boards_update`), which checks the
