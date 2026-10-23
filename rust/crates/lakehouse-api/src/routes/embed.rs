@@ -197,34 +197,69 @@ struct FrameBody {
 }
 
 /// `POST /api/embed/frame` — the sites allowed to frame the embed page opened
-/// with this token (`SEC-12`). Public, like the page itself: the token is
-/// the credential.
+/// with this token, and the content sites its image and web cards may load
+/// from (`SEC-12`, `SEC-47`). Public, like the page itself: the token is the
+/// credential.
 ///
 /// The console's `proxy.ts` calls this before it serves `/embed/*` and turns
-/// the answer into `Content-Security-Policy: frame-ancestors ...`. It returns
-/// ONLY the origin list. A token that is invalid, expired, withdrawn, for a
-/// board with embedding off or for no board at all gets the same answer as a
-/// board with no sites listed, `{"origins": []}`, so this route is no oracle
-/// for whether a token is good. A store failure is a `500` with the fixed
-/// database message; the caller treats anything but `200` as "no site".
+/// the answer into that page's `Content-Security-Policy`: `origins` is its
+/// `frame-ancestors`, `contentSites` is what its `img-src` and `frame-src`
+/// add to `'self' data: blob:` and `'none'`.
+///
+/// A token that is invalid, expired, withdrawn, for a board with embedding
+/// off or for no board at all gets the same answer as a board with nothing
+/// listed, `{"origins": [], "contentSites": []}`, so this route is no oracle
+/// for whether a token is good.
+///
+/// `contentSites` is the deployment's list (`BI-16` part B) narrowed to the
+/// sites of *this board's* image and web cards, the same list the board's
+/// payload carries to an embed (`add_formatting_for_anonymous`): the whole
+/// deployment list would tell whoever reads a shared link which sites the
+/// deployment allows (`PR #199 review M SHOULD-FIX BI-16 1`, decision M6).
+/// A store failure is a `500` with the fixed database message, and the caller
+/// treats anything but `200` as "no site".
 pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Response {
     let parsed = serde_json::from_slice::<FrameBody>(&body).unwrap_or_default();
-    match resolve_frame_origins(&state, parsed).await {
-        Ok(origins) => (StatusCode::OK, ApiJson(json!({ "origins": origins }))).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-        )
-            .into_response(),
-    }
+    let board = match board_for_frame(&state, parsed).await {
+        Ok(board) => board,
+        Err(err) => return database_failure(&err),
+    };
+    let Some(board) = board else {
+        return frame_answer(&[], &[]);
+    };
+    let content_sites = match board_content_sites(&state, &board).await {
+        Ok(sites) => sites,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    frame_answer(&board.embed_access.origins, &content_sites)
 }
 
-async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<String>, ChError> {
+/// The fixed-500 answer a store failure gets, as the other embed routes send it.
+fn database_failure(err: &ChError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, err).to_json()),
+    )
+        .into_response()
+}
+
+/// The one `200` answer this route sends, with both lists in a fixed shape.
+fn frame_answer(origins: &[String], content_sites: &[String]) -> Response {
+    (
+        StatusCode::OK,
+        ApiJson(json!({ "origins": origins, "contentSites": content_sites })),
+    )
+        .into_response()
+}
+
+/// The board a frame request names, or `None` for anything that is not a good
+/// token — every refused case gets the same empty answer.
+async fn board_for_frame(state: &AppState, body: FrameBody) -> Result<Option<Board>, ChError> {
     if let Some(jwt) = body.jwt.filter(|s| !s.is_empty()) {
         // Same verification `data` applies, so a token that would be refused
         // there is not given a framing list here.
         let Some(secret) = state.config.embed_secret.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Ok(claims) = lakehouse_embed::verify_embed(
             &jwt,
@@ -232,28 +267,66 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
             state.config.embed_token_max_lifetime_seconds,
             lakehouse_embed::unix_now(),
         ) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await?;
-        return Ok(board
-            .filter(|b| {
-                b.embed_enabled.unwrap_or(false)
-                    && !b.embed_access.is_withdrawn(
-                        claims.iat.unwrap_or(f64::NEG_INFINITY),
-                        claims.jti.as_deref(),
-                    )
-            })
-            .map(|b| b.embed_access.origins)
-            .unwrap_or_default());
+        return Ok(board.filter(|b| {
+            b.embed_enabled.unwrap_or(false)
+                && !b.embed_access.is_withdrawn(
+                    claims.iat.unwrap_or(f64::NEG_INFINITY),
+                    claims.jti.as_deref(),
+                )
+        }));
     }
     if let Some(token) = body.token.filter(|s| !s.is_empty()) {
-        let board = store::get_board_by_token(&state.clickhouse, &token).await?;
-        return Ok(board.map(|b| b.embed_access.origins).unwrap_or_default());
+        return store::get_board_by_token(&state.clickhouse, &token).await;
     }
-    Ok(Vec::new())
+    Ok(None)
+}
+
+/// The deployment's content sites that one of `board`'s image or web cards
+/// uses, in the order the settings list has them.
+///
+/// The chart read is the one `render_board_payload` already needs for an
+/// embed, and the same "no board on the chart is the default board" rule:
+/// a card that is not on this board must not widen this page's `img-src`.
+async fn board_content_sites(state: &AppState, board: &Board) -> Result<Vec<String>, ApiError> {
+    let format = crate::routes::settings::format_settings(state).await?;
+    if format.content_sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stored = store::list_stored_charts(&state.clickhouse, &Viewer::anonymous())
+        .await
+        .map_err(|err| {
+            upstream_error::report_ch(&upstream_error::DATABASE, &err)
+                .into_api_error(upstream_error::FailedAs::Internal)
+        })?;
+    let mut used: Vec<String> = Vec::new();
+    for chart in stored.iter().filter(|c| {
+        if c.board.is_empty() {
+            board.id == store::DEFAULT_BOARD_ID
+        } else {
+            c.board == board.id
+        }
+    }) {
+        let Some(url) = chart.def.types.url.as_deref() else {
+            continue;
+        };
+        let Some(origin) = lakehouse_bi::embed_access::https_origin_of(url) else {
+            continue;
+        };
+        if !used.contains(&origin) {
+            used.push(origin);
+        }
+    }
+    Ok(format
+        .content_sites
+        .into_iter()
+        .filter(|site| used.contains(site))
+        .collect())
 }
 
 /// Body of `POST /api/dashboard/embed-revoke`.

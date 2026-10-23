@@ -40,6 +40,9 @@ const BOARD: &str = "b_embed";
 #[derive(Clone)]
 struct FakeCh {
     boards: Arc<Mutex<Vec<Value>>>,
+    /// Rows of `console.bi_chart` the chart read answers with (`SEC-47`: the
+    /// frame route needs a board's cards to narrow its content sites).
+    charts: Arc<Mutex<Vec<Value>>>,
     events: Arc<Mutex<Vec<Value>>>,
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -124,12 +127,17 @@ impl FakeCh {
     }
 
     fn with_boards(boards: Vec<Value>) -> Self {
+        Self::with_charts(boards, Vec::new())
+    }
+
+    fn with_charts(boards: Vec<Value>, charts: Vec<Value>) -> Self {
         let mut events = Vec::new();
         for b in &boards {
             events.extend(seed_events_from_board(b));
         }
         Self {
             boards: Arc::new(Mutex::new(boards)),
+            charts: Arc::new(Mutex::new(charts)),
             events: Arc::new(Mutex::new(events)),
             log: Arc::new(Mutex::new(Vec::new())),
         }
@@ -324,7 +332,7 @@ impl Respond for FakeCh {
             return rows(found);
         }
         if sql.contains("FROM console.bi_chart") {
-            return rows(vec![]);
+            return rows(self.charts.lock().unwrap().clone());
         }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
@@ -949,8 +957,8 @@ async fn the_frame_answer_is_the_boards_sites_for_a_good_token_and_empty_for_eve
     ]);
     let ch = fake.serve().await;
     let app = app(&ch, Some(SECRET)).await;
-    let listed = json!({ "origins": ["https://app.customer.example"] });
-    let none = json!({ "origins": [] });
+    let listed = json!({ "origins": ["https://app.customer.example"], "contentSites": [] });
+    let none = json!({ "origins": [], "contentSites": [] });
 
     // Signed token, public link token.
     assert_eq!(
@@ -990,6 +998,96 @@ async fn the_frame_answer_without_a_secret_is_empty_not_an_error() {
     let app = app(&ch, None).await;
     assert_eq!(
         frame(&app, json!({ "jwt": token_issued(5.0, None) })).await,
-        (StatusCode::OK, json!({ "origins": [] }))
+        (StatusCode::OK, json!({ "origins": [], "contentSites": [] }))
+    );
+}
+
+/// A `console.bi_chart` row: one image card on `board` whose address is `url`.
+fn card_row(id: &str, board: &str, url: &str) -> Value {
+    let spec = json!({
+        "id": id, "title": id, "kind": "image", "mart": "mart_a",
+        "sql": "SELECT 1", "x": "kab", "y": "visitors"
+    });
+    let def = json!({
+        "title": id, "mart": "mart_a", "kind": "image", "dimension": "kab",
+        "measures": ["visitors"], "url": url
+    });
+    json!({
+        "id": id, "board": board, "created_by": "ui", "created_at": "2026-01-01 00:00:00",
+        "spec_json": json!({ "spec": spec, "def": def, "hasYear": false }).to_string(),
+    })
+}
+
+/// `SEC-47`: the frame answer carries the deployment's content sites only as
+/// far as this board's own image and web cards use them — a card on another
+/// board, or a site no card uses, would widen this page's `img-src` for no
+/// reason and tell an embed visitor what the deployment allows.
+#[tokio::test]
+async fn the_frame_answer_carries_only_the_sites_of_this_boards_cards() {
+    let fake = FakeCh::with_charts(
+        vec![board_row(
+            BOARD,
+            &json!({ "embed_origins_json": r#"["https://app.customer.example"]"# }),
+        )],
+        vec![
+            card_row("c1", BOARD, "https://Img.Example/logo.png"),
+            card_row("c2", BOARD, "https://not-listed.example/a.png"),
+            card_row("c3", "b_other", "https://elsewhere.example/a.png"),
+        ],
+    );
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec![
+            "https://img.example".to_owned(),
+            "https://elsewhere.example".to_owned(),
+            "https://unused.example".to_owned(),
+        ],
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+
+    let expected = json!({
+        "origins": ["https://app.customer.example"],
+        "contentSites": ["https://img.example"],
+    });
+    assert_eq!(
+        frame(&app, json!({ "jwt": token_issued(5.0, Some("ok")) })).await,
+        (StatusCode::OK, expected.clone())
+    );
+    // The public link token answers the same list; it is the same board.
+    assert_eq!(
+        frame(&app, json!({ "token": format!("p_{BOARD}") })).await,
+        (StatusCode::OK, expected)
+    );
+}
+
+/// `SEC-47`: a board with no card, or a deployment that never saved a site,
+/// adds nothing — the page keeps `img-src 'self' data: blob:`.
+#[tokio::test]
+async fn the_frame_answer_without_a_card_has_no_content_site() {
+    let ch = FakeCh::new(&json!({})).serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let stored = lakehouse_store::reporting_settings::ReportingSettings {
+        time_zone: "UTC".to_owned(),
+        week_start: "monday".to_owned(),
+        number_locale: "en-US".to_owned(),
+        company_palette: Vec::new(),
+        fonts: Vec::new(),
+        content_sites: vec!["https://img.example".to_owned()],
+    };
+    lakehouse_store::reporting_settings::upsert(&app.pool, &stored, "test")
+        .await
+        .expect("the settings are saved");
+
+    assert_eq!(
+        frame(&app, json!({ "jwt": token_issued(5.0, None) })).await,
+        (StatusCode::OK, json!({ "origins": [], "contentSites": [] }))
     );
 }
