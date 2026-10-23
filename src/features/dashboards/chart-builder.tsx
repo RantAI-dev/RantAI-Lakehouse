@@ -70,6 +70,7 @@ import {
   GRAIN_LABELS, columnKindOfType, grainChoices, isGrain, isTruncation, limitAfterGrainPick, limitHasEffect, type ColumnKind, type Grain,
 } from "@/lib/time-grain";
 import { cn } from "@/lib/utils";
+import { MapPicker } from "./map-picker";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
 import { selectedMart, type Mart } from "./mart-marks";
@@ -228,9 +229,9 @@ function withCalculated(base: Fields, columns: string[], calculated: CalcField[]
   return { dimensions, measures, kinds, columns, calculated };
 }
 /** Map id → label for the base-ui select (see KIND_LABELS). */
-const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 const NO_LABEL_ITEMS: Record<string, string> = { [NO_BREAKDOWN]: "— no label —" };
 const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
+const MAP_LABELS: Record<string, string> = Object.fromEntries(MAP_CATALOGUE.map((m) => [m.id, m.label]));
 /** Whether the viewport is at least `px` wide; false on the server. */
 function useMinWidth(px: number): boolean {
   const query = `(min-width: ${px}px)`;
@@ -1377,10 +1378,8 @@ export function ChartBuilder({
           {isMap ? (
             <div className="grid gap-1.5">
               <Label>Map</Label>
-              <Select value={effectiveMap} items={MAP_LABELS} onValueChange={(v) => setMapId(v ?? "")}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>{MAP_CATALOGUE.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}</SelectContent>
-              </Select>
+              {/* BI-16 C2a follow-up (planner, picker search): about 250 maps need a search. */}
+              <MapPicker maps={MAP_CATALOGUE} value={effectiveMap} onChange={setMapId} />
               {mapCredit(effectiveMap) ? <p className="text-xs text-muted-foreground">{mapCredit(effectiveMap)}</p> : null}
               {isChoropleth ? (
                 <p className="text-xs text-muted-foreground">The region column is matched to the map by name; rows that match no region are counted under the map.</p>
