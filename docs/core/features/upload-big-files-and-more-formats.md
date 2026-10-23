@@ -6,7 +6,7 @@
 | Backlog | `DATA-17` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-17.md` (no *(proposed)* number; the 2 GB figure ships only once measured, decision 3) |
-| Status | Building (Excel and Parquet merged in #76; the rest in #186, not merged) |
+| Status | Building (Excel and Parquet merged in #76; the rest in #186, not merged). Product owner's browser check passed on 2026-10-23 on a QA stack built from #186's CI images (`aa9f5fac`): several files at once, a resumed upload, column types, one table from several files and the refusal of a file that differs, the Excel 50 MB limit, a load into Bronze seen in Data Explorer (10 files, 589K rows, typed columns), a reload replacing the rows, a value that does not fit stopping the load, and the JSON, Parquet, gzip and zip formats; the acceptance checklist runs after merge |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
