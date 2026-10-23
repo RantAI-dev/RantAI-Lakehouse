@@ -662,6 +662,24 @@ fn kind_word(kind: ChartKind) -> String {
         .unwrap_or_default()
 }
 
+/// What to send instead of a measure with an aggregate of its own: the one
+/// measure's column and its aggregate when there is exactly one, or the
+/// general sentence when there are more, because then no single column can
+/// be named for the model.
+fn how_to_send_a_measure(measures: &MeasureList) -> String {
+    let own: Vec<(&str, &str)> = measures
+        .entries()
+        .filter_map(|(column, aggregate)| aggregate.map(|aggregate| (column, aggregate)))
+        .collect();
+    match own.as_slice() {
+        [(column, aggregate)] => {
+            format!("send measures: [\"{column}\"] with aggregate: \"{aggregate}\".")
+        }
+        _ => "send the column alone (measures: [\"<column>\"]) and set the chart's aggregate."
+            .to_owned(),
+    }
+}
+
 /// The checks that need neither a relation nor its columns: which fields the
 /// kind takes, and the shape of each.
 ///
@@ -677,8 +695,9 @@ pub fn check_kind_fields(
     let grouped = is_grouped_kind(kind) && !rows_mode;
     if measures.has_own_aggregates() && !grouped {
         return Err(format!(
-            "a {} takes the chart's aggregate; a measure with its own aggregate is for grouped charts and tables.",
-            kind_word(kind)
+            "a {} takes the chart's aggregate; a measure with its own aggregate is for grouped charts and tables; {}",
+            kind_word(kind),
+            how_to_send_a_measure(measures)
         ));
     }
     if let Some(filters) = &shape.filters {
@@ -1197,6 +1216,37 @@ mod tests {
         let list = measures(r#"[{"column":"stay","aggregate":"avg"}]"#);
         let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
         assert!(err.contains("takes the chart's aggregate"), "{err}");
+    }
+
+    /// The refusal names the measure to send instead, so the model has
+    /// something to write and does not send the same call again.
+    #[test]
+    fn a_kpi_refusal_names_the_column_and_the_aggregate_to_send() {
+        let list = measures(r#"[{"column":"jumlah_event","aggregate":"sum"}]"#);
+        let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
+        assert!(err.contains("takes the chart's aggregate"), "{err}");
+        assert!(
+            err.contains(r#"send measures: ["jumlah_event"] with aggregate: "sum"."#),
+            "{err}"
+        );
+    }
+
+    /// Two measures with an aggregate of their own cannot both be named, so
+    /// the refusal says how to write one of them.
+    #[test]
+    fn a_kpi_refusal_of_two_measures_with_their_own_aggregates_says_how_to_send_one() {
+        let list = measures(
+            r#"[{"column":"stay","aggregate":"avg"},{"column":"visitors","aggregate":"sum"}]"#,
+        );
+        let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
+        assert!(
+            err.contains(
+                r#"send the column alone (measures: ["<column>"]) and set the chart's aggregate."#
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("stay"), "{err}");
+        assert!(!err.contains("visitors"), "{err}");
     }
 
     #[test]
