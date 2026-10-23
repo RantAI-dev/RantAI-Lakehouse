@@ -254,6 +254,13 @@ def test_an_object_without_a_cursor_must_say_why_it_is_re_read_in_full() -> None
     assert ObjectDecl(name="r", primary_key=(), full_reason="no filter").primary_key == ()
     with pytest.raises(ValueError, match="no reason"):
         ObjectDecl(name="r", primary_key=())
+    # PR #216 final review BLOCKER 17: a delta object merges on its key and is offered incremental
+    # loads by the cursor it declares, so it must name both.
+    assert ObjectDecl(name="d", primary_key=("id",), cursor="modified_at", delta=True).delta is True
+    with pytest.raises(ValueError, match="primary key"):
+        ObjectDecl(name="d", primary_key=(), cursor="modified_at", delta=True)
+    with pytest.raises(ValueError, match="delta link"):
+        ObjectDecl(name="d", primary_key=("id",), full_reason="no filter", delta=True)
 
 
 def test_a_401_asks_for_a_new_token_once_and_a_second_401_is_the_credential() -> None:

@@ -8,7 +8,9 @@ sign-in's refresh token, or the vendor's integration credential), opens a
 `SaasSession` (AD3: the link rule, the address check before any credential,
 rate limits), asks the vendor's module what an object looks like before the
 load (AD7), and turns the module's records into a dlt resource that the sink
-loads (AD6: incremental by the object's declared cursor, merge on its key).
+loads (AD6: incremental by the object's declared cursor, merge on its key; an object
+that continues from a delta link is not filtered by the cursor and only merged, final
+review BLOCKER 17).
 
 # What a vendor module provides
 
@@ -324,6 +326,25 @@ def build_source(
             yield shape(record)
 
     resource_name = str(obj.get("target") or name)
+    if incremental and decl.delta:
+        # PR #216 final review BLOCKER 17: an object read from a delta link is NOT filtered by the
+        # cursor. The vendor's link already says what changed since the last committed run, and it
+        # can carry a change whose cursor value is below the last run's highest (an edit made while
+        # run 1 paged, a change stamped before a delete's `now()`); dlt's incremental filter would
+        # drop those rows with nothing reported. The link lives in the resource's state, which is
+        # committed with the load, so the sink decides "first run" from it (`_has_delta_link`) and
+        # merges the rows on the key from then on.
+        if not uses_state:
+            # A module that declares a delta object but keeps no state cannot continue the link.
+            raise SaasSetupRefused("this vendor's change feed cannot be continued between runs")
+
+        @dlt.resource(name=resource_name)
+        def feed() -> Iterator[dict]:
+            yield from _records(None, dlt.current.resource_state())
+
+        feed.delta_state = True  # what `sink._apply_cursor` and the first-run check look at
+        return AdapterBuildResult(source=feed, observed_before_load=observed_before)
+
     if incremental:
 
         @dlt.resource(name=resource_name)

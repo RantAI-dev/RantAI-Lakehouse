@@ -30,6 +30,13 @@ class ObjectDecl:
     deletes: bool = False
     full_reason: str | None = None
     lag_seconds: int = 0
+    # PR #216 final review BLOCKER 17: a vendor that continues from a delta link (Graph's
+    # `@odata.deltaLink`, Dataverse change tracking) replays the link and sends every row that
+    # changed since it was issued. Some of those rows carry a cursor value BELOW the last run's
+    # highest: an edit made while run 1 was paging (stamped before the item it edited was read),
+    # or a change stamped before a delete's `now()` mark. Filtering them by the cursor loses them
+    # silently, so a delta object is read without dlt's incremental filter and merged on the key.
+    delta: bool = False
     # A name for a person where `name` is an id (SharePoint: `Site / List`, slice 5 review BLOCKER 14). Shown by
     # discovery only; the ingest spec keys the object by `name`.
     label: str | None = None
@@ -48,6 +55,10 @@ class ObjectDecl:
             raise ValueError(f"object {self.name!r} has a lag but no cursor, or a negative one")
         if self.cursor is not None and self.full_reason:
             raise ValueError(f"object {self.name!r} has a cursor and also a reason it is re-read in full")
+        # BLOCKER 17: a delta object is continued from its link, so it must name the cursor the
+        # console offers it incremental loads by, and the key the sink merges it on.
+        if self.delta and (self.cursor is None or not self.primary_key):
+            raise ValueError(f"object {self.name!r} continues from a delta link, so it needs a cursor and a primary key")
 
     @property
     def incremental(self) -> bool:

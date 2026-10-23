@@ -205,7 +205,7 @@ def test_the_lists_of_the_found_sites_are_offered_without_libraries_hidden_lists
     listed = module.list_objects(session, parts, DIAL)
     assert [d.name for d in listed] == [OBJECT], "a document library and a hidden list are left out; a personal site is not searched"
     assert [d.label for d in listed] == ["Team / Tasks"], "BLOCKER 14: a name for a person; the object's name stays the two ids"
-    assert all(d.load_description() == "incremental" and d.deletes and d.primary_key == ("id",) for d in listed)
+    assert all(d.load_description() == "incremental" and d.deletes and d.primary_key == ("id",) and d.delta for d in listed)
     assert "search=*" in graph.log[0] and graph.log[0].startswith("graph.microsoft.com/v1.0/sites?")
 
 
@@ -444,6 +444,33 @@ def test_a_second_run_reads_only_the_changes_merges_them_and_marks_the_delete(la
     assert sorted(rows) == ["1", "2", "3", "4", "5", "6"], "merged on id: no duplicate, the deleted row still there"
     assert rows["2"]["field_title"] == "item 2 changed" and rows["3"]["is_deleted"] is True and rows["1"]["is_deleted"] is False
     assert not any("expand" in line and "token" not in line for line in graph.log), "the second run opened the saved link, not the whole list"
+
+
+@pytest.mark.loader
+def test_a_change_the_delta_reports_with_an_earlier_time_than_the_last_run_is_not_dropped(lab: Lab, graph: Graph) -> None:
+    """PR #216 final review BLOCKER 17, case 1: an edit made while run 1 was paging is stamped
+    before the item run 1 read last, and only shows in the next delta round. dlt's cursor filter
+    dropped it; the link, not the cursor, says what changed."""
+    graph.put(2, 40, Title="newest at run 1")
+    run(lab, graph)
+    graph.put(4, 35, Title="edited during run 1")
+    run(lab, graph)
+    rows = {r["id"]: r for r in lab.rows("sp_tasks")}
+    assert rows["4"]["field_title"] == "edited during run 1"
+
+
+@pytest.mark.loader
+def test_a_change_after_a_delete_is_not_dropped_even_though_the_delete_is_stamped_now(lab: Lab, graph: Graph) -> None:
+    """PR #216 final review BLOCKER 17, case 2: a delete's row carries the time the run saw it
+    (`SEEN`), which is later than every real change's stamp; a change after it is below the last
+    run's highest and the cursor filter dropped it."""
+    run(lab, graph)
+    graph.delete(3)
+    run(lab, graph)
+    graph.put(2, 60, Title="changed after the delete")
+    run(lab, graph)
+    rows = {r["id"]: r for r in lab.rows("sp_tasks")}
+    assert rows["2"]["field_title"] == "changed after the delete" and rows["3"]["is_deleted"] is True
 
 
 @pytest.mark.loader

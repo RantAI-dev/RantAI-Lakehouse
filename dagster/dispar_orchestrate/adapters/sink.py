@@ -178,6 +178,9 @@ REFRESHES = ("keep", "remove")
 # beyond a cursor (the cursor is pushed into the query, so only `sql_database`).
 DEDUP_MODES = ("replace_dedup", "incremental_dedup")
 INCREMENTAL_MODES = ("incremental", "incremental_dedup")
+# The resource-state keys a vendor's change-feed link is kept under (`SRC-3` final review
+# BLOCKER 17; Graph's link and Dataverse's link with the `$select` it belongs to).
+DELTA_STATE_KEYS = ("delta_link", "delta")
 # SRC-10 sixth pass: `history` also needs a key, but is written by `adapters/history.py`
 # and takes no cursor (decision 10).
 KEY_MODES = (*DEDUP_MODES, "history")
@@ -572,6 +575,47 @@ def _has_cursor(pipeline: Any, cursor: str, *, sync: bool = True) -> bool:
     )
 
 
+def _continues_from_delta(source: Any) -> bool:
+    """Whether `source` reads its objects from a vendor's change-feed link
+    instead of a cursor (`adapters/saas.py` sets `delta_state` on the
+    resource; final review BLOCKER 17)."""
+    if isinstance(source, DltSource):
+        resources = list(source.selected_resources.values())
+    elif isinstance(source, DltResource):
+        resources = [source]
+    else:
+        return False
+    return any(getattr(resource, "delta_state", False) for resource in resources)
+
+
+def _delta_resources(pipeline: Any) -> dict[str, list[str]]:
+    """The resources whose state holds a vendor's change-feed link
+    (`{schema name: [resource name]}`): Graph's `@odata.deltaLink` and
+    Dataverse's change-tracking link (`SRC-3` final review BLOCKER 17)."""
+    remembered: dict[str, list[str]] = {}
+    for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
+        for resource_name, resource_state in (source_state.get("resources") or {}).items():
+            if any(key in resource_state for key in DELTA_STATE_KEYS):
+                remembered.setdefault(schema_name, []).append(resource_name)
+    return remembered
+
+
+def _has_delta_link(pipeline: Any) -> bool:
+    """Whether an earlier run committed a change-feed link to continue from.
+    A delta object has no dlt cursor to ask (`_has_cursor`), so "first run"
+    (and therefore a replace rather than a merge) is decided by its link."""
+    return any(_delta_resources(pipeline).values())
+
+
+def _forget_delta_links(pipeline: Any) -> None:
+    """Drop every change-feed link. A run that must read the object in full
+    (its first one, or the first after a mode that left the table without the
+    deduplication marker) forgets the link first, or the read would return only
+    what changed since it and the replace would lose the rest of the table."""
+    for schema_name, resources in sorted(_delta_resources(pipeline).items()):
+        pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
+
+
 def _forget_cursors(pipeline: Any) -> None:
     """Drop every incremental cursor after an `append` run. That run added
     the whole source again, so a cursor kept from an earlier incremental
@@ -589,7 +633,8 @@ def _forget_cursors(pipeline: Any) -> None:
 def _forget_table_state(pipeline: Any) -> None:
     """Drop everything the pipeline remembers about how far the table got: every
     incremental cursor AND every deduplication marker (`SRC-10` decision 5, a
-    refresh or a clear). Without a cursor an incremental mode reads everything;
+    refresh or a clear), and a vendor's change-feed link (final review BLOCKER 17).
+    Without a cursor an incremental mode reads everything;
     without the marker `incremental_dedup` treats its next run as the first and
     replaces. Reads the state stored with the data first (a recreated container
     has no local copy). `pipeline_drop(state_only=True)` removes a resource's
@@ -601,7 +646,9 @@ def _forget_table_state(pipeline: Any) -> None:
     remembered: dict[str, list[str]] = {}
     for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
         for resource_name, resource_state in (source_state.get("resources") or {}).items():
-            if resource_state.get("incremental") or dedup.MARKER_KEY in resource_state:
+            if resource_state.get("incremental") or dedup.MARKER_KEY in resource_state or any(
+                key in resource_state for key in DELTA_STATE_KEYS
+            ):
                 remembered.setdefault(schema_name, []).append(resource_name)
     for schema_name, resources in sorted(remembered.items()):
         pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
@@ -722,6 +769,12 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
     else:
         raise UnsupportedLoadMode(f"load mode {mode!r} needs a dlt source or resource, not plain rows")
     for resource in resources:
+        if getattr(resource, "delta_state", False):
+            # PR #216 final review BLOCKER 17: an object read from a vendor's change-feed link is
+            # not filtered by a cursor at all (its rows can predate the last one seen); the merge on
+            # its key is what makes the rerun exact. `adapters/saas.py` builds it without dlt's
+            # incremental step, so there is nothing to re-apply here.
+            continue
         if not isinstance(resource.incremental, IncrementalResourceWrapper):
             raise UnsupportedLoadMode(
                 f"load mode {mode!r} is not available for {resource.name!r}: its source cannot filter by a "
@@ -938,11 +991,18 @@ def load_via_sink(
     # What the pipeline state says about earlier runs, read from the bucket first
     # (a recreated container has no local copy). Only the modes that continue from
     # a cursor consult it; the others cost no extra read.
+    # PR #216 final review BLOCKER 17: a delta object continues from its vendor link, kept in the
+    # resource state, not from a dlt cursor (`_has_cursor` would always say "first run" for it and
+    # the run would replace the table with only the changed rows).
+    delta = plan.mode in INCREMENTAL_MODES and _continues_from_delta(source)
     key_marked = False
     if plan.mode in INCREMENTAL_MODES:
         # (Synced above, by the history check or the refresh.)
         markers = dedup.markers(pipeline.state)
         key_marked = bool(markers) and all(marker == list(plan.key) for marker in markers)
+    continues = (
+        _has_delta_link(pipeline) if delta else _has_cursor(pipeline, plan.cursor or "", sync=False)
+    ) if plan.mode in INCREMENTAL_MODES else False
     run_options: dict[str, Any] = {}
     if plan.mode == "incremental":
         write_disposition: Any = "append"
@@ -954,16 +1014,19 @@ def load_via_sink(
         run_options["primary_key"] = list(plan.key)
     else:
         write_disposition = plan.mode
-    if plan.mode == "incremental_dedup" and not key_marked and _has_cursor(pipeline, plan.cursor or "", sync=False):
+    if plan.mode == "incremental_dedup" and not key_marked and continues:
         # SRC-10 R2: a cursor exists (the table was loaded with `incremental`, or
         # with another key) but no run has left the table deduplicated on THIS key.
-        # The run must read everything and replace, so the cursor goes first. Done
-        # before the run and failing safe: with no cursor, a failed run is "first"
-        # again next time.
-        _forget_cursors(pipeline)
+        # The run must read everything and replace, so the cursor (or, for a delta
+        # object, the link) goes first. Done before the run and failing safe: with
+        # nothing to continue from, a failed run is "first" again next time.
+        if delta:
+            _forget_delta_links(pipeline)
+        else:
+            _forget_cursors(pipeline)
+        continues = False
     if plan.mode in INCREMENTAL_MODES and (
-        not _has_cursor(pipeline, plan.cursor or "", sync=False)
-        or (plan.mode == "incremental_dedup" and not key_marked)
+        not continues or (plan.mode == "incremental_dedup" and not key_marked)
     ):
         # Nothing to continue from: load everything, and replace rather
         # than stack it onto what an earlier mode left there. For

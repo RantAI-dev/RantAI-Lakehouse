@@ -236,7 +236,8 @@ def test_every_public_table_is_listed_with_how_it_loads_and_whether_deletes_are_
     listed = {d.name: d for d in module.list_objects(session, parts, DIAL)}
     assert set(listed) == {"account", "contact", "legacy_thing"}
     assert (listed["account"].cursor, listed["account"].deletes, listed["account"].primary_key) == ("modifiedon", False, ("accountid",))
-    assert (listed["contact"].cursor, listed["contact"].deletes) == ("modifiedon", True), "decision 7: change tracking reports deletes"
+    assert not listed["account"].delta, "a table without change tracking is filtered by modifiedon"
+    assert (listed["contact"].cursor, listed["contact"].deletes, listed["contact"].delta) == ("modifiedon", True, True), "decision 7: change tracking reports deletes; BLOCKER 17: from its delta link"
     assert listed["legacy_thing"].load_description() == "re-read in full: legacy_thing has no modifiedon column to filter by"
     first = api.requests[0]["query"]
     assert first["$filter"] == "IsPrivate eq false and IsIntersect eq false" and "modifiedon" in first["$expand"]
@@ -494,6 +495,32 @@ def test_a_tracked_table_second_run_reads_the_changes_and_marks_the_delete(lab: 
     rows = {r["contactid"][-1]: r for r in lab.rows("dv_contacts")}
     assert sorted(rows) == ["1", "2", "3", "4", "5"] and rows["3"]["is_deleted"] is True and rows["1"]["is_deleted"] is False and rows["2"]["name"] == "row 2 changed"
     assert any("$deltatoken" in r["query"] for r in api.requests if r["path"].endswith("/contacts")), "the second run opened the saved link"
+
+
+@pytest.mark.loader
+def test_a_tracked_change_stamped_before_the_last_runs_newest_row_is_not_dropped(lab: Lab, api: Dataverse) -> None:
+    """PR #216 final review BLOCKER 17, case 1: change tracking reports a row edited while run 1
+    was paging, whose `modifiedon` is below the newest row run 1 read. dlt's cursor filter dropped it."""
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    api.tables["contact"].put(2, 90, name="newest at run 1")
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    api.tables["contact"].put(4, 60, name="edited during run 1")
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    rows = {r["contactid"][-1]: r for r in lab.rows("dv_contacts")}
+    assert rows["4"]["name"] == "edited during run 1"
+
+
+@pytest.mark.loader
+def test_a_tracked_change_after_a_delete_is_not_dropped_even_though_the_delete_is_stamped_now(lab: Lab, api: Dataverse) -> None:
+    """PR #216 final review BLOCKER 17, case 2: the deleted row carries `SEEN` as its `modifiedon`,
+    later than any real change; a change after it is below the last run's highest."""
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    api.tables["contact"].delete(3)
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    api.tables["contact"].put(2, 60, name="changed after the delete")
+    run(lab, api, "contact", "dv_contacts", "contactid")
+    rows = {r["contactid"][-1]: r for r in lab.rows("dv_contacts")}
+    assert rows["2"]["name"] == "changed after the delete" and rows["3"]["is_deleted"] is True
 
 
 @pytest.mark.loader

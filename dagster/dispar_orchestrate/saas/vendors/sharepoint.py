@@ -48,8 +48,10 @@ get only what changed. A deleted item comes as `{"id": ..., "deleted": {"state":
   local state, which the sink cannot do, so those rows stay until a full reload (the page says so).
 * A run in a load mode that is not incremental (`replace`, `append`) has no state and reads the
   list with `items?$expand=fields` in full; no deletes are seen.
-* The cursor is `modified_at` (Graph's `lastModifiedDateTime`); the sink's cursor filter and merge on
-  `id` handle the items a feed repeats.
+* The cursor is `modified_at` (Graph's `lastModifiedDateTime`); the sink merges on `id`. It is NOT
+  filtered by the cursor (final review BLOCKER 17): the link already says what changed, and an edit
+  made while run 1 paged, or one stamped before a delete's mark, can be below the last run's newest
+  value -- a cursor filter would lose it silently.
 
 # Sign-in (decision 3), checked on 2026-10-21
 
@@ -114,7 +116,10 @@ def check_object(name: str) -> tuple[str, str]:
 
 
 def _decl(name: str) -> ObjectDecl:
-    return ObjectDecl(name=name, primary_key=("id",), cursor=CURSOR_FIELD, deletes=True)
+    # PR #216 final review BLOCKER 17: the list is read from Graph's delta link, so it must not be
+    # filtered by `modified_at` -- the link can carry an edit stamped before the last run's newest
+    # row (or before a delete's mark), which dlt's cursor filter would drop.
+    return ObjectDecl(name=name, primary_key=("id",), cursor=CURSOR_FIELD, deletes=True, delta=True)
 
 
 def declaration(session: Any, parts: Any, dial: dict, name: str) -> ObjectDecl:

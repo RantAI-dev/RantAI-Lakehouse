@@ -37,6 +37,8 @@ not return as plain values are left out.
   older link makes Dataverse "throw an exception" whose HTTP status the page does not give, so a client error
   on the SAVED link is taken as a full resync (a read from a fresh tracking request, which stores a new link).
   What a resync cannot learn is which rows were deleted while the link was stale; they stay until a full reload.
+  A change-tracking read is not filtered by `modifiedon`: the link says what changed, and a change can be
+  stamped before the last run's newest row (final review BLOCKER 17).
 * **`modifiedon`** is the cursor of every other table that has it: `$filter=modifiedon ge <since>` ordered by
   `modifiedon, <key>` ("Specify an order for your query ... include a column that has a unique identifier"),
   merged on the table's `PrimaryIdAttribute`. The cursor lags by `LAG_SECONDS`, a margin of ours and not a
@@ -168,6 +170,11 @@ def _definition(session: Any, name: str) -> _Table:
 def _decl(name: str, table: _Table) -> ObjectDecl:
     if not table.has_cursor:
         return ObjectDecl(name=name, primary_key=(table.key,), full_reason=f"{name} has no {CURSOR_FIELD} column to filter by")
+    if table.tracked:
+        # PR #216 final review BLOCKER 17: a change-tracking read replays the saved delta link, so
+        # it is not filtered by `modifiedon` (a change can be stamped before the last run's newest
+        # row, or before a delete's mark). No lag applies: there is no cursor filter to move back.
+        return ObjectDecl(name=name, primary_key=(table.key,), cursor=CURSOR_FIELD, deletes=True, delta=True)
     return ObjectDecl(name=name, primary_key=(table.key,), cursor=CURSOR_FIELD, lag_seconds=LAG_SECONDS, deletes=table.tracked)
 
 
@@ -205,8 +212,11 @@ def list_objects(session: Any, parts: Any, dial: dict) -> list[ObjectDecl]:
             continue
         if known_cursor and not entry.get("Attributes"):
             out.append(ObjectDecl(name=name, primary_key=(key,), full_reason=f"{name} has no {CURSOR_FIELD} column to filter by"))
+        elif entry.get("ChangeTrackingEnabled") is True:
+            # Final review BLOCKER 17: the delta link, not a cursor filter, says what changed.
+            out.append(ObjectDecl(name=name, primary_key=(key,), cursor=CURSOR_FIELD, deletes=True, delta=True))
         else:
-            out.append(ObjectDecl(name=name, primary_key=(key,), cursor=CURSOR_FIELD, lag_seconds=LAG_SECONDS, deletes=entry.get("ChangeTrackingEnabled") is True))
+            out.append(ObjectDecl(name=name, primary_key=(key,), cursor=CURSOR_FIELD, lag_seconds=LAG_SECONDS, deletes=False))
     return out
 
 
