@@ -11,7 +11,7 @@ use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
-use super::look::{FORMAT_FIELDS, wrong_field};
+use super::look::{FORMAT_FIELDS, check_layers_name_a_source, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
     viewer_of,
@@ -225,6 +225,9 @@ pub(super) async fn create_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return json!({ "error": sentence });
+    }
     // BI-17 part A, decision 6 (`PR #199 review M SHOULD-FIX BI-17 4`): a new
     // chart in a deployment with a company palette draws with it. A palette
     // the model chose is kept, and a chart that already exists keeps what it
@@ -310,6 +313,9 @@ pub(super) async fn check_chart_draft(
         Ok(i) => i,
         Err(e) => return Some(json!({ "error": e })),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return Some(json!({ "error": sentence }));
+    }
     match store::spec_from_input(ch, &input, ChartSource::Ai, "ai", id, time).await {
         Ok(_) => None,
         Err(err) => Some(upstream_error::bi(&upstream_error::DATABASE, &err).to_json()),
@@ -349,6 +355,9 @@ pub(super) async fn update_chart(
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&input) {
+        return json!({ "error": sentence });
+    }
     if let Err(err) = require_chart_board(ch, input.board.as_deref(), &viewer).await {
         return refused(err);
     }
@@ -935,6 +944,36 @@ mod tests {
         all.iter()
             .filter(|s| s.starts_with("SELECT") && s.contains("serving.mart_x"))
             .collect()
+    }
+
+    /// A layer that names no source is refused before the assistant saves it,
+    /// and the refusal names the arguments its model sends.
+    #[tokio::test]
+    async fn create_chart_refuses_a_layer_with_no_data_source() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors", "kind": "bar", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors"],
+                "layers": [{
+                    "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                }],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            json!({
+                "error": "question 1: the layer names no data source: send its mart or sqlSource."
+            }),
+            "{reply}"
+        );
     }
 
     /// `PR #199 review M SHOULD-FIX BI-17 4` (decision M5): a new chart in a

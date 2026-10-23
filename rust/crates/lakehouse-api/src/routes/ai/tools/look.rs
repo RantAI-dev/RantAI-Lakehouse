@@ -192,6 +192,34 @@ const KINDS_NAMING_MARKS: [ChartKind; 4] = [
     ChartKind::Treemap,
 ];
 
+/// Check that every layer names a data source before the assistant saves it.
+///
+/// The console's sentence is unchanged in `lakehouse_bi::layers`, whose
+/// check is outside this change. The assistant's model is the caller that has
+/// to learn which arguments to send, so its refusal names `mart` and
+/// `sqlSource`.
+///
+/// # Errors
+///
+/// The sentence for the model, naming the first layer that names no mart
+/// and no SQL source.
+pub(super) fn check_layers_name_a_source(input: &ChartInput) -> Result<(), String> {
+    for (i, layer) in input.shape.layers_list().iter().enumerate() {
+        let names_mart = !layer.mart.trim().is_empty();
+        let names_sql = layer
+            .sql_source
+            .as_deref()
+            .is_some_and(|source| !source.trim().is_empty());
+        if !names_mart && !names_sql {
+            return Err(format!(
+                "question {}: the layer names no data source: send its mart or sqlSource.",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check the series keys the call names against the names the chart draws.
 ///
 /// The keys are the call's own: a key the stored chart holds is not the
@@ -227,7 +255,16 @@ fn check_series_keys(
         return Ok(());
     }
     let drawn = store::drawn_names(y);
-    let known: HashSet<&str> = drawn.iter().map(String::as_str).collect();
+    let known: HashSet<&str> = drawn
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.is_empty())
+        .collect();
+    // A chart that draws no named series has nothing to check a key against: the
+    // list of names would be empty and the sentence would end in "it draws: .".
+    if known.is_empty() {
+        return Ok(());
+    }
     for (key, colour) in series {
         if draws_key(def, &drawn, key, colour.as_str().unwrap_or_default()) {
             continue;
@@ -301,6 +338,9 @@ async fn format_chart(
         Ok(m) => m,
         Err(sentence) => return json!({ "error": sentence }),
     };
+    if let Err(sentence) = check_layers_name_a_source(&merged) {
+        return json!({ "error": sentence });
+    }
     // A series key the chart cannot draw colours nothing, so the call is
     // refused here: nothing is saved yet.
     if let Err(sentence) = check_series_keys(&stored.def, &stored.spec.y, args) {
@@ -670,6 +710,92 @@ mod tests {
             e,
             "colors.series names \"Total\", which the chart does not draw; it draws: sum_jumlah, sum_wisman."
         );
+    }
+
+    /// A layer with no source is refused before the assistant saves it, and
+    /// the refusal names the arguments its model sends.
+    #[test]
+    fn a_layer_with_no_data_source_is_refused_with_what_to_send() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(
+            check_layers_name_a_source(&input).unwrap_err(),
+            "question 1: the layer names no data source: send its mart or sqlSource."
+        );
+    }
+
+    /// A layer that names a mart is not refused.
+    #[test]
+    fn a_layer_that_names_a_mart_is_not_refused() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "mart": "mart_b", "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        check_layers_name_a_source(&input).unwrap();
+    }
+
+    /// A layer that names a SQL source is not refused.
+    #[test]
+    fn a_layer_that_names_a_sql_source_is_not_refused() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
+                "sqlSource": "source_b", "dimension": "province", "measures": ["visitors"],
+                "draw": "line", "axis": "right",
+            }],
+        }))
+        .unwrap();
+        check_layers_name_a_source(&input).unwrap();
+    }
+
+    /// The refusal names the layer that has no source, counted as the layers
+    /// were given.
+    #[test]
+    fn the_refusal_names_the_second_layer_when_the_first_names_a_source() {
+        let input: ChartInput = serde_json::from_value(json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [
+                {
+                    "mart": "mart_b", "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                },
+                {
+                    "dimension": "province", "measures": ["visitors"],
+                    "draw": "line", "axis": "right",
+                },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            check_layers_name_a_source(&input).unwrap_err(),
+            "question 2: the layer names no data source: send its mart or sqlSource."
+        );
+    }
+
+    /// A chart that draws no named series has nothing to check a series key
+    /// against.
+    #[test]
+    fn a_chart_that_draws_no_named_series_accepts_any_key() {
+        check_series_keys(
+            &two_measures(),
+            &ChartY::Multi(Vec::new()),
+            &args(json!({ "chart": "c1", "colors": { "series": { "Total": "#00aa00" } } })),
+        )
+        .unwrap_or_else(|e| panic!("a key is refused: {e}"));
     }
 
     /// A key the server's own rewrite turns into a drawn name is accepted:

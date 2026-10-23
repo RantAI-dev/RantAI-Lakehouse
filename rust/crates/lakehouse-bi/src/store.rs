@@ -298,6 +298,11 @@ pub struct StoredChartSpec {
 ///
 /// Any other type (a number, an object) is still a decode error, because
 /// `Option<String>` accepts only a string or `null`.
+///
+/// # Errors
+///
+/// The deserializer's own error, when the value is neither a string nor
+/// `null`: a number or an object is refused.
 fn deserialize_mart<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
@@ -4252,7 +4257,6 @@ pub async fn spec_from_input(
     id: Option<String>,
     time: &TimeContext,
 ) -> Result<StoredChartSpec, BiError> {
-    check_layers_name_a_source(input)?;
     crate::layers::check_definition(input).map_err(BiError::Validation)?;
     let mut spec = spec_from_input_base(ch, input, source, created_by, id, time).await?;
     if !input.shape.layers_list().is_empty() {
@@ -4260,36 +4264,6 @@ pub async fn spec_from_input(
     }
     key_look_by_drawn_names(&mut spec);
     Ok(spec)
-}
-
-/// A layer that names no source of its own is refused with the layer's own
-/// sentence, before the chart's source is read.
-///
-/// The refusal names the arguments the caller sends (`mart`, `sqlSource`):
-/// "a table" is the console's word, and the caller here is the assistant's
-/// model. The console's own check (`crate::layers::check_definition`)
-/// refuses the same condition with the console's word, so the store speaks
-/// first: the assistant's model is the one that has to learn the refusal.
-///
-/// # Errors
-///
-/// `BiError::Validation` with the sentence of the first layer that names
-/// no source.
-fn check_layers_name_a_source(input: &ChartInput) -> Result<(), BiError> {
-    for (i, layer) in input.shape.layers_list().iter().enumerate() {
-        let names_mart = !layer.mart.trim().is_empty();
-        let names_sql = layer
-            .sql_source
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty());
-        if !names_mart && !names_sql {
-            let n = i + 1;
-            return Err(BiError::Validation(format!(
-                "question {n}: the layer names no data source: send its mart or sqlSource."
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// The names the chart's series can take: the names the chart draws, which
@@ -7608,53 +7582,27 @@ mod tests {
         assert_eq!(err.to_string(), "invalid mart name: bad name");
     }
 
-    /// A layer that names no data source is refused with the layer's own
-    /// sentence, which names the arguments the caller sends. The refusal
-    /// comes before any query, so the server answers nothing.
+    /// The store keeps the console's wording: `crate::layers::check_definition`
+    /// refuses it, and that check is outside this change.
     #[tokio::test]
-    async fn a_layer_with_no_data_source_is_refused_with_what_to_send() {
+    async fn a_layer_with_no_data_source_keeps_the_consoles_wording() {
         let server = MockServer::start().await;
         let ch = client(&server.uri());
-        let layer = |extra: serde_json::Value| {
-            let mut l = serde_json::json!({
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "mart": "mart_a",
+            "dimension": "province", "measures": ["visitors"],
+            "layers": [{
                 "dimension": "province", "measures": ["visitors"],
                 "draw": "line", "axis": "right",
-            });
-            l.as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            l
-        };
-        let one: ChartInput = serde_json::from_value(serde_json::json!({
-            "title": "Visitors", "kind": "bar", "mart": "mart_a",
-            "dimension": "province", "measures": ["visitors"],
-            "layers": [layer(serde_json::json!({}))],
+            }],
         }))
         .unwrap();
-        let err = spec_from_input(&ch, &one, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+        let err = spec_from_input(&ch, &input, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
             .await
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "question 1: the layer names no data source: send its mart or sqlSource."
-        );
-        // The layer that names no source is the one named, and the layers are
-        // counted as they are given.
-        let two: ChartInput = serde_json::from_value(serde_json::json!({
-            "title": "Visitors", "kind": "bar", "mart": "mart_a",
-            "dimension": "province", "measures": ["visitors"],
-            "layers": [
-                layer(serde_json::json!({ "mart": "mart_b" })),
-                layer(serde_json::json!({})),
-            ],
-        }))
-        .unwrap();
-        let err = spec_from_input(&ch, &two, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "question 2: the layer names no data source: send its mart or sqlSource."
+            "question 1: choose a table or a SQL source."
         );
     }
 
