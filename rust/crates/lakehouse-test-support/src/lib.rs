@@ -83,9 +83,55 @@ fn start_postgres_container() {
         // cannot be driven after `main` has returned (it panics, and the
         // test process aborts). Sharing one server is fine for isolation,
         // since `#[sqlx::test]` gives every test its own database on it.
+        //
+        // OPS-10: server settings for a full `cargo test --workspace` run,
+        // which drives several per-test databases and pools at once on this
+        // one server:
+        //
+        // * `with_shm_size(1 GiB)` — Docker's default `/dev/shm` is 64 MiB.
+        //   Postgres allocates dynamic shared memory (parallel query, and
+        //   the per-query mmap segments behind it) there, so a burst of
+        //   concurrent queries exhausts it and the server answers SQLSTATE
+        //   53100 ("could not resize shared memory segment … No space left
+        //   on device"), or resets the connection mid-handshake. The tests
+        //   themselves are unchanged; the server now has room for the
+        //   parallel work the same queries asked for.
+        // * `max_parallel_workers_per_gather=0` — the single largest
+        //   consumer of that dynamic shared memory per query. These are
+        //   correctness tests over small tables; parallel scan buys them
+        //   nothing and costs the shm segment.
+        // * `max_connections=200` — one `#[sqlx::test]` pool is up to 10
+        //   connections (sqlx's pool default) and a test binary runs as many
+        //   of them as the machine has cores; `tests/common/mod.rs` adds a
+        //   5-connection pool plus a 1-connection admin pool per test. On a
+        //   6-core machine that worst case is 6 × (10 + 5 + 1) = 96, which
+        //   the server default of 100 barely covers. The measured peak during
+        //   the `lakehouse-api` lib binary (2,406 tests, the largest binary
+        //   here, `RUST_TEST_THREADS=4`) was 15 client backends, so 200 is
+        //   headroom rather than a live limit: pools open lazily and a test
+        //   does not hold all of its connections at once.
+        //
+        // `with_cmd` replaces the image's command, so the `fsync=off` that
+        // `testcontainers-modules`' `Postgres` sets is repeated here.
+        //
+        // The label value changed with these settings (`postgres-16` →
+        // `postgres-16-shm1g`): a container started before this change is
+        // reused by label and would keep the 64 MiB `/dev/shm`. A new name
+        // means the old one is simply no longer found; remove it by hand
+        // once (`docker rm -f $(docker ps -aq --filter
+        // label=org.rantai.lakehouse-test-support)`).
         let container = Postgres::default()
             .with_tag("16-alpine")
-            .with_label("org.rantai.lakehouse-test-support", "postgres-16")
+            .with_cmd([
+                "-c",
+                "fsync=off",
+                "-c",
+                "max_parallel_workers_per_gather=0",
+                "-c",
+                "max_connections=200",
+            ])
+            .with_shm_size(1 << 30)
+            .with_label("org.rantai.lakehouse-test-support", "postgres-16-shm1g")
             .with_reuse(ReuseDirective::Always)
             .start()
             .await
