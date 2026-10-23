@@ -961,3 +961,61 @@ async fn moving_the_token_address_to_another_host_needs_the_credentials_again() 
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// `SRC-3` T1.5: turn the seeded connector into a business-app (`saas`) one
+/// with `dial`. Its addresses are the vendor table's, not the mock server's,
+/// so these tests check what the API says and refuses before any provider is
+/// dialled.
+async fn make_saas(fx: &Fixture, dial: Value) {
+    sqlx::query(
+        "UPDATE connector SET adapter = 'saas', type = 'Salesforce', dial = $2 WHERE id = $1",
+    )
+    .bind(ID)
+    .bind(dial)
+    .execute(&fx.app.pool)
+    .await
+    .expect("turn the seeded connector into a saas one");
+}
+
+#[tokio::test]
+async fn a_saas_connector_signs_in_through_the_vendor_tables_addresses() {
+    let fx = fixture().await;
+    make_saas(
+        &fx,
+        json!({
+            "vendor": "salesforce", "account": "acme",
+            "auth": {"type": "oauth2_authorization_code", "clientId": "app-1"}
+        }),
+    )
+    .await;
+    let (status, body) = send(&fx, "GET", &url_of("oauth"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["signedIn"], false);
+    // Salesforce has a revocation address in the table; the dial named none.
+    assert_eq!(body["revocationConfigured"], true);
+    assert_eq!(body["callbackUrl"], CALLBACK);
+    // The client secret is not saved: refused before anyone is sent anywhere.
+    let (status, _) = send(&fx, "POST", &url_of("oauth/start"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_saas_dial_that_names_its_own_token_address_is_not_a_sign_in_connector() {
+    let fx = fixture().await;
+    make_saas(
+        &fx,
+        json!({
+            "vendor": "salesforce", "account": "acme",
+            "auth": {
+                "type": "oauth2_authorization_code", "clientId": "app-1",
+                "tokenUrl": format!("{}/token", fx.server.uri())
+            }
+        }),
+    )
+    .await;
+    let (status, _) = send(&fx, "GET", &url_of("oauth"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = send(&fx, "POST", &url_of("oauth/start"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(token_calls(&fx), 0, "no address of the dial was dialled");
+}

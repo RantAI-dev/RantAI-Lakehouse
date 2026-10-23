@@ -116,6 +116,69 @@ async fn a_run_with_two_attempts_keeps_each_attempt_and_its_totals(
     Ok(())
 }
 
+/// `SRC-3` slice 1 review, BLOCKER 1 (`0097`): `permission_missing` and
+/// `rate_limited` are stored, read back and worded in fixed text, and only
+/// the second is retried. A word outside the list is still refused by the
+/// database (the CHECK of `0072`, widened).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_two_saas_classes_are_stored_worded_and_retried_only_for_the_rate_limit(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    assert!(!ErrorClass::PermissionMissing.is_transient());
+    assert!(ErrorClass::RateLimited.is_transient());
+    assert_eq!(ErrorClass::PermissionMissing.as_str(), "permission_missing");
+    assert_eq!(ErrorClass::RateLimited.as_str(), "rate_limited");
+    let t0 = OffsetDateTime::now_utc() - Duration::minutes(5);
+    assert!(
+        start_run(&pool, PG, "run-saas", RunTrigger::Schedule, None, t0)
+            .await
+            .unwrap()
+    );
+    for (attempt, class, wait) in [
+        (1, ErrorClass::RateLimited, Some(60)),
+        (2, ErrorClass::PermissionMissing, None),
+    ] {
+        let report = AttemptReport {
+            error_class: Some(class),
+            wait_seconds: wait,
+            ..failed(
+                "tickets",
+                attempt,
+                t0 + Duration::seconds(i64::from(attempt)),
+                wait,
+            )
+        };
+        assert!(
+            record_attempt(&pool, PG, "run-saas", &report)
+                .await
+                .unwrap()
+        );
+    }
+    let log = get_run_log(&pool, PG, "run-saas").await.unwrap().unwrap();
+    assert_eq!(log.attempts[0].error_class.as_deref(), Some("rate_limited"));
+    assert_eq!(
+        log.attempts[1].error_class.as_deref(),
+        Some("permission_missing")
+    );
+    let text = log.to_text();
+    assert!(
+        text.contains("the source limited the rate of requests"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the account lacks a permission at the source"),
+        "{text}"
+    );
+    // The database itself still refuses a word that is not in the list.
+    let refused = sqlx::query(
+        "UPDATE connector_run_attempt SET error_class = 'made_up' WHERE run_id = 'run-saas'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(refused.is_err());
+    Ok(())
+}
+
 /// A report posted twice (the orchestrator did not see the answer) changes
 /// nothing the second time, and the first report's facts stand.
 #[sqlx::test(migrations = "../../migrations")]
