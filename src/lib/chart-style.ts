@@ -68,6 +68,17 @@ export type CondRule = {
   target?: "cell" | "text"
 }
 
+/**
+ * `BI-17` part B (plan D2): colour the points of a scatter or bubble chart by
+ * cluster. `k` is the number of groups, 2 to 10, or "auto" (the console picks
+ * it). Mirrors `StyleFields.clusters` of `lakehouse_bi::style`, which the
+ * server validates once T1 lands; until then only the console checks it.
+ */
+export type ClusterSetting = { k: "auto" | number }
+
+export const MIN_CLUSTERS = 2
+export const MAX_CLUSTERS = 10
+
 export type StyleFields = {
   format?: ValueFormat
   valueFormats?: Record<string, ValueFormat>
@@ -78,6 +89,7 @@ export type StyleFields = {
   annotations?: Annotation[]
   tooltip?: { fields: string[] }
   conditional?: CondRule[]
+  clusters?: ClusterSetting
 }
 
 /** Limits the server enforces; the builder uses them to stop early. */

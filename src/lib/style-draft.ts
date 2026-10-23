@@ -1,4 +1,4 @@
-import type { Annotation, Axes, AxisStyle, ChartColors, CondRule, DateFormat, StyleFields, ValueFormat } from "./chart-style"
+import { MAX_CLUSTERS, MIN_CLUSTERS, type Annotation, type Axes, type AxisStyle, type ChartColors, type CondRule, type DateFormat, type StyleFields, type ValueFormat } from "./chart-style"
 import { isStaticKind } from "./dashboard-tabs"
 
 /**
@@ -26,6 +26,8 @@ export type FormatRules = {
   /** Table, pivot and KPI colours by rule. */
   conditional: boolean
   referenceLines: boolean
+  /** `BI-17` part B: colour points by cluster (scatter and bubble only). */
+  clusters: boolean
 }
 
 export type FormatState = { kind: string; breakdown: boolean; measures: number }
@@ -37,6 +39,7 @@ const TOOLTIP_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
 const BY_VALUE_KINDS = ["bar", "hbar", "pie", "treemap", "geomap"]
 const NOT_CHARTS = ["table", "pivot", "kpi", "gauge", "progress"]
 export const LINE_KINDS = ["bar", "hbar", "line", "area", "stacked", "combo"]
+const CLUSTER_KINDS = ["scatter", "bubble"]
 
 export function formatRules(s: FormatState): FormatRules {
   const text = isStaticKind(s.kind)
@@ -53,6 +56,7 @@ export function formatRules(s: FormatState): FormatRules {
     tooltip: TOOLTIP_KINDS.includes(s.kind),
     conditional: ["table", "pivot", "kpi"].includes(s.kind),
     referenceLines: LINE_KINDS.includes(s.kind),
+    clusters: CLUSTER_KINDS.includes(s.kind),
   }
 }
 
@@ -69,6 +73,7 @@ export function styleFromDef(def: StyleFields | undefined): StyleFields {
   if (def.annotations) out.annotations = def.annotations.map((a) => ({ ...a }))
   if (def.tooltip) out.tooltip = { fields: [...def.tooltip.fields] }
   if (def.conditional) out.conditional = def.conditional.map((r) => ({ ...r, rule: { ...r.rule } }))
+  if (def.clusters) out.clusters = { ...def.clusters }
   return out
 }
 
@@ -162,6 +167,11 @@ export function stylePayload(style: StyleFields, rules: FormatRules): StyleField
     if (notes.length) out.annotations = notes
   }
   if (rules.tooltip && style.tooltip?.fields.length) out.tooltip = { fields: style.tooltip.fields }
+  // A group count outside 2 to 10 is not sent; the server refuses it anyway once T1 lands.
+  const k = style.clusters?.k
+  if (rules.clusters && (k === "auto" || (Number.isInteger(k) && (k as number) >= MIN_CLUSTERS && (k as number) <= MAX_CLUSTERS))) {
+    out.clusters = { k: k as "auto" | number }
+  }
   if (rules.conditional) {
     const rows = (style.conditional ?? []).flatMap((r) => { const c = cleanRule(r); return c ? [c] : [] })
     if (rows.length) out.conditional = rows

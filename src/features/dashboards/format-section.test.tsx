@@ -98,3 +98,25 @@ describe("FormatSection", () => {
     expect(onChange).toHaveBeenLastCalledWith({ colors: { palette: "default" } })
   })
 })
+
+describe("FormatSection clusters (BI-17 part B)", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+
+  it("switches clusters on at Automatic, takes a number of groups, and switches them off", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(<FormatSection rules={scatter} style={{}} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[0]![0]).toEqual({ clusters: { k: "auto" } })
+    rerender(<FormatSection rules={scatter} style={{ clusters: { k: "auto" } }} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    choose(screen.getByLabelText("Number of clusters"), "4")
+    expect(onChange.mock.calls[1]![0]).toEqual({ clusters: { k: 4 } })
+    rerender(<FormatSection rules={scatter} style={{ clusters: { k: 4 } }} onChange={onChange} valueNames={["x", "y"]} seriesNames={[]} paletteValue="default" />)
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[2]![0].clusters).toBeUndefined()
+  })
+
+  it("offers no clusters on a line chart", () => {
+    render(<FormatSection rules={formatRules({ kind: "line", breakdown: false, measures: 1 })} style={{}} onChange={() => {}} valueNames={["v"]} seriesNames={[]} paletteValue="default" />)
+    expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
+  })
+})

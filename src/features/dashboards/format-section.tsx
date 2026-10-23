@@ -11,6 +11,7 @@ import {
   BUILTIN_PALETTES, DATE_STYLES, FORMAT_STYLES, MAX_ANNOTATIONS, MAX_AFFIX_LEN, MAX_AXIS_TITLE_LEN, MAX_CONDITIONAL_RULES, MAX_DECIMALS, MAX_NOTE_LEN,
   type Annotation, type AxisStyle, type CompareOp, type CondRule, type CondRuleTest, type DateFormat, type StyleFields, type ValueFormat,
 } from "@/lib/chart-style";
+import { MAX_CLUSTERS, MIN_CLUSTERS } from "@/lib/chart-style";
 import type { FormatRules } from "@/lib/style-draft";
 import { ColourInput } from "./colour-input";
 
@@ -233,6 +234,12 @@ export function ConditionalEditor({ value, onChange, columns }: {
   );
 }
 
+/** 2 to 10 groups, or let the console choose (`BI-17` part B). */
+const CLUSTER_ITEMS: Record<string, string> = {
+  auto: "Automatic",
+  ...Object.fromEntries(Array.from({ length: MAX_CLUSTERS - MIN_CLUSTERS + 1 }, (_, i) => [String(MIN_CLUSTERS + i), String(MIN_CLUSTERS + i)])),
+};
+
 /** The groups of section 5 other than the reference lines. */
 export function FormatSection({ rules, style, onChange, valueNames, seriesNames, paletteValue, children }: {
   readonly rules: FormatRules;
@@ -341,6 +348,22 @@ export function FormatSection({ rules, style, onChange, valueNames, seriesNames,
                 ))}
               </div>
             </>
+          ) : null}
+        </Group>
+      ) : null}
+      {rules.clusters ? (
+        <Group title="Clusters">
+          <span className="flex items-center gap-2 text-xs">
+            <Switch size="sm" checked={style.clusters !== undefined} onCheckedChange={(c) => set({ clusters: c === true ? { k: "auto" } : undefined })} aria-label="Colour points by cluster" /> Colour points by cluster
+          </span>
+          {style.clusters ? (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-muted-foreground">Number of groups</span>
+              <Select value={String(style.clusters.k)} items={CLUSTER_ITEMS} onValueChange={(v) => set({ clusters: { k: !v || v === "auto" ? "auto" : Number(v) } })}>
+                <SelectTrigger className="w-28" aria-label="Number of clusters"><SelectValue /></SelectTrigger>
+                <SelectContent>{Object.entries(CLUSTER_ITEMS).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
           ) : null}
         </Group>
       ) : null}
