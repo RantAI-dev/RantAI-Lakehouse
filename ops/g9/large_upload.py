@@ -35,7 +35,8 @@ is where its numbers are read; nothing here decides a limit.
 
 # Output
 
-One table, one row per phase: what, bytes, rows, seconds, MiB/s, then for each
+Each phase prints a `[large] RESULT` line the moment it ends (run 39817023398 failed in
+its third phase and an end-of-run table is never reached then), then one table, one row per phase: what, bytes, rows, seconds, MiB/s, then for each
 container the sampled maximum and the cgroup peak in MiB, and the free disk of the
 scratch directory at the end. A figure that could not be read is `n/a`; nothing
 is filled in.
@@ -399,6 +400,28 @@ def render(phases: list[Phase], names: list[str], free_bytes: int | None) -> str
     return "\n".join(out)
 
 
+def phase_line(phase: Phase, names: list[str], free_bytes: int | None) -> str:
+    """One self-contained line for a finished phase, printed the moment it ends so that a
+    failure in a later phase keeps every earlier measurement (run 39817023398 reached the
+    third phase and its end-of-run table was never read)."""
+    rate = "n/a" if phase.seconds <= 0 else f"{phase.bytes / MIB / phase.seconds:,.1f}"
+    memory = " ".join(
+        f"{n}: max {_mib(phase.maxima.get(n))} MiB, peak {_mib(phase.peaks.get(n))} MiB" for n in names
+    )
+    rows = "n/a" if phase.rows is None else f"{phase.rows:,}"
+    return (
+        f"[large] RESULT {phase.name}: {phase.bytes / MIB:,.0f} MiB, {rows} rows, {phase.seconds:,.1f} s, "
+        f"{rate} MiB/s; {memory or 'no containers sampled'}; free disk {_mib(free_bytes)} MiB"
+    )
+
+
+def _free_disk(path: Path) -> int | None:
+    try:
+        return shutil.disk_usage(path if path.exists() else Path("/")).free
+    except OSError:
+        return None
+
+
 def run_phase(api, name: str, path: Path, rows: int, table: str, dialect: bool, sampler: Sampler) -> Phase:
     size = path.stat().st_size
     print(f"[large] {name}: declares {size:,} bytes ({size / MIB:,.2f} MiB)")
@@ -413,7 +436,9 @@ def run_phase(api, name: str, path: Path, rows: int, table: str, dialect: bool, 
     if loaded.get("rows") is not None and loaded["rows"] != rows:
         raise HarnessFailure(f"{table}: the load reported {loaded['rows']:,} rows, the file held {rows:,}")
     print(f"[large] {name}: sent in {sent - started:,.0f} s, loaded and counted by {time.time() - started:,.0f} s")
-    return Phase(name, size, rows, time.time() - started, dict(sampler.maxima), sampler.peaks())
+    phase = Phase(name, size, rows, time.time() - started, dict(sampler.maxima), sampler.peaks())
+    print(phase_line(phase, list(sampler.containers), _free_disk(path.parent)), flush=True)
+    return phase
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -136,6 +136,16 @@ def test_the_report_has_one_row_per_phase_and_says_na_for_what_it_could_not_read
     assert "5,120" in lines[-1]
 
 
+def test_a_finished_phase_prints_its_own_result_line_with_memory_and_free_disk():
+    phase = lu.Phase("csv", 200 * lu.MIB, 1_000_000, 40.0, {"api": 300 * lu.MIB, "dagster": None}, {"api": 400 * lu.MIB, "dagster": None})
+    line = lu.phase_line(phase, ["api", "dagster"], 5 * 1024 * lu.MIB)
+    assert "\n" not in line
+    assert line.startswith("[large] RESULT csv:")
+    assert "1,000,000 rows" in line and "40.0 s" in line and "5.0 MiB/s" in line
+    assert "api: max 300 MiB, peak 400 MiB" in line and "dagster: max n/a MiB, peak n/a MiB" in line
+    assert "free disk 5,120 MiB" in line
+
+
 @pytest.mark.parametrize("target", [1 * lu.MIB, 3 * lu.MIB, 7 * lu.MIB + 12_345])
 def test_no_generated_file_is_larger_than_the_size_asked_for(tmp_path, target):
     """g9-upload-large run 39803084936: a 2048 MiB CSV came out a header over the API's cap."""
