@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""SRC-3 gate, SaaS connectors (`g6-saas`, plan AD9, T1.12): the skeleton.
+"""SRC-3 gate, SaaS connectors (`g6-saas`, plan AD9 as amended at the slice 6 review):
+the ten business apps against the mock vendor server (`saas_stub.py`).
 
-Slice 1 has no vendor behind the adapter, so the gate proves the parts that
-exist and are shared:
+The gate runs as two CI jobs over this one script, each told its vendors
+(`--vendors=`, `g6-saas-a` and `g6-saas-b`); with no argument every vendor runs.
+Each vendor gets two kinds of step:
 
-1. the mock vendor server (`saas_stub.py`) is up and serves `/health`;
-2. through the API, as the console does, `GET /api/connectors/types` lists the
-   ten business-app types, every one `supported: false`, adapter `saas`, with a
-   reason (honestly unsupported until its own gate step exists: AD10 and
-   `AGENTS.md` principle 2);
-3. no type that is not one of the ten has the `saas` adapter.
+1. **Vendor level** (`run_vendors`): the vendor module and the shared `SaasSession`
+   in this process (the runner uses the Dagster image, which carries
+   `dispar_orchestrate`) talk to the mock vendor on the vendor's own port over real
+   HTTP: connect, list, describe, paging, a cursor filter, a load, a reload, a schema
+   change, a rate limit, a revoked credential.
+2. **Product level** (`step_product`, unless `--vendors-only`): through the API, as
+   the console does, `GET /api/connectors/types` lists the types, the connector is
+   created and its ingest spec saved, the connection test runs, discovery lists the
+   objects (and previews them where the vendor describes its fields), an ingest run
+   writes Bronze and is read back through ClickHouse, a reload reads only the changes,
+   and a revoked sign-in fails the run with the attempt class `sign_in_refused`.
 
-Each vendor adds its steps in its own slice (connect, discover, load, reload,
-schema change, rate limit, revoked sign-in), and `0096` (slice 7) flips the types whose
-steps pass. A vendor's steps do not need its type to be `supported`: they drive the
-vendor module and the shared `SaasSession` in this process (the runner uses the
-Dagster image, which carries `dispar_orchestrate`) against the mock vendor on the
-vendor's own port. A vendor's hosts are fixed in the table and a person cannot point
-a connector elsewhere, so the steps use the gate-only `SAAS_GATE_ORIGINS`
-(`saas/vendors/__init__.py: rebase_for_gate`). This proves the vendor code over real
-HTTP; it does not go through the API's connector routes (the Rust connection test
-has wiremock tests) or the Iceberg sink (pytest `loader` tests). `--vendors-only`
-runs the vendor steps with no API, for a local run against `python saas_stub.py`. The lines are printed with the prefix `[saas]` and copied to the job
+Eight of the ten types are `supported: true` since `0096`; Workday Reports and
+NetSuite stay `supported: false` with a reason until a real account proves them
+(decision 10, `SRC-27`). A vendor's hosts are fixed in the table and a person cannot
+point a connector elsewhere, so the steps use the gate-only `SAAS_GATE_ORIGINS`
+(`saas/vendors/__init__.py: rebase_for_gate`).
+
+The lines are printed with the prefix `[saas]` and copied to the job
 summary; the job's time is the measurement against the signed 20 minutes.
 
 Settings: `LAKEHOUSE_API_URL`, `AUTH_BOOTSTRAP_EMAIL`, `AUTH_BOOTSTRAP_PASSWORD`

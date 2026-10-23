@@ -201,7 +201,7 @@
         "reload": "real"
       },
       "notes": {
-        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
       }
     },
     "Confluence": {
@@ -213,7 +213,7 @@
         "reload": "real"
       },
       "notes": {
-        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
       }
     },
     "Dynamics 365": {
@@ -237,7 +237,7 @@
         "reload": "real"
       },
       "notes": {
-        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
       }
     }
   }

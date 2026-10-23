@@ -6,7 +6,7 @@
 | Backlog | `SRC-3` |
 | Kind | Feature |
 | Spec | `docs/core/specs/src-3.md`. This page follows it row by row; anything the spec does not say is a decision below. The spec has no *(proposed)* number; its one *(proposed)* item, dropping a no-code connector builder, is decision 14 |
-| Status | Building, in #216 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist, dlt's `rest_api` source for the rest). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing Product owner's browser check on the QA instance of #216 passed on 2026-10-22 (picker, the ten forms, the Sources header, refusal of a foreign host, the GA4 report editor, the SharePoint site picker, a connection test failing in fixed words); the rows needing real vendor accounts wait for decision 11 |
+| Status | Building, in #216 (the one pull request for phase 4). `DEC-9` decided 2026-10-19 (dlt verified sources where they exist; the other six call `SaasSession` directly, because a dlt `rest_api` source over a plain session cannot follow vendor links under the address rule: amended during the build, accepted at the slice 3 and 4 reviews). Decisions signed 2026-10-19 by the product owner ("setuju dengan plan default itu, selagi sejalan dan sesuai dengan specs"): every default, with decision 3 corrected to the spec's "OAuth where offered" before signing Product owner's browser check on the QA instance of #216 passed on 2026-10-22 (picker, the ten forms, the Sources header, refusal of a foreign host, the GA4 report editor, the SharePoint site picker, a connection test failing in fixed words); the rows needing real vendor accounts wait for decision 11 |
 | Priority | P3 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
@@ -57,7 +57,7 @@ Checked against the vendors and dlt on 2026-10-19 (sources in the plan):
 
 | Spec row | Spec target | What they can do |
 | --- | --- | --- |
-| Reuse route | `DEC-9` | (No user-visible change; decided 2026-10-19: dlt verified sources where they exist, dlt `rest_api` for the rest.) |
+| Reuse route | `DEC-9` | (No user-visible change; decided 2026-10-19: dlt verified sources where they exist, and `SaasSession` directly for the other six, because a dlt `rest_api` source over a plain session cannot follow vendor links under the address rule.) |
 | First wave | Databricks' ten GA SaaS connectors | 1. Pick Salesforce, ServiceNow, Workday Reports, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, NetSuite or SharePoint in the connector picker, each with its own form asking only what that vendor needs. |
 | Each connector: OAuth where offered | `SRC-12` | 2. Connect by signing in to the vendor in a browser window where the vendor offers it; otherwise with the vendor's integration credential (decision 3). |
 | Each connector: table and column choice | `SRC-11` | 3. See the vendor's objects listed by the vendor (decision 5) and choose objects and columns. |

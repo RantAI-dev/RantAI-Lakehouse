@@ -22,7 +22,7 @@ Bring in data from business apps without building each connector by hand.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Reuse route | None | `DEC-9`, decided 2026-10-19: dlt verified sources where one exists, dlt's `rest_api` source for the rest |
+| Reuse route | None | `DEC-9`, decided 2026-10-19: dlt verified sources where one exists; the other six call the adapter's `SaasSession` directly (a dlt `rest_api` source over a plain session cannot follow vendor links under the address rule; amended during the build, accepted at the slice 3 and 4 reviews) |
 | First wave | None | Databricks' ten GA SaaS connectors: Salesforce, ServiceNow, Workday Reports, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, NetSuite, SharePoint |
 | Second wave | None | Match Databricks' beta list (about 45), ordered by customer demand |
 | Each connector | n/a | OAuth where offered (SRC-12), table and column choice, incremental loads, schema change handling (SRC-8), a gate test (SRC-9) |
