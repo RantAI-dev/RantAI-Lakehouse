@@ -1,6 +1,19 @@
 import type { NextConfig } from "next";
 
+// `OPS-11`: Next.js 16.4 serves the dev server's own resources (HMR, chunks)
+// only to `localhost` unless the host is listed here, so a dev console opened
+// by a LAN address never finishes loading. Read the list from
+// `CONSOLE_ALLOWED_DEV_ORIGINS` (comma-separated hostnames, `*.` wildcards
+// allowed, see `.env.example`); unset or empty keeps Next's default, localhost
+// only. It affects `next dev` only: a production build ignores it.
+const allowedDevOrigins = (process.env.CONSOLE_ALLOWED_DEV_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0);
+
 const nextConfig: NextConfig = {
+  ...(allowedDevOrigins.length > 0 ? { allowedDevOrigins } : {}),
+
   // Jejak build mandiri (server + node_modules minimal) supaya image Docker
   // konsol tetap ramping — dipakai stack demo `rantai-lake-demo`.
   output: "standalone",
