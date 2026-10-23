@@ -116,7 +116,7 @@ pub enum Schedule {
 }
 
 /// The columns of `report_subscription` that hold a schedule, in the shape the
-/// table stores them (migration `0088`): `kind`, `minute`, `hour`, `weekday`,
+/// table stores them (migration `0089`): `kind`, `minute`, `hour`, `weekday`,
 /// `month_day` (`-1` is the last day).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleParts {

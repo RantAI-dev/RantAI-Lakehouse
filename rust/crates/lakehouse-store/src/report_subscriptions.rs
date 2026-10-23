@@ -1,5 +1,5 @@
 //! Report subscriptions, their recipients and the record of each send
-//! (`RPT-1`, migration `0088`, plan decision D1; feature page
+//! (`RPT-1`, migration `0089`, plan decision D1; feature page
 //! `docs/core/features/scheduled-reports.md`).
 //!
 //! This module stores and claims; it decides nothing about who may subscribe,

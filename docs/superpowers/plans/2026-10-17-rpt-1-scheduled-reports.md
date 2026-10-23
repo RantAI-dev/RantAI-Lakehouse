@@ -15,7 +15,7 @@ Anchors read on 2026-10-17 on `origin/main` (`48f3295b`) and
 
 The feature page's table, plus:
 
-- **D1 Storage in Postgres.** Migration `rust/migrations/0088_report_subscriptions.sql`
+- **D1 Storage in Postgres.** Migration `rust/migrations/0089_report_subscriptions.sql`
   (why-header): `report_subscription` (id, board, owner principal id,
   schedule kind and fields, time zone, formats and chosen charts as JSON,
   filters and parameters as JSON, skip_when_empty, paused + paused_reason,
@@ -167,7 +167,7 @@ Developer: Claude Sonnet. Branch `feat/bi-phase-4`, after BI-1 and the phase 3 m
 
 | Task | Commit | Subject |
 | --- | --- | --- |
-| T1 | `ca7255e4` | report subscriptions, recipients, deliveries and the schedule maths (migration 0088) |
+| T1 | `ca7255e4` | report subscriptions, recipients, deliveries and the schedule maths (migration 0089) |
 | T2 | `97183b52` | an email can carry attachments, every recipient in Bcc |
 | T3 | `ccec4e8a` | the report runner sends due subscriptions as their owner |
 | T4 | `841886c4` | subscription routes, the recipient picker and the outside-domain setting |
@@ -175,7 +175,7 @@ Developer: Claude Sonnet. Branch `feat/bi-phase-4`, after BI-1 and the phase 3 m
 | T6 | `538883a7` | the assistant schedules reports; others need approval |
 | T7 | `b6b81f8c` | CHANGELOG |
 
-Only one migration, `0088`; `0089` was not needed.
+Only one migration, `0089` (it was `0088` until the merge of main on 2026-10-23, when main took `0086` and `0087`); the spare was not needed.
 
 ### Deviations from the plan (all accepted by the planner)
 

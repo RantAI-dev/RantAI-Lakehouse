@@ -32,11 +32,11 @@ pub struct ReportingSettings {
     /// The sites image and web cards may load from: `https://host[:port]`,
     /// at most 50 (`BI-16` part B, migration `0087`).
     pub content_sites: Vec<String>,
-    /// Role names whose holders may not download (`BI-1`, migration `0087`).
+    /// Role names whose holders may not download (`BI-1`, migration `0088`).
     /// Empty: every role may.
     pub download_denied_roles: Vec<String>,
     /// The outside email domains a scheduled report may go to (`RPT-1`,
-    /// migration `0088`): lower-case names, at most 50. Empty: no report
+    /// migration `0089`): lower-case names, at most 50. Empty: no report
     /// leaves the company.
     pub report_allowed_domains: Vec<String>,
 }
