@@ -231,7 +231,7 @@ estimate (S, M, L), which the base has no field for.
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
-| `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31` | Data | P3 | Building | #216 | PRODUCT §2 |
+| `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31` | Data | P3 | In Acceptance | #216 | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | In Acceptance | #194 | PRODUCT §2; [spec](specs/bld-2.md) |
@@ -415,7 +415,7 @@ set by the product owner and are left empty until they are.
 | `BI-17` | 2026-10-15 | | |
 | `AI-8` | 2026-10-15 | | |
 | `AI-9` | 2026-10-14 | | |
-| `SRC-3` | 2026-10-19 | | |
+| `SRC-3` | 2026-10-19 | 2026-10-23 | |
 
 ## Decide
 
