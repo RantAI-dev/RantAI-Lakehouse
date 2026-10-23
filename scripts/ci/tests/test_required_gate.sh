@@ -163,7 +163,7 @@ expect 1 "Skipped connector operations gate blocks rust PR" "${base_rust_green[@
 expect 1 "Failing OAuth sign-in gate blocks rust PR" "${base_rust_green[@]}" G6_OAUTH_RESULT=failure
 expect 1 "Skipped OAuth sign-in gate blocks rust PR" "${base_rust_green[@]}" G6_OAUTH_RESULT=skipped
 expect 1 "Failing discovery scale gate blocks rust PR" "${base_rust_green[@]}" G6_DISCOVERY_SCALE_RESULT=failure
-expect 1 "Skipped discovery scale gate blocks rust PR" "${base_rust_green[@]}" G6_DISCOVERY_SCALE_RESULT=skipped G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped
+expect 1 "Skipped discovery scale gate blocks rust PR" "${base_rust_green[@]}" G6_DISCOVERY_SCALE_RESULT=skipped
 expect 1 "Failing business-app gate A blocks rust PR" "${base_rust_green[@]}" G6_SAAS_A_RESULT=failure
 expect 1 "Failing business-app gate B blocks rust PR" "${base_rust_green[@]}" G6_SAAS_B_RESULT=failure
 expect 1 "Skipped business-app gate A blocks rust PR" "${base_rust_green[@]}" G6_SAAS_A_RESULT=skipped
