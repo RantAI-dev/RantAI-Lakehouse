@@ -211,6 +211,23 @@ describe("useQueryStudio statements", () => {
     expect(runs.map((entry) => entry.status)).toEqual(["done", "error", "not-run"])
   })
 
+  it("a permission refusal refuses every statement of the batch", async () => {
+    const run = spyOn(queryService, "run").mockRejectedValueOnce(
+      new ServiceError("permission_denied", "not allowed to run queries")
+    )
+    const { result } = mountWith("SELECT 1; SELECT 2; SELECT 3")
+
+    await act(async () => {
+      await result.current.runQuery()
+    })
+
+    expect(run).toHaveBeenCalledTimes(1)
+    const runs = result.current.runs[result.current.activeTabId] ?? []
+    expect(runs.map((entry) => entry.status)).toEqual(["error", "error", "error"])
+    expect(runs[1]?.status === "error" && runs[1].error.code).toBe("permission_denied")
+    expect(runs[2]?.status === "error" && runs[2].error.code).toBe("permission_denied")
+  })
+
   it("refuses a batch of more than twenty statements before anything runs", async () => {
     const run = spyOn(queryService, "run").mockResolvedValue(RESULT as never)
     const notifyInfo = spyOn(notify, "notifyInfo")

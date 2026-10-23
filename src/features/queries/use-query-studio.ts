@@ -700,20 +700,42 @@ export function useQueryStudio() {
               markNotRun(index)
               break
             }
-            setRuns((previous) => ({
-              ...previous,
-              [tabId]: (previous[tabId] ?? []).map((run, at) =>
-                at === index
-                  ? {
-                      status: "error",
-                      statement: run.statement,
-                      error: toServiceError(error),
-                    }
-                  : run
-              ),
-            }))
-            markNotRun(index + 1)
-            break
+            const serviceError = toServiceError(error)
+            const isPermissionRefusal = serviceError.code === "permission_denied"
+            if (isPermissionRefusal) {
+              // A permission refusal is not a statement that failed; it is a
+              // refusal of every statement of the batch because the person
+              // lacks query execution rights. The console marks the entire
+              // remainder of the batch refused locally so nothing reaches the engine.
+              setRuns((previous) => ({
+                ...previous,
+                [tabId]: (previous[tabId] ?? []).map((run, at) =>
+                  at >= index
+                    ? {
+                        status: "error",
+                        statement: run.statement,
+                        error: serviceError,
+                      }
+                    : run
+                ),
+              }))
+              break
+            } else {
+              setRuns((previous) => ({
+                ...previous,
+                [tabId]: (previous[tabId] ?? []).map((run, at) =>
+                  at === index
+                    ? {
+                        status: "error",
+                        statement: run.statement,
+                        error: serviceError,
+                      }
+                    : run
+                ),
+              }))
+              markNotRun(index + 1)
+              break
+            }
           }
         }
       } finally {
