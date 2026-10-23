@@ -12,6 +12,7 @@ import { rawTableFullName, retryInput } from "@/lib/uploads"
 import { uploadService } from "@/services"
 import type { Upload } from "@/services/contracts/uploads"
 import { FileMark, LoadFailure, Refusal, UploadStatusPill } from "./upload-parts"
+import { BadValuesList } from "./upload-columns"
 
 /** How often the upload is read again after "Load", while it is loading. */
 const POLL_MS = 2000
@@ -31,17 +32,26 @@ type Polled = { attempt: number; upload: Upload }
  *   After a failure that happened only at the catalog the rows ARE in the
  *   table, which `LoadFailure` says and `retryInput` accounts for.
  *
+ * A load of several files (`DATA-17` slice 5) is one run and one view: `together` lists the files
+ * that were loaded with this first one, the title line says how many, and "Try again" sends the same
+ * files. Their rows are one total, on the first file (the others have no count of their own). A page
+ * opened on one of the OTHER files (`loadedWith`) does not retry it alone, which would replace the
+ * table with that file's rows: it points at the first file instead.
+ *
  * `attempt` counts the loads started from here, so a poll answer that was
  * asked for before "Try again" (a stale `failed`) is never taken for the new
  * load's.
  */
 export function UploadRunView({
   initial,
+  together = [],
   pollMs = POLL_MS,
   onChangeSettings,
   onReset,
 }: {
   readonly initial: Upload
+  /** The files loaded with this first one, in the order they were named; empty for a load of one file. */
+  readonly together?: readonly { readonly id: string; readonly name: string }[]
   readonly pollMs?: number
   /** Back to the Check step, with the upload as it now stands (its failure reason included). */
   readonly onChangeSettings: (upload: Upload) => void
@@ -68,7 +78,12 @@ export function UploadRunView({
     return () => window.clearInterval(timer)
   }, [loading, refresh, pollMs])
 
-  const input = retryInput(upload)
+  const input = retryInput(
+    upload,
+    together.map((file) => file.id)
+  )
+  const several = together.length > 0
+  const secondary = initial.loadedWith !== undefined
 
   async function tryAgain() {
     if (input === null) return
@@ -104,10 +119,17 @@ export function UploadRunView({
             <span className="shrink-0 text-xs text-muted-foreground">{formatBytes(upload.sizeBytes)}</span>
           </div>
         </div>
+        {several ? (
+          <p className="text-sm text-muted-foreground">
+            {together.length + 1} files load into one table. With {upload.originalFilename}:{" "}
+            <span className="[overflow-wrap:anywhere]">{together.map((file) => file.name).join(", ")}.</span>
+          </p>
+        ) : null}
 
         {loading ? (
           <p role="status" className="text-sm text-muted-foreground">
             Loading {upload.originalFilename}
+            {several ? ` and ${together.length} more ${together.length === 1 ? "file" : "files"}` : ""}
             {upload.bronzeTable ? ` into ${upload.bronzeTable}` : ""}. This page updates by itself; you can also
             leave it and come back from Uploaded files on Sources.
           </p>
@@ -124,9 +146,9 @@ export function UploadRunView({
               <HealthTile label="Table">
                 <span className="min-w-0 break-all font-mono text-[13px]">{table ?? "—"}</span>
               </HealthTile>
-              <HealthTile label="Rows">
+              <HealthTile label={several ? "Rows in all the files" : "Rows"}>
                 {upload.rows === undefined ? (
-                  <span className="text-muted-foreground">Not measured</span>
+                  <span className="text-muted-foreground">{secondary ? "Counted with the first file" : "Not measured"}</span>
                 ) : (
                   <span className="tabular-nums">{formatNumber(upload.rows)}</span>
                 )}
@@ -137,6 +159,7 @@ export function UploadRunView({
                 </HealthTile>
               ) : null}
             </div>
+            {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
             <div className="flex flex-wrap gap-2">
               {upload.assetId !== undefined ? (
                 <Button size="sm" render={<Link href={`/data/assets/${encodeURIComponent(upload.assetId)}`} />}>
@@ -144,7 +167,7 @@ export function UploadRunView({
                 </Button>
               ) : null}
               <Button size="sm" variant="outline" onClick={onReset}>
-                Upload another file
+                {several ? "Upload other files" : "Upload another file"}
               </Button>
             </div>
           </>
@@ -156,11 +179,18 @@ export function UploadRunView({
               <p className="mb-1 text-sm font-medium">The load{table ? ` into ${table}` : ""} failed.</p>
               <LoadFailure upload={upload} />
             </div>
+            {upload.badValues !== undefined ? <BadValuesReport upload={upload} /> : null}
             {retry.error !== null ? <Refusal error={retry.error} /> : null}
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" disabled={input === null || retry.status === "pending"} onClick={tryAgain}>
-                {retry.status === "pending" ? "Starting…" : "Try again"}
-              </Button>
+              {secondary ? (
+                <Button size="sm" render={<Link href={`/connectors/upload?id=${encodeURIComponent(initial.loadedWith ?? "")}`} />}>
+                  Open the first file
+                </Button>
+              ) : (
+                <Button size="sm" disabled={input === null || retry.status === "pending"} onClick={tryAgain}>
+                  {retry.status === "pending" ? "Starting…" : "Try again"}
+                </Button>
+              )}
               <Button size="sm" variant="outline" onClick={() => onChangeSettings(upload)}>
                 Change settings
               </Button>
@@ -180,5 +210,25 @@ export function UploadRunView({
         ) : null}
       </div>
     </SectionCard>
+  )
+}
+
+/**
+ * What the load found that did not fit its column's type (`DATA-18` decision 6):
+ * the count and the first 100. A load told to stop wrote nothing; one told to load
+ * them as empty wrote those cells as empty.
+ */
+function BadValuesReport({ upload }: { readonly upload: Upload }) {
+  const bad = upload.badValues
+  if (bad === undefined) return null
+  const stopped = upload.status === "failed"
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-muted/30 p-3" aria-label="Values that did not fit">
+      <p className="text-sm font-medium">
+        {formatNumber(bad.count)} {bad.count === 1 ? "value" : "values"} did not fit their column&apos;s type.{" "}
+        {stopped ? "The load stopped and wrote nothing." : "They were loaded as empty."}
+      </p>
+      <BadValuesList bad={bad} />
+    </div>
   )
 }

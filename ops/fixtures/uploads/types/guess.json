@@ -1,0 +1,411 @@
+{
+ "_about": "Sample values of one column and the type and date reading both the Rust guess (upload_types.rs) and any reader of the rules must reach (DATA-18 T3.1). dateFormat is the reading the guess settles on, or null when it asks (ask: true); timezone is for timestamps.",
+ "cases": [
+  {
+   "name": "whole numbers with signs",
+   "values": [
+    "1",
+    "22",
+    "-3",
+    "+4"
+   ],
+   "type": "integer",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a leading zero stays text",
+   "values": [
+    "007",
+    "1",
+    "2"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a postcode stays text",
+   "values": [
+    "02134",
+    "90210"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "one and zero are integers",
+   "values": [
+    "1",
+    "0",
+    "1"
+   ],
+   "type": "integer",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "decimals and integers together are decimal",
+   "values": [
+    "1.5",
+    "2",
+    "-0.25"
+   ],
+   "type": "decimal",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a thousands separator is text",
+   "values": [
+    "1,234",
+    "5"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "an exponent is text",
+   "values": [
+    "1e3",
+    "2"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "surrounding spaces are trimmed",
+   "values": [
+    " 12 ",
+    "3"
+   ],
+   "type": "integer",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "empty cells do not count",
+   "values": [
+    "",
+    "5",
+    "  ",
+    "6"
+   ],
+   "type": "integer",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "nothing but empty cells is text",
+   "values": [
+    "",
+    "  ",
+    ""
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "no cells at all is text",
+   "values": [],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "true and false in any case",
+   "values": [
+    "true",
+    "FALSE",
+    "True"
+   ],
+   "type": "boolean",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "yes and no",
+   "values": [
+    "Yes",
+    "no"
+   ],
+   "type": "boolean",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "y and n",
+   "values": [
+    "y",
+    "N"
+   ],
+   "type": "boolean",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "t and f",
+   "values": [
+    "T",
+    "f"
+   ],
+   "type": "boolean",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a yes/no mixed with a number is text",
+   "values": [
+    "true",
+    "2"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "ISO dates",
+   "values": [
+    "2026-10-16",
+    "2025-01-31"
+   ],
+   "type": "date",
+   "dateFormat": "iso",
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "day first is certain when one value says so",
+   "values": [
+    "16/10/2026",
+    "01/02/2026"
+   ],
+   "type": "date",
+   "dateFormat": "dmy",
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "month first is certain when one value says so",
+   "values": [
+    "10/16/2026",
+    "01/02/2026"
+   ],
+   "type": "date",
+   "dateFormat": "mdy",
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "every value could be either: ask",
+   "values": [
+    "01/02/2026",
+    "03/04/2026"
+   ],
+   "type": "date",
+   "dateFormat": null,
+   "ask": true,
+   "timezone": null
+  },
+  {
+   "name": "values that contradict each other are text",
+   "values": [
+    "16/10/2026",
+    "10/16/2026"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "ISO and day-first together are text",
+   "values": [
+    "2026-10-16",
+    "16/10/2026"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "dots as separators",
+   "values": [
+    "16.10.2026",
+    "01.02.2026"
+   ],
+   "type": "date",
+   "dateFormat": "dmy",
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "dashes as separators",
+   "values": [
+    "16-10-2026",
+    "25-12-2025"
+   ],
+   "type": "date",
+   "dateFormat": "dmy",
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a date that does not exist is text",
+   "values": [
+    "2026-02-30"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "ten fractional digits is text",
+   "values": [
+    "0.1234567891"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "nine fractional digits is decimal",
+   "values": [
+    "0.123456789"
+   ],
+   "type": "decimal",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a whole number past 64 bits is decimal",
+   "values": [
+    "9223372036854775808"
+   ],
+   "type": "decimal",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a leading dot is a decimal",
+   "values": [
+    ".5",
+    "1.25"
+   ],
+   "type": "decimal",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "a trailing dot is text",
+   "values": [
+    "5."
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "timestamps without a zone",
+   "values": [
+    "2026-10-16T13:30:05",
+    "2026-10-16 01:02:03.123456"
+   ],
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "ask": false,
+   "timezone": false
+  },
+  {
+   "name": "timestamps with a zone, all of them",
+   "values": [
+    "2026-10-16T13:30:05Z",
+    "2026-10-16T13:30:05+07:00"
+   ],
+   "type": "timestamp",
+   "dateFormat": "iso",
+   "ask": false,
+   "timezone": true
+  },
+  {
+   "name": "a mix of zoned and unzoned timestamps is text",
+   "values": [
+    "2026-10-16T13:30:05Z",
+    "2026-10-16T13:30:05"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "day-first timestamps",
+   "values": [
+    "16/10/2026 13:30",
+    "01/02/2026 08:00:01"
+   ],
+   "type": "timestamp",
+   "dateFormat": "dmy",
+   "ask": false,
+   "timezone": false
+  },
+  {
+   "name": "timestamps that could be either order: ask",
+   "values": [
+    "01/02/2026 13:30"
+   ],
+   "type": "timestamp",
+   "dateFormat": null,
+   "ask": true,
+   "timezone": false
+  },
+  {
+   "name": "a fraction of seven digits is text",
+   "values": [
+    "2026-10-16T13:30:05.1234567"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  },
+  {
+   "name": "words are text",
+   "values": [
+    "alpha",
+    "beta"
+   ],
+   "type": "text",
+   "dateFormat": null,
+   "ask": false,
+   "timezone": null
+  }
+ ]
+}

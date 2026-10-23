@@ -151,12 +151,14 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import dlt
+import pyarrow as pa
+from dlt.common.utils import uniq_id_base64
 from dlt.destinations import filesystem
 from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
 from dlt.extract.incremental import IncrementalResourceWrapper
@@ -164,9 +166,11 @@ from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
 from dlt.pipeline.exceptions import PipelineStepFailed
 from dlt.pipeline.helpers import pipeline_drop
+from pydantic import TypeAdapter
 from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.types import IcebergType
 
-from dispar_orchestrate.adapters import dedup, history
+from dispar_orchestrate.adapters import dedup, history, iceberg_stream
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +298,7 @@ class LoadPlan:
         )
 
 
-def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
+def _stamp_ingested_at(record: Any) -> Any:
     """Bronze's system ingestion-time column (ADR 0004's
     `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) --
     stamped here, the ONE place any Bronze row this sink writes gets it,
@@ -302,7 +306,19 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     (e.g. a Kafka payload that happens to carry a same-named field) is
     OVERWRITTEN, not preserved, so partitioning never depends on a
     source-provided timestamp existing, being non-null, or meaning what
-    this column means."""
+    this column means.
+
+    `record` is a row (a dict) or, since the upload job streams in batches
+    (`DATA-17` T2.1), an Arrow table or record batch: every row of the batch gets
+    the one moment the batch was stamped, in a `timestamp[us, UTC]` column that
+    replaces a column of the same name the batch brought."""
+    if isinstance(record, (pa.Table, pa.RecordBatch)):
+        stamp = pa.array([datetime.now(timezone.utc)] * record.num_rows, type=pa.timestamp("us", tz="UTC"))
+        if isinstance(record, pa.RecordBatch):
+            record = pa.Table.from_batches([record])
+        if "_ingested_at" in record.schema.names:
+            record = record.drop_columns(["_ingested_at"])
+        return record.append_column("_ingested_at", stamp)
     record["_ingested_at"] = datetime.now(timezone.utc)
     return record
 
@@ -790,6 +806,135 @@ def _apply_cursor(source: Any, cursor: str, mode: str = "incremental") -> None:
         resource.apply_hints(incremental=dlt.sources.incremental(cursor, lag=lag))
 
 
+# `DATA-18` flush size of a type-changing replace: the batches the job hands over are
+# gathered up to this many bytes, then written as data files inside the one transaction.
+RETYPE_FLUSH_BYTES = 64 * 1024 * 1024
+# Iceberg's own type names (`long`, `decimal(38, 9)`, `timestamptz`) as pyiceberg's types.
+_ICEBERG_TYPE: TypeAdapter[IcebergType] = TypeAdapter(IcebergType)
+
+
+def _changed_columns(table: Any, column_types: Mapping[str, str]) -> list[str]:
+    """The columns the table has with another Iceberg type than the load is about to
+    write, in the table's column order. `column_types` maps a column name to the Iceberg
+    type name the load writes; a column the table has and the load does not write is not a
+    difference, and neither is a column the table does not have yet."""
+    held = {field.name: str(field.field_type) for field in table.schema().fields}
+    return [
+        field.name
+        for field in table.schema().fields
+        if field.name in column_types and held[field.name] != column_types[field.name]
+    ]
+
+
+def _retype_in(transaction: Any, table: Any, changed: list[str], column_types: Mapping[str, str]) -> None:
+    """Stage, in `transaction`, the new type of each column in `changed`: the column is
+    deleted and added again under the same name (Iceberg refuses `update_column` to a type
+    that does not widen), then moved back to where it was, so the table keeps the file's
+    column order. Nothing is committed here."""
+    order = [field.name for field in table.schema().fields]
+    with transaction.update_schema() as update:
+        for name in changed:
+            update.delete_column(name)
+            update.add_column(name, _ICEBERG_TYPE.validate_python(column_types[name]))
+    with transaction.update_schema() as update:
+        for name in changed:  # in the table's order, so the column before is already in place
+            position = order.index(name)
+            if position == 0:
+                update.move_first(name)
+            else:
+                update.move_after(name, order[position - 1])
+
+
+def _items_of(source: Any) -> Iterable[Any]:
+    """What a `dlt` source or resource yields when it is run without a pipeline (its
+    maps, among them the `_ingested_at` stamp, are applied), or the items of a plain iterable."""
+    if isinstance(source, DltSource):
+        for resource in source.selected_resources.values():
+            yield from resource
+    else:
+        yield from source
+
+
+def _fit_batch(batch: pa.Table, target: pa.Schema, load_id: str) -> pa.Table:
+    """`batch` laid out as the table's (new) schema: its columns cast to the table's types, the
+    columns it does not carry as `dlt` would leave them (`_dlt_load_id`, `_dlt_id` filled in,
+    any other column null).
+
+    # Errors
+
+    Raises `ValueError` for a required column of a name this function cannot fill, and
+    whatever the cast raises for a value that does not fit."""
+    rows = batch.num_rows
+    arrays = []
+    for field in target:
+        if field.name in batch.schema.names:
+            arrays.append(batch[field.name].cast(field.type))
+        elif field.name == "_dlt_load_id":
+            arrays.append(pa.array([load_id] * rows, type=field.type))
+        elif field.name == "_dlt_id":
+            arrays.append(pa.array([uniq_id_base64(10) for _ in range(rows)], type=field.type))
+        elif field.nullable:
+            arrays.append(pa.nulls(rows, type=field.type))
+        else:
+            raise ValueError("a required column of the table is not in the load")
+    return pa.Table.from_arrays(arrays, schema=target)
+
+
+def _replace_changing_types(
+    table: Any, source: Any, changed: list[str], column_types: Mapping[str, str]
+) -> int:
+    """`DATA-18` decision 9, "replacing a table may change its types": write a `replace` that
+    changes column types as ONE `pyiceberg` transaction, the new schema and the new rows
+    together (Phase 3 slice 3 review BLOCKER 1). A failure anywhere inside, including the
+    stream's own (`on_bad_value` told to stop), commits nothing: the schema, the rows and the
+    current snapshot stay as they were, and the old snapshots stay in the table's history
+    after a success. The table is NEVER dropped or purged.
+
+    Measured with dlt 1.30.0 and pyiceberg 0.12.0 (section 8 item 5 of the Phase 3 plan): a
+    `dlt` replace that changes a column's type is refused by pyiceberg, so this case does not
+    go through `dlt`; every other load does. The batches are read from `source` (already
+    stamped with `_ingested_at`) and written inside the transaction in groups of up to
+    `RETYPE_FLUSH_BYTES`, so the file is never held whole. A failure after some groups were
+    written leaves their data files in the bucket, unreferenced by the table (the orphan
+    clean-up of `maintenance.py` owns those).
+
+    The table's `dlt` schema (in the bucket) keeps the old types of the changed columns
+    until the next `dlt` load of the table, which always declares its column types, and
+    those declarations win (section 8 item 5: no variant column).
+
+    Returns the number of rows written. # Errors: whatever the catalog, the cast or
+    `source` raises; nothing is committed then."""
+    load_id = f"{datetime.now(timezone.utc).timestamp():.6f}"
+    rows = 0
+    pending: list[pa.Table] = []
+    pending_bytes = 0
+    first = True
+    with table.transaction() as transaction:
+        _retype_in(transaction, table, changed, column_types)
+        target = transaction.table_metadata.schema().as_arrow()
+
+        def flush() -> None:
+            nonlocal first, pending, pending_bytes
+            if not pending and not first:
+                return
+            chunk = pa.concat_tables(pending) if pending else target.empty_table()
+            # The first group replaces what the table holds; later groups add to it.
+            (transaction.overwrite if first else transaction.append)(chunk)
+            first, pending, pending_bytes = False, [], 0
+
+        for item in _items_of(source):
+            fitted = _fit_batch(
+                pa.Table.from_batches([item]) if isinstance(item, pa.RecordBatch) else item, target, load_id
+            )
+            rows += fitted.num_rows
+            pending.append(fitted)
+            pending_bytes += fitted.nbytes
+            if pending_bytes >= RETYPE_FLUSH_BYTES:
+                flush()
+        flush()
+    return rows
+
+
 def _abort_pending(pipeline: Any, *, strict: bool = False) -> None:
     """Abort the pipeline's pending packages and restore its state to before
     them (`Pipeline.abort_packages`; `SRC-10` measurement 4). After a failure it
@@ -889,7 +1034,11 @@ def _load_history(source: Any, bronze_table_name: str, config: SinkConfig, plan:
 
 
 def load_via_sink(
-    source, bronze_table_name: str, config: SinkConfig, plan: LoadPlan = LoadPlan()
+    source,
+    bronze_table_name: str,
+    config: SinkConfig,
+    plan: LoadPlan = LoadPlan(),
+    column_types: Mapping[str, str] | None = None,
 ) -> SinkResult:
     """Write `source` (an already-configured `dlt` source, e.g. `sql_database(...)`
     with hints/maps already applied by the calling adapter) to Bronze
@@ -907,8 +1056,15 @@ def load_via_sink(
     with no key value, more distinct keys than `INGEST_DEDUP_MAX_ROWS`, cursor
     values that cannot be ordered. On any failure the pipeline's pending
     packages are aborted first (see "What a failed load leaves behind").
+
+    `column_types` (name to Iceberg type name, `DATA-18`): when given, a `replace` that
+    changes a column's type is written as one `pyiceberg` transaction instead of through
+    `dlt` (`_replace_changing_types`); it never drops the table.
     """
     _install_catalog_env(config)
+    # PR #186 review BLOCKER 6: dlt's Iceberg job reads the whole load into memory; see
+    # `iceberg_stream`. Before any pipeline exists, so every job of this load takes the path.
+    iceberg_stream.install()
     if plan.refresh == "remove":
         # SRC-10 decision 5: refresh, removing old rows. Emptied here, at the point
         # of loading, after the adapter's schema check let the table through (the
@@ -1038,13 +1194,29 @@ def load_via_sink(
         # re-reads and re-merges the last row.
         write_disposition = "replace"
     try:
-        load_info = pipeline.run(
-            source,
-            table_name=bronze_table_name,
-            table_format="iceberg",
-            write_disposition=write_disposition,
-            **run_options,
-        )
+        changed: list[str] = []
+        retype_table = None
+        if column_types is not None and write_disposition == "replace":
+            # `DATA-18`: a replace may change the column types; see `_replace_changing_types`.
+            retype_table = history.open_table(pipeline, bronze_table_name, sync=False)
+            changed = _changed_columns(retype_table, column_types) if retype_table is not None else []
+        if changed and retype_table is not None and column_types is not None:
+            # Phase 3 slice 3 review BLOCKER 1: one transaction, never a drop.
+            written = _replace_changing_types(retype_table, source, changed, column_types)
+            return SinkResult(
+                rows=written,
+                has_failed_jobs=False,
+                load_info_str=f"replaced in one commit, {len(changed)} column type(s) changed",
+                columns=(),  # dlt's schema is not updated by this path: nothing to report, nothing guessed
+            )
+        else:
+            load_info = pipeline.run(
+                source,
+                table_name=bronze_table_name,
+                table_format="iceberg",
+                write_disposition=write_disposition,
+                **run_options,
+            )
         dedup.assert_flushed(dedup_steps, table=bronze_table_name)
     except Exception as exc:
         # SRC-10 measurement 4: a failed load leaves its package pending and the
