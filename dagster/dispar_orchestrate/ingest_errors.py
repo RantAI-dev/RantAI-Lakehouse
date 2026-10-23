@@ -441,6 +441,10 @@ def _classify_one(exc: BaseException) -> str | None:
         return PERMISSION_MISSING
     if isinstance(exc, saas_session.SaasRateLimited):
         return RATE_LIMITED
+    if isinstance(exc, saas_session.SaasBadAnswer):
+        # Final review SHOULD-FIX 23: a 2xx body that is not JSON is the vendor being broken,
+        # not a rejected setting; retried like any other busy source.
+        return SOURCE_BUSY
     if isinstance(
         exc,
         (

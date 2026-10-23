@@ -38,7 +38,8 @@ and injectable.
 
 401 raises `SaasSignInRefused`, 403 `SaasPermissionMissing` (or `SaasQuotaExhausted` when the
 vendor module recognises a used-up quota in the body: Salesforce), 429 past the bound
-`SaasRateLimited`; any other error status raises `requests.HTTPError` (its
+`SaasRateLimited`, and a success status whose body is not JSON `SaasBadAnswer` (retried as
+`source_busy`); any other error status raises `requests.HTTPError` (its
 status is what `ingest_errors` reads). None of the messages holds the vendor's
 words, the URL or a header.
 """
@@ -46,6 +47,7 @@ words, the URL or a header.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
@@ -94,6 +96,16 @@ class SaasQuotaExhausted(SaasRateLimited):
     hours, so waiting the run's minutes would only spend more requests."""
 
 
+class SaasBadAnswer(Exception):
+    """The vendor answered a success status with a body this connector cannot read as JSON
+    (`requests.JSONDecodeError`; final review SHOULD-FIX 23). Classified `source_busy` and
+    retried: the vendor was broken, not the connector's setting, and its body is never read
+    out into the message."""
+
+    def __init__(self) -> None:
+        super().__init__("the vendor answered in a form this connector does not read")
+
+
 def _allow_http() -> bool:
     """The gate-only switch (`CONNECTOR_OAUTH_ALLOW_HTTP=true`, default off),
     the same one `adapters/rest.py` and the API read: the acceptance gate's own
@@ -107,20 +119,27 @@ def _origin_of(url: str) -> tuple[str, str, int]:
 
     # Errors
 
-    `ssrf_guard.SsrfBlocked` for a URL with no host, with userinfo, or with a
-    scheme other than `https` (`http` only under the gate-only switch).
+    `ssrf_guard.SsrfBlocked` for a URL with no host, with userinfo, with a scheme other
+    than `https` (`http` only under the gate-only switch), or for a netloc `urlparse`
+    cannot decode (an NFKC-changing character, a broken IPv6 literal; final review
+    SHOULD-FIX 23: the fixed text, never `urlparse`'s, which quotes the host).
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        # `.hostname` decodes the netloc too and raises the same `ValueError` (Python 3.12).
+        hostname = parsed.hostname
+    except ValueError:
+        raise ssrf_guard.SsrfBlocked("a business-app address must be a plain host") from None
     scheme = parsed.scheme.lower()
     if scheme != "https" and not (scheme == "http" and _allow_http()):
         raise ssrf_guard.SsrfBlocked("a business-app request must use https")
-    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+    if not hostname or parsed.username is not None or parsed.password is not None:
         raise ssrf_guard.SsrfBlocked("a business-app address must be a plain host")
     try:
         port = parsed.port
     except ValueError:
         raise ssrf_guard.SsrfBlocked("a business-app address has an invalid port") from None
-    return scheme, parsed.hostname.lower(), port or (443 if scheme == "https" else 80)
+    return scheme, hostname.lower(), port or (443 if scheme == "https" else 80)
 
 
 def _real_get(url: str, *, headers: dict, params: dict | None, timeout: float) -> Any:
@@ -230,7 +249,9 @@ class SaasSession:
             seconds = float(raw) if raw is not None else float(2**attempt)
         except (TypeError, ValueError):
             seconds = float(2**attempt)
-        if seconds < 0 or seconds > self._max_retry_after:
+        # Final review SHOULD-FIX 23: `nan` and `inf` are neither < 0 nor > the bound, so they
+        # passed and `sleep` got a value it cannot honour. Both are past the bound.
+        if not math.isfinite(seconds) or seconds < 0 or seconds > self._max_retry_after:
             raise SaasRateLimited()
         return seconds
 
@@ -273,6 +294,16 @@ class SaasSession:
         See `_send`.
         """
         return self._send("POST", target, None, body, extra_headers=headers)
+
+    def _body(self, response: Any) -> Any:
+        """The JSON body of a success answer. A body that is not JSON is the fixed
+        `SaasBadAnswer` (final review SHOULD-FIX 23), not `requests.JSONDecodeError` (a
+        `ValueError`, which `ingest_errors` classed as a rejected setting); the vendor's
+        text is never read out."""
+        try:
+            return response.json()
+        except ValueError:
+            raise SaasBadAnswer() from None
 
     def _send(
         self,
@@ -331,5 +362,5 @@ class SaasSession:
             if status >= 400:
                 raise requests.HTTPError(f"HTTP {status}", response=response)
             if with_link:
-                return response.json(), _next_link(getattr(response, "headers", None))
-            return response.json()
+                return self._body(response), _next_link(getattr(response, "headers", None))
+            return self._body(response)

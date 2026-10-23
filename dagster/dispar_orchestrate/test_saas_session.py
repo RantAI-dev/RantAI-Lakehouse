@@ -208,6 +208,48 @@ def test_a_retry_after_past_the_bound_fails_as_rate_limited_without_waiting() ->
     assert slept == [] and len(http.urls) == 1
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_retry_after_that_is_not_finite_fails_as_rate_limited_without_waiting(value: str) -> None:
+    """PR #216 final review SHOULD-FIX 23: `nan` is neither < 0 nor > the bound, so it passed and
+    reached `sleep`."""
+    http = Recorder(Reply(429, headers={"Retry-After": value}))
+    slept: list[float] = []
+    session, _ = make(http, sleep=slept.append, max_retry_after=60)
+    with pytest.raises(SaasRateLimited):
+        session.get_json("/api")
+    assert slept == [] and len(http.urls) == 1
+
+
+@pytest.mark.parametrize("url", ["https://[::1", "https://exa\u2100mple.invalid/x"])
+def test_a_host_urlparse_cannot_decode_is_a_fixed_address_refusal(url: str) -> None:
+    """SHOULD-FIX 23: `urlparse`/`.hostname` raise `ValueError` for an NFKC-changing netloc and a
+    broken IPv6 literal; it escaped as a rejected setting and carried `urlparse`'s text, which
+    quotes the host."""
+    http = Recorder()
+    session, asked = make(http)
+    with pytest.raises(ssrf_guard.SsrfBlocked) as raised:
+        session.get_json(url)
+    assert "NFKC" not in str(raised.value) and "Invalid IPv6" not in str(raised.value) and "exa" not in str(raised.value)
+    assert http.urls == [] and asked == [], "no request, no credential"
+
+
+def test_a_2xx_answer_that_is_not_json_is_a_fixed_bad_answer_classed_source_busy() -> None:
+    """SHOULD-FIX 23: `requests.JSONDecodeError` is a `ValueError`, which `ingest_errors` classed as
+    `setting_rejected` (a setting to fix, never retried)."""
+    from dispar_orchestrate import ingest_errors
+
+    class NotJson(Reply):
+        def json(self) -> object:
+            raise requests.JSONDecodeError("VENDOR-WORDS", "VENDOR-WORDS", 0)
+
+    session, _ = make(Recorder(NotJson(200)))
+    with pytest.raises(saas_session.SaasBadAnswer) as raised:
+        session.get_json("/api")
+    assert "VENDOR-WORDS" not in str(raised.value)
+    classified = ingest_errors.classify(raised.value)
+    assert (classified.error_class, classified.retried) == ("source_busy", True)
+
+
 def test_a_429_that_never_stops_fails_as_rate_limited_after_the_attempts() -> None:
     http = Recorder(*[Reply(429, headers={"Retry-After": "1"}) for _ in range(10)])
     session, _ = make(http, max_attempts=3)
