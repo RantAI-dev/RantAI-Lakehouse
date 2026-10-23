@@ -1539,3 +1539,24 @@ Commands run on the final tree, with counts:
 - BLOCKER 18: the Rust side can only refuse plain `incremental`; the
   `primaryKey`-vs-vendor-key check is Python only because the declared keys
   live in the Python vendor modules, as the finding allows.
+
+### Final review, round 2 (reviewer, 2026-10-23, head `16fd7a89`)
+
+Read every fix commit (`aa07bdd7` to `1c88b555`) against its finding.
+BLOCKERs 17 and 18 and SHOULD-FIX 20 to 26 are fixed as asked: accepted.
+The reviewer's own full run on the pre-fix head merged with `main`
+(`00565f9d`): fmt and clippy clean; Rust 133 binaries, 6,971 passed, 297
+failed, all in the `lakehouse-api` lib binary and all "Connection reset"
+in sqlx's test-database setup (the shared test Postgres); that binary
+re-run alone: 2,440 passed, 0 failed. Typecheck clean; console 2,587
+passed; Dagster 2,124 passed; Python lints, compose config and gitleaks
+OK. The fix round is re-run after round 2.
+
+- `BLOCKER 19` is not closed. `g6_saas_test.py` sets
+  `"list_marker": "/pages"` (a string) for Confluence, and the check does
+  `any(m in line for m in list_marker)`, which iterates the string's
+  characters: every request with a `/` counts, so `max_reads` and
+  `first_reads_more_than_reload` compare all requests, not page reads.
+  Fix: make it a tuple (`("/pages",)`), and make the code refuse a bare
+  string (normalise or assert a tuple) so the same slip cannot come back.
+  Cite `BLOCKER 19 (round 2)`.
