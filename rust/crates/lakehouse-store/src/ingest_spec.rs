@@ -862,21 +862,29 @@ impl TargetIdentity {
 
 /// The target identity of a `saas` dial. `SRC-3` AD2: every address of a
 /// `saas` connector is built from the vendor row and `account`, so these two
-/// decide where the credential goes. Changing either needs every credential
-/// again (`SEC-14` part A). The vendor and the host part of the account
-/// compare case-insensitively, as host names do elsewhere in this module; the
-/// tenant after a `/` (Workday) is a name and compares as written.
+/// decide where the credential goes; the sign-in kind decides which secret
+/// occupies which slot. Changing any of the three needs every credential again
+/// (`SEC-14` part A; final review SHOULD-FIX 25: with the kind left out,
+/// switching sign-in kept the stored refs in their slots and sent a secret in
+/// another role). The vendor and the host part of the account compare
+/// case-insensitively, as host names do elsewhere in this module; the tenant
+/// after a `/` (Workday) is a name and compares as written.
 fn saas_target_identity(saas: &SaasDial) -> TargetIdentity {
     let account = saas.account.trim();
     let account = match account.split_once('/') {
         Some((host, tenant)) => format!("{}/{tenant}", host.to_ascii_lowercase()),
         None => account.to_ascii_lowercase(),
     };
+    let auth_kind = match &saas.auth {
+        SaasAuth::Oauth2AuthorizationCode { .. } => "oauth2_authorization_code",
+        SaasAuth::Integration => "integration",
+    };
     TargetIdentity::new(
         "saas",
         vec![
             ("vendor", saas.vendor.trim().to_ascii_lowercase()),
             ("account", account),
+            ("authType", auth_kind.to_owned()),
         ],
     )
 }
@@ -1156,8 +1164,10 @@ const MAX_SAAS_OBJECT_NAME_LEN: usize = 256;
 ///
 /// Returns [`IngestSpecError::InvalidDial`] for an unknown vendor, an account
 /// outside the vendor's pattern, an integration credential the vendor does
-/// not offer (Salesforce: decision 4), an empty or oversized client id, or an
-/// object name that is blank, long, repeated or has a control character.
+/// not offer (Salesforce: decision 4) or `NetSuite`'s without its
+/// `certificateId` (final review SHOULD-FIX 25), an empty or oversized
+/// client id, or an object name that is blank, long, repeated or has a
+/// control character.
 fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), IngestSpecError> {
     let refuse = |message: &str| IngestSpecError::InvalidDial {
         adapter: adapter.to_owned(),
@@ -1199,6 +1209,12 @@ fn validate_saas_dial_post_parse(adapter: &str, dial: &SaasDial) -> Result<(), I
                 "certificateId is only for NetSuite's integration credential and must be a plain name",
             ));
         }
+    } else if dial.vendor == "netsuite" && dial.auth == SaasAuth::Integration {
+        // PR #216 final review SHOULD-FIX 25: without it the signed assertion cannot name the
+        // certificate uploaded in NetSuite, and the connector failed only at its connection test.
+        return Err(refuse(
+            "NetSuite's integration credential needs certificateId: the id of the certificate uploaded in NetSuite",
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     if dial.objects.len() > MAX_SAAS_OBJECTS
@@ -3983,6 +3999,10 @@ mod saas_dial_tests {
         }
         assert!(with("netsuite", "1234567", &oauth(), "cert-1").is_err());
         assert!(with("zendesk", "acme", &integration(), "cert-1").is_err());
+        // Final review SHOULD-FIX 25: the integration credential cannot be signed without the
+        // certificate id, so the save refuses it now rather than the connection test later.
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &integration())).is_err());
+        assert!(Dial::parse("saas", &dial("netsuite", "1234567", &oauth())).is_ok());
         // Not part of the target identity: it is a name, not a destination.
         let a = with("netsuite", "1234567", &integration(), "cert-1").unwrap();
         let b = with("netsuite", "1234567", &integration(), "cert-2").unwrap();
@@ -4008,14 +4028,18 @@ mod saas_dial_tests {
     }
 
     #[test]
-    fn the_saas_target_identity_changes_with_the_vendor_or_the_account_only() {
+    fn the_saas_target_identity_changes_with_the_vendor_the_account_or_the_sign_in_kind() {
         let base = Dial::parse("saas", &dial("zendesk", "acme", &oauth())).unwrap();
         let same_account_other_case =
-            Dial::parse("saas", &dial("zendesk", "ACME", &integration())).unwrap();
+            Dial::parse("saas", &dial("zendesk", "ACME", &oauth())).unwrap();
         assert_eq!(
             base.target_identity(),
             same_account_other_case.target_identity()
         );
+        // Final review SHOULD-FIX 25: a different sign-in kind is a different role for the same
+        // stored slots, so the credentials must be asked again (this used to assert equality).
+        let other_auth = Dial::parse("saas", &dial("zendesk", "acme", &integration())).unwrap();
+        assert_ne!(base.target_identity(), other_auth.target_identity());
         let mut renamed = dial("zendesk", "acme", &oauth());
         renamed["objects"] = serde_json::json!(["tickets"]);
         renamed["auth"]["clientId"] = serde_json::json!("another-app");
@@ -4034,6 +4058,11 @@ mod saas_dial_tests {
             Some("saas"),
             &dial("zendesk", "acme", &oauth()),
             &renamed
+        ));
+        assert!(is_repoint(
+            Some("saas"),
+            &dial("zendesk", "acme", &oauth()),
+            &other_auth
         ));
     }
 }

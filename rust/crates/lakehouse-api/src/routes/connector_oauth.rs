@@ -677,6 +677,21 @@ impl Revocation {
     }
 }
 
+/// The revocation address to use: the table's URL, rebased onto the gate's mock origin when the
+/// gate names this vendor (final review SHOULD-FIX 25; `gate_rebase_with` so a test needs no
+/// environment). A `rest` connector has no vendor and keeps its own URL.
+fn revocation_url(
+    settings: connector_oauth::OAuthSettings,
+    vendor: Option<&'static str>,
+    url: &str,
+    gate_origins: Option<&str>,
+) -> String {
+    vendor.map_or_else(
+        || url.to_owned(),
+        |vendor| connector_oauth::gate_rebase_with(settings, gate_origins, vendor, url),
+    )
+}
+
 /// Tell the provider to revoke the connector's refresh token, if the dial has a
 /// revocation address and a token is stored. Best effort: the caller removes the
 /// local copy whatever this returns. Used by sign-out and by deleting the
@@ -698,8 +713,18 @@ pub(super) async fn revoke_stored_token(state: &AppState, info: &ConnectorDialIn
     else {
         return Revocation::Failed;
     };
-    match connector_oauth::revoke_request(
+    // PR #216 final review SHOULD-FIX 25: the same gate-only rebase the code exchange applies.
+    // Without it a sign-out under the gate would post the mock's token to the REAL vendor address.
+    let url = revocation_url(
+        state.config.oauth_settings(),
+        app.gate_vendor,
         url,
+        std::env::var(connector_oauth::GATE_ORIGINS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    match connector_oauth::revoke_request(
+        &url,
         &token,
         &app.client_id,
         &client_secret,
@@ -803,6 +828,42 @@ mod tests {
             "vendor": vendor, "account": account,
             "auth": {"type": "oauth2_authorization_code", "clientId": "app-1"}
         })
+    }
+
+    #[test]
+    fn a_saas_sign_out_is_rebased_onto_the_gates_mock_origin() {
+        // PR #216 final review SHOULD-FIX 25: the code exchange rebased its token URL, the
+        // revocation did not -- so under the gate a sign-out posted the mock's token to the real host.
+        let on = connector_oauth::OAuthSettings { allow_http: true };
+        let origins = r#"{"salesforce":"http://127.0.0.1:8103"}"#;
+        let real = "https://acme.my.salesforce.com/services/oauth2/revoke";
+        assert_eq!(
+            revocation_url(on, Some("salesforce"), real, Some(origins)),
+            "http://127.0.0.1:8103/services/oauth2/revoke"
+        );
+        // Inert exactly as `gate_rebase` is: the switch off, another vendor, or no vendor (`rest`).
+        assert_eq!(
+            revocation_url(
+                connector_oauth::OAuthSettings { allow_http: false },
+                Some("salesforce"),
+                real,
+                Some(origins)
+            ),
+            real
+        );
+        assert_eq!(
+            revocation_url(on, Some("zendesk"), real, Some(origins)),
+            real
+        );
+        assert_eq!(
+            revocation_url(
+                on,
+                None,
+                "https://api.example.invalid/revoke",
+                Some(origins)
+            ),
+            "https://api.example.invalid/revoke"
+        );
     }
 
     #[test]

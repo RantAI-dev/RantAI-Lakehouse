@@ -141,10 +141,12 @@ describe("the rest of the saas connector surfaces", () => {
     expect(hostFromDial("saas", dial)).toBe("acme")
   })
 
-  it("asks for the credentials again when the vendor or the account changes, not for anything else", () => {
+  it("asks for the credentials again when the vendor, the account or the sign-in kind changes", () => {
     const stored = oauth("zendesk") as unknown as Record<string, unknown>
     expect(targetChanged({ storedAdapter: "saas", storedDial: stored, adapter: "saas", dial: { ...stored, account: "ACME" } })).toBe(false)
-    expect(targetChanged({ storedAdapter: "saas", storedDial: stored, adapter: "saas", dial: { ...stored, auth: { type: "integration" } } })).toBe(false)
+    // PR #216 final review SHOULD-FIX 25: another sign-in kind puts a different secret in the same
+    // stored slots, so the credentials must be entered again (this used to assert false).
+    expect(targetChanged({ storedAdapter: "saas", storedDial: stored, adapter: "saas", dial: { ...stored, auth: { type: "integration" } } })).toBe(true)
     expect(targetChanged({ storedAdapter: "saas", storedDial: stored, adapter: "saas", dial: { ...stored, account: "other" } })).toBe(true)
     expect(targetChanged({ storedAdapter: "saas", storedDial: stored, adapter: "saas", dial: { ...stored, vendor: "confluence" } })).toBe(true)
   })
