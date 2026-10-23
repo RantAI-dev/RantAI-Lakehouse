@@ -428,16 +428,16 @@ Summary: 69 capabilities. We have 25, have 23 partly and lack 19.
 
 | Capability | RantAI Lakehouse | Databricks | Snowflake | Airbyte |
 | --- | --- | --- | --- | --- |
-| Working connector types | **Partial**. PostgreSQL, MySQL/MariaDB, SQL Server, S3 files, REST, Kafka (batch), MongoDB, PostgreSQL CDC; Oracle, SFTP and MySQL/SQL Server CDC never gate-tested; Sheets does not work | **Have**. About 60 managed connectors, 10 SaaS ones generally available | **Have**. Openflow, about 25 connectors | **Have**. 602 sources, 66 certified |
+| Working connector types | **Partial**. PostgreSQL, MySQL/MariaDB, SQL Server, S3 files, REST, Kafka (batch), MongoDB, PostgreSQL CDC; Oracle, SFTP and MySQL/SQL Server CDC never gate-tested; Sheets does not work. Plus eight business-app types (`SRC-3`, next row), gate-tested against mock vendors only | **Have**. About 60 managed connectors, 10 SaaS ones generally available | **Have**. Openflow, about 25 connectors | **Have**. 602 sources, 66 certified |
 | Database change capture (CDC) | **Partial**. PostgreSQL gate-tested; MySQL and SQL Server untested; Debezium added by an operator | **Have**. SQL Server GA; MySQL and PostgreSQL in preview | **Have**. PostgreSQL, MySQL, SQL Server, Oracle | **Have**. PostgreSQL, MySQL, SQL Server, MongoDB |
-| SaaS connectors | **Missing**. Backlog SRC-3 | **Have** | **Have** | **Have** |
+| SaaS connectors | **Partial**. Eight of Databricks' ten generally available ones load end to end and incrementally where the vendor has a change filter: Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint. Each passes the `g6-saas` gate (connect, discover, load, reload) against a mock vendor; none was tried on a real account (`plans/SRC-3-RESULT.md`). Workday Reports and NetSuite are built and listed unsupported until a real account is used (`SRC-27`). The second wave (Databricks' beta list, about 45) is not started (`SRC-26`) | **Have** | **Have** | **Have** |
 | Files from object storage | **Partial**. S3 csv/json/parquet; testing is broken for wizard-made connectors | **Have** | **Have** | **Have**. Compression and glob patterns |
 | Streaming sources | **Partial**. Kafka batch poll | **Have** | **Have** | **Partial**. Community connector |
 | Create wizard | **Have**. Type, connection, tenant, review, then a real test | **Have** | **Have** | **Have**. Form generated from the connector spec, docs alongside |
 | Test connection | **Partial**. Real for five types; broken for object storage; Oracle always reads as failed | **Have** | **Partial** | **Have**. With suggested fixes |
 | Write-only credentials | **Partial**. Write-only and never returned, but stored as plain files at rest; no secret manager | **Have**. Connection objects | **Have**. Secret objects | **Have** |
 | External secret managers | **Missing** | **Have**. Beta | **Have**. Preview | **Have**. AWS, GCP, Azure, Vault |
-| OAuth sign-in to a source | **Missing**. REST OAuth2 answers unsupported | **Have** | **Have** | **Have**. One-click on cloud; own app on Core |
+| OAuth sign-in to a source | **Partial**. Browser sign-in with token refresh for REST sources (`SRC-12`) and for the eight business-app types, with each vendor's own token request (form, JSON body or Basic header); revoke on removal where the vendor has one. Gate-tested against mocks only, never at a real vendor's consent screen; other connector types have no sign-in | **Have** | **Have** | **Have**. One-click on cloud; own app on Core |
 | Change credentials | **Partial**. Works, except Oracle and object storage | **Have** | **Have** | **Have** |
 | Discover the source's tables | **Partial**. SQL and CDC sources only | **Have** | **Have** | **Have**. Asynchronous for large schemas |
 | Choose tables and columns | **Partial**. Tables; column choice not checked | **Have**. Plus row filtering | **Have** | **Have**. Top-level fields |

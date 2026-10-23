@@ -224,13 +224,14 @@ estimate (S, M, L), which the base has no field for.
 | `AI-20` | Task | The dashboard's page context sends the filters but not the time-grain override (`dashboard-page.tsx`), so the assistant cannot see it | AI Copilot | P2 | Done | #188 | PR #104 review SHOULD-FIX 11 |
 | `AI-21` | Feature | The assistant undoes its last dashboard change in one step. | AI Copilot | P2 | Planned |  | `AI-1` spec |
 | `AI-22` | Task | The assistant warns about a deprecated mart and names its replacement, as the chart builder does: `describe_mart` returns the marks, but nothing tells or tests the assistant to use them (no `AI-15` request) | AI Copilot | P2 | Todo |  | `#106` review round 1 (repo 3) |
+| `SRC-27` | Task | Test Workday Reports and NetSuite on real accounts, then make them supported (a migration like `0096` and their `coverage.json` entries). Both are built and pass the `g6-saas` gate against mocks, but their wire details come from documentation that could not be read or confirmed: Workday's token request, `Report_Entry` shape and host forms (`SRC-3` slice 6 SHOULD-FIX 15); NetSuite's revocation address, who-am-i path and 100,000-row limit. Needs a Workday tenant and a NetSuite account from the product owner (`SRC-3` decision 10, acceptance check `SRC-3-AC1`) | Data | P2 | Todo |  | `plans/SRC-3-RESULT.md` |
 
 ## Later (P3)
 
 | ID | Kind | Item | Module | Priority | Status | PR | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `OPS-3` | Feature | Run on several servers; high availability | Platform | P3 | Idea |  | PRODUCT §1, §2 |
-| `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. **Blocked by `DEC-9`, `SRC-12` (OAuth sign-in)** | Data | P3 | Planned |  | PRODUCT §2 |
+| `SRC-3` | Feature | Connectors for business apps: first Databricks' ten generally available SaaS connectors, then its beta list by customer demand. `DEC-9` decided 2026-10-19; `SRC-12` merged. Feature page `features/business-app-connectors.md`. Eight of the ten are built and supported (gate-tested on mock vendors only; no real account); Workday Reports and NetSuite are built and stay unsupported until `SRC-27`. Result: `plans/SRC-3-RESULT.md`. Follow-ups: `SRC-26` to `SRC-31` | Data | P3 | In Acceptance | #216 | PRODUCT §2 |
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | In Acceptance | #194 | PRODUCT §2; [spec](specs/bld-2.md) |
@@ -253,11 +254,16 @@ estimate (S, M, L), which the base has no field for.
 | `SRC-23` | Task | `route_auth.rs` `run_history_log_and_resume_need_connector_manage_...` passes without proving its claim: the `connector:manage` principal is in no tenant, so the tenant gate answers 404 before the permission gate and `assert_ne!(.., FORBIDDEN)` holds either way. Join both principals to the seeded tenant, as the discovery and OAuth tests do (the defect `SRC-13` review 3 BLOCKER 2 fixed there). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
 | `SRC-24` | Task | `SRC-11` plan task 9 asks `docs/plans/SRC-11-RESULT.md` for the time to auto-disable and a run log's size; the RESULT has neither and does not list them under "Not measured". Measure them or list them (principle 2). Found in the #144 review | Sources | P3 | Todo |  | #144 review |
 | `SRC-25` | Task | The `SRC-11` connector operations gate (CI job `Rust · SRC-11 connector operations`, `ops/g6` step c) fails at random: "c. auto-disable: timed out after 150s waiting for the connector to be paused by the failures (last error: None)" after the three failed runs, then passes on a re-run of the same commit. Seen on #160 and on #189 (2026-10-16, run 38933177927). Find why the pause can land after 150 s (sensor interval, alert evaluation, CI load), fix the cause or measure the real time and set the wait from it; never just raise the timeout (rule 2) | Sources | P2 | Todo |  | #189 review |
+| `SRC-26` | Feature | Second wave of business-app connectors, ordered by customer demand: Databricks' beta list (about 45) is the target; each one is a vendor module and a gate step on the `saas` adapter (`SRC-3` slices 2 to 6 show the shape). Starts with the first customer request | Data | P3 | Idea |  | `specs/src-3.md` (second wave) |
+| `SRC-28` | Task | NetSuite schema changes are seen after the load, not before it (`SRC-3` decision 9 not met for NetSuite): SuiteQL lists no table columns, and the REST record metadata describes other properties. Find a call that lists a SuiteQL table's columns (a Records Catalog call, if there is one) or decide the after-load path is enough | Data | P3 | Todo |  | `plans/SRC-3-RESULT.md` |
+| `SRC-29` | Task | Marks for the eight connector types that show the generic icon: Oracle, SQL Server, Salesforce, ServiceNow, Workday Reports, Dynamics 365, NetSuite, SharePoint. Checked 2026-10-22 against each owner's trademark guidelines (Oracle, Microsoft, Salesforce, ServiceNow, Workday): none lets a third party show its logo or product icon in a product's UI without a licence or written permission; Microsoft's icon sets are licensed for diagrams, training and documentation only, Salesforce's product logos only inside a diagram; all five allow the product's name in plain text, which the tiles already use. Simple Icons removed Microsoft, Oracle and Salesforce marks for the same reason. A mark needs the owner's written permission (Oracle and ServiceNow by written request, Workday case by case, Microsoft and Salesforce by licence or partner agreement): a business request, not code. Until then the generic icon stays (`brand-marks.ts` rule) | Data | P3 | Blocked |  | `plans/SRC-3-RESULT.md` |
+| `SRC-30` | Task | Check the vendor API shapes `SRC-3` took from documentation that was unreadable or has moved on, with a real call each: HubSpot's date-versioned paths against the `/crm/v3` ones in use (no sunset date for `v3` was found), Salesforce's quota status code (403 `REQUEST_LIMIT_EXCEEDED`), Atlassian's PKCE handling, Dataverse's expired-token status, ServiceNow's revoke prerequisites. Needs real accounts (with `SRC-27` for the other two vendors) | Data | P3 | Todo |  | `plans/SRC-3-RESULT.md` |
+| `SRC-31` | Task | Gate gaps of the `g6-saas` job: browser sign-in through the product (the API's callback exchange and the refresh with the stored refresh token) is not exercised, since a `file:` secret cannot hold a rotated refresh token; no large object is loaded (every vendor loaded 3 to 10 rows), so volume, vendor rate limits and long runs are unmeasured; the Rust and Python account rules are separate code compared only by the vendor-table fixture and parallel tests, so a shared fixture of valid and near-miss accounts would catch a drift | Data | P3 | Todo |  | `plans/SRC-3-RESULT.md` |
 | `OPS-10` | Task | The shared test Postgres runs out of shared memory under the full workspace run: `53100 could not resize shared memory segment ... No space left on device` and `UnexpectedEof` on connect, in whichever binaries run many per-test databases at once (seen in `embed_tokens`, `ai_tool`, `connector_delete_deprovision`, `upload_routes`). Each passes alone. Give the test-support container a larger `/dev/shm` (`--shm-size`) or cap its connections, so a full run is green without re-runs. Also seen once in CI: the `g6-ops` auto-disable step timed out after 150 s on #160 and passed on re-run | Platform | P2 | Todo |  | review runs 2026-10-16 |
 | `BI-31` | Task | Close out `BI` phase 2 (#160) for acceptance: (1) the owner signs the decision rows still marked "Owner to confirm at QA" on `chart-builder-questions.md`, `joins-without-sql.md`, `bins-groups-hierarchies.md`, `parameters.md`, `combined-charts.md` and `reusable-metrics.md`, with the date; (2) answer the two open questions in the `BI-2` plan (does a seeded role hold `metric:write`; are metric and segment definitions readable by everyone with `dashboard:read`); (3) one check on a running stack with a masked and row-filtered role across a join, a drill-down and an embed. Found in the #160 review | Dashboards | P2 | Todo |  | #160 review |
 | `BI-32` | Task | While the assistant is answering, a chart's reference-line label (for example "Target 20,000") moves again and again, though the chart itself stays still: the tile re-renders with the streamed message. Keep the label still until the board really changes. Cosmetic; left over from the phase 3 QA (`BI-18` part C review R29, owner's QA 2026-10-18) | Dashboards | P3 | Todo |  | `BI-18` part C plan, R29 |
 | `BI-33` | Task | `#199` follow-ups from its last review (round O, `superpowers/plans/2026-10-14-bi-18c-layout.md`): the AI-15 case `dash_map_charts_in_separate_tab` can fail when the assistant is right (its setup has only the map chart; add a second chart); the XSS test misses the sankey edge, boxplot outlier and scatter-label branches; a comment in `chart-option.ts` says ECharts' `encodeHTMLContent` is off by default, but it never applies to a series formatter | Dashboards | P2 | Todo |  | `#199` review round O |
-| `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Todo |  | phase 3 QA |
+| `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -287,7 +293,6 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
-| `DEC-9` | Open (decision) | — | `SRC-3` |
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
@@ -304,12 +309,11 @@ parity), built after it.
 | `DATA-3` | Planned | `DATA-4` | — |
 | `QS-3` | Planned | `SEC-20` | — |
 | `REL-6` | Todo | `BLD-1` | — |
-| `SRC-3` | Planned | `DEC-9` | — |
 | `SRC-4` | Planned | `SEC-14` (credentials) | — |
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-11`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -364,6 +368,7 @@ set by the product owner and are left empty until they are.
 | `SEC-43` | 2026-10-17 | 2026-10-17 | |
 | `SEC-44` | 2026-10-17 | | |
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
+| `OPS-11` | 2026-10-23 | 2026-10-23 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
@@ -411,6 +416,7 @@ set by the product owner and are left empty until they are.
 | `BI-17` | 2026-10-15 | | |
 | `AI-8` | 2026-10-15 | | |
 | `AI-9` | 2026-10-14 | | |
+| `SRC-3` | 2026-10-19 | 2026-10-23 | |
 
 ## Decide
 
@@ -429,7 +435,6 @@ rejected** with the date.
 | `DEC-5` | Mobile app | Build · No | No | Product owner |
 | `DEC-6` | Share data with another organisation | Build · Defer · No | Defer | Product owner |
 | `DEC-8` | Which assistant actions need human approval before they run (today: deletions and pauses) | Add: make a dashboard public or embeddable · change who can see a dashboard · email outside the company · delete a dashboard — each on or off | Add all four | Product owner |
-| `DEC-9` | How to get SaaS connectors | Reuse dlt verified sources (our loader already runs on dlt) · adopt another connector library · build each by hand | Reuse dlt verified sources first | Product owner |
 | `DEC-10` | Data and Query Studio edge cases: entity-relationship diagram, a no-code connector builder, business glossary and domains, table favourites, real-time query co-editing, Git for queries | Drop · Defer · Build, each of the six | Drop or defer all six | Product owner |
 | `INT-1` | Digital employees | Build · Park | Parked (product owner, 2026-10-02) | Product owner |
 
@@ -452,6 +457,7 @@ rejected** with the date.
 | `DEC-12` | Name staff as Owner and Acceptor in the public repo | Decided: no. The repo names the module; the base holds the person through the module's owner | 2026-10-09 |
 | `DEC-13` | Query Studio as a module in the base | Decided: yes, its own module | 2026-10-09 |
 | `DEC-14` | Priority of `SEC-14` and `SEC-15` | Decided: P0 | 2026-10-09 |
+| `DEC-9` | How to get SaaS connectors | Decided: dlt verified sources where one exists (Salesforce, HubSpot, Zendesk, Google Analytics); the other six call the adapter's `SaasSession` directly, because a dlt `rest_api` source over a plain `requests` session cannot carry AD3's same-origin link rule and address check or the bounded `Retry-After` (amended during the build, accepted at the slice 3 and 4 reviews); all on the existing dlt loader | 2026-10-19 |
 | `SEC-9` | The natural-language query endpoints run the model's SQL without masking or row filters, and need only a sign-in | Done: PR #78. The endpoints were removed; plain-language queries now route through the chat which applies masking and row filters via the policy rewriter. Hardening after Done, in PR #105 (`8b67ee2`): the assistant's `run_sql` refuses a statement the policy forbids before sending anything to `ClickHouse` (it used to send `EXPLAIN AST` first) | 2026-10-07 |
 | `SEC-11` (agent endpoints) | The agent endpoints return raw database error text | Done: PR #78. The endpoints were removed | 2026-10-07 |
 

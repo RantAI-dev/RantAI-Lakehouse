@@ -65,7 +65,7 @@ Signed by the product owner on 2026-10-12 with "run it as the spec says": decisi
 | # | Decision | Default | Signed |
 | --- | --- | --- | --- |
 | 1 | Spec "History (SCD type 2)". The loader refuses it for Iceberg tables (measured), so it is built here as our own merge: read the current row of every key in the load, close the ones that changed, add the new versions, in one commit. The planner proposed to defer it; the product owner chose the spec ("run it as the spec says", 2026-10-12). | Built in this work, as the spec says: columns `_valid_from`, `_valid_to` and `_is_current`. It ships only if the measurement of plan task 1 shows the merge is one commit and repeatable; if it does not, the developer stops and the product owner is asked again. | 2026-10-12 (the spec, not the planner's default) |
-| 2 | Spec "five Airbyte modes": which sources get which. | Replace, append, replace and deduplicate: every batch source. Incremental and incremental and deduplicate: SQL sources only, as incremental is today. | 2026-10-12 |
+| 2 | Spec "five Airbyte modes": which sources get which. | Replace, append, replace and deduplicate: every batch source. Incremental and incremental and deduplicate: SQL sources only, as incremental is today. *Widened by `SRC-3` (decision 6 of `business-app-connectors.md`, 2026-10-19): also the objects of a business-app connector that declare a change cursor (merge on the vendor's key).* | 2026-10-12 |
 | 3 | Spec "declared or detected primary key". | SQL sources: the key the source declares is offered and can be changed. Other sources: the user names the key columns. A deduplicating mode cannot be saved without a key. | 2026-10-12 |
 | 4 | Spec "with a cursor column": which row wins when a key repeats in one load. | The row with the highest value of the cursor column. With no cursor column (replace and deduplicate on a source without one), the last row read. | 2026-10-12 |
 | 5 | Spec "refresh keeping or removing old rows, and clear". | Refresh, keeping: load the whole table again now, by its mode's rule (a deduplicating mode merges, append adds). Refresh, removing: empty the table, then load it whole. Clear: empty the table and forget its cursor, load nothing. Each asks for confirmation; "removing" and "clear" say that the rows are gone. | 2026-10-12 |
@@ -79,7 +79,8 @@ Signed by the product owner on 2026-10-12 with "run it as the spec says": decisi
 
 - History keeps the time a load saw a change, not the time the change happened at the source, and a load that runs once a day sees at most one version a day.
 - A row deleted at the source stays in the table, in every mode.
-- Deduplication needs a key; incremental modes need a SQL source.
+- Deduplication needs a key; incremental modes need a SQL source or, for a business-app connector (`SRC-3`), an object with a change cursor. Objects without one (a Workday report, a NetSuite record type with no change time, Confluence spaces) are read in full each run, and the connector page says which and why.
+- A business-app vendor that reports deletes marks them in a column (`is_deleted`, or `status = deleted` for Zendesk) instead of removing the row, which the "deleted rows stay" limit above already says; a Workday report replaces the table each run, so a deleted row is gone there.
 
 ## Acceptance checklist
 

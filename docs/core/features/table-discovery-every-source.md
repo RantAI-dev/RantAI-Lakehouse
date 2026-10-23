@@ -92,6 +92,14 @@ beyond the spec. The planner's recommendation is the Default.
 - For MongoDB, Kafka, SFTP and Oracle the listing runs as a short job and
   takes some seconds longer than for the other sources.
 - A file listing stops at 10,000 files; a narrower glob finds the rest.
+- Business-app connectors (`SRC-3`) list the vendor's objects through the
+  same short job (the vendor's own list where it has one, a suggested list
+  where it does not, such as ServiceNow, NetSuite and Dynamics 365 tables you
+  can also name). Columns are shown before choosing for Salesforce, HubSpot,
+  ServiceNow, Dynamics 365 and Google Analytics 4 (the vendor describes its
+  fields); for Zendesk, Confluence, SharePoint, Workday Reports and NetSuite
+  the preview answers "not supported" and the columns appear after the first
+  load. Gate-tested against mock vendors only.
 
 ## Acceptance checklist
 
@@ -108,6 +116,7 @@ run with the reason. Rows 1 and 2 are the spec's checklist, in its order.
 | 6 | Pick a Kafka topic | The connector reads that topic at its next run | |
 | 7 | List a PostgreSQL schema of 10,000 tables and search for one | The list arrives within 2 minutes; the search finds it | |
 | 8 | Add an Oracle table by name | Saved, and loaded at the next run | |
+| 9 | `SRC-3`: press "Find tables" on a supported business-app connector (for example HubSpot) | The vendor's objects are listed; a preview shows columns where the vendor describes them, and says "not supported" where it does not | |
 
 **Accepted by:** __________ **Date:** ______ **Build:** ______
 

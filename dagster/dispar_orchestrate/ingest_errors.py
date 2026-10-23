@@ -6,9 +6,11 @@ one word of a CLOSED list (`ERROR_CLASSES`, the list `lakehouse-api` accepts
 in a run report: `rust/crates/lakehouse-store/src/connector_run.rs`) and says
 whether that word is retried:
 
-    retried (transient)   unreachable, timeout, source_busy, api_unreachable
-    not retried           sign_in_refused, address_refused, unsupported,
-                          setting_rejected, schema_decision_pending, other
+    retried (transient)   unreachable, timeout, source_busy, api_unreachable,
+                          rate_limited
+    not retried           sign_in_refused, permission_missing, address_refused,
+                          unsupported, setting_rejected,
+                          schema_decision_pending, other
 
 `other` is a failure nobody taught this module about. It is NOT retried: a
 retry of something unexplained only delays the failure alert, and the
@@ -64,8 +66,11 @@ from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import dedup as dedup_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
+from dispar_orchestrate.adapters import saas as saas_adapter
 from dispar_orchestrate.adapters.sink import UnsupportedLoadMode
 from dispar_orchestrate.column_gate import UnsupportedColumnType
+from dispar_orchestrate.saas import session as saas_session
+from dispar_orchestrate.saas import vendors as saas_vendors
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 logger = logging.getLogger(__name__)
@@ -82,8 +87,12 @@ UNSUPPORTED = "unsupported"
 SETTING_REJECTED = "setting_rejected"
 SCHEMA_DECISION_PENDING = "schema_decision_pending"
 OTHER = "other"
+# SRC-3 (migration 0097, slice 1 review BLOCKER 1): a business app limited the
+# rate (retried like `source_busy`), or the account lacks a permission there.
+PERMISSION_MISSING = "permission_missing"
+RATE_LIMITED = "rate_limited"
 
-RETRIED_CLASSES = frozenset({UNREACHABLE, TIMEOUT, SOURCE_BUSY, API_UNREACHABLE})
+RETRIED_CLASSES = frozenset({UNREACHABLE, TIMEOUT, SOURCE_BUSY, API_UNREACHABLE, RATE_LIMITED})
 ERROR_CLASSES = RETRIED_CLASSES | {
     SIGN_IN_REFUSED,
     ADDRESS_REFUSED,
@@ -91,6 +100,7 @@ ERROR_CLASSES = RETRIED_CLASSES | {
     SETTING_REJECTED,
     SCHEMA_DECISION_PENDING,
     OTHER,
+    PERMISSION_MISSING,
 }
 
 # The fixed phrase for each class, for a Dagster `Failure` description. The
@@ -107,6 +117,8 @@ CLASS_PHRASES = {
     SETTING_REJECTED: "a connector setting was rejected",
     SCHEMA_DECISION_PENDING: "the table waits for a schema decision",
     OTHER: "the load failed",
+    PERMISSION_MISSING: "the account lacks a permission at the source",
+    RATE_LIMITED: "the source limited the rate of requests",
 }
 
 
@@ -313,7 +325,7 @@ def _is_permission_element(exc: BaseException) -> bool:
         return bool(_class_names(exc) & _KAFKA_NOT_AUTHORIZED)
     # An SFTP server's "permission denied" arrives as `IOError(EACCES)`, which
     # Python builds as `PermissionError`.
-    return isinstance(exc, PermissionError)
+    return isinstance(exc, (PermissionError, saas_session.SaasPermissionMissing))
 
 
 def is_permission_refusal(exc: BaseException) -> bool:
@@ -418,9 +430,30 @@ def _classify_one(exc: BaseException) -> str | None:
     # connector page offers Sign in.
     if isinstance(exc, rest_adapter.OAuthSignInRefused):
         return SIGN_IN_REFUSED
+    # SRC-3 (business-app vendors), slice 1 review BLOCKER 1: each failure has
+    # its own word, so the run says "the vendor limited the rate" and "the
+    # account lacks a permission", not "busy" and "sign-in refused" (decision
+    # 13, page item 7). Migration 0097 and `connector_run::ErrorClass` carry the
+    # same two words. A refused credential stays `sign_in_refused`.
+    if isinstance(exc, saas_session.SaasSignInRefused):
+        return SIGN_IN_REFUSED
+    if isinstance(exc, saas_session.SaasPermissionMissing):
+        return PERMISSION_MISSING
+    if isinstance(exc, saas_session.SaasRateLimited):
+        return RATE_LIMITED
+    if isinstance(exc, saas_session.SaasBadAnswer):
+        # Final review SHOULD-FIX 23: a 2xx body that is not JSON is the vendor being broken,
+        # not a rejected setting; retried like any other busy source.
+        return SOURCE_BUSY
     if isinstance(
         exc,
-        (UnsupportedColumnType, UnsupportedLoadMode, dedup_adapter.DedupRefused, UnsupportedKafkaAuth),
+        (
+            UnsupportedColumnType,
+            UnsupportedLoadMode,
+            dedup_adapter.DedupRefused,
+            UnsupportedKafkaAuth,
+            saas_vendors.UnsupportedVendor,
+        ),
     ):
         return UNSUPPORTED
     if isinstance(
@@ -431,6 +464,7 @@ def _classify_one(exc: BaseException) -> str | None:
             oracle_adapter.OracleTlsConfigError,
             ssrf_guard_sftp_module.HostKeyMismatch,
             ssrf_guard_mongo_module.MongoConfigRejected,
+            saas_adapter.SaasSetupRefused,
         ),
     ):
         return SETTING_REJECTED
@@ -485,7 +519,10 @@ def classify(exc: BaseException) -> Classified:
     for element in _chain(exc):
         found = _classify_one(element)
         if found is not None:
-            return Classified(found, retried=found in RETRIED_CLASSES)
+            # A used-up daily quota (SaasQuotaExhausted) is `rate_limited` but not retried:
+            # waiting minutes would only spend more of the quota (slice 3 BLOCKER 8).
+            retried = found in RETRIED_CLASSES and not isinstance(element, saas_session.SaasQuotaExhausted)
+            return Classified(found, retried=retried)
     return Classified(OTHER, retried=False)
 
 
