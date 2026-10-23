@@ -537,8 +537,12 @@ pub struct Board {
     /// dialog and the parity corpus already read.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub updated_at: Option<String>,
-    /// Public read-only share token, when enabled.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// The public link token the row carried before `BI-19` part A moved links
+    /// to Postgres (migration `0098`). Nothing reads it for sharing any more and
+    /// it is never serialised: the live link is `lakehouse_store::public_links`.
+    /// It is still carried through a save because every save is a full-row
+    /// INSERT, and the start-up copy of old links reads it until it has run.
+    #[serde(skip_serializing, default)]
     pub public_token: Option<String>,
     /// Whether signed (JWT) embedding is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -617,7 +621,9 @@ fn new_chart_id() -> String {
     format!("u_{}", random_hex(4))
 }
 
-fn new_public_token() -> String {
+/// A fresh public link token (`p_` and 32 hex characters, 128 random bits).
+#[must_use]
+pub fn new_public_token() -> String {
     format!("p_{}", random_hex(16))
 }
 
@@ -1180,7 +1186,7 @@ const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filter
 pub(crate) const BOARD_KEEP_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, folder_id, refresh_seconds, grain, params_json, tabs_json, phone_layout_json, theme, font, owner_id";
 
 /// A board in the personal space cannot be shared. Move it to a folder first.
-const PERSONAL_NOT_SHAREABLE: &str =
+pub const PERSONAL_NOT_SHAREABLE: &str =
     "A dashboard in the personal space cannot be shared. Move it to a folder first.";
 
 fn parse_layout(s: &str) -> LayoutMap {
@@ -1562,10 +1568,11 @@ async fn save_board_patch(
         .filters
         .or(board.filters.as_deref())
         .unwrap_or(&empty_filters);
-    let public_token = patch
-        .public_token
-        .or(board.public_token.as_deref())
-        .unwrap_or("");
+    // BI-19 part A (plan D2): a save no longer decides anything about a public
+    // link. The live link is in Postgres; this is only the old column carried
+    // forward unchanged so the full-row INSERT does not blank it before the
+    // start-up copy has read it.
+    let public_token = board.public_token.as_deref().unwrap_or("");
     let embed_enabled = patch
         .embed_enabled
         .unwrap_or_else(|| board.embed_enabled.unwrap_or(false));
@@ -1628,7 +1635,6 @@ struct BoardPatch<'a> {
     created_by: Option<&'a str>,
     layout: Option<&'a LayoutMap>,
     filters: Option<&'a [FilterDef]>,
-    public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
     folder_id: Option<&'a str>,
     owner_id: Option<&'a str>,
@@ -1699,20 +1705,27 @@ pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Resul
 /// link or signed embeds on cannot go into the personal space: a draft that
 /// is shared is not a draft, and the link would keep working for everyone
 /// else, so the move is refused until sharing is turned off.
+/// `has_public_link` is whether the board has a link in Postgres (`BI-19` part
+/// A, plan D5): the link no longer lives on the board row, so the caller asks
+/// `lakehouse_store::public_links` and says so here.
 ///
 /// # Errors
 ///
 /// Returns [`BiError::Validation`] if the board does not exist or is shared
 /// and the folder is a personal space, or [`BiError::Clickhouse`] on a
 /// `ClickHouse` failure.
-pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
+pub async fn move_board(
+    ch: &ChClient,
+    id: &str,
+    folder_id: &str,
+    has_public_link: bool,
+) -> Result<(), BiError> {
     ensure_bi_table(ch).await?;
     let board = get_board(ch, id, &Viewer::system())
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let owner = crate::folders::folder_owner(ch, folder_id).await?;
-    let shared = board.embed_enabled == Some(true)
-        || board.public_token.as_deref().is_some_and(|t| !t.is_empty());
+    let shared = board.embed_enabled == Some(true) || has_public_link;
     if !owner.is_empty() && shared {
         return Err(BiError::Validation(
             "Turn off sharing before moving a dashboard to the personal space.".to_owned(),
@@ -2166,45 +2179,6 @@ pub async fn restore_board_fields(
     Ok(())
 }
 
-/// Enable/disable the public read-only share link for a board. `enable =
-/// true` mints a token if one doesn't already exist; `enable = false` clears
-/// it (revoke). Returns the active token (`""` if revoked). Ports
-/// `setBoardPublic`.
-///
-/// # Errors
-///
-/// Returns [`BiError::Validation`] if the board does not exist, or
-/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<String, BiError> {
-    ensure_bi_table(ch).await?;
-    let board = get_board(ch, id, &Viewer::system())
-        .await?
-        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
-    if enable && board.owner_id.is_some() {
-        return Err(BiError::Validation(PERSONAL_NOT_SHAREABLE.to_owned()));
-    }
-    let token = if enable {
-        let existing = board.public_token.clone().unwrap_or_default();
-        if existing.is_empty() {
-            new_public_token()
-        } else {
-            existing
-        }
-    } else {
-        String::new()
-    };
-    save_board_patch(
-        ch,
-        &board,
-        BoardPatch {
-            public_token: Some(&token),
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok(token)
-}
-
 /// Enable/disable signed (JWT) embedding for a board. Ports `setBoardEmbed`.
 ///
 /// # Errors
@@ -2461,34 +2435,6 @@ pub async fn legacy_public_links(ch: &ChClient) -> Result<Vec<(String, String)>,
         })
         .filter(|(id, token)| !id.is_empty() && !token.is_empty())
         .collect())
-}
-
-/// Fetch a board by its public share token (read-only, no auth). `None` if
-/// blank or not shared. Ports `getBoardByToken`.
-///
-/// # Errors
-///
-/// Returns [`ChError`] on a `ClickHouse` failure.
-pub async fn get_board_by_token(ch: &ChClient, token: &str) -> Result<Option<Board>, ChError> {
-    ensure_bi_table(ch).await?;
-    let t = token.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    // A public link is read by nobody in particular, so a board in the
-    // personal space is out of reach even if a link was issued before it was
-    // moved there (`move_board` refuses that move; this is the second lock).
-    let sql = format!(
-        "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token={}{} LIMIT 1",
-        SqlLiteral::from(t),
-        Viewer::anonymous().owner_clause()
-    );
-    let rows = ch.rows(&sql, None).await?;
-    let Some(mut board) = rows.first().map(row_to_board) else {
-        return Ok(None);
-    };
-    board.embed_access = get_board_embed_access(ch, &board.id).await?;
-    Ok(Some(board))
 }
 
 /// Move a board and every chart on it to the trash (`BI-18` part C, part 2).
@@ -6566,7 +6512,9 @@ mod tests {
         assert_eq!(json.get("updatedAt").unwrap(), "2026-01-02 00:00:00");
         assert_eq!(json.get("createdBy").unwrap(), "Bootstrap Admin");
         assert_eq!(json.get("description").unwrap(), "Ringkasan kunjungan");
-        assert_eq!(json.get("publicToken").unwrap(), "p_abc");
+        // BI-19 part A: the old column is never serialised; the live link is
+        // read from Postgres and added by the dashboard list.
+        assert!(json.get("publicToken").is_none());
         assert_eq!(json.get("embedEnabled").unwrap(), true);
         assert_eq!(json.get("folderId").unwrap(), "f_1");
         // A board nobody owns carries no owner key (BI-18 part C, part 2).

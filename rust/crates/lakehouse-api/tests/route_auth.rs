@@ -2655,3 +2655,65 @@ async fn lag_check_route_authorization_asserted_both_ways() {
         resp.status()
     );
 }
+
+/// `BI-19` part A (D4, D5): the three link-management routes are in
+/// `POLICY_TABLE` as `dashboard:write` and the unlock route as public, and the
+/// gate agrees both ways: no session is 401, `dashboard:read` alone is 403,
+/// `dashboard:write` gets past, and a visitor with no session reaches the
+/// public routes (the handler then says 404, never 401 or 403).
+#[tokio::test]
+async fn the_public_link_routes_are_gated_in_both_directions() {
+    let TestApp { router, pool } = spin_up().await;
+    let policy_of = |method: &str, path: &str| {
+        POLICY_TABLE
+            .iter()
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, policy)| *policy)
+    };
+    let managed = [
+        ("GET", "/api/dashboard/public-link?board=b_x"),
+        ("PUT", "/api/dashboard/public-link"),
+        ("DELETE", "/api/dashboard/public-link?board=b_x"),
+    ];
+    for (method, uri) in managed {
+        let pattern = uri.split('?').next().unwrap();
+        assert_eq!(
+            policy_of(method, pattern),
+            Some(Policy::RequiresPermission("dashboard:write")),
+            "{method} {pattern}"
+        );
+        let reader = create_principal_with_permissions(&pool, "dashboard:read").await;
+        let cookie = session_cookie_for_user(&pool, reader).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} read-only");
+        let writer = create_principal_with_permissions(&pool, "dashboard:write").await;
+        let cookie = session_cookie_for_user(&pool, writer).await;
+        let resp = request_with_cookie(&router, method, uri, &cookie).await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} writer got {}",
+            resp.status()
+        );
+        let resp = request_with_cookie(&router, method, uri, "").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} anonymous"
+        );
+    }
+    assert_eq!(
+        policy_of("POST", "/api/public/dashboard/{token}/unlock"),
+        Some(Policy::Public)
+    );
+    for (method, uri) in [
+        ("POST", "/api/public/dashboard/p_nothing/unlock"),
+        ("GET", "/api/public/dashboard/p_nothing"),
+    ] {
+        let resp = request_with_cookie(&router, method, uri, "").await;
+        assert!(
+            resp.status() != StatusCode::UNAUTHORIZED && resp.status() != StatusCode::FORBIDDEN,
+            "{method} {uri} anonymous got {}",
+            resp.status()
+        );
+    }
+}

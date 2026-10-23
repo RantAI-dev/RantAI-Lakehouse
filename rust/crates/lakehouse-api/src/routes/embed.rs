@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_bi::access::Viewer;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -206,20 +206,17 @@ struct FrameBody {
 /// board with embedding off or for no board at all gets the same answer as a
 /// board with no sites listed, `{"origins": []}`, so this route is no oracle
 /// for whether a token is good. A store failure is a `500` with the fixed
-/// database message; the caller treats anything but `200` as "no site".
+/// database message (a `503` for a public link when there is no Postgres,
+/// `BI-19` part A); the caller treats anything but `200` as "no site".
 pub async fn frame_origins(State(state): State<AppState>, body: Bytes) -> Response {
     let parsed = serde_json::from_slice::<FrameBody>(&body).unwrap_or_default();
     match resolve_frame_origins(&state, parsed).await {
         Ok(origins) => (StatusCode::OK, ApiJson(json!({ "origins": origins }))).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-        )
-            .into_response(),
+        Err(err) => crate::error::ApiRejection(err).into_response(),
     }
 }
 
-async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<String>, ChError> {
+async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<String>, ApiError> {
     if let Some(jwt) = body.jwt.filter(|s| !s.is_empty()) {
         // Same verification `data` applies, so a token that would be refused
         // there is not given a framing list here.
@@ -237,7 +234,15 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
         let Some(board_id) = claims.resource.and_then(|r| r.dashboard) else {
             return Ok(Vec::new());
         };
-        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await?;
+        let board = store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous())
+            .await
+            .map_err(|err| {
+                upstream_error::ch_error_as(
+                    &upstream_error::DATABASE,
+                    &err,
+                    upstream_error::FailedAs::Internal,
+                )
+            })?;
         return Ok(board
             .filter(|b| {
                 b.embed_enabled.unwrap_or(false)
@@ -250,8 +255,17 @@ async fn resolve_frame_origins(state: &AppState, body: FrameBody) -> Result<Vec<
             .unwrap_or_default());
     }
     if let Some(token) = body.token.filter(|s| !s.is_empty()) {
-        let board = store::get_board_by_token(&state.clickhouse, &token).await?;
-        return Ok(board.map(|b| b.embed_access.origins).unwrap_or_default());
+        // BI-19 part A (D3): a link that does not work frames nowhere, like a
+        // token that is invalid. A link with a password still answers: the page
+        // itself asks for the password, and this answer is only an origin list.
+        return Ok(
+            match crate::routes::public_links::resolve(state, &token).await? {
+                crate::routes::public_links::Resolved::Open(open) => {
+                    open.board.embed_access.origins
+                }
+                crate::routes::public_links::Resolved::Gone => Vec::new(),
+            },
+        );
     }
     Ok(Vec::new())
 }
@@ -379,26 +393,30 @@ fn value_to_string(v: &Value) -> String {
 }
 
 /// `GET /api/public/dashboard/{token}` — read-only public share view.
+///
+/// `BI-19` part A (plan D3): the link is read from Postgres. An unknown,
+/// expired, switched-off (by the link's owner or by an administrator), trashed
+/// or personal-space link is the same `404 not_found`; a link with a password
+/// needs `X-Public-Link-Ticket` from the unlock route, and without a live one
+/// answers `401 password_required` with no data and no dashboard name.
 pub async fn public_dashboard(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    let board = match store::get_board_by_token(&state.clickhouse, &token).await {
-        Ok(b) => b,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
+    let board = match crate::routes::public_links::resolve(&state, &token).await {
+        Ok(crate::routes::public_links::Resolved::Open(open)) => {
+            if let Some(refusal) =
+                crate::routes::public_links::check_ticket(&state, &open.link, &headers).await
+            {
+                return refusal;
+            }
+            open.board
         }
-    };
-    let Some(board) = board else {
-        return (
-            StatusCode::NOT_FOUND,
-            ApiJson(json!({ "error": "not_found" })),
-        )
-            .into_response();
+        Ok(crate::routes::public_links::Resolved::Gone) => {
+            return crate::routes::public_links::not_found();
+        }
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
 
     let filters = board.filters.clone().unwrap_or_default();

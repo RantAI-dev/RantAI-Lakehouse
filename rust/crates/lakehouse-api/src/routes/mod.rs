@@ -1221,6 +1221,18 @@ pub fn router(state: AppState) -> Router {
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
         )
+        // BI-19 part A (D4): the password of a public link.
+        .route(
+            "/api/public/dashboard/{token}/unlock",
+            axum::routing::post(public_links::unlock),
+        )
+        // BI-19 part A (D5): make, change and end a dashboard's public link.
+        .route(
+            "/api/dashboard/public-link",
+            get(public_links::get_link)
+                .put(public_links::put_link)
+                .delete(public_links::delete_link),
+        )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
         .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(

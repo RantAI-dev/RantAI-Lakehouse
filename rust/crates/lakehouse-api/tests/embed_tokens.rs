@@ -640,6 +640,17 @@ async fn the_public_link_ignores_every_new_check() {
     }));
     let ch = fake.serve().await;
     let app = app(&ch, None).await;
+    // BI-19 part A: the link is a row in Postgres, not the board's column.
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        BOARD,
+        &format!("p_{BOARD}"),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (status, body) = send(
         &app.router,
         Request::builder()
@@ -949,6 +960,16 @@ async fn the_frame_answer_is_the_boards_sites_for_a_good_token_and_empty_for_eve
     ]);
     let ch = fake.serve().await;
     let app = app(&ch, Some(SECRET)).await;
+    lakehouse_store::public_links::replace(
+        &app.pool,
+        BOARD,
+        &format!("p_{BOARD}"),
+        time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let listed = json!({ "origins": ["https://app.customer.example"] });
     let none = json!({ "origins": [] });
 

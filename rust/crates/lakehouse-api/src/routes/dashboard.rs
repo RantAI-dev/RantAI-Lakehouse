@@ -1075,6 +1075,11 @@ pub async fn boards_list(
         "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
         "builtin": true,
     })];
+    // BI-19 part A (plan D1): the list's "public" mark and the delete warning
+    // read the live links from Postgres, never the dashboard row. `Board` does
+    // not serialise its old `public_token`, so a board without a live link has
+    // no `publicToken` at all.
+    let links = crate::routes::public_links::live_tokens(&state).await;
     out.extend(boards.iter().map(|b| {
         let mut value = serde_json::to_value(b).unwrap_or_else(|_| json!({}));
         if let Some(obj) = value.as_object_mut() {
@@ -1083,6 +1088,9 @@ pub async fn boards_list(
                 json!(counts.get(b.id.as_str()).copied().unwrap_or(0)),
             );
             obj.insert("builtin".to_owned(), json!(false));
+            if let Some(token) = links.get(b.id.as_str()) {
+                obj.insert("publicToken".to_owned(), json!(token));
+            }
         }
         value
     }));
@@ -1187,7 +1195,7 @@ pub async fn boards_create(
         // insert, so moving it into another folder is a change of place, not
         // the first time it is given an owner.
         if !folder_id.is_empty() {
-            store::move_board(&state.clickhouse, &board.id, &folder_id)
+            store::move_board(&state.clickhouse, &board.id, &folder_id, false)
                 .await
                 .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
             board.folder_id = Some(folder_id);
@@ -1202,7 +1210,7 @@ pub async fn boards_create(
             )
             .await
             .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
-            store::move_board(&state.clickhouse, &board.id, &mine.id)
+            store::move_board(&state.clickhouse, &board.id, &mine.id, false)
                 .await
                 .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
             board.folder_id = Some(mine.id);
@@ -1228,6 +1236,9 @@ struct BoardEditBody {
     layout: Option<LayoutMap>,
     #[serde(default)]
     filters: Option<Vec<FilterDef>>,
+    /// Refused (`BI-19` part A, plan D5): public links are made, changed and
+    /// ended through `/api/dashboard/public-link`. The field stays so a console
+    /// opened before the upgrade gets this sentence and not a silent `ok`.
     #[serde(default)]
     public: Option<bool>,
     #[serde(default)]
@@ -1529,18 +1540,22 @@ async fn save_grain_and_params(
 /// File board `id` in `folder_id` (`""` = the root), if `viewer` may use that
 /// folder: another user's personal space is refused (`BI-18` part C, part 2).
 async fn file_in_folder(
-    ch: &ChClient,
+    state: &AppState,
     id: &str,
     folder_id: &str,
     viewer: &Viewer,
 ) -> Result<(), ApiError> {
+    let ch = &state.clickhouse;
     crate::routes::dashboard_folders::ensure_folder_usable(ch, folder_id, viewer).await?;
-    store::move_board(ch, id, folder_id)
+    // BI-19 part A (plan D5): the link is in Postgres now, so the rule "a shared
+    // dashboard cannot go into the personal space" asks there.
+    let has_link = crate::routes::public_links::has_link(state, id).await?;
+    store::move_board(ch, id, folder_id, has_link)
         .await
         .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))
 }
 
-/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
+/// `PUT /api/dashboard/boards` — rename/relayout/re-filter/embed a
 /// board.
 ///
 /// The built-in `"default"` board accepts a layout only: it has no name,
@@ -1569,6 +1584,14 @@ pub async fn boards_update(
     };
     if !board_edit_allowed(&parsed) {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
+    }
+    if parsed.public.is_some() {
+        // BI-19 part A (plan D5): a save no longer touches a public link, so a
+        // body that still asks for one must not look as if it worked.
+        return Err(ApiError::BadRequest(
+            "Public links are made from Share, with an expiry. Reload the page.".to_owned(),
+        )
+        .into());
     }
     let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
@@ -1627,7 +1650,7 @@ pub async fn boards_update(
             .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
-        file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
+        file_in_folder(&state, &id, folder_id.trim(), &viewer).await?;
     }
     // BI-18 part C, part 2: one version per request that changed the content.
     let changes_content = parsed.changes_content();
@@ -1635,7 +1658,7 @@ pub async fn boards_update(
         snapshot(ch, &id, &principal).await;
     }
     // SEC-12. Merged into whichever response below is returned, so a body
-    // that also sets `public` or `embed` still reports them.
+    // that also sets `embed` still reports them.
     let embed_access = apply_embed_access(ch, &id, &parsed).await?;
     let with_embed_access = |mut body: Value| {
         if let Some(map) = body.as_object_mut() {
@@ -1643,14 +1666,6 @@ pub async fn boards_update(
         }
         body
     };
-    if let Some(public) = parsed.public {
-        let token = store::set_board_public(ch, &id, public)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        return Ok(ApiJson(with_embed_access(
-            json!({ "ok": true, "publicToken": token }),
-        )));
-    }
     if let Some(embed) = parsed.embed {
         let enabled = store::set_board_embed(ch, &id, embed)
             .await
