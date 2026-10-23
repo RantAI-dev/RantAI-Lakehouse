@@ -1612,3 +1612,19 @@ Not verified, and why:
   `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`. Wiring it in
   needs a `pip install` step in that job, which this fix deliberately does
   not add.
+
+### Final review, round 3 (reviewer, 2026-10-23, head `4d72e816`)
+
+CI on `4d72e816`: 36 of 39 pass. `g6-saas-b` fails in its SharePoint
+vendor step: `g6_saas_test.py:820` and `:838` still read
+`state["delta_link"]` as a string, but `SHOULD-FIX 24` (`d612215c`) now
+stores `{"link": …, "object": …}` there (`AttributeError: 'dict' object
+has no attribute 'endswith'`). `SRC-11 connector operations` also fails
+(auto-disable timeout), as it did on #212, a tokio patch bump; it passes on
+`main`'s last two runs, so it is re-run, not fixed here.
+
+- `BLOCKER 19 (round 3)` (the gate is the proof of this PR). Read the link
+  as `state["delta_link"]["link"]` at both lines and assert
+  `state["delta_link"]["object"]` is the loaded list, so the gate also
+  proves `SHOULD-FIX 24`. Grep the gate and the stubs for any other reader
+  of a state shape the fix round changed.
