@@ -726,8 +726,18 @@ pub(crate) async fn live_tokens(state: &AppState) -> std::collections::HashMap<S
     }
 }
 
-/// Whether a dashboard has a link in Postgres (live or not), for the one rule
-/// that cares: it cannot move into the personal space (`store::move_board`).
+/// Whether a link, as stored, still counts as one: it has not expired. An
+/// expired link opens nothing and cannot be revived (an update refuses it), so
+/// it must not stop its dashboard moving into the personal space.
+fn counts_as_link(link: Option<&PublicLink>, now: OffsetDateTime) -> bool {
+    link.is_some_and(|l| l.expires_at > now)
+}
+
+/// Whether a dashboard has a live public link, for the one rule that cares: it
+/// cannot move into the personal space (`store::move_board`).
+///
+/// BI-19 part A review fix (SHOULD-FIX) R3: only a link that has not expired
+/// counts.
 ///
 /// # Errors
 ///
@@ -738,7 +748,7 @@ pub(crate) async fn has_link(state: &AppState, board_id: &str) -> Result<bool, A
     };
     public_links::get_for_board(pool, board_id)
         .await
-        .map(|l| l.is_some())
+        .map(|l| counts_as_link(l.as_ref(), OffsetDateTime::now_utc()))
         .map_err(|err| store_failure(&err))
 }
 
@@ -781,6 +791,28 @@ mod tests {
         let login_keys_are_hex =
             |k: &str| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit());
         assert!(!login_keys_are_hex(&lock_key("b_1a2b")));
+    }
+
+    /// BI-19 part A review fix (SHOULD-FIX) R3.
+    #[test]
+    fn only_a_link_that_has_not_expired_counts_as_a_link() {
+        let now = OffsetDateTime::now_utc();
+        let link = |expires_at| PublicLink {
+            board_id: "b_1".to_owned(),
+            token: "p_token".to_owned(),
+            expires_at,
+            password_hash: None,
+            password_version: 0,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(counts_as_link(Some(&link(now + Duration::days(1))), now));
+        assert!(!counts_as_link(
+            Some(&link(now - Duration::seconds(1))),
+            now
+        ));
+        assert!(!counts_as_link(None, now));
     }
 
     #[test]
