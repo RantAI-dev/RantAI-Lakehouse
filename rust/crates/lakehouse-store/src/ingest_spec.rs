@@ -1425,6 +1425,18 @@ pub enum InvalidLoadMode {
         /// The source object's name.
         name: String,
     },
+    /// Plain `incremental` on a `saas` object (final review BLOCKER 18): the
+    /// mode appends, so a vendor record read again after a change becomes a
+    /// second row under the same vendor id. Only a mode that merges on a key
+    /// keeps the table one row per record (`SRC-3` decision 6).
+    #[error(
+        "source object {name:?} asks for loadMode incremental on a business-app connector, which \
+         adds a changed record as a second row; use incremental_dedup, which keeps one row per key"
+    )]
+    SaasNeedsMerge {
+        /// The source object's name.
+        name: String,
+    },
     /// `replace_dedup` or `incremental_dedup` without a key (`SRC-10`).
     #[error(
         "source object {name:?} asks for a deduplicating loadMode, which needs primaryKey: the \
@@ -1495,8 +1507,9 @@ fn key_is_usable(columns: &[serde_json::Value]) -> bool {
 ///
 /// Returns [`InvalidLoadMode`] for the first object with an unknown
 /// `loadMode`, with an incremental mode on an adapter other than `sql` and `saas` or without a
-/// cursor column that is a plain name of sensible length, with a
-/// deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
+/// cursor column that is a plain name of sensible length, with plain `incremental` on a `saas`
+/// object (it appends; a business-app record must merge on its key, final review BLOCKER 18),
+/// with a deduplicating mode and no `primaryKey`, or with a `primaryKey` that is
 /// not a usable key.
 pub fn validate_load_modes(
     adapter: &str,
@@ -1562,6 +1575,13 @@ pub fn validate_load_modes(
         }
         if !mode.is_incremental() {
             continue;
+        }
+        // PR #216 final review BLOCKER 18: `incremental` appends, so every changed vendor record
+        // becomes a second row under the same id (and with a lag dlt's boundary de-duplication is
+        // off, so unchanged rows repeat too). A business-app object may only grow incrementally by
+        // merging on its key, which is `incremental_dedup`.
+        if adapter == "saas" && mode == LoadMode::Incremental {
+            return Err(InvalidLoadMode::SaasNeedsMerge { name });
         }
         // `SRC-3` AD6: a `saas` object may load incrementally too. Whether the
         // vendor's API can filter that object by the cursor is declared per
@@ -3486,9 +3506,11 @@ mod target_identity_tests {
         assert!(!supports_column_choice(&cdc));
     }
 
-    /// `SRC-3` T1.3, AD6: a `saas` object takes incremental modes and column
-    /// choice when it has a cursor; without one it is still refused, with the
-    /// same message as a SQL object. `rest` is still refused.
+    /// `SRC-3` T1.3, AD6: a `saas` object takes the deduplicating incremental
+    /// mode and column choice when it has a cursor; without one it is still
+    /// refused, with the same message as a SQL object. `rest` is still refused.
+    /// Final review BLOCKER 18: plain `incremental` is refused for `saas`
+    /// because it appends a changed record as a second row.
     #[test]
     fn saas_objects_take_incremental_loads_and_column_choice_only_with_a_cursor() {
         let incremental = serde_json::json!([{
@@ -3496,8 +3518,23 @@ mod target_identity_tests {
             "incrementalKey": "updated_at", "primaryKey": ["id"]
         }]);
         assert_eq!(validate_load_modes("saas", &incremental), Ok(()));
+        let append_incremental = serde_json::json!([{
+            "name": "tickets", "target": "t", "loadMode": "incremental",
+            "incrementalKey": "updated_at", "primaryKey": ["id"]
+        }]);
+        assert_eq!(
+            validate_load_modes("saas", &append_incremental),
+            Err(InvalidLoadMode::SaasNeedsMerge {
+                name: "tickets".to_owned()
+            })
+        );
+        assert_eq!(
+            validate_load_modes("sql", &append_incremental),
+            Ok(()),
+            "a SQL source keeps plain incremental: the pushed-down query reads one row per row"
+        );
         let no_cursor = serde_json::json!([{
-            "name": "tickets", "target": "t", "loadMode": "incremental"
+            "name": "tickets", "target": "t", "loadMode": "incremental_dedup", "primaryKey": ["id"]
         }]);
         assert_eq!(
             validate_load_modes("saas", &no_cursor),

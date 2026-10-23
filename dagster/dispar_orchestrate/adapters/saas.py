@@ -63,7 +63,7 @@ import dlt
 
 from dispar_orchestrate import schema_observer, ssrf_guard
 from dispar_orchestrate.adapters import rest as rest_adapter
-from dispar_orchestrate.adapters.sink import INCREMENTAL_MODES, UnsupportedLoadMode
+from dispar_orchestrate.adapters.sink import INCREMENTAL_MODES, KEY_MODES, UnsupportedLoadMode
 from dispar_orchestrate.saas import vendors
 from dispar_orchestrate.saas.objects import ObjectDecl
 from dispar_orchestrate.saas.session import SaasSession
@@ -288,11 +288,30 @@ def build_source(
 
     mode = obj.get("loadMode")
     incremental = mode in INCREMENTAL_MODES
+    # PR #216 final review BLOCKER 18: `incremental` appends, so a vendor record read again after a
+    # change becomes a second row under the same id (and with a lag dlt's boundary de-duplication is
+    # off, so unchanged rows repeat too). Decision 6 is "merge on the vendor's id", so only the
+    # deduplicating incremental mode is available for a business app.
+    if mode == "incremental":
+        raise UnsupportedLoadMode(
+            f"load mode 'incremental' is not available for {name!r}: a business app's changed record "
+            "must be merged on its key; use 'incremental_dedup'"
+        )
     if incremental:
         wanted = str(obj.get("incrementalKey") or "").strip()
         if decl.cursor is None or wanted != decl.cursor:
             raise UnsupportedLoadMode(
                 f"load mode {mode!r} is not available for {name!r}: the vendor cannot filter it by that field"
+            )
+    # PR #216 final review BLOCKER 18: a mode that keeps one row per key must use the vendor's own
+    # key. Another key (a GA4 report saved with `primaryKey: ["date"]`) folds distinct records into
+    # one; no vendor record is identified by it. Only compared where the module declares a key.
+    if mode in KEY_MODES and decl.primary_key:
+        wanted_key = tuple(str(column) for column in (obj.get("primaryKey") or []) if isinstance(column, str))
+        if wanted_key != decl.primary_key:
+            raise UnsupportedLoadMode(
+                f"load mode {mode!r} cannot use that key for {name!r}: the vendor identifies one record "
+                f"by {', '.join(decl.primary_key)}, and another key would fold different records into one"
             )
 
     columns: list[str] | None = None

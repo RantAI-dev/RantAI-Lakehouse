@@ -125,6 +125,9 @@ describe("ingest panel helpers", () => {
     // ... and a key (the two lines below named no key before the key field existed).
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
     expect(loadModeProblem({ loadMode: "replace_dedup", primaryKey: ["id"] })).toBeNull()
+    // PR #216 final review BLOCKER 18: `incremental` appends a changed business-app record as a second row.
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "sql" })).toBeNull()
   })
 
   it("names a Bronze table after the connector and the source table", () => {
@@ -530,6 +533,19 @@ describe("ConnectorIngestPanel load modes and keys", () => {
     const mode = await modeOf("orders")
     expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "history"])
     expect(screen.getByText(/Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only/)).toBeDefined()
+  })
+
+  it("offers five modes to a business app, without the append-only incremental one (final review BLOCKER 18)", async () => {
+    stubFetch({
+      ...SPEC,
+      adapter: "saas",
+      dial: { vendor: "zendesk", account: "acme", auth: { type: "integration" } } as unknown as typeof SPEC.dial,
+      sourceObjects: [{ name: "tickets", target: "saas_tickets" }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-saas" connectorName="acme" />)
+    const mode = await modeOf("tickets")
+    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "append", "replace_dedup", "incremental_dedup", "history"])
+    expect(screen.queryByText(/offered for SQL sources and business apps only/)).toBeNull()
   })
 
   it("says in each hint what happens to the rows already in the table", async () => {

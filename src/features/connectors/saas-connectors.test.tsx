@@ -159,5 +159,7 @@ describe("the rest of the saas connector surfaces", () => {
     expect(finderKind("saas", null)).toBe("saas")
     expect(supportsColumnChoice("saas", null)).toBe(true)
     expect(loadModeProblem({ loadMode: "incremental_dedup", incrementalKey: "updated_at", primaryKey: ["id"] })).toBeNull()
+    // PR #216 final review BLOCKER 18: a business app merges on its key; plain `incremental` is not offered.
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at", adapter: "saas" })).toMatch(/one per key/)
   })
 })

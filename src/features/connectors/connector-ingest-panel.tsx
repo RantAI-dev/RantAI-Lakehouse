@@ -177,15 +177,17 @@ function loadModeHint(mode: LoadMode, cursor: string): string {
  */
 function loadModesFor(adapter: string): LoadMode[] {
   // SRC-3 AD6: a business-app object loads incrementally by the cursor its vendor declares (the finder shows
-  // which objects have one), so `saas` offers the incremental modes too.
-  return adapter === "sql" || adapter === "saas"
+  // which objects have one). PR #216 final review BLOCKER 18: plain `incremental` appends a changed record as
+  // a second row, so `saas` offers only the mode that merges on the vendor's key.
+  if (adapter === "saas") return ["replace", "append", "replace_dedup", "incremental_dedup", "history"]
+  return adapter === "sql"
     ? ["replace", "incremental", "append", "replace_dedup", "incremental_dedup", "history"]
     : ["replace", "append", "replace_dedup", "history"]
 }
 
 /** Why a source cannot offer the incremental modes, or `null` when it can. */
 function missingModesNote(modes: LoadMode[]): string | null {
-  return modes.includes("incremental")
+  return modes.includes("incremental") || modes.includes("incremental_dedup")
     ? null
     : "Adding only new rows, with or without one row per key, is offered for SQL sources and business apps only: they can ask the source for just the new rows."
 }
@@ -209,9 +211,15 @@ export function loadModeProblem(selected: {
   loadMode: LoadMode
   incrementalKey?: string
   primaryKey?: string[]
+  /** The connector's adapter, when the caller knows it: `saas` cannot save plain `incremental`. */
+  adapter?: string
 }): string | null {
-  // The API refuses both (`validate_load_modes`), so they are shown before saving (SRC-10 decision 3). One at a
-  // time, the cursor first: it is the one the field next to the mode asks for.
+  // The API refuses each of these (`validate_load_modes`), so they are shown before saving (SRC-10 decision 3).
+  // One at a time, the cursor first: it is the one the field next to the mode asks for.
+  // PR #216 final review BLOCKER 18: plain `incremental` appends a changed business-app record as a second row.
+  if (selected.adapter === "saas" && selected.loadMode === "incremental") {
+    return "A business app can only add new rows one per key: choose “Add only new rows, one per key”."
+  }
   if (
     (selected.loadMode === "incremental" || selected.loadMode === "incremental_dedup") &&
     !(selected.incrementalKey ?? "").trim()
@@ -452,7 +460,7 @@ function IngestEditor({
       selection.filter((_, j) => j !== i).map((o) => o.target)
     )
   )
-  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem(s)))
+  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem({ ...s, adapter })))
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
     JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||

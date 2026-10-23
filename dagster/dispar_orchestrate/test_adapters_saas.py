@@ -154,6 +154,24 @@ def test_an_incremental_load_of_an_object_without_a_declared_cursor_is_refused(v
         build(obj(incrementalKey="created_at"))
 
 
+def test_plain_incremental_is_refused_for_a_business_app(vendor: FakeVendor) -> None:
+    """PR #216 final review BLOCKER 18: `incremental` appends, so a changed vendor record would be a
+    second row under the same id. The message is fixed and names the only mode that merges."""
+    with pytest.raises(UnsupportedLoadMode, match="incremental_dedup"):
+        build(obj(loadMode="incremental"))
+    assert vendor.calls == [], "nothing is read for a refused mode"
+
+
+def test_a_key_other_than_the_vendors_is_refused_where_the_mode_uses_it(vendor: FakeVendor) -> None:
+    """PR #216 final review BLOCKER 18: a key that differs from the vendor's own folds distinct
+    records into one (a GA4 report saved with `primaryKey: ["date"]` collapses every country of a
+    day). Checked for every mode that keeps one row per key; `replace` ignores the key."""
+    for mode in ("replace_dedup", "incremental_dedup"):
+        with pytest.raises(UnsupportedLoadMode, match="vendor identifies one record"):
+            build(obj(loadMode=mode, primaryKey=["subject"]))
+    assert build(obj(loadMode="replace", primaryKey=["subject"])) is not None
+
+
 def test_a_full_read_object_loads_without_a_cursor(vendor: FakeVendor) -> None:
     vendor.cursor = None
     vendor.records = [{"id": 1, "subject": "a", "updated_at": 10}]
