@@ -1544,6 +1544,65 @@ mod tests {
         assert!(row.contains("mart_x"), "{row}");
     }
 
+    /// The assistant's model sends `"mart": null` for "no mart". It reads as
+    /// no mart, so the chart's own mart is kept and the reply says so.
+    #[tokio::test]
+    async fn an_update_that_sends_a_null_mart_keeps_the_stored_mart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &rename_call(json!({ "mart": null })),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["mart"], json!("mart_x"), "{reply}");
+        assert_eq!(reply["sourceKept"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("mart_x"), "{row}");
+    }
+
+    /// A static kind takes no source: turning a mart chart into a text tile
+    /// carries nothing over, and the reply does not say a source was kept.
+    #[tokio::test]
+    async fn an_update_that_turns_a_chart_into_text_carries_no_source() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = rename_call(json!({ "kind": "text", "text": "A note" }));
+        args.remove("mart");
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["kind"], json!("text"), "{reply}");
+        assert!(reply.get("sourceKept").is_none(), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("A note"), "{row}");
+        assert!(!row.contains("mart_x"), "{row}");
+    }
+
     /// A call that names a SQL source keeps it: the chart's own mart is not
     /// carried over, so the two are never named at once.
     #[tokio::test]

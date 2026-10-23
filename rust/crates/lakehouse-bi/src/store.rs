@@ -293,6 +293,15 @@ pub struct StoredChartSpec {
     pub created_at: Option<String>,
 }
 
+/// Read [`ChartInput::mart`]: a string as it is, and `null` as the empty
+/// string, which is what an absent `mart` already is.
+///
+/// Any other type (a number, an object) is still a decode error, because
+/// `Option<String>` accepts only a string or `null`.
+fn deserialize_mart<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// High-level input (from the AI tool / UI builder) — the server assembles
 /// its SQL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -310,7 +319,11 @@ pub struct ChartInput {
     /// downstream validation (which mirrors `specFromInput` in
     /// `bi-store.ts`) produce the proper Indonesian error message instead
     /// of failing at deserialization with "missing field `mart`".
-    #[serde(default)]
+    ///
+    /// `null` reads as no mart, like an absent field: the assistant's model
+    /// sends `null` for "no mart", and the update path then carries the
+    /// stored source over, as it does when `mart` is absent.
+    #[serde(default, deserialize_with = "deserialize_mart")]
     pub mart: String,
     /// Dashboard SQL source id, the alternative to `mart` (exactly one of
     /// the two for every kind but `text`). `camelCase` on the wire like the
@@ -6574,6 +6587,38 @@ mod tests {
         assert_eq!(input.mart, "");
         assert_eq!(input.dimension, "");
         assert!(input.measures.is_empty());
+    }
+
+    /// `"mart": null` reads as no mart, a mart that is neither a string nor
+    /// `null` is still refused, and the field still writes as a plain string.
+    #[test]
+    fn chart_input_reads_a_null_mart_as_no_mart_and_refuses_a_number() {
+        let null: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "text", "mart": null }),
+        )
+        .expect("a null mart decodes");
+        assert_eq!(null.mart, "");
+        let named: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": "mart_x" }),
+        )
+        .expect("a named mart decodes");
+        assert_eq!(named.mart, "mart_x");
+        // A number is refused as it was before `null` was read as no mart:
+        // the assistant's model must send a name or nothing, not a number.
+        let number = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": 7 }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(number.contains("expected a string"), "{number}");
+        let object = serde_json::from_value::<ChartInput>(
+            serde_json::json!({ "title": "t", "kind": "bar", "mart": { "name": "mart_x" } }),
+        );
+        assert!(object.is_err(), "{object:?}");
+        assert_eq!(
+            serde_json::to_value(&null).expect("serializes")["mart"],
+            serde_json::json!("")
+        );
     }
 
     /// Same D1 regression, for `kind: "kpi"`: the tool schema doesn't
