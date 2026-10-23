@@ -221,4 +221,29 @@ describe("ReportingSettingsForm", () => {
     expect(screen.queryByLabelText("Report domain")).toBeNull()
     expect(screen.queryByRole("button", { name: "Remove partner.example" })).toBeNull()
   })
+
+  it("says Unsaved changes next to Save for a palette colour, a content site and a report domain, and clears it after Save (RPT-1 QA fix Q2)", async () => {
+    mockSettings(DEFAULTS)
+    render(<ReportingSettingsForm canWrite zoneList={zoneList} />)
+    const colour = (await screen.findByLabelText("Palette colour")) as HTMLInputElement
+    await waitFor(() => expect((screen.getByLabelText("Report time zone") as HTMLInputElement).value).toBe("Asia/Jakarta"))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Report domain"), { target: { value: "partner.example.com" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add domain" }))
+    // One note in the section and one next to Save.
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+    fireEvent.click(screen.getByRole("button", { name: "Remove partner.example.com" }))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(screen.getByLabelText("Content site"), { target: { value: "https://images.example.com" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add site" }))
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+    fireEvent.click(screen.getByRole("button", { name: "Remove https://images.example.com" }))
+    expect(screen.queryByText("Unsaved changes")).toBeNull()
+
+    fireEvent.change(colour, { target: { value: "#112233" } })
+    fireEvent.click(screen.getByRole("button", { name: "Add colour" }))
+    expect(screen.getAllByText("Unsaved changes").length).toBe(2)
+  })
 })

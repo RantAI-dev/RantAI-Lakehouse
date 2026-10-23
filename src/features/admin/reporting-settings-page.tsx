@@ -106,6 +106,14 @@ export function ReportingSettingsForm({
       denied.join() !== (loaded.downloadDeniedRoles ?? []).join() ||
       domains.join() !== (loaded.reportAllowedDomains ?? []).join())
 
+  // RPT-1 QA fix Q2: the three lists (palette, content sites, report domains)
+  // change only local state until Save; each says so the same way.
+  const unsaved = {
+    palette: loaded !== null && palette.join() !== loaded.companyPalette.join(),
+    sites: loaded !== null && sites.join() !== (loaded.contentSites ?? []).join(),
+    domains: loaded !== null && domains.join() !== (loaded.reportAllowedDomains ?? []).join(),
+  }
+
   // Sorted like the server stores it, so the comparison with the saved list is stable.
   const roleNames = React.useMemo(() => {
     const listed = roles.status === "success" && Array.isArray(roles.data) ? roles.data.map((r) => r.name) : []
@@ -248,6 +256,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-palette" className="text-sm font-medium">
               Company palette
             </h2>
+            {unsaved.palette ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
               {COMPANY_PALETTE_MIN} to {COMPANY_PALETTE_MAX} colours. With a palette set, new
               charts use it.
@@ -321,6 +330,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-content-sites" className="text-sm font-medium">
               Allowed content sites
             </h2>
+            {unsaved.sites ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
               Image and web-page cards may only show addresses on these sites, written
               https://host or https://host:port, no wildcards. At most {MAX_CONTENT_SITES}.
@@ -366,6 +376,7 @@ export function ReportingSettingsForm({
             <h2 id="settings-report-domains" className="text-sm font-medium">
               Reports: outside email domains
             </h2>
+            {unsaved.domains ? <UnsavedNote /> : null}
             <p className="text-xs text-muted-foreground">
               A scheduled report may be sent to an address outside the company only if its
               domain is listed here, written example.com, no wildcards. At most{" "}
@@ -429,13 +440,16 @@ export function ReportingSettingsForm({
             ))}
           </section>
           {canWrite ? (
-            <Button
-              className="w-fit"
-              onClick={handleSave}
-              disabled={!changed || paletteInvalid || save.status === "pending"}
-            >
-              Save
-            </Button>
+            <div className="flex items-center gap-3">
+              <Button
+                className="w-fit"
+                onClick={handleSave}
+                disabled={!changed || paletteInvalid || save.status === "pending"}
+              >
+                Save
+              </Button>
+              {changed ? <UnsavedNote /> : null}
+            </div>
           ) : (
             <p className="text-sm text-muted-foreground">
               Only an administrator can change these.
@@ -444,5 +458,14 @@ export function ReportingSettingsForm({
         </div>
       ) : null}
     </div>
+  )
+}
+
+/** RPT-1 QA fix Q2: the one wording for "this is not stored until Save". */
+function UnsavedNote() {
+  return (
+    <p role="status" className="text-xs text-amber-700 dark:text-amber-400">
+      Unsaved changes
+    </p>
   )
 }
