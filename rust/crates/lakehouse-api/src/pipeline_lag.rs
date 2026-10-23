@@ -699,18 +699,18 @@ async fn settle_request(
 /// `sqlx::Error` into [`StoreError::Database`], which keeps it as `source`;
 /// the raw `sqlx::Error` itself is the chain's first hop when the check
 /// makes one directly (`SET LOCAL`s, commits).
-// BLD-2 review R5 SHOULD-FIX 4: the two SQLSTATEs are matched here instead
+// BLD-2 review R5 SHOULD-FIX 6: the two SQLSTATEs are matched here instead
 // of through an existing helper, deliberately (rule 4). Both of those take a
 // `&sqlx::Error` and answer a different question:
 // `connector_probe::classify_sqlx_error` is a generic CONNECTION failure
 // class for probe messages (its `Database` arm is about authentication),
-// and `connector_listing::class_of_sqlx` buckets IO/TLS/pool-timeout and
-// listing errors. Neither knows 55P03 from 57014, and neither walks a whole
-// error CHAIN — which is what this predicate needs, because the store folds
-// the `sqlx::Error` into `StoreError::Database` and only the raw error is
-// its `source`. Sharing a helper would have given it a question no other
-// caller has; the two tests below pin both SQLSTATEs and one code that is
-// neither.
+// and `connector_listing::class_of_sqlx` classes 57014 as a timeout but not
+// 55P03 as a budget error — it does not know the check's two cuts. Neither
+// walks a whole error CHAIN, which is what this predicate needs, because the
+// store folds the `sqlx::Error` into `StoreError::Database` and only the raw
+// error is its `source`. Sharing a helper would have given it a question no
+// other caller has; the two tests below pin both SQLSTATEs and one code that
+// is neither.
 // BLD-2 review R5 SHOULD-FIX 4: the stray `R2 SHOULD-FIX 6` line that stood
 // above this doc labelled nothing here — that finding's helper is
 // `make_lag_update`, whose own site carries the tag.
@@ -1476,56 +1476,41 @@ pub const fn behind_alert_due(behind_streak: i32) -> bool {
 /// plan D7's honest note ("Downstream: no pipeline with a target lag reads
 /// this table"), as a set of ids.
 ///
-/// One call to [`pipelines::count_lag_pipelines_reading`] per candidate,
-/// which is the SAME function the lag check itself uses to decide whether a
-/// downstream pipeline is read (review R1 SHOULD-FIX 3). Reusing it is what
-/// makes the two answers agree: the earlier batched version answered the
-/// `dependsOn` edge differently from the check, so a pipeline read only
-/// through `depends_on` was told on the page that nobody reads it while the
-/// check kept scheduling it. The cost is one round trip per downstream
-/// candidate; the list this is called with is a page of pipelines, and the
-/// wrong answer is a false statement about a user's data.
+/// One call to [`pipelines::lag_pipelines_without_readers`] for the whole
+/// candidate list, which answers with the SAME predicate the lag check
+/// itself uses to decide whether a downstream pipeline is read
+/// (`pipelines::count_lag_pipelines_reading`, review R1 SHOULD-FIX 3):
+/// reusing that predicate is what makes the two answers agree — an earlier
+/// batched version answered the `dependsOn` edge differently from the
+/// check, so a pipeline read only through `depends_on` was told on the page
+/// that nobody reads it while the check kept scheduling it. It used to ask
+/// `count_lag_pipelines_reading` once per candidate, one pool checkout per
+/// row; the batched query is one checkout for the page, and the answer is
+/// unchanged (`BLD-5`, a follow-up of the same finding).
 ///
 /// The error is the caller's, never a silent zero (a swallowed failure
 /// would report every downstream pipeline as having no reader).
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] if a reader count query fails.
-// BLD-2 review R1 SHOULD-FIX 3: use count_lag_pipelines_reading for exact parity including dependsOn
+/// Returns [`StoreError`] if the reader query fails.
+// BLD-2 review R1 SHOULD-FIX 3: use the count_lag_pipelines_reading predicate for exact parity including dependsOn
 pub async fn downstream_without_readers(
     pool: &PgPool,
     candidates: &[Pipeline],
 ) -> Result<std::collections::HashSet<String>, StoreError> {
-    let candidates: Vec<&Pipeline> = candidates
+    let candidates: Vec<(&str, &str, Option<uuid::Uuid>)> = candidates
         .iter()
         .filter(|p| p.target_lag == Some(TargetLag::Downstream))
+        .map(|p| (p.id.as_str(), p.target.as_str(), p.tenant_id))
         .collect();
     if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let mut without = std::collections::HashSet::new();
-    for candidate in candidates {
-        let readers = pipelines::count_lag_pipelines_reading(
-            pool,
-            &candidate.id,
-            &candidate.target,
-            candidate.tenant_id,
-        )
-        .await?;
-        if readers == 0 {
-            without.insert(candidate.id.clone());
-        }
-    }
-    Ok(without)
+    let without = pipelines::lag_pipelines_without_readers(pool, &candidates).await?;
+    Ok(without.into_iter().collect())
 }
 
-/// BLD-2 review R4 BLOCKER 1 (a) / decision R16: the one helper every
-/// "is this P blocked by an exhausted U?" reader uses. The list page and
-/// the detail page used to answer from `dependsOn` alone, so a pipeline
-/// that reads its upstream only through its source table showed a page
-/// while the check scheduled U — the two answers must come from one store
-/// walk, the same shape as [`downstream_without_readers`].
 /// BLD-2 review R4 BLOCKER 1 (a) / decision R16, widened by decision R18:
 /// which upstream in `pipeline`'s (deepest-first) chain the check's
 /// upstream evaluation stops at. The page and the check must name the SAME
@@ -1636,8 +1621,8 @@ pub async fn upstream_stop_of(
 
 /// BLD-2 review R5 SHOULD-FIX 1: the WHOLE list's upstream stops, in one
 /// connection. The list route used to call [`upstream_stop_of`] per row,
-/// and each of those paid one chain walk plus one `list_lag_states` per
-/// upstream — an `N+1` (a list page of 100 lag pipelines paid hundreds of
+/// and each of those paid one chain walk plus one `list_lag_states` for
+/// its chain — an `N+1` (a list page of 100 lag pipelines paid hundreds of
 /// round trips, and every one of them is a page nobody is waiting for
 /// interactively). One walk per row is unavoidable (the chains differ),
 /// but one connection for all of them is not, and the per-row lag-state
@@ -1663,9 +1648,9 @@ pub async fn upstream_stop_of(
 /// [`first_upstream_stop`] already treats as "never checked, not a stop".
 ///
 /// Pinned by the route test
-/// `adding_a_listed_lag_pipeline_does_not_add_a_statement_to_the_list`
-/// in `tests/pipeline_lag_page.rs`, which counts the statements one
-/// request commits on the test's own database.
+/// `adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list`
+/// in `tests/pipeline_lag_page.rs`, which counts the pool checkouts one
+/// request makes on the test's own database.
 ///
 /// # Errors
 ///
