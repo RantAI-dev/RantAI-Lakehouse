@@ -122,9 +122,11 @@ struct LoginResponse {
 /// of whether an account with that email exists, and a locked key never
 /// reaches password verification.
 ///
-/// On a failed login, `record_failure` is called. If that call sets a
-/// lock, one `auth.login_locked` audit row is written (best-effort: a
-/// failed audit write is logged, not propagated). On a successful login,
+/// Each try is counted by `record_attempt` before the password is checked
+/// (SEC-49), so concurrent tries cannot exceed the limit; a try over the
+/// limit is refused without a hash. If a try reaches
+/// the limit and fails, one `auth.login_locked` audit row is written
+/// (best-effort: a failed audit write is logged, not propagated). On a successful login,
 /// `clear` resets the count.
 ///
 /// # Errors
@@ -153,6 +155,29 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         let secs = u64::try_from((locked_until - now).whole_seconds() + 1)
             .unwrap_or(1)
             .max(1);
+        return Err(ApiError::TooManyRequests {
+            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
+            retry_after_secs: secs,
+        }
+        .into());
+    }
+
+    // SEC-49: count this try BEFORE the password is hashed. Counting only
+    // after a failed check let many simultaneous guesses pass the lock check
+    // above before the first failure was written. The UPSERT serialises in
+    // Postgres, so only the first `max_failures` concurrent tries get a
+    // count within the limit and reach Argon2; the rest answer exactly as
+    // a locked key does, without a hash. A missing user still hashes
+    // (`DUMMY_HASH`) while within the limit, so timing is unchanged.
+    let (attempt, attempt_lock) =
+        throttle::record_attempt(pool, &key, &state.throttle_policy).await?;
+    if attempt > state.throttle_policy.max_failures {
+        let secs = attempt_lock.map_or(1, |locked_until| {
+            let now = time::OffsetDateTime::now_utc();
+            u64::try_from((locked_until - now).whole_seconds() + 1)
+                .unwrap_or(1)
+                .max(1)
+        });
         return Err(ApiError::TooManyRequests {
             message: "Too many failed sign-in attempts. Try again later.".to_owned(),
             retry_after_secs: secs,
@@ -207,8 +232,9 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         // user toward a lockout over a database hiccup (review blocker 1,
         // 2026-10-03).
         Err(AuthError::InvalidCredentials) => {
-            let lock_set = throttle::record_failure(pool, &key, &state.throttle_policy).await?;
-            if lock_set.is_some() {
+            // SEC-49: the try was already counted before hashing; the try
+            // that reached the limit is the one that set the lock.
+            if attempt_lock.is_some() && attempt == state.throttle_policy.max_failures {
                 let event = NewAuditEvent {
                     action: "auth.login_locked".to_owned(),
                     outcome: "refused".to_owned(),
