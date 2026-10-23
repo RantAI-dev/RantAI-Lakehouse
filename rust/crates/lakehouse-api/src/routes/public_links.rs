@@ -286,11 +286,17 @@ fn lock_policy() -> ThrottlePolicy {
     }
 }
 
-/// The key a link's wrong tries are counted under. Board ids are lower-case
-/// hex after `b_`, so `key_for`'s lower-casing merges no two of them (plan
-/// section 5).
+/// The key a link's tries are counted under.
+///
+/// BI-19 part A review fix (SHOULD-FIX) R2: not `key_for("public-link:<id>")`.
+/// That is the hash a login for the email `public-link:<id>` produces, so
+/// someone could lock a link by failing logins as that name (and a link's tries
+/// would count as that name's). A login key is 64 hex characters from
+/// `key_for`; this one is the prefix and the hash of the board id, which no
+/// login can produce. Board ids are lower-case hex after `b_`, so `key_for`'s
+/// lower-casing merges no two of them (plan section 5).
 fn lock_key(board_id: &str) -> String {
-    throttle::key_for(&format!("public-link:{board_id}"))
+    format!("public-link:{}", throttle::key_for(board_id))
 }
 
 fn wrong_password() -> Response {
@@ -769,6 +775,12 @@ mod tests {
         assert_eq!(lock_key("b_1a2b"), lock_key("b_1a2b"));
         assert_ne!(lock_key("b_1a2b"), lock_key("b_1a2c"));
         assert_ne!(lock_key("b_1a2b"), throttle::key_for("b_1a2b"));
+        // BI-19 part A review fix (SHOULD-FIX) R2: no login can produce it. A
+        // login key is the 64 hex characters `key_for` makes of an email.
+        assert_ne!(lock_key("b_1a2b"), throttle::key_for("public-link:b_1a2b"));
+        let login_keys_are_hex =
+            |k: &str| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit());
+        assert!(!login_keys_are_hex(&lock_key("b_1a2b")));
     }
 
     #[test]
