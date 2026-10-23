@@ -1614,7 +1614,7 @@ export function ChartBuilder({
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
           <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
             <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
-              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} /> : null}
+              {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} takesForecast={kind !== "hbar"} /> : null}
             </FormatSection>
           </FoldSection>
         </>

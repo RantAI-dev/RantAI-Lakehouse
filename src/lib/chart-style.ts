@@ -89,7 +89,7 @@ export const MAX_ANNOTATIONS = 20
 export const MAX_CONDITIONAL_RULES = 20
 
 /** What a reference line marks; mirrors `lakehouse_bi::params::LineKind`. */
-export type ReferenceLineKind = "value" | "average" | "median" | "min" | "max" | "trend" | "band"
+export type ReferenceLineKind = "value" | "average" | "median" | "min" | "max" | "trend" | "band" | "forecast"
 
 /**
  * A reference line as the server sends it with a tile's rows, parameters
@@ -106,4 +106,6 @@ export type ResolvedReferenceLine = {
   color?: string
   /** The value a computed line describes, by result name; absent is the first. */
   measure?: string
+  /** Periods ahead of a `forecast` line (`BI-17` part B, D1); the server validates it with T1. */
+  horizon?: number
 }
