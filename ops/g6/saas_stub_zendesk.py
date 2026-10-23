@@ -83,7 +83,9 @@ def _gate(handler, parsed) -> bool:  # noqa: ANN001
     """Record the request; answer 401, 403 or 429 where armed. True when it may go on."""
     expected = "Basic " + base64.b64encode(f"{EMAIL}/token:{API_TOKEN}".encode()).decode()
     with stub.STATE_LOCK:
-        STATE.log.append(f"{handler.command} {parsed.path}")
+        # PR #216 final review BLOCKER 19: log the query string too. `start_time` is the cursor
+        # filter, and only the query shows whether the reload asked from it or from the default.
+        STATE.log.append(f"{handler.command} {parsed.path}" + (f"?{parsed.query}" if parsed.query else ""))
         bearer = f"Bearer stub-zd-access-{STATE.rotations}"
         if STATE.revoked or handler.headers.get("Authorization") not in (expected, bearer):
             stub.send_json(handler, _words("Couldn't authenticate you"), 401)

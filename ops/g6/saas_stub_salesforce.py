@@ -91,7 +91,10 @@ def _words(message: str, code: str) -> list:
 def _authorised(handler, parsed) -> bool:  # noqa: ANN001
     """Record the request; answer 401, 403 or 429 where armed. True when it may go on."""
     with stub.STATE_LOCK:
-        STATE.log.append(f"{handler.command} {parsed.path}")
+        # PR #216 final review BLOCKER 19: the query string too. The SOQL cursor filter
+        # (`WHERE SystemModstamp >= ...`) is the only evidence that the reload asked for the changes
+        # rather than reading everything again; logging the path alone cannot show it.
+        STATE.log.append(f"{handler.command} {parsed.path}" + (f"?{parsed.query}" if parsed.query else ""))
         if STATE.revoked or handler.headers.get("Authorization") != f"Bearer {ACCESS_TOKEN}":
             stub.send_json(handler, _words("Session expired or invalid", "INVALID_SESSION_ID"), 401)
             return False

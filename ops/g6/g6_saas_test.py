@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import timedelta
@@ -386,7 +387,7 @@ def step_salesforce() -> None:
     again = _read(module, parts, session, dial, "Account", since=cursor)
     got = {r["Id"]: r["IsDeleted"] for r in again}
     _expect(got == {"001STUB002": False, "001STUB003": True, "001STUB004": False}, f"salesforce reload: read {got}, expected the changed (2), the deleted (3) marked IsDeleted and the new (4)")
-    _expect(any(line == "GET /services/data/v62.0/queryAll" for line in mock_log("salesforce")) and module.declaration(session, parts, dial, "Account").deletes, "salesforce reload: queryAll was not used")
+    _expect(any(line.startswith("GET /services/data/v62.0/queryAll") for line in mock_log("salesforce")) and module.declaration(session, parts, dial, "Account").deletes, "salesforce reload: queryAll was not used")
     _log("salesforce reload: the changed, the new and the deleted record (IsDeleted true) came back through queryAll; the unchanged one did not")
 
     admin("salesforce", action="add_field", name="Rating__c")
@@ -1171,6 +1172,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
         # discovery: the properties API describes deals before a load (decision 9)
         "preview_columns": {"id", "dealname", "amount"},
         "first_ids": {"1", "2", "3"}, "reload_ids": {"1", "2", "3", "4"},
+        # PR #216 final review BLOCKER 19: the search request is the cursor filter; the first run
+        # lists the object instead, so the marker is absent there.
+        "reads_marker": ("/search",),
     },
     "zendesk": {
         "type": "Zendesk", "host": "acme.zendesk.com", "account": "acme", "label": "Zendesk",
@@ -1180,6 +1184,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
         # Zendesk does not describe its fields before a read, so its preview is honestly unsupported
         "preview_columns": None,
         "first_ids": {"1", "2", "3", "4", "5", "6"}, "reload_ids": {"1", "2", "3", "4", "5", "6", "7"},
+        # PR #216 final review BLOCKER 19: the cursor is the export's `start_time`; the first run
+        # starts at the verified source's default (2000-01-01) and the reload must start later.
+        "cursor_value": r"start_time=(\d+)",
     },
     # ServiceNow: the client-credentials way (the API's connection test exchanges them for a token); the browser
     # sign-in is covered by the vendor-level step. Incident ids are ServiceNow's 32-character sys_id.
@@ -1215,7 +1222,10 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
             {"action": "put", "id": 6},
         ],
-        "reads_marker": ("/pages",), "max_reads": 2,  # newest first, stopped at the cursor: 2 of 3 pages
+        # PR #216 final review BLOCKER 19: Confluence filters in the loader (sorted newest first,
+        # stop at the cursor), so no request carries the filter; the proof is that the reload reads
+        # fewer pages than the first run (which reads them all).
+        "list_marker": "/pages", "max_reads": 2, "first_reads_more_than_reload": True,
     },
     # BLOCKER 13 of the slice 4 review: the other signed way into Confluence, the browser sign-in. The API's
     # connection test refreshes the token, reads accessible-resources, picks the connector's site and asks the
@@ -1236,7 +1246,7 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
             {"action": "put", "id": 6},
         ],
-        "reads_marker": ("/pages",), "max_reads": 2,
+        "list_marker": "/pages", "max_reads": 2, "first_reads_more_than_reload": True,
     },
     # SharePoint (V-SharePoint.4): both signed ways. Client credentials: the API's connection test and the orchestrator
     # exchange the app's id and secret at the customer's tenant (the tenant is part of the account, AD2). A list is read by
@@ -1334,7 +1344,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 4},
             {"action": "delete", "id": 3},
         ],
-        "reads_marker": ("customreport2",),
+        # PR #216 final review BLOCKER 19: a Workday report has no cursor (re-read in full), so the
+        # evidence is the opposite: the same report request in the first run AND the reload.
+        "full_read_marker": ("customreport2",),
     },
     "workday-browser": {
         "vendor": "workday",
@@ -1353,7 +1365,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 4},
             {"action": "delete", "id": 3},
         ],
-        "reads_marker": ("customreport2",),
+        # PR #216 final review BLOCKER 19: a Workday report has no cursor (re-read in full), so the
+        # evidence is the opposite: the same report request in the first run AND the reload.
+        "full_read_marker": ("customreport2",),
     },
     # NetSuite (V-NetSuite.4): the certificate way (the API's connection test and the orchestrator sign an assertion with the
     # private key made for this run; the mock checks the PS256 signature) and the browser sign-in. SuiteQL pages of two.
@@ -1405,7 +1419,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 4, "fields": {"Name": "account 4 new"}},
             {"action": "delete", "id": 3},
         ],
-        "reads_marker": ("queryAll",),
+        # PR #216 final review BLOCKER 19: the SOQL cursor filter itself (URL-encoded `>=`); the
+        # first run's query has no WHERE, so the marker is absent there.
+        "reads_marker": ("SystemModstamp+%3E%3D",),
     },
     # Google Analytics 4: the object is a report the connector defines; the sign-in is the browser's (the API's
     # connection test cannot present a service-account key yet, and says so), with the app's secret and a
@@ -1426,7 +1442,6 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "days_ago": 2, "country": "US", "metrics": {"sessions": 55}},
         ],
         "reload_ready": lambda rows: any(r["sessions_integer"] == 99 for r in rows),
-        "reads_marker": ("runReport",),
     },
     # Slice 3 review BLOCKER 10: the other signed way into GA4, the service-account key. The API's connection test
     # exchanges an RS256 assertion for a token (the mock checks the signature against the public half of the key made
@@ -1448,7 +1463,6 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "days_ago": 2, "country": "US", "metrics": {"sessions": 55}},
         ],
         "reload_ready": lambda rows: any(r["sessions_integer"] == 99 for r in rows),
-        "reads_marker": ("runReport",),
     },
 }
 
@@ -1558,7 +1572,11 @@ def step_product(vendor_id: str) -> None:
         _log(f"ga4 discover: {len(kinds)} dimensions and metrics of the property listed through discovery for the report editor")
 
     # load: ingest_job into Bronze Iceberg, read back.
+    # PR #216 final review BLOCKER 19: clear the mock's log first, so the reload's cursor evidence can
+    # be compared with what the FIRST run asked. A marker a full read also sends proves nothing.
+    admin(vendor_id, action="clear_log")
     _run_and_wait(cid, f"{vendor_id} load")
+    first_seen = mock_log(vendor_id)
     columns = spec.get("columns") or f"id, {text}" + (", status" if vendor_id == "zendesk" else "")
     order = spec.get("order", "toString(id)")
     row_id = spec.get("row_id", lambda r: str(r["id"]))  # a report has no id column: its key is its dimensions
@@ -1624,10 +1642,44 @@ def step_product(vendor_id: str) -> None:
     else:
         _expect("1" in by_id, "hubspot reload: the archived deal vanished; no delete is claimed, so it must stay")
     seen = mock_log(vendor_id)
-    reads = [line for line in seen if any(m in line for m in spec.get("reads_marker", ("/search", "cursor", "incremental")))]
-    _expect(reads, f"{vendor_id} reload: the mock saw no incremental request ({seen})")
+    # PR #216 final review BLOCKER 19: the marker is now the cursor filter ITSELF, and the check is two
+    # ways: the reload's requests carry it and the first run's do not. A marker that a full read sends
+    # as well (the old `/pages`, `runReport`, `customreport2`) let a product that forgot the cursor
+    # pass, because the merge hid the repeats. A vendor whose cursor the loader applies (Confluence,
+    # GA4) or that is re-read in full (Workday) has its own evidence, below and in its block above.
+    markers = spec.get("reads_marker")
+    if markers:
+        _expect(
+            any(all(m in line for m in markers) for line in seen),
+            f"{vendor_id} reload: no request carried the cursor filter {markers} ({seen})",
+        )
+        _expect(
+            not any(all(m in line for m in markers) for line in first_seen),
+            f"{vendor_id} load: the first run already sent {markers}, so it proves nothing about the reload ({first_seen})",
+        )
+    cursor_value = spec.get("cursor_value")
+    if cursor_value:
+        first_values = [int(n) for line in first_seen for n in re.findall(cursor_value, line)]
+        reload_values = [int(n) for line in seen for n in re.findall(cursor_value, line)]
+        _expect(
+            bool(first_values) and bool(reload_values) and max(reload_values) > max(first_values),
+            f"{vendor_id} reload: the cursor value did not move past the first run's ({first_values} -> {reload_values})",
+        )
+    for marker in spec.get("full_read_marker") or ():
+        _expect(
+            any(marker in line for line in seen) and any(marker in line for line in first_seen),
+            f"{vendor_id} reload: the full read ({marker}) is not in both runs ({first_seen} / {seen})",
+        )
+    list_marker = spec.get("list_marker") or markers or ("/search", "cursor", "incremental")
+    reads = [line for line in seen if any(m in line for m in list_marker)]
     if spec.get("max_reads"):
         _expect(len(reads) <= spec["max_reads"], f"{vendor_id} reload: {len(reads)} list requests; an incremental read stops near the cursor ({reads})")
+    if spec.get("first_reads_more_than_reload"):
+        first_reads = [line for line in first_seen if any(m in line for m in list_marker)]
+        _expect(
+            len(reads) < len(first_reads),
+            f"{vendor_id} reload: {len(reads)} list requests against the first run's {len(first_reads)}; the read did not stop at the cursor",
+        )
     _expect(not any(line == "GET /crm/v3/objects/deals" for line in seen), f"{vendor_id} reload: it listed every deal again")
     _log(f"{vendor_id} reload: "
          + {
@@ -1650,6 +1702,12 @@ def step_product(vendor_id: str) -> None:
         _expect(test.ok and body.get("ok") is False and VENDOR_WORDS not in str(body), f"{vendor_id} revoked: the connection test said {str(body)[:300]}")
         run_id = matrix._post_ingest_run(cid).json().get("runId")
         matrix.step_wait_for_run_failure(run_id)
+        # PR #216 final review BLOCKER 19: "the run failed" alone does not say why; a run that failed
+        # for another reason (a merge, a timeout) would pass. The attempt's class must be the refused
+        # sign-in, the same word the console shows.
+        log = matrix.API.get(f"{matrix.API_URL}/api/connectors/{cid}/runs/{run_id}/log", timeout=30)
+        classes = [attempt.get("errorClass") for attempt in (log.json() if log.ok else {}).get("attempts") or []]
+        _expect("sign_in_refused" in classes, f"{vendor_id} revoked: the run's attempt classes are {classes}, not sign_in_refused")
     finally:
         admin(vendor_id, action="revoke", on=False)
     _log(f"{vendor_id} revoked sign-in: the API's test fails in plain words and the run fails; none of the vendor's words appear in the test")
