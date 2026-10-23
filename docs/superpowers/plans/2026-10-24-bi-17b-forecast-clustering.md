@@ -184,29 +184,7 @@ Decisions the plan left open, for review:
 
 Checks: `bun test src/lib/forecast.test.ts` 15 pass, 0 fail; `bun run typecheck` exit 0; eslint on the two files clean; full `bun run test` and `bun run lint` counts are in the T3 entry (run once after both modules).
 
-
-### T2 `forecast.ts` (developer, branch `feat/bi-phase-6`)
-
-Commit: the one titled `feat(forecast): additive exponential-smoothing forecast (BI-17 B T2)`. TypeScript only; no cargo command run. Standalone: it imports only the `Grain` type of `time-grain.ts`; nothing from T1.
-
-API: `forecast({ values, grain, horizon, lastPeriodEnd?, now? })` returns a `Forecast` (model ANN/AAN/ANA/AAA, label, parameters, AICc, `point`/`lower`/`upper`, notes) or `{ refused: sentence }`; `isRefusal`, `seasonLength(grain)`. The caller (T4) passes one value per consecutive period (`null` for a missing bucket, so the bucket arithmetic stays with the drawing) and the end of the last bucket; `now` is a parameter, which is how the tests fake the clock.
-
-Reference numbers (committed in `src/lib/forecast-reference.json`), produced offline by:
-
-    pip install --target <dir> numpy scipy pandas statsmodels
-    python3 -I ops/forecast/make_reference.py <dir> src/lib/forecast-reference.json
-
-with `statsmodels` 0.15.0 and `numpy` 2.5.4, `ETSModel(error="add", trend/seasonal "add" or None, initialization_method="heuristic")`. Series: `AirPassengers` (144 monthly points, log scale; Rdatasets download) and the first 80 quarters of `statsmodels.datasets.macrodata` `realgdp` (log scale; trend, no season). Output: airline selects AAA (AICc ANN -230.6, AAN -146.0, ANA -473.9, AAA -495.6), gdp selects AAN (ANN -450.5, AAN -491.3, ANA -439.7, AAA -481.9). The TypeScript selects the same models, and its parameters, points and band agree with `statsmodels` to about 1e-7 relative (measured worst: point 4e-8, band 9e-8), against the plan's 1 % and 3 %.
-
-Decisions to review:
-- **Initial states = statsmodels' "heuristic" start**, not its default "estimated" one, so the comparison is against an independent fit of the same problem, not of a different one. The plan's D3 also says decomposition-based starts.
-- **AICc counts the initial states and the variance as parameters** (Hyndman et al.), recomputed in the reference script from the log-likelihood because `statsmodels` leaves heuristic states out of its own `aicc`. A model with `n - k - 1 <= 0` is not a candidate (a short series falls back to ANN).
-- **Seasons need `max(2m, 10 + 2*floor(m/2))` points**: 2 full seasons, as signed, plus what the decomposition needs to start (24 for months, 8 for quarters, 16 for days, 124 for weeks). Below 2 seasons the note says "fewer than 2 full seasons"; between the two limits, "too few to start them". Year and minute have no seasons.
-- **Thresholds** as in the feature page: under 5 periods refused (counted after the unfinished period is dropped, and the sentence says so); more than 10 % periods missing refused, up to 10 % filled in a straight line and counted; a missing latest period is refused, leading gaps are trimmed; horizon held to 1..60 and to the history length, with a note.
-- Ties in AICc go to the simpler model; a zero-error series is floored so the log stays finite (constant series: flat ANN forecast).
-- **Variance:** the generic sum c_j = alpha + j beta + gamma [m | j] is used for all four models; it reproduces `statsmodels`' closed forms (same terms) and its intervals for the two selected models (AAA, AAN). The unselected models' intervals are not compared one by one, because the module only returns the winner: *not verified* for ANN and ANA bands.
-
-Checks (from `/home/hv/lakehouse-phase6-build`): `bun test src/lib/forecast.test.ts`: 15 pass, 0 fail; `bun run typecheck`: exit 0; eslint on the two files: clean.
+Commit note: two commits carry T2, `df05a7ad` (the files and this entry) and `2c0270a6` (only a wording fix in the handoff, made after a session restart left both writing the same files). No code differs between them.
 
 
 ### T3 `kmeans.ts` (developer, branch `feat/bi-phase-6`)
