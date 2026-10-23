@@ -638,3 +638,30 @@ async fn the_dashboard_list_marks_only_boards_with_a_live_link() {
         "the stale column is never shown"
     );
 }
+
+/// `BI-19` part A review fix (BLOCKER) R1: twenty guesses at once are all
+/// counted before any is checked, all answer as a wrong password, and the link
+/// is locked afterwards even for the right password.
+#[tokio::test]
+async fn twenty_simultaneous_guesses_are_all_counted_and_all_refused() {
+    let f = one_board().await;
+    let w = writer(&f).await;
+    let (_, made) = put(&f, &w, json!({ "password": "correct horse" })).await;
+    let token = made["link"]["token"].as_str().unwrap().to_owned();
+    let guesses = (0..20).map(|_| unlock(&f, &token, "wrong guess number"));
+    let answers = futures::future::join_all(guesses).await;
+    assert_eq!(answers.len(), 20);
+    for (status, body) in &answers {
+        assert_eq!(*status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json_of(body), json!({ "error": "wrong_password" }));
+    }
+    let (counted,): (i32,) = sqlx::query_as("SELECT failures FROM login_throttle")
+        .fetch_one(&f.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(counted, 20, "every guess was counted before it was checked");
+    assert_eq!(
+        unlock(&f, &token, "correct horse").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}

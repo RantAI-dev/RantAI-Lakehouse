@@ -33,8 +33,9 @@
 //! Stored only as an `Argon2id` hash made by `lakehouse_auth::password`, checked
 //! by the same crate's verifier (constant-time by construction), never returned,
 //! never logged, never in the audit record. A wrong try is counted on the
-//! login lock's table under the key `public-link:<board id>` (five in fifteen
-//! minutes lock the link's password page for fifteen), so the lock follows the
+//! login lock's table under the key `public-link:<board id>` (five tries in
+//! fifteen minutes lock the link's password page for fifteen; a try is counted
+//! before it is checked, so simultaneous guesses cannot get past the limit), so the lock follows the
 //! dashboard and survives a guesser asking for a different token; a new link
 //! for the dashboard starts from a clean count.
 //!
@@ -343,11 +344,17 @@ pub async fn unlock(
         Err(err) => return rejection(err),
     };
     let key = lock_key(&open.link.board_id);
-    match throttle::locked_until(pool, &key).await {
-        Ok(None) => {}
-        // Locked: no hashing, and the same answer as a wrong password.
-        Ok(Some(_)) => return wrong_password(),
+    // BI-19 part A review fix (BLOCKER) R1: the try is counted BEFORE it is
+    // checked, in one atomic statement. Counting after the hash let any number
+    // of simultaneous guesses pass the lock check together, and each cost a
+    // full Argon2 run. Only the first `LOCK_FAILURES` tries of a window reach
+    // the verifier; the rest answer as a wrong password without hashing.
+    let attempt = match throttle::record_attempt(pool, &key, &lock_policy()).await {
+        Ok((n, _locked_until)) => n,
         Err(err) => return rejection(err),
+    };
+    if attempt > LOCK_FAILURES {
+        return wrong_password();
     }
     let password = Secret::new(parsed.password);
     let verified = tokio::task::spawn_blocking(move || {
@@ -356,16 +363,12 @@ pub async fn unlock(
     .await
     .unwrap_or(false);
     if !verified {
-        match throttle::record_failure(pool, &key, &lock_policy()).await {
-            Ok(Some(_locked)) => {
-                // Best effort, like the sign-in lock's record: the answer to
-                // the visitor is the same either way.
-                if let Err(err) = record_lock(pool, &open.link.board_id).await {
-                    tracing::warn!(%err, "failed to record dashboard.public_link_locked");
-                }
+        if attempt == LOCK_FAILURES {
+            // The try that reached the limit set the lock. Best effort, like the
+            // sign-in lock's record: the visitor's answer is the same either way.
+            if let Err(err) = record_lock(pool, &open.link.board_id).await {
+                tracing::warn!(%err, "failed to record dashboard.public_link_locked");
             }
-            Ok(None) => {}
-            Err(err) => return rejection(err),
         }
         return wrong_password();
     }
