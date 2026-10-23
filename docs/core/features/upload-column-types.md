@@ -6,14 +6,14 @@
 | Backlog | `DATA-18` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-18.md` (one *(proposed)* number: the 10,000-row sample, decision 1) |
-| Status | Building (#186) |
+| Status | Building (#186, not merged) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
 | Plan | `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md` (Phase 3 master plan, slice 3) |
 | Started | 2026-10-16; also in `BACKLOG.md` Dates |
 | Shipped | |
-| Evidence | |
+| Evidence | #186 (open) |
 
 ## Problem
 
@@ -66,10 +66,33 @@ Each default was the planner's recommendation.
 
 ## Limits to tell a customer
 
-- The guess reads the first 10,000 rows; a bad value further down is caught by the load, which follows the "empty or stop" choice.
+- The guess reads the first 10,000 rows (or 16 MB); a bad value further down is caught by the load, which follows the "empty or stop" choice.
 - A decimal keeps 9 digits after the point; a value with more does not fit.
 - Replacing an uploaded table with different types can break a pipeline that reads it; its next run fails and says why.
 - Adding to an existing table keeps that table's names and types.
+- The size of a typed load is the same as for any upload: 2 GB, one load at a time measured (`docs/plans/DATA-17-RESULT.md`); the harness sends no column list, so no typed load was measured at full size.
+- For an Excel workbook loaded with types, the report of values that did not fit is written but not read back, so the person sees no list of them (`DATA-31`).
+- A query through the console shows a NULL as an empty string (`DATA-29`); use `IS NULL` to tell them apart.
+
+## Spec targets, row by row
+
+Against `docs/core/specs/data-18.md`, as built in #186. "Met" means built and covered by tests and the `g9-upload` gate on the pull request; the acceptance checklist below is not run.
+
+| Spec row | Target | Result |
+| --- | --- | --- |
+| Type detection | Integer, decimal, boolean, date, timestamp, text from a sample of 10,000 rows *(proposed)* | Met (decision 1; the sample is also cut at 16 MB) |
+| Edit before loading | Name and type per column in the preview | Met (decision 8) |
+| Bad values | Counted, first 100 listed, choose null or stop | Met for the load, with the gap for workbooks above (`DATA-31`) |
+| Date formats | ISO, dd/mm/yyyy, mm/dd/yyyy; ask when ambiguous | Met (decision 4) |
+
+No spec target is left unmet, so there is no "Spec targets this feature does not meet" section.
+
+## What changed in the build
+
+- **Decision 12 (ADR 0014 decision 4).** Replaced as signed; the amendment is in `docs/adr/0014-file-upload.md`.
+- **Decision 9 (replacing a table).** `PR #186 slice 3 review BLOCKER 1`: a replace that changes a column's type first purged the table, so a failure in between lost its data. The type change and the new rows are now one Iceberg commit; a failed load changes nothing.
+- **Decision 10 (files that carry their own types).** Floating-point columns of Parquet and Avro keep their type, shown as "Floating point (from the file)" (beyond the spec, as signed).
+- **Decision 6 (values that do not fit).** The comparison of several files reports a type conflict only for a column the first file's own sample fits, so two identical files never conflict (`PR #186 slice 5 review`, `BLOCKER 5`).
 
 ## Acceptance checklist
 

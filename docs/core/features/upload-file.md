@@ -24,7 +24,9 @@ screen.
 1. On Sources, press "Upload file". The same page is offered from the first
    step of "New Connector".
 2. Choose a delimited text file (CSV or TSV), an Excel workbook (`.xls`,
-   `.xlsx`) or a Parquet file (`.parquet`) of up to 50 MB and send it.
+   `.xlsx`) or a Parquet file (`.parquet`) of up to 50 MB and send it. (#186,
+   not merged, adds JSON, JSON Lines, Avro, gzip and zip, several files and up to
+   2 GB: `upload-big-files-and-more-formats.md`.)
 3. See what the file looks like before anything is loaded: the encoding,
    the delimiter and the header row the system detected, the column names,
    and the first 20 rows. For a workbook: the sheet (the first visible one
@@ -51,10 +53,11 @@ delete, and does not see other people's uploads.
 
 ## Not included
 
-- `.xlsm`, `.xlsb`, `.ods`, other archives and JSON. They are refused with
-  a message that says what to do, never half-read.
-- Typed columns from a Parquet file, and Parquet columns of binary or nested
-  type (the file is refused, naming the first such column).
+- `.xlsm`, `.xlsb`, `.ods` and other archives. They are refused with a
+  message that says what to do, never half-read. (JSON, gzip and zip are
+  read in #186, not merged.)
+- Parquet columns of binary or nested type (the file is refused, naming the
+  first such column). Typed columns are `DATA-18`, in #186.
 - Loading several sheets of a workbook in one upload (load the workbook
   again with another sheet), typed columns, calculating formulas, and
   password-protected workbooks (refused, with the reason).
@@ -168,12 +171,17 @@ rows and shows 20.
   (`.xls`, `.xlsx`) one sheet at a time, and Parquet files; every other kind
   is refused with the reason. A macro-enabled `.xlsm`, an `.xlsb` or an `.ods` has to be saved as
   `.xlsx` or CSV first.
-- 50 MB per file, and 2,000,000 rows per load. A workbook sheet of more than
-  5,000,000 cells is refused.
+- 50 MB per file on `POST /api/uploads` and for a workbook; the Upload file
+  page sends other files in pieces and takes up to 2 GB, with no row cap
+  (`DATA-17`, #186, not merged; `upload-big-files-and-more-formats.md`). A
+  workbook sheet of more than 5,000,000 cells is refused.
 - A workbook or Parquet file is stored twice while it is loaded: the
   original and the converted text, both removed with the upload.
-- A Parquet file of more than 5,000,000 cells is refused, and so is one with
-  a binary or nested column: remove the column and save the file again.
+- A Parquet file with a binary or nested column is refused: remove the column
+  and save the file again. On the chunked path the API no longer converts a
+  Parquet file; the load job reads it (`DATA-17`, #186). The 5,000,000-cell
+  cap now applies only to a whole-file conversion in the API, which nothing
+  calls.
 - A file of more than 1,000 columns is refused at the Check step with "The
   file has more than 1,000 columns."; changing the delimiter or the header
   row there reads it again (`SEC-17`).
@@ -183,7 +191,9 @@ rows and shows 20.
   and can be sent again; nothing waits. A load that has shown as running for
   more than 6 hours no longer counts (`SEC-17`, `UPLOAD_MAX_CONCURRENT_PER_USER`
   and `UPLOAD_MAX_CONCURRENT`; `docs/core/features/upload-limits-and-safe-csv.md`).
-- Every column is text. Numbers and dates have to be converted afterwards.
+- A load that sends no column list stores every column as text. The Upload
+  file page guesses types and lets the person change them (`DATA-18`, #186,
+  not merged; `upload-column-types.md`).
 - An uploaded table stays in the raw layer. The pipeline builder cannot read
   raw tables yet, and a dashboard reads Gold tables only. So an uploaded
   table can be explored and queried, and cannot yet feed a dashboard.
@@ -205,7 +215,9 @@ rows and shows 20.
   connector loads that table, so a file cannot be loaded into it." (`SEC-16`.)
   A refused name still tells a person that someone has taken it; only a
   namespace per tenant would remove that.
-- An upload is not resumable. If the connection drops, it starts again.
+- On the Upload file page a dropped connection pauses the upload and it
+  continues by itself while the page stays open (`DATA-17`, #186). After a
+  reload it starts again.
 - In an install with several tenants, the table an upload creates appears in
   the shared catalog, which only the tenant that owns the catalog sees.
 

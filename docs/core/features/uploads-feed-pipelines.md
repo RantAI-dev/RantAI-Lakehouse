@@ -6,14 +6,14 @@
 | Backlog | `DATA-19` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-19.md` (no *(proposed)* numbers) |
-| Status | Planned |
+| Status | In Acceptance (merged in #165, 2026-10-15); checklist not run |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
-| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` (PR #165). Nothing open blocks it (`BLD-3` shipped). |
-| Started | |
-| Shipped | |
-| Evidence | |
+| Plan | `docs/superpowers/plans/2026-10-14-data-19-uploads-feed-pipelines.md` (PR #165). |
+| Started | 2026-10-14 |
+| Shipped | 2026-10-15 (merged; not accepted) |
+| Evidence | #165 |
 
 ## Problem
 

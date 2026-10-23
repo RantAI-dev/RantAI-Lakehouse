@@ -6,14 +6,14 @@
 | Backlog | `DATA-17` |
 | Kind | Feature |
 | Spec | `docs/core/specs/data-17.md` (no *(proposed)* number; the 2 GB figure ships only once measured, decision 3) |
-| Status | Building (Excel and Parquet merged in #76; the rest in #186) |
+| Status | Building (Excel and Parquet merged in #76; the rest in #186, not merged) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Held in the base; not the Owner. |
 | Plan | `docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md` (Phase 3 master plan, slices 1, 2, 4, 5 and 6) |
 | Started | 2026-10-07 (Excel); also in `BACKLOG.md` Dates |
 | Shipped | |
-| Evidence | #76 (Excel and Parquet) |
+| Evidence | #76 (Excel and Parquet); #186 (the rest, open); `docs/plans/DATA-17-RESULT.md` (the measurement the 2 GB cap is set from) |
 
 ## Problem
 
@@ -73,11 +73,41 @@ Each default was the planner's recommendation.
 
 ## Limits to tell a customer
 
-- Up to 10 files and 2 GB per upload, once measured (decision 3); Excel workbooks up to 50 MB.
+- Up to 10 files and 2 GB (GiB: 2,147,483,648 bytes) per upload, counting all the files of one load together. A gzip or zip counts its unpacked size. Excel workbooks stay at 50 MB each. There is no row cap any more: the old 2,000,000-row limit was removed because the job's memory was measured not to follow the size of the file (`docs/plans/DATA-17-RESULT.md`).
+- The 2 GB figure is measured for **one** load at a time, on one 16 GB GitHub-hosted runner: a 2 GiB load of CSV, JSON Lines, gzip or Parquet grew the load job by 0.9 to 2.3 GiB, and finished in under two minutes (CSV 107 s). Not measured, and so not promised:
+  - two 2 GB loads at the same time (the installation allows up to 16 loads at once, `SEC-17`);
+  - a Parquet file whose single row group is larger than memory (the reader decodes one row group whole);
+  - Avro and zip files at large sizes;
+  - any machine other than that runner.
+- A zip may not hold a Parquet file (decision 13; `DATA-28`).
 - An upload continues after a dropped connection only while its page stays open.
 - Several files load into one table only when their columns match.
 - Nested JSON and Avro values are kept as JSON text, not spread into columns.
-- An unfinished upload is removed after 24 hours.
+- An unfinished upload is removed after 24 hours. A person can have at most 20 uploads being received at once.
+- A workbook is still read whole by the API (its memory bounds are `SEC-22`, not this feature).
+
+## Spec targets, row by row
+
+Against `docs/core/specs/data-17.md`, as built in #186. "Met" means built and covered by tests and the `g9-upload` gate on the pull request; the acceptance checklist below is not run.
+
+| Spec row | Target | Result |
+| --- | --- | --- |
+| Formats | CSV, TSV, JSON, JSON Lines, Avro, Parquet, Excel (one sheet) | Met. JSON is a top-level array of objects (decision 11); Avro is an object container file whose top level is a record, with no codec or the deflate codec |
+| Files per upload | Up to 10, in parallel | Met. Up to 10; up to 4 pieces in flight per user (decision 6) |
+| Size | Up to 2 GB, memory measured in a RESULT document | Met for one load at a time, see the limits above and `docs/plans/DATA-17-RESULT.md`. Time was not a target; it grew by 30 to 60 percent with the streaming fix |
+| Upload method | Resumable chunks, a progress bar per file | Met, with the reach of decision 7: resuming works while the page stays open |
+| Compressed files | gzip and zip | Met, except a Parquet file inside a zip (decision 13, amended; `DATA-28`) |
+| Several files into one table | Same columns into one table; mismatches listed before loading | Met |
+
+No spec target is left unmet, so there is no "Spec targets this feature does not meet" section. The part of the size target that was not measured is in the limits above and in `BACKLOG.md` (`DATA-33`, `DATA-34`).
+
+## What changed in the build
+
+- **Decision 3 (when the 2 GB ships).** The first full-size measurement (`DATA-17-RESULT.md`, run 39903340840) showed the load job's memory growing with the file, 3 to 5 times its size (CSV 2 GiB: +9.75 GiB), so the planned streaming of the job did not hold (`PR #186 review BLOCKER 6`). The product owner decided on 2026-10-23 to fix the streaming first and set the cap from a second measurement rather than ship a smaller cap. The write step of the Iceberg load was the cause; it now writes one transaction in groups of up to 32 MiB (`adapters/iceberg_stream.py`). The second measurement (run 39916318666) is the one the cap is set from, and it met the target, so 2 GiB ships.
+- **Decision 10 (the row cap).** Removed. The measured growth followed bytes, not rows, and is now flat in both. The failure reason `TOO_MANY_ROWS` stays in the fixed list so that an older failed upload keeps its message; it is no longer raised.
+- **Decision 13 (compressed files).** Parquet inside a zip is out, signed 2026-10-21 (`DATA-28`), because a footer cannot be read by range inside a deflated entry.
+- **Decision 6 (parallel).** `PR #186 slice 1 review SHOULD-FIX 1`: a user may hold at most 20 open upload sessions (429 past that), so a client cannot open sessions without end before the 24 hour sweep.
+- **The old route.** `POST /api/uploads` keeps its 50 MB cap (decision 14). The 2 GB applies to the chunked sessions; the unpacked-size check has its own 2 GiB constant so the two do not disagree.
 
 ## Acceptance checklist
 
