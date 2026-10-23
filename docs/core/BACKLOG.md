@@ -88,6 +88,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-42` | Task | `cargo audit` and `cargo deny` are red on `main` since 2026-10-16: `zip` 8.6.0 (through `calamine` 0.36.1, the workbook reader) has `RUSTSEC-2026-0367`, `-0368`, `-0369`, fixed in `zip` 9.0.0, and no `calamine` release accepts `zip` 9 yet. All three are in `extract` (writing an archive to disk); `calamine` only reads entries and never calls it (checked in its 0.36.1 source). Ignore the three IDs in `rust/deny.toml` and the `cargo audit` step, each with that reason and a note to drop it when `calamine` moves to `zip` 9 | Administration & Security | P1 | Done | #196 | `security.yml` on `main` |
 | `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Todo |  | `#199` review (`BI-16` part B, decision D4) |
+| `SEC-48` | Task | `cargo audit` and `cargo deny` went red on 2026-10-23: `ctutils` 0.4.2 (pulled in by the RustCrypto crates) generated non-constant-time masks and `u128` comparisons (`RUSTSEC-2026-0385`). Bumped to the patched 0.4.4 in `Cargo.lock`; no code change | Administration & Security | P1 | Done | #230 | Security check on #224, 2026-10-23 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 
 ## Next (P2)
@@ -369,6 +370,7 @@ set by the product owner and are left empty until they are.
 | `SEC-44` | 2026-10-17 | | |
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
 | `OPS-11` | 2026-10-23 | 2026-10-23 | |
+| `SEC-48` | 2026-10-23 | 2026-10-23 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
