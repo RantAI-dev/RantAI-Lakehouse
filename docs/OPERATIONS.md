@@ -824,7 +824,7 @@ What the operator needs to know:
 - **Framing.** Each dashboard lists the sites allowed to show its embed pages
   (Share dialog; at most 20; `https://host[:port]`, or `http://localhost[:port]`
   for development; no wildcards). The console's `proxy.ts` asks the API
-  (`POST /api/embed/frame`, which needs no sign-in and answers only the list)
+  (`POST /api/embed/frame`, which needs no sign-in and answers only the lists)
   and sends `Content-Security-Policy: frame-ancestors <sites>`, or
   `frame-ancestors 'none'` when the list is empty, the token is not good, or
   the API cannot be reached within 3 seconds. The console reads the API address
@@ -832,8 +832,54 @@ What the operator needs to know:
   `http://localhost:8080`; a deployment must pass `-e RUST_API_URL=...`, as the
   staging deploy does). If it points where nothing listens, every embed page is
   sent as `frame-ancestors 'none'` and no embed renders. The rule is enforced by the
-  viewer's browser; it does not replace the token. No other console page sends
-  a framing header.
+  viewer's browser; it does not replace the token. Every other console page
+  sends `frame-ancestors 'none'` (`SEC-47`, the next section).
+
+### The console's Content-Security-Policy (`SEC-47`)
+
+Every console page is served with a `Content-Security-Policy`, so the browser
+— not only the page's own code — refuses an inline script, a script from
+another origin, an `object`, a moved `base`, and an image or frame from
+anywhere but the sites an administrator allows. A redirect from an allowed
+site to another one is refused by the browser as well. The policy is enforced,
+not report-only.
+
+- **What it says.** `default-src 'self'`; scripts run only with the request's
+  own nonce and `'strict-dynamic'`; `object-src 'none'`; `base-uri 'self'`;
+  `form-action 'self'`; `connect-src 'self'`; `font-src 'self' data:`. A
+  console page sends `frame-ancestors 'none'`; an embed page sends its
+  dashboard's list (the `SEC-12` bullet above). `style-src 'unsafe-inline'` is
+  a stated exception: React, Radix and ECharts write inline `style` attributes
+  and style elements, which a nonce cannot cover. It allows styles, never
+  script. `next dev` also adds `'unsafe-eval'` and the HMR websocket; a
+  production build has neither.
+- **The sites images and web pages may come from** are the content sites in
+  Admin > Settings (`BI-16` part B). A console page asks `GET
+  /api/settings/reporting` with the visitor's own cookie and reuses the answer
+  for 60 seconds, per console process; an embed page asks `POST
+  /api/embed/frame`, which answers the sites of *that dashboard's* image and
+  web cards only, never the whole deployment list. Both fail closed: an API
+  that cannot be reached within 3 seconds, a `401`, a `500` or an answer of the
+  wrong shape leaves `img-src 'self' data: blob:` and `frame-src 'none'`, and
+  the page still loads (its own scripts, styles and fonts are local). A site
+  added in Admin > Settings takes effect within a minute. Both calls read
+  `RUST_API_URL` **at run time**, as the framing call does; pointed at nothing,
+  console pages have no external image or frame but still work.
+- **Every page renders per request.** A nonce is per request, so no console
+  page is prerendered or cached by a CDN: `src/app/layout.tsx` sets
+  `dynamic = "force-dynamic"`. Cache static assets if you need to; do not cache
+  the HTML.
+- **A reverse proxy in front of the console must not drop the header.** The
+  console sets it itself; a proxy that strips or rewrites unknown
+  `Content-Security-Policy` headers leaves the console with no script at all.
+  A deployment that sets its own policy in front of the console's must keep
+  that header's nonce (or replace the whole policy knowingly).
+- **Known limits.** There is no `report-uri`: a refused request is visible only
+  in the browser's console. A public link (`/public/dashboard/<token>`) is
+  opened without a session, so it is served without the content sites: its
+  image and web cards are refused by the browser (an image card then says it
+  could not be loaded, a web card stays blank). Only the console and the embed
+  pages load them.
 
 ### Connector credentials from a secret manager (`SRC-12`, ADR 0002 addendum 6)
 
