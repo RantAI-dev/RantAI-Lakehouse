@@ -225,4 +225,39 @@ container's server settings" paragraph; the per-setting reasoning stays at
 
 ## Review
 
-(planner appends here)
+### Round 1 (planner, 2026-10-23)
+
+Reviewed `d39d320e`..`64c0eabb` against the plan and `AGENTS.md`; re-ran
+the verification at `64c0eabb` with `review/review-pr.sh` under the heavy
+lock:
+
+- `cargo fmt --check`: OK. `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`: OK (this fills the developer's
+  *not verified* workspace clippy line).
+- `cargo test --workspace`: **133 binaries, 7176 passed, 0 failed, 44
+  ignored**, first attempt, no re-run. That is the plan's goal: a full run
+  green without re-running a binary.
+- `bun run typecheck`: OK. The rest of the TypeScript block was stopped by
+  the reviewer: the PR touches no `src/`.
+- `check_intra_package_imports.py`, `check_bare_iceberg_count.py`: OK;
+  `py_compile` of the gate: OK.
+- CI on PR #232: every check passes, including `Rust · SRC-11 connector
+  operations` (the `g6-ops` gate step c fixed here) and `ci-required`.
+
+No `BLOCKER`.
+
+- **SHOULD-FIX 1 (not in this PR, filed as `SRC-32`).** The developer's
+  finding is right: `record_run_once` applies reports in arrival order, so
+  a late success resets a streak that began after it. This is a product
+  bug in `SRC-11` D3, not only a gate flake; the gate change here stops the
+  gate from exercising it. Fixing it changes the store's semantics and
+  needs its own plan.
+- Noted, no change: `wait_until_ready` panics with `assert!` outside
+  `#[cfg(test)]`. Accepted: `lakehouse-test-support` is test-only by
+  purpose, its existing start path already panics with a message, and the
+  doc comment has `# Panics`.
+- Noted for the machine, no change: the first full run filled the host
+  disk (handoff, T1). The stale 64 MiB `postgres-16` container is left for
+  the owner to remove; this branch no longer matches its label.
+
+Merged as PR #232 after merging `main` (`86cf4fd0`) into the branch.
