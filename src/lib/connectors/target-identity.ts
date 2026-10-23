@@ -18,6 +18,7 @@
  * | `mongodb` | `hosts` (as a set), `database` |
  * | `kafka` | `bootstrapServers` (as a set) |
  * | `sftp` | `host`, `port`, `hostKeyFingerprint` |
+ * | `saas` | `vendor`, `account`, `auth.type` |
  * | `sheets` | nothing |
  *
  * Host names compare case-insensitively. In a URL an absent port is the
@@ -105,6 +106,23 @@ export function targetIdentity(adapter: string | null, dial: Dial): string | nul
     case "rest": {
       const baseUrl = text(dial.baseUrl)
       parts = [baseUrl === null ? null : origin(baseUrl)]
+      break
+    }
+    case "saas": {
+      // The vendor and the account decide every address (SRC-3 AD2), and the sign-in kind decides
+      // which secret sits in which slot (final review SHOULD-FIX 25). The host part of the account
+      // compares case-insensitively; a tenant after "/" (Workday) compares as written, as in
+      // `saas_target_identity`.
+      const account = text(dial.account)?.trim() ?? null
+      const named =
+        account === null
+          ? null
+          : account.includes("/")
+            ? `${account.slice(0, account.indexOf("/")).toLowerCase()}${account.slice(account.indexOf("/"))}`
+            : account.toLowerCase()
+      const auth = dial.auth
+      const authType = auth !== null && typeof auth === "object" ? text((auth as Record<string, unknown>).type) : null
+      parts = [text(dial.vendor)?.trim().toLowerCase() ?? null, named, authType]
       break
     }
     case "mongodb":

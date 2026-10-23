@@ -5,7 +5,7 @@
 | Backlog | `SRC-3` in [BACKLOG.md](../BACKLOG.md) |
 | Module | Data |
 | Size | L (planner's estimate: S = days, M = one to two weeks, L = several weeks) |
-| Blocked by | `DEC-9`, `SRC-12` (OAuth sign-in) |
+| Blocked by | — (`DEC-9` decided 2026-10-19; `SRC-12` merged) |
 | Priority and status | In [BACKLOG.md](../BACKLOG.md), the one place they are kept |
 
 ## Why
@@ -22,7 +22,7 @@ Bring in data from business apps without building each connector by hand.
 
 | Capability | Today | Target |
 | --- | --- | --- |
-| Reuse route | None | Decision DEC-9: dlt verified sources (our loader already runs on dlt) or another library |
+| Reuse route | None | `DEC-9`, decided 2026-10-19: dlt verified sources where one exists; the other six call the adapter's `SaasSession` directly (a dlt `rest_api` source over a plain session cannot follow vendor links under the address rule; amended during the build, accepted at the slice 3 and 4 reviews) |
 | First wave | None | Databricks' ten GA SaaS connectors: Salesforce, ServiceNow, Workday Reports, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, NetSuite, SharePoint |
 | Second wave | None | Match Databricks' beta list (about 45), ordered by customer demand |
 | Each connector | n/a | OAuth where offered (SRC-12), table and column choice, incremental loads, schema change handling (SRC-8), a gate test (SRC-9) |

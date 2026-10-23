@@ -1375,7 +1375,7 @@ fn draft_quality_rule_schema() -> Value {
 
 fn get_ingest_spec_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_ingest_spec",
-        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
+        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp, saas), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id, from list_connectors" } },
             "required": ["id"] } } })
@@ -1386,7 +1386,7 @@ fn set_ingest_spec_schema() -> Value {
         "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. When you send a connector's source objects again (for example to add a table), keep each object's loadMode, primaryKey and excludedColumns exactly as get_ingest_spec returned them: an object sent without a loadMode goes back to replace, and one sent without excludedColumns loads every column again. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses. This tool never carries a credential, so it cannot change where a connector points (adapter, host, port, database, endpoint, bucket, base URL or brokers): such a change is refused with a conflict and is made in the console, where the credentials are entered again.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "connector id" },
-            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
+            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp", "saas"] },
             "ingestMode": { "type": "string", "enum": ["batch", "cdc", "stream"] },
             "dial": { "type": "object", "description": "how to reach the source; fields depend on the adapter" },
             "sourceObjects": { "type": "array", "items": { "type": "object", "properties": {

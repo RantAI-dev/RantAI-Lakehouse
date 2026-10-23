@@ -53,8 +53,8 @@ function Harness({
   dial: Record<string, unknown>
   single?: boolean
   selected?: string[]
-  onToggle?: (name: string) => void
-  onSetMany?: (names: string[], on: boolean) => void
+  onToggle?: (name: string, label?: string) => void
+  onSetMany?: (names: string[], on: boolean, labels?: Record<string, string>) => void
 }) {
   const previews = useColumnPreviews("c1", 5)
   return (
@@ -181,6 +181,41 @@ describe("TableFinder, long lists (D9)", () => {
     fireEvent.change(screen.getByLabelText("Filter tables"), { target: { value: "found" } })
     await waitFor(() => expect(screen.getByText("public.found_it")).toBeDefined(), { timeout: 3000 })
     expect(calls.some((c) => (c.body as { search?: string }).search === "found")).toBe(true)
+  })
+})
+
+describe("TableFinder, objects that come with a label (slice 5 review BLOCKER 14)", () => {
+  const labelled = [
+    { name: "s1/l1", kind: "object", load: "incremental", label: "Team / Tasks" },
+    { name: "s1/l2", kind: "object", load: "incremental", label: "Team / Issues" },
+    { name: "plain", kind: "object", load: "incremental" },
+  ]
+
+  const filler = Array.from({ length: 7 }, (_, i) => ({ name: `f${i}`, kind: "object", load: "incremental", label: `Filler / F${i}` }))
+
+  it("shows the label in words, the name only as a tooltip, and hands the label on with the tick", async () => {
+    stub((c) => (c.method === "POST" ? json({ kind: "list", state: "done", objects: labelled }) : undefined))
+    const toggled: [string, string | undefined][] = []
+    render(<Harness adapter="saas" dial={{ vendor: "sharepoint" }} onToggle={(n, l) => toggled.push([n, l])} />)
+    fireEvent.click(screen.getByRole("button", { name: "Find objects" }))
+    const row = await screen.findByText("Team / Tasks")
+    expect(row.getAttribute("title")).toBe("s1/l1")
+    expect(screen.getByText("plain").getAttribute("title")).toBeNull()
+    fireEvent.click(screen.getByLabelText(/Team \/ Tasks/))
+    fireEvent.click(screen.getByLabelText(/plain/))
+    expect(toggled).toEqual([["s1/l1", "Team / Tasks"], ["plain", undefined]])
+  })
+
+  it("filters by the label as well as the name, and 'Select shown' hands over the labels", async () => {
+    stub((c) => (c.method === "POST" ? json({ kind: "list", state: "done", objects: [...labelled, ...filler] }) : undefined))
+    const many: [string[], boolean, Record<string, string> | undefined][] = []
+    render(<Harness adapter="saas" dial={{ vendor: "sharepoint" }} onSetMany={(n, on, l) => many.push([n, on, l])} />)
+    fireEvent.click(screen.getByRole("button", { name: "Find objects" }))
+    await screen.findByText("Team / Tasks")
+    fireEvent.change(screen.getByLabelText("Filter objects"), { target: { value: "issues" } })
+    expect(screen.queryByText("Team / Tasks")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Select shown" }))
+    expect(many).toEqual([[["s1/l2"], true, { "s1/l2": "Team / Issues" }]])
   })
 })
 

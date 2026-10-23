@@ -20,6 +20,24 @@ describe("brandMarkForTypeName", () => {
     expect(new Set(Object.keys(expected).map((n) => brandMarkForTypeName(n)?.paths.join())).size).toBe(8)
   })
 
+  it("gives each business-app type whose product Simple Icons publishes today its own mark (SRC-3 T7)", () => {
+    const expected: Record<string, string> = {
+      Confluence: "Confluence",
+      "Google Analytics 4": "Google Analytics",
+      HubSpot: "HubSpot",
+      Zendesk: "Zendesk",
+    }
+    for (const [name, title] of Object.entries(expected)) {
+      expect(brandMarkForTypeName(name)?.title).toBe(title)
+    }
+  })
+
+  it("gives no mark to the business-app types Simple Icons does not publish a file for (Salesforce, ServiceNow, Workday Reports, Dynamics 365, NetSuite, SharePoint)", () => {
+    for (const name of ["Salesforce", "ServiceNow", "Workday Reports", "Dynamics 365", "NetSuite", "SharePoint"]) {
+      expect(brandMarkForTypeName(name)).toBeNull()
+    }
+  })
+
   it("gives a CDC type its database's mark", () => {
     expect(brandMarkForTypeName("PostgreSQL CDC")).toBe(brandMarkForTypeName("PostgreSQL"))
     expect(brandMarkForTypeName("MySQL CDC")).toBe(brandMarkForTypeName("MySQL"))
@@ -47,12 +65,12 @@ describe("brandMarkForTypeName", () => {
 describe("BRAND_MARKS", () => {
   const dir = process.env.BRAND_ICON_DIR
 
-  it("flags exactly the marks that need the foreground in the dark theme: Kafka, MariaDB and MQTT (brand colour below 3:1 on the chip) and MySQL (a thin line drawing, 3.16:1 is too faint)", () => {
+  it("flags exactly the marks that need the foreground in the dark theme: Kafka, MariaDB, MQTT, Confluence (1.05) and Zendesk (1.13), brand colour below 3:1 on the chip, and MySQL (a thin line drawing, 3.16:1 is too faint)", () => {
     const flagged = Object.values(BRAND_MARKS)
       .filter((m) => m.needsForegroundInDark)
       .map((m) => m.title)
       .sort()
-    expect(flagged).toEqual(["Apache Kafka", "MQTT", "MariaDB", "MySQL"])
+    expect(flagged).toEqual(["Apache Kafka", "Confluence", "MQTT", "MariaDB", "MySQL", "Zendesk"])
   })
 
   it("holds a single well-formed brand colour and a path for every mark", () => {
@@ -66,7 +84,8 @@ describe("BRAND_MARKS", () => {
 
   it.skipIf(!dir)("matches the path data of the downloaded SVG files byte for byte", () => {
     // MySQL comes from SVG Logos' `mysql-icon.svg` (two paths, 256 x 252);
-    // the other seven from Simple Icons' `<slug>.svg` (one path, 24 x 24).
+    // the others from Simple Icons' `<slug>.svg` (one path, 24 x 24; the first seven
+    // from release 16.34.0, Confluence, Google Analytics, HubSpot and Zendesk from 16.35.0).
     for (const [slug, m] of Object.entries(BRAND_MARKS)) {
       const file = slug === "mysql" ? "mysql-icon.svg" : `${slug}.svg`
       const svg = readFileSync(`${dir}/${file}`, "utf8")

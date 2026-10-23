@@ -16,6 +16,14 @@ updates:
         patterns: ["arrow*", "parquet", "iceberg*"]
       cargo-patch-and-minor:
         update-types: ["patch", "minor"]
+    # aes-gcm stays on the 0.10 line the iceberg crate already brings in
+    # (rust/Cargo.toml says why: no second AEAD stack in the graph). 0.11
+    # alone adds aes-gcm 0.11, aes 0.9 and hybrid-array next to iceberg's
+    # 0.10.3 and deprecates `Nonce::from_slice` (#213, closed 2026-10-23).
+    # Remove this entry when iceberg moves to aes-gcm 0.11 (REL-7).
+    ignore:
+      - dependency-name: "aes-gcm"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: "chore(deps)"
 

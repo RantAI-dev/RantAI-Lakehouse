@@ -1,11 +1,14 @@
 /**
  * Product marks for connector types, and the lookup from a type's name.
  *
- * Source: Simple Icons (https://simpleicons.org), release 16.34.0, licence
- * CC0-1.0. Except MySQL (below), each `paths` entry is the `d` attribute of that
- * release's `icons/<slug>.svg` (24 x 24 view box), copied as published: not
+ * Source: Simple Icons (https://simpleicons.org), licence CC0-1.0: release
+ * 16.34.0 for the first eight marks and release 16.35.0, the latest on
+ * 2026-10-21, for Confluence, Google Analytics, HubSpot and Zendesk (`SRC-3`
+ * T7: each file `icons/<slug>.svg` of that release was fetched, not copied
+ * from elsewhere). Except MySQL (below), each `paths` entry is the `d`
+ * attribute of that release's `icons/<slug>.svg` (24 x 24 view box), copied as published: not
  * simplified, re-drawn or recoloured. `hex` is the set's brand colour for it.
- * Copied in rather than installed: eight small marks do not justify
+ * Copied in rather than installed: twelve small marks do not justify
  * a package of thousands of icons (plan
  * `docs/superpowers/plans/2026-10-05-connector-type-brand-icons.md`,
  * decision 1).
@@ -21,7 +24,11 @@
  * Rule: a mark is shown only where that set publishes it today. Oracle and
  * Microsoft SQL Server are absent on purpose: Simple Icons removed both at
  * the owners' request, and no set's licence on a drawing gives a permission
- * to use the trademark, so no other set is used for them. (MySQL's second
+ * to use the trademark, so no other set is used for them. Salesforce is in
+ * Simple Icons' data file of release 16.35.0 but its `icons/salesforce.svg`
+ * is not in that release, and ServiceNow, Workday, Dynamics 365, NetSuite and
+ * SharePoint are in neither: those keep the generic icon too (checked
+ * 2026-10-21). (MySQL's second
  * source above only supplies a different drawing of a mark Simple Icons
  * still publishes.) Those types keep the adapter's generic
  * icon. Object storage, SFTP and REST API are not one product and keep
@@ -132,6 +139,42 @@ export const BRAND_MARKS = {
       "M10.657 23.994h-9.45A1.212 1.212 0 0 1 0 22.788v-9.18h.071c5.784 0 10.504 4.65 10.586 10.386Zm7.606 0h-4.045C14.135 16.246 7.795 9.977 0 9.942V6.038h.071c9.983 0 18.121 8.044 18.192 17.956Zm4.53 0h-.97C21.754 12.071 11.995 2.407 0 2.372v-1.16C0 .55.544.006 1.207.006h7.64C15.733 2.49 21.257 7.789 24 14.508v8.291c0 .663-.544 1.195-1.207 1.195ZM16.713.006h6.092A1.19 1.19 0 0 1 24 1.2v5.914c-.91-1.242-2.046-2.65-3.158-3.762C19.588 2.11 18.122.987 16.714.005Z",
     ],
   },
+  confluence: {
+    title: "Confluence",
+    hex: "#172B4D",
+    needsForegroundInDark: true,
+    viewBox: "0 0 24 24",
+    paths: [
+      "M.87 18.257c-.248.382-.53.875-.763 1.245a.764.764 0 0 0 .255 1.04l4.965 3.054a.764.764 0 0 0 1.058-.26c.199-.332.454-.763.733-1.221 1.967-3.247 3.945-2.853 7.508-1.146l4.957 2.337a.764.764 0 0 0 1.028-.382l2.364-5.346a.764.764 0 0 0-.382-1 599.851 599.851 0 0 1-4.965-2.361C10.911 10.97 5.224 11.185.87 18.257zM23.131 5.743c.249-.405.531-.875.764-1.25a.764.764 0 0 0-.256-1.034L18.675.404a.764.764 0 0 0-1.058.26c-.195.335-.451.763-.734 1.225-1.966 3.246-3.945 2.85-7.508 1.146L4.437.694a.764.764 0 0 0-1.027.382L1.046 6.422a.764.764 0 0 0 .382 1c1.039.49 3.105 1.467 4.965 2.361 6.698 3.246 12.392 3.029 16.738-4.04z",
+    ],
+  },
+  googleanalytics: {
+    title: "Google Analytics",
+    hex: "#E37400",
+    needsForegroundInDark: false,
+    viewBox: "0 0 24 24",
+    paths: [
+      "M22.84 2.9982v17.9987c.0086 1.6473-1.3197 2.9897-2.967 2.9984a2.9808 2.9808 0 01-.3677-.0208c-1.528-.226-2.6477-1.5558-2.6105-3.1V3.1204c-.0369-1.5458 1.0856-2.8762 2.6157-3.1 1.6361-.1915 3.1178.9796 3.3093 2.6158.014.1201.0208.241.0202.3619zM4.1326 18.0548c-1.6417 0-2.9726 1.331-2.9726 2.9726C1.16 22.6691 2.4909 24 4.1326 24s2.9726-1.3309 2.9726-2.9726-1.331-2.9726-2.9726-2.9726zm7.8728-9.0098c-.0171 0-.0342 0-.0513.0003-1.6495.0904-2.9293 1.474-2.891 3.1256v7.9846c0 2.167.9535 3.4825 2.3505 3.763 1.6118.3266 3.1832-.7152 3.5098-2.327.04-.1974.06-.3983.0593-.5998v-8.9585c.003-1.6474-1.33-2.9852-2.9773-2.9882z",
+    ],
+  },
+  hubspot: {
+    title: "HubSpot",
+    hex: "#FF7A59",
+    needsForegroundInDark: false,
+    viewBox: "0 0 24 24",
+    paths: [
+      "M18.164 7.93V5.084a2.198 2.198 0 001.267-1.978v-.067A2.2 2.2 0 0017.238.845h-.067a2.2 2.2 0 00-2.193 2.193v.067a2.196 2.196 0 001.252 1.973l.013.006v2.852a6.22 6.22 0 00-2.969 1.31l.012-.01-7.828-6.095A2.497 2.497 0 104.3 4.656l-.012.006 7.697 5.991a6.176 6.176 0 00-1.038 3.446c0 1.343.425 2.588 1.147 3.607l-.013-.02-2.342 2.343a1.968 1.968 0 00-.58-.095h-.002a2.033 2.033 0 102.033 2.033 1.978 1.978 0 00-.1-.595l.005.014 2.317-2.317a6.247 6.247 0 104.782-11.134l-.036-.005zm-.964 9.378a3.206 3.206 0 113.215-3.207v.002a3.206 3.206 0 01-3.207 3.207z",
+    ],
+  },
+  zendesk: {
+    title: "Zendesk",
+    hex: "#03363D",
+    needsForegroundInDark: true,
+    viewBox: "0 0 24 24",
+    paths: [
+      "M12.914 2.904V16.29L24 2.905H12.914zM0 2.906C0 5.966 2.483 8.45 5.543 8.45s5.542-2.484 5.543-5.544H0zm11.086 4.807L0 21.096h11.086V7.713zm7.37 7.84c-3.063 0-5.542 2.48-5.542 5.543H24c0-3.06-2.48-5.543-5.543-5.543z",
+    ],
+  },
 } as const satisfies Record<string, BrandMarkData>
 
 export type BrandMarkSlug = keyof typeof BRAND_MARKS
@@ -146,6 +189,13 @@ const MARK_BY_PRODUCT: Record<string, BrandMarkSlug> = {
   "Google Sheets": "googlesheets",
   "SAP / ERP": "sap",
   MQTT: "mqtt",
+  // `SRC-3` T7 (plan 2026-10-19-data-phase-4-connectors.md): the business-app
+  // types whose product Simple Icons publishes today. The type is "Google
+  // Analytics 4"; the set's mark is "Google Analytics".
+  Confluence: "confluence",
+  "Google Analytics 4": "googleanalytics",
+  HubSpot: "hubspot",
+  Zendesk: "zendesk",
 }
 
 const CDC_SUFFIX = " CDC"

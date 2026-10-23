@@ -24,6 +24,9 @@ pinned against `cdc.rs::NESTED_TYPE_MARKERS` (X9's discipline) -- so a
 set is rejected at SAVE time (`set_ingest_spec`'s validation), not
 discovered as a `KeyError` at run time.
 
+`saas` (SRC-3) is not listed in `SECRET_FIELD_NAMES`: its auth type is a key
+the vendor table resolves (`saas.vendors.secret_fields_for`).
+
 `mongodb`, `sftp` and `kafka` (the Tier 2 adapters,
 `dagster/dispar_orchestrate/adapters/{mongodb,sftp,kafka}.py`) extend the
 same table: `mongodb` needs only a `password` (its username is a literal
@@ -38,6 +41,8 @@ was never required to set.
 """
 
 from __future__ import annotations
+
+from dispar_orchestrate.saas import vendors as saas_vendors
 
 SECRET_FIELD_NAMES: dict[tuple[str, str | None], tuple[str, ...]] = {
     ("sql", None): ("password",),
@@ -66,7 +71,7 @@ SECRET_FIELD_NAMES: dict[tuple[str, str | None], tuple[str, ...]] = {
 # other adapter's lookup key always pairs with `None`, even if a caller
 # passes a stray auth_type for one (see
 # `test_a_non_rest_adapter_ignores_the_auth_type_argument`).
-_AUTH_TYPE_KEYED_ADAPTERS = ("rest", "kafka", "sftp")
+_AUTH_TYPE_KEYED_ADAPTERS = ("rest", "kafka", "sftp", "saas")
 
 
 def secret_field_names(adapter: str, auth_type: str | None) -> tuple[str, ...]:
@@ -82,6 +87,11 @@ def secret_field_names(adapter: str, auth_type: str | None) -> tuple[str, ...]:
     """
     key = (adapter, auth_type if adapter in _AUTH_TYPE_KEYED_ADAPTERS else None)
     fields = SECRET_FIELD_NAMES.get(key)
+    if fields is None and adapter == "saas" and auth_type is not None:
+        # SRC-3 AD2/AD8: a `saas` connector's slots come from the vendor table
+        # (the browser sign-in's two secrets, or a vendor's integration
+        # credential's fields). Mirrors `ingest_spec::secret_field_names`.
+        fields = saas_vendors.secret_fields_for(auth_type)
     if fields is None:
         raise ValueError(f"no secret field mapping for adapter={adapter!r} auth_type={auth_type!r}")
     return fields
