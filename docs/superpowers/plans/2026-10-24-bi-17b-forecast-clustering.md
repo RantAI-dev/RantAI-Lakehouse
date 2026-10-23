@@ -221,6 +221,6 @@ Decisions to review (all beyond what D5 spells out):
 - An emptied group during Lloyd is re-seeded on the farthest point; CH ties go to the smaller k.
 - The seed varies with k (`1 + k`) so each k has its own fixed stream; every run of the same input gives the same labels (tested).
 
-Checks: `bun test src/lib/kmeans.test.ts`: 10 pass, 0 fail (blobs give k = 3 with every point in its blob, fixed k honoured, same labels across runs, n = 5 refused, millions-scale measure does not dominate, three-measure bubble, refusals). Full checks for both T2 and T3 on the final commit are in the next paragraph.
+Checks: `bun test src/lib/kmeans.test.ts`: 10 pass, 0 fail (blobs give k = 3 with every point in its blob, fixed k honoured, same labels across runs, n = 5 refused, millions-scale measure does not dominate, three-measure bubble, refusals). On the final commit (T3): `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings (none in these files); `bun run test` 2474 pass, 1 skip, 0 fail (254 files). The webpack build is not due until T4.
 
 ## 8. Review (planner appends)
