@@ -67,6 +67,7 @@ export function ReportingSettingsForm({
   const [site, setSite] = React.useState("")
   const [denied, setDenied] = React.useState<string[]>([])
   const [domains, setDomains] = React.useState<string[]>([])
+  const [publicLinks, setPublicLinks] = React.useState(true)
   const [domain, setDomain] = React.useState("")
   // The role names come from the identity service; a person who can save
   // settings but not read roles still sees (and can clear) the saved list.
@@ -90,6 +91,7 @@ export function ReportingSettingsForm({
       setSites(loaded.contentSites ?? [])
       setDenied(loaded.downloadDeniedRoles ?? [])
       setDomains(loaded.reportAllowedDomains ?? [])
+      setPublicLinks(loaded.publicLinksEnabled !== false)
     }
   }, [loaded])
 
@@ -104,7 +106,8 @@ export function ReportingSettingsForm({
       fonts.join() !== loaded.fonts.join() ||
       sites.join() !== (loaded.contentSites ?? []).join() ||
       denied.join() !== (loaded.downloadDeniedRoles ?? []).join() ||
-      domains.join() !== (loaded.reportAllowedDomains ?? []).join())
+      domains.join() !== (loaded.reportAllowedDomains ?? []).join() ||
+      publicLinks !== (loaded.publicLinksEnabled !== false))
 
   // RPT-1 QA fix Q2: the three lists (palette, content sites, report domains)
   // change only local state until Save; each says so the same way.
@@ -169,6 +172,7 @@ export function ReportingSettingsForm({
       contentSites: sites,
       downloadDeniedRoles: denied,
       reportAllowedDomains: domains,
+      publicLinksEnabled: publicLinks,
     })
     if (result) state.reload()
   }
@@ -438,6 +442,30 @@ export function ReportingSettingsForm({
                 <Label htmlFor={`download-denied-${name}`}>{name}</Label>
               </div>
             ))}
+          </section>
+          <section className="flex flex-col gap-1.5" aria-labelledby="settings-public-links">
+            <h2 id="settings-public-links" className="text-sm font-medium">
+              Public links
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              When this is off, every public link stops working at once and no new one can
+              be made. Nothing is deleted: switching it on again brings back the links
+              that have not expired.
+            </p>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="public-links-enabled"
+                checked={publicLinks}
+                onCheckedChange={(on) => setPublicLinks(on === true)}
+                disabled={!canWrite}
+              />
+              <Label htmlFor="public-links-enabled">Allow public links</Label>
+            </div>
+            {loaded.publicLinksEnabled !== false && !publicLinks ? (
+              <p role="status" className="text-xs text-amber-700 dark:text-amber-400">
+                Saving this stops every public link now.
+              </p>
+            ) : null}
           </section>
           {canWrite ? (
             <div className="flex items-center gap-3">

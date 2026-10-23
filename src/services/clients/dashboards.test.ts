@@ -32,6 +32,34 @@ function stubFetch(answer: () => Response): Call[] {
 
 const sent = (call: Call) => JSON.parse(String(call.init.body))
 
+describe("public links (BI-19 part A)", () => {
+  it("reads the link state and defaults a missing flag to enabled", async () => {
+    const calls = stubFetch(() => json({ link: null }))
+    const state = await clickhouseDashboardService.getPublicLink("b 1")
+    expect(calls[0].url).toBe("/api/dashboard/public-link?board=b%201")
+    expect(state).toEqual({ enabled: true, link: null })
+  })
+
+  it("saves with PUT and returns the link; a refusal carries the server's sentence", async () => {
+    const link = { token: "p_x", expiresAt: "2030-01-01T00:00:00Z", expired: false, hasPassword: false, createdAt: "2029-12-01T00:00:00Z" }
+    const calls = stubFetch(() => json({ ok: true, link }))
+    expect(await clickhouseDashboardService.savePublicLink({ board: "b_1", expiresAt: link.expiresAt, password: null })).toEqual(link)
+    expect(calls[0].init.method).toBe("PUT")
+    expect(sent(calls[0])).toEqual({ board: "b_1", expiresAt: link.expiresAt, password: null })
+    stubFetch(() => json({ error: "The expiry must be between 1 hour and 365 days from now." }, 400))
+    await expect(
+      clickhouseDashboardService.savePublicLink({ board: "b_1", expiresAt: "x" }),
+    ).rejects.toThrow("The expiry must be between")
+  })
+
+  it("ends a link with DELETE", async () => {
+    const calls = stubFetch(() => json({ ok: true, ended: true }))
+    await clickhouseDashboardService.endPublicLink("b_1")
+    expect(calls[0].init.method).toBe("DELETE")
+    expect(calls[0].url).toBe("/api/dashboard/public-link?board=b_1")
+  })
+})
+
 describe("embed state (SEC-12)", () => {
   it("getEmbedInfo reads the board's state from embed-info", async () => {
     const calls = stubFetch(() =>

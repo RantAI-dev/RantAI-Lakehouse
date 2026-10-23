@@ -133,6 +133,12 @@ export type DashboardService = {
    * Needs `dashboard:read`.
    */
   getEmbedInfo(board: string, signal?: AbortSignal): Promise<EmbedInfo>
+  /** `BI-19` part A. Needs `dashboard:write`. */
+  getPublicLink(board: string, signal?: AbortSignal): Promise<PublicLinkState>
+  /** Make a link or change its expiry or password; refusals carry the server's sentence. */
+  savePublicLink(input: PublicLinkInput, signal?: AbortSignal): Promise<PublicLink>
+  /** End the link at once. */
+  endPublicLink(board: string, signal?: AbortSignal): Promise<void>
   /**
    * Replace the sites allowed to frame the board's embed pages. The server
    * validates and normalises them; a refusal arrives as `invalid_request`
@@ -265,6 +271,39 @@ export type EmbedInfo = {
   revokedBefore: number | null
   /** Sites allowed to frame the embed pages. */
   allowedOrigins: string[]
+}
+
+/**
+ * A dashboard's public link (`BI-19` part A), from `GET`/`PUT
+ * /api/dashboard/public-link`. The password is never sent back: only
+ * `hasPassword`.
+ */
+export type PublicLink = {
+  token: string
+  /** RFC 3339. */
+  expiresAt: string
+  /** True once `expiresAt` has passed; the link no longer works. */
+  expired: boolean
+  hasPassword: boolean
+  createdAt: string
+}
+
+export type PublicLinkState = {
+  /** False while an administrator has switched public links off (Admin > Settings). */
+  enabled: boolean
+  link: PublicLink | null
+}
+
+/**
+ * What a save sends. `password` absent keeps it, `null` removes it, a string
+ * (8 to 128 characters) sets it; `newLink` makes a new token even when a live
+ * link exists.
+ */
+export type PublicLinkInput = {
+  board: string
+  expiresAt: string
+  password?: string | null
+  newLink?: boolean
 }
 
 export type CreateBoardInput = {

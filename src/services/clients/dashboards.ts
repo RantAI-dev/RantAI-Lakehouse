@@ -15,7 +15,7 @@ import type {
   UpdateBoardInput,
   VersionHistory,
 } from "../contracts/dashboards"
-import type { EmbedInfo } from "../contracts/dashboards"
+import type { EmbedInfo, PublicLink, PublicLinkState } from "../contracts/dashboards"
 import { apiFetch } from "../http"
 import { ServiceError, type ServiceErrorCode } from "../errors"
 
@@ -263,6 +263,32 @@ export const clickhouseDashboardService: DashboardService = {
       revokedBefore: json.revokedBefore ?? null,
       allowedOrigins: json.allowedOrigins ?? [],
     }
+  },
+  // BI-19 part A. The server's sentences are ours, so they are shown as they come.
+  async getPublicLink(board, signal) {
+    const json = await request<Partial<PublicLinkState>>(
+      `/api/dashboard/public-link?board=${encodeURIComponent(board)}`,
+      { cache: "no-store", signal },
+      "The public link could not be loaded"
+    )
+    return { enabled: json.enabled !== false, link: json.link ?? null }
+  },
+  async savePublicLink(input, signal) {
+    const res = await apiFetch("/api/dashboard/public-link", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input),
+      signal,
+    })
+    const json = await checkedWrite<{ link: PublicLink }>(res)
+    return json.link
+  },
+  async endPublicLink(board, signal) {
+    const res = await apiFetch(`/api/dashboard/public-link?board=${encodeURIComponent(board)}`, {
+      method: "DELETE",
+      signal,
+    })
+    await checkedWrite<{ ok: boolean }>(res)
   },
   async setEmbedOrigins(board, origins, signal) {
     const json = await request<{ embedOrigins?: string[] }>(

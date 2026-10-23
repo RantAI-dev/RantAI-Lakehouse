@@ -15,6 +15,10 @@ import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import { TabBar } from "./tab-bar";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { EMBED_UNAVAILABLE, embedRefusalMessage } from "./embed-refusal";
+import { PasswordGate, openPublic } from "./public-link-access";
+
+/** BI-19 part A: the same words as the public page, for a link that does not work. */
+const LINK_GONE = "This link does not work";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | TileFailure;
 type Payload = {
@@ -44,7 +48,8 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   const look = dashboardLook(data?.board, appDark, data?.reporting?.fonts);
   const dark = look.dark;
   const [tabId, setTabId] = React.useState<string | null>(null);
-  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
+  const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "password" | "error">("loading");
+  const [attempt, setAttempt] = React.useState(0);
   // SEC-12: what a refused signed token reads. The public link keeps the
   // plain line.
   const [refusal, setRefusal] = React.useState(EMBED_UNAVAILABLE);
@@ -57,22 +62,32 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     let alive = true;
     (async () => {
       try {
-        // Deliberately NOT `apiFetch`: embed/public views are unauthenticated
-        // by design (a signed JWT or a share token, never a session), so a
+        if (!jwt) {
+          // BI-19 part A: a public link may need a password (a ticket from the
+          // unlock route). Deliberately NOT `apiFetch`, as below.
+          const result = await openPublic<Payload>(token ?? "");
+          if (!alive) return;
+          if (result.kind === "gone") { setRefusal(LINK_GONE); setState("notfound"); return; }
+          if (result.kind === "password") { setState("password"); return; }
+          if (result.kind === "error") { setState("error"); return; }
+          setData(result.data);
+          setState("ok");
+          return;
+        }
+        // Deliberately NOT `apiFetch`: embed views are unauthenticated
+        // by design (a signed JWT, never a session), so a
         // 401/403/404 is "not found" for the viewer, not a login prompt.
-        const res = jwt
-          ? await fetch(`/api/embed/data`, {
-              method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ jwt }), cache: "no-store",
-            })
-          : await fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}`, { cache: "no-store" });
+        const res = await fetch(`/api/embed/data`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jwt }), cache: "no-store",
+        });
         if (!alive) return;
         if (res.status === 404 || res.status === 403 || res.status === 401) {
-          if (jwt) setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
+          setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
           setState("notfound");
           return;
         }
-        if (jwt && res.status === 503) {
+        if (res.status === 503) {
           setRefusal(embedRefusalMessage(res.status, await res.json().catch(() => null)));
           setState("error");
           return;
@@ -83,8 +98,11 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
       } catch { if (alive) setState("error"); }
     })();
     return () => { alive = false; };
-  }, [token, jwt]);
+  }, [token, jwt, attempt]);
 
+  if (state === "password") {
+    return <PasswordGate token={token ?? ""} onOpen={() => { setState("loading"); setAttempt((n) => n + 1); }} />;
+  }
   if (state === "notfound" || state === "error") {
     return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">{refusal}</div>;
   }
