@@ -169,17 +169,26 @@ pub async fn replace(
     password: Option<&str>,
     created_by: Option<Uuid>,
 ) -> Result<PublicLink, StoreError> {
-    // One transaction, so the delete (which cascades to the tickets) and the
-    // insert are never seen apart: there is no instant with no link, and none
-    // with two.
+    // One transaction. BI-19 part A review (NOTE): a DELETE then an INSERT let
+    // two simultaneous "new link" calls both pass the delete and the second
+    // INSERT fail on the primary key (a 500). The tickets are deleted first
+    // (a new link ends them), then the row is written with ON CONFLICT DO
+    // UPDATE, so the second caller waits for the first and replaces it. The
+    // password version is bumped on replacement, so a ticket issued in the
+    // gap names a password that no longer exists.
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM dashboard_public_link WHERE board_id = $1")
+    sqlx::query("DELETE FROM dashboard_public_link_ticket WHERE board_id = $1")
         .bind(board_id)
         .execute(&mut *tx)
         .await?;
     let link = sqlx::query_as(&format!(
         "INSERT INTO dashboard_public_link (board_id, token, expires_at, password_hash, created_by) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING {COLUMNS}"
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (board_id) DO UPDATE SET token = EXCLUDED.token, \
+             expires_at = EXCLUDED.expires_at, password_hash = EXCLUDED.password_hash, \
+             password_version = dashboard_public_link.password_version + 1, \
+             created_by = EXCLUDED.created_by, created_at = now(), updated_at = now() \
+         RETURNING {COLUMNS}"
     ))
     .bind(board_id)
     .bind(token)

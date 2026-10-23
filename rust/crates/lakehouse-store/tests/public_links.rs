@@ -322,3 +322,36 @@ fn a_debug_render_shows_neither_the_token_nor_the_hash() {
     assert!(!text.contains("p_secret_token"));
     assert!(!text.contains("argon2id"));
 }
+
+/// `BI-19` part A review (NOTE): simultaneous "new link" calls for one
+/// dashboard all succeed and leave one link.
+#[sqlx::test(migrations = "../../migrations")]
+async fn simultaneous_new_links_for_one_dashboard_all_succeed_and_leave_one(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let pool = std::sync::Arc::new(pool);
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        let pool = std::sync::Arc::clone(&pool);
+        tasks.push(tokio::spawn(async move {
+            replace(
+                &pool,
+                "b_1",
+                &format!("p_concurrent_{i}"),
+                in_days(7),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM dashboard_public_link")
+        .fetch_one(&*pool)
+        .await?;
+    assert_eq!(rows, 1);
+    Ok(())
+}
