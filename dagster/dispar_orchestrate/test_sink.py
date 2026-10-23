@@ -50,7 +50,13 @@ from dispar_orchestrate.adapters.sink import (
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
 
 
-def test_sink_config_from_bronze_ingest_config_carries_only_sink_fields() -> None:
+def test_sink_config_from_bronze_ingest_config_carries_only_sink_fields(
+    monkeypatch,
+) -> None:
+    # `SEC-37`: `from_env` requires the two connector-scoped S3 credentials
+    # (no `rustfsadmin` fallback any more), so provide throwaway values.
+    monkeypatch.setenv("CONNECTOR_S3_ACCESS_KEY", "test-access-key")
+    monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "test-secret-key")
     cfg = BronzeIngestConfig.from_env()
     sink_cfg = SinkConfig.from_bronze_ingest_config(cfg)
     assert sink_cfg.warehouse_bucket == cfg.warehouse_bucket
