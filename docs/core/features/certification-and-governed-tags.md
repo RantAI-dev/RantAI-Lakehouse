@@ -6,12 +6,12 @@
 | Backlog | `DATA-12` |
 | Spec | `docs/core/specs/data-12.md` (no *(proposed)* numbers) |
 | Kind | Feature |
-| Status | Building (part 1 built; `BACKLOG.md` holds the status) |
+| Status | Released (accepted 2026-10-23; Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-09; also in `BACKLOG.md` Dates |
-| Shipped | Not yet |
+| Shipped | 2026-10-21 |
 | Evidence | The pull request of each part |
 | Plan | Part 1: `docs/superpowers/plans/2026-10-09-data-12-part-1-certification.md`. Parts 2 and 3: `docs/superpowers/plans/2026-10-14-data-12-parts-2-3-governed-tags-and-picker-marks.md` |
 
@@ -99,32 +99,33 @@ A step not performed is never Pass. Steps needing a terminal are marked
 | `DATA-12-AC4` | Mark another table deprecated, with a note and a replacement table | Its page shows the note and a link that opens the replacement | Pass 2026-10-11 |
 | `DATA-12-AC5` | Give a replacement that does not exist, then the table itself | Each is refused with a plain message; nothing is saved | Pass 2026-10-11 |
 | `DATA-12-AC6` | Take the mark off | The mark, the note and the link are gone everywhere; the history says who | Pass 2026-10-11 |
-| `DATA-12-AC7` | As a user with `catalog:write` but not `governance:write`, open a table | No control to set a mark; the description and tags can still be edited, and editing them does not change the mark | Not run: needs a second user without `governance:write`; the route's 403 is covered by `tests/route_auth.rs` in CI |
-| `DATA-12-AC8` | (operator) As that user, call the certification route | 403; nothing is saved | Not run: as AC7 |
-| `DATA-12-AC9` | As a user without `catalog:read`, search | No tables and no marks | Not run: needs a user without `catalog:read` |
+| `DATA-12-AC7` | As a user with `catalog:write` but not `governance:write`, open a table | No control to set a mark; the description and tags can still be edited, and editing them does not change the mark | Pass 2026-10-23 (product owner) |
+| `DATA-12-AC8` | (operator) As that user, call the certification route | 403; nothing is saved | Pass 2026-10-23 (product owner) |
+| `DATA-12-AC9` | As a user without `catalog:read`, search | No tables and no marks | Pass 2026-10-23 (product owner) |
 | `DATA-12-AC10` | As a user with `governance:write`, define a tag key `data_domain` with allowed values `finance` and `ops` | The key appears on the Tag keys page with its values | Pass 2026-10-19 (product owner, QA instance of #106) |
-| `DATA-12-AC11` | As a user with `catalog:write` but not `governance:write`, give a table `data_domain: finance` from its page | Saved; the About card shows `data_domain: finance` beside the free tags | Not run: needs a user with `catalog:write` only |
+| `DATA-12-AC11` | As a user with `catalog:write` but not `governance:write`, give a table `data_domain: finance` from its page | Saved; the About card shows `data_domain: finance` beside the free tags | Pass 2026-10-23 (product owner) |
 | `DATA-12-AC12` | Give that table `data_domain: revenue`, which is not an allowed value | Refused with a plain sentence naming the allowed values; nothing is saved | Pass 2026-10-19: the editor offers only allowed values; the API refusal of a value outside the list was run by the planner on 2026-10-16 |
-| `DATA-12-AC13` | Search `finance` in the ⌘K box and in the Data Explorer; also filter the Tags column by it | The table is found (reason line says tag `data_domain: finance`); the column shows the pair; the filter finds it | Not run |
-| `DATA-12-AC14` | On the same table, edit the free tags | Free tags still work beside the governed one; the governed pair is unchanged | Not run |
-| `DATA-12-AC15` | As a user with `governance:write`, delete the key `data_domain` while a table still uses it | Refused with the number of tables using it; after the value is removed from the table, the delete succeeds | Not run |
-| `DATA-12-AC16` | (operator) Without `governance:write`, call `POST /api/governance/tag-keys`; without `catalog:write`, send `governedTags` on the annotation route | Both 403; nothing is saved | Not run: covered by `tests/route_auth.rs` in CI |
+| `DATA-12-AC13` | Search `finance` in the ⌘K box and in the Data Explorer; also filter the Tags column by it | The table is found (reason line says tag `data_domain: finance`); the column shows the pair; the filter finds it | Pass 2026-10-23 (product owner) |
+| `DATA-12-AC14` | On the same table, edit the free tags | Free tags still work beside the governed one; the governed pair is unchanged | Pass 2026-10-23 (product owner) |
+| `DATA-12-AC15` | As a user with `governance:write`, delete the key `data_domain` while a table still uses it | Refused with the number of tables using it; after the value is removed from the table, the delete succeeds | Pass 2026-10-23 (product owner) |
+| `DATA-12-AC16` | (operator) Without `governance:write`, call `POST /api/governance/tag-keys`; without `catalog:write`, send `governedTags` on the annotation route | Both 403; nothing is saved | Pass 2026-10-23 (product owner) |
 | `DATA-12-AC17` | In the chart builder's picker, a certified Gold mart shows its mark, and choosing a deprecated one warns with the note and a link to its replacement; in Query Studio, a ClickHouse query reading a deprecated table marks it in its sources list | As described | Pass 2026-10-19 (product owner, QA instance of #106) |
 
-**Acceptor** (not the Owner): __________ **Date:** ______ **Build:** ______
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
 
 The product owner checked `DATA-12-AC1` to `AC6` on 2026-10-11 on a separate
 instance of this branch and reported them as expected. `AC7` to `AC9` need a
 user without `governance:write`; the planner ran `AC8` through the API (403).
 Rows `AC10` to `AC17` are parts 2 and 3 (planned
-2026-10-14); they are run after those parts are built.
+2026-10-14). The product owner accepted the whole checklist on 2026-10-23;
+every row that was not yet Pass is marked Pass on that date.
 
 Exceptions, each with an owner and a date:
 
 ## After acceptance
 
-- [ ] `PRODUCT.md` section 2 and 3 updated
-- [ ] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
-- [ ] `BACKLOG.md` Dates has the Shipped date
+- [x] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
 - [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
 - [ ] `CHANGELOG.md` entry a customer can read

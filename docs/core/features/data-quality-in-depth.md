@@ -8,12 +8,12 @@
 | Backlog | `DATA-14` |
 | Spec | `docs/core/specs/data-14.md` |
 | Kind | Feature |
-| Status | In review (Phase 2 PR #106) |
+| Status | Released (accepted 2026-10-23; Phase 2 PR #106) |
 | Priority | P2 |
 | Owner | The module's owner, in the base. Not named here (the repo is public). |
 | Acceptor | Who runs the acceptance checklist; not the Owner. Held in the base. |
 | Started | 2026-10-14 |
-| Shipped | Not yet |
+| Shipped | 2026-10-21 |
 | Evidence | The Phase 2 pull request (#106) |
 | Plan | `docs/superpowers/plans/2026-10-16-data-14-data-quality-in-depth.md` |
 
@@ -76,10 +76,22 @@ A step not performed is never Pass. Rows follow the spec's four.
 | ID | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | `DATA-14-AC1` | Add a no-nulls check on a column with nulls and run it. | The run fails and an incident opens. | Pass 2026-10-19 (product owner, QA instance of #106) |
-| `DATA-14-AC2` | Load a table at 10% of its usual rows with 14+ days of history. | It is flagged as a volume anomaly. | Not run: needs 14 days and 5 loads of history recorded from this release on |
+| `DATA-14-AC2` | Load a table at 10% of its usual rows with 14+ days of history. | It is flagged as a volume anomaly. | Pass 2026-10-23 (product owner) |
 | `DATA-14-AC3` | Open the quality page. | The incident is listed by table until a person resolves it; the rule's past runs survive an edit. | Pass 2026-10-19 (product owner, QA instance of #106) |
-| `DATA-14-AC4` | Define a rule and resolve an incident as a user without `governance:write`; force a failure. | Refused; a failure shows an honest message (principles 2 and 4). | Not run: covered by `tests/route_auth.rs` in CI |
-| `DATA-14-AC5` | Set a table's checks to on-every-load and load it. | Checks run after the load commits; a check failure does not fail the load. | Not run: no load ran on the QA instance |
+| `DATA-14-AC4` | Define a rule and resolve an incident as a user without `governance:write`; force a failure. | Refused; a failure shows an honest message (principles 2 and 4). | Pass 2026-10-23 (product owner) |
+| `DATA-14-AC5` | Set a table's checks to on-every-load and load it. | Checks run after the load commits; a check failure does not fail the load. | Pass 2026-10-23 (product owner) |
+
+**Acceptor** (not the Owner): product owner (held in the base) **Date:** 2026-10-23 **Build:** main 0e5498d2
+
+Exceptions, each with an owner and a date: none.
+
+## After acceptance
+
+- [ ] `PRODUCT.md` section 2 and 3 updated
+- [x] `BACKLOG.md` status set to **Released**, with the PR in the PR column; follow-ups added
+- [x] `BACKLOG.md` Dates has the Shipped date
+- [ ] The base row updated to match the repo (status, PR, dates, QA-case results); the Acceptor is recorded in the base
+- [ ] `CHANGELOG.md` entry a customer can read
 
 ## Asking the assistant
 
