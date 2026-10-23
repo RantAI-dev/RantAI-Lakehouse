@@ -328,3 +328,8 @@ Waiting for the AI quota to reset: AI-10-AC1 and AI-10-AC2 (the assistant's PDF 
 Findings:
 - **Q1 SHOULD-FIX: "Send now" gives no feedback.** While a send runs (up to a minute with a PDF), the buttons only grey out. Decision: the row shows "Sending…" with a spinner until the answer arrives, then the result.
 - **Q2 SHOULD-FIX: an outside domain added in Settings is lost unless the page is saved,** and nothing says so. Decision: the reports-domains section shows an unsaved-changes note next to Save when its list differs from the stored one, the same pattern for the content sites and the palette.
+
+- **Q3 SHOULD-FIX (owner's QA, 2026-10-23): "Skip when empty" never skips a dashboard that has a KPI, a progress bar or another single-value chart.**
+  - Cause: an aggregate with no grouping returns one row (`sum` of no rows is `0` in ClickHouse), so `every_data_chart_is_empty` (`report_runner.rs`) never sees every chart empty. Seen on `b_6574e2b9` with filters `provinsi = Bali` and `kab_kota` contains "Kota Jakarta Barat": every grouped tile showed "No data", and the report still tried to send.
+  - Decision (planner default, owner may change): single-value kinds (KPI, progress, gauge, a bullet without a category, and any chart with no dimension) are left out of the emptiness check, like static cards. The report is skipped when every chart that groups or lists rows is empty. A dashboard with no such chart never skips, and the dialog says so next to the checkbox.
+  - Accept: unit tests on the payload shapes (KPI plus empty bar → skip; only KPIs → no skip; one grouped chart with rows → send), and a component test for the note.
