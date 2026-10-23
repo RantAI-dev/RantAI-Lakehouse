@@ -185,10 +185,14 @@ async fn create_pipeline(
     created.id
 }
 
-/// An eighteen-hour-old check that has NOT consumed what it was asked:
-/// the shape an exhausted U's state row has (requested tokens set,
-/// consumed `None`, attempt counter past `max_retries`).
-async fn seed_exhausted_state(pool: &PgPool, id: &str, tenant: Uuid, attempt: i32) {
+/// An open request on U that it has not consumed: requested tokens set,
+/// consumed `None`, `attempt` attempts recorded. One row shape covers both
+/// states the page controls need — an `attempt` past U's own `max_retries`
+/// is exhausted under `upstream_retries_exhausted`, one within it is merely
+/// outstanding — so one helper takes the counter and each caller says which
+/// state it seeds (`BLD-5`, folding the duplicated
+/// `seed_exhausted_state`/`seed_outstanding_state`, rule 4).
+async fn seed_open_request_state(pool: &PgPool, id: &str, tenant: Uuid, attempt: i32) {
     let now = OffsetDateTime::now_utc();
     pipelines::upsert_lag_state(
         pool,
@@ -208,7 +212,7 @@ async fn seed_exhausted_state(pool: &PgPool, id: &str, tenant: Uuid, attempt: i3
         },
     )
     .await
-    .expect("seed the lag state");
+    .expect("seed the open lag state");
 }
 
 /// A checked P that has never consumed anything and is not itself
@@ -237,38 +241,6 @@ async fn seed_unmeasured_state(pool: &PgPool, id: &str, tenant: Uuid) {
     .expect("seed the lag state");
 }
 
-/// An outstanding request that still has attempts left — U was asked for
-/// this input change and has not consumed it, but `request_attempt` is
-/// within `max_retries`, so `upstream_retries_exhausted` is false.
-///
-/// BLD-2 review R5 SHOULD-FIX 7: the two controls that need a NOT-exhausted
-/// upstream seeded their state with `seed_exhausted_state` and relied on a
-/// small `max_retries` to make it not-exhausted — so the helper named for
-/// the thing they were NOT testing built the rows under test. Same row
-/// shape, honest name.
-async fn seed_outstanding_state(pool: &PgPool, id: &str, tenant: Uuid, attempt: i32) {
-    let now = OffsetDateTime::now_utc();
-    pipelines::upsert_lag_state(
-        pool,
-        &pipelines::LagStateUpdate {
-            pipeline_id: id.to_owned(),
-            tenant_id: Some(tenant),
-            consumed_tokens: None,
-            consumed_at: None,
-            pending_since: Some(now - time::Duration::hours(18)),
-            requested_run_key: Some(format!("pl-run-key:{id}:0")),
-            requested_tokens: Some(serde_json::json!({"bronze.raw": "fp:1"})),
-            requested_at: Some(now),
-            request_attempt: attempt,
-            last_check_at: now,
-            last_status: "not_measured".to_owned(),
-            behind_streak: 0,
-        },
-    )
-    .await
-    .expect("seed the outstanding lag state");
-}
-
 /// P's source is U's target, P's `dependsOn` is empty: the exact shape a
 /// chain-scheduled read has and a `dependsOn`-mirrored read does not.
 #[tokio::test]
@@ -290,7 +262,7 @@ async fn a_lag_pipeline_reading_its_upstream_only_through_the_source_table_names
     set_ready(&app.pool, &u_id).await;
     // attempt 1 > max_retries 0, asked and never consumed: exhausted
     // under `upstream_retries_exhausted`.
-    seed_exhausted_state(&app.pool, &u_id, tenant, 1).await;
+    seed_open_request_state(&app.pool, &u_id, tenant, 1).await;
 
     let p_id = create_pipeline(
         &app.pool,
@@ -371,7 +343,7 @@ async fn an_outstanding_not_exhausted_upstream_does_not_make_the_page_read_behin
     .await;
     set_ready(&app.pool, &u_id).await;
     // attempt 1 <= max_retries 2: outstanding, not exhausted.
-    seed_outstanding_state(&app.pool, &u_id, tenant, 1).await;
+    seed_open_request_state(&app.pool, &u_id, tenant, 1).await;
 
     let p_id = create_pipeline(
         &app.pool,
@@ -428,7 +400,7 @@ async fn the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_o
     )
     .await;
     set_ready(&app.pool, &u1_id).await;
-    seed_outstanding_state(&app.pool, &u1_id, tenant, 1).await;
+    seed_open_request_state(&app.pool, &u1_id, tenant, 1).await;
 
     // The nearer U2: exhausted (attempt 3 > max_retries 2, three failed runs).
     let u2_id = create_pipeline(
@@ -443,7 +415,7 @@ async fn the_page_names_the_upstream_the_check_names_when_a_deeper_upstream_is_o
     )
     .await;
     set_ready(&app.pool, &u2_id).await;
-    seed_exhausted_state(&app.pool, &u2_id, tenant, 3).await;
+    seed_open_request_state(&app.pool, &u2_id, tenant, 3).await;
 
     let p_id = create_pipeline(
         &app.pool,
@@ -561,7 +533,7 @@ async fn adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list() {
     set_ready(&app.pool, &u_id).await;
     // attempt 1 > max_retries 0, asked and never consumed: exhausted
     // under `upstream_retries_exhausted`.
-    seed_exhausted_state(&app.pool, &u_id, tenant, 1).await;
+    seed_open_request_state(&app.pool, &u_id, tenant, 1).await;
 
     let mut p_ids = Vec::new();
     for name in ["lag-page-shared-one", "lag-page-shared-two"] {
@@ -625,4 +597,91 @@ async fn adding_a_listed_lag_pipeline_does_not_add_a_round_trip_to_the_list() {
          checkout: two rows checked out {with_two_rows}, three checked out \
          {with_three_rows}"
     );
+}
+
+/// `BLD-5` (following `BLD-2 review R1 SHOULD-FIX 3`): the no-reader answer
+/// costs ONE pool checkout for the whole page, not one per downstream
+/// candidate. Before the batched query each candidate paid its own
+/// `count_lag_pipelines_reading`, so the three-candidate page below cost one
+/// checkout more than the two-candidate one.
+///
+/// The rows stay honest either way — the batched query keeps the check's own
+/// predicate (source, or `depends_on` naming a pipeline whose target is), so
+/// this test only measures the cost; `downstream_without_readers`' own tests
+/// pin the answer.
+#[tokio::test]
+async fn adding_a_downstream_candidate_does_not_add_a_round_trip_to_the_list() {
+    let (app, checkouts) = spin_up_with_env_counting_acquires(&list_overrides()).await;
+    let (app, tenant, cookie) = member_of(app, "lag-page-readers").await;
+
+    let mut downstream_ids = Vec::new();
+    for name in ["lag-page-readers-one", "lag-page-readers-two"] {
+        let id = create_pipeline(
+            &app.pool,
+            name,
+            tenant,
+            Some(TargetLag::Downstream),
+            "bronze.raw",
+            &format!("silver.{name}"),
+            Vec::new(),
+            Some(0),
+        )
+        .await;
+        set_ready(&app.pool, &id).await;
+        seed_unmeasured_state(&app.pool, &id, tenant).await;
+        downstream_ids.push(id);
+    }
+
+    // Warm-up: the first page of a fresh harness opens what later requests
+    // reuse, so it is not part of the measurement.
+    let (status, _) = get_json(&app, "/api/pipelines", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let before = checkouts.load(Ordering::SeqCst);
+    let (status, _) = get_json(&app, "/api/pipelines", &cookie).await;
+    let with_two = checkouts.load(Ordering::SeqCst) - before;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        with_two > 0,
+        "the counter must see this request's checkouts at all, or it pins \
+         nothing (measured {with_two})"
+    );
+
+    let third = create_pipeline(
+        &app.pool,
+        "lag-page-readers-three",
+        tenant,
+        Some(TargetLag::Downstream),
+        "bronze.raw",
+        "silver.lag-page-readers-three",
+        Vec::new(),
+        Some(0),
+    )
+    .await;
+    set_ready(&app.pool, &third).await;
+    seed_unmeasured_state(&app.pool, &third, tenant).await;
+    downstream_ids.push(third);
+
+    let before = checkouts.load(Ordering::SeqCst);
+    let (status, body) = get_json(&app, "/api/pipelines", &cookie).await;
+    let with_three = checkouts.load(Ordering::SeqCst) - before;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        with_three <= with_two,
+        "a third unread downstream candidate must not cost a checkout: two \
+         candidates checked out {with_two}, three checked out {with_three}"
+    );
+    let rows = body["pipelines"].as_array().expect("a pipelines array");
+    for id in &downstream_ids {
+        let row = rows
+            .iter()
+            .find(|row| row["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("row for {id} missing from {body}"));
+        assert!(
+            row["lag"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no pipeline with a target lag reads")),
+            "the batched answer must still call {id} unread: {row}"
+        );
+    }
 }
