@@ -34,10 +34,17 @@ afterEach(() => {
   cleanup()
   mock.restore()
   window.localStorage.clear()
+  visit("/query-studio")
 })
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } })
+
+/** Points the browser at a Query Studio address, the way an href does. */
+function visit(path: string) {
+  const url = new URL(path, "http://localhost:3000").href
+  ;(window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(url)
+}
 
 /** Answers the session and the Copilot sessions list; everything else is an empty success. */
 function stubNetwork() {
@@ -157,6 +164,29 @@ describe("QueryStudioPage format settings", () => {
       )
       expect(lines.join("\n")).toBe("select\n  a\nfrom\n  t")
     })
+  })
+})
+
+describe("QueryStudioPage query tabs", () => {
+  it("opens a ?sql= link in a tab of its own and leaves the draft where it was", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    visit("/query-studio?sql=SELECT%202")
+    const { container } = renderPage()
+
+    // The link's query opens in a tab of its own, beside the draft.
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /^Query \d+$/ }).length).toBe(2)
+    )
+    const editorText = () =>
+      Array.from(container.querySelectorAll(".cm-line"))
+        .map((line) => line.textContent ?? "")
+        .join("\n")
+    await waitFor(() => expect(editorText()).toBe("SELECT 2"))
+
+    // The draft is still there, in the tab that was open before.
+    fireEvent.click(screen.getByRole("button", { name: "Query 1" }))
+    await waitFor(() => expect(editorText()).toBe("SELECT 1"))
   })
 })
 

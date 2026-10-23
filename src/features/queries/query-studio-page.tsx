@@ -18,6 +18,7 @@ import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
 import { SchemaBrowser } from "./schema-browser"
+import { QueryTabBar } from "./query-tab-bar"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -36,7 +37,9 @@ export function QueryStudioPage() {
   // context on every keystroke.
   const { setPageContext } = useCopilot()
   const deferredSql = React.useDeferredValue(studio.sql)
-  const lastResult = studio.runAct.data
+  // The rows on screen are the open tab's own: a tab that never ran shows
+  // nothing, and the assistant reads the same rows the person sees.
+  const lastResult = studio.results[studio.activeTabId] ?? null
   React.useEffect(() => {
     setPageContext({
       key: "query",
@@ -74,6 +77,9 @@ export function QueryStudioPage() {
               <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
+              {/* The query tabs sit inside the SQL tab, above the editor:
+                  the natural-language and SQL choice stays as it was. */}
+              <QueryTabBar studio={studio} />
               {/* The browser sits beside the editor and never replaces it:
                   whatever the catalog answers, the editor keeps its width
                   and stays usable. */}
@@ -141,9 +147,7 @@ export function QueryStudioPage() {
               onReject={studio.fix.reject}
             />
           ) : null}
-          {studio.runAct.data ? (
-            <QueryResultsSection result={studio.runAct.data} />
-          ) : null}
+          {lastResult ? <QueryResultsSection result={lastResult} /> : null}
         </div>
         <div className="space-y-3">
           <QueryTransparencyPanel
