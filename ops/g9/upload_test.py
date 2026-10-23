@@ -976,14 +976,28 @@ def step_new_formats(api, base_table: str, state: dict) -> None:
         _expect(api.delete(f"{API_URL}/api/uploads/{upload_id}", timeout=30), 204, f"DELETE {name}")
         state["deleted"] = True
 
-    # Bombs: a few KiB of gzip or zip that unpack past the 50 MB cap are refused, and nothing is kept.
+    # Bombs: a few MiB of gzip or zip that unpack past the 2 GiB unpacked cap (MAX_UNPACKED_BYTES,
+    # plan T6.2 item 2; it was 50 MB) are refused, and nothing is kept. `PR #186 CI`: the gate's bomb
+    # was 51 MiB and became a valid upload; it is 2 GiB + 1 byte of one repeated letter, written in
+    # blocks (never held whole) and packing about 1000 to 1.
     before = len(_expect(api.get(f"{API_URL}/api/uploads", timeout=30), 200, "GET /api/uploads").json())
-    big = b"id,name\n" + b"a" * (51 * 1024 * 1024)
+    block = b"a" * (1024 * 1024)
+    blocks = 2048  # 2 GiB, and the header line below is the byte over
+    head = b"id,name\n"
+    gz = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz, mode="wb", compresslevel=9) as packer:
+        packer.write(head)
+        for _ in range(blocks):
+            packer.write(block)
     zipped = io.BytesIO()
     with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("a.csv", big)
-    for name, raw in (("bomb.csv.gz", gzip.compress(big, compresslevel=9)), ("bomb.zip", zipped.getvalue())):
-        if len(raw) > 1024 * 1024:
+        # force_zip64: the entry is past 2 GiB, which the plain header cannot declare.
+        with archive.open("a.csv", "w", force_zip64=True) as entry:
+            entry.write(head)
+            for _ in range(blocks):
+                entry.write(block)
+    for name, raw in (("bomb.csv.gz", gz.getvalue()), ("bomb.zip", zipped.getvalue())):
+        if len(raw) > 8 * 1024 * 1024:
             raise G9Failure(f"{name}: the setup should be a small file, it is {len(raw)} bytes")
         resp = api.post(f"{API_URL}/api/uploads", files={"file": (name, raw, "application/octet-stream")}, timeout=60)
         refused = _expect(resp, 400, f"POST /api/uploads ({name})").json()
