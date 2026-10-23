@@ -116,3 +116,47 @@ test("rawNamesByFeature lists each stored spelling once, under the feature it jo
   assert.deepEqual(got.get("Kota Bandung"), ["Kota Bandung"])
   assert.equal(got.has("Nowhere"), false)
 })
+
+// BI-16 C2a (plan D4): the world map (by country) and the country maps (by state or province).
+const WORLD = ["United States of America", "Côte d'Ivoire", "Czechia", "United Kingdom", "Myanmar"]
+const WORLD_ALIASES: [string, string][] = [
+  ["US", "United States of America"], ["USA", "United States of America"], ["United States", "United States of America"],
+  ["CI", "Côte d'Ivoire"], ["Czech Republic", "Czechia"], ["GB", "United Kingdom"],
+]
+
+test("a country is found by name, long name, ISO-2 or ISO-3 code, ignoring case and accents", () => {
+  const index = buildRegionIndex(WORLD, WORLD_ALIASES)
+  for (const raw of ["us", "USA", "United States", "united states of america"]) {
+    assert.equal(matchRegion(raw, "country", index), "United States of America", raw)
+  }
+  assert.equal(matchRegion("Cote d'Ivoire", "country", index), "Côte d'Ivoire")
+  assert.equal(matchRegion("Czech Republic", "country", index), "Czechia")
+  assert.equal(matchRegion("UK", "country", index), "United Kingdom")
+  assert.equal(matchRegion("Burma", "country", index), "Myanmar")
+  assert.equal(matchRegion("Atlantis", "country", index), null)
+})
+
+test("a feature name is never overridden by an alias of another feature", () => {
+  const index = buildRegionIndex(["Niger", "Nigeria"], [["Niger", "Nigeria"]])
+  assert.equal(matchRegion("Niger", "country", index), "Niger")
+})
+
+test("a state is found by name or ISO 3166-2 code and is not given Indonesian prefix rules", () => {
+  const index = buildRegionIndex(["São Paulo", "Kota Baru", "Bandung"], [["BR-SP", "São Paulo"]])
+  assert.equal(matchRegion("Sao Paulo", "subdivision", index), "São Paulo")
+  assert.equal(matchRegion("br-sp", "subdivision", index), "São Paulo")
+  assert.equal(matchRegion("Kabupaten Bandung", "subdivision", index), null)
+  assert.equal(matchRegion("Kabupaten Bandung", "regency", index), "Bandung")
+})
+
+test("rows are summed per country across spellings, and the rest are reported", () => {
+  const result = matchRegionRows(
+    [{ name: "US", value: 1 }, { name: "United States", value: 2 }, { name: "Narnia", value: 4 }],
+    "country", WORLD, WORLD_ALIASES
+  )
+  assert.deepEqual(result.data, [{ name: "United States of America", value: 3 }])
+  assert.equal(result.unmatchedRows, 1)
+  assert.deepEqual(result.unmatchedNames, ["Narnia"])
+  const raw = rawNamesByFeature(["US", "United States", "Narnia"], "country", WORLD, WORLD_ALIASES)
+  assert.deepEqual(raw.get("United States of America"), ["US", "United States"])
+})
