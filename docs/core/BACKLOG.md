@@ -263,7 +263,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-31` | Task | Close out `BI` phase 2 (#160) for acceptance: (1) the owner signs the decision rows still marked "Owner to confirm at QA" on `chart-builder-questions.md`, `joins-without-sql.md`, `bins-groups-hierarchies.md`, `parameters.md`, `combined-charts.md` and `reusable-metrics.md`, with the date; (2) answer the two open questions in the `BI-2` plan (does a seeded role hold `metric:write`; are metric and segment definitions readable by everyone with `dashboard:read`); (3) one check on a running stack with a masked and row-filtered role across a join, a drill-down and an embed. Found in the #160 review | Dashboards | P2 | Todo |  | #160 review |
 | `BI-32` | Task | While the assistant is answering, a chart's reference-line label (for example "Target 20,000") moves again and again, though the chart itself stays still: the tile re-renders with the streamed message. Keep the label still until the board really changes. Cosmetic; left over from the phase 3 QA (`BI-18` part C review R29, owner's QA 2026-10-18) | Dashboards | P3 | Todo |  | `BI-18` part C plan, R29 |
 | `BI-33` | Task | `#199` follow-ups from its last review (round O, `superpowers/plans/2026-10-14-bi-18c-layout.md`): the AI-15 case `dash_map_charts_in_separate_tab` can fail when the assistant is right (its setup has only the map chart; add a second chart); the XSS test misses the sankey edge, boxplot outlier and scatter-label branches; a comment in `chart-option.ts` says ECharts' `encodeHTMLContent` is off by default, but it never applies to a series formatter | Dashboards | P2 | Todo |  | `#199` review round O |
-| `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Todo |  | phase 3 QA |
+| `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
 | `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
@@ -313,7 +313,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-11`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-10`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -368,6 +368,7 @@ set by the product owner and are left empty until they are.
 | `SEC-43` | 2026-10-17 | 2026-10-17 | |
 | `SEC-44` | 2026-10-17 | | |
 | `SEC-46` | 2026-10-21 | 2026-10-21 | |
+| `OPS-11` | 2026-10-23 | 2026-10-23 | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
 | `OPS-1` | 2026-10-15 | 2026-10-16 | |
