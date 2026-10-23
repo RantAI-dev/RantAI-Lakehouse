@@ -1,9 +1,13 @@
 # DATA-17 T2.3 / T6.1: the large-file upload harness (ops/g9/large_upload.py), run by hand.
 #
-# FULL SIZE (T6.1): csv_mb=2048 parquet_mb=1945 parquet_files=10 jsonl_mb=2048
-# gzip_mb=2048. The API refuses a session above its MAX_SESSION_BYTES (50 MiB until
-# T6.2 sets the cap), so the build under test must carry a raised cap; see the
-# "Slice 6" handoff of docs/superpowers/plans/2026-10-16-data-phase-3-uploads.md.
+# DEFAULTS: 200 MiB per format, well inside the cap, so a manual run on any branch that
+# has T6.2 (the session cap and the unpacked cap are both 2 GiB, `MAX_SESSION_BYTES` and
+# `MAX_UNPACKED_BYTES` in the API) works as it is, with no throwaway branch.
+#
+# FULL SIZE (T6.1, opt-in: type these in "Run workflow"): csv_mb=2048 parquet_mb=1945
+# parquet_files=10 jsonl_mb=2048 gzip_mb=2048. 2048 MiB is the cap itself, exactly
+# 2,147,483,648 bytes, which the API accepts; a size above it is refused by design. The
+# figures of these runs are docs/plans/DATA-17-RESULT.md.
 #
 # A workflow of its own, started only with "Run workflow", for three reasons:
 #
@@ -28,11 +32,11 @@ on:
   workflow_dispatch:
     inputs:
       csv_mb:
-        description: "Size of the generated CSV in MiB (0 skips it). 2048 is the 2 GiB of the plan."
+        description: "Size of the generated CSV in MiB (0 skips it). 2048 is the 2 GiB cap (full T6.1 size, opt-in)."
         default: "200"
         type: string
       parquet_mb:
-        description: "MiB of Parquet in all, over the files below (0 skips them). 1945 is 1.9 GiB."
+        description: "MiB of Parquet in all, over the files below (0 skips them). 1945 is 1.9 GiB (full T6.1 size, opt-in); the session cap is 2 GiB per file."
         default: "200"
         type: string
       parquet_files:
@@ -40,11 +44,11 @@ on:
         default: "10"
         type: string
       jsonl_mb:
-        description: "Size of the generated JSON Lines file in MiB (0 skips it). 2048 is the 2 GiB of the plan."
+        description: "Size of the generated JSON Lines file in MiB (0 skips it). 2048 is the 2 GiB cap (full T6.1 size, opt-in)."
         default: "200"
         type: string
       gzip_mb:
-        description: "MiB a generated gzipped CSV unpacks to (0 skips it). The cap counts the unpacked size."
+        description: "MiB a generated gzipped CSV unpacks to (0 skips it). The 2 GiB cap counts the unpacked size; 2048 is the full T6.1 size, opt-in."
         default: "200"
         type: string
 
