@@ -204,7 +204,7 @@ Decisions to review:
 - **Seasons need `max(2m, 10 + 2*floor(m/2))` points**: 2 full seasons, as signed, plus what the decomposition needs to start (24 for months, 8 for quarters, 16 for days, 124 for weeks). Below 2 seasons the note says "fewer than 2 full seasons"; between the two limits, "too few to start them". Year and minute have no seasons.
 - **Thresholds** as in the feature page: under 5 periods refused (counted after the unfinished period is dropped, and the sentence says so); more than 10 % periods missing refused, up to 10 % filled in a straight line and counted; a missing latest period is refused, leading gaps are trimmed; horizon held to 1..60 and to the history length, with a note.
 - Ties in AICc go to the simpler model; a zero-error series is floored so the log stays finite (constant series: flat ANN forecast).
-- The `statsmodels` closed-form variances were checked against the generic sum c_j = alpha + j beta + gamma [m | j] used here (they agree by the numbers above, all four models' shapes: AAN, ANA via airline/gdp alternatives are covered only for the selected models; ANN and the other unselected models are not compared one by one).
+- **Variance:** the generic sum c_j = alpha + j beta + gamma [m | j] is used for all four models; it reproduces `statsmodels`' closed forms (same terms) and its intervals for the two selected models (AAA, AAN). The unselected models' intervals are not compared one by one, because the module only returns the winner: *not verified* for ANN and ANA bands.
 
 Checks (from `/home/hv/lakehouse-phase6-build`): `bun test src/lib/forecast.test.ts`: 15 pass, 0 fail; `bun run typecheck`: exit 0; eslint on the two files: clean.
 
