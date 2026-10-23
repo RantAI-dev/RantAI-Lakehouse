@@ -8,8 +8,8 @@ import {
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { apiFetch } from "@/services/http";
-import { dashboardService } from "@/services";
-import type { EmbedInfo } from "@/services/contracts/dashboards";
+// BI-19 part A review fix (SHOULD-FIX) R4: features import `@/services` only.
+import { dashboardService, type EmbedInfo } from "@/services";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
 import { PublicLinkPanel } from "./public-link-panel";
 import { AllowedSitesEditor, Disclosure, WithdrawTokens } from "./embed-access-panel";

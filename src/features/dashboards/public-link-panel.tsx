@@ -6,8 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { copyText as copyToClipboard } from "@/lib/copy-text";
 import { readableErrorMessage } from "@/lib/notify-message";
-import { dashboardService } from "@/services";
-import type { PublicLink, PublicLinkState } from "@/services/contracts/dashboards";
+// BI-19 part A review fix (SHOULD-FIX) R4: features import `@/services` only.
+import { dashboardService, type PublicLink, type PublicLinkState } from "@/services";
 
 /** `BI-19` part A, decision A1: 30 days is chosen for you; a year is the most. */
 export const EXPIRY_CHOICES = ["1", "7", "30", "90", "date"] as const;
