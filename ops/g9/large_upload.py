@@ -19,9 +19,10 @@ is where its numbers are read; nothing here decides a limit.
    `--sizes 256,512,1024,2048` (MiB) measures each enabled format at each of those
    sizes instead, every one its own phase with its own `RESULT` line (the Parquet
    size is the total over `--parquet-files` files).
-   The rows are sized so that a file stays under the job's 2,000,000-row cap
-   (`file_ingest.MAX_ROWS`): wide rows of random text, which also compress
-   poorly, so the Parquet files reach the size asked for.
+   The rows are sized to stay under 2,000,000, as they were when the job had a
+   row cap (`file_ingest.MAX_ROWS`, removed in T6.2 item 4), so the figures of
+   `docs/plans/DATA-17-RESULT.md` stay comparable run to run: wide rows of random
+   text, which also compress poorly, so the Parquet files reach the size asked for.
 3. Sends each file in 8 MiB pieces (`POST /api/uploads/sessions`, `PUT .../parts/{n}`,
    `POST .../complete`), 4 pieces at a time, and loads it with `replace` into its
    own raw table (`POST .../ingest`), then polls the upload to `ingested`.
@@ -78,7 +79,8 @@ from pathlib import Path
 PART_SIZE = 8 * 1024 * 1024
 PIECES_IN_FLIGHT = 4
 MIB = 1024 * 1024
-# The job's row cap (`file_ingest.MAX_ROWS`); a generated file stays under it.
+# The job's former row cap (`file_ingest.MAX_ROWS`, removed in T6.2 item 4); a generated
+# file still stays under it so that a run is comparable with the measured ones.
 JOB_MAX_ROWS = 2_000_000
 TARGET_ROWS = 1_900_000
 

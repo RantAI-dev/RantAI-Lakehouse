@@ -23,8 +23,9 @@ source said" (ADR 0014, decision 4); the sketch this replaces stripped every
 value. Whitespace only decides whether a record is blank (skipped below the
 header) and how a column is named. A row shorter than the header is padded
 with empty strings and a longer one is cut to the header's length, which
-drops its extra cells. And the row cap (`MAX_ROWS`) is a failure, never a
-truncation: the load that passes it fails, and nothing is written.
+drops its extra cells. There is no cap on the number of rows: memory follows
+the bytes of the file and not its rows (`docs/plans/DATA-17-RESULT.md`), and
+the bytes are capped by the API (`DATA-17` T6.2 item 4, decision 10).
 
 # The file is streamed, never held whole (`DATA-17` T2.1, plan AD2)
 
@@ -42,9 +43,10 @@ produces one, and the column and cell rules would refuse it later.
 Because the file is read once, the first data row is read BEFORE dlt is asked
 to write anything, so a header past the end, a header with no cells, one with
 too many, and a file with no rows below it all fail without a pipeline having
-been made. The one failure that can only be found mid-stream is the row cap
-(`MAX_ROWS`): the batch generator raises it from inside dlt's extract step, which
-runs before anything is normalized or loaded, so nothing is written (measured:
+been made. The failures that can only be found mid-stream (the store failing,
+the unpacked bytes passing `max_bytes`) are raised by the batch generator from
+inside dlt's extract step, which runs before anything is normalized or loaded,
+so nothing is written (measured:
 `test_a_failure_while_dlt_extracts_leaves_the_destination_untouched`).
 
 # Parquet is read here too (`DATA-17` T2.2)
@@ -65,8 +67,8 @@ after the names are cleaned (`_column_names`), and their order may differ from
 file to file; the columns and their order are the first file's. A file whose
 names are not the first file's fails the load (`LOAD_FAILED`, nothing written):
 the API has listed that mismatch before the load and refuses it, so reaching it
-here means another caller launched the job, or a file changed. The row cap and
-the unpacked-bytes budget (`max_bytes`) are those of the whole load, not of each
+here means another caller launched the job, or a file changed. The unpacked-bytes
+budget (`max_bytes`) is that of the whole load, not of each
 file (feature page decision 1: the cap counts all of a load's files), and the row
 count a load reports is the sum. The API records one outcome, under the primary's
 `upload:<id>`, and settles every file of the load from it.
@@ -148,12 +150,14 @@ AUTHOR = "upload"
 # caller's side cannot make this job read Bronze data out of the same bucket.
 UPLOAD_PREFIX = "uploads/"
 
-# The limit on a file's data rows (decision 2 of the feature page,
-# `docs/core/features/upload-file.md`, and "Limits" of the plan). The API
-# checks a file's size and kind when it is uploaded and never counts its rows
-# (`routes/uploads.rs` only knows this limit as the reason `JOB_TOO_MANY_ROWS`),
-# so this is where the limit is enforced, as a failure and never a truncation.
-MAX_ROWS = 2_000_000
+# There is no limit on a file's data rows (it was `MAX_ROWS` = 2,000,000, decision 2 of
+# `docs/core/features/upload-file.md`). Decision 10 of
+# `docs/core/features/upload-big-files-and-more-formats.md` removes it once memory is
+# measured flat; `docs/plans/DATA-17-RESULT.md` (after the streaming fix) measured the
+# job's growth from 256 MiB to 2 GiB flat in the file's size for every format, with
+# rows from 0.95 to 14 million, so memory follows bytes and the API's byte cap
+# (2 GiB, plus `max_bytes` for what a gzip or zip unpacks to) is the bound. Plan T6.2
+# item 4.
 
 # The limit on a file's columns (`SEC-17`): the header record's cells under the
 # reading the load was told. A header decided how many columns a table got and
@@ -211,6 +215,9 @@ HEADER_PAST_END = "The header row is past the end of the file."
 # not what happened: the file has a record there.
 HEADER_NO_COLUMNS = "The header row has no columns."
 NO_ROWS = "The file has no rows below the header row."
+# No longer raised (`MAX_ROWS` is gone, T6.2 item 4). The sentence stays in this list,
+# and in the fixture shared with the API, because the API shows a recorded reason only
+# when it is one of these and an upload that failed with it before keeps its message.
 TOO_MANY_ROWS = "The file has more than 2,000,000 rows."
 LOAD_FAILED = "The load into the table failed."
 NOT_REGISTERED = "The table was loaded but could not be registered in the catalog."
@@ -531,8 +538,8 @@ class TableStream:
     Arrow record batches. It holds the columns and the row in hand, never the
     rows: `batches()` is the only producer of rows and counts them as they pass.
 
-    `failure` is set when the stream itself ends the load (the row cap, or the
-    store failing mid-read) so that `_write` can tell that from a failure of
+    `failure` is set when the stream itself ends the load (the unpacked bytes
+    passing the cap, or the store failing mid-read) so that `_write` can tell that from a failure of
     dlt, whose exception wraps whatever the generator raised.
     """
 
@@ -559,19 +566,15 @@ class TableStream:
 
         # Errors
 
-        Raises `LoadFailure(TOO_MANY_ROWS)` (also kept in `failure`) at the row
-        after `MAX_ROWS`, before it is added to a batch: a file over the cap is
-        a failure and never a truncation. Raises `LoadFailure(UNREADABLE)` when
-        the store fails while the file is read.
+        Raises `LoadFailure(UNREADABLE)` when the store fails while the file is
+        read, and the `LoadFailure` of the records themselves (the unpacked bytes
+        passing the cap), also kept in `failure`.
         """
         width = len(self.columns)
         cells: list[list[str]] = [[] for _ in range(width)]
         try:
             for record in itertools.chain([self.first], self.records):
                 self.row_count += 1
-                if self.row_count > MAX_ROWS:
-                    self.failure = LoadFailure(TOO_MANY_ROWS)
-                    raise self.failure
                 for column, value in zip(cells, _shape(record, width)):
                     column.append(value)
                 if len(cells[0]) >= BATCH_ROWS:
@@ -579,7 +582,7 @@ class TableStream:
                     cells = [[] for _ in range(width)]
         except LoadFailure as caught:
             # Slice 4: a failure raised by the records themselves (the bytes of a gzip
-            # or zip file passing the cap) is the reason, as the row cap is.
+            # or zip file passing the cap) is the reason.
             self.failure = self.failure or caught
             raise
         except Exception as exc:  # noqa: BLE001 -- the store or the decoder failed mid-read; the detail is the cause
@@ -600,8 +603,7 @@ def open_table(source: str | Iterable[str], delimiter: str, header_row: int) -> 
     the preview reports it and the case above alike as an empty `columns`, and
     the two have a sentence each since review finding C2), `NO_ROWS` (nothing
     below the header that is not blank) or `TOO_MANY_COLUMNS` (a header of more
-    than `MAX_COLUMNS` cells, found before any row is read). The row cap is
-    found later, by `TableStream.batches`.
+    than `MAX_COLUMNS` cells, found before any row is read).
     """
     header, records = read_table(source, delimiter, header_row)
     if not header:
@@ -653,16 +655,12 @@ class ParquetStream:
 
         # Errors
 
-        Raises `LoadFailure(TOO_MANY_ROWS)` (also kept in `failure`) before the
-        batch that would pass `MAX_ROWS` (the rows of all the files together), and
-        `LoadFailure(UNREADABLE)` when the store or a file fails while it is read.
+        Raises `LoadFailure(UNREADABLE)` when the store or a file fails while it
+        is read.
         """
         try:
             for parquet_file, order in self._files():
                 for batch in text_batches(parquet_file, BATCH_ROWS):
-                    if self.row_count + batch.num_rows > MAX_ROWS:
-                        self.failure = LoadFailure(TOO_MANY_ROWS)
-                        raise self.failure
                     self.row_count += batch.num_rows
                     if order is not None:
                         batch = batch.select(order)
@@ -859,7 +857,7 @@ def _json_stream(
     # Errors
 
     `LoadFailure`: `NO_ROWS`, `HEADER_NO_COLUMNS` (no object has a key), `TOO_MANY_COLUMNS`,
-    `TOO_MANY_ROWS` or what `upload_formats` refused, as `UNREADABLE` or `TOO_LARGE_UNPACKED`."""
+    or what `upload_formats` refused, as `UNREADABLE` or `TOO_LARGE_UNPACKED`."""
 
     def objects() -> Iterator[dict[str, Any]]:
         with entries_of() as entries:
@@ -870,8 +868,6 @@ def _json_stream(
     count = 0
     for item in _translated(objects()):
         count += 1
-        if count > MAX_ROWS:
-            raise LoadFailure(TOO_MANY_ROWS)
         keys.update(dict.fromkeys(item))
         if len(keys) > MAX_COLUMNS:
             raise LoadFailure(TOO_MANY_COLUMNS) from ValueError(f"the objects have more than {MAX_COLUMNS} keys")
@@ -1205,7 +1201,7 @@ def _write(
         )
     except Exception as exc:  # noqa: BLE001 -- whatever dlt or the catalog raised is the cause, never the reason
         # dlt wraps what the generator raised: the stream knows if it was the
-        # row cap or the store, and that is the reason, not "the load failed".
+        # unpacked-bytes cap or the store, and that is the reason, not "the load failed".
         if stream.failure is not None:
             raise stream.failure  # its own cause (the store's error) is kept
         raise LoadFailure(LOAD_FAILED) from exc

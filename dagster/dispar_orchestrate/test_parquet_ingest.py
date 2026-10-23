@@ -21,7 +21,6 @@ from dispar_orchestrate.file_ingest import (
     LOAD_FAILED,
     NO_ROWS,
     TOO_MANY_COLUMNS,
-    TOO_MANY_ROWS,
     UNREADABLE,
     LoadFailure,
     open_parquet_stream,
@@ -116,18 +115,6 @@ def test_batches_are_at_most_the_batch_size_and_the_rows_are_counted_as_they_pas
         assert stream.row_count == sum(sizes)
         assert batch.schema.types == [pa.string()]
     assert max(sizes) <= 4 and sum(sizes) == 10
-
-
-def test_the_row_cap_is_a_failure_and_a_file_at_the_cap_passes(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 5)
-    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 2)
-    assert open_parquet_stream(_parquet_of(pa.table({"n": list(range(5))}))).row_count == 0
-    ok = open_parquet_stream(_parquet_of(pa.table({"n": list(range(5))})))
-    assert sum(b.num_rows for b in ok.batches()) == 5
-    over = open_parquet_stream(_parquet_of(pa.table({"n": list(range(6))})))
-    with pytest.raises(LoadFailure) as caught:
-        list(over.batches())
-    assert caught.value.reason == TOO_MANY_ROWS and over.failure is caught.value
 
 
 def test_a_page_that_cannot_be_read_is_unreadable_and_not_a_failed_load():

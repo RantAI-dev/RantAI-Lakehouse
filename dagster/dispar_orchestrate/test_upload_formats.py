@@ -23,7 +23,6 @@ from dispar_orchestrate.file_ingest import (
     NO_ROWS,
     TOO_LARGE_UNPACKED,
     TOO_MANY_COLUMNS,
-    TOO_MANY_ROWS,
     UNREADABLE,
 )
 from dispar_orchestrate.test_file_ingest import REPO_ROOT, _fails_with, _Harness, _params
@@ -124,13 +123,6 @@ def test_a_json_lines_file_with_a_line_that_is_not_an_object_or_not_json_fails_b
 def test_more_than_a_thousand_keys_fail_as_too_many_columns():
     raw = json.dumps([{f"k{i}": i for i in range(1001)}]).encode()
     _fails_with(_Harness(raw=raw), TOO_MANY_COLUMNS, _params(format="json"))
-
-
-def test_more_rows_than_the_cap_fail_in_the_first_pass_before_anything_is_written(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    harness = _Harness(raw=b'{"a": 1}\n' * 4)
-    _fails_with(harness, TOO_MANY_ROWS, _params(format="jsonl"))
-    assert harness.loads == []
 
 
 # ── Avro ─────────────────────────────────────────────────────────────────

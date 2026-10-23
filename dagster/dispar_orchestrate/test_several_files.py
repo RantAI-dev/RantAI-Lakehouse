@@ -23,7 +23,6 @@ from dispar_orchestrate.file_ingest import (
     MAX_LOAD_FILES,
     NO_ROWS,
     TOO_LARGE_UNPACKED,
-    TOO_MANY_ROWS,
     UNREADABLE,
     FileIngestParams,
     LoadFailure,
@@ -191,14 +190,6 @@ def test_gzip_files_share_one_unpacked_budget_so_the_cap_counts_all_of_the_load(
     assert together.loads == []
     fits = _Several({_key(1, "gz"): one, _key(2, "gz"): second})
     fits.run(_params(storage_keys=(_key(1, "gz"), _key(2, "gz")), compression="gzip", max_bytes=len(A) + len(B)))
-
-
-def test_the_row_cap_counts_the_rows_of_all_the_files(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    harness = _Several({_key(1): A, _key(2): B})
-    _fails_with(harness, TOO_MANY_ROWS, _params(storage_keys=(_key(1), _key(2))))
-    ok = _Several({_key(1): A, _key(2): C})
-    ok.run(_params(storage_keys=(_key(1), _key(2))))
 
 
 def test_a_file_that_cannot_be_opened_is_unreadable_and_the_ones_opened_are_closed():

@@ -275,9 +275,12 @@ def test_there_are_eleven_different_failure_reasons_among_them_the_header_row_wi
     assert COLUMNS_NOT_PREVIEWED == "The file's columns are not the ones the preview showed."
 
 
-def test_the_row_cap_in_the_sentence_is_the_row_cap_the_job_enforces():
-    assert file_ingest.MAX_ROWS == 2_000_000
-    assert f"{file_ingest.MAX_ROWS:,}" in TOO_MANY_ROWS
+def test_the_job_has_no_row_cap_and_keeps_the_old_sentence_only_so_recorded_failures_still_show():
+    # T6.2 item 4 (decision 10): memory follows bytes, measured flat in
+    # `docs/plans/DATA-17-RESULT.md`, so the row cap is gone. The sentence stays in the list the
+    # API shows recorded reasons from (an upload that failed with it before keeps its message).
+    assert not hasattr(file_ingest, "MAX_ROWS")
+    assert TOO_MANY_ROWS in FAILURE_REASONS
 
 
 def test_the_column_cap_in_the_sentence_is_the_column_cap_the_job_enforces():
@@ -444,27 +447,6 @@ def test_the_first_row_is_read_before_the_sink_is_asked_for_anything():
     assert harness.registered == []
 
 
-def test_the_row_cap_fails_the_run_from_inside_the_load_and_the_reason_is_not_the_loads(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 2)
-    harness = _Harness(raw=b"a\n1\n2\n3\n4\n")
-    # The fake load reads the resource as dlt would; the generator raises mid-way and the
-    # fake wraps it as dlt does, so only the stream's own record of it tells the reason.
-    original = harness.load
-
-    def wrapping(resource, table, config, plan, **kwargs):
-        try:
-            return original(resource, table, config, plan, **kwargs)
-        except LoadFailure as exc:
-            raise RuntimeError("PipelineStepFailed") from exc
-
-    harness.load = wrapping
-    failure = _fails_with(harness, TOO_MANY_ROWS)
-    assert failure.rows is None
-    assert harness.registered == []
-    assert [row["error"] for row in harness.recorded] == [TOO_MANY_ROWS]
-
-
 def test_a_store_that_fails_while_the_file_is_read_is_unreadable_and_not_a_failed_load():
     class Dying(io.BytesIO):
         calls = 0
@@ -490,6 +472,21 @@ def test_a_store_that_fails_while_the_file_is_read_is_unreadable_and_not_a_faile
     assert isinstance(failure.__cause__, OSError)  # the store's own error, for the run log
 
 
+class _DiesAfterFirstRead(io.BytesIO):
+    """A stored file whose first read gives `body` and whose next read fails, as a store does
+    when the connection drops mid-file."""
+
+    def __init__(self, body: bytes) -> None:
+        super().__init__()
+        self.body, self.calls = body, 0
+
+    def read(self, size=-1):
+        self.calls += 1
+        if self.calls > 1:
+            raise OSError("connection reset by peer")
+        return self.body
+
+
 def _local_pipeline_load(directory: str):
     """A `load` that runs the resource through a real dlt pipeline into a
     local filesystem destination, stamped as the sink stamps it. Not Iceberg:
@@ -507,11 +504,10 @@ def _local_pipeline_load(directory: str):
     return load
 
 
-def test_a_failure_while_dlt_extracts_leaves_the_destination_untouched_and_the_next_run_starts_clean(
-    tmp_path, monkeypatch
-):
-    # V4 of the plan, measured with dlt 1.30.0: the row cap raises inside the
-    # generator, which is dlt's extract step, before anything is normalized or loaded.
+def test_a_failure_while_dlt_extracts_leaves_the_destination_untouched_and_the_next_run_starts_clean(tmp_path):
+    # V4 of the plan, measured with dlt 1.30.0: a failure raised inside the generator (it was
+    # the row cap; now the store dying mid-file) is dlt's extract step, before anything is
+    # normalized or loaded.
     directory = str(tmp_path)
     ok = _Harness(raw=b"a\n1\n2\n")
     ok.load = _local_pipeline_load(directory)
@@ -519,14 +515,14 @@ def test_a_failure_while_dlt_extracts_leaves_the_destination_untouched_and_the_n
     before = sorted(glob.glob(os.path.join(directory, "ds", "g9_orders", "*")))
     assert len(before) == 1
 
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    monkeypatch.setattr(file_ingest, "BATCH_ROWS", 1)
-    over = _Harness(raw=b"a\n1\n2\n3\n4\n5\n")
+    # The store dies after the first block was read: the first row is in hand, dlt is
+    # extracting, and the generator raises from inside the extract step.
+    over = _Harness()
+    over.read = lambda config, key: _DiesAfterFirstRead(b"a\n1\n2\n3\n4\n5\n")
     over.load = _local_pipeline_load(directory)
-    _fails_with(over, TOO_MANY_ROWS)
+    _fails_with(over, UNREADABLE)
     assert sorted(glob.glob(os.path.join(directory, "ds", "g9_orders", "*"))) == before
 
-    monkeypatch.undo()
     again = _Harness(raw=b"a\n7\n8\n9\n")
     again.load = _local_pipeline_load(directory)
     again.run()
@@ -714,14 +710,6 @@ def test_a_header_of_nothing_but_commas_is_over_the_column_cap():
     with pytest.raises(LoadFailure) as caught:
         parse_file("," * 5_000 + "\n1\n", ",", 0)
     assert caught.value.reason == TOO_MANY_COLUMNS
-
-
-def test_the_row_cap_is_a_failure_found_while_counting_and_a_file_at_the_cap_passes(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    assert parse_file("a\n1\n2\n3\n", ",", 0).row_count == 3
-    with pytest.raises(LoadFailure) as caught:
-        parse_file("a\n1\n2\n3\n4\n", ",", 0)
-    assert caught.value.reason == TOO_MANY_ROWS
 
 
 def test_rows_leave_as_arrow_batches_of_at_most_the_batch_size_and_not_as_a_list_held_in_memory(monkeypatch):
@@ -1124,15 +1112,6 @@ def test_a_file_that_cannot_be_loaded_writes_nothing_and_records_its_reason(raw,
     assert harness.loads == [] and harness.registered == []
     [row] = harness.recorded
     assert (row["status"], row["error"], row["rows"]) == ("failed", reason, None)
-
-
-def test_a_file_over_the_row_cap_fails_and_nothing_is_written(monkeypatch):
-    monkeypatch.setattr(file_ingest, "MAX_ROWS", 3)
-    harness = _Harness(raw=b"a\n1\n2\n3\n4\n")
-    _fails_with(harness, TOO_MANY_ROWS)
-    assert harness.loads == [] and harness.registered == []
-    [row] = harness.recorded
-    assert (row["status"], row["error"], row["rows"]) == ("failed", TOO_MANY_ROWS, None)
 
 
 def test_a_failure_inside_the_sink_records_the_load_reason_and_registers_nothing():
