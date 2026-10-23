@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { StyleFields } from "./chart-style"
-import { NOTE_KINDS, formatRules, formatUsed, styleFromDef, stylePayload, withNote } from "./style-draft"
+import { NOTE_KINDS, effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette, withNote } from "./style-draft"
 
 const FULL: StyleFields = {
   format: { style: "compact", currency: "IDR", decimals: 2, thousands: false, currencyDisplay: "code", prefix: "~", suffix: " x" },
@@ -102,5 +102,54 @@ describe("withNote", () => {
   test("the kinds that take a note are the kinds with a category or date axis", () => {
     expect(NOTE_KINDS).toContain("bar")
     expect(NOTE_KINDS).not.toContain("pie")
+  })
+})
+
+describe("the company palette of a new chart (BI-17 part A, decision 6)", () => {
+  const company = ["#112233", "#445566"]
+
+  test("a new chart with no palette of its own draws with the company palette", () => {
+    expect(withCompanyPalette({}, company, false).colors).toEqual({ palette: "company" })
+  })
+
+  test("a palette the person chose is kept", () => {
+    const style: StyleFields = { colors: { palette: "muted" } }
+    expect(withCompanyPalette(style, company, false).colors).toEqual({ palette: "muted" })
+  })
+
+  test("a chart being edited keeps what it has", () => {
+    expect(withCompanyPalette({}, company, true).colors).toBeUndefined()
+  })
+
+  test("without a company palette nothing changes", () => {
+    expect(withCompanyPalette({}, [], false).colors).toBeUndefined()
+    expect(withCompanyPalette({}, ["#112233"], false).colors).toBeUndefined()
+  })
+})
+
+// PR #199 review O SHOULD-FIX 4: the builder must be able to keep "Default"
+// on a new chart once a company palette exists.
+describe("the palette the builder shows", () => {
+  const company = ["#112233", "#445566"]
+
+  test("a new chart with no choice of its own shows the company palette", () => {
+    expect(effectivePalette({}, company, false)).toBe("company")
+  })
+
+  test("a palette the person chose is shown as it is", () => {
+    const style: StyleFields = { colors: { palette: "muted" } }
+    expect(effectivePalette(style, company, false)).toBe("muted")
+  })
+
+  test("the default the person chose is shown as the default, not as the company palette", () => {
+    const style: StyleFields = { colors: { palette: "default" } }
+    expect(effectivePalette(style, company, false)).toBe("default")
+    // And it is kept when the chart is saved.
+    expect(withCompanyPalette(style, company, false).colors).toEqual({ palette: "default" })
+  })
+
+  test("a chart being edited and a deployment without a company palette show the default", () => {
+    expect(effectivePalette({}, company, true)).toBe("default")
+    expect(effectivePalette({}, [], false)).toBe("default")
   })
 })

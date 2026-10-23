@@ -1,7 +1,7 @@
 import * as React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "bun:test"
-import type { BoardTab } from "@/services/clients/bi-store"
+import type { BoardTab } from "@/services"
 import { TabBar, type TabEditing } from "./tab-bar"
 
 afterEach(cleanup)

@@ -46,17 +46,6 @@ export type ChartInput = {
   & StyleFields // number formats, colours, axes, notes, conditional colours (BI-17 part A)
   & TypeDefFields; // goal, bands, histogram ranges, address of an image or web card (BI-16 part B)
 
-/** Tile position on the grid canvas (12 columns). Key = chartId. */
-export type TileBox = {
-  x: number; y: number; w: number; h: number;
-  /** The tab this tile sits on (BI-18 part C). Absent: the first tab, or no tabs. */
-  tab?: string;
-};
-/** A tab of a dashboard (BI-18 part C); `id` is stable across renames. Mirrors `lakehouse_bi::layout::Tab`. */
-export type BoardTab = { id: string; title: string };
-/** A tile in the phone layout: its place in the one column and its height in rows. */
-export type PhoneTile = { id: string; h: number };
-export type LayoutMap = Record<string, TileBox>;
 /** How a dashboard filter compares its column; absent means `in`. Mirrors `FilterOp` in `lakehouse-bi`. */
 export type FilterOp = "in" | "not_in" | "between" | "relative" | "contains" | "starts_with" | "ends_with" | "not_contains";
 export type RelativeUnit = "day" | "week" | "month" | "quarter" | "year";
@@ -108,47 +97,3 @@ export type ChartClick =
   | { kind: "query"; id: string }
   | { kind: "url"; url: string };
 
-export type Board = {
-  id: string;
-  name: string;
-  /** Satu kalimat tujuan board, tampil di halaman daftar dashboard. */
-  description?: string;
-  /** Nama tampilan pembuat board. Kosong untuk board lama / tanpa login. */
-  createdBy?: string;
-  /** Folder this board is filed in; empty or null = no folder. */
-  folderId?: string | null;
-  /** The principal whose personal space holds this board (BI-18 part C, part 2); absent when it is shared. */
-  ownerId?: string;
-  layout?: LayoutMap;
-  filters?: FilterDef[];
-  /** BI-18 part C: absent when the dashboard has no tabs. */
-  tabs?: BoardTab[];
-  /** BI-18 part C: the order and heights of the tiles below 640 px, when an editor saved them. */
-  phoneLayout?: PhoneTile[];
-  /**
-   * The auto-refresh an editor saved, in seconds (one of 60, 300, 600, 900,
-   * 1800, 3600). Absent when none was saved; BI-18·B.
-   */
-  refreshSeconds?: number;
-  /** BI-17 part A: the dashboard's own theme (`light` or `dark`) and font id; absent follows the console. */
-  theme?: string;
-  font?: string;
-  createdAt?: string;
-  /**
-   * Kapan board terakhir ditulis.
-   *
-   * Nilainya sama dengan `createdAt`, dan itu disengaja: tabelnya
-   * `ReplacingMergeTree(created_at)`, jadi `created_at` adalah kolom versi
-   * yang ditulis ulang `now()` setiap kali board di-rename / layout
-   * disimpan / filter diubah. Jadi sejak awal isinya memang "terakhir
-   * diubah", cuma namanya saja "created". Di UI, labeli **"Updated"** —
-   * jangan pernah "Created", karena itu klaim yang tidak benar.
-   */
-  updatedAt?: string;
-  /** Jumlah tile di board ini; dihitung server, bukan kolom tersimpan. */
-  chartCount?: number;
-  /** `true` hanya untuk board bawaan (`default`) yang tidak bisa dihapus. */
-  builtin?: boolean;
-  publicToken?: string;
-  embedEnabled?: boolean;
-};

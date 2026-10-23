@@ -54,7 +54,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { notifyError, withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { dashboardService } from "@/services"
-import type { Board } from "@/services/clients/bi-store"
+import type { Board } from "@/services"
 import { notifyDashboardsChanged } from "./dashboard-events"
 import {
   BoardActionsMenu,
@@ -414,8 +414,8 @@ export function DashboardListPage() {
 
   const actions = React.useMemo<BoardRowActions>(
     () => ({
-      onRename: setRenaming,
-      onDelete: setDeleting,
+      onRename: canFile ? setRenaming : undefined,
+      onDelete: canFile ? setDeleting : undefined,
       onMove: canFile ? setMoving : undefined,
       isFavourite: (b) => favouriteIds.has(b.id),
       onToggleFavourite: (b) => {
@@ -428,14 +428,16 @@ export function DashboardListPage() {
           reloadShortcuts()
         })()
       },
-      onDuplicate: (b) => {
-        void (async () => {
-          const created = await duplicateAction.run(b.id)
-          notifyDashboardsChanged()
-          reload()
-          if (created?.id) router.push(`/dashboards/${created.id}`)
-        })()
-      },
+      onDuplicate: canFile
+        ? (b) => {
+            void (async () => {
+              const created = await duplicateAction.run(b.id)
+              notifyDashboardsChanged()
+              reload()
+              if (created?.id) router.push(`/dashboards/${created.id}`)
+            })()
+          }
+        : undefined,
     }),
     [canFile, duplicateAction, favouriteIds, reload, reloadShortcuts, router],
   )
@@ -500,12 +502,13 @@ export function DashboardListPage() {
       return next
     })
 
-  const newButton = (
+  // BI-18 part C review fix (SHOULD-FIX) R27: without `dashboard:write` there is no button.
+  const newButton = canFile ? (
     <Button size="sm" onClick={() => setCreateOpen(true)}>
       <PlusIcon data-icon="inline-start" />
       New dashboard
     </Button>
-  )
+  ) : null
 
   // Tidak ada primitive ToggleGroup di repo ini, jadi dua tombol ikon dengan
   // `aria-pressed` — sama jelasnya bagi screen reader tanpa menambah primitive

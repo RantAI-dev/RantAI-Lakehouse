@@ -200,7 +200,7 @@ Branch `feat/bi-phase-3`, from `27c51dfe`. Developer: Claude Sonnet. Nothing pus
 **Checks run** (foreground, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2`, on the final Rust code; the last commit touches TS only):
 
 - `cd rust && cargo fmt --check`: clean.
-- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api -p lakehouse-alerts --all-targets -- -D warnings`: no warnings.
+- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api -p lakehouse-alerts --all-targets -- -D warnings`: no warnings. **Corrected in the handoff of round M (2026-10-21): this was not true for the code as it was finally merged. The run on the final code fails at `lakehouse-bi/src/style.rs` with `clippy::needless_pass_by_value` (the test helper `colours_of`), which is what CI reported in round M; the helper takes the value by reference now.**
 - `cargo test -p lakehouse-bi -- --test-threads=4`: 511 passed, 3 ignored, 0 failed (lib), `specs_match_typescript` 1 passed.
 - `cargo test -p lakehouse-alerts -- --test-threads=4`: 90 passed, 1 ignored, 0 failed.
 - `cargo test -p lakehouse-store -- --test-threads=4`: 199 lib tests and every integration binary ok, 0 failed (`reporting_settings` 6 passed, among them the new CHECK test; own Postgres through testcontainers).
@@ -270,3 +270,7 @@ Not verified by anyone yet: the new statements on a real ClickHouse (the
 dev API rebuild and the owner's QA run them), the browser, the assistant
 through a model. The reviewer's own re-run was skipped at the owner's
 request.
+
+### Planner review of PR #199 before merge, 2026-10-21 (round M)
+
+One review covers all three items of PR #199: see `docs/superpowers/plans/2026-10-14-bi-18c-layout.md`, section 8, "Planner review of PR #199 before merge, 2026-10-21 (round M)".

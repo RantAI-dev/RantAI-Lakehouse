@@ -112,7 +112,15 @@ const MAX_ITER: u32 = 8;
 
 /// What a late `ask_user` gets back (plan 14). The model reads it on its
 /// next round, so it asks the model to answer with the reading it used.
-const LATE_ASK_REFUSAL: &str = "ask_user must come before any query in a turn. Answer now with the reading you used, and say which reading it is.";
+/// The wording forbids the three defects staging QA saw in the model's
+/// reply: an apology or a mention of the refusal, a closing question in
+/// plain text, and a reply in another language.
+const LATE_ASK_REFUSAL: &str = "ask_user is refused: a turn may ask only before \
+it runs a query, and this turn has run one. Do not apologise and do not \
+mention this refusal. Answer now from the results above with the reading \
+you used, and say in one sentence which reading it is. Do not end with a \
+question: if another reading is possible, name it as a statement. Reply in \
+the language of the user's question.";
 
 /// What a call gets back when the console's allowlist did not offer the tool
 /// (plan 17). The model reads it on its next round, so it is told to answer
@@ -465,17 +473,24 @@ fn without_tool_in_explain(tools: Vec<Value>, newest_user: Option<&str>) -> Vec<
         .collect()
 }
 
-/// Validates the body and assembles the system prompt, history and the tool
-/// list for this principal and mode. A bad body is a ready 400 response.
-async fn prepare_chat(
+/// R30: the note for a person who cannot change dashboards goes before the
+/// closing language line, which stays last.
+fn with_permission_note(
     state: &AppState,
-    principal: Option<&Principal>,
-    headers: &axum::http::HeaderMap,
-    parsed: ChatBody,
-) -> Result<PreparedChat, Response> {
-    let perms = principal.map(|p| &p.permissions);
-    let history: Vec<LlmMessage> = parsed
-        .messages
+    sys: String,
+    perms: Option<&lakehouse_auth::PermissionSet>,
+    recent_user: &[&str],
+) -> String {
+    let closing = prompt::closing(
+        recent_user.last().copied().unwrap_or_default(),
+        state.config.ai_default_reply_language,
+    );
+    prompt::with_permission_note(sys, perms, &closing)
+}
+
+/// The user and assistant turns of a request as model messages.
+fn history_of(messages: &[IncomingMessage]) -> Vec<LlmMessage> {
+    messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| LlmMessage {
@@ -489,7 +504,19 @@ async fn prepare_chat(
             tool_call_id: None,
             name: None,
         })
-        .collect();
+        .collect()
+}
+
+/// Validates the body and assembles the system prompt, history and the tool
+/// list for this principal and mode. A bad body is a ready 400 response.
+async fn prepare_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    parsed: ChatBody,
+) -> Result<PreparedChat, Response> {
+    let perms = principal.map(|p| &p.permissions);
+    let history = history_of(&parsed.messages);
     if history.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -497,7 +524,6 @@ async fn prepare_chat(
         )
             .into_response());
     }
-
     let is_build = parsed.mode.as_deref() == Some("build");
     let recent_user: Vec<&str> = parsed
         .messages
@@ -538,7 +564,6 @@ async fn prepare_chat(
             relevant.contains(name)
         })
         .collect();
-
     // The rules for asking are written only for a chat that can ask: one
     // whose tool list holds `ask_user`. The SQL help rules follow the same
     // rule for `propose_sql`.
@@ -562,7 +587,7 @@ async fn prepare_chat(
         sql_help,
     )
     .await;
-
+    let sys = with_permission_note(state, sys, perms, &recent_user);
     let mut messages = vec![LlmMessage {
         role: LlmMessageRole::System,
         content: Some(sys),
@@ -2389,6 +2414,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_late_ask_refusal_forbids_an_apology_a_closing_question_and_another_language() {
+        // The constant is the only instruction the model reads on its next
+        // round, so it must forbid the three defects staging QA saw.
+        let text = LATE_ASK_REFUSAL.to_lowercase();
+        assert!(
+            text.contains("apologi"),
+            "the refusal must forbid an apology, got: {text}"
+        );
+        assert!(
+            text.contains("do not end with a question"),
+            "the refusal must forbid a closing question in plain text, got: {text}"
+        );
+        assert!(
+            text.contains("language of the user's question"),
+            "the refusal must tell the model to reply in the user's language, got: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn with_both_switches_on_the_count_rules_come_after_the_ask_back_rules() {
         let state = state_with_ask_back_and_layer("true", "true");
@@ -2637,6 +2681,50 @@ mod tests {
             "the language line is unchanged in build mode: {system}"
         );
         assert!(lang.contains("Indonesian"), "{lang}");
+    }
+
+    /// BI-18 part C review fix (SHOULD-FIX) R30: the chat of a person who cannot
+    /// change dashboards says why the tools are withheld, ahead of the language
+    /// line; a person who can gets no such sentence.
+    #[tokio::test]
+    async fn a_chat_without_dashboard_write_says_the_tools_are_withheld_for_permissions() {
+        let state = state_with_ask_back("false");
+        let headers = axum::http::HeaderMap::new();
+        let system = |who: Principal| {
+            let state = state.clone();
+            let headers = headers.clone();
+            async move {
+                let chat = prepare_chat(
+                    &state,
+                    Some(&who),
+                    &headers,
+                    history_of(&[("user", "Move the map charts to a new tab.")]),
+                )
+                .await
+                .map_err(|_| "a valid body")
+                .expect("a prepared chat");
+                chat.messages[0].content.clone().unwrap_or_default()
+            }
+        };
+        let viewer = system(analyst(1)).await;
+        assert!(
+            viewer.contains(
+                "Your account cannot change dashboards; ask an editor or an administrator."
+            ),
+            "{viewer}"
+        );
+        assert!(
+            viewer.find("Your account cannot change dashboards")
+                < viewer.find(&prompt::closing("Move the map charts to a new tab.", None)),
+            "the sentence comes before the language line"
+        );
+        let mut editor = analyst(2);
+        editor.permissions = lakehouse_auth::PermissionSet::parse("dashboard:write, query:read");
+        assert!(
+            !system(editor)
+                .await
+                .contains("Your account cannot change dashboards")
+        );
     }
 
     #[tokio::test]

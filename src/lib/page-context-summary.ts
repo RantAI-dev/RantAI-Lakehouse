@@ -41,6 +41,9 @@ export type FilterLike = FilterDef
 const DEFAULT_ROWS = 5
 const DEFAULT_CHARS = 5000
 const VALUE_CHARS = 40
+/** The tab list's own budget, and where the chart-to-tab mapping is read. */
+const TAB_MAX_CHARS = 600
+const TAB_HINT = "; list_charts gives each chart's tab"
 
 /** One value, compact: numbers as-is, text clipped, empties as "∅". */
 function fmt(value: unknown): string {
@@ -159,20 +162,42 @@ export function summarizeParams(controls: { param: { name: string; type: string 
  * The dashboard's tabs for the assistant (BI-18 part C, AI-9): each with its
  * id, whether it is the open one, and the chart ids on it, so "put the map
  * charts in a separate tab" can be done with `move_charts_to_tab`.
+ *
+ * A board with many charts lists too long to send, so over the budget each
+ * tab carries the number of charts on it instead of their ids, and the
+ * summary says where the ids can be read.
  */
 export function summarizeTabs(
   tabs: readonly { id: string; title: string }[],
   tabOfChart: (id: string) => string | undefined,
   chartIds: readonly string[],
   selected?: string,
+  opts: { maxChars?: number } = {}
 ): string {
   if (tabs.length === 0) return "none (the dashboard has no tabs)"
-  return tabs
-    .map((t) => {
-      const ids = chartIds.filter((id) => tabOfChart(id) === t.id)
-      return `"${t.title}" (id ${t.id}${t.id === selected ? ", open" : ""}; ${ids.length ? `charts ${ids.join(", ")}` : "no charts"})`
-    })
+  const maxChars = opts.maxChars ?? TAB_MAX_CHARS
+  const tabLine = (t: { id: string; title: string }, charts: string) =>
+    `"${t.title}" (id ${t.id}${t.id === selected ? ", open" : ""}; ${charts})`
+  const perTab = tabs.map((t) => ({
+    tab: t,
+    charts: chartIds.filter((id) => tabOfChart(id) === t.id),
+  }))
+  const full = perTab
+    .map(({ tab, charts }) => tabLine(tab, charts.length ? `charts ${charts.join(", ")}` : "no charts"))
     .join("; ")
+  if (full.length <= maxChars) return full
+  // Over the budget: count the charts per tab instead of naming them.
+  const counted = perTab.map(({ tab, charts }) =>
+    tabLine(tab, charts.length ? `${charts.length} chart${charts.length === 1 ? "" : "s"}` : "no charts")
+  )
+  // Tabs that do not fit are left out, so the list stays inside the budget.
+  const kept: string[] = []
+  for (const line of counted) {
+    if ([...kept, line].join("; ").length > maxChars) break
+    kept.push(line)
+  }
+  const list = kept.length ? kept.join("; ") : clip(counted[0], maxChars)
+  return `${list}${TAB_HINT}`
 }
 
 /** The SQL in the editor plus the first rows of its last result. */

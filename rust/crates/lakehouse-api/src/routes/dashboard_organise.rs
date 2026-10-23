@@ -118,13 +118,14 @@ pub(crate) async fn require_board(ch: &ChClient, id: &str, viewer: &Viewer) -> R
     }
 }
 
-/// Require that a chart may be put on dashboard `board` (`None`, blank or the
-/// built-in board always pass; so does an id that never existed, as before).
+/// Require that a chart may be put on dashboard `board` (`None` and blank
+/// always pass, and so does the built-in board).
 ///
 /// # Errors
 ///
-/// As [`require_board`] when the dashboard is in the trash or private to
-/// somebody else.
+/// As [`require_board`]: an id that never existed is refused like one in the
+/// trash or private to somebody else, so the answer does not tell the three
+/// apart (`PR #199 review M SHOULD-FIX BI-18 1`).
 pub(crate) async fn require_chart_board(
     ch: &ChClient,
     board: Option<&str>,
@@ -138,7 +139,15 @@ pub(crate) async fn require_chart_board(
         .await
         .map_err(Gate::Store)?
     {
-        Some((2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
+        // An id that never existed used to pass, and the chart was created on
+        // a dashboard nobody has: the status code then told a caller that the
+        // id is unknown, while a private one was refused. Both are refused
+        // now, with the same sentence.
+        //
+        // A dashboard that was purged for good (state 1) is refused like one
+        // in the trash: a chart may not be created on a dashboard that is
+        // gone (`PR #199 review O SHOULD-FIX 2`).
+        None | Some((1 | 2, _)) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         Some((_, owner)) if !viewer.sees(&owner) => Err(Gate::Missing(BOARD_NOT_FOUND)),
         _ => Ok(()),
     }
@@ -223,29 +232,47 @@ pub(crate) async fn visible_live_chart_board(
         .map(|()| board))
 }
 
-/// Check that an edit may write chart `id`: it is not in the trash and not on a
-/// board the viewer may not see. Returns the board it is on now, `None` for a
-/// new id (an edit of an unknown id keeps creating one, as before).
+/// Check that an edit may write chart `id`: it is not in the trash, not purged
+/// for good, and not on a board the viewer may not see. Returns the board it
+/// is on now.
 ///
 /// # Errors
 ///
-/// [`Gate::Missing`] for a chart in the trash or on a board the viewer cannot
-/// see; [`Gate::Store`] when the store is unreachable.
+/// [`Gate::Missing`] for a chart that never existed, one in the trash, one
+/// purged for good and one on a board the viewer cannot see: all four answer
+/// the same sentence, so the status code does not tell a caller that a chart
+/// of somebody else exists (`PR #199 review M SHOULD-FIX BI-18 1`); and so
+/// that an edit cannot bring a purged chart back to life
+/// (`PR #199 review O SHOULD-FIX 2`). [`Gate::Store`] when the store is
+/// unreachable.
 pub(crate) async fn require_editable_chart(
     ch: &ChClient,
     id: &str,
     viewer: &Viewer,
-) -> Result<Option<String>, Gate> {
+) -> Result<String, Gate> {
     let Some((state, board)) = store::chart_row_state(ch, id).await.map_err(Gate::Store)? else {
-        return Ok(None);
+        // An id that never existed used to be edited into a new chart, so the
+        // status code told a caller that the chart is unknown, while one on a
+        // board they cannot see was refused.
+        return Err(Gate::Missing(CHART_NOT_FOUND));
     };
     match state {
         0 => {
-            require_chart_board(ch, Some(&board), viewer).await?;
-            Ok(Some(board))
+            // The chart's own sentence, not the dashboard's: a caller must not
+            // learn that a chart of somebody else exists.
+            require_chart_board(ch, Some(&board), viewer)
+                .await
+                .map_err(|gate| match gate {
+                    Gate::Missing(_) => Gate::Missing(CHART_NOT_FOUND),
+                    other @ Gate::Store(_) => other,
+                })?;
+            Ok(board)
         }
-        2 => Err(Gate::Missing(CHART_NOT_FOUND)),
-        _ => Ok(None),
+        // A chart in the trash (2) can be restored, a purged one (1) is gone
+        // for good: an edit of either would bring it back without a restore,
+        // so both are refused like an id that never existed. Any other state
+        // is refused too (fail closed).
+        _ => Err(Gate::Missing(CHART_NOT_FOUND)),
     }
 }
 
@@ -389,6 +416,9 @@ struct RevertPlan {
     /// Titles of charts the version had that were removed from the trash for
     /// good: they cannot come back, and their tiles are left out.
     gone: Vec<String>,
+    /// Titles of charts the version had that now sit on another dashboard:
+    /// they are not on this one any more, and their tiles are left out.
+    moved: Vec<String>,
     /// Ids of charts on the dashboard now that the version did not have.
     added_since: Vec<String>,
     /// The layout and phone layout with the tiles of skipped charts removed.
@@ -433,13 +463,23 @@ async fn prepare_revert(
     number: u32,
     time: &lakehouse_bi::grain::TimeContext,
 ) -> Result<RevertPlan, ApiError> {
-    let live: Vec<StoredChartSpec> = store::list_stored_charts(ch, &Viewer::system())
+    let all_live: Vec<StoredChartSpec> = store::list_stored_charts(ch, &Viewer::system())
         .await
-        .map_err(|err| classify_ch_error(&err))?
-        .into_iter()
+        .map_err(|err| classify_ch_error(&err))?;
+    let live: Vec<StoredChartSpec> = all_live
+        .iter()
         .filter(|c| c.board == board)
+        .cloned()
         .collect();
     let live_ids: HashSet<&str> = live.iter().map(|c| c.spec.id.as_str()).collect();
+    // The live charts that are on another dashboard: a chart of the version
+    // that was moved elsewhere is not gone, it sits on another dashboard
+    // (`PR #199 review M SHOULD-FIX BI-18 2`).
+    let elsewhere: HashSet<&str> = all_live
+        .iter()
+        .filter(|c| c.board != board)
+        .map(|c| c.spec.id.as_str())
+        .collect();
     let trashed = trash::trashed_chart_ids(ch, board)
         .await
         .map_err(|err| classify_ch_error(&err))?;
@@ -477,9 +517,14 @@ async fn prepare_revert(
     let mut charts = Vec::new();
     let mut restored = Vec::new();
     let mut gone = Vec::new();
+    let mut moved = Vec::new();
     for chart in &state.charts {
         if !kept_ids.contains(chart.id.as_str()) {
-            gone.push(chart.title.clone());
+            if elsewhere.contains(chart.id.as_str()) {
+                moved.push(chart.title.clone());
+            } else {
+                gone.push(chart.title.clone());
+            }
             continue;
         }
         if !live_ids.contains(chart.id.as_str()) {
@@ -496,6 +541,7 @@ async fn prepare_revert(
         charts,
         restored,
         gone,
+        moved,
         added_since,
         layout,
         phone_layout,
@@ -636,6 +682,7 @@ pub async fn revert(
         "chartsRemoved": plan.added_since.len(),
         "chartsRestored": plan.restored,
         "chartsGone": plan.gone,
+        "chartsMoved": plan.moved,
     })))
 }
 

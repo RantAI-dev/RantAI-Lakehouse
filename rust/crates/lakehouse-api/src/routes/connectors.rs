@@ -1631,12 +1631,14 @@ fn slots_cover(required: usize, primary: bool, secondary: bool) -> bool {
 
 /// Whether a connector can have a second credential: an S3-shaped `files`
 /// connector (access key + secret key) or a `rest` one (basic auth's
-/// username + password, an `OAuth2` client id + secret). Every other adapter
+/// username + password, an `OAuth2` client id + secret) or a `saas` one (a
+/// browser sign-in's client secret + refresh token, `SRC-3`; a vendor's
+/// integration credential may fill one slot or two). Every other adapter
 /// reads exactly one (`secret_field_names`). A pre-WS3 row with no adapter
 /// keeps whatever slots it already has.
 fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
     match dial_info.adapter.as_deref() {
-        Some("files" | "rest") => true,
+        Some("files" | "rest" | "saas") => true,
         Some(_) => false,
         None => dial_info.secret_ref_secondary.is_some(),
     }
@@ -2471,7 +2473,8 @@ fn resolve_debezium_source_target(
                 | Dial::Sheets(_)
                 | Dial::Mongo(_)
                 | Dial::Kafka(_)
-                | Dial::Sftp(_) => {
+                | Dial::Sftp(_)
+                | Dial::Saas(_) => {
                     return Err(ApiError::BadRequest(format!(
                         "connector {id} is registered with adapter {adapter:?} but its parsed \
                          dial is not a sql/cdc shape"
@@ -3325,7 +3328,8 @@ pub struct IngestCredentialBody {
 /// when `dial.endpoint` is set — a `files` dial with no endpoint override
 /// has no caller-supplied host to check) and `rest` (`dial.baseUrl`,
 /// parsed the same way [`connector_probe::probe_s3`] parses an S3
-/// endpoint) against [`connector_probe::resolve_checked`], gated the SAME
+/// endpoint) and `saas` (the vendor table's API and token addresses, built
+/// from `dial.account`) against [`connector_probe::resolve_checked`], gated the SAME
 /// way [`connector_probe::probe`] already is by
 /// `&state.config.connector_internal_hosts()`. Never checks
 /// `sheets`: its dial names a spreadsheet id, not a caller-chosen host —
@@ -3341,7 +3345,15 @@ pub struct IngestCredentialBody {
 async fn check_dial_ssrf(
     dial: &Dial,
     internal_hosts: &crate::internal_hosts::InternalHosts,
+    oauth: crate::connector_oauth::OAuthSettings,
 ) -> Result<(), ApiError> {
+    // `SRC-3` AD2: a `saas` dial dials the API host and the token host the
+    // vendor table builds from `account`; both are checked, since they can
+    // differ (a vendor's sign-in service is not its API).
+    let saas_urls: Vec<String> = match dial {
+        Dial::Saas(saas) => saas_dialled_urls(saas, oauth),
+        _ => Vec::new(),
+    };
     let host_port: Option<(&str, u16)> = match dial {
         Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
         Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
@@ -3362,8 +3374,16 @@ async fn check_dial_ssrf(
         // already has (its dial names a spreadsheet id, not a
         // caller-chosen host). The authoritative check for these
         // adapters stays in Dagster, not here.
-        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) | Dial::Saas(_) => None,
     };
+    for url in &saas_urls {
+        if let Some((host, port)) = connector_probe::parse_endpoint_host_port(url) {
+            connector_probe::resolve_checked(host, port, internal_hosts)
+                .await
+                .map(|_approved| ())
+                .map_err(ApiError::BadRequest)?;
+        }
+    }
     let Some((host, port)) = host_port else {
         return Ok(());
     };
@@ -3373,6 +3393,35 @@ async fn check_dial_ssrf(
         .await
         .map(|_approved| ())
         .map_err(ApiError::BadRequest)
+}
+
+/// The addresses a `saas` dial makes the product dial: the vendor's API base
+/// and token endpoint, built from the vendor table and the account
+/// (`SRC-3` AD2). Empty for a dial whose vendor or account no longer
+/// validates ([`Dial::parse`] has refused both before this runs).
+fn saas_dialled_urls(
+    saas: &lakehouse_store::ingest_spec::SaasDial,
+    oauth: crate::connector_oauth::OAuthSettings,
+) -> Vec<String> {
+    use lakehouse_store::saas_vendors::{SaasVendor, vendor};
+    let Some(vendor) = vendor(&saas.vendor) else {
+        return Vec::new();
+    };
+    let Ok(parts) = vendor.validate_account(&saas.account) else {
+        return Vec::new();
+    };
+    // Slice 2 review SHOULD-FIX 5: the gate-only mock origin (a no-op unless the
+    // gate-only switch is on), so the save-time check looks at what will be dialled.
+    [vendor.api_base, vendor.oauth.token_url]
+        .iter()
+        .map(|template| {
+            crate::connector_oauth::gate_rebase(
+                oauth,
+                vendor.id,
+                &SaasVendor::render(template, &parts),
+            )
+        })
+        .collect()
 }
 
 /// `SRC-12 review C1 BLOCKER 1`: refuse an `OAuth2` address the product will
@@ -3622,7 +3671,12 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     let Some(credential) = credential else {
-        check_dial_ssrf(&dial, &state.config.connector_internal_hosts()).await?;
+        check_dial_ssrf(
+            &dial,
+            &state.config.connector_internal_hosts(),
+            state.config.oauth_settings(),
+        )
+        .await?;
         return match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
             Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
                 spec,
@@ -3694,7 +3748,12 @@ async fn save_with_credentials(
     )?;
     let candidate = candidate_dial_info(&after, &changes, None)?;
 
-    check_dial_ssrf(dial, &state.config.connector_internal_hosts()).await?;
+    check_dial_ssrf(
+        dial,
+        &state.config.connector_internal_hosts(),
+        state.config.oauth_settings(),
+    )
+    .await?;
     // Only after the address is approved: a refused target makes no call to
     // the secret manager.
     resolve_references(state, &mut changes, "the change was NOT saved").await?;
@@ -3821,7 +3880,7 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// the ingest run"` (F2.7: Dagster's own text was logged at the
 /// dagster crate boundary), except that a job the orchestrator has not
 /// loaded yet (`outcome.job_not_loaded`) is a 503 with a stable code
-/// (`PR #105 CI fix`); `Err(err)` becomes a 503 `orchestrator_unreachable`,
+/// (`PR #105 CI fix`); `Err(err)` becomes a retryable 503 or a 502,
 /// see below.
 ///
 /// # Errors
@@ -3832,7 +3891,8 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 /// paused (`SRC-8`, [`CONNECTOR_PAUSED`]), if a run for this connector is still
 /// queued or running (see [`connector_runs`]), or if the table named waits
 /// for a schema decision; 422 if `Dagster` reports a launch-time failure; 503
-/// on a `Dagster` transport failure; 503/500 as above for the database pool.
+/// or 502 on a `Dagster` call, as below; 503/500 as above for the database
+/// pool.
 ///
 /// Two `503` answers carry a stable `code` beside the fixed `error`
 /// sentence and a `Retry-After`, so a client retries on the code and never
@@ -3844,11 +3904,16 @@ fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
 ///   location is still loading. It was a `422` before; `503` is the
 ///   route's status for "backing service not ready", the console treats
 ///   any non-2xx the same, and nothing else depends on the `422`.
-/// - `orchestrator_unreachable`: `Dagster` could not be reached or answered
-///   with a protocol failure, on the run list or the launch.
+/// - `orchestrator_unreachable`: `Dagster` could not be reached, or answered
+///   `5xx`, on the run list or the launch — the two failures that mean the
+///   same request will work shortly (`PR #105 review SHOULD-FIX 5` narrowed
+///   this code to them; a GraphQL error, an unreadable body or a `4xx` is a
+///   `502` with no code, because repeating the request unchanged gets the
+///   same answer).
 ///
 /// Every other launch failure stays the generic `422` with a reference id
-/// and no code.
+/// and no code, and a `Dagster` answer this service cannot use is the `502`
+/// above.
 ///
 /// # A run of one table (`SRC-10` decision 5)
 ///

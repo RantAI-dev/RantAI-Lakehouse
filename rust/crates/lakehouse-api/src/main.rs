@@ -41,6 +41,7 @@ mod rustfs_client;
 mod secret_crypto;
 mod secret_manager;
 mod sql_guard;
+mod sql_lineage;
 mod sql_rewrite;
 mod state;
 mod tenant;

@@ -615,6 +615,55 @@ def step_verify_the_silver_rows_match_the_bronze_source() -> None:
     print(f"[g7] silver.{SILVER_TABLE_NAME} holds {silver_rows} rows = the {bronze_rows} distinct ids of bronze.{BRONZE_TABLE_NAME}")
 
 
+def step_verify_column_lineage_of_the_pipeline_target(pipeline_id: str) -> None:
+    """`DATA-13-AC1` on CI: the Silver column the pipeline wrote names the
+    Bronze column it comes from.
+
+    The pipeline's column lineage is written when Dagster's run-status sensor
+    reports the run `SUCCESS` to `POST /api/pipelines/events/run-finished`
+    (the API keeps the SQL it approved at the enforce call until then), which
+    happens a sensor tick after the run ends. So this step polls, and fails
+    with the last answer if no mapping appears: a lineage that never arrives
+    must fail the gate, not be waited out silently.
+
+    The pipeline is `select(id, customer)` over `bronze.<BRONZE_TABLE_NAME>`,
+    so `id` and `customer` of the Silver table must each map back to the
+    column of the same name in the Bronze table, recorded by this pipeline
+    (`producer.kind == "pipeline"`, `producer.ref == <its id>`), and the
+    answer must state the one-year retention."""
+    table = f"silver.{SILVER_TABLE_NAME}"
+    source = f"bronze.{BRONZE_TABLE_NAME}"
+    last: dict = {}
+
+    def mapped(column: str) -> bool:
+        resp = API.get(
+            f"{API_URL}/api/governance/lineage/columns",
+            params={"table": table, "column": column, "direction": "up"},
+            timeout=10,
+        )
+        if not resp.ok:
+            raise G7Failure(f"GET /api/governance/lineage/columns failed: {resp.status_code} {resp.text}")
+        body = resp.json()
+        last.clear()
+        last.update(body)
+        if body.get("supported") is not True or body.get("retention", {}).get("days") != 365:
+            raise G7Failure(f"column lineage must say supported true and a 365-day retention, got: {body}")
+        return any(
+            m.get("from") == {"table": source, "column": column}
+            and m.get("to") == {"table": table, "column": column}
+            and not m.get("partial")
+            and m.get("producer") == {"kind": "pipeline", "ref": pipeline_id}
+            for m in body.get("mappings", [])
+        )
+
+    for column in ("id", "customer"):
+        try:
+            _wait_for(f"column lineage {table}.{column} <- {source}.{column}", lambda c=column: mapped(c), 180)
+        except G7Failure as exc:
+            raise G7Failure(f"{exc}; last answer: {last}") from exc
+    print(f"[g7] {table} maps id and customer back to {source}, recorded by the pipeline")
+
+
 # ── BLD-4: a chain after `ingest_job` fires only for its own table ──────
 
 # The one upstream this half proves: `dagster/dispar_orchestrate/
@@ -1371,6 +1420,7 @@ def main() -> int:
         pipeline_id = step_create_and_activate_authored_pipeline()
         step_trigger_and_wait_for_real_row_materializations(pipeline_id)
         step_verify_the_silver_rows_match_the_bronze_source()
+        step_verify_column_lineage_of_the_pipeline_target(pipeline_id)
         step_verify_graph_and_source()
         step_verify_target_lag_bronze_to_silver(pipeline_id)
     except G7Failure as exc:

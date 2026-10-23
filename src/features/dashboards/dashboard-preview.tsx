@@ -8,7 +8,7 @@ import { useTheme } from "next-themes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useService } from "@/hooks/use-service";
 import type { ChartRenderSpec } from "@/lib/dashboard-specs";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import type { LayoutMap } from "@/services";
 import { apiFetch } from "@/services/http";
 import { TileBody } from "./tile-body";
 import type { TileFailure } from "@/services/contracts/dashboards";

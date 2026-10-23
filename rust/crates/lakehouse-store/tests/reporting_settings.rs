@@ -11,9 +11,9 @@ use lakehouse_test_support as _;
 use lakehouse_store::reporting_settings::{ReportingSettings, get, upsert};
 use sqlx::PgPool;
 
-/// Settings with the formatting defaults of migration `0085` and the empty
-/// content-site list of `0086` and the empty denied-roles list of `0087` and the empty
-/// report-domain list of `0088`.
+/// Settings with the formatting defaults of migration `0086`, the empty
+/// content-site list of `0087`, the empty denied-roles list of `0088` and the
+/// empty report-domain list of `0089`.
 fn settings(zone: &str, week: &str) -> ReportingSettings {
     ReportingSettings {
         time_zone: zone.to_owned(),

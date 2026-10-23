@@ -99,3 +99,30 @@ test("a chart grouped by a date grain says so after its measures", () => {
 test("a chart with no measures has no measure label", () => {
   expect(draftMeasureLabel(chartDefFromArgs({ title: "T", mart: "mart_x" }), undefined)).toBe("")
 })
+
+// BI-18 part C review fix (SHOULD-FIX) R25, R26: the draft previews what Confirm saves.
+test("a histogram's width and a progress goal reach the preview as the model sent them", () => {
+  const histogram = chartDefFromArgs({ title: "H", kind: "histogram", mart: "m", dimension: "visitors", histogram: { width: 500 } })
+  expect(histogram.histogram).toEqual({ width: 500 })
+  const progress = chartDefFromArgs({ title: "P", kind: "progress", mart: "m", measures: ["visitors"], goal: 300000 })
+  expect(progress.goal).toBe(300000)
+  const second = chartDefFromArgs({ title: "B", kind: "bullet", mart: "m", dimension: "d", measures: ["a", "b"], goal: { measure: "b" }, bands: [1, 2, 3] })
+  expect(second.goal).toEqual({ measure: "b" })
+  expect(second.bands).toEqual([1, 2, 3])
+  const image = chartDefFromArgs({ title: "I", kind: "image", url: "https://example.com/a.png", alt: "A" })
+  expect([image.url, image.alt]).toEqual(["https://example.com/a.png", "A"])
+})
+
+test("every field Confirm sends is in the draft, so the previewed and saved charts are one", () => {
+  const args = {
+    title: "T", kind: "bar", mart: "m", dimension: "d", measures: ["v"],
+    format: { style: "currency", currency: "IDR" }, colors: { series: { v: "#16a34a" } },
+    histogram: { count: 10 }, goal: 5, bands: [1], url: "https://example.com", alt: "x",
+  }
+  const def = chartDefFromArgs(args) as Record<string, unknown>
+  for (const key of ["format", "colors", "histogram", "goal", "bands", "url", "alt"]) {
+    expect(def[key]).toEqual((args as Record<string, unknown>)[key])
+  }
+  // Not sending a width or a count stays automatic: no histogram key appears.
+  expect(chartDefFromArgs({ title: "H", kind: "histogram", mart: "m", dimension: "v" }).histogram).toBeUndefined()
+})

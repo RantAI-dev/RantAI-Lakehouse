@@ -27,8 +27,7 @@ import {
 } from "@/lib/formatting-settings"
 import { listTimeZones } from "@/lib/time-zones"
 import { withNotify } from "@/lib/notify"
-import { identityService, settingsService } from "@/services"
-import type { ReportingSettingsInput } from "@/services/contracts/settings"
+import { identityService, settingsService, type ReportingSettingsInput } from "@/services"
 
 const WEEK_STARTS = { monday: "Monday", sunday: "Sunday" } as const
 

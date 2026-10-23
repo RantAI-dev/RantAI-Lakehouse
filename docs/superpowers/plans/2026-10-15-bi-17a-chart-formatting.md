@@ -294,7 +294,7 @@ Branch `feat/bi-phase-3`, from `ea3e034e`. Developer: Claude Sonnet. Nothing pus
 **Checks run** (all in the foreground, `CARGO_TARGET_DIR=/home/hv/.cache/lakehouse-uiux-target CARGO_BUILD_JOBS=2`, on the final code before the T9 and handoff commits, which touch only Markdown):
 
 - `cd rust && cargo fmt --check`: clean.
-- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings`: no warnings.
+- `cargo clippy -p lakehouse-bi -p lakehouse-store -p lakehouse-api --all-targets -- -D warnings`: no warnings. **Corrected in the handoff of round M (2026-10-21): this was not true for the code as it was finally merged. The run on the final code fails at `lakehouse-bi/src/style.rs` with `clippy::needless_pass_by_value` (the test helper `colours_of`), which is what CI reported in round M; the helper takes the value by reference now.**
 - `cargo test -p lakehouse-bi -- --test-threads=4`: 490 passed, 3 ignored, 0 failed (lib), plus `specs_match_typescript` 1 passed.
 - `cargo test -p lakehouse-store -- --test-threads=4`: every test binary ok, 0 failed (`reporting_settings` 5 passed). The store tests start their own Postgres through `lakehouse-test-support` (testcontainers), so no `DATABASE_URL` was set or needed.
 - `cargo test -p lakehouse-api --lib -- --test-threads=4 settings dashboard ai:: embed`: 522 passed, 4 ignored, 0 failed.
@@ -376,3 +376,13 @@ and BI-16 B's `0073_reporting_content_sites.sql` is
 branches and `0090` to `0094` are reserved by Data phase 3). The file
 contents did not change. A database that applied them as 72 and 73 (only
 the dev stack) needs its two `_sqlx_migrations` rows fixed by hand.
+
+**Renumbered again (round M, decision M4, 2026-10-21).** `main` took `0085`
+for `0085_quality_incident_stale.sql` (`DATA-14`), so the two files are now
+`0086_reporting_formatting.sql` and `0087_reporting_content_sites.sql`, with
+their contents unchanged. A database that applied them as 85 and 86 (only the
+dev stack) needs its two `_sqlx_migrations` rows fixed by hand.
+
+### Planner review of PR #199 before merge, 2026-10-21 (round M)
+
+One review covers all three items of PR #199: see `docs/superpowers/plans/2026-10-14-bi-18c-layout.md`, section 8, "Planner review of PR #199 before merge, 2026-10-21 (round M)".

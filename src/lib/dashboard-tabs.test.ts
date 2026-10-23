@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import type { BoardTab, FilterDef, LayoutMap } from "@/services/clients/bi-store"
+import type { BoardTab, LayoutMap } from "@/services";
+import type { FilterDef } from "@/services/clients/bi-store";
 import {
   addTab, appliesOnTab, bottomOfTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab, placeUnboxed,
   phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,

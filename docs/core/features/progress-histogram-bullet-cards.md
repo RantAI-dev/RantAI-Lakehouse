@@ -56,6 +56,9 @@ Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 - The allowed-sites list is checked when a card is saved and when it is
   shown. The console does not yet send a Content-Security-Policy that
   would enforce it in the browser as well; that is a separate backlog item.
+- The list is checked against the address as it was written: an image or a
+  frame that follows a redirect is shown wherever that redirect goes, so a
+  site on the list can send the browser to a site that is not on it.
 
 ## Coverage against Metabase
 

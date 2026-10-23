@@ -48,7 +48,7 @@ jobs:
       # never calls extract, and the workspace has no direct zip dependency.
       # See rust/deny.toml for the full justification.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0381
         working-directory: rust
 
   cargo-deny:

@@ -101,12 +101,50 @@ describe("axes", () => {
     expect(styled.option).toBe(option)
   })
 
+  test("a logarithmic axis is refused when a box has a number at or below zero", () => {
+    // A box plot's entry is its five numbers: the check used to read only the
+    // last one, so a box whose minimum was negative got a logarithmic axis.
+    const box = [
+      { k: "Bali", v: [10, 20, 30, 40, 50] },
+      { k: "Java", v: [-5, 20, 30, 40, 50] },
+    ]
+    const option = buildOption({ kind: "boxplot", x: "k", y: "v" } as never, box, false)
+    const styled = styleOption(option, { kind: "boxplot", y: "v", style: { axes: { y: { log: true } } }, locale: "en-US", decimals: 0 })
+    expect(styled.message).toBe("A logarithmic axis cannot show zero or negative values")
+  })
+
+  test("a logarithmic axis is refused when a line or a band sits at or below zero", () => {
+    const style: StyleFields = { axes: { y: { log: true } } }
+    const option = buildOption({ kind: "bar", x: "k", y: "v" } as never, rows, false)
+    for (const line of [
+      { value: 0 },
+      { value: -10 },
+      { kind: "band" as const, value: -10, to: 100 },
+      { kind: "band" as const, value: 10, to: 0 },
+    ]) {
+      const styled = styleOption(option, { kind: "bar", y: "v", style, locale: "en-US", decimals: 0, referenceLines: [line] })
+      expect(styled.message).toBe("A logarithmic axis cannot show zero or negative values")
+    }
+    // A line above zero is drawn.
+    const ok = styleOption(option, { kind: "bar", y: "v", style, locale: "en-US", decimals: 0, referenceLines: [{ value: 1000 }] })
+    expect(ok.message).toBeUndefined()
+  })
+
   test("values on the right go to a second Y axis", () => {
     const { option } = draw("bar", { axes: { rightValues: ["w"], y2: { title: "Nights" } } }, ["v", "w"])
     const axes = option.yAxis as { name?: string; position?: string }[]
     expect(axes).toHaveLength(2)
     expect(axes[1]).toMatchObject({ position: "right", name: "Nights" })
     expect(series(option).map((s) => s.yAxisIndex)).toEqual([0, 1])
+  })
+
+  test("the second Y axis is named after the values on it when it has no title", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, measureLabels: { w: "Nights" } })
+    const axes = styled.option.yAxis as { name?: string }[]
+    expect(axes[1]!.name).toBe("Nights")
   })
 })
 
@@ -135,6 +173,27 @@ describe("data labels and notes", () => {
     ])
     expect(html).toContain("w")
     expect(html).not.toContain("1,200")
+  })
+
+  test("a note with markup is drawn as text, not as HTML", () => {
+    const style: StyleFields = { annotations: [{ x: "Java", text: '<img src=x onerror="alert(1)">' }] }
+    const { option } = draw("bar", style)
+    const pin = (series(option)[0]!.markPoint as { tooltip: { formatter: (p: { name?: string }) => string } }).tooltip
+    const html = pin.formatter({ name: '<img src=x onerror="alert(1)">' })
+    expect(html).not.toContain("<img")
+    expect(html).toContain("&lt;img")
+  })
+
+  test("the tooltip fields escape the series name and the axis label", () => {
+    const { option } = draw("bar", { tooltip: { fields: ["w"] } }, ["v", "w"])
+    const format = (option.tooltip as { formatter: (p: unknown) => string }).formatter
+    const html = format([
+      { axisValueLabel: '<img src=x onerror="alert(1)">', seriesIndex: 1, seriesName: '<b>name</b>', value: 3 },
+    ])
+    expect(html).not.toContain("<img")
+    expect(html).not.toContain("<b>name</b>")
+    expect(html).toContain("&lt;img")
+    expect(html).toContain("&lt;b&gt;name")
   })
 })
 
@@ -195,5 +254,47 @@ describe("reference lines", () => {
     const empty = { values: () => [] as number[] }
     const o = base()
     expect(withReferenceLines(o, [{ kind: "average" }], false, false, empty)).toBe(o)
+  })
+
+  test("a computed line for a measure on the right axis is drawn on that axis and widens it only", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const cols = seriesColumns({ kind: "bar", y, breakdown: false }, 2)
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, columns: cols })
+    const ctx = {
+      values: (measure?: string) => rows.map((r) => Number(r[(measure ?? "v") as "v"])),
+      format: (_m: string | undefined, v: number) => String(v),
+    }
+    const out = withReferenceLines(styled.option, [{ kind: "average", measure: "w" }], false, false, ctx, cols) as unknown as {
+      series: { markLine?: { data: { yAxis: number; name?: string }[] } }[]
+      yAxis: { max?: unknown }[]
+    }
+    // The line hangs on the first series of the right axis, not on the first series.
+    expect(out.series[0]!.markLine).toBeUndefined()
+    expect(out.series[1]!.markLine!.data).toEqual([{ yAxis: 4, name: "Average" }])
+    // And only the right axis is widened.
+    expect(out.yAxis[0]!.max).toBeUndefined()
+    expect(typeof out.yAxis[1]!.max).toBe("function")
+  })
+
+  test("a computed line without a measure stays on the first axis", () => {
+    const style: StyleFields = { axes: { rightValues: ["w"] } }
+    const y = ["v", "w"]
+    const option = buildOption({ kind: "bar", x: "k", y } as never, rows, false, { style, locale: "en-US", companyPalette: [] })
+    const cols = seriesColumns({ kind: "bar", y, breakdown: false }, 2)
+    const styled = styleOption(option, { kind: "bar", y, breakdown: false, style, locale: "en-US", decimals: 0, columns: cols })
+    const ctx = {
+      values: (measure?: string) => rows.map((r) => Number(r[(measure ?? "v") as "v"])),
+      format: (_m: string | undefined, v: number) => String(v),
+    }
+    const out = withReferenceLines(styled.option, [{ kind: "average" }], false, false, ctx, cols) as unknown as {
+      series: { markLine?: { data: { yAxis: number; name?: string }[] } }[]
+      yAxis: { max?: unknown }[]
+    }
+    expect(out.series[0]!.markLine!.data).toEqual([{ yAxis: 1400, name: "Average" }])
+    expect(out.series[1]!.markLine).toBeUndefined()
+    expect(typeof out.yAxis[0]!.max).toBe("function")
+    expect(out.yAxis[1]!.max).toBeUndefined()
   })
 })

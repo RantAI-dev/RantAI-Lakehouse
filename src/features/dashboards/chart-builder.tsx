@@ -1,5 +1,8 @@
 "use client";
 
+import { governedPairLabels } from "@/features/catalog/governed-tags"
+import { Pill } from "@/components/patterns/status-badge"
+
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
@@ -28,6 +31,8 @@ import {
   type ChartSourceChoice,
 } from "@/lib/chart-source";
 import { useAuth } from "@/features/auth/auth-provider";
+import { DeprecationNotice } from "@/features/catalog/asset-certification";
+import { CertificationBadge } from "@/components/patterns/status-badge";
 import {
   NEW_SQL_CHOICE, fieldsFromColumns, keepIfOffered,
 } from "@/lib/sql-source-draft";
@@ -67,6 +72,7 @@ import {
 import { cn } from "@/lib/utils";
 import { DEFAULT_CHOROPLETH_MAP, DEFAULT_POINT_MAP, MAP_CATALOGUE, mapCredit } from "./echarts-maps";
 import { SqlRowsTable, SqlSourcePanel } from "./sql-source-panel";
+import { selectedMart, type Mart } from "./mart-marks";
 import { JoinsSection, type JoinTableInfo } from "./joins-section";
 import { LayersSection } from "./layers-section";
 import { layerDraftsFromDef, layerProblems, layersPayload, takesLayers, type LayerDraft } from "@/lib/chart-layers";
@@ -77,7 +83,7 @@ import { readKindListPref, writeKindListPref } from "@/lib/kind-list-pref";
 import { CustomFieldsMenu } from "./custom-fields-menu";
 import { builderRules, carryOverOnKindSwitch, moreOptionsUsed } from "@/lib/builder-rules";
 import type { StyleFields } from "@/lib/chart-style";
-import { formatRules, formatUsed, styleFromDef, stylePayload } from "@/lib/style-draft";
+import { effectivePalette, formatRules, formatUsed, styleFromDef, stylePayload, withCompanyPalette } from "@/lib/style-draft";
 import { FormatSection } from "./format-section";
 import { FormulaEditorDialog } from "./formula-editor";
 import { isValueGroup, type CalcField } from "@/services/contracts/calc-fields";
@@ -352,7 +358,7 @@ export function ChartBuilder({
   const open = controlled ? openProp! : openState;
   const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
-  const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
+  const [marts, setMarts] = React.useState<Mart[]>([]);
   const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   // BI-8: the formula box. `editing` is the field being changed, absent for a new one.
@@ -388,6 +394,7 @@ export function ChartBuilder({
   // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
   const [source, setSource] = React.useState("");
   const choice = decodeSourceChoice(source);
+  const chosenMart = selectedMart(marts, choice);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
   const [kindQuery, setKindQuery] = React.useState("");
   const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery, KIND_KEYWORDS), [kindQuery]);
@@ -450,8 +457,9 @@ export function ChartBuilder({
   // Raw table, pivot and KPI comparison settings (BI-16 part A).
   const [tableDraft, setTableDraft] = React.useState<TableDraft>(emptyTableDraft);
   // BI-16 part B: the deployment's content sites, a progress bar's goal, a bullet's bands, a histogram's ranges, a card's address.
-  const { contentSites } = useReporting();
+  const { contentSites, companyPalette } = useReporting();
   const sites = contentSites ?? [];
+  const palette = companyPalette ?? [];
   const [typeDraft, setTypeDraft] = React.useState<TypeDraft>(emptyTypeDraft);
   const changeType = (patch: Partial<TypeDraft>) => setTypeDraft((d) => ({ ...d, ...patch }));
   const isText = kind === "text";
@@ -1036,7 +1044,12 @@ export function ChartBuilder({
       };
     }
     // BI-17 part A: only the groups this kind takes, with empty ones left out.
-    if (!isStaticTile) Object.assign(payload, stylePayload(style, fmtRules));
+    // A new chart in a deployment with a company palette draws with it
+    // (decision 6, `PR #199 review M SHOULD-FIX BI-17 4`).
+    if (!isStaticTile) {
+      const styled = stylePayload(style, fmtRules);
+      Object.assign(payload, fmtRules.colors ? withCompanyPalette(styled, palette, isEdit) : styled);
+    }
     // A chart without marks to click (text, KPI, gauge, table, density map)
     // has no click setting; one left over from another kind is dropped.
     const clickable = kindHasClickValue(kind);
@@ -1268,11 +1281,29 @@ export function ChartBuilder({
               <SelectContent>
                 <SelectGroup>
                   <SelectLabel>Gold marts</SelectLabel>
-                  {marts.map((m) => (
-                    <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
-                      {m.name} · {m.rows.toLocaleString("id-ID")}
-                    </SelectItem>
-                  ))}
+                  {marts.map((m) => {
+                    const governed = governedPairLabels(m.governedTags)
+                    const tags = m.tags ?? []
+                    return (
+                      <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                        <span className="flex items-center gap-1.5 flex-wrap">
+                          <span>{m.name} · {m.rows.toLocaleString("id-ID")}</span>
+                          {/* DATA-12 part 3 & PR #106 review R1 BLOCKER 2: mark and tags */}
+                          <CertificationBadge certification={m.certification} />
+                          {governed.map((pair) => (
+                            <Pill key={`governed:${pair}`} tone="info" className="text-[10px]">
+                              {pair}
+                            </Pill>
+                          ))}
+                          {tags.map((tag) => (
+                            <Pill key={tag} tone="neutral" className="text-[10px]">
+                              {tag}
+                            </Pill>
+                          ))}
+                        </span>
+                      </SelectItem>
+                    )
+                  })}
                 </SelectGroup>
                 {sqlSources.length ? (
                   <SelectGroup>
@@ -1294,6 +1325,9 @@ export function ChartBuilder({
                 ) : null}
               </SelectContent>
             </Select>
+            {/* DATA-12 part 3: a deprecated mart still works; it warns, with the
+                note and a link to its replacement, and never blocks. */}
+            {chosenMart ? <DeprecationNotice asset={chosenMart} /> : null}
             {choice?.kind === "mart" ? (
               <JoinsSection
                 baseMart={baseMart}
@@ -1580,7 +1614,7 @@ export function ChartBuilder({
 
           {/* BI-17 part A: formats, colours, axes, labels, reference lines, notes, tooltip; conditional colours for tables and KPIs. */}
           <FoldSection number={5} title="Format" open={formatOpen} onOpenChange={setFormatOpen} panelRef={(n) => { panelRefs.current[5] = n; }}>
-            <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames}>
+            <FormatSection rules={fmtRules} style={style} onChange={setStyle} valueNames={formatValueNames} seriesNames={formatValueNames} paletteValue={effectivePalette(style, palette, isEdit)}>
               {rules.referenceLines ? <ReferenceLinesEditor value={refLines} onChange={setRefLines} numberParams={numberParamDefs} valueNames={resultNames} /> : null}
             </FormatSection>
           </FoldSection>

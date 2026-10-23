@@ -1109,6 +1109,18 @@ services:
               }
             }'
         fi
+        # DATA-15 F4: a dropped table is kept 7 days (604800 s) and can be
+        # undropped from its asset page; Lakekeeper 0.13.3's default is a
+        # hard delete, which cannot come back. Applied on every run, not
+        # only on create, so an existing warehouse gets it too and a rerun
+        # changes nothing (the same profile is written again). A table
+        # dropped before this ran was hard-deleted and is not recoverable.
+        wh_id=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .id')
+        curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse/$$wh_id/delete-profile" \
+          -H 'Content-Type: application/json' \
+          -d '{"delete-profile": {"type": "soft", "expiration-seconds": 604800}}' >/dev/null
     restart: "no"
 
   # R1 — one-shot: self-register every non-admin principal
@@ -1757,6 +1769,18 @@ services:
               }
             }'
         fi
+        # DATA-15 F4: a dropped table is kept 7 days (604800 s) and can be
+        # undropped from its asset page; Lakekeeper 0.13.3's default is a
+        # hard delete, which cannot come back. Applied on every run, not
+        # only on create, so an existing warehouse gets it too and a rerun
+        # changes nothing (the same profile is written again). A table
+        # dropped before this ran was hard-deleted and is not recoverable.
+        wh_id=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .id')
+        curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse/$$wh_id/delete-profile" \
+          -H 'Content-Type: application/json' \
+          -d '{"delete-profile": {"type": "soft", "expiration-seconds": 604800}}' >/dev/null
     restart: "no"
 
   # R1 (ADR 0011) — grants for the SEAWEEDFS warehouse. Grants are
@@ -3546,6 +3570,17 @@ services:
       context: ./ops/g6
       dockerfile: Dockerfile.rest_stub
     profiles: ["g6", "g6-other"]
+    restart: "no"
+
+  # SRC-3 (T1.12, AD9): the mock vendor server of the SaaS gate, one container
+  # for every vendor (each on its own path prefix). Gate-only: its own profile,
+  # started by the two `g6-saas-*` jobs and nothing else. It holds no data and no
+  # credential; it is reachable only on the compose network.
+  saas-stub-g6:
+    build:
+      context: ./ops/g6
+      dockerfile: Dockerfile.saas_stub
+    profiles: ["g6-saas"]
     restart: "no"
 
   # Tier 2 (G6) — the mongodb-adapter fixture

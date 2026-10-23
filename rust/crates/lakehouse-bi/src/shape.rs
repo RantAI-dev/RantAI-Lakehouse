@@ -250,9 +250,17 @@ impl Serialize for MeasureList {
 
 impl<'de> Deserialize<'de> for MeasureList {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let entries = Vec::<MeasureEntry>::deserialize(deserializer).map_err(|_| {
+        let entries = Vec::<serde_json::Value>::deserialize(deserializer).map_err(|_| {
             D::Error::custom("measures must be column names, {column, aggregate} or {metric}")
         })?;
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                MeasureEntry::deserialize(&entry)
+                    .map_err(|_| D::Error::custom(measure_refusal(index, &entry)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let is_metric = entries
             .iter()
             .map(|e| matches!(e, MeasureEntry::Metric(_)))
@@ -269,6 +277,37 @@ impl<'de> Deserialize<'de> for MeasureList {
         )
         .with_metrics(is_metric))
     }
+}
+
+/// The sentence for a measure that does not read: which entry of the list it
+/// is, and the entry itself.
+///
+/// One sentence for the whole list leaves the model guessing which of its
+/// entries is wrong, so the entry and its place in the list say it outright.
+fn measure_refusal(index: usize, entry: &serde_json::Value) -> String {
+    let shown: String = entry.to_string().chars().take(80).collect();
+    match plain_string_advice(entry) {
+        Some(value) => format!(
+            "measures[{index}] is not a column name, {{column, aggregate}} or {{metric}}: {shown}; send \"{value}\" as a plain string"
+        ),
+        None => format!(
+            "measures[{index}] is not a column name, {{column, aggregate}} or {{metric}}: {shown}"
+        ),
+    }
+}
+
+/// The text of a measure that came as an object with a single key, when that
+/// key holds a string.
+///
+/// A client that wraps its text sends `{"$text": "jumlah"}` where a measure
+/// is a plain string. The refusal says how to write it instead, because the
+/// model does not know that a measure is a plain string.
+fn plain_string_advice(entry: &serde_json::Value) -> Option<&str> {
+    let object = entry.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.values().next()?.as_str()
 }
 
 /// The result name of a measure with its own aggregate: `avg_stay`. Two
@@ -623,6 +662,24 @@ fn kind_word(kind: ChartKind) -> String {
         .unwrap_or_default()
 }
 
+/// What to send instead of a measure with an aggregate of its own: the one
+/// measure's column and its aggregate when there is exactly one, or the
+/// general sentence when there are more, because then no single column can
+/// be named for the model.
+fn how_to_send_a_measure(measures: &MeasureList) -> String {
+    let own: Vec<(&str, &str)> = measures
+        .entries()
+        .filter_map(|(column, aggregate)| aggregate.map(|aggregate| (column, aggregate)))
+        .collect();
+    match own.as_slice() {
+        [(column, aggregate)] => {
+            format!("send measures: [\"{column}\"] with aggregate: \"{aggregate}\".")
+        }
+        _ => "send the column alone (measures: [\"<column>\"]) and set the chart's aggregate."
+            .to_owned(),
+    }
+}
+
 /// The checks that need neither a relation nor its columns: which fields the
 /// kind takes, and the shape of each.
 ///
@@ -638,8 +695,9 @@ pub fn check_kind_fields(
     let grouped = is_grouped_kind(kind) && !rows_mode;
     if measures.has_own_aggregates() && !grouped {
         return Err(format!(
-            "a {} takes the chart's aggregate; a measure with its own aggregate is for grouped charts and tables.",
-            kind_word(kind)
+            "a {} takes the chart's aggregate; a measure with its own aggregate is for grouped charts and tables; {}",
+            kind_word(kind),
+            how_to_send_a_measure(measures)
         ));
     }
     if let Some(filters) = &shape.filters {
@@ -1096,8 +1154,33 @@ mod tests {
         let err =
             serde_json::from_str::<MeasureList>(r#"[{"column":"stay","aggregate":"avg","x":1}]"#)
                 .unwrap_err();
-        assert!(err.to_string().contains("measures must be"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "measures[0] is not a column name, {column, aggregate} or {metric}: {\"column\":\"stay\",\"aggregate\":\"avg\",\"x\":1}"
+        );
         assert!(serde_json::from_str::<MeasureList>("[1]").is_err());
+    }
+
+    /// A client that wraps its text sends a measure as an object. The refusal
+    /// says which entry it is and how to write the measure instead.
+    #[test]
+    fn a_measure_sent_as_an_object_is_refused_with_the_advice_to_send_a_string() {
+        let err = serde_json::from_str::<MeasureList>(r#"[{"$text": "jumlah"}]"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "measures[0] is not a column name, {column, aggregate} or {metric}: {\"$text\":\"jumlah\"}; send \"jumlah\" as a plain string"
+        );
+    }
+
+    /// One bad entry among good ones: the refusal names the entry, so the
+    /// model knows which one to fix.
+    #[test]
+    fn a_bad_measure_names_the_entry_that_is_bad() {
+        let err = serde_json::from_str::<MeasureList>(r#"["a", 5]"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "measures[1] is not a column name, {column, aggregate} or {metric}: 5"
+        );
     }
 
     #[test]
@@ -1133,6 +1216,37 @@ mod tests {
         let list = measures(r#"[{"column":"stay","aggregate":"avg"}]"#);
         let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
         assert!(err.contains("takes the chart's aggregate"), "{err}");
+    }
+
+    /// The refusal names the measure to send instead, so the model has
+    /// something to write and does not send the same call again.
+    #[test]
+    fn a_kpi_refusal_names_the_column_and_the_aggregate_to_send() {
+        let list = measures(r#"[{"column":"jumlah_event","aggregate":"sum"}]"#);
+        let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
+        assert!(err.contains("takes the chart's aggregate"), "{err}");
+        assert!(
+            err.contains(r#"send measures: ["jumlah_event"] with aggregate: "sum"."#),
+            "{err}"
+        );
+    }
+
+    /// Two measures with an aggregate of their own cannot both be named, so
+    /// the refusal says how to write one of them.
+    #[test]
+    fn a_kpi_refusal_of_two_measures_with_their_own_aggregates_says_how_to_send_one() {
+        let list = measures(
+            r#"[{"column":"stay","aggregate":"avg"},{"column":"visitors","aggregate":"sum"}]"#,
+        );
+        let err = kind_check(&list, &ShapeFields::default(), ChartKind::Kpi).unwrap_err();
+        assert!(
+            err.contains(
+                r#"send the column alone (measures: ["<column>"]) and set the chart's aggregate."#
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("stay"), "{err}");
+        assert!(!err.contains("visitors"), "{err}");
     }
 
     #[test]

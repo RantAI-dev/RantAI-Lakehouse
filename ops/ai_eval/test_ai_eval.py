@@ -626,6 +626,20 @@ class WhereMatchTests(unittest.TestCase):
                  "where": {"kind": "line", "def.grain": "month"}, "count": 1}
         self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"c-real"}), [])
 
+    def test_a_path_with_an_index_reads_the_element_at_that_place_in_a_list(self) -> None:
+        # `tabs[0].title` is the first tab's title, so a case can check the
+        # order the tabs are in (`PR #199 review O SHOULD-FIX 1`).
+        board = {"id": "b-1", "tabs": [{"id": "t_1", "title": "Maps"}, {"id": "t_2", "title": "Overview"}]}
+        self.assertEqual(m.dig(board, "tabs[0].title"), ["Maps"])
+        self.assertEqual(m.dig(board, "tabs[1].title"), ["Overview"])
+        # An index past the end of the list finds nothing, as an absent field does.
+        self.assertEqual(m.dig(board, "tabs[2].title"), [])
+
+    def test_a_where_key_with_an_index_matches_only_the_board_in_that_order(self) -> None:
+        board = {"id": "b-1", "tabs": [{"id": "t_1", "title": "Maps"}, {"id": "t_2", "title": "Overview"}]}
+        self.assertTrue(m.where_matches(board, {"id": "b-1", "tabs[0].title": "Maps"}))
+        self.assertFalse(m.where_matches(board, {"id": "b-1", "tabs[0].title": "Overview"}))
+
     def test_the_three_grain_and_table_keys_resolve_against_a_real_spec_item(self) -> None:
         # The three cases that could never pass (P1) must now resolve against
         # the shape the route returns, so a perfect assistant can match them.
@@ -643,6 +657,100 @@ class WhereMatchTests(unittest.TestCase):
             {"mart": "mart_event", "kind": "table", "def.tableMode": "rows"},
         )
         self.assertTrue(m.where_matches(table, cases["chart_rows_table"]["expect_state"][0]["where"]))
+
+
+# ── `tile_on_tab`: the chart on the tab it names ───────────────────────────
+
+
+# The board `GET /api/dashboard/boards` returns: `tabs` is a list of
+# `{id, title}` and `layout` is keyed by chart id, each tile naming its tab
+# by that tab's id.
+TWO_TAB_BOARD = {
+    "id": "b1",
+    "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+    "layout": {"c1": {"tab": "t2"}},
+}
+
+
+class TileOnTabTests(unittest.TestCase):
+    def test_a_tile_tagged_with_the_tab_id_matches_the_tab_it_names(self) -> None:
+        # The tile names the tab by its id, so the tab's title is what the
+        # check compares.
+        self.assertTrue(m.tile_on_tab_matches(TWO_TAB_BOARD, {"chart": "c1", "tab_title": "Maps"}))
+        self.assertFalse(m.tile_on_tab_matches(TWO_TAB_BOARD, {"chart": "c1", "tab_title": "Summary"}))
+
+    def test_a_tile_on_another_tab_does_not_match_the_tab_it_names(self) -> None:
+        board = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"c1": {"tab": "t1"}},
+        }
+        self.assertFalse(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Maps"}))
+
+    def test_an_untagged_tile_matches_only_the_first_tab_title(self) -> None:
+        # A tile with no tab leaves the chart on the first tab.
+        board = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"c1": {}},
+        }
+        self.assertTrue(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Summary"}))
+        self.assertFalse(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Maps"}))
+
+    def test_a_tile_naming_a_tab_that_no_longer_exists_matches_the_first_tab(self) -> None:
+        board = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"c1": {"tab": "gone"}},
+        }
+        self.assertTrue(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Summary"}))
+        self.assertFalse(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Maps"}))
+
+    def test_a_board_without_tabs_does_not_match_a_chart_on_a_tab(self) -> None:
+        board = {"id": "b1", "layout": {"c1": {"tab": "t2"}}}
+        self.assertFalse(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Maps"}))
+        # A board with an empty tab list is the same case.
+        self.assertFalse(m.tile_on_tab_matches({"id": "b1", "tabs": [], "layout": {"c1": {"tab": "t2"}}},
+                                              {"chart": "c1", "tab_title": "Maps"}))
+
+    def test_a_chart_with_no_tile_does_not_match_a_tab(self) -> None:
+        board = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"other": {"tab": "t2"}},
+        }
+        self.assertFalse(m.tile_on_tab_matches(board, {"chart": "c1", "tab_title": "Maps"}))
+        # A board with no layout at all is the same case.
+        self.assertFalse(m.tile_on_tab_matches({"id": "b1", "tabs": TWO_TAB_BOARD["tabs"]},
+                                               {"chart": "c1", "tab_title": "Maps"}))
+
+    def test_the_chart_name_in_tile_on_tab_is_filled_with_the_runs_chart_id(self) -> None:
+        check = {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"},
+                 "tile_on_tab": {"chart": "{chart}", "tab_title": "Maps"}, "count": 1}
+        filled = m.fill_check(check, {"board": "b-1", "chart": "c-1"})
+        self.assertEqual(filled["tile_on_tab"], {"chart": "c-1", "tab_title": "Maps"})
+
+    def test_a_state_check_whose_board_does_not_put_the_chart_on_the_tab_reports_a_problem(self) -> None:
+        # The board holds the chart, but on another tab than the check names.
+        cfg = make_cfg()
+        on_summary = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"c1": {"tab": "t1"}},
+        }
+        session = FakeSession({("GET", "/api/dashboard/boards"): {"boards": [on_summary]}})
+        check = {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "b1"},
+                 "tile_on_tab": {"chart": "c1", "tab_title": "Maps"}, "count": 1}
+        problems = m.expect_state_problems(cfg, session, check, own_ids={"b1"})
+        self.assertTrue(problems)
+        # The same board with the chart on the tab the check names matches.
+        on_maps = {
+            "id": "b1",
+            "tabs": [{"id": "t1", "title": "Summary"}, {"id": "t2", "title": "Maps"}],
+            "layout": {"c1": {"tab": "t2"}},
+        }
+        session = FakeSession({("GET", "/api/dashboard/boards"): {"boards": [on_maps]}})
+        self.assertEqual(m.expect_state_problems(cfg, session, check, own_ids={"b1"}), [])
 
 
 # ── expect_approval, expect_no_tool, forbid_unless_tool ───────────────────
@@ -1299,6 +1407,52 @@ class DashboardCasesTests(unittest.TestCase):
                 continue
             self.assertIs(case.get("confirm"), True, case["id"])
             self.assertIn("expect_state", case, case["id"])
+
+    def test_a_case_that_checks_a_tab_confirms_the_write_that_creates_it(self) -> None:
+        # A tab is written only when the harness confirms the assistant's
+        # draft, so a case that checks for a tab the assistant creates needs
+        # `confirm`: without it the tab is never written and the case can
+        # never pass (`PR #199 review O BLOCKER 3`).
+        cases = json.loads((HERE / "dashboard_cases.json").read_text())
+        for case in cases:
+            checks_a_tab = any(
+                "tabs[]" in json.dumps(check.get("where", {}))
+                for check in case.get("expect_state", [])
+            )
+            if not checks_a_tab:
+                continue
+            self.assertIs(case.get("confirm"), True, case["id"])
+
+    def test_the_map_case_expects_the_map_chart_to_be_moved_to_the_tab_it_names(self) -> None:
+        # The case asked for "a separate tab" and checked only that the board
+        # exists, so it passed whatever the assistant did with the map chart
+        # (`PR #199 review O SHOULD-FIX 1`).
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["dash_map_charts_in_separate_tab"]
+        self.assertEqual(
+            case["expect_tool"],
+            {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{map_chart}"}},
+        )
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
+            case["expect_state"],
+        )
+        # The tab is named in the request, so the check can name it too.
+        self.assertIn("called Maps", case["turns"][0])
+
+    def test_the_move_tab_case_checks_the_order_the_tabs_are_in(self) -> None:
+        # Two tabs and a move: the order is the result, so it is checked
+        # (`PR #199 review O SHOULD-FIX 1`).
+        cases = {c["id"]: c for c in json.loads((HERE / "dashboard_cases.json").read_text())}
+        case = cases["dash_move_tab"]
+        self.assertIn(
+            {"path": "/api/dashboard/boards", "list": "boards",
+             "where": {"id": "{board}", "tabs[0].title": "Maps"}, "count": 1},
+            case["expect_state"],
+        )
+        # "Maps" was the second tab and is asked for first, so it is the first.
+        self.assertIn("first position", case["turns"][2])
 
     def test_the_two_chained_write_cases_ask_for_the_chart_in_a_second_turn(self) -> None:
         # One message cannot carry both writes: the board or the field waits

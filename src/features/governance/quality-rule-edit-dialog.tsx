@@ -18,6 +18,7 @@ import { notifySuccess } from "@/lib/notify"
 import { SEVERITY_LABEL, type Severity } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { QualityRule, UpdateQualityRuleInput } from "@/services/contracts/governance"
+import { ThresholdForms } from "./quality-check-fields"
 
 const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
@@ -72,7 +73,8 @@ export function EditRuleDialog({
     governanceService.updateQualityRule(rule.id, input, signal)
   )
   const rewrite = ruleRewrite(rule, { asset, threshold, severity })
-  // Results describe what the rule checked; a different check has none yet.
+  // DATA-14 (F2): the results stay in the rule's history, but they describe
+  // what it checked before, so a different check shows none yet.
   const clearsResults =
     asset.trim() !== rule.asset || threshold.trim() !== rule.threshold
 
@@ -119,10 +121,7 @@ export function EditRuleDialog({
               placeholder="email not null >= 95%"
             />
             <p className="text-xs text-muted-foreground">
-              To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
-              <span className="font-mono">column not null &gt;= 95%</span>,{" "}
-              <span className="font-mono">column unique</span> or{" "}
-              <span className="font-mono">column between 0 and 100</span>, and name the table as
+              To be runnable, write it as one of: <ThresholdForms />. Name the table as
               silver.table, serving.table or bronze.table.
             </p>
           </div>
@@ -143,8 +142,8 @@ export function EditRuleDialog({
           </div>
           {clearsResults ? (
             <p className="text-xs text-muted-foreground">
-              The results recorded for this rule are cleared: they describe what it checked
-              before. It reads &quot;not run yet&quot; until it runs again.
+              The results recorded for this rule are kept in its history, but they describe what
+              it checked before. It reads &quot;not run yet&quot; until it runs again.
             </p>
           ) : null}
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}

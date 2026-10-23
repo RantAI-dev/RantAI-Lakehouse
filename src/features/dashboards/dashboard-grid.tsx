@@ -6,7 +6,7 @@ import { settleLayout } from "@/lib/grid-layout";
 import {
   PHONE_MAX_WIDTH, collapseLayout, foldedTiles, phoneOrder, placeUnboxed, tabOf,
 } from "@/lib/dashboard-tabs";
-import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services/clients/bi-store";
+import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services";
 import { PhoneStack } from "./phone-stack";
 import { SectionTile, TileCard, isSectionKind } from "./tile-card";
 import { useFolded } from "./use-folded";

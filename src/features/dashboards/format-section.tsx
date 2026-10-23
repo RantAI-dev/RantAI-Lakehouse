@@ -234,7 +234,7 @@ export function ConditionalEditor({ value, onChange, columns }: {
 }
 
 /** The groups of section 5 other than the reference lines. */
-export function FormatSection({ rules, style, onChange, valueNames, seriesNames, children }: {
+export function FormatSection({ rules, style, onChange, valueNames, seriesNames, paletteValue, children }: {
   readonly rules: FormatRules;
   readonly style: StyleFields;
   readonly onChange: (next: StyleFields) => void;
@@ -242,6 +242,11 @@ export function FormatSection({ rules, style, onChange, valueNames, seriesNames,
   readonly valueNames: readonly string[];
   /** The columns a conditional rule can read. */
   readonly seriesNames?: readonly string[];
+  /**
+   * The palette the chart draws with: the one the person chose, or the one a
+   * chart with no choice of its own draws with (`PR #199 review O SHOULD-FIX 4`).
+   */
+  readonly paletteValue: string;
   /** The reference lines editor, placed after the axes. */
   readonly children?: React.ReactNode;
 }) {
@@ -281,7 +286,10 @@ export function FormatSection({ rules, style, onChange, valueNames, seriesNames,
       ) : null}
       {rules.colors ? (
         <Group title="Colours">
-          <Select value={colors.palette ?? "default"} items={PALETTE_LABELS} onValueChange={(v) => setColors({ palette: v && v !== "default" ? v : undefined })}>
+          {/* The palette the person chose is stored as it is, "default" included:
+              it is a choice of its own, so a company palette does not take it
+              (`PR #199 review O SHOULD-FIX 4`). */}
+          <Select value={paletteValue} items={PALETTE_LABELS} onValueChange={(v) => setColors({ palette: v || undefined })}>
             <SelectTrigger className="w-48" aria-label="Palette"><SelectValue /></SelectTrigger>
             <SelectContent>{[...BUILTIN_PALETTES, "company"].map((p) => <SelectItem key={p} value={p}>{PALETTE_LABELS[p]}</SelectItem>)}</SelectContent>
           </Select>

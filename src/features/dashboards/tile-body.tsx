@@ -21,7 +21,7 @@ import { domainsOf } from "@/lib/conditional-format";
 import { decimalsFor } from "@/lib/chart-axis";
 import type { StyleFields } from "@/lib/chart-style";
 import { formatAxisValue, formatValue, withMetricFormats } from "@/lib/value-format";
-import { styleOption } from "./style-option";
+import { styleOption, seriesColumns } from "./style-option";
 import type { ColumnSetting, TableDefFields } from "@/lib/table-types";
 import type { FilterDef } from "@/services/clients/bi-store";
 import { bucketLabel, calendarFirstDay, isGrain } from "@/lib/time-grain";
@@ -159,7 +159,11 @@ export function TileBody({
     const yCols = Array.isArray(spec.y) ? spec.y : [spec.y];
     const decimals = decimalsFor(rows.flatMap((r) => yCols.map((c) => Number(r[c] ?? 0))));
     const built = buildOption({ ...spec, measureLabels }, rows, dark, { firstDay: calendarFirstDay(reporting.weekStart), style, locale, companyPalette: reporting.companyPalette });
-    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals });
+    // The result column each series draws, in series order: a computed
+    // reference line is drawn on the axis of the measure it describes
+    // (`PR #199 review M BLOCKER 4`, decision M2).
+    const cols = seriesColumns({ kind: spec.kind, y: spec.y, breakdown: !!spec.series }, (built.series as unknown[] | undefined)?.length ?? 0);
+    const styled = styleOption(built, { kind: spec.kind, y: spec.y, breakdown: !!spec.series, style, locale, decimals, columns: cols, referenceLines: cell.referenceLines, measureLabels });
     if (styled.message) {
       return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
     }
@@ -172,6 +176,7 @@ export function TileBody({
         format: (measure, v) => formatValue(v, fmtOf(measure), locale, decimals),
         cutOff: !!cell.truncated,
       },
+      cols,
     );
     const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
@@ -234,6 +239,11 @@ function TypeBBody({
         <div className="min-h-0 flex-1"><EChart option={drawn.option} height="100%" /></div>
         {cell.rows.length >= HISTOGRAM_ROW_CAP ? (
           <p className="px-1 pt-1 text-[11px] text-muted-foreground">Only the first {HISTOGRAM_ROW_CAP} ranges are shown; choose a wider width.</p>
+        ) : null}
+        {drawn.withoutValue > 0 ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {drawn.withoutValue} {drawn.withoutValue === 1 ? "row has" : "rows have"} no value
+          </p>
         ) : null}
       </div>
     );
@@ -302,6 +312,10 @@ function CombinedBody({
   const styled = styleOption(combined.option, {
     kind: spec.kind, y: spec.y, style, locale, decimals,
     columns: Array.isArray(combined.option.series) ? combined.option.series.map((s) => (s as { name?: string }).name) : undefined,
+    // A line or a band at or below zero vanishes on a logarithmic axis, so
+    // the lines are read here too and the tile says so
+    // (`PR #199 review O SHOULD-FIX 8`).
+    referenceLines: cell.referenceLines,
   });
   if (styled.message) {
     return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;

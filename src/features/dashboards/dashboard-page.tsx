@@ -21,7 +21,6 @@ import { PART_NO_CLICK_REASON, isGrain, isTruncation, switchChoices, type Column
 import { effectiveRefresh, canSaveRefresh as refreshIsSaveable, listedInterval } from "@/lib/dashboard-refresh";
 import { enterFullscreen, leaveFullscreen, readFullscreenDark, writeFullscreenDark } from "@/lib/dashboard-fullscreen";
 import { notifyFailure, notifyInfo, notifySuccess } from "@/lib/notify";
-import { createBoard, deleteBoard, deleteChart, duplicateBoard, renameBoard, saveBoardLayout } from "./board-writes";
 import { readableErrorMessage } from "@/lib/notify-message";
 import { summarizeFilters, summarizeFilterJson, summarizeGrain, summarizeParams, summarizeTabs, summarizeTiles } from "@/lib/page-context-summary";
 import { FILTER_PARAM, decodeFilters, dropInertFilters, enforceRequired, filtersEqual, filtersToParam, isActiveFilter, normalizeFilters, toggleValue } from "@/lib/dashboard-filter-state";
@@ -31,7 +30,8 @@ import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
   TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
-import type { BoardTab, ChartClick, LayoutMap, FilterDef, FilterField, PhoneTile } from "@/services/clients/bi-store";
+import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
+import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
@@ -76,6 +76,15 @@ import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataCho
 import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
 import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
+
+/**
+ * The sentence for a refused dashboard write: the server's own, without the
+ * `code:` prefix it may carry (the code is for the log, not for the reader:
+ * BI-18 part C review fix (SHOULD-FIX) R20).
+ */
+function writeError(e: unknown): string | undefined {
+  return e instanceof Error ? readableErrorMessage(e.message) : undefined;
+}
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
 type BoardOpt = { id: string; name: string; folderId?: string | null; ownerId?: string };
@@ -564,48 +573,49 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       // BI-18 part C review fix (SHOULD-FIX) R19: a refused save is said, not dropped.
-      saveBoardLayout(board, next).catch((e) => notifyFailure("The layout was not saved", e instanceof Error ? e.message : undefined));
+      dashboardService.saveBoardLayout(board, next).catch((e) => notifyFailure("The layout was not saved", writeError(e)));
     }, 600);
   }, [board]);
 
   async function removeChart(id: string) {
     setRemoveBusy(true);
     try {
-      await deleteChart(id);
+      await dashboardService.deleteChart(id);
       setRemoving(null);
       void load();
     } catch (e) {
-      notifyFailure("The chart was not deleted", e instanceof Error ? e.message : undefined);
+      notifyFailure("The chart was not deleted", writeError(e));
     } finally {
       setRemoveBusy(false);
     }
   }
-  // BI-18 part C review fix (SHOULD-FIX) R19: every write below checks the answer
-  // (`board-writes.ts`) and says the server's sentence when it is refused.
+  // BI-18 part C review fix (SHOULD-FIX) R19: every write below goes through
+  // the service, which checks the answer, and says the server's sentence when
+  // it is refused.
   async function duplicateDashboard() {
     try {
-      const json = await duplicateBoard(board);
+      const copy = await dashboardService.duplicateBoard(board);
       notifyDashboardsChanged();
-      if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+      if (copy.id) router.push(`/dashboards/${copy.id}`);
     } catch (e) {
-      notifyFailure("The dashboard was not duplicated", e instanceof Error ? e.message : undefined);
+      notifyFailure("The dashboard was not duplicated", writeError(e));
     }
   }
   async function createDashboard() {
     try {
-      const json = await createBoard("New dashboard");
+      const created = await dashboardService.createBoard({ name: "New dashboard" });
       notifyDashboardsChanged();
-      if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
+      if (created.id) router.push(`/dashboards/${created.id}`);
     } catch (e) {
-      notifyFailure("The dashboard was not created", e instanceof Error ? e.message : undefined);
+      notifyFailure("The dashboard was not created", writeError(e));
     }
   }
   async function deleteDashboard() {
     if (isDefault) return;
     try {
-      await deleteBoard(board);
+      await dashboardService.deleteBoard(board);
     } catch (e) {
-      notifyFailure("The dashboard was not deleted", e instanceof Error ? e.message : undefined);
+      notifyFailure("The dashboard was not deleted", writeError(e));
       return;
     }
     notifySuccess("Dashboard moved to the trash", "Restore it from Trash on the dashboard list for 30 days.");
@@ -617,9 +627,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   async function renameDashboard(name: string) {
     if (isDefault) return;
     try {
-      await renameBoard(board, name);
+      await dashboardService.updateBoard({ id: board, name });
     } catch (e) {
-      notifyFailure("The dashboard was not renamed", e instanceof Error ? e.message : undefined);
+      notifyFailure("The dashboard was not renamed", writeError(e));
       return;
     }
     setRenameOpen(false);
@@ -1052,7 +1062,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // console, and anything portalled out of this element, keeps its theme.
   return (
     <ReportingProvider reporting={data?.reporting}>
-    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"))} style={look.style}>
+    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6", look.className || (fullscreen && fsDark && "dark"), look.className && !fullscreen && "rounded-lg p-4")} style={look.style}>
       <PageHeader
         title={
           <BoardSwitcher

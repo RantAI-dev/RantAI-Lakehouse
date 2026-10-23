@@ -12,7 +12,7 @@ import {
 import { MAX_TABS, TAB_TITLE_MAX } from "@/lib/dashboard-tabs";
 import { cn } from "@/lib/utils";
 import { LineDialog } from "./line-dialog";
-import type { BoardTab } from "@/services/clients/bi-store";
+import type { BoardTab } from "@/services";
 
 /** What an editor can do to the tabs; absent for a viewer, an embed and a public link. */
 export type TabEditing = {

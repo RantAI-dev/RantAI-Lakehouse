@@ -25,9 +25,9 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use super::super::dashboard_organise::trash_restore;
 use super::typed_filters::{chart_row, client, statements};
 use super::{
-    DashboardQuery, GrainRequest, RecordsQuery, TableExportQuery, ValuesQuery, boards_delete,
-    boards_list, boards_update, export, get_body, records_for_roles, specs_create, specs_delete,
-    specs_list, specs_update, table_export, values_for_roles,
+    DashboardQuery, GrainRequest, RecordsQuery, TableExportQuery, ValuesQuery, boards_create,
+    boards_delete, boards_list, boards_update, export, get_body, records_for_roles, specs_create,
+    specs_delete, specs_list, specs_update, table_export, values_for_roles,
 };
 use crate::config::Config;
 use crate::policy_engine::PolicyEngineObligations;
@@ -595,6 +595,117 @@ async fn a_chart_cannot_be_put_on_a_deleted_or_private_board() {
         assert!(outcome.is_err(), "{is_deleted} {owner}");
         assert!(writes(&server).await.is_empty());
     }
+}
+
+/// `PR #199 review M SHOULD-FIX BI-18 1`: a chart cannot be put on a
+/// dashboard that never existed either. It used to be created there, so the
+/// status code told a caller that the id is unknown, while a private one was
+/// refused. The gate itself is checked, so the refusal cannot come from
+/// anything else.
+#[tokio::test]
+async fn a_dashboard_that_does_not_exist_is_refused_like_a_private_one() {
+    let me = Viewer::user(id_of(ME), false);
+    // An id that never existed.
+    let server = engine(vec![]).await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_never"),
+        &me,
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    // A dashboard in somebody else's personal space: the same refusal.
+    let server = engine(vec![(
+        &["SELECT is_deleted, owner_id FROM console.bi_board"],
+        vec![state_row(0, &id_of(OTHER))],
+    )])
+    .await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_never"),
+        &me,
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+}
+
+/// `PR #199 review M SHOULD-FIX BI-18 1`: an edit of a chart that does not
+/// exist is refused, like one on a board the caller cannot see, so the status
+/// code does not tell the two apart.
+#[tokio::test]
+async fn an_edit_of_a_chart_that_does_not_exist_is_refused() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![]).await;
+    let refused =
+        super::super::dashboard_organise::require_editable_chart(&client(&server), "c_never", &me)
+            .await;
+    assert!(refused.is_err(), "{refused:?}");
+    // A chart on a dashboard the caller cannot see: the same sentence, so the
+    // answer does not say that a chart of somebody else exists.
+    let server = engine(vec![
+        (
+            &["SELECT is_deleted, board FROM console.bi_chart"],
+            vec![json!({ "is_deleted": 0, "board": "b_draft" })],
+        ),
+        (
+            &["SELECT is_deleted, owner_id FROM console.bi_board"],
+            vec![state_row(0, &id_of(OTHER))],
+        ),
+    ])
+    .await;
+    let refused = super::super::dashboard_organise::require_editable_chart(
+        &client(&server),
+        "c_private",
+        &me,
+    )
+    .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a chart on a private dashboard must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "this tile does not exist");
+}
+
+/// `PR #199 review O SHOULD-FIX 2`: a dashboard that was purged for good
+/// (state 1) is refused like one in the trash, so a chart is not created on
+/// a dashboard that is gone.
+#[tokio::test]
+async fn a_chart_cannot_be_created_on_a_dashboard_that_was_purged_for_good() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![(
+        &["SELECT is_deleted, owner_id FROM console.bi_board"],
+        vec![state_row(1, "")],
+    )])
+    .await;
+    let refused = super::super::dashboard_organise::require_chart_board(
+        &client(&server),
+        Some("b_purged"),
+        &me,
+    )
+    .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a purged dashboard must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "dashboard not found.");
+}
+
+/// `PR #199 review O SHOULD-FIX 2`: a chart that was purged for good (state
+/// 1) is refused like one in the trash, so an edit cannot bring it back to
+/// life.
+#[tokio::test]
+async fn an_edit_of_a_chart_that_was_purged_for_good_is_refused() {
+    let me = Viewer::user(id_of(ME), false);
+    let server = engine(vec![(
+        &["SELECT is_deleted, board FROM console.bi_chart"],
+        vec![json!({ "is_deleted": 1, "board": "b_draft" })],
+    )])
+    .await;
+    let refused =
+        super::super::dashboard_organise::require_editable_chart(&client(&server), "c_purged", &me)
+            .await;
+    let Err(super::super::dashboard_organise::Gate::Missing(sentence)) = refused else {
+        panic!("a purged chart must be refused with the fixed sentence");
+    };
+    assert_eq!(sentence, "this tile does not exist");
 }
 
 #[tokio::test]
@@ -1759,6 +1870,224 @@ async fn a_duplicate_of_a_tabbed_board_names_the_tab_of_every_tile() {
     assert!(board.contains(&copy.id));
 }
 
+/// `PR #199 review M BLOCKER 5`: a new dashboard filed in the personal space
+/// is private from its FIRST insert, so it is never public in between.
+#[tokio::test]
+async fn a_new_dashboard_in_the_personal_space_is_private_from_its_first_insert() {
+    let server = engine(vec![(
+        &["FROM console.bi_folder FINAL"],
+        vec![folder_row("fp_me", &id_of(ME))],
+    )])
+    .await;
+    let body = json!({ "name": "Draft", "folderId": "fp_me" });
+    boards_create(
+        State(state_for(&server)),
+        Some(Extension(person(ME, "dashboard:write"))),
+        body.to_string().into(),
+    )
+    .await
+    .done("the dashboard was created");
+    let written = writes(&server).await;
+    let first = written
+        .iter()
+        .find(|w| w.contains("INTO console.bi_board ("))
+        .expect("the dashboard was created");
+    assert!(first.contains(&id_of(ME)), "{first}");
+}
+
+/// `PR #199 review M BLOCKER 5`: a copy of a private dashboard is private
+/// from its FIRST insert, so it is never visible to another user, not even
+/// for the moment between the insert and the write that used to give it its
+/// owner back.
+#[tokio::test]
+async fn a_duplicate_of_a_private_board_is_private_from_its_first_insert() {
+    let server = engine(vec![
+        (
+            &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+            vec![board_row("b1", "u_owner")],
+        ),
+        (
+            &[
+                "SELECT id, spec_json, board, created_by",
+                "FROM console.bi_chart FINAL",
+            ],
+            vec![chart_row("c1", "b1", "mart_a", None)],
+        ),
+    ])
+    .await;
+    let ch = client(&server);
+    let copy =
+        lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+            .await
+            .unwrap();
+    assert_eq!(copy.owner_id.as_deref(), Some("u_owner"));
+    let written = writes(&server).await;
+    let first = written
+        .iter()
+        .find(|w| w.contains("INTO console.bi_board ("))
+        .expect("the copy was created");
+    // The owner is in the first insert, not only in a later write.
+    assert!(first.contains("'u_owner'"), "{first}");
+}
+
+/// `PR #199 review M BLOCKER 5`: a copy whose chart could not be written is
+/// taken back, so no half-built dashboard is left behind.
+#[tokio::test]
+async fn a_duplicate_that_cannot_be_finished_leaves_no_copy_behind() {
+    use wiremock::matchers::{body_string_contains, method};
+    let server = MockServer::start().await;
+    // The chart's own statement fails, so the copy cannot be finished. The
+    // first mock registered is the one that answers, so this one is mounted
+    // before the catch-all.
+    Mock::given(method("POST"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [board_row("b1", "u_owner")], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_chart FINAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [chart_row("c1", "b1", "mart_a", None)], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0
+        })))
+        .mount(&server)
+        .await;
+    let ch = client(&server);
+    lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+        .await
+        .expect_err("the chart's statement fails");
+    let written = writes(&server).await;
+    // The copy was taken back: the board and its charts are wiped.
+    assert!(
+        written
+            .iter()
+            .any(|w| w.contains("INTO console.bi_board (id, name, owner_id, is_deleted)")),
+        "{written:?}"
+    );
+    assert!(
+        written.iter().any(|w| w.contains(
+            "INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted)"
+        )),
+        "{written:?}"
+    );
+}
+
+/// `PR #199 review O SHOULD-FIX 3`: a copy that could not be finished and
+/// could not be taken back says so: the cleanup failure is reported and the
+/// copy's own error is kept.
+#[tokio::test]
+async fn a_duplicate_whose_cleanup_fails_reports_the_cleanup_failure() {
+    use wiremock::matchers::{body_string_contains, method};
+    let server = MockServer::start().await;
+    // The half-built copy cannot be taken back: the wipe of its charts fails.
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "INSERT INTO console.bi_chart (id, title, spec_json, board, created_by, is_deleted)",
+        ))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    // The chart's own statement fails, so the copy cannot be finished.
+    Mock::given(method("POST"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [board_row("b1", "u_owner")], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("FROM console.bi_chart FINAL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [chart_row("c1", "b1", "mart_a", None)], "rows": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": [], "data": [], "rows": 0
+        })))
+        .mount(&server)
+        .await;
+    let ch = client(&server);
+    let err =
+        lakehouse_bi::store::duplicate_board(&ch, "b1", "Ann", &Viewer::user("u_owner", false))
+            .await
+            .expect_err("the chart's statement fails");
+    match err {
+        lakehouse_bi::store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+            // The error's own text is not written here: the SEC-11 scan reads
+            // a route file's test tail too, and an error's text belongs in a
+            // log, not in a message.
+            assert!(
+                matches!(cause, lakehouse_bi::store::BiError::Clickhouse(_)),
+                "the copy's own error is kept"
+            );
+            assert!(
+                matches!(cleanup, lakehouse_clickhouse::ChError::Server(_)),
+                "the cleanup failure is carried out"
+            );
+        }
+        lakehouse_bi::store::DuplicateError::Copy(_) => {
+            panic!("a cleanup that failed must be reported, not dropped")
+        }
+    }
+}
+
+/// `PR #199 review M SHOULD-FIX BI-18 3`: a save that arrives after the
+/// dashboard was deleted must not write a blank row over its trash entry: the
+/// dashboard would come back to life as an empty shell.
+#[tokio::test]
+async fn a_save_that_races_a_delete_writes_no_row() {
+    let server = engine(vec![(
+        &["FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='b1'"],
+        vec![],
+    )])
+    .await;
+    let ch = client(&server);
+    let layout: lakehouse_bi::store::LayoutMap =
+        serde_json::from_value(json!({ "c1": { "x": 0, "y": 0, "w": 6, "h": 4 } })).unwrap();
+    let refused = lakehouse_bi::store::update_board_layout(&ch, "b1", &layout).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(writes(&server).await.is_empty());
+    // The built-in dashboard has no row until something is saved: its shell is
+    // still written.
+    let written = lakehouse_bi::store::update_board_layout(
+        &ch,
+        lakehouse_bi::store::DEFAULT_BOARD_ID,
+        &layout,
+    )
+    .await;
+    assert!(written.is_ok(), "{written:?}");
+    assert!(
+        writes(&server)
+            .await
+            .iter()
+            .any(|w| w.contains("INTO console.bi_board (")),
+        "the built-in dashboard's row is still written"
+    );
+}
+
 /// Going back to a version saved before the stamping: its untagged tiles were on
 /// ITS first tab (B), not the live board's (A).
 #[tokio::test]
@@ -1957,6 +2286,31 @@ async fn going_back_names_a_chart_that_was_removed_for_good_and_leaves_no_hole()
     );
     let board = last_board_write(&written);
     assert!(!board.contains(r#""c1":"#), "{board}");
+}
+
+/// `PR #199 review M SHOULD-FIX BI-18 2`: a chart the version had that was
+/// moved to another dashboard is not gone. The revert says where it is, so the
+/// answer does not say it was removed from the trash for good.
+#[tokio::test]
+async fn going_back_says_a_chart_that_moved_to_another_dashboard() {
+    let mut rules = trash_rules(false);
+    rules.insert(
+        0,
+        (
+            vec![
+                "SELECT id, spec_json, board, created_by",
+                "FROM console.bi_chart FINAL",
+            ],
+            vec![chart_row("c1", "b_other", "mart_a", None)],
+        ),
+    );
+    let server = history_server(rules).await;
+    let done = match revert_to(&server, 2).await {
+        Ok(done) => done,
+        Err(response) => panic!("not restored: {}", text_of(response).await),
+    };
+    assert_eq!(done["chartsMoved"], json!(["Hotels"]));
+    assert_eq!(done["chartsGone"], json!([]));
 }
 
 /// R8, and the question about dragging: a layout save (what a drag in edit mode

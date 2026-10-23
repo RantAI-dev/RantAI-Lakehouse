@@ -366,6 +366,44 @@ pub(super) const SYSTEM_ASK_SUFFIX: &str = "
 
 MODE: ASK (read-only). You can read and analyse anything, but you cannot change anything: no creating or deleting charts, pipelines, connectors or rules. You can still change the page's view filters with set_board_view_filters, since it changes only this person's view. If the user asks for a change, tell them to switch to Build mode.";
 
+/// What the model is told when the person cannot change dashboards (`BI-18`
+/// part C review fix (SHOULD-FIX) R30). The tools that write are then not in
+/// its list because of the person's permissions, and without this line it
+/// explained their absence as "not available in this session" or "not wired up
+/// here", which is false (principle 2). `None` when the person may write, and
+/// when nobody is signed in.
+pub(super) fn dashboard_permission_note(
+    perms: Option<&lakehouse_auth::PermissionSet>,
+) -> Option<&'static str> {
+    // Nobody signed in has no account to speak of: the prompt is unchanged.
+    if perms.is_none_or(|p| p.has("dashboard:write")) {
+        return None;
+    }
+    Some(
+        "[Permissions: the signed-in person's account does not have the dashboard:write \
+permission, so the tools that create or change charts, tabs and dashboards are withheld \
+from you because of that permission, not because they are unavailable or not set up. \
+When asked to change a dashboard, say: \"Your account cannot change dashboards; ask an \
+editor or an administrator.\" Reading dashboards and charts still works.]",
+    )
+}
+
+/// The system prompt with [`dashboard_permission_note`] before its closing
+/// language line (which stays last), when the note applies (R30).
+pub(super) fn with_permission_note(
+    sys: String,
+    perms: Option<&lakehouse_auth::PermissionSet>,
+    closing: &str,
+) -> String {
+    let Some(note) = dashboard_permission_note(perms) else {
+        return sys;
+    };
+    match sys.strip_suffix(closing) {
+        Some(head) => format!("{head}\n\n{note}{closing}"),
+        None => format!("{sys}\n\n{note}"),
+    }
+}
+
 /// The line added to the newest user message, naming the mode for that
 /// message. The history still holds the model's own earlier statements about
 /// the mode (for example "I am in ASK mode" after a switch to Build), and the
@@ -1168,5 +1206,34 @@ mod tests {
             closing("这个图表是什么", Some(ReplyLanguage::Indonesian)),
             PLAIN_LINE
         );
+    }
+
+    /// `BI-18` part C review fix (SHOULD-FIX) R30.
+    #[test]
+    fn a_person_without_dashboard_write_gets_the_permission_sentence_in_the_context() {
+        use lakehouse_auth::PermissionSet;
+        let viewer = PermissionSet::parse("dashboard:read");
+        let note = dashboard_permission_note(Some(&viewer)).unwrap_or_default();
+        assert!(
+            note.contains("does not have the dashboard:write permission"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Your account cannot change dashboards"),
+            "{note}"
+        );
+        assert!(note.contains("not because they are unavailable"), "{note}");
+        assert!(dashboard_permission_note(None).is_none());
+        let full = with_permission_note(
+            "HEAD\n\nLANGUAGE: x".to_owned(),
+            Some(&viewer),
+            "\n\nLANGUAGE: x",
+        );
+        assert!(
+            full.starts_with("HEAD\n\n[Permissions:") && full.ends_with("\n\nLANGUAGE: x"),
+            "{full}"
+        );
+        let editor = PermissionSet::parse("dashboard:write, dashboard:read");
+        assert!(dashboard_permission_note(Some(&editor)).is_none());
     }
 }

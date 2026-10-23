@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { tileMeasureLabels } from "@/lib/chart-shape"
+import type { EChartsOption } from "echarts"
 import { MARKER_LIMIT, buildOption, showsPointMarkers, withReferenceLines } from "./chart-option"
 
 const rowsOf = (n: number) => Array.from({ length: n }, (_, i) => ({ x: `p${i}`, v: i }))
@@ -151,4 +152,46 @@ test("a legend names a joined measure by its column and truncates long entries w
   assert.ok((legend.textStyle?.width ?? 0) > 0)
   const names = (option.series as { name?: string }[]).map((s) => s.name)
   assert.deepEqual(names, ["max of rooms", "visitors"])
+})
+
+// PR #199 review O BLOCKER 1: ECharts sets a tooltip formatter's result as
+// HTML, so a category or series name with markup ran for every viewer, on
+// public links and signed embeds included. Every family of the tooltip
+// formatters is fed the payload here and must write it as text.
+const XSS = `<img src=x onerror=alert(1)>`
+const XSS_AS_TEXT = `&lt;img src=x onerror=alert(1)&gt;`
+
+type TooltipCase = {
+  name: string
+  spec: Parameters<typeof buildOption>[0]
+  rows: Record<string, unknown>[]
+  /** What ECharts hands the formatter. */
+  params: unknown
+}
+
+const tooltipCases: TooltipCase[] = [
+  { name: "pie", spec: { kind: "pie", x: "c", y: "v" }, rows: [{ c: XSS, v: 1 }], params: { name: XSS, value: 1, percent: 50 } },
+  { name: "rose", spec: { kind: "rose", x: "c", y: "v" }, rows: [{ c: XSS, v: 1 }], params: { name: XSS, value: 1, percent: 50 } },
+  { name: "funnel", spec: { kind: "funnel", x: "c", y: "v" }, rows: [{ c: XSS, v: 1 }], params: { name: XSS, value: 1 } },
+  { name: "treemap", spec: { kind: "treemap", x: "c", y: "v" }, rows: [{ c: XSS, v: 1 }], params: { name: XSS, value: 1 } },
+  { name: "scatter", spec: { kind: "scatter", x: "c", y: ["v"] }, rows: [{ c: XSS, v: 1 }], params: { name: XSS, value: [1, 2] } },
+  { name: "bubble", spec: { kind: "bubble", x: "c", y: ["v", "s"] }, rows: [{ c: XSS, v: 1, s: 2 }], params: { name: XSS, value: [1, 2, 3] } },
+  { name: "waterfall", spec: { kind: "waterfall", x: "c", y: "v" }, rows: [{ c: XSS, v: 1 }], params: [{ dataIndex: 0 }] },
+  { name: "heatmap", spec: { kind: "heatmap", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { value: [0, 0, 1] } },
+  { name: "sankey", spec: { kind: "sankey", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { name: `a:${XSS}`, value: 1, data: { source: `a:${XSS}`, target: `b:${XSS}` } } },
+  { name: "sunburst", spec: { kind: "sunburst", x: "c", y: "v", series: "g" }, rows: [{ c: XSS, g: XSS, v: 1 }], params: { treePathInfo: [{ name: XSS }], value: 1 } },
+  { name: "boxplot", spec: { kind: "boxplot", x: "c", y: "v" }, rows: [{ c: XSS, v: [1, 2, 3, 4, 5] }], params: { seriesType: "boxplot", data: [1, 2, 3, 4, 5], dataIndex: 0 } },
+  { name: "calendar", spec: { kind: "calendar", x: "d", y: "v" }, rows: [{ d: "2026-10-01", v: 1 }], params: { value: [XSS, 1] } },
+]
+
+test("PR #199 review O BLOCKER 1: a name with markup in any tooltip is written as text, not as HTML", () => {
+  for (const c of tooltipCases) {
+    const option = buildOption(c.spec, c.rows, false) as EChartsOption
+    const formatter = (option.tooltip as { formatter?: (p: unknown) => string }).formatter
+    assert.equal(typeof formatter, "function", `${c.name}: the tooltip has a formatter`)
+    const html = formatter!(c.params)
+    assert.equal(typeof html, "string", `${c.name}: the formatter writes a string`)
+    assert.ok(!html.includes("<img"), `${c.name}: the markup did not run`)
+    assert.ok(html.includes(XSS_AS_TEXT), `${c.name}: the name is written as text`)
+  }
 })

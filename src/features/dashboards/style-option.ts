@@ -1,6 +1,8 @@
 import type { EChartsOption } from "echarts";
 import { interpolate } from "@/lib/chart-palettes";
-import type { AxisStyle, StyleFields, ValueFormat } from "@/lib/chart-style";
+import { escapeHtml } from "@/lib/geo-points";
+import type { AxisStyle, ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
+import { displayColumn } from "@/lib/chart-joins";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
 
 /**
@@ -31,6 +33,18 @@ export type StyleInput = {
    * and a per-value format or a second-axis choice names them that way.
    */
   columns?: (string | undefined)[];
+  /**
+   * The reference lines the tile draws, so a line at or below zero on a
+   * logarithmic axis is refused instead of vanishing
+   * (`PR #199 review M SHOULD-FIX BI-17 1`).
+   */
+  referenceLines?: readonly ResolvedReferenceLine[];
+  /**
+   * The readable label of each value, by result name: the same labels the
+   * legend and the tooltip use. The second axis is named after the values on
+   * it when it has no title of its own (`PR #199 review M SHOULD-FIX BI-17 2`).
+   */
+  measureLabels?: Record<string, string>;
 };
 
 export type Styled = {
@@ -66,6 +80,39 @@ function entryNumber(d: unknown, scatter: boolean, index: number): number | null
   const v = Array.isArray(d) ? d[scatter ? index : d.length - 1] : typeof d === "object" && d ? (d as Obj).value : d;
   const inner = Array.isArray(v) ? v[scatter ? index : v.length - 1] : v;
   return typeof inner === "number" && Number.isFinite(inner) ? inner : null;
+}
+
+/**
+ * The numbers of one data entry that a logarithmic axis must not see at or
+ * below zero.
+ *
+ * A box plot's entry is its five numbers (min, Q1, median, Q3, max): one of
+ * them at or below zero is enough, and the check used to read only the last
+ * one, so a box whose minimum was negative got a logarithmic axis
+ * (`PR #199 review M SHOULD-FIX BI-17 1`). Any other entry is the value it
+ * draws.
+ */
+function axisValues(series: Obj, d: unknown, scatter: boolean): number[] {
+  if (series.type === "boxplot" && Array.isArray(d)) {
+    return d.map((n) => Number(n)).filter((n) => Number.isFinite(n));
+  }
+  const v = entryNumber(d, scatter, 1);
+  return v === null ? [] : [v];
+}
+
+/**
+ * Whether a reference line sits at or below zero: a plain line at a value, or
+ * a band with such an edge. A computed line is not: it is computed from the
+ * values on screen, which the axis check has already cleared.
+ */
+function lineAtOrBelowZero(line: ResolvedReferenceLine): boolean {
+  if (line.kind === "band") {
+    return (
+      (line.value !== undefined && line.value <= 0) || (line.to !== undefined && line.to <= 0)
+    );
+  }
+  if (line.kind && line.kind !== "value") return false;
+  return line.value !== undefined && line.value <= 0;
 }
 
 function restyleAxis(axis: unknown, s: AxisStyle, category: boolean): unknown {
@@ -107,7 +154,20 @@ function applyAxes(option: Obj, series: Obj[], cols: (string | undefined)[], inp
   if (right.size && !horizontal) {
     const left = Array.isArray(option[valKey]) ? (option[valKey] as unknown[])[0] : option[valKey];
     const existing = Array.isArray(option[valKey]) ? (option[valKey] as unknown[])[1] : undefined;
-    option[valKey] = [left, existing ?? { ...asObj(left), position: "right", splitLine: { show: false }, alignTicks: false }];
+    const rightAxis: Obj =
+      existing === undefined
+        ? { ...asObj(left), position: "right", splitLine: { show: false }, alignTicks: false }
+        : asObj(existing);
+    // The right axis's name: its own title, or the labels of the values on
+    // it, so an axis without a title is not a nameless one
+    // (`PR #199 review M SHOULD-FIX BI-17 2`).
+    if (rightAxis.name === undefined && !axes.y2?.title) {
+      const labels = [...right]
+        .map((col) => input.measureLabels?.[col] ?? displayColumn(col))
+        .filter((label) => label.length > 0);
+      if (labels.length) rightAxis.name = labels.join(", ");
+    }
+    option[valKey] = [left, rightAxis];
     series.forEach((s, i) => {
       s.yAxisIndex = right.has(cols[i] ?? "") ? 1 : 0;
     });
@@ -120,10 +180,12 @@ function applyAxes(option: Obj, series: Obj[], cols: (string | undefined)[], inp
     if (!st || (i > 0 && !right.size && !axes.y2)) continue;
     if (st.log) {
       const hit = series.some((s) => ((s.yAxisIndex ?? 0) === i || valueAxes.length === 1) && (s.data as unknown[] | undefined)?.some((d) => {
-        const n = entryNumber(d, scatter, 1);
-        return n !== null && n <= 0;
+        return axisValues(s, d, scatter).some((n) => n <= 0);
       }));
       if (hit) return LOG_MESSAGE;
+      // A line or a band at or below zero would vanish on a logarithmic
+      // axis, so it is refused with the same sentence.
+      if (i === 0 && (input.referenceLines ?? []).some(lineAtOrBelowZero)) return LOG_MESSAGE;
     }
     let axis = restyleAxis(valueAxes[i], st, false) as Obj;
     // The labels of each axis are written in the format of the value it carries.
@@ -234,7 +296,10 @@ function applyNotes(series: Obj[], option: Obj, input: StyleInput): number {
       ...mark,
       symbol: "pin",
       symbolSize: 26,
-      tooltip: { formatter: (p: { name?: string }) => p.name ?? "" },
+      // The note's text is the user's, and the server's check for it allows
+      // `<` and `>`; ECharts sets a tooltip formatter's result as HTML, so
+      // the text is escaped before it goes in (`PR #199 review M BLOCKER 1`).
+      tooltip: { formatter: (p: { name?: string }) => escapeHtml(p.name ?? "") },
       data: [...((mark.data as unknown[] | undefined) ?? []), { name: note.text, coord: horizontal ? [value, at] : [at, value], value }],
     };
   }
@@ -252,10 +317,13 @@ function applyTooltipFields(option: Obj, series: Obj[], cols: (string | undefine
     formatter: (params: unknown) => {
       const list = (Array.isArray(params) ? params : [params]) as { axisValueLabel?: string; seriesIndex: number; marker?: string; seriesName?: string; value?: unknown }[];
       const f = (col?: string) => input.style?.valueFormats?.[col ?? ""] ?? input.style?.format;
+      // The series name and the axis label are warehouse data and ECharts
+      // sets a tooltip formatter's result as HTML, so every text but the
+      // marker's own markup is escaped (`PR #199 review M BLOCKER 1`).
       const lines = list
         .filter((p) => keep.has(cols[p.seriesIndex] ?? ""))
-        .map((p) => `${p.marker ?? ""} ${p.seriesName || cols[p.seriesIndex] || ""}: <b>${typeof p.value === "number" ? formatValue(p.value, f(cols[p.seriesIndex]), input.locale, input.decimals) : String(p.value ?? "")}</b>`);
-      return [list[0]?.axisValueLabel ?? "", ...lines].join("<br/>");
+        .map((p) => `${p.marker ?? ""} ${escapeHtml(p.seriesName || cols[p.seriesIndex] || "")}: <b>${typeof p.value === "number" ? formatValue(p.value, f(cols[p.seriesIndex]), input.locale, input.decimals) : escapeHtml(String(p.value ?? ""))}</b>`);
+      return [escapeHtml(list[0]?.axisValueLabel ?? ""), ...lines].join("<br/>");
     },
   };
   void series;

@@ -6,7 +6,10 @@ import { useTheme } from "next-themes";
 import { ChartColumn, PencilRuler } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ChartBuilder, type ChartDef } from "@/features/dashboards/chart-builder";
+import { ReportingProvider } from "@/features/dashboards/reporting-context";
 import { TileBody } from "@/features/dashboards/tile-body";
+import { useService } from "@/hooks/use-service";
+import { settingsService } from "@/services";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
 import type { BinDef, GridDef } from "@/lib/chart-bins";
 import type { JoinDef } from "@/lib/chart-joins";
@@ -51,7 +54,13 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
         (typeof m === "object" && m !== null && typeof (m as { metric?: unknown }).metric === "string") ||
         (typeof m === "object" && m !== null && typeof (m as { column?: unknown }).column === "string" && typeof (m as { aggregate?: unknown }).aggregate === "string"))
     : undefined;
+  // BI-18 part C review fix (SHOULD-FIX) R25, R26: the draft is the model's own
+  // arguments first, as Confirm sends them, then the fields normalised below.
+  // Before, every field not listed here (`histogram`, `goal`, `bands`, `url`,
+  // `alt`, the style fields) was dropped, so a histogram asked for in bins of 500
+  // previewed as automatic and a progress bar with a goal previewed as "needs a goal".
   return {
+    ...(args as Partial<ChartDef>),
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? str(args.text) ?? "",
     subtitle: str(args.subtitle),
     mart: str(args.mart),
@@ -106,6 +115,16 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     referenceLines: Array.isArray(args.referenceLines) ? (args.referenceLines as RefLineDef[]) : undefined,
     click: isObject(args.click) ? (args.click as ChartClick) : undefined,
   };
+}
+
+/**
+ * The spec a draft tile is drawn from: the preview's render spec, which carries no
+ * `def`, with the draft's own definition in it (BI-18 part C review fix
+ * (SHOULD-FIX) R28). A progress bar, bullet graph and the style fields read
+ * their goal, bands, format and colours from `spec.def`.
+ */
+export function previewSpecWithDef<S extends object>(spec: S, def: ChartDef): S & { def: unknown } {
+  return { ...spec, def: (spec as { def?: unknown }).def ?? def };
 }
 
 /**
@@ -177,6 +196,10 @@ export function ChartDraftCard({
     return () => controller.abort();
   }, [def]);
 
+  // BI-16 part B (`PR #199 review M SHOULD-FIX BI-16 2`): a draft of an image
+  // or a web card checks its address against the sites an administrator
+  // allows, and without them the card says the site is no longer allowed.
+  const reporting = useService((signal) => settingsService.getReporting(signal), []).data ?? undefined;
   const metricLabels = preview && "metricLabels" in preview.result ? preview.result.metricLabels : undefined;
   const measureLabel = draftMeasureLabel(def, metricLabels);
 
@@ -201,12 +224,17 @@ export function ChartDraftCard({
             Preview unavailable: {previewError}
           </div>
         ) : preview ? (
-          <TileBody
-            spec={preview.spec}
-            cell={preview.result}
-            dark={resolvedTheme === "dark"}
-            loading={loading}
-          />
+          <ReportingProvider reporting={reporting}>
+            <TileBody
+              // BI-18 part C review fix (SHOULD-FIX) R28: the preview answers with the render spec
+              // only; a card reads its goal, bands, format and colours from `spec.def`, as a saved
+              // tile does, so the draft's own definition goes in when the answer carries none.
+              spec={previewSpecWithDef(preview.spec, def)}
+              cell={preview.result}
+              dark={resolvedTheme === "dark"}
+              loading={loading}
+            />
+          </ReportingProvider>
         ) : (
           <div className="h-full animate-pulse rounded-lg bg-muted/60" />
         )}

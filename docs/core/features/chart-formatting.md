@@ -67,13 +67,18 @@ Planner defaults, all confirmed by the product owner on 2026-10-17 (phase 3 QA).
 - Computed reference lines describe the rows on screen, not every row of the table, when a chart is cut off.
 - Only the console's own fonts.
 - A logarithmic axis cannot show zero or negative values.
+- The default chart palette is the one every chart used before, and it does not reach the 3:1 contrast on a light background: its sky, amber, lime and orange are below it. The four new palettes do. The default is kept as it is so that no saved chart changes colour (the owner's choice).
+- On a raw table, a colour range is read over the rows of the page (50 at a time), not over every row of the table.
 
 ## Asking the assistant
 
 `format_chart` takes the same formatting fields as the chart builder and
 changes only the ones it is given, so the assistant can change one setting
-without resending the others; `set_dashboard_theme` sets a dashboard's
-theme and font. The standard request set gains `AI-8-AC1`. The AI team reviews this
+without resending the others; `update_chart` keeps the formatting the call
+leaves out, so changing a chart's title does not cost it its colours or its
+number format; a change of the chart's kind resets the formatting, because
+the old formatting does not fit the new kind; `set_dashboard_theme` sets a
+dashboard's theme and font. The standard request set gains `AI-8-AC1`. The AI team reviews this
 part.
 
 ## Acceptance checklist

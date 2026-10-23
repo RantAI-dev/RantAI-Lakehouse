@@ -6,6 +6,19 @@ import { ConditionalEditor, FormatSection, ValueFormatEditor } from "./format-se
 
 afterEach(cleanup)
 
+/**
+ * Chooses an option of a base-ui Select the way a pointer does: the list
+ * opens, the option takes focus (which makes it the active one), and it is
+ * clicked. In this jsdom a click on an option that was not focused first does
+ * not reach `onValueChange`, so the focus step is part of the choice.
+ */
+function choose(trigger: HTMLElement, option: string) {
+  fireEvent.click(trigger)
+  const target = screen.getByRole("option", { name: option })
+  fireEvent.focus(target)
+  fireEvent.click(target)
+}
+
 describe("ConditionalEditor", () => {
   it("adds a rule on the only column there is, takes its number, and removes it", () => {
     const onChange = mock<(r: CondRule[]) => void>(() => {})
@@ -50,28 +63,38 @@ describe("ValueFormatEditor", () => {
 describe("FormatSection", () => {
   it("edits the format of one value apart from the others", () => {
     const onChange = mock<(s: StyleFields) => void>(() => {})
-    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 2 })} style={{}} onChange={onChange} valueNames={["visitors", "nights"]} />)
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 2 })} style={{}} onChange={onChange} valueNames={["visitors", "nights"]} paletteValue="default" />)
     fireEvent.change(screen.getByLabelText("Number format decimals"), { target: { value: "1" } })
     expect(onChange).toHaveBeenLastCalledWith({ format: { decimals: 1 } })
   })
 
   it("lists a note, adds one, and stops at twenty", () => {
     const onChange = mock<(s: StyleFields) => void>(() => {})
-    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={onChange} valueNames={["visitors"]} />)
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={onChange} valueNames={["visitors"]} paletteValue="default" />)
     fireEvent.click(screen.getByRole("button", { name: /Add a note/ }))
     expect(onChange).toHaveBeenLastCalledWith({ annotations: [{ x: "", text: "" }] })
     cleanup()
     const twenty = Array.from({ length: 20 }, (_, i) => ({ x: `p${i}`, text: "n" }))
-    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{ annotations: twenty }} onChange={onChange} valueNames={["visitors"]} />)
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{ annotations: twenty }} onChange={onChange} valueNames={["visitors"]} paletteValue="default" />)
     expect(screen.queryByRole("button", { name: /Add a note/ })).toBeNull()
   })
 
   it("offers colour by value only when the chart can take it", () => {
     const noop = () => {}
-    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: true, measures: 1 })} style={{}} onChange={noop} valueNames={["visitors"]} />)
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: true, measures: 1 })} style={{}} onChange={noop} valueNames={["visitors"]} paletteValue="default" />)
     expect(screen.queryByLabelText("Colour by value")).toBeNull()
     cleanup()
-    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={noop} valueNames={["visitors"]} />)
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={noop} valueNames={["visitors"]} paletteValue="default" />)
     expect(screen.getByLabelText("Colour by value")).toBeTruthy()
+  })
+
+  // PR #199 review O SHOULD-FIX 4: picking "Default" has to be a choice of
+  // its own, or a company palette takes the chart over.
+  it("keeps the default palette a person chose, and shows the palette the chart draws with", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    render(<FormatSection rules={formatRules({ kind: "bar", breakdown: false, measures: 1 })} style={{}} onChange={onChange} valueNames={["visitors"]} paletteValue="company" />)
+    expect(screen.getByRole("combobox", { name: "Palette" }).textContent).toContain("Company palette")
+    choose(screen.getByRole("combobox", { name: "Palette" }), "Default")
+    expect(onChange).toHaveBeenLastCalledWith({ colors: { palette: "default" } })
   })
 })

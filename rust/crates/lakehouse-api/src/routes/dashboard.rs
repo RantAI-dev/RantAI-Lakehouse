@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_bi::access::Viewer;
@@ -966,8 +966,8 @@ pub async fn specs_update(
         )
     })?;
     // The board it left changed too, when the edit moved it.
-    if let Some(old) = old_board.filter(|b| *b != spec.board) {
-        snapshot(ch, &old, &principal).await;
+    if old_board != spec.board {
+        snapshot(ch, &old_board, &principal).await;
     }
     snapshot(ch, &spec.board, &principal).await;
     Ok(ApiJson(
@@ -1141,36 +1141,73 @@ pub async fn boards_create(
     // takes only its owner's dashboards.
     crate::routes::dashboard_folders::ensure_folder_usable(&state.clickhouse, &folder_id, &viewer)
         .await?;
-    let mut board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer).await
+    // The owner of the folder a new dashboard is filed in: it travels in the
+    // first insert, so a dashboard filed in a personal space is private from
+    // the moment it exists and never public in between
+    // (`PR #199 review M BLOCKER 5`). An ordinary folder has no owner.
+    let folder_owner = if folder_id.is_empty() {
+        String::new()
     } else {
-        store::create_board(
+        lakehouse_bi::folders::folder_owner(&state.clickhouse, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?
+    };
+    let duplicated = parsed.duplicate.is_some();
+    let mut board = if let Some(dup) = parsed.duplicate {
+        store::duplicate_board(&state.clickhouse, &dup, &author, &viewer)
+            .await
+            .map_err(|err| match err {
+                store::DuplicateError::Copy(cause) => {
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+                store::DuplicateError::CopyAndCleanup { cause, cleanup } => {
+                    // The half-built copy that could not be taken back is the
+                    // operator's problem: it is reported under a reference id
+                    // (the raw text goes to the log, never to a response) and
+                    // the caller's own error is kept
+                    // (`PR #199 review O SHOULD-FIX 3`).
+                    let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &cleanup);
+                    crate::routes::dashboard_folders::classify_bi_error(&cause)
+                }
+            })?
+    } else {
+        store::create_board_in(
             &state.clickhouse,
             &parsed.name.unwrap_or_default(),
             &parsed.description.unwrap_or_default(),
             &author,
+            &folder_id,
+            &folder_owner,
         )
         .await
-    }
-    .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-    if !folder_id.is_empty() {
-        store::move_board(&state.clickhouse, &board.id, &folder_id)
-            .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(folder_id);
-    } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
-        // An administrator duplicating somebody else's draft: the copy is the
-        // administrator's own draft, not a second one in the other user's
-        // space.
-        let mine =
-            lakehouse_bi::folders::ensure_personal_folder(&state.clickhouse, viewer.id(), &author)
+        .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?
+    };
+    if duplicated {
+        // A copy lands next to the original and is private from its first
+        // insert, so moving it into another folder is a change of place, not
+        // the first time it is given an owner.
+        if !folder_id.is_empty() {
+            store::move_board(&state.clickhouse, &board.id, &folder_id)
                 .await
-                .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
-        store::move_board(&state.clickhouse, &board.id, &mine.id)
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(folder_id);
+        } else if board.owner_id.as_deref().is_some_and(|o| o != viewer.id()) {
+            // An administrator duplicating somebody else's draft: the copy is the
+            // administrator's own draft, not a second one in the other user's
+            // space.
+            let mine = lakehouse_bi::folders::ensure_personal_folder(
+                &state.clickhouse,
+                viewer.id(),
+                &author,
+            )
             .await
-            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
-        board.folder_id = Some(mine.id);
-        board.owner_id = Some(viewer.id().to_owned());
+            .map_err(|err| crate::routes::dashboard_folders::classify_ch_error(&err))?;
+            store::move_board(&state.clickhouse, &board.id, &mine.id)
+                .await
+                .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+            board.folder_id = Some(mine.id);
+            board.owner_id = Some(viewer.id().to_owned());
+        }
     }
     if let Some(Extension(p)) = principal.as_ref() {
         snapshot(&state.clickhouse, &board.id, p).await;
@@ -1386,6 +1423,21 @@ async fn check_theme_and_font(state: &AppState, parsed: &BoardEditBody) -> Resul
     }
 }
 
+/// The error of a board write: a board that is not there any more (deleted
+/// while the edit was on its way) is refused with its own sentence, and the
+/// store's failure keeps the mapping the write had before
+/// (`PR #199 review M SHOULD-FIX BI-18 3`).
+fn board_write_error(err: &store::BiError) -> ApiError {
+    match err {
+        store::BiError::Validation(msg) => ApiError::BadRequest(msg.clone()),
+        store::BiError::Clickhouse(err) => upstream_error::ch_error_as(
+            &upstream_error::DATABASE,
+            err,
+            upstream_error::FailedAs::BadRequest,
+        ),
+    }
+}
+
 /// The tabs and the phone layout of a board edit (`BI-18` part C), both
 /// already checked by [`check_tab_rules`].
 async fn save_tabs_and_phone_layout(
@@ -1556,13 +1608,7 @@ pub async fn boards_update(
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(seconds) = refresh {
         store::update_board_refresh(ch, &id, seconds)
@@ -1578,13 +1624,7 @@ pub async fn boards_update(
         let filters = without_inert(filters);
         store::update_board_filters(ch, &id, &filters)
             .await
-            .map_err(|err| {
-                upstream_error::ch_error_as(
-                    &upstream_error::DATABASE,
-                    &err,
-                    upstream_error::FailedAs::BadRequest,
-                )
-            })?;
+            .map_err(|err| board_write_error(&err))?;
     }
     if let Some(folder_id) = &parsed.folder_id {
         file_in_folder(ch, &id, folder_id.trim(), &viewer).await?;
@@ -1672,7 +1712,12 @@ pub struct FieldsQuery {
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
-pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+pub async fn fields(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Query(q): Query<FieldsQuery>,
+) -> Response {
     if let Some(id) = q.source.as_deref() {
         return match source_fields_body(&state.clickhouse, id).await {
             Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
@@ -1689,13 +1734,42 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         };
     }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok(mut body) => {
+            if q.mart.is_none() {
+                // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2:
+                // Only decorate marts if catalog_tenant_refusal allows it:
+                if let Ok(None) =
+                    crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers)
+                        .await
+                {
+                    mark_marts(&state, &mut body).await;
+                }
+            }
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
         )
             .into_response(),
     }
+}
+
+/// `DATA-12` part 3: puts each mart's certified or deprecated mark on the
+/// mart list the chart builder's picker reads, from the same annotation
+/// fields the catalog shows (`catalog::insert_certification_fields`), so the
+/// picker can mark a mart and warn when a deprecated one is chosen. A mart's
+/// catalog id is `serving.<name>`; an unmarked mart gains no key. One batch
+/// read for the whole list.
+async fn mark_marts(state: &AppState, body: &mut Value) {
+    let Some(marts) = body.get_mut("marts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    // `DATA-12` task 10 moved the merge itself to
+    // `catalog::apply_serving_certification`: the assistant's
+    // `describe_mart` marks its marts the same way, so the guard, the id
+    // convention and the field shape have one owner instead of two.
+    crate::routes::catalog::apply_serving_certification(state, marts, "name").await;
 }
 
 /// `?joins=` branch of [`fields`] (`BI-7`): the columns of the flat relation a
@@ -4584,6 +4658,80 @@ mod tests {
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
         // BI-18 part C: the tab only on a tile that names one.
         assert!(out.contains("      c2: { x: 3, y: 0, w: 3, h: 5, tab: t_maps }"));
+    }
+
+    // ── DATA-12 part 3: marks on the mart list ───────────────────────────
+    mod marks {
+        use std::collections::HashMap;
+
+        // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+        // testcontainer bootstrap runs for this test binary.
+        use lakehouse_test_support as _;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                format!(
+                    "postgres://{}:postgres@{}:{}/{}",
+                    options.get_username(),
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_database().expect("a named database"),
+                ),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        async fn deprecate(pool: &lakehouse_store::PgPool, id: &str, replacement: Option<&str>) {
+            lakehouse_store::annotation::set_certification(
+                pool,
+                &lakehouse_store::annotation::CertificationInput {
+                    asset_id: id.to_owned(),
+                    status: "deprecated".to_owned(),
+                    note: Some("Use the v2 mart".to_owned()),
+                    replacement_asset_id: replacement.map(str::to_owned),
+                    certified_by: "Rina".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_deprecated_mart_reaches_the_picker_payload_with_its_note_and_replacement(
+            pool: lakehouse_store::PgPool,
+        ) {
+            deprecate(&pool, "serving.orders", Some("serving.orders_v2")).await;
+            let mut body = json!({ "marts": [
+                { "name": "orders", "rows": 10 },
+                { "name": "orders_v2", "rows": 12 },
+                { "name": "stock", "rows": 3 },
+            ]});
+
+            mark_marts(&state_for(&pool), &mut body).await;
+
+            let orders = &body["marts"][0];
+            assert_eq!(orders["certification"], json!("deprecated"));
+            assert_eq!(orders["certificationNote"], json!("Use the v2 mart"));
+            assert_eq!(orders["replacementAssetId"], json!("serving.orders_v2"));
+            assert_eq!(orders["replacementName"], json!("orders_v2"));
+            assert_eq!(orders["rows"], json!(10), "the existing fields are kept");
+            assert!(body["marts"][1].get("certification").is_none());
+            assert!(body["marts"][2].get("certification").is_none());
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_list_with_no_marks_is_left_exactly_as_it_was(pool: lakehouse_store::PgPool) {
+            let original = json!({ "marts": [{ "name": "orders", "rows": 10 }] });
+            let mut body = original.clone();
+            mark_marts(&state_for(&pool), &mut body).await;
+            assert_eq!(body, original);
+        }
     }
 }
 

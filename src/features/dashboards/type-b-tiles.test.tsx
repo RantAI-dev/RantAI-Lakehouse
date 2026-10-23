@@ -105,6 +105,17 @@ describe("a histogram", () => {
     tile(spec, rows([]))
     expect(screen.getByText("No data.")).toBeTruthy()
   })
+
+  it("says how many rows have no value, instead of losing them", () => {
+    tile(spec, rows([{ price: 0, __count: 3 }, { price: null, __count: 1 }, { price: 2000, __count: 7 }]))
+    expect(screen.getByText("1 row has no value")).toBeTruthy()
+    cleanup()
+    // The rows without a value are the bin with no range, and their number is
+    // that bin's count (1 + 2), not the number of such rows in the result
+    // (`PR #199 review O SHOULD-FIX 5`).
+    tile(spec, rows([{ price: 0, __count: 3 }, { price: null, __count: 1 }, { price: null, __count: 2 }]))
+    expect(screen.getByText("3 rows have no value")).toBeTruthy()
+  })
 })
 
 describe("a bullet graph", () => {

@@ -7,7 +7,8 @@
  * and the order a phone shows its tiles in. No fetch and no React.
  */
 
-import type { BoardTab, FilterDef, LayoutMap, PhoneTile, TileBox } from "@/services/clients/bi-store"
+import type { BoardTab, LayoutMap, PhoneTile, TileBox } from "@/services";
+import type { FilterDef } from "@/services/clients/bi-store";
 import type { ChartKind } from "./dashboard-specs"
 
 /** Query parameter holding the selected tab. */

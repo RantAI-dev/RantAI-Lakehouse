@@ -10,7 +10,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { cn } from "@/lib/utils";
 import { filterLabel, isActiveFilter, isRequiredColumn } from "@/lib/dashboard-filter-state";
 import { withTies } from "@/lib/dashboard-tabs";
-import type { BoardTab, FilterDef, FilterField } from "@/services/clients/bi-store";
+import type { BoardTab } from "@/services";
+import type { FilterDef, FilterField } from "@/services/clients/bi-store";
 import { DateEditor, NumberEditor, TextEditor, blankFilter, type EditorProps } from "./filter-editors";
 
 function KindIcon({ kind, className }: { kind: string; className?: string }) {

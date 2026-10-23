@@ -3,9 +3,13 @@ import type { ChartColors } from "./chart-style"
 /**
  * The palettes the console ships (`BI-17` part A, feature decision 6). `default` is the
  * indigo-led categorical palette every chart used before; the four others are new.
- * Every colour has a relative luminance between 0.13 and 0.30, which keeps at least 3:1
- * contrast (the graphics threshold) against both the light card (#ffffff) and the dark
- * card (#18181b); `chart-palettes.test.ts` checks it.
+ * Every colour of the four new palettes reaches 3:1 contrast (the graphics threshold)
+ * against both the light card (#ffffff) and the dark card (#18181b), and
+ * `chart-palettes.test.ts` checks it.
+ *
+ * The `default` palette is the exception, and the test skips it for that reason: it is
+ * kept exactly as it was so that no saved chart changes colour, and its sky, amber, lime
+ * and orange are below 3:1 on the light card (`PR #199 review M SHOULD-FIX BI-17 5`).
  */
 export const DEFAULT_PALETTE = [
   "#6366f1", "#0ea5e9", "#10b981", "#f59e0b",

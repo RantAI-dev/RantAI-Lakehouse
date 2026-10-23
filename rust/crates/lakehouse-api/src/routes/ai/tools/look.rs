@@ -89,6 +89,22 @@ pub(crate) fn merge_format(
             FORMAT_FIELDS.join(", ")
         ));
     }
+    // `PR #199 review M SHOULD-FIX BI-17 3`: a key that is not a formatting
+    // field is refused, not dropped. The tool used to ignore it and answer
+    // `formatted: true`, so a model that sent a title or a measure was told
+    // the chart had changed when it had not.
+    let unknown: Vec<String> = args
+        .keys()
+        .filter(|key| key.as_str() != "chart" && !FORMAT_FIELDS.contains(&key.as_str()))
+        .map(|key| format!("\"{key}\""))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "format_chart changes formatting only: {} {} not a field it changes. Use update_chart to change what the chart shows.",
+            unknown.join(", "),
+            if unknown.len() == 1 { "is" } else { "are" }
+        ));
+    }
     let Ok(mut def) = serde_json::to_value(stored) else {
         return Err("the chart's definition could not be read.".to_owned());
     };
@@ -106,15 +122,54 @@ pub(crate) fn merge_format(
             }
         }
     }
-    let Ok(merged) = serde_json::from_value::<ChartInput>(def) else {
-        return Err(
-            "a formatting field has the wrong shape or an unknown name: follow the tool's schema."
-                .to_owned(),
-        );
+    let merged = match serde_json::from_value::<ChartInput>(def.clone()) {
+        Ok(merged) => merged,
+        Err(cause) => return Err(wrong_shape_sentence(&def, &cause.to_string())),
     };
     lakehouse_bi::style::check_style(&merged)?;
     lakehouse_bi::params::check_reference_lines(&merged)?;
     Ok(merged)
+}
+
+/// The formatting field whose shape is wrong, when one field alone is to
+/// blame.
+///
+/// A definition that does not read names no field: serde says what it found,
+/// not where it found it. Taking each formatting field out of the definition
+/// and reading what is left tells which one is to blame, for the definition
+/// reads again once the wrong field is gone. Two wrong fields leave nothing
+/// to single out, so no field is named.
+fn wrong_format_field(def: &Value) -> Option<&'static str> {
+    let fields = def.as_object()?;
+    let mut wrong: Option<&'static str> = None;
+    for field in FORMAT_FIELDS {
+        if !fields.contains_key(field) {
+            continue;
+        }
+        let mut without = fields.clone();
+        without.remove(field);
+        if serde_json::from_value::<ChartInput>(Value::Object(without)).is_ok() {
+            if wrong.is_some() {
+                return None;
+            }
+            wrong = Some(field);
+        }
+    }
+    wrong
+}
+
+/// The sentence for a formatting field that does not read: what serde said,
+/// and which field was to blame when one field alone is.
+///
+/// The field is named in front of serde's own words, because serde's words
+/// say what was found and not where it was found: the model has to know
+/// which of its arguments to fix.
+fn wrong_shape_sentence(def: &Value, cause: &str) -> String {
+    let named = wrong_format_field(def).filter(|field| !cause.contains(*field));
+    match named {
+        Some(field) => format!("a formatting field has the wrong shape: \"{field}\": {cause}"),
+        None => format!("a formatting field has the wrong shape: {cause}"),
+    }
 }
 
 async fn format_chart(
@@ -128,10 +183,11 @@ async fn format_chart(
     }
     let ch = &state.clickhouse;
     let viewer: Viewer = principal.map_or_else(Viewer::anonymous, viewer_of);
-    // A chart in the trash or on somebody else's personal board cannot be edited.
+    // A chart in the trash, one purged for good, or one on somebody else's
+    // personal board cannot be edited, and all three answer like a chart
+    // that never existed.
     match require_editable_chart(ch, &id, &viewer).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return json!({ "error": "chart not found." }),
+        Ok(_) => {}
         Err(crate::routes::dashboard_organise::Gate::Missing(sentence)) => {
             return json!({ "error": sentence });
         }
@@ -221,7 +277,46 @@ async fn set_dashboard_theme(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
     use super::*;
+    use crate::config::Config;
+
+    /// The state the tool reads through: no Postgres, so the reporting
+    /// settings read as their defaults.
+    fn state_for(server: &MockServer) -> AppState {
+        let env = HashMap::from([
+            ("CH_URL".to_owned(), server.uri()),
+            (
+                "DATABASE_URL".to_owned(),
+                "not a connection string".to_owned(),
+            ),
+        ]);
+        AppState::new(Config::from_map(&env).expect("a valid test config"))
+    }
+
+    /// A `ClickHouse` that answers the chart's own state with these rows and
+    /// every other statement with none.
+    async fn engine(rows: Vec<Value>) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                let sql = String::from_utf8_lossy(&request.body);
+                let rows = if sql.contains("FROM console.bi_chart") {
+                    rows.clone()
+                } else {
+                    Vec::new()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "meta": [], "data": rows, "rows": rows.len() }))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
 
     fn stored() -> ChartInput {
         serde_json::from_value(json!({
@@ -261,25 +356,35 @@ mod tests {
         );
     }
 
+    /// `PR #199 review M SHOULD-FIX BI-17 3`: a key that is not a formatting
+    /// field is refused, not dropped. The test before this one asserted the
+    /// dropping: it named a title, a mart and a kind, and expected the chart
+    /// to be unchanged and the call to succeed. The tool answered
+    /// `formatted: true`, so a model that sent a title was told the chart had
+    /// changed when it had not.
     #[test]
-    fn nothing_but_the_formatting_fields_is_read_from_the_call() {
-        let before = stored();
+    fn a_key_that_is_not_a_formatting_field_is_refused() {
+        for (key, value) in [
+            ("title", json!("Hijacked")),
+            ("mart", json!("mart_other")),
+            ("kind", json!("pie")),
+            ("dimension", json!("x")),
+            ("measures", json!(["y"])),
+            ("limit", json!(1)),
+            ("click", json!(null)),
+            ("board", json!("b2")),
+        ] {
+            let mut call = json!({ "chart": "c1", "labels": { "show": true } });
+            call[key] = value;
+            let e = merge_format(&stored(), &args(call)).unwrap_err();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        // The formatting fields themselves still go through.
         let after = merge_format(
-            &before,
-            &args(json!({
-                "chart": "c1", "labels": { "show": true },
-                "title": "Hijacked", "mart": "mart_other", "kind": "pie", "dimension": "x",
-                "measures": ["y"], "limit": 1, "click": null, "board": "b2",
-            })),
+            &stored(),
+            &args(json!({ "chart": "c1", "labels": { "show": true } })),
         )
         .unwrap();
-        assert_eq!(after.title, before.title);
-        assert_eq!(after.mart, before.mart);
-        assert_eq!(after.kind, before.kind);
-        assert_eq!(after.dimension, before.dimension);
-        assert_eq!(after.limit, before.limit);
-        assert_eq!(after.click, before.click);
-        assert_eq!(after.board, before.board);
         assert!(after.style.labels.unwrap().show);
     }
 
@@ -368,6 +473,22 @@ mod tests {
         assert!(e.contains("wrong shape"), "{e}");
     }
 
+    /// A refusal that says "a formatting field" leaves the model guessing
+    /// which of its arguments is wrong. The sentence names the field, so the
+    /// model knows what to fix.
+    #[test]
+    fn a_field_of_the_wrong_shape_names_the_field() {
+        let e = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "format": { "style": "rupiah" } })),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "a formatting field has the wrong shape: \"format\": unknown variant `rupiah`, expected one of `auto`, `number`, `percent`, `currency`, `scientific`, `compact`"
+        );
+    }
+
     #[test]
     fn a_call_with_no_formatting_field_is_refused_and_says_which_are_allowed() {
         let e = merge_format(&stored(), &args(json!({ "chart": "c1", "title": "x" }))).unwrap_err();
@@ -390,5 +511,22 @@ mod tests {
         for field in FORMAT_FIELDS.iter().filter(|f| **f != "referenceLines") {
             assert!(json.get(*field).is_some(), "{field} is not a style field");
         }
+    }
+
+    /// `PR #199 review O SHOULD-FIX 2`: a chart that was purged for good
+    /// (state 1) answers like one that never existed, so the answer does not
+    /// tell the two apart.
+    #[tokio::test]
+    async fn a_purged_chart_answers_like_a_chart_that_never_existed() {
+        let purged = engine(vec![json!({ "is_deleted": 1, "board": "b1" })]).await;
+        let unknown = engine(Vec::new()).await;
+        let call = args(json!({ "chart": "c1", "colors": { "palette": "muted" } }));
+        let purged_reply = Box::pin(format_chart(&state_for(&purged), None, &call)).await;
+        let unknown_reply = Box::pin(format_chart(&state_for(&unknown), None, &call)).await;
+        assert_eq!(
+            purged_reply, unknown_reply,
+            "a purged chart and a chart that never existed answer the same"
+        );
+        assert_eq!(purged_reply["error"], json!("this tile does not exist"));
     }
 }

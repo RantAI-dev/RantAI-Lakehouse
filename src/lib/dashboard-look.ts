@@ -48,7 +48,13 @@ export function dashboardLook(
 ): DashboardLook {
   const theme = isTheme(board?.theme) ? board.theme : "auto"
   const dark = theme === "auto" ? appDark : theme === "dark"
-  const className = theme === "dark" ? "dark" : theme === "light" ? "theme-light" : ""
+  // BI-18 part C review fix (SHOULD-FIX) R22: the class only redefines the
+  // tokens; text inherits its colour from the console's body, and a surface
+  // keeps the console's background, so a dark board in a light console had dark
+  // text on its tiles and grey boxes (`bg-muted`) on a light page. The scope
+  // paints its own surface and text colour from its own tokens.
+  const scope = "bg-background text-foreground"
+  const className = theme === "dark" ? `dark ${scope}` : theme === "light" ? `theme-light ${scope}` : ""
   const font = board?.font
   const family = font && FONT_FAMILIES[font] && (!allowedFonts || allowedFonts.includes(font)) ? FONT_FAMILIES[font] : undefined
   return { dark, className, style: family ? { fontFamily: family } : undefined }

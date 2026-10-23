@@ -47,7 +47,7 @@ Yes. The assistant asks by itself when a word is unclear. The user answers by cl
 ## Limits to tell a customer
 
 - The chat asks once. If its previous message was a question, it takes the most likely reading and says which.
-- A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn.
+- A turn in which the chat asks holds the question and its options only; the chat does not ask after it has already run a query in that turn. After a refused late ask the chat answers with the reading it used, without an apology and without a question in text.
 - Options are two to four, each at most 80 characters.
 - A saved word is stored per user. Another user is asked again.
 - A user keeps at most 100 saved words. The 101st is refused until one is deleted. The 30 newest go into the prompt.

@@ -35,11 +35,27 @@ const COMPACT_STEPS: readonly [number, string][] = [
   [1e3, "K"],
 ]
 
-/** The compact step of `v`: the scaled number and its letter, or the number itself below 1,000. */
-function compactParts(v: number): { scaled: number; letter: string } {
+/**
+ * The compact step of `v`: the scaled number and its letter, or the number
+ * itself below 1,000.
+ *
+ * A value that rounds up to a thousand of its own step belongs to the next
+ * one: 999,950 is "1 M", not "1,000 K"
+ * (`PR #199 review M SHOULD-FIX BI-17 8`).
+ */
+function compactParts(v: number, decimals: number | undefined): { scaled: number; letter: string } {
   const a = Math.abs(v)
-  for (const [size, letter] of COMPACT_STEPS) {
-    if (a >= size) return { scaled: v / size, letter }
+  const digits = decimals ?? 1
+  for (const [index, [size, letter]] of COMPACT_STEPS.entries()) {
+    if (a < size) continue
+    const scaled = v / size
+    // COMPACT_STEPS runs from the largest unit down, so the step above is the
+    // one before it.
+    if (index > 0 && Math.abs(scaled) >= 1000 - 0.5 * 10 ** -digits) {
+      const [upSize, upLetter] = COMPACT_STEPS[index - 1]!
+      return { scaled: v / upSize, letter: upLetter }
+    }
+    return { scaled, letter }
   }
   return { scaled: v, letter: "" }
 }
@@ -60,7 +76,7 @@ function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number)
     case "compact": {
       // Compact with a currency code is a compact amount: "Rp 1,23 M" (decision 3).
       if (fmt.currency) return compactCurrency(v, fmt, locale)
-      const { scaled, letter } = compactParts(v)
+      const { scaled, letter } = compactParts(v, fmt.decimals)
       const n = plainSpaces(scaled.toLocaleString(locale, { ...fraction(fmt.decimals, 1), useGrouping: grouping }))
       return letter ? `${n} ${letter}` : n
     }
@@ -84,7 +100,7 @@ function body(v: number, fmt: ValueFormat, locale: string, autoDecimals: number)
 
 /** A currency in compact form: "Rp 1,23 M". The symbol and its place come from `Intl`; the scaled number carries the letter. */
 function compactCurrency(v: number, fmt: ValueFormat, locale: string): string {
-  const { scaled, letter } = compactParts(v)
+  const { scaled, letter } = compactParts(v, fmt.decimals)
   const decimals = fmt.decimals ?? (letter ? 1 : undefined)
   const text = plainSpaces(
     new Intl.NumberFormat(locale, {
@@ -192,9 +208,12 @@ export function formatDateValue(value: unknown, fmt: DateFormat | undefined, loc
   if (hh === undefined) return day
   const time = new Intl.DateTimeFormat(locale, {
     timeZone: "UTC",
-    hour: fmt?.hour12 ? "numeric" : "2-digit",
+    // The locale's own clock when the format does not say: the server's own
+    // doc says "absent follows the locale", and this forced 24-hour time
+    // (`PR #199 review M SHOULD-FIX BI-17 8`).
+    hour: fmt?.hour12 === false ? "2-digit" : "numeric",
     minute: "2-digit",
-    hour12: fmt?.hour12 ?? false,
+    hour12: fmt?.hour12,
   }).format(at)
   return `${day} ${plainSpaces(time)}`
 }

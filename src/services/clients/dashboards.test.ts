@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
+import { readableErrorMessage } from "@/lib/notify-message"
 import { ServiceError } from "../errors"
 import { clickhouseDashboardService } from "./dashboards"
 
@@ -109,6 +110,43 @@ describe("embed state (SEC-12)", () => {
     stubFetch(() => json({ error: "that token has no id (jti), so it cannot be withdrawn on its own; withdraw all the dashboard's embed tokens instead." }, 400))
     const err = await clickhouseDashboardService.revokeEmbedToken("b_1", "a.b.c").catch((e: unknown) => e)
     expect((err as ServiceError).message).toContain("no id (jti)")
+  })
+})
+
+describe("a refused dashboard write is an error, not a success (BI-18 part C review fix (SHOULD-FIX) R19)", () => {
+  const calls: [string, () => Promise<unknown>][] = [
+    ["create", () => clickhouseDashboardService.createBoard({ name: "New dashboard" })],
+    ["duplicate", () => clickhouseDashboardService.duplicateBoard("b1")],
+    ["rename", () => clickhouseDashboardService.updateBoard({ id: "b1", name: "Renamed" })],
+    ["delete a dashboard", () => clickhouseDashboardService.deleteBoard("b1")],
+    ["delete a chart", () => clickhouseDashboardService.deleteChart("c1")],
+    ["save a layout", () => clickhouseDashboardService.saveBoardLayout("b1", {})],
+  ]
+  for (const [name, call] of calls) {
+    it(`${name} throws the server's sentence on a 403, without the code`, async () => {
+      stubFetch(() => json({ error: "permission_denied: dashboard:write" }, 403))
+      const err = await call().catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ServiceError)
+      expect((err as ServiceError).code).toBe("permission_denied")
+      // The page shows the readable sentence: the code is for the log.
+      expect(readableErrorMessage((err as ServiceError).message)).toBe(
+        "This account does not have permission. Ask a workspace admin.",
+      )
+    })
+  }
+
+  it("says the status when the refusal has no sentence", async () => {
+    stubFetch(() => json({}, 500))
+    const err = await clickhouseDashboardService.deleteBoard("b1").catch((e: unknown) => e)
+    expect((err as ServiceError).message).toBe("The change was refused (500).")
+  })
+
+  it("returns the answer of a write that went through", async () => {
+    stubFetch(() => json({ board: { id: "b9" } }))
+    const copy = await clickhouseDashboardService.duplicateBoard("b1")
+    expect(copy.id).toBe("b9")
+    stubFetch(() => json({ ok: true }))
+    await clickhouseDashboardService.deleteChart("c1")
   })
 })
 
