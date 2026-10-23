@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useFormatSettings } from "./use-format-settings"
+import { KeyboardShortcutsDialog } from "./keyboard-shortcuts-dialog"
 import type { useQueryStudio } from "./use-query-studio"
 
 /** What the keyword case is called in the settings control. */
@@ -221,6 +222,7 @@ export function SqlPanel({
             </div>
           </PopoverContent>
         </Popover>
+        <KeyboardShortcutsDialog />
         {onToggleSchema ? (
           <Button
             size="sm"
