@@ -1628,3 +1628,61 @@ has no attribute 'endswith'`). `SRC-11 connector operations` also fails
   `state["delta_link"]["object"]` is the loaded list, so the gate also
   proves `SHOULD-FIX 24`. Grep the gate and the stubs for any other reader
   of a state shape the fix round changed.
+
+### Handoff: final review round 3 (developer, 2026-10-23)
+
+One commit, one finding: `f1243720` — `fix(g6): the SharePoint gate reads the
+saved delta link as link + object` (BLOCKER 19, round 3; also proves
+SHOULD-FIX 24).
+
+What changed:
+
+- `ops/g6/g6_saas_test.py`: a new `_saved_delta_link(state, object_name)`
+  raises a named `SaasGateFailure` when `state["delta_link"]` is not a dict
+  with a non-empty `"link"` string (never the CI's `AttributeError`), and
+  requires `"object"` to be the list the step loaded. Both SharePoint sites —
+  the first load (`token=v5`) and the 410 resync (`token=v9`) — call it with
+  `SP_OBJECT`, so the gate also asserts the object tie SHOULD-FIX 24 added.
+  The citation `PR #216 final review BLOCKER 19 (round 3)` is at both sites
+  and in the helper docstring; the mismatch message names SHOULD-FIX 24.
+- `ops/g6/test_saas_gate_saved_delta_link.py` (new): six unittest cases, no
+  network and no docker — the valid shape, the pre-fix bare string (named
+  failure, not `AttributeError`), a missing key, a dict without a link string,
+  and a link saved for another list.
+
+Sweep of the gate and the stubs, as asked: the only other state reader is
+Dynamics 365's `state["delta"]["link"]` (`g6_saas_test.py:990`), which is right
+against `dynamics365.py` (`_tracked` stores `{"link", "select", "object"}`);
+no gate or stub sends plain `"incremental"` as a saas `loadMode` (the product
+step sends `incremental_dedup`, Workday `replace`); GA4's `decl.lag_seconds`
+and the BLOCKER 19 marker tuples are unchanged by round 3; no stub reads dlt
+state at all.
+
+Commands run, with results:
+
+- `python3 -m py_compile ops/g6/g6_saas_test.py
+  ops/g6/test_saas_gate_saved_delta_link.py`: OK.
+- `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`: **12 tests, 0
+  failures, 0 errors** (6 marker tests from round 2, 6 new).
+- Without docker: `/home/shiro/rantai/venv-bld3/bin/python
+  /tmp/opencode/sp_gate_state_check.py` (scratch, not committed) ran
+  `sharepoint.read` over the dagster suite's fake Graph: it produced
+  `{"delta_link": {"link": ".../delta?token=v5", "object": <SP_OBJECT>}}`,
+  `_saved_delta_link` returned the link, the pre-fix expression on that same
+  state raised `AttributeError: 'dict' object has no attribute 'endswith'`,
+  and a link saved for another list was refused with the SHOULD-FIX 24
+  message.
+- `cd dagster && python -m pytest dispar_orchestrate/test_saas_sharepoint.py
+  -q`: **39 passed, 0 failed** (223 warnings), 20.35s — the module's own
+  tests for both state shapes (first run, later run, other object, resync).
+
+Not verified, and why:
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  task does not start; the read path is exercised above only against the
+  fake Graph and the unit tests. CI decides whether `g6-saas-b`'s SharePoint
+  step now passes.
+- **The new unit test is not discovered by CI** for the same reason as round
+  2's: it imports the gate module, which imports `requests`, and the
+  `repo-lints` job installs no third-party packages. It is run by the command
+  above.
