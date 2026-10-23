@@ -27,6 +27,20 @@ export function isStaticKind(kind: ChartKind | string): boolean {
 }
 
 /**
+ * A chart that yields one row whatever the data: a KPI, a progress bar, a
+ * gauge, or any chart whose definition has no dimension (a bullet graph without
+ * a category). A raw table and a pivot also have no dimension but list rows of
+ * their own. "Skip when empty" leaves these out, so a dashboard with only these
+ * never skips (RPT-1 QA fix Q3). Mirrors `is_single_value` in `report_runner.rs`.
+ */
+export function isSingleValueChart(kind: ChartKind | string, def?: { readonly dimension?: unknown } | null): boolean {
+  if (kind === "kpi" || kind === "progress" || kind === "gauge") return true
+  if (kind === "table" || kind === "pivot") return false
+  const d = def?.dimension
+  return d === undefined || d === null || d === ""
+}
+
+/**
  * The height, in grid rows, a new tile of `kind` is created at (BI-18 part C
  * review fix (SHOULD-FIX) R6): a heading, a section header and a divider are one
  * line of text or a rule, so they take one row (44 px, which fits the heading's
