@@ -122,15 +122,54 @@ pub(crate) fn merge_format(
             }
         }
     }
-    let Ok(merged) = serde_json::from_value::<ChartInput>(def) else {
-        return Err(
-            "a formatting field has the wrong shape or an unknown name: follow the tool's schema."
-                .to_owned(),
-        );
+    let merged = match serde_json::from_value::<ChartInput>(def.clone()) {
+        Ok(merged) => merged,
+        Err(cause) => return Err(wrong_shape_sentence(&def, &cause.to_string())),
     };
     lakehouse_bi::style::check_style(&merged)?;
     lakehouse_bi::params::check_reference_lines(&merged)?;
     Ok(merged)
+}
+
+/// The formatting field whose shape is wrong, when one field alone is to
+/// blame.
+///
+/// A definition that does not read names no field: serde says what it found,
+/// not where it found it. Taking each formatting field out of the definition
+/// and reading what is left tells which one is to blame, for the definition
+/// reads again once the wrong field is gone. Two wrong fields leave nothing
+/// to single out, so no field is named.
+fn wrong_format_field(def: &Value) -> Option<&'static str> {
+    let fields = def.as_object()?;
+    let mut wrong: Option<&'static str> = None;
+    for field in FORMAT_FIELDS {
+        if !fields.contains_key(field) {
+            continue;
+        }
+        let mut without = fields.clone();
+        without.remove(field);
+        if serde_json::from_value::<ChartInput>(Value::Object(without)).is_ok() {
+            if wrong.is_some() {
+                return None;
+            }
+            wrong = Some(field);
+        }
+    }
+    wrong
+}
+
+/// The sentence for a formatting field that does not read: what serde said,
+/// and which field was to blame when one field alone is.
+///
+/// The field is named in front of serde's own words, because serde's words
+/// say what was found and not where it was found: the model has to know
+/// which of its arguments to fix.
+fn wrong_shape_sentence(def: &Value, cause: &str) -> String {
+    let named = wrong_format_field(def).filter(|field| !cause.contains(*field));
+    match named {
+        Some(field) => format!("a formatting field has the wrong shape: \"{field}\": {cause}"),
+        None => format!("a formatting field has the wrong shape: {cause}"),
+    }
 }
 
 async fn format_chart(
@@ -432,6 +471,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("wrong shape"), "{e}");
+    }
+
+    /// A refusal that says "a formatting field" leaves the model guessing
+    /// which of its arguments is wrong. The sentence names the field, so the
+    /// model knows what to fix.
+    #[test]
+    fn a_field_of_the_wrong_shape_names_the_field() {
+        let e = merge_format(
+            &stored(),
+            &args(json!({ "chart": "c1", "format": { "style": "rupiah" } })),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "a formatting field has the wrong shape: \"format\": unknown variant `rupiah`, expected one of `auto`, `number`, `percent`, `currency`, `scientific`, `compact`"
+        );
     }
 
     #[test]

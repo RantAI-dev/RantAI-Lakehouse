@@ -312,6 +312,21 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "format!(\"filters: {err}\")",
         "serde error over the caller's own tool arguments",
     ),
+    // The tool's own decode of the model's formatting arguments: serde
+    // reporting a shape it cannot parse out of the formatting block the
+    // model sent. Same class as the `ai/tools/dashboards.rs` entry above --
+    // our own schema describing the caller's input, never an upstream
+    // payload.
+    (
+        "ai/tools/look.rs",
+        "cause.to_string()",
+        "serde error over the model's own formatting arguments, the same class as dashboards.rs above: it names the field the model must fix, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
+        "ai/tools/look.rs",
+        "a formatting field has the wrong shape: ",
+        "the same serde error over the model's own formatting arguments, in front of the field's name",
+    ),
 ];
 
 /// Calls that are the choke point: a line using one is not a leak.
