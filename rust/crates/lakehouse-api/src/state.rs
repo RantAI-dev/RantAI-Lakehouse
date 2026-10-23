@@ -211,6 +211,10 @@ pub struct AppState {
     /// feature decision 5); a third request waits for a slot. Shared across
     /// clones.
     pub pdf_slots: Arc<tokio::sync::Semaphore>,
+    /// At most `TILE_CONCURRENCY_MAX` (default 24) dashboard tiles are
+    /// computed at once per process, across every request (`BI-4` part A,
+    /// plan D2); a request also caps itself at 6. Shared across clones.
+    pub tile_slots: Arc<tokio::sync::Semaphore>,
     /// Test seam for the alert webhook sender (merge of `SEC-10` into the
     /// `SRC-17` delivery tests): those tests deliver to a `wiremock`
     /// listener on loopback, which the real address policy refuses by
@@ -740,6 +744,7 @@ impl AppState {
             throttle_policy: Arc::new(throttle_policy),
             upload_receive,
             pdf_slots: Arc::new(tokio::sync::Semaphore::new(PDF_AT_ONCE)),
+            tile_slots: Arc::new(crate::tile_pool::slots_from_env()),
             #[cfg(test)]
             webhook_sender_override: None,
         }

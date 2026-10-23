@@ -46,6 +46,7 @@ mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
+mod tile_pool;
 mod transform_grammar;
 mod upload_limits;
 mod upload_parquet;

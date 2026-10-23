@@ -170,6 +170,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &board_id,
         &filters,
         &time,
+        &state.tile_slots,
     )
     .await;
     match payload {
@@ -421,6 +422,7 @@ pub async fn public_dashboard(
         &board_id,
         &filters,
         &time,
+        &state.tile_slots,
     )
     .await;
     match payload {
@@ -586,6 +588,7 @@ async fn render_board_payload(
     board_id: &str,
     filters: &[FilterDef],
     time: &lakehouse_bi::grain::TimeContext,
+    tile_slots: &tokio::sync::Semaphore,
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
@@ -643,54 +646,94 @@ async fn render_board_payload(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for original in &stored_for_board {
-        let tile_filters = tile_filters(board, filters, &original.spec.id);
-        let effective = crate::routes::support::effective_chart(original, &cols, &sources, &read);
-        let c = match &effective {
-            Ok(e) => &**e,
-            Err(msg) => {
-                results.insert(original.spec.id.clone(), json!({ "error": msg }));
-                charts_out.push(embed_rendered(original, original));
-                continue;
-            }
-        };
-        match stored_chart_sql(c, &[], &tile_filters, &cols, &sources, &read) {
-            Ok(filtered) => {
-                let (id, mut val) = run_spec_sql(
-                    ch,
-                    &c.spec.id,
-                    &filtered.sql,
-                    &roles,
-                    &placeholders,
-                    obligations,
-                )
-                .await;
-                crate::routes::support::annotate_params(&mut val, c, &values);
-                crate::routes::support::annotate_grain(&mut val, &filtered, c);
-                // BI-16 part A: the first page of a raw table, with its
-                // total; an embed and a public link offer no paging.
-                crate::routes::support::annotate_table(
-                    ch,
-                    &mut val,
-                    &filtered,
-                    (&roles, &placeholders, obligations),
-                )
-                .await;
-                let tile_ctx = crate::routes::layers::LayerContext {
-                    filters: &tile_filters,
-                    ..layer_ctx
+    // BI-4 part A (plan D1/D2): the tiles run up to 6 at once for this
+    // request and under the process's `tile_slots`, through the one shared
+    // mechanism (`tile_pool`). Each tile keeps the masks of the embed viewer
+    // role and its own `error` value; the outputs come back in chart order,
+    // the order the sequential loop produced.
+    let (cols_ref, sources_ref, read_ref, values_ref) = (&cols, &sources, &read, &values);
+    let (roles_ref, placeholders_ref, catalog_ref) = (&roles, &placeholders, &field_catalog);
+    let layer_ctx_ref = &layer_ctx;
+    let tiles: Vec<futures::future::BoxFuture<'_, (String, Value, Value)>> = stored_for_board
+        .iter()
+        .map(|original| {
+            let original: &StoredChartSpec = original;
+            Box::pin(async move {
+                let tile_filters = tile_filters(board, filters, &original.spec.id);
+                let effective = crate::routes::support::effective_chart(
+                    original,
+                    cols_ref,
+                    sources_ref,
+                    read_ref,
+                );
+                let c = match &effective {
+                    Ok(e) => &**e,
+                    Err(msg) => {
+                        return (
+                            original.spec.id.clone(),
+                            json!({ "error": msg }),
+                            embed_rendered(original, original),
+                        );
+                    }
                 };
-                crate::routes::layers::annotate_layers(&tile_ctx, &mut val, c, filtered.grain)
-                    .await;
-                annotate_metric_labels(&mut val, c, &field_catalog, Some((&cols, &sources)));
-                results.insert(id, val);
-            }
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-            }
-        }
-
-        charts_out.push(embed_rendered(original, c));
+                let val = match stored_chart_sql(
+                    c,
+                    &[],
+                    &tile_filters,
+                    cols_ref,
+                    sources_ref,
+                    read_ref,
+                ) {
+                    Ok(filtered) => {
+                        let (id, mut val) = run_spec_sql(
+                            ch,
+                            &c.spec.id,
+                            &filtered.sql,
+                            roles_ref,
+                            placeholders_ref,
+                            obligations,
+                        )
+                        .await;
+                        crate::routes::support::annotate_params(&mut val, c, values_ref);
+                        crate::routes::support::annotate_grain(&mut val, &filtered, c);
+                        // BI-16 part A: the first page of a raw table, with
+                        // its total; an embed and a public link offer no
+                        // paging.
+                        crate::routes::support::annotate_table(
+                            ch,
+                            &mut val,
+                            &filtered,
+                            (roles_ref, placeholders_ref, obligations),
+                        )
+                        .await;
+                        let tile_ctx = crate::routes::layers::LayerContext {
+                            filters: &tile_filters,
+                            ..*layer_ctx_ref
+                        };
+                        crate::routes::layers::annotate_layers(
+                            &tile_ctx,
+                            &mut val,
+                            c,
+                            filtered.grain,
+                        )
+                        .await;
+                        annotate_metric_labels(
+                            &mut val,
+                            c,
+                            catalog_ref,
+                            Some((cols_ref, sources_ref)),
+                        );
+                        (id, val)
+                    }
+                    Err(msg) => (c.spec.id.clone(), json!({ "error": msg })),
+                };
+                (val.0, val.1, embed_rendered(original, c))
+            }) as futures::future::BoxFuture<'_, (String, Value, Value)>
+        })
+        .collect();
+    for (id, val, rendered) in crate::tile_pool::run_tiles(tile_slots, tiles).await {
+        results.insert(id, val);
+        charts_out.push(rendered);
     }
 
     Ok(board_body(board, &charts_out, &results, time))
@@ -833,6 +876,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         )
         .await
         .unwrap();
@@ -979,6 +1023,7 @@ mod typed_filters {
             "b1",
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         )
         .await
         .unwrap();
@@ -1086,6 +1131,7 @@ mod typed_filters {
             "b1",
             &locked,
             &lakehouse_bi::grain::TimeContext::default(),
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         )
         .await
         .unwrap();
@@ -1185,6 +1231,7 @@ mod typed_filters {
             "b1",
             &[],
             &time,
+            &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
         )
         .await
         .unwrap();

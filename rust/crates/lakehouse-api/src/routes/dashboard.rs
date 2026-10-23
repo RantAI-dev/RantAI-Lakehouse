@@ -226,7 +226,7 @@ pub(crate) async fn payload_for(
         &principal.role_names,
         &placeholders,
         &obligations,
-        (&time, requested, &viewer),
+        (&time, requested, &viewer, &state.tile_slots),
     )
     .await
     {
@@ -263,9 +263,10 @@ pub(crate) async fn payload_for(
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single large TS handler (spec \
-              merge -> filter application -> parallel tile execution); \
-              splitting it up would scatter one pipeline across helpers \
-              with no independent reuse"
+              merge -> filter application -> tile execution, which BI-4 \
+              part A runs side by side through `tile_pool`); splitting it \
+              up would scatter one pipeline across helpers with no \
+              independent reuse"
 )]
 async fn get_body(
     ch: &ChClient,
@@ -274,7 +275,12 @@ async fn get_body(
     roles: &[String],
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
-    (time, requested_grain, viewer): (&TimeContext, GrainRequest, &Viewer),
+    (time, requested_grain, viewer, tile_slots): (
+        &TimeContext,
+        GrainRequest,
+        &Viewer,
+        &tokio::sync::Semaphore,
+    ),
 ) -> Result<Value, BodyError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -383,21 +389,6 @@ async fn get_body(
     // the board reads, not only the ones an active filter touches.
     let cols = mart_columns(ch).await?;
 
-    let mut results = Map::new();
-    if on_default {
-        for k in KPIS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &k.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-        for c in CHARTS.iter() {
-            let sql =
-                lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &c.id, &sql, roles, placeholders, obligations).await;
-            results.insert(id, val);
-        }
-    }
     let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     // BI-13: the questions of a combined chart are asked as the viewer, one
     // statement each; their sources are read here, once, and a read that fails
@@ -419,65 +410,104 @@ async fn get_body(
         layer_sources: &layer_sources,
         read: &read,
     };
-    for c in &stored_for_board {
-        // BI-11: the chart as this read sees it, every parameter replaced by
-        // its value; a value that does not fit is this tile's plain sentence.
-        let c = match effective_chart(c, &cols, &sources, &read) {
-            Ok(effective) => effective,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let c = &*c;
-        // BI-18 part C: a filter tied to other tabs is not given to this tile,
-        // and so is not reported as skipped on it either.
-        let tile_filters =
-            lakehouse_bi::layout::filters_for_chart(&filters, &tabs, &layout, &c.spec.id);
-        let tile_layer_ctx = crate::routes::layers::LayerContext {
-            filters: &tile_filters,
-            ..layer_ctx
-        };
-        let filtered = match stored_chart_sql(c, &years, &tile_filters, &cols, &sources, &read) {
-            Ok(filtered) => filtered,
-            Err(msg) => {
-                results.insert(c.spec.id.clone(), json!({ "error": msg }));
-                continue;
-            }
-        };
-        let (id, mut val) = run_spec_sql(
-            ch,
-            &c.spec.id,
-            &filtered.sql,
-            roles,
-            placeholders,
-            obligations,
-        )
-        .await;
-        let skipped = &filtered.skipped;
-        crate::routes::support::annotate_params(&mut val, c, &loaded.values);
-        crate::routes::support::annotate_grain(&mut val, &filtered, c);
-        crate::routes::support::annotate_table(
-            ch,
-            &mut val,
-            &filtered,
-            (roles, placeholders, obligations),
-        )
-        .await;
-        crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain).await;
-        crate::routes::support::annotate_metric_labels(
-            &mut val,
-            c,
-            &field_catalog,
-            Some((&cols, &sources)),
-        );
-        // The tile still renders; this only lets it say which active filters
-        // its data cannot honour (no such column, or a type that does not fit).
-        if !skipped.is_empty()
-            && let Value::Object(tile) = &mut val
+    // BI-4 part A (plan D1/D2): every tile is one future, run up to 6 at once
+    // for this request and under the process's `tile_slots`. A tile's masks
+    // and row filters are applied inside its own pipeline, as before, and its
+    // failure is its own `error` value, so no tile can fail another. The
+    // outputs come back in this order (built-ins, then stored charts), which
+    // is the order the sequential loops inserted them in.
+    let (years_ref, cols_ref, sources_ref, read_ref) = (&years, &cols, &sources, &read);
+    let (filters_ref, tabs_ref, layout_ref) = (&filters, &tabs, &layout);
+    let (values_ref, catalog_ref, layer_ctx_ref) = (&loaded.values, &field_catalog, &layer_ctx);
+    let mut tiles: Vec<futures::future::BoxFuture<'_, (String, Value)>> = Vec::new();
+    if on_default {
+        for (id, sql_text, mart) in KPIS
+            .iter()
+            .map(|k| (&k.id, &k.sql, &k.mart))
+            .chain(CHARTS.iter().map(|c| (&c.id, &c.sql, &c.mart)))
         {
-            tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            tiles.push(Box::pin(async move {
+                let sql = lakehouse_bi::builder::apply_builtin_year_filter(
+                    sql_text, mart, years_ref, cols_ref,
+                );
+                run_spec_sql(ch, id, &sql, roles, placeholders, obligations).await
+            }));
         }
+    }
+    for c in &stored_for_board {
+        let c: &StoredChartSpec = c;
+        tiles.push(Box::pin(async move {
+            // BI-11: the chart as this read sees it, every parameter replaced
+            // by its value; a value that does not fit is this tile's plain
+            // sentence.
+            let c = match effective_chart(c, cols_ref, sources_ref, read_ref) {
+                Ok(effective) => effective,
+                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+            };
+            let c = &*c;
+            // BI-18 part C: a filter tied to other tabs is not given to this
+            // tile, and so is not reported as skipped on it either.
+            let tile_filters = lakehouse_bi::layout::filters_for_chart(
+                filters_ref,
+                tabs_ref,
+                layout_ref,
+                &c.spec.id,
+            );
+            let tile_layer_ctx = crate::routes::layers::LayerContext {
+                filters: &tile_filters,
+                ..*layer_ctx_ref
+            };
+            let filtered = match stored_chart_sql(
+                c,
+                years_ref,
+                &tile_filters,
+                cols_ref,
+                sources_ref,
+                read_ref,
+            ) {
+                Ok(filtered) => filtered,
+                Err(msg) => return (c.spec.id.clone(), json!({ "error": msg })),
+            };
+            let (id, mut val) = run_spec_sql(
+                ch,
+                &c.spec.id,
+                &filtered.sql,
+                roles,
+                placeholders,
+                obligations,
+            )
+            .await;
+            let skipped = &filtered.skipped;
+            crate::routes::support::annotate_params(&mut val, c, values_ref);
+            crate::routes::support::annotate_grain(&mut val, &filtered, c);
+            crate::routes::support::annotate_table(
+                ch,
+                &mut val,
+                &filtered,
+                (roles, placeholders, obligations),
+            )
+            .await;
+            crate::routes::layers::annotate_layers(&tile_layer_ctx, &mut val, c, filtered.grain)
+                .await;
+            crate::routes::support::annotate_metric_labels(
+                &mut val,
+                c,
+                catalog_ref,
+                Some((cols_ref, sources_ref)),
+            );
+            // The tile still renders; this only lets it say which active
+            // filters its data cannot honour (no such column, or a type that
+            // does not fit).
+            if !skipped.is_empty()
+                && let Value::Object(tile) = &mut val
+            {
+                tile.insert("filtersSkipped".to_owned(), json!(skipped));
+            }
+            (id, val)
+        }));
+    }
+    let mut results = Map::new();
+    for (id, val) in crate::tile_pool::run_tiles(tile_slots, tiles).await {
         results.insert(id, val);
     }
 
@@ -5462,10 +5492,113 @@ mod typed_filters {
                 &lakehouse_bi::grain::TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
         .expect("the payload builds")
+    }
+
+    /// Answers a tile query after 300 ms and records when it arrived, so a
+    /// test can see how many tiles were in flight together.
+    struct SlowTile {
+        arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    }
+
+    impl wiremock::Respond for SlowTile {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let text = String::from_utf8_lossy(&request.body);
+            if text.contains("mart_bad") {
+                return ResponseTemplate::new(500).set_body_string("boom");
+            }
+            self.arrivals
+                .lock()
+                .expect("arrivals lock")
+                .push(std::time::Instant::now());
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "meta": [{ "name": "kab", "type": "String" }, { "name": "visitors", "type": "UInt32" }],
+                    "data": [{ "kab": "a", "visitors": 1 }],
+                    "rows": 1,
+                }))
+        }
+    }
+
+    /// BI-4 part A (plan D1/T1): twelve 300 ms tiles are answered in two
+    /// rounds of six, in chart order, and a tile whose query fails does not
+    /// fail the others.
+    #[tokio::test]
+    async fn twelve_slow_tiles_load_six_at_a_time_in_order_and_one_failure_stays_its_own() {
+        let server = MockServer::start().await;
+        let mut charts: Vec<Value> = (0..12)
+            .map(|i| chart_row(&format!("c{i:02}"), "b1", "mart_a", None))
+            .collect();
+        charts[8] = chart_row("c08", "b1", "mart_bad", None);
+        answer(
+            &server,
+            "FROM console.bi_chart FINAL",
+            &["id", "board", "created_by", "created_at", "spec_json"],
+            charts,
+        )
+        .await;
+        answer(&server, "FROM console.bi_board FINAL", &["id"], vec![]).await;
+        answer(&server, "FROM console.bi_source FINAL", &["id"], vec![]).await;
+        let mut cols = mart_column_rows("mart_a", &[("visitors", "UInt32"), ("kab", "String")]);
+        cols.extend(mart_column_rows(
+            "mart_bad",
+            &[("visitors", "UInt32"), ("kab", "String")],
+        ));
+        answer(
+            &server,
+            "SELECT table, name, type FROM system.columns",
+            &["table", "name", "type"],
+            cols,
+        )
+        .await;
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(body_string_contains("serving."))
+            .respond_with(SlowTile {
+                arrivals: arrivals.clone(),
+            })
+            .mount(&server)
+            .await;
+        answer_rest(&server).await;
+
+        let started = std::time::Instant::now();
+        let body = dashboard(&server, "").await;
+        let took = started.elapsed();
+
+        let results = body["results"].as_object().expect("results");
+        let ids: Vec<&String> = results.keys().collect();
+        let expected: Vec<String> = (0..12).map(|i| format!("c{i:02}")).collect();
+        assert_eq!(ids, expected.iter().collect::<Vec<_>>(), "chart order");
+        assert!(
+            results["c08"].get("error").is_some(),
+            "{:?}",
+            results["c08"]
+        );
+        for id in expected.iter().filter(|id| *id != "c08") {
+            assert!(
+                results[id].get("error").is_none(),
+                "{id}: {:?}",
+                results[id]
+            );
+            assert_eq!(results[id]["rows"][0]["visitors"], 1, "{id}");
+        }
+        // Eleven 300 ms tiles one after another take 3.3 s.
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+        let times = arrivals.lock().expect("arrivals lock").clone();
+        assert_eq!(times.len(), 11, "every healthy tile asked once");
+        let first = *times.iter().min().expect("a tile query");
+        let in_first_wave = times
+            .iter()
+            .filter(|t| t.duration_since(first) < std::time::Duration::from_millis(200))
+            .count();
+        // Six start together; the 7th cannot start until one finishes (300 ms).
+        // The failing tile (c08) is in the second wave, so the first has six.
+        assert_eq!(in_first_wave, 6, "six tiles in the first wave");
     }
 
     #[test]
@@ -6616,6 +6749,7 @@ mod time_grain {
                 time,
                 requested.into(),
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -6692,6 +6826,7 @@ mod time_grain {
                 &TimeContext::default(),
                 super::GrainRequest::Own,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
@@ -7082,6 +7217,7 @@ mod table_tiles {
                 &TimeContext::default(),
                 GrainRequest::Saved,
                 &lakehouse_bi::access::Viewer::system(),
+                &tokio::sync::Semaphore::new(crate::tile_pool::TILES_PER_PROCESS),
             ),
         )
         .await
