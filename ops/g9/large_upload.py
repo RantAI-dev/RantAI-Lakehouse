@@ -16,6 +16,9 @@ is where its numbers are read; nothing here decides a limit.
    JSON Lines file of `--jsonl-mb` MiB (2048) and a gzipped CSV that unpacks to
    `--gzip-mb` MiB (2048; the file sent is smaller, the unpacked size is what the
    cap counts, feature page decision 2). Slice 6 (T6.1) names these four.
+   `--sizes 256,512,1024,2048` (MiB) measures each enabled format at each of those
+   sizes instead, every one its own phase with its own `RESULT` line (the Parquet
+   size is the total over `--parquet-files` files).
    The rows are sized so that a file stays under the job's 2,000,000-row cap
    (`file_ingest.MAX_ROWS`): wide rows of random text, which also compress
    poorly, so the Parquet files reach the size asked for.
@@ -27,8 +30,15 @@ is where its numbers are read; nothing here decides a limit.
    `--containers` (`NAME=container` pairs, e.g. `api=g9large-lakehouse-api-1`,
    `dagster=g9large-dagster-code-location-1`) once a second, by
    `docker exec <container> cat /sys/fs/cgroup/memory.current`, and reads
-   `memory.peak` (cgroup v2) at the end of each phase. `memory.peak` counts since
-   the container started, so it never goes down; the sampled maximum is per phase.
+   `memory.peak` (cgroup v2) at the end of each phase. Every phase is its own
+   window (g9-upload-large run 39891862222 printed one identical maximum for three
+   phases, because the sampler's maximum and `memory.peak`, which counts since the
+   container started and never goes down, carried over): at the start of a phase the
+   sampler drops its maximum, records the container's memory then (the baseline) and
+   tries to reset `memory.peak` by writing to it (cgroup v2, kernel 6.12 and later,
+   and only where the container's cgroup file is writable). Where the write is
+   refused the peak stays "since start" and the line says so; the sampled maximum,
+   with the baseline beside it, is the per-phase figure either way.
    The Dagster run is a process of the code-location container, so that
    container's figures are the run's. The console (Next.js) is not part of this
    compose project: its proxy was measured on its own (section 8 item 3 of the plan).
@@ -210,24 +220,39 @@ def _docker_cat(container: str, path: str) -> int | None:
 
 
 class Sampler:
-    """Reads `memory.current` of each container once a second while a phase runs."""
+    """Reads `memory.current` of each container once a second while a phase runs.
+
+    One window per `with`: entering drops the previous phase's maximum, records the
+    baseline (the memory just before the phase) and tries to reset `memory.peak`.
+    """
 
     def __init__(self, containers: dict[str, str], interval_s: float = 1.0) -> None:
         self.containers = containers
         self.interval_s = interval_s
         self.maxima: dict[str, int | None] = {name: None for name in containers}
+        self.baselines: dict[str, int | None] = {name: None for name in containers}
+        self.peak_reset: dict[str, bool] = {name: False for name in containers}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def _sample(self) -> None:
+        for name, container in self.containers.items():
+            value = _docker_cat(container, "/sys/fs/cgroup/memory.current")
+            if value is not None:
+                self.maxima[name] = max(self.maxima[name] or 0, value)
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            for name, container in self.containers.items():
-                value = _docker_cat(container, "/sys/fs/cgroup/memory.current")
-                if value is not None:
-                    self.maxima[name] = max(self.maxima[name] or 0, value)
+            self._sample()
             self._stop.wait(self.interval_s)
 
     def __enter__(self) -> "Sampler":
+        self._stop.clear()
+        self.maxima = {name: None for name in self.containers}
+        self.baselines = {
+            name: _docker_cat(container, "/sys/fs/cgroup/memory.current") for name, container in self.containers.items()
+        }
+        self.peak_reset = {name: _reset_peak(container) for name, container in self.containers.items()}
         if self.containers:
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
@@ -237,9 +262,27 @@ class Sampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=15)
+            self._thread = None
+        self._sample()  # the state at the end of the window, however short it was
 
     def peaks(self) -> dict[str, int | None]:
         return {name: _docker_cat(container, "/sys/fs/cgroup/memory.peak") for name, container in self.containers.items()}
+
+
+def _reset_peak(container: str) -> bool:
+    """Writes to `memory.peak` (cgroup v2, kernel 6.12 and later): any write resets the
+    watermark of the writing file descriptor. True when the container accepted it."""
+    try:
+        out = subprocess.run(
+            ["docker", "exec", container, "sh", "-c", "echo 0 > /sys/fs/cgroup/memory.peak"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # ── The API ──────────────────────────────────────────────────────────────
@@ -377,25 +420,54 @@ class Phase:
     seconds: float
     maxima: dict[str, int | None] = field(default_factory=dict)
     peaks: dict[str, int | None] = field(default_factory=dict)
+    baselines: dict[str, int | None] = field(default_factory=dict)
+    peak_reset: dict[str, bool] = field(default_factory=dict)
+
+
+def snapshot(name: str, size: int, rows: int | None, seconds: float, sampler: "Sampler") -> Phase:
+    """A phase with the figures of the sampler's window that just ended."""
+    return Phase(name, size, rows, seconds, dict(sampler.maxima), sampler.peaks(), dict(sampler.baselines), dict(sampler.peak_reset))
 
 
 def _mib(value: int | None) -> str:
     return "n/a" if value is None else f"{value / MIB:,.0f}"
 
 
+def _peak_text(phase: Phase, name: str) -> str:
+    value = phase.peaks.get(name)
+    return _mib(value) + ("*" if value is not None and phase.peak_reset.get(name) else "")
+
+
+def _growth(phase: Phase, name: str) -> str:
+    base, high = phase.baselines.get(name), phase.maxima.get(name)
+    if base is None or high is None:
+        return "n/a"
+    return f"{(high - base) / MIB:+,.0f}"
+
+
 def render(phases: list[Phase], names: list[str], free_bytes: int | None) -> str:
-    head = ["phase", "MiB", "rows", "seconds", "MiB/s"] + [f"{n} max" for n in names] + [f"{n} peak" for n in names]
+    head = (
+        ["phase", "MiB", "rows", "seconds", "MiB/s"]
+        + [f"{n} base" for n in names]
+        + [f"{n} max" for n in names]
+        + [f"{n} peak" for n in names]
+    )
     lines = [head]
     for p in phases:
         rate = "n/a" if p.seconds <= 0 else f"{p.bytes / MIB / p.seconds:,.1f}"
         lines.append(
             [p.name, f"{p.bytes / MIB:,.0f}", "n/a" if p.rows is None else f"{p.rows:,}", f"{p.seconds:,.1f}", rate]
+            + [_mib(p.baselines.get(n)) for n in names]
             + [_mib(p.maxima.get(n)) for n in names]
-            + [_mib(p.peaks.get(n)) for n in names]
+            + [_peak_text(p, n) for n in names]
         )
     widths = [max(len(row[i]) for row in lines) for i in range(len(head))]
     out = ["  ".join(cell.rjust(widths[i]) if i else cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in lines]
-    out.append(f"memory in MiB: 'max' is the largest memory.current sampled once a second during the phase; 'peak' is the container's memory.peak since it started")
+    out.append(
+        "memory in MiB: 'base' is memory.current just before the phase; 'max' is the largest memory.current sampled "
+        "once a second during that phase only; 'peak' is memory.peak, '*' marking one reset at the phase start "
+        "(otherwise it is since the container started)"
+    )
     out.append(f"free disk of the scratch directory at the end: {_mib(free_bytes)} MiB")
     return "\n".join(out)
 
@@ -406,7 +478,10 @@ def phase_line(phase: Phase, names: list[str], free_bytes: int | None) -> str:
     third phase and its end-of-run table was never read)."""
     rate = "n/a" if phase.seconds <= 0 else f"{phase.bytes / MIB / phase.seconds:,.1f}"
     memory = " ".join(
-        f"{n}: max {_mib(phase.maxima.get(n))} MiB, peak {_mib(phase.peaks.get(n))} MiB" for n in names
+        f"{n}: base {_mib(phase.baselines.get(n))} MiB, max {_mib(phase.maxima.get(n))} MiB "
+        f"(growth {_growth(phase, n)} MiB), peak {_mib(phase.peaks.get(n))} MiB "
+        f"({'reset at phase start' if phase.peak_reset.get(n) else 'since container start'})"
+        for n in names
     )
     rows = "n/a" if phase.rows is None else f"{phase.rows:,}"
     return (
@@ -436,9 +511,28 @@ def run_phase(api, name: str, path: Path, rows: int, table: str, dialect: bool, 
     if loaded.get("rows") is not None and loaded["rows"] != rows:
         raise HarnessFailure(f"{table}: the load reported {loaded['rows']:,} rows, the file held {rows:,}")
     print(f"[large] {name}: sent in {sent - started:,.0f} s, loaded and counted by {time.time() - started:,.0f} s")
-    phase = Phase(name, size, rows, time.time() - started, dict(sampler.maxima), sampler.peaks())
+    phase = snapshot(name, size, rows, time.time() - started, sampler)
     print(phase_line(phase, list(sampler.containers), _free_disk(path.parent)), flush=True)
     return phase
+
+
+def parse_sizes(text: str) -> list[int]:
+    """`"256,512"` -> `[256, 512]`; empty text is no list (today's one size per format)."""
+    try:
+        sizes = [int(part) for part in text.split(",") if part.strip()]
+    except ValueError as exc:
+        raise HarnessFailure(f"--sizes {text!r} is not a comma-separated list of whole MiB") from exc
+    if any(size <= 0 for size in sizes):
+        raise HarnessFailure(f"--sizes {text!r} holds a size that is not above zero")
+    return sizes
+
+
+def sizes_for(flag_mb: int, sizes: list[int]) -> list[int]:
+    """The sizes one format is measured at: none when its own option is 0 (skipped), the
+    `--sizes` list when there is one, otherwise its own single size."""
+    if flag_mb <= 0:
+        return []
+    return sizes or [flag_mb]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -448,6 +542,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parquet-mb", type=int, default=1945, help="MiB of Parquet in all (0 skips them)")
     parser.add_argument("--jsonl-mb", type=int, default=2048, help="size of the JSON Lines file in MiB (0 skips it)")
     parser.add_argument("--gzip-mb", type=int, default=2048, help="MiB a gzipped CSV unpacks to (0 skips it)")
+    parser.add_argument(
+        "--sizes",
+        default="",
+        help="comma-separated MiB list, e.g. 256,512,1024,2048: each enabled format is measured at each size "
+        "(its own phase and RESULT line); the per-format size options are then ignored except for 0 = skip",
+    )
     parser.add_argument("--containers", default="", help="NAME=container,NAME=container to sample")
     parser.add_argument("--scratch", default="", help="a directory for the generated files")
     args = parser.parse_args(argv)
@@ -466,32 +566,41 @@ def main(argv: list[str] | None = None) -> int:
     try:
         login(api)
         sampler = Sampler(containers)
-        if args.csv_mb > 0:
+        sizes = parse_sizes(args.sizes)
+        graded = bool(sizes)
+        for csv_mb in sizes_for(args.csv_mb, sizes):
+            label = f"csv {csv_mb} MiB" if graded else "csv"
             path = scratch / f"large-{suffix}.csv"
-            rows = write_csv(path, args.csv_mb * MIB)
+            rows = write_csv(path, csv_mb * MIB)
             print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
-            phases.append(run_phase(api, "csv", path, rows, f"g9_large_{suffix}_csv", True, sampler))
+            phases.append(run_phase(api, label, path, rows, f"g9_large_{suffix}_csv{csv_mb}", True, sampler))
             path.unlink()
-        if args.jsonl_mb > 0:
+        for jsonl_mb in sizes_for(args.jsonl_mb, sizes):
+            label = f"jsonl {jsonl_mb} MiB" if graded else "jsonl"
             path = scratch / f"large-{suffix}.jsonl"
-            rows = write_jsonl(path, args.jsonl_mb * MIB)
+            rows = write_jsonl(path, jsonl_mb * MIB)
             print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
-            phases.append(run_phase(api, "jsonl", path, rows, f"g9_large_{suffix}_jsonl", False, sampler))
+            phases.append(run_phase(api, label, path, rows, f"g9_large_{suffix}_jsonl{jsonl_mb}", False, sampler))
             path.unlink()
-        if args.gzip_mb > 0:
+        for gzip_mb in sizes_for(args.gzip_mb, sizes):
+            label = f"csv.gz {gzip_mb} MiB" if graded else "csv.gz"
             path = scratch / f"large-{suffix}.csv.gz"
-            rows = write_csv_gz(path, args.gzip_mb * MIB)
+            rows = write_csv_gz(path, gzip_mb * MIB)
             print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB gzipped, {rows:,} rows")
-            phases.append(run_phase(api, "csv.gz", path, rows, f"g9_large_{suffix}_gz", True, sampler))
+            phases.append(run_phase(api, label, path, rows, f"g9_large_{suffix}_gz{gzip_mb}", True, sampler))
             path.unlink()
         if args.parquet_mb > 0 and args.parquet_files > 0:
-            each = args.parquet_mb * MIB // args.parquet_files
-            for n in range(args.parquet_files):
-                path = scratch / f"large-{suffix}-{n}.parquet"
-                rows = write_parquet(path, each)
-                print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
-                phases.append(run_phase(api, f"parquet {n + 1}/{args.parquet_files}", path, rows, f"g9_large_{suffix}_pq{n}", False, sampler))
-                path.unlink()
+            for parquet_mb in sizes_for(args.parquet_mb, sizes):
+                each = parquet_mb * MIB // args.parquet_files
+                tag = f"parquet {parquet_mb} MiB" if graded else "parquet"
+                for n in range(args.parquet_files):
+                    path = scratch / f"large-{suffix}-{n}.parquet"
+                    rows = write_parquet(path, each)
+                    print(f"[large] generated {path.name}: {path.stat().st_size / MIB:,.0f} MiB, {rows:,} rows")
+                    phases.append(
+                        run_phase(api, f"{tag} {n + 1}/{args.parquet_files}", path, rows, f"g9_large_{suffix}_pq{parquet_mb}_{n}", False, sampler)
+                    )
+                    path.unlink()
     except HarnessFailure as exc:
         print(f"[large] FAILED: {exc}", file=sys.stderr)
         if phases:
