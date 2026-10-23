@@ -8,7 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
-import { buildOption, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
+import { buildOption, clusterNote, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
 import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
@@ -176,7 +176,8 @@ export function TileBody({
       buckets: { grain, raw: rawRows.map((r) => r[spec.x]), timeZone: reporting.timeZone, breakdown: !!spec.series },
     };
     const option = withReferenceLines(styled.option, cell.referenceLines, spec.kind === "hbar", dark, lineCtx, cols);
-    const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar");
+    // BI-17 part B: what the chart says under itself about a forecast or about clusters.
+    const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar") ?? clusterNote(spec, rows, style);
     const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />

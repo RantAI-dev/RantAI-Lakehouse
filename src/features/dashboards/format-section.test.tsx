@@ -120,3 +120,27 @@ describe("FormatSection clusters (BI-17 part B)", () => {
     expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
   })
 })
+
+describe("Clusters (BI-17 part B)", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+  const section = (style: StyleFields, onChange: (s: StyleFields) => void, rules = scatter) =>
+    <FormatSection rules={rules} style={style} onChange={onChange} valueNames={["sales", "visits"]} paletteValue="default" />
+
+  it("switches clusters on at automatic, then takes 2 to 10 groups, and switches them off", () => {
+    const onChange = mock<(s: StyleFields) => void>(() => {})
+    const { rerender } = render(section({}, onChange))
+    expect(screen.queryByLabelText("Number of clusters")).toBeNull()
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[0]![0].clusters).toEqual({ k: "auto" })
+    rerender(section({ clusters: { k: "auto" } }, onChange))
+    choose(screen.getByLabelText("Number of clusters"), "4")
+    expect(onChange.mock.calls[1]![0].clusters).toEqual({ k: 4 })
+    fireEvent.click(screen.getByRole("switch", { name: "Colour points by cluster" }))
+    expect(onChange.mock.calls[2]![0].clusters).toBeUndefined()
+  })
+
+  it("is not offered on a chart kind that cannot cluster", () => {
+    render(section({}, () => {}, formatRules({ kind: "bar", breakdown: false, measures: 1 })))
+    expect(screen.queryByRole("switch", { name: "Colour points by cluster" })).toBeNull()
+  })
+})

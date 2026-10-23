@@ -178,3 +178,19 @@ describe("clusters", () => {
     expect(stylePayload(styleFromDef({}), scatter)).toEqual({})
   })
 })
+
+// BI-17 part B (plan D2): the Clusters setting.
+test("clusters are offered on a scatter and a bubble chart only", () => {
+  expect(formatRules({ kind: "scatter", breakdown: false, measures: 2 }).clusters).toBe(true)
+  expect(formatRules({ kind: "bubble", breakdown: false, measures: 3 }).clusters).toBe(true)
+  expect(formatRules({ kind: "line", breakdown: false, measures: 1 }).clusters).toBe(false)
+})
+
+test("a valid clusters setting round-trips, and an invalid or unsupported one is not sent", () => {
+  const scatter = formatRules({ kind: "scatter", breakdown: false, measures: 2 })
+  for (const k of ["auto", 2, 10] as const) {
+    expect(stylePayload(styleFromDef({ clusters: { k } }), scatter)).toEqual({ clusters: { k } })
+  }
+  for (const k of [1, 11, 2.5, Number.NaN]) expect(stylePayload({ clusters: { k } }, scatter)).toEqual({})
+  expect(stylePayload({ clusters: { k: "auto" } }, formatRules({ kind: "bar", breakdown: false, measures: 1 }))).toEqual({})
+})
