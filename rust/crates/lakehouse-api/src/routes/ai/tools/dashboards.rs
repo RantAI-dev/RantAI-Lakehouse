@@ -11,7 +11,7 @@ use lakehouse_clickhouse::ChClient;
 use serde_json::{Map, Value, json};
 
 use super::arg_str;
-use super::look::FORMAT_FIELDS;
+use super::look::{FORMAT_FIELDS, wrong_field};
 use crate::routes::dashboard_organise::{
     Gate, drop_tile, place_new_chart, require_chart_board, require_editable_chart, snapshot_as,
     viewer_of,
@@ -40,8 +40,27 @@ pub(super) fn refused(gate: Gate) -> Value {
 /// Parse a tool call's raw args `Value` into a [`ChartInput`], the same way
 /// `args as unknown as ChartInput` casts in `ai-tools.ts` (no validation at
 /// this boundary — `spec_from_input` validates for real).
+///
+/// A call that does not read names the field to blame when one field alone is
+/// to blame, as `format_chart` does for its own fields: serde's words say
+/// what was found and not where it was found, so the model has to know which
+/// of its arguments to fix. Two fields of the wrong shape name none, and the
+/// error is serde's own words.
 fn parse_chart_input(args: &Map<String, Value>) -> Result<ChartInput, String> {
-    serde_json::from_value(Value::Object(args.clone())).map_err(|e| e.to_string())
+    let def = Value::Object(args.clone());
+    match serde_json::from_value::<ChartInput>(def.clone()) {
+        Ok(input) => Ok(input),
+        Err(cause) => {
+            let cause = cause.to_string();
+            // The candidates are the call's own top-level keys: a chart's
+            // arguments are flat on the wire.
+            let candidates: Vec<&str> = args.keys().map(String::as_str).collect();
+            match wrong_field(&def, &candidates).filter(|field| !cause.contains(*field)) {
+                Some(field) => Err(format!("\"{field}\": {cause}")),
+                None => Err(cause),
+            }
+        }
+    }
 }
 
 /// The call's args with the formatting the call does not name filled in from
@@ -1160,6 +1179,65 @@ mod tests {
         assert_eq!(
             bar["error"],
             json!("goal is only for a progress bar and a bullet graph.")
+        );
+    }
+
+    /// A call whose args do not read names the field to blame: serde's words
+    /// say what was found and not where it was found, so the model has to
+    /// know which of its arguments to fix. The bands of a bullet graph are
+    /// numbers, and the model sent objects.
+    #[tokio::test]
+    async fn a_chart_call_with_bands_of_objects_names_the_field_to_fix() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = create_chart(
+            &ch,
+            None,
+            &arguments(json!({
+                "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+                "dimension": "province", "measures": ["visitors", "target"],
+                "goal": { "measure": "target" },
+                "bands": [{ "value": 1000, "label": "Target" }],
+            })),
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(
+            reply["error"],
+            json!("\"bands\": invalid type: map, expected f64"),
+            "{reply}"
+        );
+    }
+
+    /// Two fields of the wrong shape name none: there is nothing to single
+    /// out, so the error is serde's own words, as it was before.
+    #[tokio::test]
+    async fn a_chart_call_with_two_fields_of_the_wrong_shape_names_none() {
+        let server = mart_server().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let args = arguments(json!({
+            "title": "Visitors against target", "kind": "bullet", "mart": "mart_x",
+            "dimension": "province", "measures": ["visitors", "target"],
+            "goal": { "measure": 5 },
+            "bands": [{ "value": 1000, "label": "Target" }],
+        }));
+        let reply = create_chart(
+            &ch,
+            None,
+            &args,
+            None,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        // The error is serde's own words, with no field's name in front.
+        let serde_own = serde_json::from_value::<ChartInput>(Value::Object(args.clone()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(reply["error"], json!(serde_own), "{reply}");
+        assert!(
+            !reply["error"].as_str().unwrap().contains("\"bands\""),
+            "{reply}"
         );
     }
 

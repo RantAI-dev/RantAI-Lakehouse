@@ -134,28 +134,33 @@ pub(crate) fn merge_format(
     Ok(merged)
 }
 
-/// The formatting field whose shape is wrong, when one field alone is to
-/// blame.
+/// The field whose shape is wrong, when one field alone is to blame.
 ///
 /// A definition that does not read names no field: serde says what it found,
-/// not where it found it. Taking each formatting field out of the definition
+/// not where it found it. Taking each candidate field out of the definition
 /// and reading what is left tells which one is to blame, for the definition
 /// reads again once the wrong field is gone. Two wrong fields leave nothing
 /// to single out, so no field is named.
-fn wrong_format_field(def: &Value) -> Option<&'static str> {
+///
+/// The candidates are a parameter because the fields that can be to blame are
+/// the ones the caller named: the formatting fields for `format_chart`, the
+/// top-level keys of the call for a chart call. A candidate the definition
+/// does not hold changes nothing when it is taken out, so it can never be
+/// named.
+pub(super) fn wrong_field<'a>(def: &Value, candidates: &[&'a str]) -> Option<&'a str> {
     let fields = def.as_object()?;
-    let mut wrong: Option<&'static str> = None;
-    for field in FORMAT_FIELDS {
-        if !fields.contains_key(field) {
+    let mut wrong: Option<&'a str> = None;
+    for field in candidates {
+        if !fields.contains_key(*field) {
             continue;
         }
         let mut without = fields.clone();
-        without.remove(field);
+        without.remove(*field);
         if serde_json::from_value::<ChartInput>(Value::Object(without)).is_ok() {
             if wrong.is_some() {
                 return None;
             }
-            wrong = Some(field);
+            wrong = Some(*field);
         }
     }
     wrong
@@ -168,7 +173,7 @@ fn wrong_format_field(def: &Value) -> Option<&'static str> {
 /// say what was found and not where it was found: the model has to know
 /// which of its arguments to fix.
 fn wrong_shape_sentence(def: &Value, cause: &str) -> String {
-    let named = wrong_format_field(def).filter(|field| !cause.contains(*field));
+    let named = wrong_field(def, &FORMAT_FIELDS).filter(|field| !cause.contains(*field));
     match named {
         Some(field) => format!("a formatting field has the wrong shape: \"{field}\": {cause}"),
         None => format!("a formatting field has the wrong shape: {cause}"),
