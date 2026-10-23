@@ -289,4 +289,29 @@ webpack build after T3, T4 and T8.
 
 ## 7. Handoff (developer appends, one entry per part)
 
+### C2a Bundled maps (developer, branch `feat/bi-phase-6`)
+
+Commit: `840cf5e0` feat(maps): BI-16 C2a world and country maps from Natural Earth (T4). TypeScript, Python and static data only; no cargo command run, no Rust change (the API only checks the shape of a map id, `store.rs` `map_id_is_well_formed`, which `world` and `adm1-usa` satisfy).
+
+Data (Natural Earth 5.1.1, public domain; the archives were downloaded into a scratch directory outside the repo, read with `zipfile` only, and deleted afterwards): `public/geo/world.geojson` 743,310 bytes (242 countries); `public/geo/admin1/` 3,838,691 bytes in 250 files (largest `RUS` 200,785); `public/geo` in all 5,724,669 bytes (255 files), against the 15 MB budget and the plan's 25 MB stop line.
+
+Deviations and findings, for review:
+- **No mapshaper/shapely.** Neither is installed and installing was not allowed; the script (`ops/geo/build_natural_earth.py`) parses the shapefile with `struct` and simplifies with Douglas-Peucker (settings in `public/geo/README.md`). D4 names them as options, not requirements.
+- **Per-country files are keyed by Natural Earth `adm0_a3`**, which differs from ISO for a few places (for example `KOS`). Catalogue ids are `adm1-<a3 lower>`; Indonesia has none (D4).
+- **ISO codes:** `ISO_A2_EH`/`ISO_A3_EH` repair the -99 codes of France and Norway. Somaliland, N. Cyprus and the Siachen Glacier have no ISO code; the properties are empty rather than filled with Natural Earth's own codes. Kosovo carries `XK`/`KOS`, not ISO.
+- **Name matching:** `plain()` now also ignores accents, for every level (the Indonesian files have none, so nothing changes there; pinned by tests). New levels `country` and `subdivision`; aliases (ISO codes, `name_long`, `iso_3166_2`) are read from the map's own properties by `ensureMap` and never override a feature name; a short table covers UK, Burma, Ivory Coast and a few more.
+- The country picker in the chart builder now lists 251 maps in one select (sorted by country name after the three Indonesian ones). No search box was added; that is a UI decision for the planner.
+- **Webpack build not run** (plan section 6 asks for it after T4): not verified, to keep the VM's disk and memory free; CI runs it.
+- A world `geomap` rendered in a real canvas/browser was not checked; the component test hands the option to a mocked `EChart`.
+
+Checks (all from `/home/hv/lakehouse-phase6-build`):
+- `bun run typecheck`: exit 0.
+- `bun run lint`: 0 errors, 9 warnings, none in a file of this commit.
+- `bun test src/lib/geo-regions.test.ts src/features/dashboards/natural-earth-maps.test.tsx`: 24 pass, 0 fail.
+- `bun test src/features/dashboards src/lib`: 1317 pass, 1 skip, 0 fail (151 files).
+- `bun run test`: 2444 pass, 1 skip, 0 fail (251 files).
+- `python3 -I -m unittest discover -s ops/geo -p 'test_*.py'`: 11 tests OK (pytest is not installed here; the tests are plain `unittest`, which pytest also runs).
+- Existing behaviour: `natural-earth-maps.test.tsx` pins the three Indonesian/Jakarta catalogue entries, the two defaults, the credit text, and draws Jakarta (no map set) and `id-provinces` through `GeoChart` with the old name rules.
+
+
 ## 8. Review (planner appends, one entry per part)
