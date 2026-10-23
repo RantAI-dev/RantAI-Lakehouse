@@ -209,4 +209,18 @@ Decisions to review:
 Checks (from `/home/hv/lakehouse-phase6-build`): `bun test src/lib/forecast.test.ts`: 15 pass, 0 fail; `bun run typecheck`: exit 0; eslint on the two files: clean.
 
 
+### T3 `kmeans.ts` (developer, branch `feat/bi-phase-6`)
+
+Commit: `feat(clusters): deterministic k-means for scatter and bubble charts (BI-17 B T3)`. TypeScript only, no cargo; standalone (no type from T1; the `k` argument is `number | "auto"`, which is what T1's `Clusters { k: Auto | Fixed(2..=10) }` becomes on the wire, to be mapped by T4).
+
+API: `cluster(points, k)` returns `{ labels, k, auto, groups: [{ size, center }], score }` or `{ refused }`; `isClusterRefusal`, `mulberry32`. Min-max scaling per measure, k-means++ from mulberry32 (seed 1 + k), Lloyd to convergence or 100 iterations, best of 5 restarts by inertia, k by Calinski-Harabasz over 2..min(10, floor(n/3)), as D5. Groups are numbered by first appearance; centres are reported in the measures' own units for the legend "Cluster 1 (n = 42; x = ..., y = ...)".
+
+Decisions to review (all beyond what D5 spells out):
+- A fixed k needs `3k` points and `k` distinct positions, else a refusal sentence (feature decision 6: "at least 3 points per group, else fewer groups or a sentence"); auto also never exceeds the number of distinct positions.
+- Fewer than 6 points, all points identical, or a non-finite value: a refusal sentence each. A measure that never varies scales to 0.
+- An emptied group during Lloyd is re-seeded on the farthest point; CH ties go to the smaller k.
+- The seed varies with k (`1 + k`) so each k has its own fixed stream; every run of the same input gives the same labels (tested).
+
+Checks: `bun test src/lib/kmeans.test.ts`: 10 pass, 0 fail (blobs give k = 3 with every point in its blob, fixed k honoured, same labels across runs, n = 5 refused, millions-scale measure does not dominate, three-measure bubble, refusals). Full checks for both T2 and T3 on the final commit are in the next paragraph.
+
 ## 8. Review (planner appends)
