@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::throttle::ThrottlePolicy;
@@ -92,6 +93,21 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// Whether the start-up step has confirmed the application database is
+    /// usable at this build's schema version (`OPS-4`, `main::
+    /// bring_database_up`). Starts `false`: nothing has proven the schema
+    /// yet, so `GET /health` reports the database as unavailable until
+    /// migrations applied or a later retry succeeded (fail closed,
+    /// AGENTS.md principle 3).
+    ///
+    /// Not a live probe: this is the last answer the start-up step or its
+    /// retry loop gave, so a database lost AFTER boot keeps answering
+    /// `ok` here until the process restarts. A per-request probe would
+    /// have to be a bounded `SELECT 1` on its own short timeout — `GET
+    /// /health` is polled by the ops gates, and a probe that waits on a
+    /// dead database's default 30 s acquire timeout would stall them.
+    /// `docs/OPERATIONS.md` records that limit.
+    pub db_ready: Arc<AtomicBool>,
     /// Resolves a connector's `secretRef` to an actual credential value —
     /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
     /// its "Restricting connector secretRefs" addendum). **Deliberately
@@ -624,6 +640,18 @@ fn postgres_pool(config: &Config) -> Option<Arc<PgPool>> {
     }
 }
 
+/// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
+/// configured numbers, converted to the shape the login handler reads.
+/// A free function only so the state constructor stays inside clippy's
+/// line budget as the state grows; behaviour is unchanged.
+fn login_throttle_policy(config: &Config) -> ThrottlePolicy {
+    ThrottlePolicy {
+        max_failures: config.login_max_failures,
+        window: Duration::seconds(i64::from(config.login_failure_window_secs)),
+        lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
+    }
+}
+
 impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
@@ -710,11 +738,7 @@ impl AppState {
         let secret_manager = config.secret_manager.clone();
         warn_if_no_reference_prefixes(&secret_manager);
         let secrets_keyring = connector_secrets_keyring(&config);
-        let throttle_policy = ThrottlePolicy {
-            max_failures: config.login_max_failures,
-            window: Duration::seconds(i64::from(config.login_failure_window_secs)),
-            lockout: Duration::seconds(i64::from(config.login_lockout_secs)),
-        };
+        let throttle_policy = login_throttle_policy(&config);
         let upload_receive = ReceiveLimiter::new(
             config.upload_max_concurrent_per_user,
             config.upload_max_concurrent,
@@ -725,6 +749,7 @@ impl AppState {
             dagster: Arc::new(dagster),
             llm: Arc::new(llm),
             pg,
+            db_ready: Arc::new(AtomicBool::new(false)),
             connector_secret_resolver: connector_secret_resolver(
                 EnvSecretResolver::new(),
                 &secrets_dir,
@@ -762,6 +787,23 @@ impl AppState {
             return sender.clone();
         }
         crate::webhook_guard::sender(&self.config)
+    }
+
+    /// Whether `GET /health` should report the application database as
+    /// usable (`OPS-4`): no pool is never ready, and a pool is ready only
+    /// after [`Self::mark_database_ready`].
+    #[must_use]
+    pub fn database_ready(&self) -> bool {
+        self.pg.is_some() && self.db_ready.load(Ordering::Relaxed)
+    }
+
+    /// Records that the start-up step confirmed the application database's
+    /// schema is at this build's version (`OPS-4`). Set once, from `main::
+    /// bring_database_up` or its retry loop; nothing clears it, since the
+    /// only way to lose the database after that is a per-request failure
+    /// this flag deliberately does not track (see [`Self::db_ready`]).
+    pub fn mark_database_ready(&self) {
+        self.db_ready.store(true, Ordering::Relaxed);
     }
 }
 
