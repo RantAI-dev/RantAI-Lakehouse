@@ -303,3 +303,22 @@ Read against the plan, the feature page, BI-1 section 8 and DEC-8. R1 was checke
 ### Review 2 (planner, 2026-10-18, fix round 1 at `9c6730ee`)
 
 R1: the report write tools are refused and not offered in headless runs, and `ownerId` is stripped there. R2: `report_audience` runs before the gate at both dispatch sites, keeps the stored recipients when none are named, and fails closed (any lookup that cannot be made reads as approval); its result reaches `effective_risk_with` server-side only. R3 to R9 as the handoff states; R4/R5 and R6/R7 share commits because the hunks interleave (accepted). The R8 fixture change gives the test's recipient a role that may view dashboards instead of weakening the rule (accepted). No open BLOCKER on RPT-1. The review's NOTE items are `BI-35` in the backlog; BI-1's export limits are `BI-34`. Next: the owner's phase 4 QA of BI-1 and RPT-1 together on `:3100` with Gotenberg and Mailpit.
+
+### Owner's browser QA of phase 4 (BI-1 and RPT-1), 2026-10-23
+
+On `:3100` at `af2ae6c2`, with Gotenberg and Mailpit.
+
+Passed:
+- PDF download (BI-1-AC1): every tile, the cover with the filters and who downloaded it, the image and web cards as "Shown in the console only". It needed `127.0.0.1` in the dev server's allowed origins (`a5f1312b`); a dev-only artefact.
+- Excel formatted and CSV raw (BI-1-AC5).
+- The download switch hides the menus (BI-1-AC4).
+- An outside domain that is not listed is refused, and is accepted once listed.
+- Pause and resume.
+
+Not verified locally, by the owner's choice (2026-10-23): the email delivery itself (RPT-1-AC1, AC2, AC5). The notify mailer requires TLS to the SMTP server, as the alert mailer on `main` does. The dev VM has no TLS mail server, and Mailpit offers none, so every send ends "the mail server could not be reached". Delivery is covered by `report_runner` with a fake mailer, and by the `lettre` message read back. Check it on staging.
+
+Waiting for the AI quota to reset: AI-10-AC1 and AI-10-AC2 (the assistant's PDF link, and self and outside schedules).
+
+Findings:
+- **Q1 SHOULD-FIX: "Send now" gives no feedback.** While a send runs (up to a minute with a PDF), the buttons only grey out. Decision: the row shows "Sending…" with a spinner until the answer arrives, then the result.
+- **Q2 SHOULD-FIX: an outside domain added in Settings is lost unless the page is saved,** and nothing says so. Decision: the reports-domains section shows an unsaved-changes note next to Save when its list differs from the stored one, the same pattern for the content sites and the palette.
