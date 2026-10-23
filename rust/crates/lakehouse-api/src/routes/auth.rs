@@ -110,6 +110,25 @@ struct LoginResponse {
     must_change_password: bool,
 }
 
+/// The one answer for a locked key, shared by the lock check and the
+/// over-the-limit refusal (SEC-49) so the two cannot differ on the wire.
+/// `None` (no lock time known) waits one second.
+fn locked_response(locked_until: Option<time::OffsetDateTime>) -> ApiError {
+    // `.max(1)` keeps the value in range, so the `try_from` fallback is
+    // unreachable; it exists so no `as` cast can silently wrap a negative
+    // difference.
+    let secs = locked_until.map_or(1, |locked| {
+        let now = time::OffsetDateTime::now_utc();
+        u64::try_from((locked - now).whole_seconds() + 1)
+            .unwrap_or(1)
+            .max(1)
+    });
+    ApiError::TooManyRequests {
+        message: "Too many failed sign-in attempts. Try again later.".to_owned(),
+        retry_after_secs: secs,
+    }
+}
+
 /// `POST /api/auth/login` — verify `{ email, password }`, and on success,
 /// create a server-side session and set its cookie.
 ///
@@ -148,18 +167,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     let key = throttle::key_for(&email);
 
     if let Some(locked_until) = throttle::locked_until(pool, &key).await? {
-        let now = time::OffsetDateTime::now_utc();
-        // `.max(1)` keeps the value in range, so the `try_from` fallback
-        // below is unreachable; it exists so no `as` cast can silently
-        // wrap a negative difference.
-        let secs = u64::try_from((locked_until - now).whole_seconds() + 1)
-            .unwrap_or(1)
-            .max(1);
-        return Err(ApiError::TooManyRequests {
-            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
-            retry_after_secs: secs,
-        }
-        .into());
+        return Err(locked_response(Some(locked_until)).into());
     }
 
     // SEC-49: count this try BEFORE the password is hashed. Counting only
@@ -172,17 +180,7 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
     let (attempt, attempt_lock) =
         throttle::record_attempt(pool, &key, &state.throttle_policy).await?;
     if attempt > state.throttle_policy.max_failures {
-        let secs = attempt_lock.map_or(1, |locked_until| {
-            let now = time::OffsetDateTime::now_utc();
-            u64::try_from((locked_until - now).whole_seconds() + 1)
-                .unwrap_or(1)
-                .max(1)
-        });
-        return Err(ApiError::TooManyRequests {
-            message: "Too many failed sign-in attempts. Try again later.".to_owned(),
-            retry_after_secs: secs,
-        }
-        .into());
+        return Err(locked_response(attempt_lock).into());
     }
 
     let credential = Credential::Password {
@@ -250,6 +248,11 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
             Err(ApiError::invalid_or_expired().into())
         }
         Err(err) => {
+            // SEC-49: the try was counted before hashing; a storage error is
+            // not a wrong password, so give the count back (best-effort).
+            if let Err(refund_err) = throttle::refund_attempt(pool, &key).await {
+                tracing::warn!(%refund_err, "failed to refund a login attempt");
+            }
             tracing::warn!(error = %err, "login failed with a non-credential error");
             Err(ApiError::from(err).into())
         }

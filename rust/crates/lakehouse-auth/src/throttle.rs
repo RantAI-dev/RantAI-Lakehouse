@@ -208,6 +208,33 @@ async fn bump(
     Ok(row)
 }
 
+/// Give back one count taken by [`record_attempt`] when the try ended in a
+/// storage error rather than a verdict on the password (SEC-49). Counting
+/// before the check would otherwise let database hiccups walk a real user
+/// toward a lockout (review blocker 1, 2026-10-03). A row left with no
+/// count and no lock is deleted, so a storage failure leaves no row. One
+/// statement; it never goes below zero.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn refund_attempt(pool: &PgPool, key: &str) -> Result<(), AuthError> {
+    sqlx::query(
+        "WITH gone AS ( \
+           DELETE FROM login_throttle \
+           WHERE key_hash = $1 AND failures <= 1 AND locked_until IS NULL \
+           RETURNING 1 \
+         ) \
+         UPDATE login_throttle SET failures = failures - 1 \
+         WHERE key_hash = $1 AND failures > 1 \
+           AND NOT EXISTS (SELECT 1 FROM gone)",
+    )
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Clear the throttle row for `key` — called on a successful login so the
 /// count resets.
 ///

@@ -247,3 +247,30 @@ async fn record_attempt_reports_no_lock_below_the_limit_and_a_lock_at_it(pool: P
     assert_eq!(count, 5);
     assert!(locked.is_some());
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refund_attempt_gives_back_one_count_and_removes_an_empty_row(pool: PgPool) {
+    // SEC-49: a storage error during sign-in must not count toward the lock.
+    let key = throttle::key_for("refund@test.com");
+    throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    throttle::refund_attempt(&pool, &key).await.unwrap();
+    let (count, _) = throttle::record_attempt(&pool, &key, &policy())
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "one refund leaves one count, the next try is #2");
+    throttle::refund_attempt(&pool, &key).await.unwrap();
+    throttle::refund_attempt(&pool, &key).await.unwrap();
+    let rows: Option<(i32,)> =
+        sqlx::query_as("SELECT failures FROM login_throttle WHERE key_hash = $1")
+            .bind(&key)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(rows.is_none(), "an emptied row is deleted");
+    throttle::refund_attempt(&pool, &key).await.unwrap();
+}
