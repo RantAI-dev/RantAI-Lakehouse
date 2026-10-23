@@ -86,8 +86,10 @@ instead of reporting a delete that never happened. `update_chart` keeps the
 formatting and the board the call leaves out, so changing a chart's title
 does not move it to another board or cost it its colours; a change of the
 chart's kind resets the formatting, because the old formatting does not fit
-the new kind. `list_charts` names each chart's board and its tab, so the
-assistant can read what an update keeps.
+the new kind. `update_chart` keeps the data source the call leaves out
+too, so a rename does not have to repeat the mart. `list_charts` names
+each chart's board and its tab, so the assistant can read what an update
+keeps.
 
 A dashboard filter that names a saved segment is refused: a board filter
 names a column, and a saved segment belongs to a chart's or a metric's own

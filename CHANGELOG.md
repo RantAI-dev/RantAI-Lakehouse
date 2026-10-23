@@ -422,6 +422,7 @@ once a first release is tagged.
 
 ### Fixed
 
+- A refused chart call says what to send: a KPI refused a measure with an aggregate of its own names the column and the aggregate to send, a chart with no data source is told to send a mart or a SQL source, and `update_chart` keeps the data source the call leaves out, so a rename does not have to repeat the mart (`AI-3`, `AI-5`).
 - Dashboard eval (`AI-15`): the checks are stricter, so a case measures the whole request. The rupiah format of a chart, the 20 ranges of a histogram, and the tab a chart is put on are checked now, and the harness gained the `tile_on_tab` key, which reads a board's layout and puts a chart on the tab its tile names, or on the first tab when the tile names no tab that exists; the saved-filter case asks for 2024, a year the seed holds, instead of the ambiguous "last year".
 - The assistant's `delete_chart` refuses a chart that does not exist or that the person cannot see, instead of reporting a delete that never happened (`AI-1`).
 - The assistant's `update_chart` keeps the formatting and the board the call leaves out, and resets the formatting when the chart's kind changes, because the old formatting does not fit the new kind; `list_charts` now names each chart's board and its tab, so the assistant can read what an update keeps (`AI-3`, `AI-9`).

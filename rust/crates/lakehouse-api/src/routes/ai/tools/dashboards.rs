@@ -70,6 +70,49 @@ fn args_with_kept_formatting(args: &Map<String, Value>, stored: &ChartInput) -> 
     merged
 }
 
+/// The call's args with the data source the call does not name filled in
+/// from the stored chart: the stored mart, or the stored SQL source.
+///
+/// The call's own source wins: a call that names a mart or a SQL source
+/// keeps it, so the two are never named at once. A kind that reads no data
+/// at all (a note, a heading, an image) takes no source, so nothing is
+/// carried over.
+///
+/// The second value says whether a source was carried over.
+fn args_with_kept_source(
+    args: &Map<String, Value>,
+    call: &ChartInput,
+    stored: &ChartInput,
+) -> (Map<String, Value>, bool) {
+    let mut merged = args.clone();
+    if call.kind.is_static() {
+        return (merged, false);
+    }
+    if !call.mart.trim().is_empty()
+        || call
+            .sql_source
+            .as_deref()
+            .is_some_and(|source| !source.trim().is_empty())
+    {
+        return (merged, false);
+    }
+    let mart = stored.mart.trim();
+    if !mart.is_empty() {
+        merged.insert("mart".to_owned(), json!(mart));
+        return (merged, true);
+    }
+    if let Some(source) = stored
+        .sql_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    {
+        merged.insert("sqlSource".to_owned(), json!(source));
+        return (merged, true);
+    }
+    (merged, false)
+}
+
 /// What a call carries over from the chart it changes: the call's own
 /// arguments with the formatting the call does not name filled in, and
 /// whether the stored formatting was kept.
@@ -78,6 +121,8 @@ struct KeptFormatting {
     kept: bool,
     /// The call's arguments, with the kept formatting filled in.
     args: Map<String, Value>,
+    /// The stored data source was kept: the call names no source of its own.
+    source_kept: bool,
 }
 
 /// The formatting a call does not name, carried over from the stored chart.
@@ -114,20 +159,25 @@ async fn kept_formatting(
         return Ok(KeptFormatting {
             kept: true,
             args: args.clone(),
+            source_kept: false,
         });
     };
-    // A kind the call changes takes other formatting (colours are for
-    // charts, a second axis for a bar): the stored formatting is dropped
+    // The stored formatting is kept when the call does not change the kind:
+    // a kind the call changes takes other formatting (colours are for
+    // charts, a second axis for a bar), so the stored formatting is dropped
     // rather than carried into a kind that would refuse it.
-    if stored.def.kind != call.kind {
-        return Ok(KeptFormatting {
-            kept: false,
-            args: args.clone(),
-        });
-    }
+    let (kept, args) = if stored.def.kind == call.kind {
+        (true, args_with_kept_formatting(args, &stored.def))
+    } else {
+        (false, args.clone())
+    };
+    // The data source is carried over whatever the kind becomes: a chart
+    // that names no source of its own reads the one the stored chart has.
+    let (args, source_kept) = args_with_kept_source(&args, &call, &stored.def);
     Ok(KeptFormatting {
-        kept: true,
-        args: args_with_kept_formatting(args, &stored.def),
+        kept,
+        args,
+        source_kept,
     })
 }
 
@@ -275,6 +325,7 @@ pub(super) async fn update_chart(
         Err(reply) => return reply,
     };
     let formatting_kept = kept.kept;
+    let source_kept = kept.source_kept;
     let mut input = match parse_chart_input(&kept.args) {
         Ok(i) => i,
         Err(e) => return json!({ "error": e }),
@@ -309,6 +360,9 @@ pub(super) async fn update_chart(
                     "board": spec.board,
                     "formattingKept": formatting_kept,
                 });
+                if source_kept {
+                    reply["sourceKept"] = json!(true);
+                }
                 if !formatting_kept {
                     reply["note"] = json!(
                         "the chart's kind changed, so its formatting was reset; send the formatting again if the new kind takes it."
@@ -1361,6 +1415,93 @@ mod tests {
             "{draft}"
         );
         assert_eq!(saved["error"], draft["error"], "{saved}");
+    }
+
+    /// A rename that names no mart keeps the chart's own mart: the assistant
+    /// does not have to repeat it, and the reply says it was kept.
+    #[tokio::test]
+    async fn an_update_that_names_no_mart_keeps_the_stored_mart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = rename_call(json!({}));
+        args.remove("mart");
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert_eq!(reply["updated"], json!(true), "{reply}");
+        assert_eq!(reply["mart"], json!("mart_x"), "{reply}");
+        assert_eq!(reply["sourceKept"], json!(true), "{reply}");
+        let row = chart_row(&sent(&server).await);
+        assert!(row.contains("mart_x"), "{row}");
+    }
+
+    /// A call that names a SQL source keeps it: the chart's own mart is not
+    /// carried over, so the two are never named at once.
+    #[tokio::test]
+    async fn an_update_that_names_a_sql_source_does_not_carry_the_mart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = rename_call(json!({ "sqlSource": "s_1" }));
+        args.remove("mart");
+        let reply = update_chart(
+            &ch,
+            Some(&person(7)),
+            &args,
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.contains("choose either a mart or a SQL source, not both."),
+            "{reply}"
+        );
+        assert!(error.contains("SQL source 's_1' not found."), "{reply}");
+    }
+
+    /// The card and the save agree: a rename that names no mart is checked
+    /// with the mart the chart has, so it is offered for confirmation.
+    #[tokio::test]
+    async fn the_draft_check_of_a_rename_that_names_no_mart_passes() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let mut args = rename_call(json!({}));
+        args.remove("mart");
+        let draft = check_chart_draft(
+            &ch,
+            &args,
+            Some("c_1".to_owned()),
+            &lakehouse_bi::grain::TimeContext::default(),
+        )
+        .await;
+        assert!(draft.is_none(), "{draft:?}");
     }
 
     /// A chart is listed with the board it is on and the tab it sits on: a

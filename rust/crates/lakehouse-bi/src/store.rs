@@ -4084,6 +4084,14 @@ async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved,
             crate::fields::list_catalog_fields_for(ch, SourceKind::SqlSource, id).await?;
         return Ok(resolved);
     }
+    // A chart that names no source at all says what to send, so the caller
+    // is not left with an empty name.
+    if input.mart.trim().is_empty() {
+        return Err(BiError::Validation(
+            "the chart names no data source: send mart or sqlSource (list_charts gives them)"
+                .to_owned(),
+        ));
+    }
     let mart = input
         .mart
         .strip_prefix("serving.")
@@ -7485,6 +7493,36 @@ mod tests {
             let got = bi6_refusal(&extra);
             assert!(got.contains(expected), "{extra}: {got}");
         }
+    }
+
+    /// A chart that names no data source says what to send: the mart or the
+    /// SQL source. The refusal comes before any query, so the server answers
+    /// nothing.
+    #[tokio::test]
+    async fn a_chart_with_no_data_source_is_refused_with_what_to_send() {
+        let server = MockServer::start().await;
+        let ch = client(&server.uri());
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "dimension": "province", "measures": ["visitors"],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &input, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the chart names no data source: send mart or sqlSource (list_charts gives them)"
+        );
+        // A mart name that is wrong is a different refusal: it is named.
+        let wrong: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Visitors", "kind": "bar", "mart": "bad name",
+            "dimension": "province", "measures": ["visitors"],
+        }))
+        .unwrap();
+        let err = spec_from_input(&ch, &wrong, ChartSource::Ai, "ai", None, &DEFAULT_TIME)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "invalid mart name: bad name");
     }
 
     #[test]
