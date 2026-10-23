@@ -41,6 +41,12 @@ export const NONCE_HEADER = "x-nonce"
 /** The most sites the API stores (`MAX_CONTENT_SITES` in `embed_access.rs`). */
 export const MAX_CONTENT_SITES = 50
 
+/** How long one answer from `/api/settings/reporting` may be reused. */
+export const SITES_CACHE_MS = 60_000
+
+/** Longer than this and the page is served without the extra sites it asked for. */
+export const ASK_TIMEOUT_MS = 3_000
+
 /**
  * A fresh nonce: 16 random bytes in base64, the alphabet Next's own parser
  * accepts (`get-script-nonce-from-header` in the installed Next).
@@ -93,6 +99,64 @@ export function contentSites(values: unknown): string[] {
     if (out.length === MAX_CONTENT_SITES) break
   }
   return out
+}
+
+/**
+ * `GET /api/settings/reporting`'s `contentSites`, or `null` when the body is
+ * not that answer. `null` is "no answer", which is not cached; an empty list
+ * is a real answer ("this deployment allows no site") and is.
+ */
+export function sitesFromSettings(body: unknown): string[] | null {
+  if (typeof body !== "object" || body === null) return null
+  const values = (body as { contentSites?: unknown }).contentSites
+  return Array.isArray(values) ? contentSites(values) : null
+}
+
+/** Asks the API for the settings with the request's own cookie; the reader times it. */
+export type SettingsFetcher = (cookie: string, signal: AbortSignal) => Promise<Response>
+
+export type SiteReaderOptions = {
+  /** The clock, for tests. */
+  now?: () => number
+  /** The timeout, for tests; production always uses [`ASK_TIMEOUT_MS`]. */
+  timeoutMs?: number
+}
+
+/**
+ * The deployment's content sites, read through `fetchSettings` with
+ * `cookie` and reused for [`SITES_CACHE_MS`].
+ *
+ * One list exists per deployment, so there is one cache entry, not one per
+ * session. Fail closed: no session (`401`), a timeout, a failed request or a
+ * body that is not the settings answer is no site at all, and is *not* cached
+ * — so a page served to a signed-out visitor cannot hide the sites from the
+ * next signed-in page. The cache is per server process; a second replica asks
+ * once a minute of its own.
+ */
+export function contentSiteReader(
+  fetchSettings: SettingsFetcher,
+  options: SiteReaderOptions = {},
+): (cookie: string) => Promise<string[]> {
+  const now = options.now ?? Date.now
+  const timeoutMs = options.timeoutMs ?? ASK_TIMEOUT_MS
+  let cached: { sites: string[]; at: number } | null = null
+  return async (cookie) => {
+    const at = now()
+    if (cached !== null && at - cached.at < SITES_CACHE_MS) return cached.sites
+    let body: unknown
+    try {
+      const res = await fetchSettings(cookie, AbortSignal.timeout(timeoutMs))
+      if (!res.ok) return []
+      body = await res.json()
+    } catch {
+      // Unreachable, too slow, or not JSON: no extra site.
+      return []
+    }
+    const sites = sitesFromSettings(body)
+    if (sites === null) return []
+    cached = { sites, at }
+    return sites
+  }
 }
 
 export type PolicyOptions = {
