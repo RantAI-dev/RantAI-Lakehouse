@@ -72,7 +72,9 @@ const ALSO_RULE: &str =
 const COMPARE_BODY: &str = "The request body must be an object with alsoUploads, a list of upload ids, and optionally encoding, delimiter, headerRow, sheet and columns.";
 const OTHER_NOT_FOUND: &str = "One of the other files was not found.";
 const OTHER_KIND: &str = "All the files of one load must be the same kind of file, for example all CSV or all Parquet. Remove the ones that differ.";
-const TOO_LARGE_TOGETHER: &str = "The files together are larger than the 50 MB limit.";
+/// The files of one load added together, against [`MAX_UNPACKED_BYTES`] (2 GiB): its own
+/// text, not the 50 MB sentence of one `POST /api/uploads` file (plan T6.2 item 5).
+const TOO_LARGE_TOGETHER: &str = "The files together are larger than the 2 GB limit.";
 
 /// How many files and names a refusal sentence lists before it says "and N more".
 const LISTED: usize = 5;

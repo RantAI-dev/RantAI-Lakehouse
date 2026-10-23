@@ -7141,7 +7141,7 @@ async fn files_of_two_kinds_or_together_over_the_cap_are_refused() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
     assert_eq!(
         reply.json["error"],
-        "The files together are larger than the 50 MB limit."
+        "The files together are larger than the 2 GB limit."
     );
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
 }

@@ -248,7 +248,7 @@ describe("UploadFilePage, first step", () => {
     )
     expect(facts.get("Accepted")).toBe("CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip")
     expect(facts.get("Files")).toContain("Up to 10 at once")
-    expect(facts.get("Size")).toBe("Up to 50 MB in all")
+    expect(facts.get("Size")).toBe("Up to 2 GB in all; an Excel workbook up to 50 MB")
     expect(facts.get("Not accepted")).toBe(".xlsm, .xlsb, .ods, .tar, .7z and other archives")
     expect(facts.get("Workbooks")).toContain("One sheet is loaded")
     expect(facts.get("Parquet and Avro")).toContain("binary column is refused")
@@ -430,7 +430,7 @@ describe("UploadFilePage, first step", () => {
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("did not reach the service")
     expect(alert.textContent).toContain("413")
-    expect(alert.textContent).toContain("50 MB")
+    expect(alert.textContent).toContain("2 GB")
     expect(alert.textContent).not.toContain("Request Entity Too Large")
   })
 
@@ -886,7 +886,7 @@ describe("UploadFilePage, Check step for JSON, Avro, gzip and zip (DATA-17 slice
     await open("orders.csv.gz", { layout: { format: "delimited", compression: "gzip" } })
     expect(screen.getByLabelText("Encoding")).toBeDefined()
     expect(screen.getByLabelText("Delimiter")).toBeDefined()
-    expect(screen.getByText(/compressed with gzip/).textContent).toContain("counts toward the 50 MB limit")
+    expect(screen.getByText(/compressed with gzip/).textContent).toContain("counts toward the 2 GB limit")
   })
 
   it("lists the files of a zip, and turns Next off with the reason when one has other columns", async () => {

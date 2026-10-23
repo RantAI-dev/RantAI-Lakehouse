@@ -48,6 +48,15 @@ function notReached(status: number): string {
   return `The upload did not reach the service (answered ${status}). Files up to 50 MB are accepted; check that this one is under the limit and try again.`
 }
 
+/**
+ * The same for the chunked path (sessions, pieces, complete): its limit is 2 GB
+ * (an Excel workbook keeps 50 MB), not the 50 MB of `POST /api/uploads`. Plan
+ * T6.2 item 5: each path's text names its own cap.
+ */
+function notReachedByPieces(status: number): string {
+  return `The upload did not reach the service (answered ${status}). Files up to 2 GB are accepted (Excel workbooks up to 50 MB); check that this one is under the limit and try again.`
+}
+
 /** `Retry-After` as whole seconds (the API sends `5`), or `undefined` when absent or not a number. */
 function retryAfterSecs(res: Response): number | undefined {
   const raw = res.headers.get("Retry-After")
@@ -106,7 +115,7 @@ export const uploadService: UploadService = {
       body: JSON.stringify({ filename: input.filename, sizeBytes: input.sizeBytes }),
       signal,
     })
-    if (!res.ok) throw await failure(res, notReached)
+    if (!res.ok) throw await failure(res, notReachedByPieces)
     return (await res.json()) as UploadSession
   },
   async putPart(id, number, bytes, signal) {
@@ -118,7 +127,7 @@ export const uploadService: UploadService = {
       body: bytes,
       signal,
     })
-    if (!res.ok) throw await failure(res, notReached)
+    if (!res.ok) throw await failure(res, notReachedByPieces)
     return (await res.json()) as UploadPartReceipt
   },
   async listParts(id, signal) {
@@ -126,7 +135,7 @@ export const uploadService: UploadService = {
   },
   async complete(id, signal) {
     const res = await apiFetch(uploadUrl(id, "/complete"), { method: "POST", signal })
-    if (!res.ok) throw await failure(res, notReached)
+    if (!res.ok) throw await failure(res, notReachedByPieces)
     return (await res.json()) as CreateUploadResponse
   },
   async preview(id, options, signal) {

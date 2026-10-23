@@ -291,7 +291,7 @@ export function UploadCheckStep({
       {layout?.compression === "gzip" ? (
         <UploadNotice>
           This file is compressed with gzip. It is read as it is once unpacked, and what it unpacks to counts toward
-          the 50 MB limit.
+          the 2 GB limit.
         </UploadNotice>
       ) : null}
       {shown?.archive ? <UploadArchiveList files={shown.archive.files} problem={archiveProblem(shown.archive)} /> : null}

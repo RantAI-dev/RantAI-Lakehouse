@@ -64,8 +64,8 @@ use uuid::Uuid;
 
 use super::{
     Accepted, CreateResponse, EMPTY_FILE, MAX_UNPACKED_BYTES, MAX_UPLOAD_BYTES, NO_TENANT,
-    TOO_LARGE, UploadView, blocking, classify_head, display_name, not_found, pool, record_audit,
-    sha256_hex, storage_key, upload_audit_event,
+    UploadView, blocking, classify_head, display_name, not_found, pool, record_audit, sha256_hex,
+    storage_key, upload_audit_event,
 };
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -101,10 +101,15 @@ pub(crate) const MAX_PART_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The sentence for a file over [`MAX_SESSION_BYTES`]. Its own text, not the
-/// 50 MB sentence of `POST /api/uploads` and of a workbook (`TOO_LARGE`),
+/// 50 MB sentence of `POST /api/uploads` (`super::TOO_LARGE`) or of a workbook,
 /// which would send a person away from a file the session path takes. Fixed
 /// text, as every refusal is (`SEC-11`).
 const SESSION_TOO_LARGE: &str = "The file is larger than the 2 GB limit.";
+
+/// The sentence for a workbook over [`MAX_UPLOAD_BYTES`] on the session path:
+/// it names the workbook's own 50 MB (decision 9), not the 2 GB of the session
+/// and not the generic file sentence. Fixed text (`SEC-11`).
+const WORKBOOK_TOO_LARGE: &str = "The workbook is larger than the 50 MB limit.";
 
 /// How much of the assembled file is read to tell what it is.
 const COMPLETE_SNIFF_BYTES: u64 = 64 * 1024;
@@ -639,7 +644,7 @@ async fn open_whole(
         });
     }
     if declared > u64::try_from(MAX_UPLOAD_BYTES).unwrap_or(u64::MAX) {
-        return Err(ApiError::BadRequest(TOO_LARGE.to_owned()));
+        return Err(ApiError::BadRequest(WORKBOOK_TOO_LARGE.to_owned()));
     }
     let Some(_place) = state.upload_receive.try_acquire(&row.uploaded_by) else {
         // Not a refusal of the file: it stays, and the caller completes again.
@@ -694,7 +699,8 @@ mod tests {
         assert_eq!(MAX_SESSION_BYTES, 2048 * MIB);
         assert_eq!(MAX_UPLOAD_BYTES, 52_428_800);
         assert!(SESSION_TOO_LARGE.contains("2 GB"));
-        assert!(TOO_LARGE.contains("50 MB"));
+        assert!(super::super::TOO_LARGE.contains("50 MB"));
+        assert!(WORKBOOK_TOO_LARGE.contains("50 MB"));
         let limit: usize = 8 * 1024 * 1024 + 64 * 1024;
         assert_eq!(MAX_PART_BODY_BYTES, limit);
         assert_eq!(PART_SIZE, 8 * MIB);

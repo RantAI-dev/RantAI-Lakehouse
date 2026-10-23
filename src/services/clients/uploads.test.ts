@@ -148,6 +148,8 @@ describe("uploadService requests", () => {
     const err = await rejection(uploadService.putPart("up-1", 1, new Blob(["a"])))
     expect(err.status).toBe(413)
     expect(err.message).toContain("did not reach the service")
+    // The chunked path names its own limit, 2 GB, not the 50 MB of `POST /api/uploads`.
+    expect(err.message).toContain("2 GB")
     expect(err.message).not.toContain("Request Entity Too Large")
   })
 

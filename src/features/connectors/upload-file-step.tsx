@@ -20,12 +20,12 @@ const ACCEPT =
 const FACTS: readonly { label: string; value: string }[] = [
   { label: "Accepted", value: "CSV, TSV, JSON, JSON Lines, Avro, .xls, .xlsx, .parquet, .gz and .zip" },
   { label: "Files", value: `Up to ${MAX_FILES} at once, sent in pieces; they load into one table when their columns match, in any order` },
-  { label: "Size", value: "Up to 50 MB in all" },
+  { label: "Size", value: "Up to 2 GB in all; an Excel workbook up to 50 MB" },
   { label: "Not accepted", value: ".xlsm, .xlsb, .ods, .tar, .7z and other archives" },
   { label: "Workbooks", value: "One sheet is loaded, chosen on the next step" },
   { label: "Parquet and Avro", value: "Each column starts with the type the file declares; a file with a binary column is refused" },
   { label: "JSON", value: "An array of objects (.json) or one object per line (.jsonl); the keys are the columns, and a nested value is kept as JSON text" },
-  { label: "Compressed", value: "A .gz of one text or JSON file, or a .zip of up to 10 files of one format with the same columns; what it unpacks to counts toward the 50 MB" },
+  { label: "Compressed", value: "A .gz of one text or JSON file, or a .zip of up to 10 files of one format with the same columns; what it unpacks to counts toward the 2 GB" },
 ]
 
 /**
