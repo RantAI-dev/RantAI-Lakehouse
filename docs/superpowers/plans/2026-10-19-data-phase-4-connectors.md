@@ -1344,3 +1344,120 @@ Accepted: the gate's first step now expecting eight supported and two not;
   instance (picker, the ten forms, the GA4 report editor, the SharePoint
   site picker, a connector page's incremental/full notes). Real-account
   rows of the checklist wait for decision 11's accounts.
+
+### Final review before merge (reviewer, 2026-10-23, head `f85913d3` with `main` merged)
+
+A second reviewer (Claude Opus, kleopasevan's side) read the whole PR
+before merge, with four read-only passes (SaaS HTTP and SSRF, Rust,
+load path, console/gates/docs); every BLOCKER below was re-checked by the
+reviewer. `BLOCKER 17` was reproduced: a test on the existing SharePoint
+fixtures with a real Iceberg load fails 2 of 2 (an edit made during run 1
+and a change after a delete are both lost). The SSRF layer holds: no link
+from a vendor answer reaches another origin, every dial is checked and
+pinned before any credential, redirects are off, the gate override is
+inert unless `CONNECTOR_OAUTH_ALLOW_HTTP == "true"`. Rust, migrations,
+`POLICY_TABLE`, secrets, rule 12 and the vendored licences are clean.
+
+**Verdict: not ready to merge. 3 BLOCKERs.**
+
+- `BLOCKER 17` (decision 6/7, `SRC-3-AC4`; principle 2). Delta-link reads
+  go through dlt's cursor filter. `adapters/saas.py` wraps every
+  incremental object in `dlt.sources.incremental(decl.cursor, …)`, but
+  SharePoint (`saas/vendors/sharepoint.py`, cursor `modified_at`, no lag)
+  and Dynamics 365 change tracking (`dynamics365.py`, 300 s lag) ignore
+  `since` and replay the saved delta link. dlt then drops every row whose
+  cursor is below the previous run's highest value, while the link moves
+  past it: an item edited during run 1 after its page was read, or any
+  change stamped below a delete's `now()` stamp (orchestrator clock), is
+  lost with nothing reported. Fix: an object read from a delta link is not
+  filtered by the cursor (a vendor declaration says so, for example
+  `ObjectDecl.delta = True`, and the adapter builds that resource without
+  `dlt.sources.incremental`, merging on the key); the delete stamp no
+  longer matters then. Tests: the two cases above for SharePoint and the
+  same two for Dynamics, each failing before the fix.
+- `BLOCKER 18` (decision 6: "merge on the vendor's id"; `SRC-3-AC4` "no
+  duplicate"). Plain `incremental` (append) is accepted for `saas`:
+  `adapters/saas.py` checks only `incrementalKey`, the Rust load-mode
+  validation and the console offer it, `sink.py` maps it to `append`. Every
+  changed record becomes a second row, and with a lag (GA4 3 days,
+  ServiceNow/NetSuite a day, Dynamics/Confluence 5 minutes) dlt turns
+  boundary de-duplication off, so unchanged rows repeat every run. With
+  `incremental_dedup` the key comes from `obj.primaryKey` and is never
+  compared with `decl.primary_key` (a GA4 report saved with
+  `primaryKey: ["date"]` collapses all countries into one row a day). Fix:
+  for `saas`, refuse plain `incremental` (Rust validation with a fixed
+  message, Python `UnsupportedLoadMode`, console not offering it) and
+  refuse a `primaryKey` that differs from the vendor's declared key (Python
+  at load; Rust where the declared key is known, otherwise Python only, and
+  say so). Tests both ways in each language.
+- `BLOCKER 19` (AD9, `coverage.json` marks reload `real`; principle 2).
+  The product reload step proves nothing about incremental for Salesforce
+  and Zendesk: `g6_saas_test.py` counts the reload as incremental when one
+  logged request contains a marker, but `saas_stub_salesforce.py` and
+  `saas_stub_zendesk.py` log only the path, and the markers (`queryAll`;
+  `incremental`, `cursor`) match a full read too. A product that forgot the
+  cursor on run 2 passes (the merge hides it). Fix: both stubs log the query
+  string; the markers are the cursor filter itself (Salesforce
+  `WHERE SystemModstamp >=` with a non-initial value; Zendesk a non-zero
+  `start_time`); check every other vendor's marker the same way (it must be
+  absent from the first run's requests and present in the reload's). The
+  revoked sign-in product step also asserts the run's class is
+  `sign_in_refused`, not only that it failed.
+
+SHOULD-FIX
+
+- `SHOULD-FIX 20` (rule 2). `scripts/ci/tests/test_required_gate.sh`:
+  "Skipped discovery scale gate blocks rust PR" now also sets
+  `G6_SAAS_A_RESULT=skipped G6_SAAS_B_RESULT=skipped`, so it would pass if
+  discovery-scale were removed from `required_gate.sh`. Restore the single
+  variable (the SaaS skips have their own cases).
+- `SHOULD-FIX 21`. HubSpot searches from `since - 60 s` (`hubspot.py`) but
+  declares no `lag_seconds`, so dlt discards the margin's rows: declare
+  `lag_seconds = SEARCH_LAG_SECONDS` and drop the hand-made floor, as GA4.
+- `SHOULD-FIX 22`. GA4: a week/month/year report re-reads from the period
+  start, but the 3-day lag drops the previous period's row, so it is never
+  revised; make the lag at least the period plus 3 days for those grains
+  (or refuse those grains and say so). And the report editor allows 20
+  names in total (`src/lib/connectors/ga4-report.ts`, `ga4.py`), while the
+  Data API `runReport` takes at most 9 dimensions and 10 metrics: check
+  that against Google's page and validate the two separately on both
+  sides, citing the page in the commit (or say it could not be read).
+- `SHOULD-FIX 23`. `saas/session.py`: `_origin_of` lets `urlparse`'s
+  `ValueError` escape (NFKC-changing host, broken IPv6 literal), which is
+  classed `setting_rejected` and carries vendor text into the Dagster
+  failure description: raise `SsrfBlocked` with fixed text, `from None`.
+  `Retry-After: nan` passes the bound (`math.isfinite`). A 2xx answer that
+  is not JSON (`requests.JSONDecodeError`) is classed `setting_rejected`;
+  give it a fixed `SaasBadAnswer` (or similar) classed `source_busy`.
+  Tests for each.
+- `SHOULD-FIX 24`. A saved delta link is not tied to its object
+  (SharePoint replays `state["delta_link"]` with no check of site/list;
+  Dynamics checks `$select` only): store the object name with the link and
+  treat a mismatch as no saved link. Test.
+- `SHOULD-FIX 25` (Rust). `connector_oauth.rs` `revoke_stored_token` does
+  not apply the gate override, so under the gate a revocation would post
+  the stub's tokens to the real vendor host: apply `gate_rebase` as the
+  exchange does. NetSuite `auth.type = integration` without
+  `certificateId` is accepted at save and fails only at the test: refuse
+  it in `validate_saas_dial_post_parse`. `saas_target_identity` ignores
+  `auth.type`, so switching sign-in method keeps the stored refs in their
+  slots and sends a secret in another role: include `auth.type` in the
+  identity (credentials are asked again), with the test that asserted the
+  opposite changed and the reason in the commit.
+- `SHOULD-FIX 26` (docs, rule 1). `ops/g6/g6_saas_test.py` module
+  docstring still describes slice 1 (no vendor, all unsupported, not
+  through the API). `DEC-9` row in `BACKLOG.md`, `specs/src-3.md` and
+  `business-app-connectors.md` say the six non-vendored vendors use dlt's
+  `rest_api`; they call `SaasSession` directly (accepted at the slice 3/4
+  reviews): correct the text and say why. `BACKLOG.md` `SRC-3` row says
+  follow-ups `SRC-26` to `SRC-30`; `SRC-31` exists. `coverage.json` notes
+  say discovery "previews one" for Zendesk, whose preview is an honest
+  `not_supported`.
+
+Not a finding: SharePoint list labels live in component state, so after
+a reload a saved list shows its ids until "Find objects" runs; add it to
+`SRC-29`.
+
+Each fix cites its number at the site and in the commit (rule 13); each
+new test fails without its fix. Then the full verification block once,
+and a Handoff below.
