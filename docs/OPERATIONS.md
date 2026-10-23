@@ -61,7 +61,8 @@ report healthy (`depends_on: condition: service_healthy`) before starting,
 so first-boot migrations and the bootstrap-admin seed (both of which need
 Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
-"Postgres-down is quiet," below.
+"Postgres: unreachable is loud, a mismatched schema refuses to start,"
+below.
 
 `rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
 from any `lakehouse-api` route as of P6** — see the module map in
@@ -894,43 +895,37 @@ turn each one on.
 
 ## Healthcheck: what `GET /health` actually checks
 
-`GET /health` is a **plain liveness check** — it returns `200 ok`
-unconditionally, with no dependency on Postgres, ClickHouse, Dagster, or
-the LLM (`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn
-health()`). It answers "is the process up and serving," not "are its
-dependencies reachable." That's sufficient for compose's own
-`depends_on`/orchestration needs (which target `postgres` and
-`clickhouse`'s own healthchecks directly, not this endpoint), and it's
-what the existing `#[tokio::test] health_returns_200_ok` locks in.
+`GET /health` answers `200` with a JSON body — `{"status": "ok",
+"database": "ok" | "unavailable"}` — and it is still a **liveness plus
+application-database check**, not a full readiness probe
+(`rust/crates/lakehouse-api/src/routes/mod.rs`, `async fn health`). It
+does not dial ClickHouse, Dagster, Lakekeeper or the LLM: the status code
+stays `200` whenever the process can answer at all, because a deployment
+with no usable Postgres still serves every Phase 1 route (catalog,
+overview, query, storage), and the ops gates (`ops/g*/`) and
+`ops/ai_eval` poll this endpoint for a `200` to decide the API is up.
 
-**We did not add a `GET /health/ready` in this pass.** It would be
-genuinely useful (a real k8s/compose readiness probe should reflect
-dependency health, not just liveness), but every route file that would
-need touching to add one — `main.rs`, `routes/mod.rs` is fine, but wiring
-in a new handler that calls out to ClickHouse/Postgres crosses into
-territory this phase was told not to touch casually — plus the DoS
-consideration (a readiness probe must do a *bounded*, cheap check —
-e.g. `SELECT 1` / `ChClient::query("SELECT 1")` with a short timeout, not
-a full dependency traversal, and definitely not hitting Dagster or the LLM
-on every probe) needs its own review, not a drive-by addition. Proposed
-shape, for whoever picks this up:
+`database` is what `OPS-4` added:
 
-```
-GET /health/ready
-  -> 200 {"postgres": "ok"|"unavailable", "clickhouse": "ok"|"unavailable"}
-     if Postgres is configured (state.pg.is_some()), a bounded SELECT 1
-     against it (short timeout, e.g. 1s) — degrade to "unavailable" on
-     error rather than 500
-     same for ClickHouse: a cheap `SELECT 1` / `/ping`, bounded timeout
-     never hit Dagster or the LLM here — they're already excluded from
-     "core" health by design (see Config's doc comments) and calling out
-     to them on every probe is exactly the unbounded-upstream-call
-     DoS shape to avoid
-  -> always 200 (a probe endpoint shouldn't itself flap the process's
-     perceived liveness); readiness is communicated in the body, not the
-     status code, unless the orchestrator specifically wants a non-200 to
-     pull the pod from a load balancer — pick one and document it
-```
+- `ok` — the start-up step connected and applied every migration, so the
+  schema is at this build's version.
+- `unavailable` — no pool at all (`DATABASE_URL` did not parse), the
+  database could not be reached, or it refused the migrations. Phase 2
+  routes (identity, auth, governance writes, pipelines, connectors,
+  alerts, ...) are degraded; Phase 1 answers.
+
+The value is the last answer the start-up step or its 60 s retry loop
+gave, **not a live probe**. A database lost after boot keeps answering
+`ok` until the process restarts: a per-request probe would have to be a
+bounded `SELECT 1` on its own short timeout, and `/health` is polled by
+the gates, so a probe that waits out a dead database's 30 s acquire
+timeout would stall them. An operator diagnosing "the database died" has
+to read the log (below), not only this endpoint.
+
+**There is no `GET /health/ready`.** This section used to propose adding
+one; `OPS-4` instead extended the one health route with the
+application-database state, which is the dependency that actually
+changes what the console can do.
 
 ## Bootstrap admin: there is no default credential
 
@@ -949,26 +944,50 @@ force a password change before continuing (see
 `routes::auth::change_password`, which enforces this server-side, not
 just as a UI hint).
 
-## Postgres-down is quiet — this is the biggest operational trap here
+## Postgres: unreachable is loud, a mismatched schema refuses to start
 
-**The service does not refuse to boot when Postgres is unreachable.**
-`lakehouse_store::connect_lazy` never does network I/O at startup; a
-misconfigured or dead `DATABASE_URL` is discovered lazily, at first use.
-Dependent (Phase 2: identity, auth, governance-writes, pipelines,
-connectors, alerts, ...) routes degrade to `503` one request at a time
-instead of the process failing to start or a healthcheck failing loudly.
+`lakehouse_store::connect_lazy` never does network I/O at startup, so a
+dead `DATABASE_URL` is still only discovered when something first uses
+the pool. `OPS-4` keeps that degrade — the Phase 1 routes (catalog,
+overview, query, storage) do not touch Postgres, and an unreachable
+database must not take the whole console down — but makes it loud, and
+draws one hard line:
 
-**In practice this means:** a broken `DATABASE_URL` looks, from the
-outside, like "the process is up and `/health` is green" while every
-login attempt and every Phase 2 route silently 503s. Watch the `503` rate
-and the structured logs (`tracing::error!` on migration/bootstrap
-failures), not just process uptime or the liveness check, when diagnosing
-"nothing works" reports. The same applies to ClickHouse-backed routes,
-which 503 the same way if ClickHouse is down — the difference is only
-that in the local compose stack, ClickHouse *is* wired into
-`depends_on: condition: service_healthy`, so this specific failure mode is
-less likely to bite you locally than in a deployment that skips that
-check.
+- **The database is reachable but the migrations fail** (a `_sqlx_migrations`
+  row this build does not have or has changed, a failed statement):
+  `lakehouse-api` **refuses to start** and exits non-zero, logging the
+  migration error and the line `the application database is not at this
+  build's schema version`. Compose restarts it and it says the same thing
+  every time. This is deliberate: before `OPS-4` the API started anyway,
+  sqlx stopped at the first mismatch, and every newer route answered
+  `500` while the process looked healthy (PRs #106 and #199). The fix for
+  a real mismatch is to run the matching migrations, not to restart until
+  it works.
+- **The database cannot be reached at all** (connection refused, a
+  timeout, a closed pool): the API serves the Phase 1 routes and logs an
+  `error!` at start and again every 60 s until a connection succeeds, at
+  which point the migrations apply and the retries stop. `GET /health`
+  reports `"database": "unavailable"` meanwhile (see "Healthcheck"
+  above). If the database becomes reachable later with a schema that
+  still does not match this build, the retry loop logs the same
+  schema-mismatch line once and stops — a mismatch does not heal by
+  waiting, and a background task cannot un-start a process that is
+  already serving.
+- **No pool at all** (`DATABASE_URL` is not a parsable Postgres URL):
+  every Phase 2 route answers `503`, `/health` says the database is
+  unavailable, and the log carries the reason.
+
+**In practice this means:** watch `/health`'s `database` field and the
+structured logs (`tracing::error!` on migration/retry/bootstrap
+failures), not just process uptime. With a pool but an unreachable
+database, a Phase 2 query fails as `500` with the fixed text
+`database error` (the driver's own text stays in the log, never in the
+response); with no pool at all it is `503`. The same applies to
+ClickHouse-backed routes, which 503 the same way if ClickHouse is down —
+the difference is only that in the local compose stack, ClickHouse *is*
+wired into `depends_on: condition: service_healthy`, so this specific
+failure mode is less likely to bite you locally than in a deployment that
+skips that check.
 
 ## Features unavailable in the local stack
 

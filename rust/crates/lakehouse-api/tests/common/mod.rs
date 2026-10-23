@@ -245,6 +245,11 @@ async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState,
     // since `tower::ServiceExt::oneshot` never touches a real socket.
     let config = Config::from_map(&env).expect("a valid test Config");
     let state = AppState::new(config);
+    // OPS-4: the harness applied the migrations to this database before
+    // building the state, which is what `main::bring_database_up` confirms
+    // in production — so `GET /health` reports the database as usable here
+    // rather than as "never checked".
+    state.mark_database_ready();
 
     (state, pool)
 }
