@@ -33,7 +33,8 @@ application: https://learn.microsoft.com/en-us/graph/api/listitem-delta). The fe
 state for each item, not each change"; it ends in `@odata.deltaLink`, which the NEXT run opens to
 get only what changed. A deleted item comes as `{"id": ..., "deleted": {"state": "deleted"}}`.
 
-* **The delta link lives in the resource's dlt state** (`state["delta_link"]`), set only after the
+* **The delta link lives in the resource's dlt state** (`state["delta_link"]`, holding the link and
+  the object it belongs to: final review SHOULD-FIX 24), set only after the
   last page of a full enumeration was handed on, so a read that fails halfway keeps the old link;
   dlt commits the state with the load of the rows and the sink restores it after a failed load
   (`sink._abort_pending`). A test runs this against a real Iceberg table.
@@ -286,7 +287,8 @@ def _enumerate(session: Any, first: str, params: dict | None) -> Iterator[dict[s
 def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any, state: Any = None) -> Iterator[dict[str, Any]]:
     """The rows of a list. With `state` (an incremental load) the delta feed is used and its link kept;
     without it (any other load mode) the list is read in full. `since` is not used: the delta link, not a
-    time, says where the last run stopped."""
+    time, says where the last run stopped. The state keeps the link with the object it belongs to
+    (SHOULD-FIX 24), so a link saved for another list is not replayed here."""
     site, list_id = check_object(decl.name)
     base = f"{API}/sites/{site}/lists/{list_id}/items"
     if state is None:
@@ -298,13 +300,18 @@ def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any, 
             raise
         return
     saved = state.get("delta_link")
+    # PR #216 final review SHOULD-FIX 24: the link belongs to ONE object. A saved link kept for
+    # another list (or from before this change, which stored a bare string) is not used: replaying
+    # it would read another list's changes into this object's table.
+    usable = isinstance(saved, dict) and saved.get("object") == decl.name and isinstance(saved.get("link"), str) and bool(saved["link"])
     fresh = (f"{base}/delta", {"$expand": "fields", "$top": PAGE_SIZE})
-    attempts = [(saved, None), fresh] if isinstance(saved, str) and saved else [fresh]
+    attempts = [(saved["link"], None), fresh] if usable else [fresh]
     for number, (first, params) in enumerate(attempts):
         try:
             for produced in _enumerate(session, first, params):
                 if isinstance(produced, str):
-                    state["delta_link"] = produced  # only now: the whole feed was handed on
+                    # only now: the whole feed was handed on; the object name ties it to this list
+                    state["delta_link"] = {"link": produced, "object": decl.name}
                 else:
                     yield produced
             return

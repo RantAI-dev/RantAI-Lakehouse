@@ -30,7 +30,8 @@ not return as plain values are left out.
   https://learn.microsoft.com/en-us/power-apps/developer/data-platform/use-change-tracking-synchronize-data-external-systems,
   read 2026-10-21) is the one way Dataverse reports a delete. For a table that has it, the first read asks for
   tracking and every page's `@odata.nextLink` is followed to the `@odata.deltaLink`, which is kept in the
-  resource's dlt state with the `$select` it belongs to; the next run opens it and gets the changed rows and
+  resource's dlt state with the `$select` and the table it belongs to (final review SHOULD-FIX 24); the
+  next run opens it and gets the changed rows and
   the deleted ones (`@odata.context` ending `$deletedEntity`, `id`, `reason`). A deleted row is marked, not
   removed (`is_deleted`, its key, the time this run saw it as `modifiedon`). Tracking takes no `$filter`,
   `$orderby`, `$expand` or `$top`. Changes are kept for 7 days by default (`ExpireChangeTrackingInDays`); an
@@ -271,13 +272,21 @@ def _stamp(since: Any) -> str:
     return _as_time(since).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _tracked(session: Any, table: _Table, state: dict) -> Iterator[dict[str, Any]]:
-    """A table with change tracking: from the saved delta link when there is one for this `$select`, else a
-    fresh tracking request. The new link is stored only after the last page was handed on."""
+def _tracked(session: Any, table: _Table, state: dict, name: str) -> Iterator[dict[str, Any]]:
+    """A table with change tracking: from the saved delta link when there is one for this `$select`
+    AND this table (SHOULD-FIX 24), else a fresh tracking request. The new link is stored only after
+    the last page was handed on."""
     seen_at = now()
     saved = state.get("delta")
     fresh = (f"{API}/{table.entity_set}", {"$select": table.select}, _prefer("odata.track-changes"))
-    usable = isinstance(saved, dict) and saved.get("select") == table.select and isinstance(saved.get("link"), str)
+    # PR #216 final review SHOULD-FIX 24: the link is this table's. A link saved for another table
+    # (or another `$select`) is not replayed: it would read that table's changes into this one.
+    usable = (
+        isinstance(saved, dict)
+        and saved.get("object") == name
+        and saved.get("select") == table.select
+        and isinstance(saved.get("link"), str)
+    )
     attempts = [(saved["link"], None, _prefer()), fresh] if usable else [fresh]
     for number, (first, params, headers) in enumerate(attempts):
         try:
@@ -296,7 +305,7 @@ def _tracked(session: Any, table: _Table, state: dict) -> Iterator[dict[str, Any
                 delta = body.get("@odata.deltaLink")
                 if not isinstance(delta, str):
                     raise SaasSetupRefused("Dynamics 365 ended a change feed without a link to continue from")
-                state["delta"] = {"link": delta, "select": table.select}
+                state["delta"] = {"link": delta, "select": table.select, "object": name}
                 link = None
             return
         except requests.HTTPError as exc:
@@ -313,7 +322,7 @@ def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any, 
     rows modified since, in `modifiedon, key` order. Otherwise every row in key order."""
     table = _definition(session, decl.name)
     if state is not None and decl.deletes and table.tracked:
-        yield from _tracked(session, table, state)
+        yield from _tracked(session, table, state, decl.name)
         return
     params: dict[str, Any] = {"$select": table.select}
     if decl.cursor and since is not None:

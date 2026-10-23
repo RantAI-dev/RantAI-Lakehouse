@@ -340,6 +340,7 @@ def test_a_first_tracked_run_asks_for_tracking_without_a_filter_and_keeps_the_li
     assert len(contact_requests) == 3 and contact_requests[0]["headers"]["Prefer"] == "odata.track-changes,odata.maxpagesize=500"
     assert not any(k in contact_requests[0]["query"] for k in ("$filter", "$orderby")), "tracking takes neither"
     assert state["delta"]["link"].endswith(f"$deltatoken={api.tables['contact'].version}") and state["delta"]["select"] == "contactid,name,modifiedon,createdon"
+    assert state["delta"]["object"] == "contact", "SHOULD-FIX 24: the link is stored with the table it belongs to"
 
 
 def test_a_later_tracked_run_opens_the_saved_link_and_a_delete_is_marked_not_removed(api: Dataverse) -> None:
@@ -384,7 +385,7 @@ def test_a_link_dataverse_no_longer_serves_is_a_full_resync_with_a_new_link(api:
 
 
 def test_a_resync_that_is_refused_too_is_a_failure(api: Dataverse) -> None:
-    state = {"delta": {"link": f"{ORIGIN}/api/data/v9.2/contacts?$deltatoken=1", "select": "contactid,name,modifiedon,createdon"}}
+    state = {"delta": {"link": f"{ORIGIN}/api/data/v9.2/contacts?$deltatoken=1", "select": "contactid,name,modifiedon,createdon", "object": "contact"}}
     api.status["/contacts"] = 400
     with pytest.raises(requests.HTTPError):
         tracked_read(api, state)
@@ -392,14 +393,23 @@ def test_a_resync_that_is_refused_too_is_a_failure(api: Dataverse) -> None:
 
 
 def test_a_link_saved_for_other_columns_is_not_reused(api: Dataverse) -> None:
-    state = {"delta": {"link": f"{ORIGIN}/api/data/v9.2/contacts?$deltatoken=5", "select": "contactid"}}
+    state = {"delta": {"link": f"{ORIGIN}/api/data/v9.2/contacts?$deltatoken=5", "select": "contactid", "object": "contact"}}
     assert len(tracked_read(api, state)) == 5
     assert state["delta"]["select"] == "contactid,name,modifiedon,createdon"
     assert not any(r["query"].get("$deltatoken") == "5" for r in api.requests if r["path"].endswith("/contacts"))
 
 
+def test_a_link_saved_for_another_table_is_not_reused(api: Dataverse) -> None:
+    """PR #216 final review SHOULD-FIX 24: the link used to be tied only to its `$select`, so a link
+    saved for another table of the same shape would replay that table's changes into this one."""
+    state = {"delta": {"link": f"{ORIGIN}/api/data/v9.2/contacts?$deltatoken=5", "select": "contactid,name,modifiedon,createdon", "object": "account"}}
+    assert len(tracked_read(api, state)) == 5, "the full tracking read, not the other table's link"
+    assert state["delta"]["object"] == "contact"
+    assert not any(r["query"].get("$deltatoken") == "5" for r in api.requests if r["path"].endswith("/contacts"))
+
+
 def test_a_saved_link_to_another_host_stops_the_run_before_a_request_to_it(api: Dataverse) -> None:
-    state = {"delta": {"link": "https://evil.example.invalid/api/data/v9.2/contacts?$deltatoken=1", "select": "contactid,name,modifiedon,createdon"}}
+    state = {"delta": {"link": "https://evil.example.invalid/api/data/v9.2/contacts?$deltatoken=1", "select": "contactid,name,modifiedon,createdon", "object": "contact"}}
     with pytest.raises(ssrf_guard.SsrfBlocked):
         tracked_read(api, state)
     assert not any(r["path"].endswith("/contacts") for r in api.requests)

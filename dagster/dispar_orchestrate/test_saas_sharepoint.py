@@ -260,7 +260,8 @@ def test_a_first_incremental_run_enumerates_the_feed_and_keeps_the_delta_link_on
     state: dict = {}
     got = read(graph, state)
     assert [r["id"] for r in got] == ["1", "2", "3", "4", "5"] and len([line for line in graph.log if "/delta" in line]) == 3
-    assert state == {"delta_link": f"{ORIGIN}/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v{graph.version}"}
+    # PR #216 final review SHOULD-FIX 24: the link is stored with the object it belongs to.
+    assert state == {"delta_link": {"link": f"{ORIGIN}/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v{graph.version}", "object": OBJECT}}
     first = got[0]
     assert first["modified_at"] == BASE + timedelta(minutes=1) and first["is_deleted"] is False and first["field_Title"] == "item 1"
     assert first["field_Owner"] == '{"LookupId": 7}' and first["content_type"] == "Item" and "field_@odata.etag" not in first
@@ -279,7 +280,17 @@ def test_a_later_run_opens_the_saved_link_and_gets_only_the_changes_and_a_delete
     assert sorted(got) == ["2", "3", "6"] and got["2"]["field_Title"] == "item 2 changed"
     assert got["3"] == {"id": "3", "is_deleted": True, "modified_at": SEEN}, "a deleted item keeps its id, the mark and the time it was seen"
     assert graph.log[0].startswith(f"graph.microsoft.com/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v5"), "the saved link is opened as it is"
-    assert state["delta_link"].endswith(f"token=v{graph.version}")
+    assert state["delta_link"]["link"].endswith(f"token=v{graph.version}")
+
+
+def test_a_saved_link_that_belongs_to_another_object_is_not_replayed(graph: Graph) -> None:
+    """PR #216 final review SHOULD-FIX 24: the link is stored with the object it belongs to, so a
+    link kept for another list is not opened for this one (it would read that list's changes)."""
+    other = f"{SITE}/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    state = {"delta_link": {"link": f"{ORIGIN}/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v1", "object": other}}
+    got = read(graph, state)
+    assert [r["id"] for r in got] == ["1", "2", "3", "4", "5"], "a full enumeration, not the other object's changes"
+    assert state["delta_link"]["object"] == OBJECT and state["delta_link"]["link"].endswith(f"token=v{graph.version}")
 
 
 def test_a_read_that_fails_halfway_keeps_the_old_delta_link(graph: Graph) -> None:
@@ -303,14 +314,14 @@ def test_a_gone_link_is_a_full_resync_and_the_new_link_is_stored(graph: Graph) -
     graph.expired = True
     got = read(graph, state)
     assert sorted(r["id"] for r in got) == ["1", "2", "3", "4", "5", "7"], "every item again, from a delta with no token"
-    assert state["delta_link"].endswith(f"token=v{graph.version}")
+    assert state["delta_link"]["link"].endswith(f"token=v{graph.version}")
     assert not any("never-followed" in line for line in graph.log), "the Location header of the 410 is not followed"
     graph.expired = False
     assert read(graph, state) == [], "the next run continues from the new link"
 
 
 def test_a_resync_that_is_refused_too_is_a_failure_and_leaves_no_link(graph: Graph) -> None:
-    state = {"delta_link": f"{ORIGIN}/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v1"}
+    state = {"delta_link": {"link": f"{ORIGIN}/v1.0/sites/{SITE}/lists/{LIST}/items/delta?token=v1", "object": OBJECT}}
     graph.status["/delta"] = 410
     with pytest.raises(requests.HTTPError):
         read(graph, state)
@@ -318,7 +329,7 @@ def test_a_resync_that_is_refused_too_is_a_failure_and_leaves_no_link(graph: Gra
 
 
 def test_a_saved_link_to_another_host_stops_the_run_before_any_request_is_made(graph: Graph) -> None:
-    state = {"delta_link": "https://evil.example.invalid/v1.0/delta?token=v1"}
+    state = {"delta_link": {"link": "https://evil.example.invalid/v1.0/delta?token=v1", "object": OBJECT}}
     with pytest.raises(ssrf_guard.SsrfBlocked) as err:
         read(graph, state)
     assert "evil" not in str(err.value) and graph.log == []
