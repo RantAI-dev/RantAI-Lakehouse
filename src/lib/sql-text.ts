@@ -116,6 +116,16 @@ export function hasStatement(sql: string): boolean {
   return stripSqlComments(sql).trim().length > 0
 }
 
+/**
+ * How many statements one run may send.
+ *
+ * The server runs exactly one statement per request, so a buffer with
+ * several statements is a batch of requests. The cap keeps one keystroke
+ * from starting a hundred of them: the batch is refused before anything
+ * runs.
+ */
+export const MAX_STATEMENTS_PER_RUN = 20
+
 /** First line of a statement, for naming things after it. */
 export function sqlSummary(sql: string, max = 60): string {
   const line = stripSqlComments(sql).trim().split("\n")[0]?.trim() ?? ""

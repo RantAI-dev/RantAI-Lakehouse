@@ -19,7 +19,7 @@ mock.module("next/navigation", () => ({
   }),
 }))
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { TableProviders } from "@/components/app-shell/table-providers"
 import { AuthProvider } from "@/features/auth/auth-provider"
@@ -79,6 +79,28 @@ function renderPage() {
     </AuthProvider>,
   )
 }
+
+/** One row of a result, as the API sends it. */
+const RESULT = {
+  id: "r1",
+  columns: ["n"],
+  rows: [{ n: 1 }],
+  engine: "clickhouse",
+  rowCount: 1,
+  truncated: false,
+  rowLimit: 2000,
+  metrics: {
+    durationMs: 1,
+    scannedBytes: 0,
+    costUnits: 0,
+    engine: "hot",
+    workloadClass: "interactive",
+    cacheHit: null,
+    pushdowns: null,
+    policyObligations: null,
+  },
+  plan: null,
+} as never
 
 describe("QueryStudioPage Fix with AI", () => {
   it("shows the Fix with AI button only after a run has failed, not before one and not after one that succeeded", async () => {
@@ -187,6 +209,79 @@ describe("QueryStudioPage query tabs", () => {
     // The draft is still there, in the tab that was open before.
     fireEvent.click(screen.getByRole("button", { name: "Query 1" }))
     await waitFor(() => expect(editorText()).toBe("SELECT 1"))
+  })
+})
+
+describe("QueryStudioPage statements", () => {
+  it("disables the actions that work on one statement when the tab holds several", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1; SELECT 2")
+    renderPage()
+
+    const explain = await screen.findByRole("button", { name: "Explain" })
+    await waitFor(() => expect((explain as HTMLButtonElement).disabled).toBe(true))
+    expect(explain.getAttribute("title")).toBe("Select one statement")
+
+    const estimate = screen.getByRole("button", { name: "Estimate" })
+    expect((estimate as HTMLButtonElement).disabled).toBe(true)
+    expect(estimate.getAttribute("title")).toBe("Select one statement")
+
+    const save = screen.getByRole("button", { name: "Save query" })
+    expect((save as HTMLButtonElement).disabled).toBe(true)
+    expect(save.getAttribute("title")).toBe("Select one statement")
+  })
+
+  it("proposes a fix for the statement that failed, not for the whole buffer", async () => {
+    stubNetwork()
+    const proposeFix = spyOn(queryService, "proposeFix").mockResolvedValue({
+      sql: "SELECT amount FROM t",
+      reason: "The column is named amount.",
+    })
+    spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "Unknown identifier: amont")
+    )
+    seedDraft("SELECT amont FROM t; SELECT 2")
+    renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run all" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+
+    fireEvent.click(await screen.findByRole("button", { name: /Fix with AI/ }))
+
+    await waitFor(() => expect(proposeFix).toHaveBeenCalledTimes(1))
+    expect(proposeFix.mock.calls[0]?.[0]).toBe("SELECT amont FROM t")
+  })
+
+  it("puts the accepted fix back in the statement it was made for and nowhere else", async () => {
+    stubNetwork()
+    spyOn(queryService, "run")
+      .mockResolvedValueOnce(RESULT)
+      .mockRejectedValueOnce(new ServiceError("invalid_request", "Unknown identifier: amont"))
+    spyOn(queryService, "proposeFix").mockResolvedValue({
+      sql: "SELECT amount FROM t",
+      reason: "The column is named amount.",
+    })
+    seedDraft("SELECT 1;\nSELECT amont FROM t;\nSELECT 3")
+    const { container } = renderPage()
+
+    const runButton = await screen.findByRole("button", { name: "Run all" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+
+    // The failure is on the second statement, so its result tab is the one
+    // that carries the error.
+    const bar = await screen.findByRole("group", { name: "Statement results" })
+    fireEvent.click(within(bar).getByRole("button", { name: "SELECT amont FROM t" }))
+    fireEvent.click(await screen.findByRole("button", { name: /Fix with AI/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "Accept" }))
+
+    await waitFor(() => {
+      const lines = Array.from(container.querySelectorAll(".cm-line")).map(
+        (line) => line.textContent ?? ""
+      )
+      expect(lines.join("\n")).toBe("SELECT 1;\nSELECT amount FROM t;\nSELECT 3")
+    })
   })
 })
 

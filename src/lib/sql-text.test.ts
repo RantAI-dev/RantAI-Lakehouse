@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert"
 import { test } from "node:test"
 import {
   hasStatement,
+  MAX_STATEMENTS_PER_RUN,
   splitStatements,
   sqlSummary,
   stripSqlComments,
@@ -147,4 +148,8 @@ test("splitStatements dan stripSqlComments sepakat soal isi string", () => {
   const statements = splitStatements(sql)
   assert.equal(statements.length, 1)
   assert.equal(statements[0]?.text, sql)
+})
+
+test("MAX_STATEMENTS_PER_RUN adalah batas dua puluh statement per run", () => {
+  assert.equal(MAX_STATEMENTS_PER_RUN, 20)
 })

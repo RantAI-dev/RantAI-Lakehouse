@@ -73,30 +73,41 @@ export function SqlPanel({
     setSql,
     engine,
     setEngine,
-    completionExtensions,
-    runAct,
+    editorExtensions,
+    statements,
+    running,
+    stopRun,
     estimateAct,
-    estimatable,
+    runnable,
+    targetStatement,
     runQuery,
+    runSelectionOrAll,
     reEstimate,
     explain,
   } = studio
-  const running = runAct.status === "pending"
   const explainBusy = explain.busy
   const explainRun = explain.run
   const { settings, setSettings } = useFormatSettings()
+
+  // The actions that work on one statement are disabled without one: the
+  // button's title says what to do about it.
+  const oneStatement = targetStatement !== null
+  const manyStatements = statements.length > 1
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       // Either modifier, like the command palette and the sidebar
       // shortcut: which one a keyboard has is not worth detecting.
       if (!(event.metaKey || event.ctrlKey) || event.key !== "Enter") return
+      // The editor's own binding runs the selection and marks the key as
+      // handled. Running the batch here as well would run it twice.
+      if (event.defaultPrevented) return
       event.preventDefault()
-      if (!running) void runQuery()
+      if (!running) void runSelectionOrAll()
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-  }, [runQuery, running])
+  }, [runSelectionOrAll, running])
 
   return (
     <div className="space-y-3">
@@ -106,7 +117,7 @@ export function SqlPanel({
       <SqlEditor
         value={sql}
         onChange={setSql}
-        extensions={completionExtensions}
+        extensions={editorExtensions}
         onView={(view) => studio.setEditorView(view)}
       />
       <div className="flex flex-wrap items-center gap-2">
@@ -122,23 +133,35 @@ export function SqlPanel({
         <Button
           size="sm"
           onClick={() => void runQuery()}
-          disabled={running || !estimatable}
+          disabled={running || !runnable}
         >
           <Play className="size-4" aria-hidden />
-          {running ? "Running…" : "Run query"}
+          {running ? "Running…" : manyStatements ? "Run all" : "Run query"}
         </Button>
         {running ? (
-          <Button size="sm" variant="outline" onClick={runAct.cancel}>
+          <Button size="sm" variant="outline" onClick={stopRun}>
             <Square className="size-4" aria-hidden />
             Stop
           </Button>
         ) : null}
-        <Button size="sm" variant="outline" onClick={onSave} disabled={!estimatable}>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onSave}
+          disabled={!oneStatement}
+          title={oneStatement ? undefined : "Select one statement"}
+        >
           <Save className="size-4" aria-hidden />
           Save query
         </Button>
         {onSaveAsSource ? (
-          <Button size="sm" variant="outline" onClick={onSaveAsSource} disabled={!estimatable}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onSaveAsSource}
+            disabled={!oneStatement}
+            title={oneStatement ? undefined : "Select one statement"}
+          >
             <LayoutDashboard className="size-4" aria-hidden />
             Save as SQL source
           </Button>
@@ -147,7 +170,7 @@ export function SqlPanel({
           size="sm"
           variant="outline"
           onClick={() => setSql(formatSql(sql, settings))}
-          disabled={!estimatable}
+          disabled={!runnable}
         >
           <WandSparkles className="size-4" aria-hidden />
           Format
@@ -213,7 +236,8 @@ export function SqlPanel({
           size="sm"
           variant="ghost"
           onClick={reEstimate}
-          disabled={estimateAct.status === "pending" || !estimatable}
+          disabled={estimateAct.status === "pending" || !oneStatement}
+          title={oneStatement ? undefined : "Select one statement"}
         >
           Estimate
         </Button>
@@ -221,7 +245,8 @@ export function SqlPanel({
           size="sm"
           variant="outline"
           onClick={() => void explainRun()}
-          disabled={explainBusy || !estimatable}
+          disabled={explainBusy || !oneStatement}
+          title={oneStatement ? undefined : "Select one statement"}
         >
           <BookOpen className="size-4" aria-hidden />
           {explainBusy ? "Explaining…" : "Explain"}
