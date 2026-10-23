@@ -63,11 +63,16 @@ Decisions 1 to 6 signed by the product owner on 2026-10-11 ("run it", on the pla
 | 7 | Beyond the spec: none of this can be proven on the build machine. A gate starts the whole stack in containers, which that machine cannot do safely, and the branch is not pushed. | `SRC-9` is built on a branch of its own after PR #101 merges, pushed as a draft pull request from its first commit, so CI runs each gate while it is written. | 2026-10-11 |
 | 8 | Beyond the spec, found by this work: MySQL CDC and SQL Server CDC are listed as supported and cannot run. The API renders the PostgreSQL template for them with another connector class: no `database.server.id` for MySQL, no `database.names` for SQL Server, PostgreSQL-only slot and publication settings for both, and no way to remove what a connector leaves at the source. | Both are listed as not supported, with the reason on the tile, as `SRC-6` did for Google Sheets. Connectors of those types that already exist stay. The API refuses to render their Debezium settings with the same reason. Building them is `SRC-4`. | 2026-10-12 |
 | 9 | Decision 1's target, measured: the one job that held every batch source took 21m56s to 22m48s. | The batch sources are split into two parallel jobs, SQL sources in one and file, REST, document, stream and SFTP sources in the other, so that the slowest connector gate job is back under 20 minutes. Measured again and written into `docs/plans/SRC-9-RESULT.md`. No step is removed. | 2026-10-12 |
+| 10 | Added by `SRC-3` (2026-10-21): the eight business-app connectors (Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint) become supported, and Workday Reports and NetSuite are built but stay unsupported (`SRC-3` decision 10). The ten need a mock vendor server and about 65 to 88 seconds of product steps each, so one job passes 20 minutes. | One gate, `g6-saas`, run as two parallel jobs on the same scripts, each told its vendors: "Rust · SRC-3 business-app connectors (A)" (HubSpot, Zendesk, Salesforce, Google Analytics 4, ServiceNow) and "(B)" (Confluence, SharePoint, Dynamics 365, Workday, NetSuite); both are required checks. The registry names the gate `g6-saas`, and each type's note names its job. Measured on one CI run: A 7m18s, B 13m23s, in `docs/plans/SRC-3-RESULT.md`. No step is removed. The two unsupported types are checked by the gate (they must stay unsupported with a reason) and have no registry entry until a real-account test (`SRC-27`). | 2026-10-21 (planner's amendment of `SRC-3` AD9, product owner's 20-minute budget unchanged) |
 
 ## Limits to tell a customer
 
 - A gate proves a connector type against one version of one source system,
   in a container, with small data.
+- The business-app types are proven against a mock vendor server that the
+  developers wrote from the vendors' documentation, never against a real
+  vendor account: a vendor that behaves differently from its documentation
+  fails only on a real account (`SRC-3-AC1`, `SRC-27`).
 - For Oracle, MongoDB, Kafka and SFTP the gate proves the load, not a
   connection test, because the product has none for them yet.
 
@@ -79,7 +84,7 @@ Rows 1 to 4 are the spec's checklist, in its order.
 | # | Do this | Expect | Result |
 | --- | --- | --- | --- |
 | 1 | Spec: every Target row above works as written | Rows 5 to 8 pass | |
-| 2 | Spec: open a pull request's CI run | One passing gate per connector type in the picker: thirteen rows, four steps each | |
+| 2 | Spec: open a pull request's CI run | One passing gate per connector type in the picker that is supported: nineteen rows since `SRC-3` (eleven before it), four steps each | |
 | 3 | Spec: on a test branch, break one connector's code (for example the SFTP adapter) | That type's row turns red and CI fails; the other rows stay green | |
 | 4 | Spec: the gates sign in as a user; a step that fails prints an honest message | No gate passes by skipping a step; a skipped step is shown as skipped with its reason | |
 | 5 | On a test branch, list a new type as supported without a gate | The coverage check fails and names the type | |

@@ -1,5 +1,5 @@
 {
-  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest not_supported failure today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'.",
+  "_about": "SRC-9 registry of connector gate coverage. One entry per connector type that connector_type lists as supported after all migrations (0035, 0043, 0062, 0066, 0096). 'gate' names the ops/ gate that covers the type today, or null. Each step (connect, discover, load, reload) is 'real' (the product does it and the gate must see it work), 'refused' (the product answers an honest not_supported failure today and the gate must see exactly that; the reason is the backlog item that will change it) or 'missing' (no gate asserts it yet). Read by the gates through ops/gates/gate_summary.py, which turns it and the results into the table in the CI job summary, and by the coverage check of SRC-9 task 8. Change it in the same commit as the gate or the product behaviour it describes. For change-capture types load is the first copy and reload is a later insert, update and delete arriving. A type that is supported but not fully covered may carry an explicit 'waiver' {until: backlog id, reason}; the coverage check lists it as waived and fails on a waiver that waives nothing. The g6 gate is one script run by two CI jobs, g6-ingest (G6_GROUP=sql) and g6-ingest-other (G6_GROUP=other); this registry names gates, not jobs, so every type the script loads keeps 'g6' and each job's table shows the other job's types as skipped, 'covered by job <name>'. The g6-saas gate is likewise one script run by two CI jobs (g6-saas-a: HubSpot, Zendesk, Salesforce, Google Analytics 4, ServiceNow; g6-saas-b: Confluence, SharePoint, Dynamics 365, and the unsupported Workday Reports and NetSuite, which have no entry here until a real-account test); each entry's note names its job.",
   "types": {
     "PostgreSQL": {
       "gate": "g6",
@@ -142,6 +142,102 @@
         "all": "SRC-9 plan task 4: atmoz/sftp in the g6 override, with a host key minted by the fixture so the pinned fingerprint is its own.",
         "connect": "SRC-5: an SFTP connector cannot be tested from the console.",
         "discover": "SRC-13 D12: the orchestrator lists the files under the dial's path, which hold orders.csv; its preview shows id, name and amount from the header and first rows, types inferred."
+      }
+    },
+    "Salesforce": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "ServiceNow": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "Google Analytics 4": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "HubSpot": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "Zendesk": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (A)\" (g6-saas-a), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "Confluence": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "Dynamics 365": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and previews one, load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
+      }
+    },
+    "SharePoint": {
+      "gate": "g6-saas",
+      "steps": {
+        "connect": "real",
+        "discover": "real",
+        "load": "real",
+        "reload": "real"
+      },
+      "notes": {
+        "all": "SRC-3 slice 7: proven in the CI job \"Rust · SRC-3 business-app connectors (B)\" (g6-saas-b), against the mock vendor in ops/g6/saas_stub.py, not a real account. Connect is the API's test route, discover lists the vendor's objects and the preview is honestly not supported (the vendor does not describe its fields), load is a first copy to Bronze, reload is a second run that picks up a changed record (and a delete where the vendor reports one)."
       }
     }
   }

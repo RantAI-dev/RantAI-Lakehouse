@@ -102,8 +102,11 @@ beyond the spec. The planner's recommendation is the Default.
   accepted.
 - Vault: KV version 2, no namespaces. Azure: the public cloud. Google: a
   service-account key file or the platform identity.
-- OAuth: REST connectors only; client authentication by `client_secret_post`
-  only; a signed-in connector cannot be moved to another provider (create a
+- OAuth: REST connectors and, since `SRC-3`, the business-app connectors
+  (each vendor's sign-in, token and revoke addresses are fixed in the product, not typed);
+  client authentication by `client_secret_post`, `client_secret_basic` (a Basic header: Workday Reports,
+  NetSuite) or a JSON body (`post_json`: Zendesk, Confluence) as the vendor
+  requires, per vendor; a signed-in connector cannot be moved to another provider (create a
   new one); two runs of one connector at once can race on a provider that
   rotates refresh tokens.
 

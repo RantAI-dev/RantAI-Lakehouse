@@ -973,3 +973,117 @@ def test_an_unclassified_failure_is_logged_at_warning_with_its_type_name_and_nev
     records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert records and "Odd" in records[0].getMessage()
     assert "secret-looking" not in caplog.text
+
+
+# --- SRC-3 T1.10: business apps through the vendor module ------------------------------------
+
+
+class _FakeSaasModule:
+    def __init__(self, *, describes: bool = True) -> None:
+        from dispar_orchestrate.adapters.saas import Field
+
+        self._fields = [Field("id", "integer", False), Field("subject", "text")]
+        if describes:
+            self.describe = lambda session, parts, dial, name: self._fields
+
+    def list_objects(self, session, parts, dial):
+        from dispar_orchestrate.saas.objects import ObjectDecl
+
+        return [
+            ObjectDecl(name="tickets", primary_key=("id",), cursor="updated_at"),
+            ObjectDecl(name="owners", primary_key=("id",), full_reason="the API has no last-modified filter"),
+            ObjectDecl(name="Users", primary_key=("id",), cursor="updated_at"),
+        ]
+
+    def declaration(self, session, parts, dial, name):
+        return next(d for d in self.list_objects(session, parts, dial) if d.name == name)
+
+
+_SAAS = {
+    "id": "conn-1",
+    "adapter": "saas",
+    "dial": {"vendor": "netsuite", "account": "1234567", "auth": {"type": "integration"}},  # the module is injected by `_saas_backends`
+    "secretRef": "env:CONNECTOR_SAAS_TOKEN",
+}
+
+
+def _saas_backends(module) -> Backends:
+    def open_session(dial, secrets, *, connector_id, resolve_checked):
+        from dispar_orchestrate.saas import vendors
+
+        return module, vendors.vendor("zendesk"), vendors.AccountParts("acme"), object()
+
+    return _backends(saas_open=open_session)
+
+
+def test_a_saas_list_names_each_object_with_how_it_loads_and_honours_search() -> None:
+    result = discover.discover(_SAAS, _request("list"), backends=_saas_backends(_FakeSaasModule()))
+    assert result["objects"] == [
+        {"name": "Users", "kind": "object", "load": "incremental"},
+        {"name": "owners", "kind": "object", "load": "re-read in full: the API has no last-modified filter"},
+        {"name": "tickets", "kind": "object", "load": "incremental"},
+    ]
+    found = discover.discover(_SAAS, _request("list", search="USER"), backends=_saas_backends(_FakeSaasModule()))
+    assert [o["name"] for o in found["objects"]] == ["Users"]
+
+
+def test_a_saas_fields_list_gives_the_vendors_dimensions_and_metrics_to_build_a_report_from() -> None:
+    """Slice 3 review BLOCKER 9: `schema = "fields"` lists what an object can be defined from."""
+
+    class WithFields(_FakeSaasModule):
+        def list_fields(self, session, parts, dial):
+            return [{"name": "sessions", "kind": "metric"}, {"name": "country", "kind": "dimension"}, {"name": "countryId", "kind": "dimension"}]
+
+    result = discover.discover(_SAAS, _request("list", schema="fields"), backends=_saas_backends(WithFields()))
+    assert result["objects"] == [
+        {"name": "country", "kind": "dimension"},
+        {"name": "countryId", "kind": "dimension"},
+        {"name": "sessions", "kind": "metric"},
+    ]
+    found = discover.discover(_SAAS, _request("list", schema="fields", search="ID"), backends=_saas_backends(WithFields()))
+    assert [o["name"] for o in found["objects"]] == ["countryId"]
+    with pytest.raises(discover.NotSupported):
+        discover.discover(_SAAS, _request("list", schema="fields"), backends=_saas_backends(_FakeSaasModule()))
+
+
+def test_a_saas_preview_gives_the_vendors_fields_and_the_declared_key() -> None:
+    result = discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(_FakeSaasModule()))
+    assert result["columns"] == [
+        {"name": "id", "typeName": "integer", "inferred": False},
+        {"name": "subject", "typeName": "text", "inferred": False},
+    ]
+    assert result["primaryKey"] == ["id"]
+
+
+def test_a_saas_preview_of_a_vendor_that_does_not_describe_is_not_supported() -> None:
+    with pytest.raises(discover.NotSupported):
+        discover.discover(
+            _SAAS, _request("preview", object="tickets"), backends=_saas_backends(_FakeSaasModule(describes=False))
+        )
+
+
+def test_the_saas_failures_have_discovery_classes() -> None:
+    from dispar_orchestrate.saas import session as saas_session
+    from dispar_orchestrate.saas import vendors
+
+    assert discover.classify_discovery(saas_session.SaasSignInRefused()) == discover.SIGN_IN_REFUSED
+    assert discover.classify_discovery(saas_session.SaasPermissionMissing()) == discover.NO_PERMISSION
+    assert discover.classify_discovery(vendors.UnsupportedVendor()) == discover.NOT_SUPPORTED
+
+
+def test_a_saas_vendor_with_no_module_is_not_supported_through_the_real_opener(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Slice 6 gave NetSuite, the last of the ten, a module; remove it to have the case of a vendor id added to the table first.
+    from dispar_orchestrate.saas import vendors
+
+    monkeypatch.delitem(vendors.MODULE_PATHS, "netsuite")
+    monkeypatch.delitem(vendors._MODULES, "netsuite", raising=False)
+    with pytest.raises(Exception) as raised:
+        discover.discover(_SAAS, _request("list"), backends=_backends())
+    assert discover.classify_discovery(raised.value) == discover.NOT_SUPPORTED
+
+
+def test_a_saas_object_the_vendor_cannot_describe_has_no_preview() -> None:
+    module = _FakeSaasModule()
+    module.describe = lambda session, parts, dial, name: None  # type: ignore[method-assign]
+    with pytest.raises(discover.NotSupported):
+        discover.discover(_SAAS, _request("preview", object="tickets"), backends=_saas_backends(module))

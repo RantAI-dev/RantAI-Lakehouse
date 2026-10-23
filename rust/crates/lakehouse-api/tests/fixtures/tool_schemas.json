@@ -6165,7 +6165,7 @@
     "type": "function",
     "function": {
       "name": "get_ingest_spec",
-      "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
+      "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp, saas), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -6202,7 +6202,8 @@
               "sheets",
               "mongodb",
               "kafka",
-              "sftp"
+              "sftp",
+              "saas"
             ]
           },
           "ingestMode": {

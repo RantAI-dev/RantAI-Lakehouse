@@ -970,6 +970,8 @@ async fn list_s3(
                 meta.last_modified
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ),
+            load: None,
+            label: None,
         });
     }
     Ok(Listing { objects, truncated })
@@ -1125,12 +1127,15 @@ pub async fn dispatch(
         }
         Dial::Sheets(_) => Answer::failed(kind, ErrorClass::NotSupported),
         // Oracle, MongoDB, Kafka, SFTP, and the column preview of REST.
+        // `SRC-3` T1.6: a `saas` connector's objects and columns are listed
+        // by the vendor's own module in the orchestrator, never by the API.
         Dial::Sql(_)
         | Dial::Cdc(_)
         | Dial::Rest(_)
         | Dial::Mongo(_)
         | Dial::Kafka(_)
-        | Dial::Sftp(_) => return Dispatch::Orchestrator,
+        | Dial::Sftp(_)
+        | Dial::Saas(_) => return Dispatch::Orchestrator,
     };
     Dispatch::Done(answer)
 }
@@ -1379,6 +1384,21 @@ mod tests {
             serde_json::json!({"hosts": ["m.example:27017"], "database": "d",
                 "username": "u", "directConnection": true}),
         );
+        // `SRC-3` T1.6: a business-app connector is listed by its vendor's
+        // module in the orchestrator, for both lists and column previews.
+        let saas = info(
+            "saas",
+            serde_json::json!({
+                "vendor": "zendesk", "account": "acme",
+                "auth": {"type": "integration"}
+            }),
+        );
+        for kind in [Kind::List, Kind::Preview] {
+            assert!(matches!(
+                dispatch(kind, &saas, &request, &resolver, &InternalHosts::NONE).await,
+                Dispatch::Orchestrator
+            ));
+        }
         for connector in [&oracle, &mongo] {
             let out = dispatch(
                 Kind::List,
