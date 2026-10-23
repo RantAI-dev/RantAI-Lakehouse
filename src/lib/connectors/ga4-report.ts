@@ -14,8 +14,14 @@ export const GA4_TIME_DIMENSIONS = ["date", "isoYearIsoWeek", "year", "yearMonth
 
 const LABEL = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
 const API_NAME = /^[A-Za-z][A-Za-z0-9_]*(:[A-Za-z0-9_]+)?$/
-/** The most names (dimensions + metrics) one report may hold. */
-export const GA4_MAX_NAMES = 20
+/**
+ * The Data API's own limits, checked separately (PR #216 final review SHOULD-FIX 22): Google's
+ * discovery document for v1beta states both on `RunReportRequest` ("Requests are allowed up to 9
+ * dimensions." / "Requests are allowed up to 10 metrics."); the "Create a report" guide says "you
+ * can use up to nine dimensions per request". The time dimension counts as one.
+ */
+export const GA4_MAX_DIMENSIONS = 9
+export const GA4_MAX_METRICS = 10
 
 export type Ga4Report = { label: string; dimensions: string[]; metrics: string[] }
 
@@ -50,8 +56,11 @@ export function reportProblem(report: Ga4Report, taken: readonly string[]): stri
   if (!LABEL.test(label)) return "Name the report with letters, digits and underscores, starting with a letter."
   if (taken.includes(label)) return "A report with this name exists."
   if (report.metrics.length === 0) return "Choose at least one metric."
-  const all = [...withTimeDimension(report.dimensions), ...report.metrics]
-  if (all.length > GA4_MAX_NAMES) return `A report holds at most ${GA4_MAX_NAMES} dimensions and metrics.`
+  const dimensions = withTimeDimension(report.dimensions)
+  if (dimensions.length > GA4_MAX_DIMENSIONS)
+    return `A report takes at most ${GA4_MAX_DIMENSIONS} dimensions, including its date.`
+  if (report.metrics.length > GA4_MAX_METRICS) return `A report takes at most ${GA4_MAX_METRICS} metrics.`
+  const all = [...dimensions, ...report.metrics]
   if (!all.every((n) => API_NAME.test(n))) return "A dimension or metric has a name Google Analytics does not use."
   return null
 }

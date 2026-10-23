@@ -65,6 +65,32 @@ def test_the_connectors_reports_are_its_objects_each_incremental_on_its_time_dim
     assert monthly.cursor == "yearMonth" and monthly.primary_key == ("yearMonth",)
 
 
+def test_a_weekly_monthly_or_yearly_report_steps_back_over_the_period_it_may_still_revise() -> None:
+    """PR #216 final review SHOULD-FIX 22: with a 3-day lag a run at the start of a new month
+    re-reads only that month, so the month that closed (revised after it closed) is never read
+    again. The lag covers the period plus the 3-day lookback; a daily report is unchanged."""
+    assert ga4.declaration(None, PARTS, DIAL, "d = country | sessions").lag_seconds == 3 * 86_400
+    for text, days in (("w = isoYearIsoWeek | sessions", 7), ("m = yearMonth | sessions", 31), ("y = year | sessions", 366)):
+        assert ga4.declaration(None, PARTS, DIAL, text).lag_seconds == (3 + days) * 86_400, text
+
+
+def test_a_report_takes_at_most_nine_dimensions_and_ten_metrics() -> None:
+    """SHOULD-FIX 22: the Data API allows up to 9 dimensions and up to 10 metrics per request
+    (`RunReportRequest` in `analyticsdata.googleapis.com/$discovery/rest?version=v1beta`; the
+    "Create a report" guide states the 9). The old check allowed 20 names in total."""
+    nine = ["date", *[f"dim{i}" for i in range(8)]]
+    ten = [f"m{i}" for i in range(10)]
+    label, dims, metrics = ga4.parse_report(f"t = {', '.join(nine)} | {', '.join(ten)}")
+    assert (len(dims), len(metrics)) == (9, 10)
+    with pytest.raises(saas_adapter.SaasSetupRefused, match="at most 9 dimensions"):
+        ga4.parse_report(f"t = {', '.join([*nine, 'extra'])} | {', '.join(ten)}")
+    with pytest.raises(saas_adapter.SaasSetupRefused, match="10 metrics"):
+        ga4.parse_report(f"t = {', '.join(nine)} | {', '.join([*ten, 'm10'])}")
+    # The time dimension is one of the nine, even when the report does not name it.
+    with pytest.raises(saas_adapter.SaasSetupRefused, match="at most 9 dimensions"):
+        ga4.parse_report(f"t = {', '.join([f'dim{i}' for i in range(9)])} | sessions")
+
+
 def test_describe_types_the_columns_from_the_properties_metadata_and_refuses_a_name_it_does_not_have() -> None:
     session = session_over(FakeGa4())
     fields = {x.name: x for x in ga4.describe(session, PARTS, DIAL, REPORT)}

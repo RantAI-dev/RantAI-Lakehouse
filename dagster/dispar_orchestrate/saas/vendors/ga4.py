@@ -27,7 +27,10 @@ definition has; `date` is added when it has none) is the cursor and the dimensio
 together are the merge key. A later run starts `LOOKBACK_DAYS` days before the last
 value (vendored local change 2: Google may change a day for 24-48 hours; the object's
 `lag_seconds`, which dlt's incremental subtracts from the last value and for which it
-switches its boundary de-duplication off) and the merge replaces the rows read again. A report always has a cursor, so none is "re-read in full".
+switches its boundary de-duplication off) and the merge replaces the rows read again. A
+report always has a cursor, so none is "re-read in full". For a weekly, monthly or yearly
+report the lag also covers one period (`_PERIOD_DAYS`, final review SHOULD-FIX 22), or the
+period that just closed would never be read again after Google revised it.
 
 # The property's time zone (slice 3 review SHOULD-FIX 11)
 
@@ -92,7 +95,16 @@ ROWS_PER_PAGE = 10_000
 _LABEL = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 # A Data API name: letters, digits, underscore, with the one `customEvent:name` form.
 _API_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(:[A-Za-z0-9_]+)?$")
-_MAX_NAMES = 20
+# PR #216 final review SHOULD-FIX 22: the Data API's own limits, checked separately. Google's
+# discovery document for v1beta states both on `RunReportRequest` ("Requests are allowed up to 9
+# dimensions." / "Requests are allowed up to 10 metrics."), and the "Create a report" guide says
+# "you can use up to nine dimensions per request". The old code allowed 20 names in total.
+MAX_DIMENSIONS = 9
+MAX_METRICS = 10
+# The time dimensions whose value is a period longer than a day: a revision of the period just
+# closed is re-read only when the lag reaches back over it (SHOULD-FIX 22). `date`, `dateHour`
+# and `dateHourMinute` are covered by LOOKBACK_DAYS alone.
+_PERIOD_DAYS = {"year": 366, "yearMonth": 31, "isoYearIsoWeek": 7}
 
 
 def _refuse() -> SaasSetupRefused:
@@ -114,12 +126,17 @@ def parse_report(text: str) -> tuple[str, list[str], list[str]]:
     dims = [d.strip() for d in dims_text.split(",") if d.strip()]
     metrics = [m.strip() for m in metrics_text.split(",") if m.strip()]
     names = [*dims, *metrics]
-    if not metrics or len(names) > _MAX_NAMES or len(set(dims)) != len(dims) or len(set(metrics)) != len(metrics):
+    if not metrics or len(set(dims)) != len(dims) or len(set(metrics)) != len(metrics):
         raise _refuse()
     if not all(_API_NAME.match(n) for n in names):
         raise _refuse()
     if not any(d in ga_source.TIME_DIMENSIONS for d in dims):
         dims.append("date")
+    # SHOULD-FIX 22: the two limits are the API's, and the time dimension counts as one.
+    if len(dims) > MAX_DIMENSIONS or len(metrics) > MAX_METRICS:
+        raise SaasSetupRefused(
+            f"a Google Analytics report takes at most {MAX_DIMENSIONS} dimensions and {MAX_METRICS} metrics per request"
+        )
     return label.strip(), dims, metrics
 
 
@@ -127,10 +144,17 @@ def time_dimension(dims: list[str]) -> str:
     return next(d for d in dims if d in ga_source.TIME_DIMENSIONS)
 
 
+def lag_seconds(cursor: str) -> int:
+    """How far a run steps back from the cursor: the 3-day lookback, plus the length of the
+    cursor's period when the report is weekly, monthly or yearly (SHOULD-FIX 22)."""
+    return (LOOKBACK_DAYS + _PERIOD_DAYS.get(cursor, 0)) * 86_400
+
+
 def declaration(session: Any, parts: Any, dial: dict, name: str) -> ObjectDecl:
     """The report's declaration: the time dimension is the cursor, the dimensions the key."""
     _label, dims, _metrics = parse_report(name)
-    return ObjectDecl(name=name, primary_key=tuple(dims), cursor=time_dimension(dims), lag_seconds=LOOKBACK_DAYS * 86_400)
+    cursor = time_dimension(dims)
+    return ObjectDecl(name=name, primary_key=tuple(dims), cursor=cursor, lag_seconds=lag_seconds(cursor))
 
 
 def list_objects(session: Any, parts: Any, dial: dict) -> list[ObjectDecl]:
@@ -166,8 +190,9 @@ def describe(session: Any, parts: Any, dial: dict, name: str) -> list[Field] | N
 
 
 def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any) -> Iterator[dict[str, Any]]:
-    """The rows of a report from `LOOKBACK_DAYS` before `since`, or from the start of
-    Google Analytics' data for a first run (`since` is `None`)."""
+    """The rows of a report from `since` (the cursor minus its declared lag, which already
+    includes `LOOKBACK_DAYS` and, for a period, the period itself), or from the start of Google
+    Analytics' data for a first run (`since` is `None`)."""
     label, dims, metrics = parse_report(decl.name)
     cursor = time_dimension(dims)
     yield from ga_helpers.basic_report(

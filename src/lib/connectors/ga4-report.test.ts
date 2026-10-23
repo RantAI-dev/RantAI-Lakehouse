@@ -29,7 +29,17 @@ describe("a GA4 report text", () => {
     expect(reportProblem({ ...ok, label: "1 bad" }, [])).toMatch(/Name the report/)
     expect(reportProblem(ok, ["t"])).toMatch(/exists/)
     expect(reportProblem({ ...ok, metrics: [] }, [])).toMatch(/at least one metric/)
-    expect(reportProblem({ ...ok, metrics: Array.from({ length: 25 }, (_, i) => `m${i}`) }, [])).toMatch(/at most 20/)
+    // PR #216 final review SHOULD-FIX 22: the Data API's two limits, separate, with the time
+    // dimension counted (9 dimensions and 10 metrics, not 20 names).
+    const tenMetrics = Array.from({ length: 10 }, (_, i) => `m${i}`)
+    expect(reportProblem({ ...ok, metrics: tenMetrics }, [])).toBeNull()
+    expect(reportProblem({ ...ok, metrics: [...tenMetrics, "m10"] }, [])).toMatch(/at most 10 metrics/)
+    const nineDimensions = ["date", ...Array.from({ length: 8 }, (_, i) => `dim${i}`)]
+    const eightMetrics = tenMetrics.slice(0, 8)
+    expect(reportProblem({ label: "t", dimensions: nineDimensions, metrics: eightMetrics }, [])).toBeNull()
+    expect(reportProblem({ label: "t", dimensions: [...nineDimensions, "extra"], metrics: eightMetrics }, [])).toMatch(
+      /at most 9 dimensions/
+    )
     expect(reportProblem({ ...ok, dimensions: ["a;b"] }, [])).toMatch(/does not use/)
   })
 })
