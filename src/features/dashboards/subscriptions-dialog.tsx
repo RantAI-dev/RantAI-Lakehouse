@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -109,6 +110,9 @@ function SubscriptionRow({
   readonly onChanged: () => void;
 }) {
   const [busy, setBusy] = React.useState(false);
+  // RPT-1 QA fix Q1: a send can take a minute with a PDF, so this row says it is
+  // sending (not only greyed) until the answer arrives; other actions stay quiet.
+  const [sending, setSending] = React.useState(false);
   const [note, setNote] = React.useState<string | null>(null);
   async function run(fn: () => Promise<string | void>) {
     setBusy(true); setNote(null);
@@ -131,13 +135,21 @@ function SubscriptionRow({
         {s.skipWhenEmpty ? " · skipped when every chart is empty" : ""}
       </div>
       <div className="text-xs">{describeStatus(s)}</div>
-      {note ? <p role="status" className="text-xs">{note}</p> : null}
+      {sending ? (
+        <p role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />Sending…
+        </p>
+      ) : note ? <p role="status" className="text-xs">{note}</p> : null}
       {s.canEdit !== false ? (
         <div className="flex flex-wrap gap-1.5 pt-1">
-          <Button variant="outline" size="xs" disabled={busy} onClick={() => void run(async () => {
-            const d = await reportService.sendNow(s.id);
-            return d.status === "sent" ? "Sent. Check the inbox." : d.status === "skipped" ? `Skipped. ${d.reason ?? ""}` : `Not sent. ${d.reason ?? ""}`;
-          })}>Send now</Button>
+          <Button variant="outline" size="xs" disabled={busy} onClick={() => { setSending(true); void run(async () => {
+            try {
+              const d = await reportService.sendNow(s.id);
+              return d.status === "sent" ? "Sent. Check the inbox." : d.status === "skipped" ? `Skipped. ${d.reason ?? ""}` : `Not sent. ${d.reason ?? ""}`;
+            } finally {
+              setSending(false);
+            }
+          }); }}>{sending ? "Sending…" : "Send now"}</Button>
           <Button variant="outline" size="xs" disabled={busy} onClick={() => void run(async () => {
             // RPT-1 review fix (SHOULD-FIX) R4: pause and resume send only the flag.
             await reportService.setPaused(s.id, !s.paused);

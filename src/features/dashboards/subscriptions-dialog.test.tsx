@@ -136,4 +136,25 @@ describe("SubscriptionsDialog", () => {
     // RPT-1 review fix (SHOULD-FIX) R4: only the flag is sent.
     expect(put).toEqual({ paused: true })
   })
+
+  it("shows Sending… with a spinner on the row until the send answers, then the result (RPT-1 QA fix Q1)", async () => {
+    const calls = mockApi({ items: [sub] })
+    const base = global.fetch
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    global.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/send")) await gate
+      return base(input, init)
+    }) as unknown as typeof fetch
+    render(<SubscriptionsDialog {...props} />)
+    fireEvent.click(await screen.findByRole("button", { name: "Send now" }))
+    const row = await screen.findByRole("status")
+    expect(row.textContent).toContain("Sending…")
+    expect(row.querySelector("svg.animate-spin")).not.toBeNull()
+    expect(screen.queryByRole("button", { name: "Send now" })).toBeNull()
+    release()
+    expect(await screen.findByText(`Not sent. ${EMAIL_NOT_SET_UP}`)).toBeDefined()
+    expect(screen.queryByText("Sending…")).toBeNull()
+    expect(calls.length).toBeGreaterThan(0)
+  })
 })
