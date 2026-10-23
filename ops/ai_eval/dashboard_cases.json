@@ -452,7 +452,7 @@
       {"name": "board", "method": "POST", "path": "/api/dashboard/boards", "body": {"name": "Eval Save Filters"}, "id_at": "board.id"}
     ],
     "turns": [
-      "Show me last year only.",
+      "Show me 2024 only.",
       "Save this filter as the default for everyone."
     ],
     "expect_tool": {"name": "save_board_filters", "args_contains": {"board": "{board}", "filters": "tahun"}},
@@ -515,7 +515,8 @@
     ],
     "expect_tool": {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{chart}"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "tile_on_tab": {"chart": "{chart}", "tab_title": "Maps"}, "count": 1}
     ]
   },
   {
@@ -564,7 +565,8 @@
     "turns": ["Put the map charts in a separate tab called Maps on dashboard {board}."],
     "expect_tool": {"name": "move_charts_to_tab", "args_contains": {"board": "{board}", "chartIds": "{map_chart}"}},
     "expect_state": [
-      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1}
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}", "tabs[].title": "Maps"}, "count": 1},
+      {"path": "/api/dashboard/boards", "list": "boards", "where": {"id": "{board}"}, "tile_on_tab": {"chart": "{map_chart}", "tab_title": "Maps"}, "count": 1}
     ]
   },
   {
@@ -577,7 +579,7 @@
     "turns": ["Show the values of chart {chart} in rupiah and add a target line at 1,000."],
     "expect_tool": {"name": "format_chart", "args_contains": {"chart": "{chart}"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 1000}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"id": "{chart}", "def.referenceLines[].value": 1000, "def.format.style": "currency", "def.format.currency": "IDR"}, "count": 1}
     ]
   },
   {
@@ -610,7 +612,7 @@
     "turns": ["Show how the number of events is spread as a histogram with 20 ranges."],
     "expect_tool": {"name": "create_chart", "args_contains": {"kind": "histogram"}},
     "expect_state": [
-      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "histogram"}, "count": 1}
+      {"path": "/api/dashboard/specs", "list": "charts", "where": {"kind": "histogram", "def.histogram.count": 20}, "count": 1}
     ]
   },
   {

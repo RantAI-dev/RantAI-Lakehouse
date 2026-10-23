@@ -372,6 +372,37 @@ def _is_or_holds(got: Any, want: Any) -> bool:
     return got == want
 
 
+def tile_on_tab_matches(item: Any, spec: dict[str, Any]) -> bool:
+    """Whether the board puts the chart `spec["chart"]` on the tab titled
+    `spec["tab_title"]`.
+
+    A tile names its tab by that tab's id. A tile that names no tab, or names
+    one the board does not have, leaves the chart on the first tab. A board
+    with no tabs is on no tab, and a chart with no tile in the layout is on no
+    tab either."""
+    if not isinstance(item, dict):
+        return False
+    tabs = item.get("tabs")
+    if not isinstance(tabs, list) or not tabs:
+        return False
+    layout = item.get("layout")
+    tile = layout.get(spec.get("chart")) if isinstance(layout, dict) else None
+    if not isinstance(tile, dict):
+        return False
+    named = tile.get("tab")
+    tab: Any = None
+    if named is not None:
+        for candidate in tabs:
+            if isinstance(candidate, dict) and candidate.get("id") == named:
+                tab = candidate
+                break
+    if tab is None:
+        tab = tabs[0]
+    if not isinstance(tab, dict):
+        return False
+    return tab.get("title") == spec.get("tab_title")
+
+
 def resolve_fact(cfg: Config, session: requests.Session, fact: dict[str, Any]) -> list[Any]:
     """The expected values of one fact: every row's first column for `sql`,
     every value at `path` of an API GET for `api`, or `values` as given."""
@@ -535,6 +566,10 @@ def fill_check(check: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
         for key, value in check.get("where", {}).items()
     }
     filled["path"] = fill_names(check["path"], names)
+    if "tile_on_tab" in check:
+        # The chart of a `tile_on_tab` is a name the run saved, like the ids
+        # of a `where`.
+        filled["tile_on_tab"] = fill_value(check["tile_on_tab"], names)
     return filled
 
 
@@ -761,11 +796,13 @@ def expect_state_problems(
     resp.raise_for_status()
     items = resp.json().get(check["list"], [])
     where = check.get("where", {})
+    tile_on_tab = check.get("tile_on_tab")
     matches = [
         i
         for i in items
         if where_matches(i, where)
         and (check.get("scope") == "all" or str(i.get("id")) in own_ids)
+        and (tile_on_tab is None or tile_on_tab_matches(i, tile_on_tab))
     ]
     if "min" in check:
         if len(matches) < check["min"]:
