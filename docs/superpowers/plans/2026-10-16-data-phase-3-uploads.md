@@ -847,6 +847,124 @@ whether to measure one load of ten files is the planner's call with T6.2's `MAX_
 that ingest of JSON Lines/gzip needs no preview call first (`upload_test.py` calls it, the harness does not); `bun` checks and
 Rust (no TypeScript or Rust file changed after the round-2 run); `cargo test --workspace`. Disk was 5.9 GB free at the end.
 
+### BLOCKER 6, investigation (developer, 2026-10-23)
+
+**Method.** The job's own load path in one process: `file_ingest.run_file_load` with the real
+`sink.load_via_sink`, a local filesystem destination (the `lab` fixture's, no Lakekeeper, no
+ClickHouse), files made by `ops/g9/large_upload.py`'s writers (wide rows of random text, the
+same shapes as the CI run), dagster venv (dlt 1.30.0, pyarrow 25.0.1, pyiceberg 0.12.0). The
+process's resident memory (`/proc/self/status`, every 50 ms) is the figure, split by the stage
+`dlt` is in (`Pipeline.extract`, `normalize`, `load` wrapped); growth is the maximum over the
+base before the job. The registration in ClickHouse is not in this path (it is a fake): it is a
+row count and a `CREATE`, with no data in it. Single runs, 11 GB VM, nothing else heavy running.
+
+**Before the fix** (growth over base, MiB; stage columns are the maximum while that stage ran):
+
+| Format | Size | Growth | extract | normalize | load |
+| --- | --- | --- | --- | --- | --- |
+| CSV | 64 MiB | 449 | 124 | 61 | 450 |
+| CSV | 256 MiB | 1,316 | 134 | 92 | 1,317 |
+| JSON Lines | 64 | 357 | 93 | 76 | 357 |
+| JSON Lines | 256 | 937 | 93 | 76 | 938 |
+| CSV gzip (unpacked 64 / 256) | 64 | 449 | 116 | 67 | 450 |
+| CSV gzip | 256 | 1,352 | 134 | 94 | 1,352 |
+| Parquet | 64 | 386 | 173 | 161 | 385 |
+| Parquet | 256 | 1,354 | 371 | 371 | 1,340 |
+
+**Where the memory goes.**
+
+1. **The write step of `dlt`'s Iceberg job (the main cause, all four formats).** The readers
+   already stream (`TableStream.batches` and `ParquetStream.batches` yield tables of 50,000
+   rows), and `extract` and `normalize` stay at 60 to 150 MiB at any size for the three text
+   formats. `load` is the stage that grows, at 4.5 to 5 times the file (CSV 256 MiB: 1,317 MiB).
+   `dlt` 1.30.0 gives the Iceberg write ONE job per table, with all the table's normalized
+   files (`TableFormatLoadFilesystemJob.file_paths`), and `IcebergLoadFilesystemJob.run` does
+   `self.arrow_dataset.to_table()` (the whole load as one Arrow table; the Delta job streams a
+   `RecordBatchReader`, this one does not), then `ensure_iceberg_compatible_arrow_data` casts it
+   (a second copy) and `pyiceberg`'s `overwrite` or `append` cuts and encodes it (a third). No
+   `dlt` setting reaches it: `file_max_items` and `file_max_bytes` only make more normalized
+   files, which the one job still reads together, so the plan's "bounded normalize and write
+   through dlt's rotation" is not a way to bound the write. This differs from the plan's
+   assumption that the readers or dlt's extract held the file: they do not.
+2. **A read-ahead cache of `pyarrow` (Parquet input, and the write step's own read).**
+   `pq.ParquetFile` defaults to `pre_buffer=True` in this pyarrow, which keeps every byte range
+   it fetched cached until the file is closed: reading a 328 MiB file in 20,000-row batches
+   held 340 MiB of Arrow memory (36 MiB with `pre_buffer=False`, 16 MiB reading row group by row
+   group). This is why a Parquet upload's `extract` and `normalize` grow with the file (173 to
+   371 MiB from 64 to 256 MiB) while the text formats' do not.
+3. **`pyarrow.dataset`'s scanner (found while fixing 1).** Reading the normalized file through
+   `dataset.to_batches(batch_readahead=1, fragment_readahead=1, pre_buffer=False)` held 23 MiB
+   when its consumer was fast and 300 MiB when the consumer took 50 ms per batch (it reads
+   ahead on its own threads without regard to the consumer; `use_threads=False` held 63 MiB,
+   `ParquetFile.iter_batches(pre_buffer=False)` 36 MiB). A streamed write consumes slowly, so the
+   scanner would have brought the whole file back.
+4. Not a cause (measured): the CSV and JSON parsing (`extract` is flat), `_ingested_at` stamping,
+   the Iceberg catalog registration. The allocator (`mimalloc`) keeps freed pages for a while,
+   so resident memory falls slower than Arrow's own count (`pa.total_allocated_bytes()`).
+
+**The change.**
+- `adapters/iceberg_stream.py` (new): the Iceberg load job of `dlt` gets a `to_table()` that
+  stands for the table, and `write_iceberg_table` writes it as ONE `pyiceberg` transaction in
+  groups of up to 32 MiB (`FLUSH_BYTES`) read file by file with `ParquetFile.iter_batches(
+  pre_buffer=False)`; the first group of a `replace` overwrites and the rest append, so a load is
+  still one commit and a failure commits nothing (data files stay unreferenced for the orphan
+  clean-up, as in `_replace_changing_types`). `merge` loads and any other `pa.Table` keep
+  `dlt`'s own path. `sink.load_via_sink` installs it before the pipeline exists (`install()` is
+  idempotent). A different dlt that changes the job would bypass it silently; the memory test is
+  the guard.
+- `parquet_ingest.open_parquet`: `pre_buffer=False`.
+- `FLUSH_BYTES` chosen by measurement (CSV, growth at 64 / 256 MiB): 64 MiB groups 444 / 540,
+  16 MiB 344 / 412, 32 MiB 417 / 464; 32 MiB groups gave data files of about 25 MiB (10 files for a 256 MiB
+  CSV, measured), fewer and larger than 16 MiB groups would, for 50 MiB more memory than 16.
+- Readers, `dlt`'s buffer settings, column types, null rules, the several-files load, the bad-
+  values report and `MAX_ROWS` are untouched. (`file_max_items`/`buffer_max_items` were not set:
+  extract and normalize are already flat, and rotation cannot bound the write, see 1.)
+
+**After the fix** (same method; growth in MiB; stages in the second line of each run):
+
+| Format | 64 MiB | 256 MiB | 1,024 MiB | Before: 64 / 256 |
+| --- | --- | --- | --- | --- |
+| CSV | 417 | 464 | 468 | 449 / 1,316 |
+| JSON Lines | 395 | 427 | not run | 357 / 937 |
+| CSV gzip | 380 | 504 | 479 | 449 / 1,352 |
+| Parquet | 361 | 430 | not run | 386 / 1,354 |
+
+The growth is now a constant of about 350 to 500 MiB (`dlt`'s extract about 150, normalize
+about 100, the write about 400 including `pyiceberg`'s buffers and the allocator) and does not
+follow the file: CSV 64 to 1,024 MiB is 417 to 468. Parquet's `extract`/`normalize` are 178 /
+166 at 64 MiB and 192 / 178 at 256 MiB (371 / 371 before). Times are unchanged (CSV 256 MiB:
+about 26 s before and after). Not measured here: 2 GiB (this VM has 5.8 GB of disk free), the
+CI runner, a second load at the same time.
+
+**The test** (`test_load_memory.py`, `loader`-marked, 4 parametrised cases, about 2.5 minutes):
+each format is loaded at 32 and 128 MiB in a fresh process and the larger load's growth may not
+exceed the smaller's by more than `MAX_EXTRA_MIB = 250`. Differences measured, fixed code: CSV
++107, JSON Lines +79, gzip +131, Parquet +63; unfixed code (sink.py and parquet_ingest.py
+stashed): +461, +430, +499, +562, all four fail. 250 sits between the worst fixed (131) and the
+best unfixed (430). `test_iceberg_stream.py` (4 tests) pins the write's behaviour with tiny
+groups: one commit for a multi-group replace, append adds, a failed load changes nothing, the
+groups are cut by bytes and lose no row.
+
+**Commands run** (dagster venv, foreground).
+- `cd dagster && python -m pytest dispar_orchestrate -q -p no:cacheprovider` (foreground, whole suite, final code):
+  **1784 passed, 1 skipped** in 19m30s. The first whole run, before the two fixes below, had 18 failed / 1765 passed.
+- Those 18 were mine, found by that run: (a) 17 tests inject their failure at `pyiceberg`'s `Table.append` / `Table.overwrite`
+  (`_Failure` in `test_load_modes_dedup_measurement.py`); the streamed write stages in a `Transaction`, which those two only
+  wrap, so `_Failure` now patches `Transaction.append` / `.overwrite` where both paths meet (same injected failure, same
+  assertions, reason in the comment at the site); (b) `test_sink_history.py::test_a_column_added_at_the_source...` showed that
+  a zero-row load must still commit its (empty) snapshot, because a scan reads the schema of the current snapshot and
+  `history.ensure_columns` depends on it; `iceberg_stream._write` now commits it, and `test_iceberg_stream.py` pins it.
+- `test_load_memory.py` (4 cases): 4 passed in 2m27s on the fixed code, 4 failed in 2m23s with `sink.py` and `parquet_ingest.py` stashed.
+- `ops/lint/check_intra_package_imports.py`, `check_bare_iceberg_count.py`, `check_connector_gate_coverage.py`: OK (rc 0).
+- Measurement scripts (in the session scratchpad, not committed): a copy of the job's load path with RSS sampling by `dlt` stage.
+
+**Not verified.** The CI runner and 2 GiB (the planner's `g9-upload-large` on the throwaway
+branch); the merge strategy of the new job class (merge keeps `dlt`'s path and no upload uses
+it); a Lakekeeper catalog (the local filesystem catalog commits as one metadata file the same
+way, but a REST catalog's commit conflict behaviour is not measured, as in SRC-10); that a
+Parquet row group larger than memory (one 1 GiB group) is bounded: the reader decodes a row
+group whole, and uploaded files with huge row groups are not generated here.
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
