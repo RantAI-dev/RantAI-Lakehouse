@@ -628,7 +628,9 @@ async fn open_whole(
     }
     if accepted == Accepted::Parquet {
         // `DATA-17` T2.2: only the footer is read, by range. The file is never
-        // held, so it has no size cap here (the job's row cap bounds a load).
+        // held, so it has no size cap here beyond the session's (2 GiB), and no cell cap
+        // either: the job streams the file by row group (`DATA-17-RESULT.md`, plan T6.2
+        // item 3). The footer is bounded by `MAX_FOOTER_BYTES` before it is read.
         let reader = RangeReader::open(store, &row.storage_key).await?;
         let opened = blocking(move || upload_parquet::inspect(&reader)).await?;
         return Ok(WholeFacts {

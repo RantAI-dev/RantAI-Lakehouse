@@ -88,9 +88,17 @@
 //!   sentence names the first such column and its type, so the user knows
 //!   what to remove;
 //! - a file of more than [`MAX_CELLS`] cells (rows times columns), decided from
-//!   the footer before any row is decoded. A Parquet file is compressed and can
-//!   hold far more than the bytes of the upload suggest, and the API converts
-//!   it in memory. The number is a cap, not a measurement;
+//!   the footer before any row is decoded, **only when the whole file is
+//!   converted in memory** (`convert` with no row limit). A Parquet file is
+//!   compressed and can hold far more than the bytes of the upload suggest, and
+//!   that conversion holds it all. The footer read ([`inspect`]) and a preview
+//!   ([`convert`] with a row limit) do not hold the file, so they have no cell
+//!   cap: the load job streams a Parquet file by row group and the upload is
+//!   bounded by its byte cap (`DATA-17` T6.2 item 3,
+//!   `docs/plans/DATA-17-RESULT.md`). What still protects the API's own memory
+//!   there is [`MAX_FOOTER_BYTES`] (the footer is bounded before it is
+//!   read), [`MAX_PREVIEW_GROUP_BYTES`] (the first row group a preview fetches)
+//!   and [`MAX_OUTPUT_BYTES`]. The number is a cap, not a measurement;
 //! - a conversion whose text would pass [`MAX_OUTPUT_BYTES`]: the cell cap
 //!   does not bound the size of a cell, and a column of long repeated strings
 //!   compresses to almost nothing.
@@ -118,10 +126,24 @@ use serde::Serialize;
 
 use crate::upload_workbook::{finish_text, float_text, write_record};
 
-/// The most cells a Parquet file may hold: 5,000,000 rows times columns, the
-/// same cap as a workbook's sheet. A cap that keeps the conversion's memory
-/// bounded, not a measured limit.
+/// The most cells a Parquet file may hold when it is converted whole in memory:
+/// 5,000,000 rows times columns, the same cap as a workbook's sheet. A cap that
+/// keeps that conversion's memory bounded, not a measured limit. It does not
+/// apply to [`inspect`] or to a preview ([`cell_cap_for`]): the job streams a
+/// Parquet file, and the upload is bounded by its bytes.
 pub const MAX_CELLS: u64 = crate::upload_workbook::MAX_SHEET_CELLS;
+
+/// The cell cap for a read: [`MAX_CELLS`] only when the whole file is converted
+/// in memory (`max_rows` is `None`), none for the footer read and for a preview,
+/// which hold a footer and a first row group and never the file. `DATA-17` T6.2
+/// item 3; the API's memory is bounded there by [`MAX_FOOTER_BYTES`],
+/// [`MAX_PREVIEW_GROUP_BYTES`] and [`MAX_OUTPUT_BYTES`], not by a cell count.
+const fn cell_cap_for(max_rows: Option<usize>) -> u64 {
+    match max_rows {
+        None => MAX_CELLS,
+        Some(_) => u64::MAX,
+    }
+}
 
 /// The most text a conversion may produce: 512 MiB. The cell cap alone does not
 /// bound it (see the module doc); a cap, not a measurement.
@@ -177,7 +199,7 @@ pub enum ParquetFileError {
         /// `binary`, `list`, `map`, `struct` or another fixed word.
         type_name: &'static str,
     },
-    /// The file is past [`MAX_CELLS`].
+    /// The file is past [`MAX_CELLS`] and was to be converted whole.
     #[error("That file is larger than the limit of 5,000,000 cells (rows times columns).")]
     TooLarge,
     /// The text of the file would be past [`MAX_OUTPUT_BYTES`].
@@ -493,10 +515,10 @@ fn type_label(data_type: &DataType) -> String {
 ///
 /// [`ParquetFileError::Unreadable`] when the bytes do not open as a Parquet
 /// file, [`ParquetFileError::Encrypted`], [`ParquetFileError::NoColumns`],
-/// [`ParquetFileError::Unsupported`] for a binary or nested column,
-/// [`ParquetFileError::TooLarge`] past [`MAX_CELLS`].
+/// [`ParquetFileError::Unsupported`] for a binary or nested column. There is no
+/// cell cap here: only the footer is read ([`cell_cap_for`]).
 pub fn inspect<R: ChunkReader + 'static>(reader: &R) -> Result<ParquetInfo, ParquetFileError> {
-    inspect_capped(reader, MAX_CELLS)
+    inspect_capped(reader, u64::MAX)
 }
 
 fn inspect_capped<R: ChunkReader + 'static>(
@@ -522,7 +544,7 @@ pub fn convert<R: ChunkReader + Clone + 'static>(
     convert_capped(
         reader,
         max_rows,
-        MAX_CELLS,
+        cell_cap_for(max_rows),
         MAX_OUTPUT_BYTES,
         MAX_PREVIEW_GROUP_BYTES,
     )
@@ -1263,6 +1285,20 @@ mod tests {
         );
         // A file with no rows is no cells, whatever its columns.
         assert!(inspect_capped(&fixture(EMPTY), 0).is_ok());
+    }
+
+    /// `DATA-17` T6.2 item 3: the cell cap is for the whole-file conversion in
+    /// memory; the footer read and a preview have none, so a Parquet file that
+    /// the job streams is bounded by its bytes.
+    #[test]
+    fn the_cell_cap_applies_to_a_whole_conversion_and_not_to_a_footer_or_a_preview() {
+        assert_eq!(cell_cap_for(None), MAX_CELLS);
+        assert_eq!(cell_cap_for(Some(2000)), u64::MAX);
+        // A file of 15 cells is read by `inspect` and by a preview whatever the cap
+        // of a whole conversion would say.
+        let bytes = fixture(ORDERS);
+        assert!(inspect(&bytes).is_ok());
+        assert!(convert(&bytes, Some(2)).is_ok());
     }
 
     #[test]
