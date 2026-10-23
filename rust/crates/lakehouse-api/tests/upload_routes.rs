@@ -6395,8 +6395,10 @@ async fn a_gzip_bomb_is_refused_when_it_arrives_and_nothing_is_stored() {
     // (The zip check shares the cap and `count`; its refusal is pinned by the
     // `upload_formats` tests, which take the cap as a parameter, since a 2 GiB zip entry
     // could only be built in memory here.)
+    // `PR #186 CI`: constant bytes at the best level pack about 1000 to 1, so the bomb is
+    // about 2 MiB; the fast level left it past the setup bound below.
     let block = vec![b'a'; MIB];
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     for _ in 0..2048 {
         std::io::Write::write_all(&mut encoder, &block).unwrap();
     }
