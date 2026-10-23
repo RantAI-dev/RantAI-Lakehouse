@@ -162,4 +162,51 @@ the files touched; the webpack build after T4.
 
 ## 7. Handoff (developer appends)
 
+### T2 `forecast.ts` (developer, branch `feat/bi-phase-6`)
+
+Files: `src/lib/forecast.ts`, `src/lib/forecast.test.ts`, `src/lib/forecast-reference.json`, `ops/forecast/make_reference.py`. TypeScript only; no cargo command run, and nothing depends on T1: the module has its own types (`ForecastInput`, `Forecast`, `ForecastRefusal`) and takes the grain as a string.
+
+Reference numbers (statsmodels, run on this machine, packages installed with `pip --target` into a scratch directory, not into the repo or the user site):
+
+    python3 -I ops/forecast/make_reference.py <dir with numpy and statsmodels> src/lib/forecast-reference.json
+
+`statsmodels` 0.15.0, `numpy` 2.5.4. Series: `AirPassengers` (144 months, log scale, via `get_rdataset`) and the first 80 quarters of `macrodata` `realgdp` (log scale; trend, no season). Output of the script: `airline AAA {'ANN': -230.631, 'AAN': -146.013, 'ANA': -473.915, 'AAA': -495.581}` and `gdp AAN {'ANN': -450.485, 'AAN': -491.266, 'ANA': -439.725, 'AAA': -481.863}` (AICc per model). The TypeScript chooses the same model on both and reproduces every point forecast and every 95 % bound to better than 1e-6 relative (the tests allow the plan's 1 % and 3 %). Measured worst deviation: points 4e-8, bounds 9e-8, parameters equal to four digits.
+
+Decisions the plan left open, for review:
+- **Initial states** follow statsmodels' `heuristic` start (classical decomposition and a regression on ten points), not its estimated start, so both implementations optimise the same likelihood from the same states. D3 says the same.
+- **AICc counts** the smoothing parameters, the initial states (seasonal ones as `m`) and the variance, the usual convention; statsmodels' own `aicc` leaves heuristic initial states out, so the script recomputes it from the log-likelihood and the test compares AICc to 0.1 %.
+- **The search** is Nelder-Mead from four starts, with the parameters projected into 0 < alpha < 1, 0 < beta <= alpha, 0 < gamma <= 1 - alpha (a projection, not a penalty, so bound solutions such as alpha = 0.9999 are reached).
+- **Seasons** are offered when there are at least `max(2m, 10 + 2 floor(m/2))` periods: two full seasons (the plan) and enough smoothed points for the regression (what the decomposition needs). Fewer gives a note saying which. For 52 weekly periods that is 124 points.
+- **Gaps:** leading missing periods are skipped; a missing latest period is refused; more than 10 % missing is refused; up to 10 % filled in a straight line and counted in `notes`.
+- **Current period:** the caller passes the exclusive end of the last period (`lastPeriodEnd`) and, in tests, `now`; the module has no zone logic, T4 owns the bucket arithmetic (plan section 5, first item, still to verify there).
+- **Horizon** is clamped to 1..60 and to the history length, with a note.
+- A constant series gives a flat forecast with a zero-width band (the SSE is floored at 1e-300).
+
+Checks: `bun test src/lib/forecast.test.ts` 15 pass, 0 fail; `bun run typecheck` exit 0; eslint on the two files clean; full `bun run test` and `bun run lint` counts are in the T3 entry (run once after both modules).
+
+
+### T2 `forecast.ts` (developer, branch `feat/bi-phase-6`)
+
+Commit: the one titled `feat(forecast): additive exponential-smoothing forecast (BI-17 B T2)`. TypeScript only; no cargo command run. Standalone: it imports only the `Grain` type of `time-grain.ts`; nothing from T1.
+
+API: `forecast({ values, grain, horizon, lastPeriodEnd?, now? })` returns a `Forecast` (model ANN/AAN/ANA/AAA, label, parameters, AICc, `point`/`lower`/`upper`, notes) or `{ refused: sentence }`; `isRefusal`, `seasonLength(grain)`. The caller (T4) passes one value per consecutive period (`null` for a missing bucket, so the bucket arithmetic stays with the drawing) and the end of the last bucket; `now` is a parameter, which is how the tests fake the clock.
+
+Reference numbers (committed in `src/lib/forecast-reference.json`), produced offline by:
+
+    pip install --target <dir> numpy scipy pandas statsmodels
+    python3 -I ops/forecast/make_reference.py <dir> src/lib/forecast-reference.json
+
+with `statsmodels` 0.15.0 and `numpy` 2.5.4, `ETSModel(error="add", trend/seasonal "add" or None, initialization_method="heuristic")`. Series: `AirPassengers` (144 monthly points, log scale; Rdatasets download) and the first 80 quarters of `statsmodels.datasets.macrodata` `realgdp` (log scale; trend, no season). Output: airline selects AAA (AICc ANN -230.6, AAN -146.0, ANA -473.9, AAA -495.6), gdp selects AAN (ANN -450.5, AAN -491.3, ANA -439.7, AAA -481.9). The TypeScript selects the same models, and its parameters, points and band agree with `statsmodels` to about 1e-7 relative (measured worst: point 4e-8, band 9e-8), against the plan's 1 % and 3 %.
+
+Decisions to review:
+- **Initial states = statsmodels' "heuristic" start**, not its default "estimated" one, so the comparison is against an independent fit of the same problem, not of a different one. The plan's D3 also says decomposition-based starts.
+- **AICc counts the initial states and the variance as parameters** (Hyndman et al.), recomputed in the reference script from the log-likelihood because `statsmodels` leaves heuristic states out of its own `aicc`. A model with `n - k - 1 <= 0` is not a candidate (a short series falls back to ANN).
+- **Seasons need `max(2m, 10 + 2*floor(m/2))` points**: 2 full seasons, as signed, plus what the decomposition needs to start (24 for months, 8 for quarters, 16 for days, 124 for weeks). Below 2 seasons the note says "fewer than 2 full seasons"; between the two limits, "too few to start them". Year and minute have no seasons.
+- **Thresholds** as in the feature page: under 5 periods refused (counted after the unfinished period is dropped, and the sentence says so); more than 10 % periods missing refused, up to 10 % filled in a straight line and counted; a missing latest period is refused, leading gaps are trimmed; horizon held to 1..60 and to the history length, with a note.
+- Ties in AICc go to the simpler model; a zero-error series is floored so the log stays finite (constant series: flat ANN forecast).
+- The `statsmodels` closed-form variances were checked against the generic sum c_j = alpha + j beta + gamma [m | j] used here (they agree by the numbers above, all four models' shapes: AAN, ANA via airline/gdp alternatives are covered only for the selected models; ANN and the other unselected models are not compared one by one).
+
+Checks (from `/home/hv/lakehouse-phase6-build`): `bun test src/lib/forecast.test.ts`: 15 pass, 0 fail; `bun run typecheck`: exit 0; eslint on the two files: clean.
+
+
 ## 8. Review (planner appends)
