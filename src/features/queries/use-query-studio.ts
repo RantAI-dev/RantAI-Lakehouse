@@ -5,6 +5,11 @@ import * as React from "react"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { readDraft, writeDraft } from "@/lib/query-draft"
+import {
+  tablesInStatement,
+  type ColumnState,
+  type CompletionTable,
+} from "@/lib/sql-completion"
 import { hasStatement } from "@/lib/sql-text"
 import { assetService, queryService } from "@/services"
 import { toServiceError, type ServiceError } from "@/services/errors"
@@ -14,6 +19,10 @@ import type {
   SaveQueryInput,
   SqlFixOutcome,
 } from "@/services/contracts/queries"
+import {
+  createSqlCompletionSource,
+  sqlCompletionExtension,
+} from "./sql-completion-source"
 
 /** What the editor holds before anyone types. */
 export const STARTER_SQL = "-- Write SQL here, or generate it from a question"
@@ -23,6 +32,14 @@ const ESTIMATE_DEBOUNCE_MS = 500
 
 /** How long to wait before writing the draft to storage. */
 const DRAFT_DEBOUNCE_MS = 400
+
+/**
+ * The shape of a catalog id that is a SQL table name: `silver.orders`.
+ *
+ * A Bronze asset's id is a registry slug, not a table name, and its Trino
+ * name sits on the asset's detail rather than on the list.
+ */
+const SQL_TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/
 
 export type StudioTab = "nl" | "sql"
 
@@ -69,25 +86,91 @@ export function useQueryStudio() {
   const savedState = useService((s) => queryService.listSaved(s), [])
   const historyState = useService((s) => queryService.listHistory(s), [])
 
-  // Schema for editor autocomplete, from the real catalog so suggestions
+  // The tables the catalog shows, from the real catalog so suggestions
   // cannot drift from what exists.
-  //
-  // TABLE NAMES ONLY, not their columns: the column list lives on
-  // `AssetDetail`, and fetching it means one request per asset — too much
-  // for a completion list. Columns can follow if the backend grows a bulk
-  // schema endpoint.
   //
   // A failure here is deliberately not shown as a page error: autocomplete
   // is a nicety, and Query Studio works without it.
   const assetsState = useService((s) => assetService.listAssets({}, s), [])
-  const sqlSchema = React.useMemo(() => {
-    if (assetsState.status !== "success") return undefined
-    const schema: Record<string, string[]> = {}
-    for (const asset of assetsState.data) {
-      schema[`${asset.namespace}.${asset.name}`] = []
-    }
-    return Object.keys(schema).length > 0 ? schema : undefined
+
+  // The tables in the shape the completion needs: the SQL name to insert,
+  // the name a person reads, and every name the table answers to.
+  //
+  // A Bronze asset's registry slug is not a SQL name, and its Trino name
+  // sits on the asset's detail rather than on this list, so such a table
+  // gets no reference and is never suggested.
+  const tables = React.useMemo<CompletionTable[]>(() => {
+    if (assetsState.status !== "success") return []
+    return assetsState.data.map((asset) => ({
+      id: asset.id,
+      label: asset.name,
+      reference: SQL_TABLE_NAME.test(asset.id) ? asset.id : "",
+      names: [asset.id, `${asset.namespace}.${asset.name}`],
+    }))
   }, [assetsState.status, assetsState.data])
+
+  // The columns of the tables the buffer names: fetched once each and kept
+  // for the session. A table that cannot be read is kept as a failure too,
+  // so it is not asked for again on every keystroke.
+  //
+  // The ref holds the same cache as the state, because the completion
+  // source reads it the moment a keystroke asks for suggestions, and a
+  // state update is not there yet at that point.
+  const [columns, setColumns] = React.useState<Record<string, ColumnState>>({})
+  const columnsRef = React.useRef<Record<string, ColumnState>>({})
+  const mountedRef = React.useRef(true)
+  const rememberColumns = React.useCallback((id: string, state: ColumnState) => {
+    columnsRef.current[id] = state
+    // The person may have left the page while the request was in flight.
+    if (!mountedRef.current) return
+    setColumns((previous) => ({ ...previous, [id]: state }))
+  }, [])
+
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  React.useEffect(() => {
+    if (assetsState.status !== "success") return
+    for (const named of tablesInStatement(sql, tables)) {
+      // The cache answers "has this table been asked for yet?": a table
+      // named twice is fetched once, and a table that failed is not asked
+      // for again.
+      if (named.id in columnsRef.current) continue
+      rememberColumns(named.id, { status: "loading" })
+      void assetService.getAsset(named.id).then(
+        (detail) =>
+          rememberColumns(named.id, {
+            status: "ready",
+            columns: detail.schema.map((column) => ({
+              name: column.name,
+              dataType: column.dataType,
+            })),
+          }),
+        // The catalog refused or the request failed: the table is kept as
+        // a failure, and the editor says so instead of asking again.
+        () => rememberColumns(named.id, { status: "failed" })
+      )
+    }
+  }, [sql, tables, assetsState.status, rememberColumns])
+
+  // The suggestions the editor offers. The source is built once and reads
+  // the cache when it is asked, so a keystroke never waits for the network.
+  const completionSource = React.useMemo(
+    () =>
+      createSqlCompletionSource({
+        tables,
+        columns: () => columnsRef.current,
+      }),
+    [tables]
+  )
+  const completionExtensions = React.useMemo(
+    () => [sqlCompletionExtension(completionSource)],
+    [completionSource]
+  )
 
   // ── Draft ────────────────────────────────────────────────────────────
   // Restored after mount, never during render: `localStorage` does not
@@ -261,7 +344,10 @@ export function useQueryStudio() {
     setSql,
     engine,
     setEngine,
-    sqlSchema,
+    tables,
+    columns,
+    completionSource,
+    completionExtensions,
     estimatable,
     generateAct,
     estimateAct,

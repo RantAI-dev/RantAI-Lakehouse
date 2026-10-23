@@ -123,3 +123,31 @@ describe("useQueryStudio explain", () => {
     expect(runSpy).not.toHaveBeenCalled()
   })
 })
+
+describe("useQueryStudio columns", () => {
+  it("takes the columns of a table once, however often the statement names it", async () => {
+    spyOn(queryService, "listSaved").mockResolvedValue([])
+    spyOn(queryService, "listHistory").mockResolvedValue([])
+    spyOn(assetService, "listAssets").mockResolvedValue([
+      { id: "silver.orders", name: "Orders", namespace: "silver" },
+    ] as never)
+    const getAsset = spyOn(assetService, "getAsset").mockResolvedValue({
+      schema: [{ name: "amount", dataType: "Int64" }],
+    } as never)
+
+    const hook = renderHook(() => useQueryStudio())
+    await waitFor(() => expect(hook.result.current.tables.length).toBe(1))
+    act(() =>
+      hook.result.current.setSql("SELECT * FROM silver.orders a JOIN silver.orders b")
+    )
+
+    await waitFor(() => expect(getAsset).toHaveBeenCalledTimes(1))
+    expect(getAsset).toHaveBeenCalledWith("silver.orders")
+    await waitFor(() =>
+      expect(hook.result.current.columns["silver.orders"]).toEqual({
+        status: "ready",
+        columns: [{ name: "amount", dataType: "Int64" }],
+      })
+    )
+  })
+})

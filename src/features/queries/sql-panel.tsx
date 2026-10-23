@@ -59,7 +59,7 @@ export function SqlPanel({
     setSql,
     engine,
     setEngine,
-    sqlSchema,
+    completionExtensions,
     runAct,
     estimateAct,
     estimatable,
@@ -86,7 +86,10 @@ export function SqlPanel({
 
   return (
     <div className="space-y-3">
-      <SqlEditor value={sql} onChange={setSql} schema={sqlSchema} />
+      {/* The editor gets the console's own completion source, not the
+          language extension's schema: the tables and columns come from the
+          catalog, under the names a query can actually use. */}
+      <SqlEditor value={sql} onChange={setSql} extensions={completionExtensions} />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>
           <SelectTrigger size="sm" className="w-32">
