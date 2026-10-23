@@ -244,6 +244,12 @@ The NOTE items (a requester holding `agent:approve` approving their own outside 
 
 **Not verified:** the busy-PDF retry end to end (it needs both PDF slots held for the 60 s slot wait; the rule and the store move are tested separately); R8's tenant rule against a real multi-tenant deployment (tested with one tenant); `request_approval` and the audience lookup in the headless loop are not reachable by design (R1).
 
+### Fix round 2 (developer, after the owner's QA Q1 and Q2)
+
+- **Q1** (`subscriptions-dialog.tsx`): "Send now" sets a per-row `sending` flag; the row shows a spinner and "Sending…" (and the button reads "Sending…") until the answer arrives, then the result sentence. Test: a held `/send` shows the spinner, then the result.
+- **Q2** (`reporting-settings-page.tsx`): an "Unsaved changes" note next to Save while any setting differs from the stored one, and the same note in the section of each of the palette, content-sites and report-domains lists that differs. Test: add and remove in each list.
+- Checks: `bun run typecheck` clean; `bun run lint` 0 errors, 9 warnings (none in these files); `bun test src/features/dashboards src/features/admin` 435 pass, 0 fail (55 files). No Rust touched. Not run: the full `bun run test`.
+
 ## 8. Review (planner appends)
 
 ### Review 1 (planner, 2026-10-18, at `d9f96362`)
