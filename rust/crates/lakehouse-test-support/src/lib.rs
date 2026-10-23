@@ -32,12 +32,22 @@
 //! with a clear message instead of silently skipping tests.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use sqlx::Connection;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::postgres::Postgres;
 
 static DATABASE_URL: OnceLock<String> = OnceLock::new();
+
+/// How long the server gets to answer a query after the container is started,
+/// the pause between attempts, and the cap on one attempt. A *new* container
+/// gets the same 60 s from `testcontainers` (`DEFAULT_STARTUP_TIMEOUT`); a
+/// reused one used to get nothing (see [`wait_until_ready`]).
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const READY_RETRY: Duration = Duration::from_millis(200);
+const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns the `DATABASE_URL` of the per-process test Postgres container.
 ///
@@ -51,6 +61,58 @@ pub fn database_url() -> String {
         .get()
         .unwrap_or_else(|| panic!("lakehouse-test-support: DATABASE_URL not initialized yet"))
         .clone()
+}
+
+/// Waits until the server answers `SELECT 1`.
+///
+/// `testcontainers` 0.27.3 starts a stopped container it found by label and
+/// returns without running the image's wait strategy
+/// (`runners/async_runner.rs`, the reusable-containers branch:
+/// `client.start_container(...)` then `ContainerAsync::construct`), while
+/// `Postgres`'s readiness is the "database system is ready to accept
+/// connections" message (`testcontainers-modules` 0.15,
+/// `src/postgres/mod.rs`). So every test process that found the shared
+/// container stopped ran while nothing listened yet, and the kernel reset
+/// each setup connection: on 2026-10-23 the first full `lakehouse-api` lib
+/// run of a session (container stopped) had 224 tests fail with
+/// "Connection reset by peer" and the second (container running) had 0
+/// (`OPS-10`). A TCP connect alone is not enough — the postmaster listens
+/// before recovery ends and answers "the database system is starting up" —
+/// and a query is exactly what `#[sqlx::test]` needs.
+///
+/// # Panics
+///
+/// Panics when no attempt answers within `READY_TIMEOUT`, with the last
+/// error. A container that never becomes usable must fail loudly once, not
+/// let every test report a reset connection of its own.
+async fn wait_until_ready(url: &str) {
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        let last = match tokio::time::timeout(READY_ATTEMPT_TIMEOUT, ready_once(url)).await {
+            Ok(Ok(())) => return,
+            Ok(Err(err)) => err,
+            Err(_) => format!("no answer within {} s", READY_ATTEMPT_TIMEOUT.as_secs()),
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lakehouse-test-support: the Postgres testcontainer did not answer a query \
+             within {}s (last error: {last})",
+            READY_TIMEOUT.as_secs()
+        );
+        tokio::time::sleep(READY_RETRY).await;
+    }
+}
+
+/// One readiness attempt: connect and run `SELECT 1`.
+async fn ready_once(url: &str) -> Result<(), String> {
+    let mut conn = sqlx::PgConnection::connect(url)
+        .await
+        .map_err(|err| err.to_string())?;
+    sqlx::query("SELECT 1")
+        .execute(&mut conn)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// Starts (once per test process) a disposable Postgres container and
@@ -155,7 +217,12 @@ fn start_postgres_container() {
         let container = Box::leak(Box::new(container));
         let _ = container;
 
-        format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres")
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres");
+        // `OPS-10`: `start()` above starts a stopped container and returns
+        // without waiting for Postgres, so the port can answer nothing for
+        // the first seconds of the process (see `wait_until_ready`).
+        wait_until_ready(&url).await;
+        url
     });
 
     DATABASE_URL
