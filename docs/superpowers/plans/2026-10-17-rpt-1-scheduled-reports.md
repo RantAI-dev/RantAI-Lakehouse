@@ -250,6 +250,16 @@ The NOTE items (a requester holding `agent:approve` approving their own outside 
 - **Q2** (`reporting-settings-page.tsx`): an "Unsaved changes" note next to Save while any setting differs from the stored one, and the same note in the section of each of the palette, content-sites and report-domains lists that differs. Test: add and remove in each list.
 - Checks: `bun run typecheck` clean; `bun run lint` 0 errors, 9 warnings (none in these files); `bun test src/features/dashboards src/features/admin` 435 pass, 0 fail (55 files). No Rust touched. Not run: the full `bun run test`.
 
+### Fix round 3 (developer, after the owner's QA Q3)
+
+Commit: the fix commit "fix(reports): Skip when empty leaves single-value charts out of the check" (see `git log`).
+
+- `report_runner.rs`: `every_data_chart_is_empty` skips `is_single_value` charts (kpi, progress, gauge; any chart whose `def.dimension` is absent or empty, or the `x` of a built-in's spec). A raw table and a pivot have no dimension but list rows, so they stay judged (deviation from "any chart with no dimension", needed to keep listing charts). A dimension that is a parameter slot (object) counts as grouped. The existing emptiness test gave its bar a `def.dimension`.
+- Console: `isSingleValueChart` in `src/lib/dashboard-tabs.ts` (mirrors the Rust rule); the dashboard page passes `grouped` per chart; the dialog shows a note under "Skip when empty" when no chart is grouped.
+- Tests: Rust `a_single_value_chart_does_not_count_when_the_grouped_charts_are_empty`; TS `isSingleValueChart` unit test; dialog test for the note.
+- Checks: `cargo fmt --check` ok (after one rustfmt wrap in my test); `cargo clippy --workspace --all-targets -- -D warnings` exit 0; `cargo test -p lakehouse-api --lib -- report` 107 passed; `--test report_runner -- --test-threads=1` 19 passed; `--test report_routes -- --test-threads=1` 12 passed; `bun run typecheck` clean; `bun run lint` 0 errors (9 existing warnings); `bun test src/features/dashboards src/lib/dashboard-tabs.test.ts` 437 pass, 0 fail.
+- Not verified: the owner's `b_6574e2b9` case in the browser.
+
 ## 8. Review (planner appends)
 
 ### Review 1 (planner, 2026-10-18, at `d9f96362`)
