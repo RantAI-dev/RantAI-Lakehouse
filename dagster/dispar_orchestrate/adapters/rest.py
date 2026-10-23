@@ -142,8 +142,30 @@ def _allow_http_token_url() -> bool:
     return os.environ.get("CONNECTOR_OAUTH_ALLOW_HTTP", "").strip() == "true"
 
 
-def _token_request(token_url: str, form: dict[str, str], *, resolve_checked) -> dict:
-    """POST `form` to `token_url` and return the answer's JSON object.
+def _basic_client_header(client_id: str, client_secret: str) -> str:
+    """`client_secret_basic` (RFC 6749 2.3.1, SRC-3 AD8): id and secret are
+    form-encoded, then joined and base64-encoded, as the Rust side does."""
+    from urllib.parse import quote
+
+    pair = f"{quote(client_id, safe='-._~')}:{quote(client_secret, safe='-._~')}"
+    return f"Basic {base64.b64encode(pair.encode()).decode()}"
+
+
+def _token_request(
+    token_url: str,
+    form: dict[str, str],
+    *,
+    resolve_checked,
+    basic: tuple[str, str] | None = None,
+    as_json: bool = False,
+) -> dict:
+    """POST `form` to `token_url` and return the answer's JSON object. `basic`
+    is `(client_id, client_secret)` for a provider that takes the client in an
+    `Authorization: Basic` header (SRC-3 AD8); `form` then carries neither.
+    `as_json` sends `form` as a JSON body instead of a form body, with the client in
+    it (`client_secret_post_json`, slice 2 review BLOCKER 3: Zendesk's
+    `POST /oauth/tokens` "must be formatted as JSON",
+    https://developer.zendesk.com/api-reference/ticketing/oauth/grant_type_tokens/).
 
     WS3 plan review Z5: `tokenUrl` is as caller-supplied as `baseUrl`, so it
     gets the same resolve_checked + pin + no-redirects discipline, plus an
@@ -164,7 +186,11 @@ def _token_request(token_url: str, form: dict[str, str], *, resolve_checked) -> 
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     resolved = resolve_checked(parsed.hostname, port)
     with ssrf_guard.pinned_resolution(parsed.hostname, resolved):
-        resp = requests.post(token_url, data=form, timeout=_TOKEN_TIMEOUT_SECONDS, allow_redirects=False)
+        # `headers` only when asked for: a `rest` connector's request is exactly
+        # what it was before SRC-3.
+        extra = {"headers": {"Authorization": _basic_client_header(*basic)}} if basic else {}
+        body_arg = {"json": form} if as_json else {"data": form}
+        resp = requests.post(token_url, timeout=_TOKEN_TIMEOUT_SECONDS, allow_redirects=False, **body_arg, **extra)
     if 300 <= resp.status_code < 400:
         # Not `_refuse_redirect`: its message carries the Location, which is
         # the provider's text.
@@ -210,6 +236,10 @@ class AuthSession:
         self._refresh_token = secrets.get("refreshToken")
         self._headers: dict | None = None
         self._expires_at: float | None = None
+        # SRC-3 AD3: the `instance_url` a vendor's token answer may carry (Salesforce).
+        # Only the `saas` adapter reads it, and only through `SaasSession.adopt_origin`;
+        # a `rest` connector never does.
+        self.instance_url: str | None = None
 
     @property
     def refreshable(self) -> bool:
@@ -253,21 +283,36 @@ class AuthSession:
         if auth_type == "oauth2_authorization_code":
             if not self._refresh_token:
                 raise OAuthSignInRefused()
-            body = _token_request(
-                auth["tokenUrl"],
-                {
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                    "client_id": auth["clientId"],
-                    "client_secret": secrets["clientSecret"],
-                },
-                resolve_checked=self._resolve_checked,
-            )
+            if auth.get("clientAuth") == "basic":
+                # SRC-3 AD8: only a `saas` vendor sets this (the vendor table's
+                # `clientAuth`); a `rest` dial has no such field.
+                body = _token_request(
+                    auth["tokenUrl"],
+                    {"grant_type": "refresh_token", "refresh_token": self._refresh_token},
+                    resolve_checked=self._resolve_checked,
+                    basic=(auth["clientId"], secrets["clientSecret"]),
+                )
+            else:
+                body = _token_request(
+                    auth["tokenUrl"],
+                    {
+                        "grant_type": "refresh_token",
+                        "refresh_token": self._refresh_token,
+                        "client_id": auth["clientId"],
+                        "client_secret": secrets["clientSecret"],
+                    },
+                    resolve_checked=self._resolve_checked,
+                    # `client_secret_post_json` (BLOCKER 3): same fields, JSON body.
+                    as_json=auth.get("clientAuth") == "post_json",
+                )
             self._keep_rotated(body.get("refresh_token"))
             return self._with_token(body)
         raise ValueError(f"rest adapter does not know auth type {auth_type!r}")
 
     def _with_token(self, body: dict) -> dict:
+        returned = body.get("instance_url")
+        if isinstance(returned, str) and returned:
+            self.instance_url = returned
         expires_in = body.get("expires_in")
         if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and expires_in > 0:
             # A margin, so the token is replaced before the source sees it expire:

@@ -23,7 +23,7 @@ import type { Dial, DiscoveryAnswer, DiscoveryObject, DiscoveryRequest } from "@
  * (D3); a MongoDB database's collections; a Kafka broker's topics (D4); an Oracle login's
  * schemas, then its tables (D5).
  */
-export type FinderKind = "sql" | "oracle" | "files" | "sftp" | "rest" | "mongodb" | "kafka"
+export type FinderKind = "sql" | "oracle" | "files" | "sftp" | "rest" | "mongodb" | "kafka" | "saas"
 
 /** The finder a connector type gets, or `null` for a type that cannot list (Google Sheets). */
 export function finderKind(adapter: string, dial: Dial | null | undefined): FinderKind | null {
@@ -36,6 +36,7 @@ export function finderKind(adapter: string, dial: Dial | null | undefined): Find
     case "rest":
     case "mongodb":
     case "kafka":
+    case "saas":
       return adapter
     default:
       return null
@@ -54,6 +55,7 @@ export const FINDER_WORDS: Record<FinderKind, { many: string; find: string }> = 
   rest: { many: "endpoints", find: "Find endpoints" },
   mongodb: { many: "collections", find: "Find collections" },
   kafka: { many: "topics", find: "Find topics" },
+  saas: { many: "objects", find: "Find objects" },
 }
 
 /**
@@ -103,13 +105,20 @@ function ObjectRow({
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/50"
       >
         <input id={id} type={inputType} checked={checked} disabled={disabled} onChange={onToggle} />
-        <span id={nameId} className="min-w-0 flex-1 truncate font-mono text-xs">
-          {object.name}
+        {/* Slice 5 review BLOCKER 14: a vendor whose names are ids (SharePoint lists) gives a label to read. */}
+        <span id={nameId} className={cn("min-w-0 flex-1 truncate text-xs", object.label ? "" : "font-mono")} title={object.label ? object.name : undefined}>
+          {object.label ?? object.name}
         </span>
         {object.kind === "file" ? (
           <span className="shrink-0 text-xs text-muted-foreground">
             {formatBytes(object.size)}
             {object.modifiedAt ? ` · ${formatDateTime(object.modifiedAt)}` : ""}
+          </span>
+        ) : null}
+        {/* SRC-3 decision 6: say how a business-app object loads, so nobody finds out from a slow run. */}
+        {object.load ? (
+          <span data-testid="object-load" className="shrink-0 text-xs text-muted-foreground">
+            {object.load}
           </span>
         ) : null}
       </label>
@@ -126,7 +135,7 @@ type RowsProps = {
   inputType: "checkbox" | "radio"
   selected: ReadonlySet<string>
   disabled: boolean
-  onToggle: (name: string) => void
+  onToggle: (name: string, label?: string) => void
   onColumns: (name: string) => void
 }
 
@@ -140,7 +149,7 @@ function PlainRows({ objects, inputType, selected, disabled, onToggle, onColumns
             inputType={inputType}
             checked={selected.has(object.name)}
             disabled={disabled}
-            onToggle={() => onToggle(object.name)}
+            onToggle={() => onToggle(object.name, object.label)}
             onColumns={() => onColumns(object.name)}
           />
         </li>
@@ -180,7 +189,7 @@ function WindowedRows({ objects, inputType, selected, disabled, onToggle, onColu
                 inputType={inputType}
                 checked={selected.has(object.name)}
                 disabled={disabled}
-                onToggle={() => onToggle(object.name)}
+                onToggle={() => onToggle(object.name, object.label)}
                 onColumns={() => onColumns(object.name)}
               />
             </li>
@@ -266,9 +275,10 @@ export type TableFinderProps = {
   defaultSchema: string
   previews: ColumnPreviews
   selectedNames: ReadonlySet<string>
-  onToggle: (name: string) => void
-  /** Tick (`true`) or untick (`false`) every one of `names`: the buttons over the shown rows. */
-  onSetMany: (names: string[], on: boolean) => void
+  /** `label` is the listed object's label, when the vendor gave one (it names the Bronze table by default). */
+  onToggle: (name: string, label?: string) => void
+  /** Tick (`true`) or untick (`false`) every one of `names`: the buttons over the shown rows. `labels` are the shown objects' labels. */
+  onSetMany: (names: string[], on: boolean, labels?: Record<string, string>) => void
   /** Kafka: one topic per connector, so the list is radio buttons and has no "select shown" (D4). */
   single?: boolean
   /** Locks the list while a pick is being saved. */
@@ -323,7 +333,7 @@ export function TableFinder({
     ? (searched.objects ?? [])
     : serverSearch || needle === ""
       ? baseObjects
-      : baseObjects.filter((o) => o.name.toLowerCase().includes(needle))
+      : baseObjects.filter((o) => o.name.toLowerCase().includes(needle) || (o.label ?? "").toLowerCase().includes(needle))
   const schemas = (schemaList.data?.state === "done" ? (schemaList.data.objects ?? []) : []).filter(
     (o) => o.kind === "schema"
   )
@@ -406,6 +416,8 @@ export function TableFinder({
               ? "Lists the endpoints this connector declares."
               : kind === "mongodb"
                 ? "Lists the collections of this connector's database."
+                : kind === "saas"
+                  ? "Lists the objects the vendor offers, and says which load only what changed."
                 : "Lists the topics of this connector's broker; internal ones are hidden."}
           </p>
         )}
@@ -487,7 +499,8 @@ export function TableFinder({
                 onClick={() =>
                   onSetMany(
                     objects.map((o) => o.name),
-                    !allShownSelected
+                    !allShownSelected,
+                    Object.fromEntries(objects.flatMap((o) => (o.label ? [[o.name, o.label]] : [])))
                   )
                 }
               >

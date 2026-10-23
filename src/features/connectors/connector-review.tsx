@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { saasVendorById } from "@/lib/connectors/saas-vendors"
 
 type Item = { label: string; value: React.ReactNode }
 
@@ -80,6 +81,12 @@ export function connectionReviewItems(adapter: string | null, dial: Record<strin
         { label: "Pagination", value: text((d.pagination as { type?: unknown } | undefined)?.type) || "none" },
       ]
     }
+    case "saas":
+      return [
+        { label: "Business app", value: saasVendorById(d.vendor)?.label ?? text(d.vendor) },
+        { label: "Account", value: text(d.account) },
+        { label: "Sign-in", value: authType(d) === "integration" ? "Integration credential" : "Browser sign-in" },
+      ]
     case "sheets":
       return [
         { label: "Spreadsheet", value: text(d.spreadsheetId) },

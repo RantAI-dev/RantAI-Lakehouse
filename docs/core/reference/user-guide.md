@@ -56,7 +56,7 @@ and share them.
 | **Catalog** | Browse the namespaces and tables the lakehouse holds. |
 | **Data Explorer** | Browse data assets by layer, from raw to curated, and open one to see its schema, a sample, quality checks, policies, lineage and history. |
 | **Query Studio** | Write SQL, or ask in plain language and review the generated SQL before running it. Save queries you reuse. Queries are read-only. |
-| **Sources** | Register the systems data comes from, and test the connection. A real connection test exists for PostgreSQL and S3-compatible storage; other types say "unsupported". |
+| **Sources** | Register the systems data comes from, and test the connection. A real connection test exists for PostgreSQL, S3-compatible storage and the business apps (Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence, Dynamics 365, SharePoint: sign in with a key or in the browser, pick objects and columns, load incrementally where the vendor allows); other types say "unsupported". Workday Reports and NetSuite are not offered yet. |
 
 The layers:
 

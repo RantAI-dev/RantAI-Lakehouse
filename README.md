@@ -435,7 +435,9 @@ issue about any of the following — they're known, not bugs:
   embeddings API. The API's knowledge source and vector-job records remain
   (Postgres, `lakehouse-store::knowledge`) with no search route and no page.
 - **Connector "Test connection" dials PostgreSQL, MySQL/MariaDB, SQL Server,
-  S3-compatible object storage and REST APIs.** `POST /api/connectors/{id}/test`
+  S3-compatible object storage, REST APIs and the business-app vendors
+  (Salesforce, ServiceNow, Google Analytics 4, HubSpot, Zendesk, Confluence,
+  Dynamics 365, SharePoint; a fixed vendor host, never one typed by the user).** `POST /api/connectors/{id}/test`
   (`lakehouse-api`'s `connector_probe` module) opens a real, bounded
   connection to those and measures real latency, resolving the connector's
   `secretRef` through the allowlisted resolver (ADR 0002). Oracle, MongoDB,

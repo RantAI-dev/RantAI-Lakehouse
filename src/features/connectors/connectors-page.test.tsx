@@ -109,7 +109,7 @@ describe("ConnectorsPage tabs", () => {
     renderPage()
     expect(
       await screen.findByText(
-        "Databases, change capture, object storage, files, REST APIs and message topics. Data enters the platform here before processing."
+        "Databases, change capture, object storage, files, REST APIs, message topics and business apps. Data enters the platform here before processing."
       )
     ).toBeDefined()
     expect(screen.queryByText(/SaaS/)).toBeNull()
