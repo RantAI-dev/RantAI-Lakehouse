@@ -25,6 +25,22 @@
 //! is exposed for the rare test that needs to open its own connection
 //! outside of `#[sqlx::test]`'s injected pool.
 //!
+//! # The container's server settings
+//!
+//! It runs with 1 GiB of `/dev/shm`, `max_parallel_workers_per_gather=0` and
+//! `max_connections=200` (`OPS-10`): a full workspace run drives thousands of
+//! per-test databases, migrations and pools at once against this one server,
+//! and Docker's default 64 MiB `/dev/shm` ran out under it — Postgres answered
+//! SQLSTATE 53100 ("could not resize shared memory segment … No space left on
+//! device") in whichever binaries ran many per-test databases at once, while
+//! each passed alone. The label value carries the settings
+//! (`postgres-16-shm1g`) because a container is reused by label and one
+//! started before this change would keep the old `/dev/shm`. The separate
+//! "Connection reset by peer" failures in the same runs were a race with the
+//! server's own start, not memory: see `wait_until_ready`. The tests
+//! themselves did not change; the reasoning for each setting is at
+//! `start_postgres_container`.
+//!
 //! # Requirements
 //!
 //! Docker (or a compatible container runtime) must be reachable from the
