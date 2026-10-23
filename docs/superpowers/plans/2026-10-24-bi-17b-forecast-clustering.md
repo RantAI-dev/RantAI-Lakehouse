@@ -201,4 +201,23 @@ Decisions to review (all beyond what D5 spells out):
 
 Checks: `bun test src/lib/kmeans.test.ts`: 10 pass, 0 fail (blobs give k = 3 with every point in its blob, fixed k honoured, same labels across runs, n = 5 refused, millions-scale measure does not dominate, three-measure bubble, refusals). On the final commit (T3): `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings (none in these files); `bun run test` 2474 pass, 1 skip, 0 fail (254 files). The webpack build is not due until T4.
 
+### T4 Drawing and editor (developer, branch `feat/bi-phase-6`)
+
+Commits: `90c35b75` (Forecast kind and horizon in the reference-line editor), `16da9a7f` (period arithmetic, `src/lib/forecast-periods.ts`), `1ef3faa9` and `a7f93881` (forecast drawing and the tile test; these two came from a second session that was running against the same worktree), `8d7518ed` (Clusters setting in the Format section), `21cf4ae9` (cluster drawing). TypeScript only, no cargo.
+
+**The server does not validate any of this until T1 lands.** The console sends `referenceLines: [{ kind: "forecast", horizon: N, label?, color?, measure? }]` and `clusters: { k: "auto" | 2..10 }` exactly as plan D1 and D2 define them; until T1 adds `LineKind::Forecast`, `horizon` and `StyleFields.clusters`, a save carrying them is whatever the current Rust does with an unknown kind and an unknown field (not tested here). The limits (horizon 1 to 60, one forecast per chart, k 2 to 10, scatter and bubble only, no forecast on a horizontal bar chart) are enforced by the console alone for now: the editor hides what is invalid and `refLinesPayload` / `stylePayload` do not send it.
+
+What was built:
+- **Forecast drawing** (`withReferenceLines` -> `withForecastLine`, `forecast-line.ts`): future labels appended to the category axis from the last bucket and the grain; a dashed line starting on the last actual value; the band as two stacked line series (the lower one invisible; both kept out of the tooltip and the legend); the line's tooltip writes "value (95 % band lo to hi)"; a bar chart gets the forecast as a line over the bars (the extra categories did not disturb the existing series, tested). When the unfinished current period is left out, the forecast starts on its category. The note under the chart (`forecastNote`) is the model and band, plus what was filled or left out, or the refusal sentence; a refusal draws no line (Q5). Refusal sentences of its own: breakdown, horizontal bars, a grain that is not a truncation, dates that are not one run of periods.
+- **How the buckets arrive (plan section 5):** as wall-clock text in the report zone (`YYYY-MM-DD`, or with `HH:MM:SS` for hour and minute), so future labels are calendar steps on that text with `bucketLabel`; only "is the last period finished" needs the zone, through `Intl` (`wallClockMs`). Rows are laid on a regular grid, a missing bucket is a gap that `forecast.ts` fills or refuses.
+- **PDF render view:** `render-view.tsx` mounts `TileBody`, so the PDF draws what the tile hands the chart; `tile-forecast.test.tsx` and `tile-clusters.test.tsx` assert that at the `EChart` boundary. *Not verified:* the band in a real PDF (needs a browser and a running stack).
+- **Clusters:** `StyleFields.clusters`; Format section group "Clusters" (switch, number of groups); `clustersOf` / `clusterNote` in `chart-option.ts`, `cluster-plan.ts` (memoised) over `kmeans.ts`. One series per cluster with the palette's colours, legend "Cluster 1 (n = 5; x = ..., y = ...)" (bubble adds z); the note says "Clusters of the N points shown" and how k was chosen; a refusal keeps the single series and prints the sentence.
+- A forecast on a chart whose rows were cut off by the row limit forecasts the rows on screen, as the trend line does.
+
+Not done in T4 (as the plan lists it for T5 or later): assistant schema and cases; the copilot draft card does not show a forecast.
+
+Checks on the final commit: `bun run typecheck` exit 0; `bun run lint` 0 errors, 9 warnings (none in these files); `bun run test` 2513 pass, 1 skip, 0 fail (258 files); `bun --bun next build --webpack` exit 0 (run detached, log `/tmp/claude-1000/build-t4.log`). Scoped runs: forecast-line 9, tile-forecast 3, tile-clusters 5, forecast-periods 7, style-draft and params additions, reference-lines-editor 6, format-section 12.
+
+Process note: two sessions resumed this task at once for a while and both wrote to the worktree; the committed `src/lib/kmeans.ts` (`kmeans({ points, k })`) is the other session's version of T3, not the `cluster(points, k)` the T3 handoff above describes. The T3 handoff text predates that and should be read against the file.
+
 ## 8. Review (planner appends)
