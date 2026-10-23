@@ -141,7 +141,7 @@ estimate (S, M, L), which the base has no field for.
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
 | `OPS-1` | Task | Trim old versions of raw tables | Operations | P2 | Done | #178 | `README.md` |
-| `OPS-9` | Task | The per-table maintenance route (`GET /api/lakehouse/tables/{ns}/{table}/maintenance`) never shows a Bronze table's last run: the job records the qualified name (`bronze.<table>`) while `routes/lakehouse.rs` `maintenance_verb_run_query` and `routes/governance.rs` `maintenance_run_query` filter on the bare name from the URL. The aggregate Governance view is right | Operations | P2 | Todo |  | `docs/plans/OPS-1-RESULT.md` |
+| `OPS-9` | Task | The per-table maintenance route (`GET /api/lakehouse/tables/{ns}/{table}/maintenance`) never shows a Bronze table's last run: the job records the qualified name (`bronze.<table>`) while `routes/lakehouse.rs` `maintenance_verb_run_query` and `routes/governance.rs` `maintenance_run_query` filter on the bare name from the URL. The aggregate Governance view is right | Operations | P2 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/plans/OPS-1-RESULT.md` |
 | `DATA-2` | Task | Keep the last copies of a published Gold table, remove the rest. | Build | P2 | Done | #164 | `features/gold-publish-per-mart.md`; [spec](specs/data-2.md) |
 | `DATA-10` | Task | A merge-proof "has this mart changed" signal for publishing, so background merges do not trigger extra copies | Build | P2 | Done | #156 | Slice B review, gold-publish plan |
 | `DATA-6` | Feature | A "latest copy only" table for outside readers of published tables. | Build | P2 | Planned |  | `features/gold-publish-per-mart.md`; [spec](specs/data-6.md) |
@@ -176,11 +176,11 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-17` | Feature | Upload more formats (Excel, JSON, Parquet, Avro), up to 10 files at once in parallel, up to 2 GB per upload once measured (Databricks' limits) | Data | P2 | Building | #76 | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-18` | Feature | Column types on upload, with names and types editable before loading | Data | P2 | Planned |  | `reference/competitive-comparison.md` (Data matrix) |
 | `DATA-19` | Feature | Uploaded tables can feed pipelines and so reach dashboards. | Data | P2 | In Acceptance | #165 | `reference/competitive-comparison.md` (Data matrix) |
-| `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-1` | Feature | Query Studio editor basics: column autocomplete, schema browser, several statements, tabs, formatting rules | Query Studio | P2 | Building | #237 | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-2` | Feature | Query Studio results: up to 64,000 rows or 10 MB shown, grid filters and column stats, full server downloads up to 5 GB (Databricks' limits), server-side Stop, configurable timeouts. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-3` | Feature | Saved queries done properly: edit, delete, folders, sharing levels, version history. **Blocked by `SEC-20`** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `QS-4` | Feature | Query history page with filters, and a query profile | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
-| `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. **Blocked by `BI-18` (the dashboard date filter)** | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
+| `QS-5` | Feature | The bridge to BI: parameters that become dashboard filters, snippets, charts from results, reuse a saved query in SQL, alerts on a query. | Query Studio | P2 | Planned |  | `reference/competitive-comparison.md` (Query Studio matrix) |
 | `AI-16` | Task | Hand-off to the AI team: AI features for the Data module. Remaining: plain-language table search, AI classification, AI quality suggestions and incident help, AI connector building. The AI team plans these | AI Copilot | P2 | In Progress | #79, #95, #96, #109, #110, #111, #112, #118 | `docs/core/features/semantic-layer.md` |
 | `AI-17` | Feature | The chat asks once, with options, which reading of an unclear word the person means, remembers the clicked answer per user, and writes in full only the tables a question names. **Staging QA, 2026-10-18, after #208:** in 8 late-ask runs the reply never apologised, kept the user's language and named the reading it used; it still mentioned the refusal in 4, asked in text in 2 and offered another reading in 4. A server check of the reply is the owner's call. Checklist rows 5 and 9 to 12 not run | AI Copilot | P2 | Building | #81, #84, #125, #208 | `features/chat-ask-back.md` |
 | `WEB-1` | Feature | Landing page at `/landing`: a 3D night lake with the logo's creature, and a scroll story through sources, the Bronze/Silver/Gold layers, the assistant, dashboards, governance and open source. Copy limited to what is built | Business | P2 | In Acceptance | #107 | `superpowers/plans/2026-10-11-landing-page.md` |
@@ -237,7 +237,8 @@ estimate (S, M, L), which the base has no field for.
 | `DATA-8` | Feature | Instant copies of a table for testing | Data | P3 | Idea |  | PRODUCT §2 |
 | `BLD-4` | Task | A pipeline that names `ingest_job` in its upstreams runs after every connector's load, not only after the load of its own source table: its sensor counts any `ingest_job` success. Filter by the run's connector and target table, as `DATA-19` does for `file_ingest_job`. | Build | P3 | Done | #189 | `DATA-19` plan, section 5 |
 | `BLD-2` | Feature | Tables that refresh themselves within a target lag set per pipeline, and the same through the assistant. | Build | P3 | In Acceptance | #194 | PRODUCT §2; [spec](specs/bld-2.md) |
-| `BLD-5` | Task | `BLD-2` follow-ups from its last review (round 6 of `docs/superpowers/plans/2026-10-15-bld-2-target-lag.md`): five stale or mis-tagged comments and one copied test helper, no behaviour; and `downstream_without_readers` still runs one query per downstream candidate. | Build | P3 | Todo |  | `BLD-2` plan, round 6 |
+| `BLD-5` | Task | `BLD-2` follow-ups from its last review (round 6 of `docs/superpowers/plans/2026-10-15-bld-2-target-lag.md`): five stale or mis-tagged comments and one copied test helper, no behaviour; and `downstream_without_readers` still runs one query per downstream candidate. | Build | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `BLD-2` plan, round 6 |
+| `BLD-6` | Task | `lag_pipelines_without_readers` (the batched reader check from `BLD-5`) copies the SQL predicate of `count_lag_pipelines_reading`, and its doc says the two "cannot drift". Share the predicate, or add a store test that runs both on the same fixture, and correct the comment (AGENTS.md rule 1). Found in PR #234 review round 1, SHOULD-FIX 1 | Build | P3 | Todo |  | `rust/crates/lakehouse-store/src/pipelines.rs` |
 | `SRC-5` | Feature | Real connection test for MongoDB, Kafka, SFTP, Sheets and Oracle sources | Data | P3 | Idea |  | `connector_probe.rs` |
 | `DOC-2` | Task | Step-by-step user guide checked against a running console | Docs | P3 | Todo |  | `reference/user-guide.md` |
 | `DATA-3` | Feature | Store Gold in open format first; serve from a fast copy. **Blocked by `DATA-4`** and a new ADR that replaces ADR 0010's direction | Build | P3 | Planned |  | ADR 0010; [spec](specs/data-3.md) |
@@ -266,7 +267,7 @@ estimate (S, M, L), which the base has no field for.
 | `BI-32` | Task | While the assistant is answering, a chart's reference-line label (for example "Target 20,000") moves again and again, though the chart itself stays still: the tile re-renders with the streamed message. Keep the label still until the board really changes. Cosmetic; left over from the phase 3 QA (`BI-18` part C review R29, owner's QA 2026-10-18) | Dashboards | P3 | Todo |  | `BI-18` part C plan, R29 |
 | `BI-33` | Task | `#199` follow-ups from its last review (round O, `superpowers/plans/2026-10-14-bi-18c-layout.md`): the AI-15 case `dash_map_charts_in_separate_tab` can fail when the assistant is right (its setup has only the map chart; add a second chart); the XSS test misses the sankey edge, boxplot outlier and scatter-label branches; a comment in `chart-option.ts` says ECharts' `encodeHTMLContent` is off by default, but it never applies to a series formatter | Dashboards | P2 | Todo |  | `#199` review round O |
 | `OPS-11` | Task | Next.js 16.4 (on `main`) blocks the dev server's own resources for any origin but `localhost`, so a console dev server opened by a LAN address never finishes loading. Read the allowed dev origins from an environment variable (`allowedDevOrigins`), empty by default, and document it in `.env.example`. Found at the phase 3 QA, 2026-10-17 | Operations | P3 | Done | #229 | phase 3 QA |
-| `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Todo |  | `docs/OPERATIONS.md` |
+| `OPS-4` | Task | Fail loudly when the application database is unreachable | Platform | P3 | Done | [#234](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/234) | `docs/OPERATIONS.md` |
 | `OPS-6` | Feature | Log and trace viewer | Operations | P3 | Idea |  | `docs/archive/FEATURE_COVERAGE.md` |
 | `BIZ-1` | Feature | Enterprise edition | Business | P3 | Idea |  | PRODUCT §1 |
 | `BIZ-2` | Feature | Hosted cloud version | Business | P3 | Idea |  | PRODUCT §1 |
@@ -284,7 +285,7 @@ parity), built after it.
 
 | Item | Status | Blocked by | Blocks |
 | --- | --- | --- | --- |
-| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `BI-26` (locking a dashboard filter in an embed), `QS-5` (the dashboard date filter) |
+| `BI-18` | Building | — | `AI-2`, `AI-9` (templates part), `BI-26` (locking a dashboard filter in an embed) |
 | `BI-1` | Planned | — | `AI-10`, `RPT-1` (PDF and Excel attachments) |
 | `RPT-1` | Planned | `BI-1` (PDF and Excel attachments) | `AI-10`, `BI-19` (digest schedules) |
 | `BI-14` | Planned | — | `AI-13` |
@@ -295,7 +296,7 @@ parity), built after it.
 | `BLD-1` | Building | — | `REL-6` |
 | `DATA-4` | Planned | — | `DATA-3` |
 | `DEC-8` | Open (decision) | — | `AI-11` |
-| `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
+| `QS-5` | Planned | — | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
 | `SEC-20` | Todo | — | `QS-3` |
@@ -315,7 +316,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-5`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-4`, `OPS-6`, `OPS-8`, `OPS-9`, `QA-1`, `QRY-1`, `QS-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-25`, `SEC-34`, `SEC-37`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-45`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -373,6 +374,11 @@ set by the product owner and are left empty until they are.
 | `OPS-11` | 2026-10-23 | 2026-10-23 | |
 | `SEC-48` | 2026-10-23 | 2026-10-23 | |
 | `OPS-10` | 2026-10-23 | 2026-10-23 | |
+| `QS-1` | 2026-10-23 | | |
+| `OPS-9` | 2026-10-23 | 2026-10-23 | |
+| `OPS-4` | 2026-10-23 | 2026-10-23 | |
+| `BLD-5` | 2026-10-23 | 2026-10-23 | |
+| `BLD-6` | | | |
 | `SRC-32` | | | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |

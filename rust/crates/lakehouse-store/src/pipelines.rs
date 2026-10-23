@@ -2004,9 +2004,6 @@ pub async fn upsert_lag_state_conn(
 /// A lag state whose row has never been checked (`last_check_at IS NULL`)
 /// maps to `None`, the same shape [`PipelineLagState`] picks from.
 ///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if a query fails.
 /// BLD-2 review R5 SHOULD-FIX 3, measured on the tests this function is
 /// pinned by (both in `tests/pipelines.rs`): the sort below owns the
 /// missing-row INSERT order — a `BEFORE INSERT` probe fails without it,
@@ -2015,6 +2012,10 @@ pub async fn upsert_lag_state_conn(
 /// Both halves are asserted rather than assumed; a caller that ever locks
 /// the rows one statement at a time inherits the sorted order from HERE,
 /// which is what the contention test is there to say.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
 pub async fn lock_lag_states_ordered(
     conn: &mut sqlx::PgConnection,
     ids: &[String],
@@ -2157,6 +2158,56 @@ pub async fn count_lag_pipelines_reading(
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+/// The batched form of [`count_lag_pipelines_reading`]: which of
+/// `candidates` — `(id, target, tenant_id)` — no lag pipeline reads.
+///
+/// `downstream_without_readers` used to call [`count_lag_pipelines_reading`]
+/// once per downstream candidate, which is one pool checkout per row. One
+/// statement answers all of them, with the SAME predicate (a pipeline with a
+/// target lag whose source is the candidate's target, or whose `depends_on`
+/// names a pipeline whose target is), so the batched answer cannot drift
+/// from the per-row one the check still uses. `unnest` of three parallel
+/// arrays rather than `= ANY($1)` because each candidate pairs its own
+/// target and tenant, which one array cannot express.
+///
+/// A tenantless candidate (`tenant_id` NULL) matches no reader, exactly as
+/// `count_lag_pipelines_reading` answers `0` for one without querying.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn lag_pipelines_without_readers(
+    pool: &PgPool,
+    candidates: &[(&str, &str, Option<Uuid>)],
+) -> Result<Vec<String>, StoreError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<&str> = candidates.iter().map(|c| c.0).collect();
+    let targets: Vec<&str> = candidates.iter().map(|c| c.1).collect();
+    let tenants: Vec<Option<Uuid>> = candidates.iter().map(|c| c.2).collect();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT c.id FROM unnest($1::text[], $2::text[], $3::uuid[]) \
+         AS c(id, target, tenant_id) \
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM pipeline_definition p \
+           WHERE p.tenant_id = c.tenant_id \
+             AND p.id != c.id \
+             AND (p.target_lag_seconds IS NOT NULL OR p.target_lag_downstream) \
+             AND (p.source = c.target OR EXISTS ( \
+                    SELECT 1 FROM unnest(p.depends_on) AS up(id) \
+                    JOIN pipeline_definition u ON u.id = up.id \
+                    WHERE u.tenant_id = c.tenant_id AND u.target = c.target))) \
+         ORDER BY c.id",
+    )
+    .bind(&ids)
+    .bind(&targets)
+    .bind(&tenants)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Upstream pipelines whose target lag is `downstream`, and whose target is
