@@ -73,6 +73,11 @@ const MARKER: &str = "UPSTREAM-DETAIL-9f3a1c";
 /// module is private), so repeated here and pinned by that module's own test.
 const CAP: usize = 50 * 1024 * 1024;
 
+/// `MAX_SESSION_BYTES` of `routes::uploads::sessions`: 2 GiB, exactly
+/// 2,147,483,648 (`DATA-17-RESULT.md`, plan T6.2). Also private, so repeated
+/// here and pinned by that module's own test.
+const SESSION_CAP: usize = 2 * 1024 * 1024 * 1024;
+
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!(
         "{}/../../../ops/fixtures/uploads/{name}",
@@ -4736,7 +4741,7 @@ const MIB: usize = 1024 * 1024;
 const STILL_RECEIVING: &str = "This upload is still being received, so it cannot be used yet.";
 const NOT_RECEIVING: &str = "This upload is not receiving pieces.";
 const EMPTY_FILE: &str = "The file is empty.";
-const TOO_LARGE: &str = "The file is larger than the 50 MB limit.";
+const SESSION_TOO_LARGE: &str = "The file is larger than the 2 GB limit.";
 const OTHER_BINARY: &str = "This is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.";
 
 /// A piece that takes 1.5 s to store, so requests sent together overlap.
@@ -5083,9 +5088,9 @@ async fn a_session_over_the_cap_or_with_no_bytes_or_a_bad_body_is_refused_and_op
     let empty = stack.open_session(&bayu, "a.csv", 0).await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(empty.json["error"], EMPTY_FILE);
-    let big = stack.open_session(&bayu, "a.csv", CAP + 1).await;
+    let big = stack.open_session(&bayu, "a.csv", SESSION_CAP + 1).await;
     assert_eq!(big.status, StatusCode::BAD_REQUEST);
-    assert_eq!(big.json["error"], TOO_LARGE);
+    assert_eq!(big.json["error"], SESSION_TOO_LARGE);
     let huge = stack.open_session(&bayu, "a.csv", usize::MAX).await;
     assert_eq!(huge.status, StatusCode::BAD_REQUEST);
     for body in [
@@ -5113,9 +5118,10 @@ async fn a_session_over_the_cap_or_with_no_bytes_or_a_bad_body_is_refused_and_op
     assert_eq!(rows, 0);
     assert!(stack.bucket.open_multiparts().is_empty());
 
-    let at_cap = stack.open_session(&bayu, "a.csv", CAP).await;
+    let at_cap = stack.open_session(&bayu, "a.csv", SESSION_CAP).await;
     assert_eq!(at_cap.status, StatusCode::CREATED, "{}", at_cap.text);
-    assert_eq!(at_cap.json["partCount"], 7);
+    // 2 GiB in pieces of 8 MiB.
+    assert_eq!(at_cap.json["partCount"], 256);
 }
 
 /// Another tenant's session answers the 404 an unknown id gets, on every

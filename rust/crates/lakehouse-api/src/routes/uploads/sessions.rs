@@ -88,12 +88,23 @@ pub(crate) const PART_SIZE: u64 = 8 * 1024 * 1024;
 /// below does, with its own sentence).
 pub(crate) const MAX_PART_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 
-/// The largest file a session may announce, in bytes. Behind one constant so
-/// that raising the cap (slice 6 of the plan, after the measurement) is one
-/// edit; `POST /api/uploads` keeps [`MAX_UPLOAD_BYTES`]. Until that
-/// measurement it is the same 50 MiB, and the sentence for a file over it is the
-/// existing one.
-const MAX_SESSION_BYTES: u64 = 50 * 1024 * 1024;
+/// The largest file a session may announce, in bytes: 2 GiB, exactly
+/// 2,147,483,648, and a file of one byte more is refused. The feature page's
+/// "2 GB" (decision 1, "GB means GiB") is the target of `DATA-17`, and
+/// `docs/plans/DATA-17-RESULT.md` (the section after the streaming fix, run
+/// 39916318666) measured a 2 GiB load of every format growing the job by about
+/// 0.9 to 2.3 GiB, flat in the file's size; the API's own memory stayed
+/// flat at every size. The cap is for what a session carries by pieces and
+/// never holds; `POST /api/uploads` keeps [`MAX_UPLOAD_BYTES`] (50 MiB, the
+/// whole file in memory), and a workbook keeps that size here as well
+/// ([`open_whole`], decision 9). Plan section 7, T6.2.
+const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The sentence for a file over [`MAX_SESSION_BYTES`]. Its own text, not the
+/// 50 MB sentence of `POST /api/uploads` and of a workbook (`TOO_LARGE`),
+/// which would send a person away from a file the session path takes. Fixed
+/// text, as every refusal is (`SEC-11`).
+const SESSION_TOO_LARGE: &str = "The file is larger than the 2 GB limit.";
 
 /// How much of the assembled file is read to tell what it is.
 const COMPLETE_SNIFF_BYTES: u64 = 64 * 1024;
@@ -206,10 +217,10 @@ pub async fn create_session(
         return Err(ApiError::BadRequest(EMPTY_FILE.to_owned()).into());
     }
     if request.size_bytes > MAX_SESSION_BYTES {
-        return Err(ApiError::BadRequest(TOO_LARGE.to_owned()).into());
+        return Err(ApiError::BadRequest(SESSION_TOO_LARGE.to_owned()).into());
     }
     let declared = i64::try_from(request.size_bytes)
-        .map_err(|_| ApiError::BadRequest(TOO_LARGE.to_owned()))?;
+        .map_err(|_| ApiError::BadRequest(SESSION_TOO_LARGE.to_owned()))?;
     let pool = pool(&state)?;
     // Phase 3 slice 1 review SHOULD-FIX 1: counted before anything is opened
     // in storage, so a refusal leaves no multipart upload behind.
@@ -672,11 +683,15 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// The cap of a session is the cap of a whole file until the measurement
-    /// of slice 6 changes it; the 50 MiB of the sentence is this number.
+    /// The cap of a session is 2 GiB, exactly, and its sentence says 2 GB;
+    /// a whole file (`POST /api/uploads`) and a workbook stay at 50 MiB and
+    /// say 50 MB (`DATA-17-RESULT.md`, plan T6.2).
     #[test]
-    fn a_session_is_capped_at_the_same_50_mib_as_a_whole_file_for_now() {
-        assert_eq!(MAX_SESSION_BYTES, u64::try_from(MAX_UPLOAD_BYTES).unwrap());
+    fn a_session_is_capped_at_2_gib_and_a_whole_file_at_50_mib() {
+        assert_eq!(MAX_SESSION_BYTES, 2_147_483_648);
+        assert_eq!(MAX_SESSION_BYTES, 2048 * MIB);
+        assert_eq!(MAX_UPLOAD_BYTES, 52_428_800);
+        assert!(SESSION_TOO_LARGE.contains("2 GB"));
         assert!(TOO_LARGE.contains("50 MB"));
         let limit: usize = 8 * 1024 * 1024 + 64 * 1024;
         assert_eq!(MAX_PART_BODY_BYTES, limit);

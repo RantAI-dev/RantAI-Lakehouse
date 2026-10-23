@@ -26,11 +26,25 @@ import type {
 } from "@/services/contracts/uploads"
 
 /**
- * The largest file the API accepts (its `MAX_UPLOAD_BYTES`): 50 MiB, which
- * its sentence calls "50 MB". A bigger file is refused in the browser, before
- * a byte of it is sent.
+ * The largest file `POST /api/uploads` accepts (its `MAX_UPLOAD_BYTES`), and
+ * the largest Excel workbook the chunked path accepts (decision 9 of
+ * `docs/core/features/upload-big-files-and-more-formats.md`): 50 MiB, which
+ * the API's sentences call "50 MB". A bigger workbook is refused in the
+ * browser, before a byte of it is sent.
  */
 export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+/**
+ * The largest file the chunked upload path takes (the API's
+ * `MAX_SESSION_BYTES`, `routes/uploads/sessions.rs`): 2 GiB, exactly
+ * 2,147,483,648 bytes, "2 GB" in words (decision 1: GB means GiB). The page
+ * sends every file by pieces, so this is the limit it enforces for all but
+ * workbooks. Measured in `docs/plans/DATA-17-RESULT.md`; plan T6.2.
+ */
+export const MAX_SESSION_BYTES = 2 * 1024 * 1024 * 1024
+
+/** A workbook is read whole by the API, so it keeps [`MAX_UPLOAD_BYTES`] on the chunked path as well. */
+const WORKBOOK_NAME = /\.xlsx?$/i
 
 /** The most files one upload takes (decision 5 of `docs/core/features/upload-big-files-and-more-formats.md`). */
 export const MAX_FILES = 10
@@ -227,8 +241,12 @@ export const REGISTRATION_FAILED_REASON = "The table was loaded but could not be
  * what to do next.
  */
 export function fileSizeProblem(name: string, sizeBytes: number): string | null {
-  if (sizeBytes <= MAX_UPLOAD_BYTES) return null
-  return `${name} is ${formatBytes(sizeBytes)}, over the 50 MB limit. Split it into smaller files or leave out columns you do not need, then choose a file again.`
+  if (WORKBOOK_NAME.test(name)) {
+    if (sizeBytes <= MAX_UPLOAD_BYTES) return null
+    return `${name} is ${formatBytes(sizeBytes)}, over the 50 MB limit for an Excel workbook. Save the sheet as CSV, or leave out columns you do not need, then choose a file again.`
+  }
+  if (sizeBytes <= MAX_SESSION_BYTES) return null
+  return `${name} is ${formatBytes(sizeBytes)}, over the 2 GB limit. Split it into smaller files or leave out columns you do not need, then choose a file again.`
 }
 
 /**
@@ -280,7 +298,7 @@ export function fileProblem(name: string, sizeBytes: number): string | null {
  * - The list holds at most [`MAX_FILES`]; the first files of a pick are kept
  *   (decision 5) and `dropped` counts the rest.
  * - A file with a problem of its own ([`fileProblem`]) is listed with it.
- * - The 50 MB limit counts all the files of one upload together (decision 2):
+ * - The 2 GB limit counts all the files of one upload together (decision 2):
  *   a file that would take the sum over it is listed with a sentence saying
  *   so and is not sent, so a person never waits for files the load would
  *   refuse. `existing` is what the list holds already (a refused file does not
@@ -296,10 +314,10 @@ export function planPick(
   const candidates = taken.map((file): Candidate => {
     const own = fileProblem(file.name, file.size)
     if (own !== null) return { file, problem: own }
-    if (total + file.size > MAX_UPLOAD_BYTES) {
+    if (total + file.size > MAX_SESSION_BYTES) {
       return {
         file,
-        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 50 MB limit for one upload (all its files together). Remove a file, then choose this one again.`,
+        problem: `${file.name} would bring the files to ${formatBytes(total + file.size)}, over the 2 GB limit for one upload (all its files together). Remove a file, then choose this one again.`,
       }
     }
     total += file.size

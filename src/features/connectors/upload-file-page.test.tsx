@@ -25,7 +25,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { formatBytes } from "@/lib/format"
-import { MAX_UPLOAD_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
+import { MAX_SESSION_BYTES, REGISTRATION_FAILED_REASON, TABLE_NAME_RULE } from "@/lib/uploads"
 import type { Upload, UploadColumnSpec, UploadPreview } from "@/services/contracts/uploads"
 import { UploadFilePage } from "./upload-file-page"
 
@@ -195,16 +195,16 @@ function next() {
 const CSV = () => new File(["sku,qty\na1,3\nb2,5\n"], "stock.csv", { type: "text/csv" })
 
 describe("UploadFilePage, first step", () => {
-  it("has a labelled file control and refuses a file over 50 MB, sending nothing", async () => {
+  it("has a labelled file control and refuses a file over 2 GB, sending nothing", async () => {
     const calls = stubFetch()
     render(<UploadFilePage />)
     const big = new File(["x"], "big.csv")
-    Object.defineProperty(big, "size", { value: MAX_UPLOAD_BYTES + 1 })
+    Object.defineProperty(big, "size", { value: MAX_SESSION_BYTES + 1 })
     chooseFile(big)
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("big.csv")
-    expect(alert.textContent).toContain("50 MB limit")
+    expect(alert.textContent).toContain("2 GB limit")
     expect(next().disabled).toBe(true)
     fireEvent.click(next())
     expect(calls.filter((c) => c.method !== "GET")).toEqual([])

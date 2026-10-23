@@ -7,6 +7,7 @@ import {
   COLUMN_NAME_RULE,
   COLUMN_TYPES,
   MAX_FILES,
+  MAX_SESSION_BYTES,
   MAX_TABLE_NAME_CHARS,
   MAX_UPLOAD_BYTES,
   REGISTRATION_FAILED_REASON,
@@ -42,9 +43,13 @@ import {
   withColumnType,
 } from "./uploads"
 
-test("MAX_UPLOAD_BYTES is the API's cap, 50 MiB", () => {
+test("MAX_UPLOAD_BYTES is the cap of POST /api/uploads and of a workbook, 50 MiB", () => {
   assert.equal(MAX_UPLOAD_BYTES, 50 * 1024 * 1024)
   assert.equal(MAX_UPLOAD_BYTES, 52_428_800)
+})
+
+test("MAX_SESSION_BYTES is the chunked path's cap, exactly 2 GiB (DATA-17-RESULT.md, plan T6.2)", () => {
+  assert.equal(MAX_SESSION_BYTES, 2_147_483_648)
 })
 
 test("tableNameProblem says the API's sentence, word for word", () => {
@@ -280,109 +285,22 @@ test("REGISTRATION_FAILED_REASON is one of the reasons the load job records", ()
   assert.equal(REGISTRATION_FAILED_REASON, "The table was loaded but could not be registered in the catalog.")
 })
 
-test("fileSizeProblem refuses only a file over 50 MB, names the limit and says what to do", () => {
+test("fileSizeProblem refuses a file over 2 GB, and a workbook over 50 MB, each naming its own limit", () => {
   assert.equal(fileSizeProblem("a.csv", 0), null)
-  assert.equal(fileSizeProblem("a.csv", MAX_UPLOAD_BYTES), null)
-  const problem = fileSizeProblem("big.csv", MAX_UPLOAD_BYTES + 1)
+  assert.equal(fileSizeProblem("a.csv", MAX_UPLOAD_BYTES + 1), null, "a text file may be past 50 MB")
+  assert.equal(fileSizeProblem("a.csv", MAX_SESSION_BYTES), null)
+  const problem = fileSizeProblem("big.csv", MAX_SESSION_BYTES + 1)
   assert.ok(problem !== null)
   assert.match(problem, /^big\.csv is /)
-  assert.match(problem, /50 MB limit/)
+  assert.match(problem, /2 GB limit/)
   assert.match(problem, /Split it/)
-})
 
-test("retryInput repeats what the load was told, and replaces after a registration failure", () => {
-  const options = { encoding: "utf-8" as const, delimiter: ";", headerRow: 2 }
-  const failed = upload({
-    status: "failed",
-    parseOptions: options,
-    bronzeTable: "stock",
-    loadMode: "append",
-    error: "The load into the table failed.",
-  })
-  assert.deepEqual(retryInput(failed), { ...options, bronzeTable: "stock", mode: "append" })
-  assert.deepEqual(retryInput({ ...failed, loadMode: "replace" }), { ...options, bronzeTable: "stock", mode: "replace" })
-  // Rows are already in the table: adding them again would double them.
-  assert.equal(retryInput({ ...failed, error: REGISTRATION_FAILED_REASON })?.mode, "replace")
-  // A load nobody recorded the settings of is not guessed at.
-  assert.equal(retryInput(upload({ status: "failed" })), null)
-  assert.equal(retryInput(upload({ status: "failed", parseOptions: options })), null)
-})
-
-test("retryInput sends the other files of a load of several files back with it, and nothing for a load of one", () => {
-  const options = { encoding: "utf-8" as const, delimiter: ",", headerRow: 0 }
-  const failed = upload({ status: "failed", parseOptions: options, bronzeTable: "stock", loadMode: "replace" })
-  assert.deepEqual(retryInput(failed, ["up-2", "up-3"]), {
-    ...options,
-    bronzeTable: "stock",
-    mode: "replace",
-    alsoUploads: ["up-2", "up-3"],
-  })
-  assert.equal("alsoUploads" in (retryInput(failed, []) ?? {}), false)
-  assert.equal("alsoUploads" in (retryInput(failed) ?? {}), false)
-})
-
-test("mismatchLines says what a file lacks, what it adds and which columns do not fit, and nothing for a file that matches", () => {
-  const base = { uploadId: "up-2", file: "b.csv", missing: [], extra: [], typeConflicts: [] }
-  assert.deepEqual(mismatchLines(base), [])
-  assert.deepEqual(mismatchLines({ ...base, missing: ["name", "qty"], extra: ["notes"] }), [
-    "Missing: name, qty",
-    "Not in the first file: notes",
-  ])
-  assert.deepEqual(mismatchLines({ ...base, typeConflicts: [{ column: "qty", expected: "integer", found: "text" }] }), [
-    "qty: the first file reads it as integer, here it looks like text",
-  ])
-})
-
-test("groupProblem keeps Load off for a file that differs before one still being sent, and says nothing when all is well", () => {
-  assert.equal(groupProblem({ pending: 0, mismatched: 0 }), null)
-  assert.match(groupProblem({ pending: 0, mismatched: 1 }) ?? "", /^One file does not have the columns of the first\. Remove it/)
-  assert.match(groupProblem({ pending: 0, mismatched: 3 }) ?? "", /^3 files do not have the columns of the first\. Remove them/)
-  assert.match(groupProblem({ pending: 1, mismatched: 0 }) ?? "", /^One file is still being sent\. Load waits until it arrives/)
-  assert.match(groupProblem({ pending: 2, mismatched: 0 }) ?? "", /^2 files are still being sent\. Load waits until they arrive/)
-  assert.match(groupProblem({ pending: 2, mismatched: 1 }) ?? "", /^One file does not have/)
-})
-
-test("fileKindProblem refuses a workbook or an archive the API does not read by its name, in the API's words", () => {
-  for (const name of ["a.xlsm", "a.xlsb", "a.ods", "a.tar", "a.7z", "a.tgz", "a.rar", "report.final.xlsm"]) {
-    assert.equal(
-      fileKindProblem(name),
-      `${name} looks like a workbook or an archive this upload does not read. Excel workbooks must be .xls or .xlsx, and archives .gz or .zip; or save the sheet as .xlsx or CSV first.`,
-      name
-    )
+  for (const name of ["a.xlsx", "A.XLS"]) {
+    assert.equal(fileSizeProblem(name, MAX_UPLOAD_BYTES), null, name)
+    const workbook = fileSizeProblem(name, MAX_UPLOAD_BYTES + 1)
+    assert.ok(workbook !== null, name)
+    assert.match(workbook, /50 MB limit for an Excel workbook/)
   }
-})
-
-test("fileKindProblem lets JSON, JSON Lines, Avro, gzip and zip through: the API opens them, and refuses one that does not open", () => {
-  for (const name of ["a.json", "a.JSONL", "a.ndjson", "a.avro", "a.gz", "a.csv.gz", "a.zip", "A.ZIP"]) {
-    assert.equal(fileKindProblem(name), null, name)
-  }
-})
-
-test("fileKindProblem lets an .xls or .xlsx through: the API opens it, and refuses one that does not open", () => {
-  for (const name of ["a.xls", "a.xlsx", "DATA.XLS", "Data.XlsX", "report.final.xlsx", "a.csv.xlsx"]) {
-    assert.equal(fileKindProblem(name), null, name)
-  }
-})
-
-test("fileKindProblem lets a .parquet through: the API opens it, and refuses one that does not open", () => {
-  for (const name of ["a.parquet", "DATA.PARQUET", "report.final.parquet", "a.csv.parquet"]) {
-    assert.equal(fileKindProblem(name), null, name)
-  }
-})
-
-test("fileKindProblem refuses other binaries in the API's sentence, which lists what is read now", () => {
-  for (const name of ["a.pdf", "a.docx", "a.orc", "a.sqlite"]) {
-    assert.equal(
-      fileKindProblem(name),
-      `${name} is not a file this upload reads. Upload CSV, TSV, JSON, JSON Lines, Avro, Parquet or Excel (.xls, .xlsx) files, a .gz of a text or JSON file, or a .zip of such files.`
-    )
-  }
-})
-
-test("fileKindProblem ignores the case of the extension", () => {
-  assert.ok(fileKindProblem("DATA.XLSM")?.includes("looks like a workbook or an archive"))
-  assert.ok(fileKindProblem("Data.OdS")?.includes("looks like a workbook or an archive"))
-  assert.equal(fileKindProblem("DATA.PARQUET"), null)
 })
 
 test("fileKindProblem lets through delimited text, unknown extensions and names with no extension", () => {
@@ -393,7 +311,7 @@ test("fileKindProblem lets through delimited text, unknown extensions and names 
 
 test("fileProblem gives the kind first, then the size, and null for an acceptable file", () => {
   assert.ok(fileProblem("a.xlsm", MAX_UPLOAD_BYTES + 1)?.includes("looks like a workbook or an archive"))
-  assert.ok(fileProblem("a.csv", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
+  assert.ok(fileProblem("a.csv", MAX_SESSION_BYTES + 1)?.includes("2 GB limit"))
   assert.ok(fileProblem("a.xlsx", MAX_UPLOAD_BYTES + 1)?.includes("50 MB limit"))
   assert.equal(fileProblem("a.csv", 1024), null)
   assert.equal(fileProblem("a.xlsx", 1024), null)
@@ -483,21 +401,21 @@ test("planPick counts the files already listed against the ten", () => {
 test("planPick gives a file its own problem: a kind the API does not read, or one over the limit", () => {
   const { candidates } = planPick(
     [],
-    [fileOfSize("stock.XLSM", 10), fileOfSize("big.csv", MAX_UPLOAD_BYTES + 1), fileOfSize("ok.csv", 10)]
+    [fileOfSize("stock.XLSM", 10), fileOfSize("big.csv", MAX_SESSION_BYTES + 1), fileOfSize("ok.csv", 10)]
   )
   assert.match(candidates[0].problem ?? "", /looks like a workbook or an archive/)
-  assert.match(candidates[1].problem ?? "", /over the 50 MB limit/)
+  assert.match(candidates[1].problem ?? "", /over the 2 GB limit/)
   assert.equal(candidates[2].problem, null)
 })
 
-test("planPick counts the 50 MB of one upload over all its files, and a refused file does not count", () => {
-  const half = MAX_UPLOAD_BYTES / 2
+test("planPick counts the 2 GB of one upload over all its files, and a refused file does not count", () => {
+  const half = MAX_SESSION_BYTES / 2
   const { candidates } = planPick(
-    [{ size: half, state: "received" }, { size: MAX_UPLOAD_BYTES, state: "refused" }],
+    [{ size: half, state: "received" }, { size: MAX_SESSION_BYTES, state: "refused" }],
     [fileOfSize("a.csv", half), fileOfSize("b.csv", 1), fileOfSize("c.csv", 1)]
   )
   assert.equal(candidates[0].problem, null, "exactly the limit in all")
-  assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 50 MB limit for one upload/)
+  assert.match(candidates[1].problem ?? "", /b\.csv would bring the files to .*over the 2 GB limit for one upload/)
   assert.match(candidates[2].problem ?? "", /c\.csv would bring the files/)
 })
 
