@@ -29,8 +29,11 @@ here says `deletes`.
 # Search lag
 
 HubSpot says a newly updated record can take "a few moments" to appear in
-search. A search therefore starts `SEARCH_LAG_SECONDS` before the cursor; the
-records read twice are merged on `id`.
+search. The object declares `SEARCH_LAG_SECONDS` as its `lag_seconds` (final
+review SHOULD-FIX 21), so dlt's incremental hands `read` a `since` that much
+earlier and keeps the margin's rows: before that the module stepped back by
+hand and dlt dropped them as below the cursor. The records read twice are
+merged on `id`.
 """
 
 from __future__ import annotations
@@ -85,10 +88,13 @@ def _kind(name: str) -> _Kind:
 
 
 def declaration(session: Any, parts: Any, dial: dict, name: str) -> ObjectDecl:
-    """The object's declaration (cursor, key, why it is re-read in full)."""
+    """The object's declaration (cursor, key, why it is re-read in full). A CRM object also declares
+    the search lag: HubSpot says a change can take "a few moments" to appear in search, so dlt hands
+    `read` a `since` this much earlier (PR #216 final review SHOULD-FIX 21; before that the module
+    stepped back by hand and dlt then dropped those rows as below the cursor)."""
     kind = _kind(name)
     if kind.crm_type is not None:
-        return ObjectDecl(name=name, primary_key=("id",), cursor=hs_settings.LAST_MODIFIED_PROPERTY[kind.crm_type])
+        return ObjectDecl(name=name, primary_key=("id",), cursor=hs_settings.LAST_MODIFIED_PROPERTY[kind.crm_type], lag_seconds=SEARCH_LAG_SECONDS)
     return ObjectDecl(name=name, primary_key=("id",), full_reason=kind.full_reason)
 
 
@@ -166,7 +172,11 @@ def read(session: Any, parts: Any, dial: dict, decl: ObjectDecl, *, since: Any) 
     if since is None:
         pages = _full(kind.path, session, first, later)
     else:
-        floor = hs_helpers._to_ms(since) - SEARCH_LAG_SECONDS * 1000
+        # PR #216 final review SHOULD-FIX 21: `since` already carries the declared lag
+        # (`ObjectDecl.lag_seconds`, which dlt's incremental subtracts), so stepping back here again
+        # would read 120 s and, worse, dlt's cursor filter would drop every row in the margin:
+        # the margin only exists if the resource's cursor knows about it.
+        floor = hs_helpers._to_ms(since)
         pages = _search_or_full(kind, session, decl.cursor, floor, props, first, later)
     for page in pages:
         for record in page:

@@ -149,6 +149,7 @@ def test_six_crm_objects_are_incremental_and_owners_and_pipelines_say_why_they_a
     declared = {d.name: d for d in hubspot.list_objects(None, None, DIAL)}
     assert set(declared) == {"companies", "contacts", "deals", "tickets", "products", "quotes", "owners", "pipelines_deals", "pipelines_tickets"}
     assert declared["deals"].cursor == "hs_lastmodifieddate" and declared["deals"].load_description() == "incremental"
+    assert declared["deals"].lag_seconds == hubspot.SEARCH_LAG_SECONDS, "SHOULD-FIX 21: the search margin is the declared lag"
     assert declared["contacts"].cursor == "lastmodifieddate"
     for name in ("owners", "pipelines_deals", "pipelines_tickets"):
         assert declared[name].cursor is None and declared[name].load_description().startswith("re-read in full: HubSpot cannot filter")
@@ -191,15 +192,25 @@ def test_a_first_run_lists_everything_and_types_the_values(api: FakeHubspot) -> 
     assert records[1]["is_renewal"] is False
 
 
-def test_a_later_run_searches_from_the_cursor_with_a_lag_and_reads_only_what_changed(api: FakeHubspot) -> None:
+def test_a_later_run_searches_from_the_since_dlt_hands_over_with_the_declared_lag(api: FakeHubspot) -> None:
+    """PR #216 final review SHOULD-FIX 21: the margin is the declared lag, which dlt subtracts
+    (`since` below); the module must not step back a second time, or dlt's cursor filter would drop
+    every row in the 120 s window it read."""
     for i in range(1, 6):
         api.put(api.deals, str(i), 10_000_000 + i * 600_000, dealname=f"d{i}", amount=i)
-    cursor = iso(10_000_000 + 3 * 600_000)  # the last value of an earlier run: deal 3
-    records = read(api, "deals", since=cursor)
+    cursor_ms = 10_000_000 + 3 * 600_000  # the last value of an earlier run: deal 3
+    (decl,) = [d for d in hubspot.list_objects(None, None, DIAL) if d.name == "deals"]
+    assert decl.lag_seconds == hubspot.SEARCH_LAG_SECONDS
+    lagged = iso(cursor_ms - decl.lag_seconds * 1000)  # what dlt hands over: the cursor minus its lag
+    records = read(api, "deals", since=lagged)
     assert [r["id"] for r in records] == ["3", "4", "5"], "deal 3 again (merge removes it); 1 and 2 are not read"
     # 30 seconds before the cursor is inside the lag window and is read too.
-    api.put(api.deals, "2", 10_000_000 + 3 * 600_000 - 30_000, dealname="late-visible")
-    assert "2" in [r["id"] for r in read(api, "deals", since=cursor)]
+    api.put(api.deals, "2", cursor_ms - 30_000, dealname="late-visible")
+    assert "2" in [r["id"] for r in read(api, "deals", since=lagged)]
+    # 90 seconds before the cursor is OUTSIDE the one lag: it must not be read (a second, hand-made
+    # step back would reach it, and dlt would then drop it again -- the defect this fixes).
+    api.put(api.deals, "1", cursor_ms - 90_000, dealname="too-old")
+    assert "1" not in [r["id"] for r in read(api, "deals", since=lagged)]
 
 
 def test_contacts_are_searched_on_lastmodifieddate(api: FakeHubspot) -> None:
@@ -255,9 +266,11 @@ def test_a_second_run_reads_only_the_changed_deal_and_the_table_has_no_duplicate
     assert not any(m == "GET" and p == "/crm/v3/objects/deals" for m, p in api.log), "and did not list every deal"
     rows = {r["id"]: r["dealname"] for r in lab.rows("deals")}
     assert rows == {"1": "d1", "2": "d2-changed", "3": "d3", "4": "d4-new"}, "changed and new rows only; merged on id"
-    # The search starts 60 s before the cursor (HubSpot's "few moments" lag), so it
-    # also returned deals 1 and 3; the incremental merge loaded only the two that differ.
-    assert api.searched == ["1", "3", "2", "4"] and second.rows == 2
+    # The search starts 60 s before the cursor (HubSpot's "few moments" lag, now the declared
+    # `lag_seconds`), so it also returned deals 1 and 3; the merge updates them where they are, so
+    # the load reports four rows and the table still holds four, one per id (SHOULD-FIX 21: before,
+    # dlt's cursor filter dropped those two).
+    assert api.searched == ["1", "3", "2", "4"] and second.rows == 4
     assert len(lab.rows("deals")) == 4
 
 
