@@ -157,54 +157,57 @@ pub(crate) fn add_formatting(body: &mut Value, format: &FormatSettings) {
     }
 }
 
-/// The origins of the image and web cards of a payload's dashboard: the
-/// addresses of the cards, as their origin (`https://host[:port]`).
-fn card_origins(body: &Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let Some(charts) = body.get("charts").and_then(Value::as_array) else {
-        return out;
-    };
-    for chart in charts {
-        // The stored definition of a card carries its address; every other
-        // kind has none.
-        let Some(url) = chart
-            .get("def")
-            .and_then(|def| def.get("url"))
-            .and_then(Value::as_str)
-        else {
+/// The content sites of a board's image and web cards: the deployment's list,
+/// in the order it was saved, narrowed to the origins those cards load from
+/// (their address as `https://host[:port]`; every other kind has none).
+///
+/// `PR #233 review SHOULD-FIX 1`: the embed payload (`embed::render_board_payload`)
+/// and the frame answer (`embed::board_content_sites`) both narrow with this
+/// one function over the same cards (`embed::board_cards`), so the policy can
+/// neither refuse a card the payload shows nor allow a site no card uses. The
+/// whole list would tell whoever reads a shared link which sites the
+/// deployment allows (`PR #199 review M SHOULD-FIX BI-16 1`, decision M6), and
+/// a card whose site was taken off the list is not in it any more, so the card
+/// says so, as it does in the console.
+pub(crate) fn content_sites_of_cards(
+    cards: &[&lakehouse_bi::store::StoredChartSpec],
+    format: &FormatSettings,
+) -> Vec<String> {
+    let mut origins: Vec<String> = Vec::new();
+    for card in cards {
+        // The stored definition of an image or web card carries its address;
+        // every other kind has none.
+        let Some(url) = card.def.types.url.as_deref() else {
             continue;
         };
         if let Some(origin) = lakehouse_bi::embed_access::https_origin_of(url)
-            && !out.contains(&origin)
+            && !origins.contains(&origin)
         {
-            out.push(origin);
+            origins.push(origin);
         }
     }
-    out
+    format
+        .content_sites
+        .iter()
+        .filter(|site| origins.contains(site))
+        .cloned()
+        .collect()
 }
 
 /// Add the formatting settings to an anonymous payload (a public link or a
 /// signed embed): the number locale, the company palette and the fonts as
-/// everywhere, but only the content sites of that dashboard's own image and
-/// web cards, and only the ones an administrator still allows.
-///
-/// The whole list would tell whoever reads a public link which sites the
-/// deployment allows (`PR #199 review M SHOULD-FIX BI-16 1`, decision M6). A
-/// card whose site was taken off the list is not in it any more, so the card
-/// says so, as it does in the console.
-pub(crate) fn add_formatting_for_anonymous(body: &mut Value, format: &FormatSettings) {
-    let origins = card_origins(body);
+/// everywhere, and the content sites of that dashboard's own image and web
+/// cards, already narrowed by [`content_sites_of_cards`].
+pub(crate) fn add_formatting_for_anonymous(
+    body: &mut Value,
+    format: &FormatSettings,
+    content_sites: &[String],
+) {
     add_formatting(body, format);
     let Some(reporting) = body.get_mut("reporting").and_then(Value::as_object_mut) else {
         return;
     };
-    let sites: Vec<Value> = format
-        .content_sites
-        .iter()
-        .filter(|site| origins.contains(site))
-        .map(|site| json!(site))
-        .collect();
-    reporting.insert("contentSites".to_owned(), Value::Array(sites));
+    reporting.insert("contentSites".to_owned(), json!(content_sites));
 }
 
 /// Check the optional formatting fields of a body against the closed lists,
@@ -526,19 +529,56 @@ mod tests {
         assert_eq!(got.fonts, ["inter", "system"]);
     }
 
-    /// `PR #199 review M SHOULD-FIX BI-16 1` (decision M6): an anonymous
-    /// payload carries only the origins of that dashboard's own image and web
-    /// cards, and only the ones an administrator still allows.
+    /// A stored `kind` chart on `board`, with `def` as saved.
+    fn card(
+        kind: &str,
+        board: &str,
+        def: serde_json::Value,
+    ) -> lakehouse_bi::store::StoredChartSpec {
+        lakehouse_bi::store::StoredChartSpec {
+            spec: serde_json::from_value(json!({
+                "id": "c", "title": "C", "kind": kind, "mart": "mart_a",
+                "sql": "", "x": "", "y": "visitors"
+            }))
+            .unwrap(),
+            source: lakehouse_bi::specs::ChartSource::Ui,
+            board: board.to_owned(),
+            def: serde_json::from_value(def).unwrap(),
+            has_year: false,
+            created_by: None,
+            created_at: None,
+        }
+    }
+
+    /// A stored image card on `board` whose address is `url`.
+    fn image_card(board: &str, url: &str) -> lakehouse_bi::store::StoredChartSpec {
+        card(
+            "image",
+            board,
+            json!({
+                "title": "C", "mart": "mart_a", "kind": "image",
+                "measures": ["visitors"], "url": url
+            }),
+        )
+    }
+
+    /// `PR #199 review M SHOULD-FIX BI-16 1` (decision M6) and `PR #233
+    /// review SHOULD-FIX 1`: an anonymous payload carries only the origins of
+    /// that dashboard's own image and web cards, and only the ones an
+    /// administrator still allows.
     #[test]
-    fn an_anonymous_payload_carries_only_the_sites_of_its_own_cards() {
-        let mut payload = json!({
-            "reporting": { "timeZone": "UTC" },
-            "charts": [
-                { "def": { "kind": "image", "url": "https://img.example/logo.png" } },
-                { "def": { "kind": "web", "url": "https://status.example/board" } },
-                { "def": { "kind": "bar", "dimension": "x" } }
-            ]
-        });
+    fn the_content_sites_are_the_ones_the_boards_cards_load_from() {
+        let img = image_card("b1", "https://img.example/logo.png");
+        let status = image_card("b1", "https://status.example/board");
+        // A bar chart has no address of its own.
+        let bar = card(
+            "bar",
+            "b1",
+            json!({
+                "title": "B", "mart": "mart_a", "kind": "bar",
+                "dimension": "x", "measures": ["visitors"]
+            }),
+        );
         let format = FormatSettings {
             content_sites: vec![
                 "https://img.example".to_owned(),
@@ -547,23 +587,39 @@ mod tests {
             ],
             ..FormatSettings::default()
         };
-        add_formatting_for_anonymous(&mut payload, &format);
+        assert_eq!(
+            content_sites_of_cards(&[&img, &status, &bar], &format),
+            ["https://img.example", "https://status.example"]
+        );
+        // A card whose site was taken off the list is not in it, so the card
+        // says the site is no longer allowed.
+        let mut without = format.clone();
+        without.content_sites = vec!["https://other.example".to_owned()];
+        assert!(content_sites_of_cards(&[&img], &without).is_empty());
+        assert!(content_sites_of_cards(&[], &format).is_empty());
+    }
+
+    #[test]
+    fn an_anonymous_payload_carries_the_content_sites_it_is_given() {
+        let mut payload = json!({ "reporting": { "timeZone": "UTC" } });
+        let format = FormatSettings {
+            content_sites: vec![
+                "https://img.example".to_owned(),
+                "https://other.example".to_owned(),
+            ],
+            ..FormatSettings::default()
+        };
+        add_formatting_for_anonymous(&mut payload, &format, &["https://img.example".to_owned()]);
         assert_eq!(
             payload["reporting"]["contentSites"],
-            json!(["https://img.example", "https://status.example"])
+            json!(["https://img.example"])
         );
         // The rest of the formatting rides along as everywhere.
         assert_eq!(payload["reporting"]["numberLocale"], json!("en-US"));
-        // A card whose site was taken off the list is not in it, so the card
-        // says the site is no longer allowed.
-        let mut gone = json!({
-            "reporting": { "timeZone": "UTC" },
-            "charts": [{ "def": { "kind": "image", "url": "https://img.example/logo.png" } }]
-        });
-        let mut without = format.clone();
-        without.content_sites = vec!["https://other.example".to_owned()];
-        add_formatting_for_anonymous(&mut gone, &without);
-        assert_eq!(gone["reporting"]["contentSites"], json!([]));
+
+        let mut none = json!({ "reporting": { "timeZone": "UTC" } });
+        add_formatting_for_anonymous(&mut none, &format, &[]);
+        assert_eq!(none["reporting"]["contentSites"], json!([]));
     }
 
     #[test]
