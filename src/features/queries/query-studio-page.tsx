@@ -17,6 +17,7 @@ import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import { summarizeQuery } from "@/lib/page-context-summary"
+import { SchemaBrowser } from "./schema-browser"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -26,6 +27,7 @@ export function QueryStudioPage() {
   const studio = useQueryStudio()
   const [saveOpen, setSaveOpen] = React.useState(false)
   const [sourceOpen, setSourceOpen] = React.useState(false)
+  const [schemaOpen, setSchemaOpen] = React.useState(false)
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
 
@@ -72,11 +74,27 @@ export function QueryStudioPage() {
               <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlPanel
-                studio={studio}
-                onSave={() => setSaveOpen(true)}
-                onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
-              />
+              {/* The browser sits beside the editor and never replaces it:
+                  whatever the catalog answers, the editor keeps its width
+                  and stays usable. */}
+              <div
+                className={
+                  schemaOpen ? "grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]" : undefined
+                }
+              >
+                <div className="min-w-0">
+                  <SqlPanel
+                    studio={studio}
+                    onSave={() => setSaveOpen(true)}
+                    onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
+                    onToggleSchema={() => setSchemaOpen((open) => !open)}
+                    schemaOpen={schemaOpen}
+                  />
+                </div>
+                {schemaOpen ? (
+                  <SchemaBrowser studio={studio} onClose={() => setSchemaOpen(false)} />
+                ) : null}
+              </div>
               {/*
                * Iceberg time travel: pins one version of the raw tables
                * through a query setting. Shown whatever the engine, and

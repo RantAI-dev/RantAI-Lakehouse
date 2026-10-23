@@ -1,7 +1,16 @@
 "use client"
 
 import * as React from "react"
-import { BookOpen, LayoutDashboard, Play, Save, Settings, Square, WandSparkles } from "lucide-react"
+import {
+  BookOpen,
+  Database,
+  LayoutDashboard,
+  Play,
+  Save,
+  Settings,
+  Square,
+  WandSparkles,
+} from "lucide-react"
 
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql, type KeywordCase } from "@/lib/sql-format"
@@ -48,11 +57,16 @@ export function SqlPanel({
   studio,
   onSave,
   onSaveAsSource,
+  onToggleSchema,
+  schemaOpen = false,
 }: {
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onSave: () => void
   /** Present only when the principal may author dashboard SQL sources. */
   readonly onSaveAsSource?: () => void
+  /** Present when the page has a schema browser to open and close. */
+  readonly onToggleSchema?: () => void
+  readonly schemaOpen?: boolean
 }) {
   const {
     sql,
@@ -89,7 +103,12 @@ export function SqlPanel({
       {/* The editor gets the console's own completion source, not the
           language extension's schema: the tables and columns come from the
           catalog, under the names a query can actually use. */}
-      <SqlEditor value={sql} onChange={setSql} extensions={completionExtensions} />
+      <SqlEditor
+        value={sql}
+        onChange={setSql}
+        extensions={completionExtensions}
+        onView={(view) => studio.setEditorView(view)}
+      />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={engine} onValueChange={(v) => setEngine(v as typeof engine)}>
           <SelectTrigger size="sm" className="w-32">
@@ -179,6 +198,17 @@ export function SqlPanel({
             </div>
           </PopoverContent>
         </Popover>
+        {onToggleSchema ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onToggleSchema}
+            aria-pressed={schemaOpen}
+          >
+            <Database className="size-4" aria-hidden />
+            Schema
+          </Button>
+        ) : null}
         <Button
           size="sm"
           variant="ghost"

@@ -12,6 +12,7 @@
  * a comment is not mistaken for code.
  */
 
+import type { DataLayer } from "./status"
 import { tokenizeSql, type SqlToken } from "./sql-text"
 
 /** A table the catalog shows, and the names a person may write for it. */
@@ -22,6 +23,8 @@ export type CompletionTable = {
   label: string
   /** The SQL name to insert, e.g. `silver.mart_wisman`. Empty when the catalog does not say. */
   reference: string
+  /** The layer the catalog files the table under; the schema browser groups by it, the completion ignores it. */
+  layer: DataLayer
   /** Every name the table answers to: its id and its display name (`namespace.name`). */
   names: string[]
 }
@@ -30,7 +33,8 @@ export type CompletionTable = {
 export type ColumnState =
   | { status: "loading" }
   | { status: "ready"; columns: { name: string; dataType: string }[] }
-  | { status: "failed" }
+  /** `reason` is the catalog's own refusal, when it gave one; the completion note stays the same either way. */
+  | { status: "failed"; reason?: string }
 
 /** One suggestion. */
 export type CompletionOption = {

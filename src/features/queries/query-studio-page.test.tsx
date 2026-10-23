@@ -159,3 +159,43 @@ describe("QueryStudioPage format settings", () => {
     })
   })
 })
+
+describe("QueryStudioPage schema browser", () => {
+  it("keeps the editor and the run working when the catalog refuses the schema browser", async () => {
+    stubNetwork()
+    spyOn(assetService, "listAssets").mockRejectedValue(
+      new ServiceError("permission_denied", "catalog:read", 403)
+    )
+    const run = spyOn(queryService, "run").mockRejectedValue(
+      new ServiceError("invalid_request", "stopped here")
+    )
+    seedDraft("SELECT 1")
+    const { container } = renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Schema" }))
+    expect(await screen.findByText(/needs catalog access/i)).toBeTruthy()
+
+    // The refusal sits beside the editor, not in place of it.
+    expect(container.querySelector(".cm-content")).not.toBeNull()
+    const runButton = await screen.findByRole("button", { name: "Run query" })
+    await waitFor(() => expect((runButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(runButton)
+    await waitFor(() => expect(run).toHaveBeenCalledTimes(1))
+    await screen.findByText(/stopped here/)
+  })
+
+  it("closes the browser from its own button and from the toolbar toggle", async () => {
+    stubNetwork()
+    seedDraft("SELECT 1")
+    renderPage()
+
+    const toggle = await screen.findByRole("button", { name: "Schema" })
+    expect(toggle.getAttribute("aria-pressed")).toBe("false")
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute("aria-pressed")).toBe("true")
+    fireEvent.click(await screen.findByRole("button", { name: "Close schema browser" }))
+
+    expect(screen.queryByRole("complementary", { name: "Schema browser" })).toBeNull()
+    expect(toggle.getAttribute("aria-pressed")).toBe("false")
+  })
+})

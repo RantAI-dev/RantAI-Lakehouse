@@ -13,18 +13,21 @@ const TABLES: CompletionTable[] = [
     id: "silver.orders",
     label: "Orders",
     reference: "silver.orders",
+    layer: "silver",
     names: ["silver.orders", "silver.Orders"],
   },
   {
     id: "serving.customers",
     label: "Customers",
     reference: "serving.customers",
+    layer: "gold",
     names: ["serving.customers", "serving.Customers"],
   },
   {
     id: "demo_orders",
     label: "Demo Orders",
     reference: "",
+    layer: "raw",
     names: ["demo_orders", "bronze.Demo Orders"],
   },
 ]
@@ -135,6 +138,34 @@ test("sqlCompletionOptions memberi satu pesan saat kolom tabel gagal dimuat", ()
   assert.equal(options[0]?.label, "Columns could not be loaded")
   assert.equal(options[0]?.kind, "message")
   assert.equal(options[0]?.apply, undefined)
+})
+
+test("sqlCompletionOptions menyebut kegagalan dengan kalimat yang sama walau ada alasan penolakan", () => {
+  const sql = "SELECT o. FROM silver.orders o"
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: after(sql, "o."),
+    tables: TABLES,
+    columns: { "silver.orders": { status: "failed", reason: "Tenant belum dikonfigurasi" } },
+  })
+  // The reason belongs to the schema browser; the editor keeps its one line.
+  assert.equal(options.length, 1)
+  assert.equal(options[0]?.label, "Columns could not be loaded")
+})
+
+test("sqlCompletionOptions tidak peduli pada layer tabel", () => {
+  const sql = "SELECT * FROM "
+  const { options } = sqlCompletionOptions({
+    sql,
+    cursor: sql.length,
+    tables: TABLES,
+    columns: {},
+  })
+  // Silver, gold and raw tables alike: only those with a SQL name are offered.
+  assert.deepEqual(
+    options.map((option) => option.label),
+    ["silver.orders", "serving.customers"]
+  )
 })
 
 test("sqlCompletionOptions tidak memberi kolom untuk tabel yang tidak ada di katalog", () => {

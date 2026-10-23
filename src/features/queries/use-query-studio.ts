@@ -2,8 +2,11 @@
 
 import * as React from "react"
 
+import type { EditorView } from "@codemirror/view"
+
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { catalogRefusal } from "@/lib/catalog-refusal"
 import { readDraft, writeDraft } from "@/lib/query-draft"
 import {
   tablesInStatement,
@@ -105,6 +108,7 @@ export function useQueryStudio() {
       id: asset.id,
       label: asset.name,
       reference: SQL_TABLE_NAME.test(asset.id) ? asset.id : "",
+      layer: asset.layer,
       names: [asset.id, `${asset.namespace}.${asset.name}`],
     }))
   }, [assetsState.status, assetsState.data])
@@ -133,29 +137,79 @@ export function useQueryStudio() {
     }
   }, [])
 
-  React.useEffect(() => {
-    if (assetsState.status !== "success") return
-    for (const named of tablesInStatement(sql, tables)) {
-      // The cache answers "has this table been asked for yet?": a table
-      // named twice is fetched once, and a table that failed is not asked
-      // for again.
-      if (named.id in columnsRef.current) continue
-      rememberColumns(named.id, { status: "loading" })
-      void assetService.getAsset(named.id).then(
-        (detail) =>
-          rememberColumns(named.id, {
+  // Fetches one table's columns and keeps what came back.
+  //
+  // The tenant gate answers a refusal with `200` and a body that has no
+  // `schema`, so a refusal is read before the schema is. Without that, the
+  // `.map` below threw inside the handler and the table stayed "loading"
+  // for good.
+  const fetchColumns = React.useCallback(
+    (id: string) => {
+      rememberColumns(id, { status: "loading" })
+      void assetService.getAsset(id).then(
+        (detail) => {
+          const refusal = catalogRefusal(detail)
+          if (refusal) {
+            rememberColumns(id, { status: "failed", reason: refusal.reason })
+            return
+          }
+          rememberColumns(id, {
             status: "ready",
             columns: detail.schema.map((column) => ({
               name: column.name,
               dataType: column.dataType,
             })),
-          }),
-        // The catalog refused or the request failed: the table is kept as
-        // a failure, and the editor says so instead of asking again.
-        () => rememberColumns(named.id, { status: "failed" })
+          })
+        },
+        // The request failed: the table is kept as a failure, and the
+        // editor says so instead of asking again.
+        () => rememberColumns(id, { status: "failed" })
       )
+    },
+    [rememberColumns]
+  )
+
+  React.useEffect(() => {
+    if (assetsState.status !== "success") return
+    for (const named of tablesInStatement(sql, tables)) {
+      // The cache answers "has this table been asked for yet?": a table
+      // named twice is fetched once, and a table that failed is not asked
+      // for again on a keystroke.
+      if (named.id in columnsRef.current) continue
+      fetchColumns(named.id)
     }
-  }, [sql, tables, assetsState.status, rememberColumns])
+  }, [sql, tables, assetsState.status, fetchColumns])
+
+  // The schema browser asks for a table's columns when a person expands it.
+  // It shares the cache above, so a table the statement already named is not
+  // fetched twice. Only a person pressing "Retry" (`retry`) may fetch a
+  // failed table again: a keystroke never does.
+  const loadColumns = React.useCallback(
+    (id: string, options: { retry?: boolean } = {}) => {
+      const cached = columnsRef.current[id]
+      if (cached && !(options.retry && cached.status === "failed")) return
+      fetchColumns(id)
+    },
+    [fetchColumns]
+  )
+
+  // The editor's view is kept in a ref: the browser needs it at click time
+  // only, and a state update would re-render the page for a view that
+  // never changes what is drawn.
+  const viewRef = React.useRef<EditorView | null>(null)
+  const setEditorView = React.useCallback((view: EditorView) => {
+    viewRef.current = view
+  }, [])
+  const insertAtCursor = React.useCallback((text: string) => {
+    const view = viewRef.current
+    if (!view) return
+    const { from, to } = view.state.selection.main
+    view.dispatch({
+      changes: { from, to, insert: text },
+      selection: { anchor: from + text.length },
+    })
+    view.focus()
+  }, [])
 
   // The suggestions the editor offers. The source is built once and reads
   // the cache when it is asked, so a keystroke never waits for the network.
@@ -344,8 +398,12 @@ export function useQueryStudio() {
     setSql,
     engine,
     setEngine,
+    assetsState,
     tables,
     columns,
+    loadColumns,
+    setEditorView,
+    insertAtCursor,
     completionSource,
     completionExtensions,
     estimatable,
