@@ -1560,3 +1560,55 @@ OK. The fix round is re-run after round 2.
   Fix: make it a tuple (`("/pages",)`), and make the code refuse a bare
   string (normalise or assert a tuple) so the same slip cannot come back.
   Cite `BLOCKER 19 (round 2)`.
+
+### Handoff: final review round 2 (developer, 2026-10-23)
+
+One commit, one task: `bdb1d359` — `fix(g6): Confluence's read markers are
+tuples, and the gate refuses a bare string` (BLOCKER 19, round 2).
+
+What changed:
+
+- `ops/g6/g6_saas_test.py`: both Confluence entries (the API-token one and
+  `confluence-browser`) now set `"list_marker": ("/pages",)`. A new
+  `_markers(spec, key)` returns `spec[key]` as a tuple, `()` when absent,
+  and raises `SaasGateFailure` on a bare string (not normalised to a
+  one-element tuple: the gate fails loudly rather than pass on nothing).
+  `reads_marker`, `full_read_marker` and `list_marker` are all read through
+  it, so the character-by-character iteration cannot come back. The three
+  call sites and both spec entries carry the
+  `PR #216 final review BLOCKER 19 (round 2)` citation and the reason.
+- `ops/g6/test_saas_gate_markers.py` (new): six unittest cases, no network
+  and no docker — the helper's absent/tuple/string cases, all three marker
+  keys of every entry are tuples of strings, and both Confluence entries
+  match a page request but not `POST /api/v1/connectors/4/test`.
+
+Commands run, with results:
+
+- `python3 -m py_compile ops/g6/g6_saas_test.py
+  ops/g6/test_saas_gate_markers.py`: OK.
+- `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`: **6 tests, 0
+  failures, 0 errors**.
+- Mutation check: with `"list_marker": "/pages"` put back by hand, the same
+  discover run gives **2 failures + 2 errors** (the tuple assertion and the
+  helper call); restored, 6 pass. The old string form counts
+  `POST /api/v1/connectors/4/test` as a page read, the tuple form does not.
+- Type sweep of every `PRODUCT_VENDORS` value: `list_marker`,
+  `reads_marker` and `full_read_marker` are the only marker lists and are
+  now `tuple` in all 16 entries; `cursor_value` is still a regex string by
+  design (used with `re.findall`), `columns`/`order`/`text`/`key` are SQL
+  fragments or scalars, and the remaining iterables are `set`/`list`/
+  callables as before.
+
+Not verified, and why:
+
+- **The `g6-saas` gate has not run.** It needs the docker stack, which this
+  task does not start; only the script and its unit test were run. CI
+  decides whether the changed read counts hold against the mock (both
+  Confluence entries must now see fewer page requests on the reload than
+  on the first run, at most 2).
+- **The new unit test is not discovered by CI.** It imports the gate module,
+  which imports `requests`, and the `repo-lints` job installs no
+  third-party packages; the test docstring says to run it with
+  `python3 -m unittest discover -s ops/g6 -p 'test_*.py'`. Wiring it in
+  needs a `pip install` step in that job, which this fix deliberately does
+  not add.
