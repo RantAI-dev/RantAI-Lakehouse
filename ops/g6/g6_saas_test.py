@@ -144,6 +144,28 @@ def _expect(condition: bool, message: str) -> None:
         raise SaasGateFailure(message)
 
 
+def _markers(spec: dict, key: str) -> tuple[str, ...]:
+    """`spec[key]` as a tuple of request markers, refusing a bare string.
+
+    PR #216 final review BLOCKER 19 (round 2): `"list_marker": "/pages"` was a
+    bare string, and `any(m in line for m in list_marker)` iterates a string's
+    characters, so every request carrying a `/` counted as a page read and the
+    read counts compared all requests instead of page reads. A string is never
+    a marker list, so it is refused here rather than normalised into a
+    one-element tuple: the gate fails loudly instead of passing on nothing.
+    """
+    value = spec.get(key)
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raise SaasGateFailure(
+            f"{spec.get('label', key)}: {key} is a bare string ({value!r}); "
+            f"it must be a tuple of markers such as ({value!r},) "
+            "(PR #216 final review BLOCKER 19, round 2)"
+        )
+    return tuple(value)
+
+
 def _raises(expected: str, call) -> Exception:  # noqa: ANN001
     """The exception `call` raises, which must be of the class named `expected`
     and must not hold any word the mock's error bodies carry."""
@@ -1225,10 +1247,11 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
             {"action": "put", "id": 6},
         ],
-        # PR #216 final review BLOCKER 19: Confluence filters in the loader (sorted newest first,
+        # PR #216 final review BLOCKER 19 (round 2): Confluence filters in the loader (sorted newest first,
         # stop at the cursor), so no request carries the filter; the proof is that the reload reads
-        # fewer pages than the first run (which reads them all).
-        "list_marker": "/pages", "max_reads": 2, "first_reads_more_than_reload": True,
+        # fewer pages than the first run (which reads them all). The marker is a TUPLE: as a bare
+        # string it was iterated character by character, and every request carrying a `/` counted.
+        "list_marker": ("/pages",), "max_reads": 2, "first_reads_more_than_reload": True,
     },
     # BLOCKER 13 of the slice 4 review: the other signed way into Confluence, the browser sign-in. The API's
     # connection test refreshes the token, reads accessible-resources, picks the connector's site and asks the
@@ -1249,7 +1272,9 @@ PRODUCT_VENDORS: dict[str, dict] = {
             {"action": "put", "id": 2, "fields": {"title": "page 2 changed"}},
             {"action": "put", "id": 6},
         ],
-        "list_marker": "/pages", "max_reads": 2, "first_reads_more_than_reload": True,
+        # the page-read evidence is the same as the API-token entry's above: a tuple marker (`_markers`
+        # refuses a bare string, PR #216 final review BLOCKER 19, round 2).
+        "list_marker": ("/pages",), "max_reads": 2, "first_reads_more_than_reload": True,
     },
     # SharePoint (V-SharePoint.4): both signed ways. Client credentials: the API's connection test and the orchestrator
     # exchange the app's id and secret at the customer's tenant (the tenant is part of the account, AD2). A list is read by
@@ -1650,7 +1675,7 @@ def step_product(vendor_id: str) -> None:
     # as well (the old `/pages`, `runReport`, `customreport2`) let a product that forgot the cursor
     # pass, because the merge hid the repeats. A vendor whose cursor the loader applies (Confluence,
     # GA4) or that is re-read in full (Workday) has its own evidence, below and in its block above.
-    markers = spec.get("reads_marker")
+    markers = _markers(spec, "reads_marker")
     if markers:
         _expect(
             any(all(m in line for m in markers) for line in seen),
@@ -1668,12 +1693,14 @@ def step_product(vendor_id: str) -> None:
             bool(first_values) and bool(reload_values) and max(reload_values) > max(first_values),
             f"{vendor_id} reload: the cursor value did not move past the first run's ({first_values} -> {reload_values})",
         )
-    for marker in spec.get("full_read_marker") or ():
+    for marker in _markers(spec, "full_read_marker"):
         _expect(
             any(marker in line for line in seen) and any(marker in line for line in first_seen),
             f"{vendor_id} reload: the full read ({marker}) is not in both runs ({first_seen} / {seen})",
         )
-    list_marker = spec.get("list_marker") or markers or ("/search", "cursor", "incremental")
+    # PR #216 final review BLOCKER 19 (round 2): every marker list comes through `_markers`, which
+    # refuses a bare string -- a string here is iterated character by character by the counts below.
+    list_marker = _markers(spec, "list_marker") or markers or ("/search", "cursor", "incremental")
     reads = [line for line in seen if any(m in line for m in list_marker)]
     if spec.get("max_reads"):
         _expect(len(reads) <= spec["max_reads"], f"{vendor_id} reload: {len(reads)} list requests; an incremental read stops near the cursor ({reads})")
