@@ -348,11 +348,15 @@ jobs:
         working-directory: rust
 
   # ── Rust: MSRV compile check ─────────────────────────────────────────
-  # In PR 1, the 1.88.0 MSRV test run is converted into a fast compile check
-  # (cargo check --workspace --all-targets --locked) so we ensure MSRV
-  # compatibility without duplicating the full integration test run time.
+  # Adds a fast compile check of the declared minimum (REL-9: it moved to
+  # the latest stable, so it is checked one patch below the pin) without
+  # duplicating the full integration test run time. The `+1.99.0` is
+  # load-bearing: `rust/rust-toolchain.toml` overrides whatever toolchain
+  # the checkout action installs as the default (rustup precedence:
+  # command-line spec > rust-toolchain file > default), so a plain
+  # `cargo check` here would rebuild this job on the pin, not the floor.
   msrv:
-    name: Rust · MSRV check (1.88.0)
+    name: Rust · MSRV check (1.99.0)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -364,7 +368,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
 
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
@@ -372,10 +376,10 @@ jobs:
         with:
           workspaces: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: msrv-1.88.0
+          key: msrv-1.99.0
 
-      - name: cargo check --workspace --all-targets --locked
-        run: cargo check --workspace --all-targets --locked
+      - name: cargo +1.99.0 check --workspace --all-targets --locked
+        run: cargo +1.99.0 check --workspace --all-targets --locked
         working-directory: rust
 
   # ── Rust: G1 acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,

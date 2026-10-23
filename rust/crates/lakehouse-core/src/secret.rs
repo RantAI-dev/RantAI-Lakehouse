@@ -177,8 +177,9 @@ pub enum SecretFailure {
 /// # Object safety and async
 ///
 /// Deliberately `async fn` via `#[async_trait]`-free native async-in-trait
-/// (stabilized on this workspace's MSRV, `1.88`) rather than a sync
-/// signature: a real external-provider implementation (Vault, AWS Secrets
+/// (stabilized well below this workspace's `rust-version = "1.99"` floor)
+/// rather than a sync signature: a real external-provider implementation
+/// (Vault, AWS Secrets
 /// Manager) is a network call, and forcing a sync signature today would
 /// mean every future implementation either blocks a runtime thread or the
 /// trait needs a breaking change later. Getting this right now is exactly
