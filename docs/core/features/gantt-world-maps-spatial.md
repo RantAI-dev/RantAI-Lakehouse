@@ -43,8 +43,8 @@ they fall in. There is no way to add a chart type of one's own.
 | 6 | **Distance** is the distance on the Earth's surface (WGS 84 ellipsoid) in kilometres (or metres, chosen in the formula), from latitude and longitude columns. | Planner default — owner to confirm at QA |
 | 7 | **RegionOf(map, lat, lon)** names the region of a map a point falls in, or empty when none; it is computed on the engine against the map's full (unsimplified) boundaries, stored on the engine for this purpose when the map is uploaded. | Planner default — owner to confirm at QA |
 | 8 | **Masks and row filters** apply to the point data as for every chart; boundaries are not data and have no masks. | Planner default — owner to confirm at QA |
-| 9 | **Custom charts.** Recommended: no plugin that runs customer code in the console; if wanted, a later part offers a custom chart from a declarative template (an ECharts option with placeholders for the chart's columns, no scripts, no functions), checked on save. | **Owner to sign before building** (Q3) |
-| 10 | **Upload size.** 50 MB per boundary file (the spec's proposed number), simplified to 5 MB for drawing. | **Owner to sign before building** (Q4) |
+| 9 | **Custom charts.** Recommended: no plugin that runs customer code in the console; if wanted, a later part offers a custom chart from a declarative template (an ECharts option with placeholders for the chart's columns, no scripts, no functions), checked on save. | **Signed by the owner, 2026-10-24** (Q3) |
+| 10 | **Upload size.** 50 MB per boundary file (the spec's proposed number), simplified to 5 MB for drawing. | **Signed by the owner, 2026-10-24** (Q4) |
 
 ## Limits to tell a customer
 

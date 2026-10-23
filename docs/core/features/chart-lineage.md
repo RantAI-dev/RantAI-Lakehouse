@@ -35,7 +35,7 @@ changed.
 
 | # | Decision | Default |
 | --- | --- | --- |
-| 1 | **Who sees it.** The chart's path needs `lineage:read` (Analyst and above today), like the lineage page. A Dashboard Viewer sees the menu item with the sentence "Lineage needs the lineage permission; ask your administrator", not the path. | **Owner to sign before building** (Q6) |
+| 1 | **Who sees it.** The chart's path needs `lineage:read` (Analyst and above today), like the lineage page. A Dashboard Viewer sees the menu item with the sentence "Lineage needs the lineage permission; ask your administrator", not the path. | **Signed by the owner, 2026-10-24** (Q6) |
 | 2 | **What a chart's path starts from.** The chart's own record: its mart, its SQL source, its joined tables, its combined questions' sources (`BI-13`), and the metrics its measures use. Each is a node with its own kind (chart, SQL source, metric). | Planner default — owner to confirm at QA |
 | 3 | **Refresh times** come from the records already kept: a Gold or Silver table's last build (the statement that last wrote it), a Bronze table's last change (the Iceberg table's last update), a connector's last successful run, an upload's time. A step without a record says "not recorded". | Planner default — owner to confirm at QA |
 | 4 | **Columns.** Where `DATA-13` recorded column mappings, each of the chart's fields lists its source columns step by step; a field computed in a formula lists the columns the formula names. | Planner default — owner to confirm at QA |

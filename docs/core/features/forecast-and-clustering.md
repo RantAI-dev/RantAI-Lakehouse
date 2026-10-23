@@ -33,7 +33,7 @@ chart shows points but not the groups they fall into.
 
 | # | Decision | Default |
 | --- | --- | --- |
-| 1 | **Method.** Exponential smoothing, chosen automatically like Tableau: the product tries level only, level and trend, level and seasons, and level, trend and seasons (additive), and keeps the one that fits best by a standard score (AICc). Seasons follow the chart's period: 12 for months, 4 for quarters, 7 for days, 52 for weeks, 24 for hours; none for years. The band is the model's own 95 % prediction interval. | **Owner to sign before building** (Q5) |
+| 1 | **Method.** Exponential smoothing, chosen automatically like Tableau: the product tries level only, level and trend, level and seasons, and level, trend and seasons (additive), and keeps the one that fits best by a standard score (AICc). Seasons follow the chart's period: 12 for months, 4 for quarters, 7 for days, 52 for weeks, 24 for hours; none for years. The band is the model's own 95 % prediction interval. | **Signed by the owner, 2026-10-24** (Q5) |
 | 2 | **Honesty thresholds.** No forecast below 5 periods; seasons only with at least 2 full seasons of history; more than 10 % of periods missing → no forecast; up to 10 % missing are filled in a straight line and the note says how many. Each refusal is a sentence on the chart, never a line. | Planner default — owner to confirm at QA |
 | 3 | **The current period is left out** when it is not finished (it contains today in the report time zone), and the note says so, because a half month looks like a fall. | Planner default — owner to confirm at QA |
 | 4 | **Horizon.** 1 to 60 periods, and never more than the length of the history. | Planner default — owner to confirm at QA |
