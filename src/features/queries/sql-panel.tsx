@@ -1,11 +1,12 @@
 "use client"
 
 import * as React from "react"
-import { BookOpen, LayoutDashboard, Play, Save, Square, WandSparkles } from "lucide-react"
+import { BookOpen, LayoutDashboard, Play, Save, Settings, Square, WandSparkles } from "lucide-react"
 
 import { SqlEditor } from "@/components/sql-editor"
-import { formatSql } from "@/lib/sql-format"
+import { formatSql, type KeywordCase } from "@/lib/sql-format"
 import { Button } from "@/components/ui/button"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Select,
   SelectContent,
@@ -13,7 +14,29 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { useFormatSettings } from "./use-format-settings"
 import type { useQueryStudio } from "./use-query-studio"
+
+/** What the keyword case is called in the settings control. */
+const KEYWORD_CASE_LABELS: Record<KeywordCase, string> = {
+  upper: "Upper case",
+  lower: "Lower case",
+  preserve: "As typed",
+}
+
+/** What the indent is called in the settings control. */
+const INDENT_LABELS: Record<"0" | "2" | "4", string> = {
+  "0": "No indent",
+  "2": "2 spaces",
+  "4": "4 spaces",
+}
+
+/** The indent the control picked, or none when it picked something else. */
+function indentOf(value: string | null): 0 | 2 | 4 {
+  if (value === "2") return 2
+  if (value === "4") return 4
+  return 0
+}
 
 /**
  * The SQL editor and everything you can do to what is in it.
@@ -47,6 +70,7 @@ export function SqlPanel({
   const running = runAct.status === "pending"
   const explainBusy = explain.busy
   const explainRun = explain.run
+  const { settings, setSettings } = useFormatSettings()
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -100,12 +124,58 @@ export function SqlPanel({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => setSql(formatSql(sql))}
+          onClick={() => setSql(formatSql(sql, settings))}
           disabled={!estimatable}
         >
           <WandSparkles className="size-4" aria-hidden />
           Format
         </Button>
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button size="sm" variant="outline">
+              <Settings className="size-4" aria-hidden />
+              Format settings
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-64 gap-3">
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-muted-foreground">Keyword case</p>
+              <Select
+                value={settings.keywordCase}
+                items={KEYWORD_CASE_LABELS}
+                onValueChange={(v) =>
+                  setSettings({ ...settings, keywordCase: (v ?? "upper") as KeywordCase })
+                }
+              >
+                <SelectTrigger size="sm" className="w-full" aria-label="Keyword case">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="upper">Upper case</SelectItem>
+                  <SelectItem value="lower">Lower case</SelectItem>
+                  <SelectItem value="preserve">As typed</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-muted-foreground">Indent</p>
+              <Select
+                value={String(settings.indent)}
+                items={INDENT_LABELS}
+                onValueChange={(v) => setSettings({ ...settings, indent: indentOf(v) })}
+              >
+                <SelectTrigger size="sm" className="w-full" aria-label="Indent">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">No indent</SelectItem>
+                  <SelectItem value="2">2 spaces</SelectItem>
+                  <SelectItem value="4">4 spaces</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </PopoverContent>
+        </Popover>
         <Button
           size="sm"
           variant="ghost"

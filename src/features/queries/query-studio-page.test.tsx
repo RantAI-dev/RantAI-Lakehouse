@@ -27,6 +27,7 @@ import { CopilotProvider } from "@/features/copilot/use-copilot"
 import { assetService, lakehouseService, queryService } from "@/services"
 import { ServiceError } from "@/services/errors"
 import { QUERY_DRAFT_KEY } from "@/lib/query-draft"
+import { SQL_FORMAT_SETTINGS_KEY } from "@/lib/sql-format-settings"
 import { QueryStudioPage } from "./query-studio-page"
 
 afterEach(() => {
@@ -115,5 +116,46 @@ describe("QueryStudioPage Fix with AI", () => {
     fireEvent.click(runButton)
     await waitFor(() => expect(run).toHaveBeenCalledTimes(2))
     expect(await screen.findByRole("button", { name: /Fix with AI/ })).toBeTruthy()
+  })
+})
+
+describe("QueryStudioPage format settings", () => {
+  it("menampilkan pengaturan format yang tersimpan di browser ini", async () => {
+    stubNetwork()
+    window.localStorage.setItem(
+      SQL_FORMAT_SETTINGS_KEY,
+      JSON.stringify({ keywordCase: "lower", indent: 4 })
+    )
+    seedDraft("select a from t")
+    renderPage()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Format settings" }))
+    await waitFor(() =>
+      expect(screen.getByRole("combobox", { name: "Keyword case" }).textContent).toContain(
+        "Lower case"
+      )
+    )
+    expect(screen.getByRole("combobox", { name: "Indent" }).textContent).toContain("4 spaces")
+  })
+
+  it("memformat dengan pengaturan yang tersimpan", async () => {
+    stubNetwork()
+    window.localStorage.setItem(
+      SQL_FORMAT_SETTINGS_KEY,
+      JSON.stringify({ keywordCase: "lower", indent: 2 })
+    )
+    seedDraft("select a from t")
+    const { container } = renderPage()
+
+    const formatButton = await screen.findByRole("button", { name: "Format" })
+    await waitFor(() => expect((formatButton as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(formatButton)
+
+    await waitFor(() => {
+      const lines = Array.from(container.querySelectorAll(".cm-line")).map(
+        (line) => line.textContent ?? ""
+      )
+      expect(lines.join("\n")).toBe("select\n  a\nfrom\n  t")
+    })
   })
 })
