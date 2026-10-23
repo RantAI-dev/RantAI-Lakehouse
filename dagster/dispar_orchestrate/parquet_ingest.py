@@ -67,7 +67,9 @@ class UnsupportedColumn(ValueError):
 
 def open_parquet(handle) -> pq.ParquetFile:
     """The file, opened for reading by ranges, with `INT96` as microseconds."""
-    return pq.ParquetFile(handle, coerce_int96_timestamp_unit="us")
+    # `pre_buffer=False` (`PR #186 review BLOCKER 6`): the default caches every byte range it
+    # fetched until the file is closed, so reading a file in batches held the whole file.
+    return pq.ParquetFile(handle, coerce_int96_timestamp_unit="us", pre_buffer=False)
 
 
 def column_names_of(parquet_file: pq.ParquetFile) -> list[str]:

@@ -170,7 +170,7 @@ from pydantic import TypeAdapter
 from pyiceberg.expressions import AlwaysTrue
 from pyiceberg.types import IcebergType
 
-from dispar_orchestrate.adapters import dedup, history
+from dispar_orchestrate.adapters import dedup, history, iceberg_stream
 
 logger = logging.getLogger(__name__)
 
@@ -1002,6 +1002,9 @@ def load_via_sink(
     `dlt` (`_replace_changing_types`); it never drops the table.
     """
     _install_catalog_env(config)
+    # PR #186 review BLOCKER 6: dlt's Iceberg job reads the whole load into memory; see
+    # `iceberg_stream`. Before any pipeline exists, so every job of this load takes the path.
+    iceberg_stream.install()
     if plan.refresh == "remove":
         # SRC-10 decision 5: refresh, removing old rows. Emptied here, at the point
         # of loading, after the adapter's schema check let the table through (the
