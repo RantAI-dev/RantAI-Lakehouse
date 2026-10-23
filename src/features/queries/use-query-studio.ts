@@ -153,7 +153,10 @@ function newTabId(): string {
   const random = globalThis.crypto?.randomUUID?.()
   if (random) return random
   tabCounter += 1
-  return `tab-${Date.now().toString(36)}-${tabCounter}`
+  // Random entropy prevents id collisions between windows sharing the same
+  // localStorage draft when creating a tab in the same millisecond.
+  const entropy = Math.random().toString(36).slice(2, 8)
+  return `tab-${Date.now().toString(36)}-${tabCounter}-${entropy}`
 }
 
 /**
@@ -702,40 +705,23 @@ export function useQueryStudio() {
             }
             const serviceError = toServiceError(error)
             const isPermissionRefusal = serviceError.code === "permission_denied"
-            if (isPermissionRefusal) {
-              // A permission refusal is not a statement that failed; it is a
-              // refusal of every statement of the batch because the person
-              // lacks query execution rights. The console marks the entire
-              // remainder of the batch refused locally so nothing reaches the engine.
-              setRuns((previous) => ({
-                ...previous,
-                [tabId]: (previous[tabId] ?? []).map((run, at) =>
-                  at >= index
-                    ? {
-                        status: "error",
-                        statement: run.statement,
-                        error: serviceError,
-                      }
-                    : run
-                ),
-              }))
-              break
-            } else {
-              setRuns((previous) => ({
-                ...previous,
-                [tabId]: (previous[tabId] ?? []).map((run, at) =>
-                  at === index
-                    ? {
-                        status: "error",
-                        statement: run.statement,
-                        error: serviceError,
-                      }
-                    : run
-                ),
-              }))
-              markNotRun(index + 1)
-              break
-            }
+            // A permission refusal denies execution rights for the entire
+            // batch, so subsequent statements are marked refused without
+            // calling the engine.
+            setRuns((previous) => ({
+              ...previous,
+              [tabId]: (previous[tabId] ?? []).map((run, at) =>
+                (isPermissionRefusal ? at >= index : at === index)
+                  ? {
+                      status: "error",
+                      statement: run.statement,
+                      error: serviceError,
+                    }
+                  : run
+              ),
+            }))
+            if (!isPermissionRefusal) markNotRun(index + 1)
+            break
           }
         }
       } finally {
