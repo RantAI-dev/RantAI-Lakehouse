@@ -4248,14 +4248,21 @@ pub async fn spec_from_input(
     Ok(spec)
 }
 
+/// The names the chart's series can take: the names the chart draws, which
+/// are the keys `colors.series` and `valueFormats` are stored under.
+#[must_use]
+pub fn drawn_names(y: &crate::specs::ChartY) -> Vec<String> {
+    match y {
+        crate::specs::ChartY::Single(y) => vec![y.clone()],
+        crate::specs::ChartY::Multi(ys) => ys.clone(),
+    }
+}
+
 /// BI-18 part C review fix (BLOCKER) R24: series colours are keyed by the name
 /// the chart draws, whichever path saved them (builder, `create_chart`,
 /// `update_chart`, `format_chart`: all end in [`spec_from_input`]).
 fn key_look_by_drawn_names(spec: &mut StoredChartSpec) {
-    let drawn: Vec<String> = match &spec.spec.y {
-        crate::specs::ChartY::Single(y) => vec![y.clone()],
-        crate::specs::ChartY::Multi(ys) => ys.clone(),
-    };
+    let drawn = drawn_names(&spec.spec.y);
     crate::style::key_series_by_drawn_name(&mut spec.def, &drawn);
 }
 

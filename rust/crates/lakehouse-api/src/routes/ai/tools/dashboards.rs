@@ -488,6 +488,25 @@ pub(super) async fn list_charts(ch: &ChClient, principal: Option<&Principal>) ->
             "source": c.source,
             "board": c.board,
         });
+        // The formatting the chart holds, as it is stored: the fields it
+        // does not hold stay out, so a chart with no formatting lists an
+        // empty style. A `StyleFields` holds no map without a string key
+        // and no float JSON cannot hold, so the serialisation cannot fail;
+        // the fallback says the style is unknown, not that it is empty.
+        entry["style"] = serde_json::to_value(&c.def.style).unwrap_or(Value::Null);
+        // The reference lines it holds, when it has any.
+        if let Some(lines) = c
+            .def
+            .shape
+            .reference_lines
+            .as_ref()
+            .filter(|lines| !lines.is_empty())
+        {
+            entry["referenceLines"] = serde_json::to_value(lines).unwrap_or(Value::Null);
+        }
+        // The names its series can take: the keys a series colour and a
+        // value format are stored under.
+        entry["seriesNames"] = json!(store::drawn_names(&c.spec.y));
         let tab = match boards.iter().find(|b| b.id == c.board) {
             Some(board) => tab_of_chart(board, &c.spec.id),
             None => None,
@@ -1546,5 +1565,71 @@ mod tests {
         let chart = &reply["charts"][0];
         assert_eq!(chart["board"], json!("b_board"), "{reply}");
         assert_eq!(chart["tab"], json!("tab_a"), "{reply}");
+    }
+
+    /// A chart is listed with the formatting it holds and the names its
+    /// series can take: the number format, the series colour and the
+    /// reference line a call can name, and the name a series colour is
+    /// keyed by.
+    #[tokio::test]
+    async fn the_assistant_lists_the_formatting_and_the_series_names_of_a_chart() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+            "format": { "style": "number", "decimals": 0 },
+            "colors": { "series": { "visitors": "#112233" } },
+            "referenceLines": [{ "value": 1000.0, "label": "Target" }],
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = list_charts(&ch, Some(&person(7))).await;
+        let chart = &reply["charts"][0];
+        assert_eq!(
+            chart["style"]["format"],
+            json!({ "style": "number", "decimals": 0 }),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["style"]["colors"]["series"]["visitors"],
+            json!("#112233"),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["referenceLines"][0]["value"],
+            json!(1000.0),
+            "{reply}"
+        );
+        assert_eq!(
+            chart["referenceLines"][0]["label"],
+            json!("Target"),
+            "{reply}"
+        );
+        assert_eq!(chart["seriesNames"], json!(["visitors"]), "{reply}");
+    }
+
+    /// A chart with no formatting lists an empty style and no reference
+    /// lines: the fields a chart does not hold stay out of the entry, and
+    /// the names its series can take are still listed.
+    #[tokio::test]
+    async fn the_assistant_lists_a_chart_with_no_formatting_as_an_empty_style() {
+        let server = stored_chart_server(json!({
+            "title": "Visitors",
+            "kind": "bar",
+            "mart": "mart_x",
+            "dimension": "province",
+            "measures": ["visitors"],
+            "board": "b_board",
+        }))
+        .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let reply = list_charts(&ch, Some(&person(7))).await;
+        let chart = &reply["charts"][0];
+        assert_eq!(chart["style"], json!({}), "{reply}");
+        assert!(chart.get("referenceLines").is_none(), "{reply}");
+        assert_eq!(chart["seriesNames"], json!(["visitors"]), "{reply}");
     }
 }
