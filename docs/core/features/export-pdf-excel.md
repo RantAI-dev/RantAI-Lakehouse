@@ -46,6 +46,10 @@ A chart's data downloads only as CSV, only from a raw table, and only up to
 | 10 | Every download (PDF, Excel, CSV) is written to the audit log before the file is sent, as the CSV export does today; with the audit log down, the download is refused. | Planner |
 | 11 | The assistant's export tool returns a download link to the same export the menu uses; the file is made when the person opens it, with their permissions. Nothing is stored. | Planner |
 
+## Owner decisions at the phase 4 QA (2026-10-23)
+
+- The PDF stacks every tile full width, one per row; it does not copy the dashboard's columns. The owner accepted this for now.
+
 ## Limits to tell a customer
 
 - PDFs need the Gotenberg container; without it, only the browser's print.

@@ -60,6 +60,10 @@ Tools `create_report_subscription`, `list_report_subscriptions`,
 request set gains `AI-10-AC1` ("Send this dashboard to me every Monday as a
 PDF."). The AI team reviews this part.
 
+## Owner decisions at the phase 4 QA (2026-10-23)
+
+- At send time, a console recipient must still have `dashboard:read` and a role that may download, and must share a tenant with the owner when the owner has tenants; others are skipped and counted (RPT-1 review R8). Confirmed by the owner.
+
 ## Acceptance checklist
 
 Run by the product owner on a running console. A step not performed is never a pass.
