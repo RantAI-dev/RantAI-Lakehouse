@@ -6,6 +6,7 @@ import { DEFAULT_PALETTE, resolvePalette } from "@/lib/chart-palettes";
 import type { ResolvedReferenceLine, StyleFields, ValueFormat } from "@/lib/chart-style";
 import { formatAxisValue, formatValue } from "@/lib/value-format";
 import type { ChartSpec } from "@/lib/dashboard-specs";
+import { planForecast, withForecastSeries, type ForecastBuckets, type ForecastPlan } from "./forecast-line";
 import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 
 /**
@@ -534,6 +535,8 @@ export type LineContext = {
   format?: (measure: string | undefined, v: number) => string;
   /** Set when the result was cut off: computed labels then say "of the N shown" (decision 9). */
   cutOff?: boolean;
+  /** `BI-17` part B: the buckets of the rows, so a forecast can find the periods ahead. */
+  buckets?: ForecastBuckets;
 };
 
 const LINE_NAME: Record<string, string> = { average: "Average", median: "Median", min: "Min", max: "Max", trend: "Trend" };
@@ -589,6 +592,61 @@ export function trendEnds(values: readonly number[]): [number, number] | null {
  * their own and stay on the first axis.
  */
 export function withReferenceLines(
+  option: EChartsOption,
+  lines: readonly ReferenceLine[] | undefined,
+  horizontal: boolean,
+  dark: boolean,
+  ctx?: LineContext,
+  columns?: readonly (string | undefined)[],
+): EChartsOption {
+  return withForecastLine(withMarkLines(option, lines, horizontal, dark, ctx, columns), lines, horizontal, dark, ctx, columns);
+}
+
+/**
+ * `BI-17` part B (D4): the forecast reference line, if the chart has one and
+ * knows its buckets (`ctx.buckets`). Drawn after the other lines, on the
+ * axis of the measure it describes; a refusal draws nothing (the sentence is
+ * `forecastNote`).
+ */
+export function withForecastLine(
+  option: EChartsOption,
+  lines: readonly ReferenceLine[] | undefined,
+  horizontal: boolean,
+  dark: boolean,
+  ctx?: LineContext,
+  columns?: readonly (string | undefined)[],
+): EChartsOption {
+  const found = forecastOf(lines, ctx, horizontal);
+  if (!found || !ctx) return option;
+  const { line, plan } = found;
+  const series = Array.isArray(option.series) ? option.series : [];
+  const i = line.measure && columns ? columns.findIndex((c) => c === line.measure) : 0;
+  return withForecastSeries(option, plan, {
+    name: line.label || "Forecast",
+    color: line.color ?? (dark ? "#fbbf24" : "#d97706"),
+    seriesIndex: Math.min(Math.max(i, 0), Math.max(series.length - 1, 0)),
+    actual: ctx.values(line.measure),
+    write: (v) => ctx.format?.(line.measure, v) ?? formatNumber(v, decimalsFor([v])),
+  });
+}
+
+/** The forecast line of a chart and its plan; the first `forecast` line is the only one (D1). */
+function forecastOf(lines: readonly ReferenceLine[] | undefined, ctx: LineContext | undefined, horizontal: boolean): { line: ReferenceLine; plan: ForecastPlan } | null {
+  const line = lines?.find((l) => l.kind === "forecast");
+  if (!line || !ctx?.buckets || !Number.isInteger(line.horizon)) return null;
+  const plan = planForecast(line.horizon as number, ctx.values(line.measure), ctx.buckets, horizontal);
+  return { line, plan };
+}
+
+/**
+ * The sentence under a chart with a forecast: the model and band, or why
+ * there is no forecast (Q5: a refusal is a sentence, never a line).
+ */
+export function forecastNote(lines: readonly ReferenceLine[] | undefined, ctx: LineContext | undefined, horizontal: boolean): string | undefined {
+  return forecastOf(lines, ctx, horizontal)?.plan.note;
+}
+
+function withMarkLines(
   option: EChartsOption,
   lines: readonly ReferenceLine[] | undefined,
   horizontal: boolean,

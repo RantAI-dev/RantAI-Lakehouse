@@ -8,7 +8,7 @@ import { ErrorWithReference } from "@/components/error-reference";
 import type { TileFailure } from "@/services/contracts/dashboards";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
-import { buildOption, fmtInt, withReferenceLines } from "./chart-option";
+import { buildOption, fmtInt, forecastNote, withReferenceLines } from "./chart-option";
 import { buildCombinedOption, cutLayers, failedLayers } from "./combined-option";
 import { takesLayers, type LayerDef } from "@/lib/chart-layers";
 import { GeoChart } from "./geo-chart";
@@ -168,27 +168,29 @@ export function TileBody({
       return <p role="status" className="grid h-full place-items-center px-3 text-center text-xs text-muted-foreground">{styled.message}.</p>;
     }
     const fmtOf = (column?: string) => style?.valueFormats?.[column ?? yCols[0] ?? ""] ?? style?.format;
-    const option = withReferenceLines(
-      styled.option,
-      cell.referenceLines, spec.kind === "hbar", dark,
-      {
-        values: (measure) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
-        format: (measure, v) => formatValue(v, fmtOf(measure), locale, decimals),
-        cutOff: !!cell.truncated,
-      },
-      cols,
-    );
+    const lineCtx = {
+      values: (measure?: string) => rows.map((r) => Number(r[measure ?? yCols[0] ?? ""] ?? 0)),
+      format: (measure: string | undefined, v: number) => formatValue(v, fmtOf(measure), locale, decimals),
+      cutOff: !!cell.truncated,
+      // BI-17 part B: a forecast finds the periods ahead from the raw buckets and the report zone.
+      buckets: { grain, raw: rawRows.map((r) => r[spec.x]), timeZone: reporting.timeZone, breakdown: !!spec.series },
+    };
+    const option = withReferenceLines(styled.option, cell.referenceLines, spec.kind === "hbar", dark, lineCtx, cols);
+    const forecastSentence = forecastNote(cell.referenceLines, lineCtx, spec.kind === "hbar");
     const chart = (
       <EChart option={hideLegend ? { ...option, legend: { show: false } } : option} height="100%"
         onDataClick={onDataClick ? (hit, pos) => onDataClick(hit, pos, { rows: rawRows, labelledRows: rows, grain: grain ?? undefined, otherLabels, bin: bins[spec.x] }) : undefined} />
     );
-    if (!styled.hiddenNotes) return chart;
+    if (!styled.hiddenNotes && !forecastSentence) return chart;
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="min-h-0 flex-1">{chart}</div>
-        <p className="px-1 pt-1 text-[11px] text-muted-foreground">
-          {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
-        </p>
+        {styled.hiddenNotes ? (
+          <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+            {styled.hiddenNotes} {styled.hiddenNotes === 1 ? "note" : "notes"} not shown: {styled.hiddenNotes === 1 ? "its point is" : "their points are"} not in the result
+          </p>
+        ) : null}
+        {forecastSentence ? <p className="px-1 pt-1 text-[11px] text-muted-foreground">{forecastSentence}</p> : null}
       </div>
     );
   }
