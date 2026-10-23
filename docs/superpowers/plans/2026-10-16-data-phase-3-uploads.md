@@ -965,6 +965,63 @@ way, but a REST catalog's commit conflict behaviour is not measured, as in SRC-1
 Parquet row group larger than memory (one 1 GiB group) is bounded: the reader decodes a row
 group whole, and uploaded files with huge row groups are not generated here.
 
+### Handoff: T6.2 (developer, 2026-10-23)
+
+Set the cap from `docs/plans/DATA-17-RESULT.md` (second section, run 39916318666). Six commits on
+`feat/data-phase-3-uploads`, one per item, from `f9168648`; not pushed.
+
+| Commit | Item |
+| --- | --- |
+| `5749fb60` | 1. `MAX_SESSION_BYTES` = 2,147,483,648 (refuses `> cap`); console `MAX_SESSION_BYTES` for every pick but a workbook (`.xls`/`.xlsx`: 50 MB); session sentence "2 GB" |
+| `a4459580` | 2. `MAX_UNPACKED_BYTES` (2 GiB) in `uploads.rs`: the gzip/zip check on both paths, the grouped-load total (`group.rs`), and `run_config`'s `max_bytes`. `MAX_UPLOAD_BYTES` keeps `POST /api/uploads` only; the workbook check keeps it |
+| `ea92e8d5` | 3. Parquet cell cap: see "Item 3" below |
+| `3298b819` | 4. `MAX_ROWS` and its three refusal paths removed from the job |
+| `4106d5e6` | 5. Refusal texts: sessions "2 GB", workbook on the session path "The workbook is larger than the 50 MB limit.", grouped total "2 GB", `POST /api/uploads` "50 MB"; console texts and screen facts |
+| `ccc7f78a` | 6. `g9-upload-large.yml`: header and descriptions; the defaults (200 MiB) already sit inside the cap, full T6.1 sizes stay opt-in |
+
+**Item 3 (read before removing).** The cell cap (`MAX_CELLS`, 5,000,000) was decided from the footer's
+row and column counts only. After T2.2 the API never converts a whole Parquet file: `inspect` reads the
+footer by range and `convert` is called only for a preview (`Some(2000)` rows). What bounds the API's
+memory on those paths is `MAX_FOOTER_BYTES` (16 MiB, checked before the footer is read),
+`MAX_PREVIEW_GROUP_BYTES` (64 MiB for a preview's first row group) and `MAX_OUTPUT_BYTES`, not the
+cell count. So the cap no longer applies to `inspect` or to a preview (`cell_cap_for`); it stays for
+`convert(.., None)`, the whole-file conversion in memory, which has no caller today. Nothing that
+protects the API's own memory was removed. The workbook's `MAX_SHEET_CELLS` is untouched.
+
+**Decisions of mine, for the reviewer.**
+- `TOO_MANY_ROWS` stays in `FAILURE_REASONS` and in `ops/fixtures/upload_load_failure_reasons.json`
+  (the API shows a recorded reason only when it is in that list; an upload that failed with it
+  keeps its message). It is no longer raised, and a test says so.
+- The unpack check on `POST /api/uploads` also uses the 2 GiB `MAX_UNPACKED_BYTES`: the job gets one
+  `max_bytes`, so the two paths must not disagree.
+- The route test of the gzip bomb now builds 2 GiB + 1 byte in 1 MiB blocks (it takes a few seconds
+  more); its zip half was dropped, because a 2 GiB zip entry could only be built in memory. The zip
+  cap is pinned by the `upload_formats` tests, which take the cap as a parameter; `deflated_zip`, now
+  unused, was removed.
+- The mid-extract test with a real dlt pipeline (`test_a_failure_while_dlt_extracts_...`) now fails
+  the load with a store that dies after its first block (`UNREADABLE`), where it used the row cap.
+- `ops/g9/large_upload.py` still generates under 2,000,000 rows so a new run is comparable with the
+  measured ones; its comment says so.
+- Item 1's commit includes the session sentence, because its test pins the text.
+
+**Commands and counts (run from the worktree).**
+- `cargo fmt --check`: clean (rc 0) after `cargo fmt`, which changed only my hunks.
+- `bun test src/lib`: 893 pass, 1 skip, 0 fail. `bun test src/features/connectors`: 348 pass, 0 fail.
+  `bun test src/services`: 126 pass, 0 fail. `bun run typecheck`: clean. `bun run lint`: 0 errors, 11
+  warnings (none in files I touched).
+- `ops/lint/check_*.py` (four scripts): rc 0 each. `python -m pytest ops/g9`: 16 passed.
+- `dagster`: touched tests (`test_file_ingest`, `test_parquet_ingest`, `test_several_files`,
+  `test_upload_formats`): 288 passed, 1 skipped in 21 s. Whole suite (`python -m pytest dispar_orchestrate -q -x`, foreground-equivalent, 21 min): 1778 passed, 1 skipped.
+
+**Not verified.** The Rust build and tests (`cargo clippy -p lakehouse-store -p lakehouse-api
+--all-targets`, `cargo test -p lakehouse-api --lib uploads`, `--test upload_routes`): the disk was
+7.8 GB free when I started and, when it rose to 35 GB, another session's `cargo clippy --workspace`
+was running and 5 GB of memory was available, so I did not start a build. The Rust edits were
+written without a compiler: expect CI to find any slip (the places to look: the import lists of
+`sessions.rs` and `group.rs`, `cell_cap_for`, the `super::super::TOO_LARGE` in a `sessions.rs` test).
+The `workflow_dispatch` file was parsed as YAML only; it was not dispatched. Two loads at once at 2 GiB
+remain unmeasured (RESULT).
+
 ## 12. Review
 
 ### Slice 1, round 1 (planner/reviewer, Claude Opus), at `159f8dea`, 2026-10-19
