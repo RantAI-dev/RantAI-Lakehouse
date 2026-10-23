@@ -91,6 +91,18 @@ too, so a rename does not have to repeat the mart. `list_charts` names
 each chart's board and its tab, so the assistant can read what an update
 keeps.
 
+`list_charts` also names the formatting a chart holds (the `style` it
+was saved with, and the reference lines when it has any) and the names
+its series can take (`seriesNames`): the names the chart draws, which are
+the names a series colour and a value format are stored under. The
+assistant names a series instead of guessing one. `format_chart` refuses
+a series the chart does not draw, and names the series the chart does
+draw, so the assistant corrects the call instead of trying again. A chart
+whose series are not known when it is saved (one that breaks its data
+down into one series per value, or one that reads a parameter) is not
+checked, and a pie, a rose, a funnel or a treemap colours its marks by
+the name of the item and not by a series.
+
 A dashboard filter that names a saved segment is refused: a board filter
 names a column, and a saved segment belongs to a chart's or a metric's own
 filters.

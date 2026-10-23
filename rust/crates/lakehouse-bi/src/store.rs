@@ -4267,9 +4267,9 @@ pub async fn spec_from_input(
 ///
 /// The refusal names the arguments the caller sends (`mart`, `sqlSource`):
 /// "a table" is the console's word, and the caller here is the assistant's
-/// model. `crate::layers::check_definition` refuses the same condition with
-/// the console's word, so the store speaks first: the one that has to learn
-/// this is the model.
+/// model. The console's own check (`crate::layers::check_definition`)
+/// refuses the same condition with the console's word, so the store speaks
+/// first: the assistant's model is the one that has to learn the refusal.
 ///
 /// # Errors
 ///
