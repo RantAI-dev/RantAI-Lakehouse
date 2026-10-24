@@ -321,6 +321,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Since `main` moved to Rust 1.99.1 (REL-9), this job on PR #204 died
+      # every time: one run's annotation says `System.IO.IOException: No space
+      # left on device` from the runner itself (no job logs), and two more hit
+      # the 40-minute limit with no logs (the runner died the same way). Before
+      # the 1.99.1 merge the same job passed in 19-29 min. `main` still passes
+      # (22-28 min) because it has far fewer integration-test binaries; this
+      # branch adds many, and each debug test binary of `lakehouse-api` is
+      # about 0.8 GB, on a runner with about 14 GB free. So the step is on
+      # this PR: its test binaries are what overflow the disk. It deletes only
+      # preinstalled toolchains this job never uses; Docker (testcontainers)
+      # and the Rust toolchain stay. `df` puts the freed space in the log.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
