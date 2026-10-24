@@ -51,6 +51,9 @@ they fall in. There is no way to add a chart type of one's own.
 - Uploaded borders are drawn simplified; very fine borders lose detail on screen, but `RegionOf` uses the full borders.
 - 1,000 bars per Gantt chart.
 - **`RegionOf` is not available to a role that has a data policy** (a mask or a row filter anywhere): the data engine's policy check refuses every dictionary lookup of such a role, because it cannot see where a dictionary reads from, and the role is told so in a sentence that names `RegionOf`. Signed by the owner, 2026-10-24 (option B); a narrow exemption for the console's own map dictionaries is a follow-up for the security team. `Distance` has no such limit.
+- **Renaming or deleting a map and `RegionOf` fields.** A map cannot be deleted while a calculated field's `RegionOf` names it (by id or by name); the refusal lists the fields. A rename is not checked: a field that names the map by its label stops working until its formula is changed. Name the map by its id (`m_` and 12 characters, shown in Admin > Maps) in a formula that must survive a rename.
+- **`Distance` takes degrees**: a latitude outside -90 to 90 or a longitude outside -180 to 180 is refused when written as a number in the formula, and gives an empty value when it comes from a column.
+- **The map's lookup keeps the API's database login.** The region lookup on the engine reads its boundaries as the API's own `ClickHouse` user; the password is hidden in the engine's views and logs but stored in the engine's own metadata. After a password rotation, upload the map again (a lookup already loaded keeps working until the engine restarts).
 - Country maps are first-level regions only (states, provinces); finer levels need an uploaded file, as Indonesia's regencies are today.
 
 ## Asking the assistant
