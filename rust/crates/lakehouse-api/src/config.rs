@@ -427,10 +427,13 @@ pub struct Config {
     /// `auth_identity.provider`. Default `"default"`.
     pub oidc_provider_name: String,
     /// Explicit override for the JWKS endpoint URL. `None` when unset, in
-    /// which case `crate::state::AppState::new` derives
-    /// `"{issuer}/.well-known/jwks.json"` — the conventional `OIDC`
-    /// discovery-document location every provider this crate documents
-    /// (Okta, Entra, Google, Keycloak) publishes at.
+    /// which case `SEC-38` applies: the address is the `jwks_uri` from the
+    /// provider's discovery document
+    /// (`{issuer}/.well-known/openid-configuration`), read on the first
+    /// key lookup and cached with the key set. Set this only when a
+    /// provider's discovery document is unavailable or names a key set
+    /// this deployment cannot reach; an explicit value is used exactly as
+    /// given and no discovery request is made.
     pub oidc_jwks_url: Option<String>,
     /// Whether an unrecognized `OIDC` subject is allowed to provision a new
     /// `app_user`. Default `false` — see

@@ -600,23 +600,34 @@ pub(crate) fn connector_allowed_patterns(manager: Option<SecretManagerKind>) -> 
 /// This is the one place that decision is made; every other piece of this
 /// module and `crate::auth` just reacts to [`AuthState::oidc`] being
 /// present or absent.
+///
+/// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through unchanged
+/// and no discovery request is ever made; when it is unset the key set's
+/// address comes from the provider's discovery document
+/// (`{issuer}/.well-known/openid-configuration`), read lazily on the first
+/// key lookup, so an unreachable provider never stops the API from
+/// starting.
 fn oidc_config(config: &Config) -> Option<OidcConfig> {
     let issuer = config.oidc_issuer.as_ref()?;
     let client_id = config.oidc_client_id.as_ref()?;
-    let jwks_url = config
-        .oidc_jwks_url
-        .clone()
-        .unwrap_or_else(|| format!("{}/.well-known/jwks.json", issuer.trim_end_matches('/')));
-    Some(OidcConfig {
-        issuer: issuer.clone(),
-        client_id: client_id.clone(),
-        provider_name: config.oidc_provider_name.clone(),
-        jwks_url,
-        jit_provisioning: config.oidc_jit_provisioning,
-        role_map: config.oidc_role_map.clone(),
-        groups_claim: config.oidc_groups_claim.clone(),
-        clock_skew_seconds: config.oidc_clock_skew_seconds,
-    })
+    let mut oidc = match config.oidc_jwks_url.clone() {
+        Some(jwks_url) => OidcConfig::new(
+            issuer.clone(),
+            client_id.clone(),
+            config.oidc_provider_name.clone(),
+            jwks_url,
+        ),
+        None => OidcConfig::with_discovery(
+            issuer.clone(),
+            client_id.clone(),
+            config.oidc_provider_name.clone(),
+        ),
+    };
+    oidc.jit_provisioning = config.oidc_jit_provisioning;
+    oidc.role_map.clone_from(&config.oidc_role_map);
+    oidc.groups_claim.clone_from(&config.oidc_groups_claim);
+    oidc.clock_skew_seconds = config.oidc_clock_skew_seconds;
+    Some(oidc)
 }
 
 /// The login-throttle policy [`AppState::new`] stores (`SEC-5`): the three
@@ -1139,5 +1150,35 @@ mod tests {
             resolver.resolve("vault:secret/a#k").await,
             Err(SecretError::UnsupportedRef { .. })
         ));
+    }
+
+    /// `SEC-38`: an operator-set `OIDC_JWKS_URL` is passed through exactly
+    /// as given (and then no discovery request is ever made), while an
+    /// unset one now leaves the address to the provider's discovery
+    /// document instead of deriving the old
+    /// `{issuer}/.well-known/jwks.json` path.
+    #[test]
+    fn oidc_config_keeps_an_explicit_jwks_url_and_otherwise_leaves_discovery_to_the_client() {
+        let mut env = HashMap::new();
+        env.insert(
+            "OIDC_ISSUER".to_owned(),
+            "https://issuer.example".to_owned(),
+        );
+        env.insert("OIDC_CLIENT_ID".to_owned(), "client-1".to_owned());
+
+        let discovery = oidc_config(&Config::from_map(&env).expect("a valid test Config"))
+            .expect("OIDC_ISSUER and OIDC_CLIENT_ID are both set");
+        assert_eq!(discovery.jwks_url, None);
+
+        env.insert(
+            "OIDC_JWKS_URL".to_owned(),
+            "https://keys.example/tenant/keys".to_owned(),
+        );
+        let explicit = oidc_config(&Config::from_map(&env).expect("a valid test Config"))
+            .expect("OIDC_ISSUER and OIDC_CLIENT_ID are both set");
+        assert_eq!(
+            explicit.jwks_url.as_deref(),
+            Some("https://keys.example/tenant/keys")
+        );
     }
 }

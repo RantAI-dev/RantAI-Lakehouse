@@ -51,6 +51,7 @@ use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
 use uuid::Uuid;
 
 use crate::authenticator::Authenticator;
@@ -96,8 +97,17 @@ const ALLOWED_ALGORITHMS: &[Algorithm] = &[
 
 /// How long a fetched JWKS is trusted before [`JwksClient`] will fetch it
 /// again, absent a cache miss forcing an earlier refetch (see
-/// [`JwksClient::key_for`]'s doc comment for the rotation path).
+/// [`JwksClient::key_for`]'s doc comment for the rotation path). The same
+/// TTL applies to a discovery document [`JwksClient`] had to read to learn
+/// the key set's address (`SEC-38`).
 const DEFAULT_JWKS_TTL: StdDuration = StdDuration::from_secs(300);
+
+/// The `OpenID Connect` Discovery 1.0 document path, appended to the
+/// configured issuer when no explicit key-set address is configured
+/// (`SEC-38`, discovery section 4). Entra ID and Google both publish their
+/// keys at a `jwks_uri` named there; neither serves a key set at the
+/// `{issuer}/.well-known/jwks.json` path this module used to assume.
+const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 
 /// The default `leeway` (in seconds) applied to `exp`/`nbf` validation when
 /// [`OidcConfig::clock_skew_seconds`] is not overridden. Matches
@@ -126,8 +136,15 @@ pub struct OidcConfig {
     /// [`crate::Principal::provider`] and the `auth_identity.provider`
     /// value this authenticator reads and writes.
     pub provider_name: String,
-    /// The URL [`JwksClient`] fetches the provider's signing keys from.
-    pub jwks_url: String,
+    /// The URL [`JwksClient`] fetches the provider's signing keys from,
+    /// when the operator set one explicitly (`OIDC_JWKS_URL`).
+    ///
+    /// `None` means: read the address from the provider's `OpenID Connect`
+    /// discovery document (`{issuer}/.well-known/openid-configuration`,
+    /// its `jwks_uri` member) on the first key lookup — `SEC-38`. An
+    /// explicit address always wins, and then no discovery request is ever
+    /// made.
+    pub jwks_url: Option<String>,
     /// Whether an unrecognized `sub` (no existing `auth_identity` row) is
     /// allowed to provision a new `app_user` on the spot. Defaults to
     /// `false` at the config layer — see [`crate::authenticator`] module
@@ -148,8 +165,8 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     /// Build a config with [`DEFAULT_CLOCK_SKEW_SECONDS`] clock skew, no
-    /// role mapping, and JIT provisioning off — the safe defaults a caller
-    /// only needs to override explicitly.
+    /// role mapping, JIT provisioning off, and `jwks_url` set explicitly —
+    /// the safe defaults a caller only needs to override explicitly.
     #[must_use]
     pub fn new(
         issuer: impl Into<String>,
@@ -161,7 +178,27 @@ impl OidcConfig {
             issuer: issuer.into(),
             client_id: client_id.into(),
             provider_name: provider_name.into(),
-            jwks_url: jwks_url.into(),
+            jwks_url: Some(jwks_url.into()),
+            jit_provisioning: false,
+            role_map: HashMap::new(),
+            groups_claim: "groups".to_owned(),
+            clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
+        }
+    }
+
+    /// Same as [`Self::new`], but with no explicit key-set address: the
+    /// address is read from `issuer`'s discovery document (`SEC-38`).
+    #[must_use]
+    pub fn with_discovery(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        provider_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            issuer: issuer.into(),
+            client_id: client_id.into(),
+            provider_name: provider_name.into(),
+            jwks_url: None,
             jit_provisioning: false,
             role_map: HashMap::new(),
             groups_claim: "groups".to_owned(),
@@ -184,6 +221,43 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+/// One cached discovery read: the `jwks_uri` a provider's discovery
+/// document named, with the time it was read (`SEC-38`). Cached for the
+/// same [`JwksClient::ttl`] as the key set itself, per the plan's decision
+/// 2 — a discovery document is no more trustworthy for longer than the
+/// keys it points at.
+struct CachedDiscovery {
+    url: String,
+    fetched_at: Instant,
+}
+
+/// The subset of an `OpenID Connect` Discovery 1.0 document this module
+/// reads (`SEC-38`, section 4). Unknown members are ignored, as the
+/// specification allows a provider to add its own.
+#[derive(Debug, Deserialize)]
+struct DiscoveryDocument {
+    /// The issuer identifier the provider claims. Trusted only when it
+    /// equals the configured issuer exactly (discovery section 4.3).
+    issuer: String,
+    /// The key set's absolute URL.
+    jwks_uri: String,
+}
+
+/// Where a [`JwksClient`] learns the key set's address from.
+enum JwksSource {
+    /// An operator-set address (`OIDC_JWKS_URL`): used exactly as given,
+    /// with no discovery request at all (`SEC-38`, decision 1).
+    Fixed(String),
+    /// The provider's discovery document, read lazily on the first key
+    /// lookup and again on the refresh moments [`JwksClient::key_for`]
+    /// documents (`SEC-38`, decision 2).
+    Discovery {
+        /// The configured issuer, used both to build the discovery
+        /// document's address and to check the document's own `issuer`.
+        issuer: String,
+    },
+}
+
 /// Fetches and caches a provider's JSON Web Key Set.
 ///
 /// # Why caching is load-bearing, not an optimization
@@ -196,11 +270,19 @@ struct CachedJwks {
 /// "one fetch per request" into "one fetch per [`DEFAULT_JWKS_TTL`]
 /// window, plus one extra fetch the instant a `kid` this service hasn't
 /// seen shows up" — see [`Self::key_for`].
+///
+/// # Where the key set lives
+///
+/// With an explicit address ([`Self::new`], [`Self::with_ttl`]) it is
+/// fetched from there. Without one ([`Self::discovering`]) the address
+/// comes from the provider's discovery document, so `OIDC_JWKS_URL` is
+/// optional (`SEC-38`).
 pub struct JwksClient {
-    url: String,
+    source: JwksSource,
     http: reqwest::Client,
     ttl: StdDuration,
     cache: RwLock<Option<CachedJwks>>,
+    discovery: RwLock<Option<CachedDiscovery>>,
 }
 
 impl JwksClient {
@@ -215,20 +297,46 @@ impl JwksClient {
     /// waiting [`DEFAULT_JWKS_TTL`] in real time.
     #[must_use]
     pub fn with_ttl(url: impl Into<String>, ttl: StdDuration) -> Self {
+        Self::with_source(JwksSource::Fixed(url.into()), ttl)
+    }
+
+    /// Build a client that reads the key set's address from `issuer`'s
+    /// discovery document (`{issuer}/.well-known/openid-configuration`),
+    /// caching the address and the keys for `ttl` (`SEC-38`).
+    #[must_use]
+    pub fn discovering(issuer: impl Into<String>, ttl: StdDuration) -> Self {
+        Self::with_source(
+            JwksSource::Discovery {
+                issuer: issuer.into(),
+            },
+            ttl,
+        )
+    }
+
+    /// The one place a [`JwksClient`]'s fields are assembled, so every
+    /// constructor caches the same way.
+    fn with_source(source: JwksSource, ttl: StdDuration) -> Self {
         Self {
-            url: url.into(),
+            source,
             http: reqwest::Client::new(),
             ttl,
             cache: RwLock::new(None),
+            discovery: RwLock::new(None),
         }
     }
 
-    /// Fetch the JWKS document fresh over HTTP. Never consults or updates
-    /// the cache itself — callers decide when a fetch is warranted.
-    async fn fetch(&self) -> Result<JwkSet, AuthError> {
+    /// `GET url` and parse the body as `T`. Every transport, status and
+    /// parse failure folds into [`AuthError::InvalidCredentials`]: a
+    /// provider that cannot serve its own (public) configuration makes no
+    /// token verifiable here, and the caller must not learn which upstream
+    /// step failed (principle 4).
+    async fn get_json<T>(&self, url: &str) -> Result<T, AuthError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         let response = self
             .http
-            .get(&self.url)
+            .get(url)
             .send()
             .await
             .map_err(|_| AuthError::InvalidCredentials)?;
@@ -236,9 +344,92 @@ impl JwksClient {
             return Err(AuthError::InvalidCredentials);
         }
         response
-            .json::<JwkSet>()
+            .json::<T>()
             .await
             .map_err(|_| AuthError::InvalidCredentials)
+    }
+
+    /// The `jwks_uri` from the cached discovery document, but only if it is
+    /// still within [`Self::ttl`] — the mirror of [`Self::cached_key`].
+    fn cached_discovery_url(&self) -> Option<String> {
+        let guard = self.discovery.read().ok()?;
+        let cached = guard.as_ref()?;
+        if cached.fetched_at.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(cached.url.clone())
+    }
+
+    /// Read `issuer`'s discovery document and return its `jwks_uri`.
+    ///
+    /// The document is trusted only when its own `issuer` equals `issuer`
+    /// exactly (Discovery 1.0 section 4.3) and `jwks_uri` is an absolute
+    /// `https` URL (`http` only when the issuer itself is `http`, i.e. a
+    /// local test provider such as `ops/oidc-mock`). Each refusal logs
+    /// which check failed, by name only — the provider's text never
+    /// becomes a response, and its document is never echoed into a log
+    /// line.
+    ///
+    /// The issuer and the document are administrator configuration, never
+    /// request input, so the connector address allowlist does not apply
+    /// here — the same reasoning `crate::openfga`'s module doc gives for
+    /// its own dialer.
+    async fn discover(&self, issuer: &str) -> Result<String, AuthError> {
+        let document_url = format!("{}{DISCOVERY_PATH}", issuer.trim_end_matches('/'));
+        let document: DiscoveryDocument = self.get_json(&document_url).await.inspect_err(|_| {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery document could not be read",
+                "OIDC discovery failed; no token can be verified"
+            );
+        })?;
+        if document.issuer != issuer {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery issuer does not equal the configured issuer",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+        if !jwks_uri_is_allowed(&document.jwks_uri, issuer) {
+            tracing::warn!(
+                issuer = %issuer,
+                reason = "discovery jwks_uri is not an absolute https URL",
+                "OIDC discovery refused"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+        if let Ok(mut guard) = self.discovery.write() {
+            *guard = Some(CachedDiscovery {
+                url: document.jwks_uri.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(document.jwks_uri)
+    }
+
+    /// The address this client reads the key set from. `refresh_discovery`
+    /// forces a fresh discovery read even while the cached address is
+    /// still within [`Self::ttl`] — the unknown-`kid` path in
+    /// [`Self::key_for`].
+    async fn jwks_url(&self, refresh_discovery: bool) -> Result<String, AuthError> {
+        match &self.source {
+            JwksSource::Fixed(url) => Ok(url.clone()),
+            JwksSource::Discovery { issuer } => {
+                if !refresh_discovery && let Some(url) = self.cached_discovery_url() {
+                    return Ok(url);
+                }
+                self.discover(issuer).await
+            }
+        }
+    }
+
+    /// Fetch the JWKS document fresh over HTTP. Never consults or updates
+    /// the key-set cache itself — callers decide when a fetch is
+    /// warranted. `refresh_discovery` is forwarded to [`Self::jwks_url`].
+    async fn fetch(&self, refresh_discovery: bool) -> Result<JwkSet, AuthError> {
+        let url = self.jwks_url(refresh_discovery).await?;
+        self.get_json::<JwkSet>(&url).await
     }
 
     /// Look for `kid` in the cached JWKS, but only if the cache is still
@@ -253,6 +444,18 @@ impl JwksClient {
             return None;
         }
         decoding_key_from_jwk(cached.set.find(kid)?).ok()
+    }
+
+    /// Whether the key-set cache holds a set that is still within
+    /// [`Self::ttl`] — i.e. whether [`Self::cached_key`] returning `None`
+    /// means "this `kid` is unknown" rather than "the cache is cold or
+    /// expired".
+    fn cache_is_fresh(&self) -> bool {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|c| c.fetched_at.elapsed() < self.ttl))
+            .unwrap_or(false)
     }
 
     /// Resolve `kid` to a [`DecodingKey`], fetching the JWKS if (and only
@@ -271,6 +474,11 @@ impl JwksClient {
     /// supplied `kid`) is rejected — see the caller,
     /// [`OidcAuthenticator::validate_token`].
     ///
+    /// With discovery (`SEC-38`), a `kid` a *fresh* cached set doesn't know
+    /// also re-reads the discovery document: the provider may have moved
+    /// its keys, not just rotated them. A cold or expired cache re-reads it
+    /// anyway, because the cached address carries the same TTL.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidCredentials`] if the JWKS can't be
@@ -280,7 +488,7 @@ impl JwksClient {
         if let Some(key) = self.cached_key(kid) {
             return Ok(key);
         }
-        let set = self.fetch().await?;
+        let set = self.fetch(self.cache_is_fresh()).await?;
         let key = set
             .find(kid)
             .and_then(|jwk| decoding_key_from_jwk(jwk).ok());
@@ -291,6 +499,27 @@ impl JwksClient {
             });
         }
         key.ok_or(AuthError::InvalidCredentials)
+    }
+}
+
+/// Whether a discovery document's `jwks_uri` may be used (`SEC-38`,
+/// decision 3): it must be an absolute URL with a host, served over
+/// `https` — or over `http` only when the configured issuer is itself
+/// `http`, which is how this repository's local test providers
+/// (`ops/oidc-mock`, Keycloak on the compose network) are reached. A
+/// document that arrived over `https` therefore never downgrades its key
+/// set to plaintext.
+fn jwks_uri_is_allowed(jwks_uri: &str, issuer: &str) -> bool {
+    let Ok(parsed) = Url::parse(jwks_uri) else {
+        return false;
+    };
+    if parsed.host_str().is_none() {
+        return false;
+    }
+    match parsed.scheme() {
+        "https" => true,
+        "http" => Url::parse(issuer).is_ok_and(|issuer| issuer.scheme() == "http"),
+        _ => false,
     }
 }
 
@@ -376,10 +605,15 @@ pub struct OidcAuthenticator {
 
 impl OidcAuthenticator {
     /// Build an authenticator for `config`, backed by `pool`, fetching JWKS
-    /// from `config.jwks_url` with the default cache TTL.
+    /// from `config.jwks_url` with the default cache TTL — or, when no
+    /// explicit address is configured, from the address the provider's
+    /// discovery document names (`SEC-38`).
     #[must_use]
     pub fn new(config: OidcConfig, pool: PgPool) -> Self {
-        let jwks = JwksClient::new(config.jwks_url.clone());
+        let jwks = match &config.jwks_url {
+            Some(url) => JwksClient::new(url.clone()),
+            None => JwksClient::discovering(config.issuer.clone(), DEFAULT_JWKS_TTL),
+        };
         Self::with_jwks_client(config, jwks, pool)
     }
 
@@ -691,6 +925,31 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_discovery_jwks_uri_must_be_absolute_and_not_downgrade_https() {
+        // `SEC-38`, decision 3. A wiremock server can only serve over
+        // plaintext `http`, so the `http`-under-`https` refusal is checked
+        // here, on the pure rule, rather than through a discovered
+        // document.
+        assert!(jwks_uri_is_allowed(
+            "https://keys.example/jwks",
+            "https://issuer.example"
+        ));
+        assert!(jwks_uri_is_allowed(
+            "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/certs",
+            "http://keycloak:8080/realms/lakehouse"
+        ));
+        assert!(!jwks_uri_is_allowed(
+            "http://keys.example/jwks",
+            "https://issuer.example"
+        ));
+        assert!(!jwks_uri_is_allowed("/jwks", "https://issuer.example"));
+        assert!(!jwks_uri_is_allowed(
+            "file:///etc/passwd",
+            "https://issuer.example"
+        ));
+    }
 
     #[test]
     fn provider_label_combines_the_oidc_prefix_and_name() {

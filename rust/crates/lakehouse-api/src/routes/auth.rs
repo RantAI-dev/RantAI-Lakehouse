@@ -1471,6 +1471,25 @@ mod tests {
             .await;
     }
 
+    /// Mount the discovery document `SEC-38` reads when `OIDC_JWKS_URL` is
+    /// unset. These round-trip tests set `OIDC_ISSUER` to the mock server
+    /// itself and no `OIDC_JWKS_URL`, so this (not the key set's path)
+    /// is what names `/.well-known/jwks.json` as the key set's address.
+    async fn mount_discovery(server: &wiremock::MockServer, issuer: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
     async fn mount_token_endpoint(server: &wiremock::MockServer, id_token: &str) {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/token"))
@@ -1508,6 +1527,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let key = TestKey::generate("kid-1");
         mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
 
         let issuer = server.uri();
         let client_id = "lakehouse-console";
@@ -1625,6 +1645,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let key = TestKey::generate("kid-1");
         mount_jwks(&server, &key).await;
+        mount_discovery(&server, &server.uri()).await;
 
         let issuer = server.uri();
         let client_id = "lakehouse-console";
