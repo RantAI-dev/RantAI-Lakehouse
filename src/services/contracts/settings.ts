@@ -5,8 +5,8 @@
  * both read it, so a chart and a filter agree about where a month begins.
  *
  * `BI-17` part A adds the number locale, the company palette and the allowed
- * fonts, and `BI-16` part B the allowed content sites, saved on the same
- * screen with the same permission.
+ * fonts, `BI-16` part B the allowed content sites, and `BI-1` the roles that
+ * may not download, saved on the same screen with the same permission.
  *
  * Produced by `routes::settings` in `lakehouse-api`. Reading needs only a
  * sign-in; saving needs `settings:write`.
@@ -30,6 +30,17 @@ export type ReportingSettings = {
    * be saved.
    */
   contentSites: string[]
+  /**
+   * Names of the roles that may not download (`BI-1`). A person whose every
+   * role is on the list gets no download items; a Platform Admin always may.
+   * Empty: everyone may.
+   */
+  downloadDeniedRoles: string[]
+  /**
+   * Outside email domains a scheduled report may go to (`RPT-1`), lower case,
+   * at most 50, no wildcards. Empty: no report leaves the company.
+   */
+  reportAllowedDomains: string[]
 }
 
 /**
@@ -37,7 +48,7 @@ export type ReportingSettings = {
  * the value stored, so a caller that only changes the zone is unaffected.
  */
 export type ReportingSettingsInput = Pick<ReportingSettings, "timeZone" | "weekStart"> &
-  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites">>
+  Partial<Pick<ReportingSettings, "numberLocale" | "companyPalette" | "fonts" | "contentSites" | "downloadDeniedRoles" | "reportAllowedDomains">>
 
 export interface SettingsService {
   getReporting(signal?: AbortSignal): Promise<ReportingSettings>

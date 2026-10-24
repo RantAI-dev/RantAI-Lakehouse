@@ -1,4 +1,4 @@
-//! The CSV of a whole-result export (`BI-16` part A, T8).
+//! The CSV of a whole-result export (`BI-16` part A, T8; `BI-1` D6 streams it).
 //!
 //! One writer, one set of rules: UTF-8 with a byte-order mark (so a
 //! spreadsheet reads the encoding right), CRLF line ends and RFC 4180 quoting.
@@ -15,7 +15,7 @@ use serde_json::Value;
 const BOM: &str = "\u{feff}";
 
 /// A cell as the text that goes in the file, before quoting.
-fn cell_text(value: Option<&Value>) -> String {
+pub(crate) fn cell_text(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
         Some(Value::Number(n)) => n.to_string(),
@@ -25,8 +25,10 @@ fn cell_text(value: Option<&Value>) -> String {
     }
 }
 
-/// Prefix a text that a spreadsheet could read as a formula.
-fn neutralise(text: &str) -> String {
+/// Prefix a text that a spreadsheet could read as a formula. The one rule for
+/// every download: the CSV writer below and the `.xlsx` writer
+/// (`export.rs`) both call it (`BI-1` D6, AGENTS.md rule 4).
+pub(crate) fn neutralise(text: &str) -> String {
     if text.starts_with(['=', '+', '-', '@', '\t', '\r']) {
         format!("'{text}")
     } else {
@@ -44,25 +46,33 @@ fn quote(field: &str) -> String {
     }
 }
 
-/// The file: a header row of `labels` (neutralised like any text cell), then
+/// One line of the file from fields that are already text (neutralised by the
+/// caller where they are text, [`neutralise`]): quoted when they need it, ended
+/// by CRLF. `BI-1` D6 writes a download a line at a time.
+pub(crate) fn line(fields: &[String]) -> String {
+    let quoted: Vec<String> = fields.iter().map(|f| quote(f)).collect();
+    format!("{}\r\n", quoted.join(","))
+}
+
+/// The start of every file: the byte-order mark and the header row of `labels`
+/// (neutralised like any text cell).
+pub(crate) fn header(labels: &[String]) -> String {
+    let neutral: Vec<String> = labels.iter().map(|l| neutralise(l)).collect();
+    format!("{BOM}{}", line(&neutral))
+}
+
+/// The whole file in memory, for the tests: a header row of `labels` (neutralised like any text cell), then
 /// one row per entry of `rows` with the values of `columns`, in order.
-#[must_use]
+#[cfg(test)]
 pub(crate) fn write_csv(
     labels: &[String],
     columns: &[String],
     rows: &[serde_json::Map<String, Value>],
 ) -> String {
-    let mut out = String::from(BOM);
-    let header: Vec<String> = labels.iter().map(|l| quote(&neutralise(l))).collect();
-    out.push_str(&header.join(","));
-    out.push_str("\r\n");
+    let mut out = header(labels);
     for row in rows {
-        let line: Vec<String> = columns
-            .iter()
-            .map(|c| quote(&cell_text(row.get(c))))
-            .collect();
-        out.push_str(&line.join(","));
-        out.push_str("\r\n");
+        let fields: Vec<String> = columns.iter().map(|c| cell_text(row.get(c))).collect();
+        out.push_str(&line(&fields));
     }
     out
 }

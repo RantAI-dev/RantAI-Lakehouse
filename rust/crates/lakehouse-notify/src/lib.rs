@@ -17,7 +17,10 @@ mod webhook;
 pub use webhook::MappedResolver;
 pub use webhook::{ResolveFuture, TargetRefusal, TargetResolver, WebhookError, WebhookSender};
 
-use lettre::message::{Mailbox, SinglePart, header};
+use std::future::Future;
+use std::pin::Pin;
+
+use lettre::message::{Attachment as MailAttachment, Mailbox, MultiPart, SinglePart, header};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::Serialize;
@@ -132,6 +135,22 @@ pub struct SmtpConfig {
     pub from: String,
 }
 
+/// The `From` mailbox: `from` when it parses, else a syntactically valid
+/// placeholder rather than erroring the whole send on a malformed `SMTP_FROM`
+/// (mirrors how permissive the TypeScript config resolution is about this
+/// field, which is never validated before use). The literal below is a valid
+/// address by construction, so this never panics.
+fn from_mailbox(from: &str) -> Mailbox {
+    from.parse().unwrap_or_else(|_| {
+        Mailbox::new(
+            None,
+            "rantai-lake@localhost"
+                .parse()
+                .unwrap_or_else(|_| unreachable!("literal address is always valid")),
+        )
+    })
+}
+
 /// Build the `SMTP` message that `EmailSender::send` would send, without
 /// sending it — split out so message construction (headers, from/to,
 /// body) can be tested without a live `SMTP` connection.
@@ -147,19 +166,7 @@ fn build_message(
     html: &str,
 ) -> Result<Message, lettre::error::Error> {
     Message::builder()
-        .from(from.parse().unwrap_or_else(|_| {
-            // Falls back to a syntactically valid placeholder rather than
-            // erroring the whole send on a malformed `SMTP_FROM` — mirrors
-            // how permissive the TypeScript config resolution is about
-            // this field (never validated before use). The literal below
-            // is a valid address by construction, so this never panics.
-            Mailbox::new(
-                None,
-                "rantai-lake@localhost"
-                    .parse()
-                    .unwrap_or_else(|_| unreachable!("literal address is always valid")),
-            )
-        }))
+        .from(from_mailbox(from))
         .to(to.parse().map_err(|_| lettre::error::Error::MissingTo)?)
         .subject(subject)
         .singlepart(
@@ -167,6 +174,92 @@ fn build_message(
                 .header(header::ContentType::TEXT_HTML)
                 .body(html.to_owned()),
         )
+}
+
+/// One file attached to an email (`RPT-1`, plan decision D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// The file name the reader sees. The caller makes it safe (letters,
+    /// digits, `-`, `_`, one extension); this crate does not rewrite it.
+    pub file_name: String,
+    /// The media type (`application/pdf`, ...). One that does not parse is
+    /// sent as `application/octet-stream`.
+    pub content_type: String,
+    /// The file's bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl Attachment {
+    /// The file's size in bytes.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// The bytes of all `attachments` together: what a caller checks against its
+/// budget before it builds the message. The message itself is larger (every
+/// attachment is base64 in the mail, a third more), so a budget set from this
+/// figure is a budget on the files, not on what the mail server sees.
+#[must_use]
+pub fn total_size(attachments: &[Attachment]) -> usize {
+    attachments.iter().map(Attachment::size).sum()
+}
+
+/// Build the message [`EmailSender::send_with_attachments`] sends: a
+/// `multipart/mixed` with the HTML body first and one part per attachment.
+///
+/// Every recipient is in `Bcc` and the `To` is the sender's own address, so
+/// recipients do not see each other (feature decision, plan D5). `lettre`
+/// leaves `Bcc` out of the formatted headers and puts every recipient in the
+/// `SMTP` envelope; a test pins both.
+///
+/// # Errors
+///
+/// `Err` when `bcc` is empty or one entry is not a mailbox, or the message
+/// cannot be built.
+fn build_message_with_attachments(
+    from: &str,
+    bcc: &[String],
+    subject: &str,
+    html: &str,
+    attachments: &[Attachment],
+) -> Result<Message, lettre::error::Error> {
+    if bcc.is_empty() {
+        return Err(lettre::error::Error::MissingTo);
+    }
+    let sender = from_mailbox(from);
+    let mut builder = Message::builder().from(sender.clone()).to(sender.clone());
+    let mut envelope_to = Vec::with_capacity(bcc.len());
+    for recipient in bcc {
+        let mailbox = recipient
+            .parse::<Mailbox>()
+            .map_err(|_| lettre::error::Error::MissingTo)?;
+        envelope_to.push(mailbox.email.clone());
+        builder = builder.bcc(mailbox);
+    }
+    // RPT-1 review fix (SHOULD-FIX) R9: the SMTP envelope holds the Bcc list and
+    // nothing else, so the sender's own mailbox (the visible To) gets no copy of
+    // every report.
+    builder = builder.envelope(
+        lettre::address::Envelope::new(Some(sender.email), envelope_to)
+            .map_err(|_| lettre::error::Error::MissingTo)?,
+    );
+    let mut parts = MultiPart::mixed().singlepart(
+        SinglePart::builder()
+            .header(header::ContentType::TEXT_HTML)
+            .body(html.to_owned()),
+    );
+    for file in attachments {
+        let content_type = header::ContentType::parse(&file.content_type).unwrap_or_else(|_| {
+            header::ContentType::parse("application/octet-stream")
+                .unwrap_or(header::ContentType::TEXT_PLAIN)
+        });
+        parts = parts.singlepart(
+            MailAttachment::new(file.file_name.clone()).body(file.bytes.clone(), content_type),
+        );
+    }
+    builder.subject(subject).multipart(parts)
 }
 
 /// Sends email via `SMTP`, porting `sendEmail`.
@@ -209,7 +302,43 @@ impl EmailSender {
         let Ok(message) = build_message(&self.config.from, to, subject, html) else {
             return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
         };
+        self.transmit(host, message).await
+    }
 
+    /// Send one email with files attached, to many people at once, each in
+    /// `Bcc` (`RPT-1`, plan D5). The failure reasons are the same fixed set as
+    /// [`Self::send`]: `SMTP_HOST` unset, an address refused, the server not
+    /// reached or refusing. Nothing from the server's reply is returned.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err`; every failure is a [`DeliverResult`] with
+    /// `ok: false`.
+    pub async fn send_with_attachments(
+        &self,
+        bcc: &[String],
+        subject: &str,
+        html: &str,
+        attachments: &[Attachment],
+    ) -> DeliverResult {
+        let Some(host) = &self.config.host else {
+            return DeliverResult::err(DeliveryFailure::EmailNotConfigured);
+        };
+        if bcc.iter().any(|to| to.is_empty() || !to.contains('@')) {
+            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+        }
+        let Ok(message) =
+            build_message_with_attachments(&self.config.from, bcc, subject, html, attachments)
+        else {
+            return DeliverResult::err(DeliveryFailure::EmailAddressRefused);
+        };
+        self.transmit(host, message).await
+    }
+
+    /// Connect to `host` and hand over `message`, classifying a failure into
+    /// the fixed set (`SRC-17` F1: the transport's own message is never
+    /// returned).
+    async fn transmit(&self, host: &str, message: Message) -> DeliverResult {
         let builder = if self.config.secure {
             AsyncSmtpTransport::<Tokio1Executor>::relay(host)
         } else {
@@ -234,6 +363,55 @@ impl EmailSender {
             }
             Err(_) => DeliverResult::err(DeliveryFailure::MailServerUnreachable),
         }
+    }
+
+    /// Whether `SMTP_HOST` is set: without it nothing can be sent.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.config.host.is_some()
+    }
+}
+
+/// The future a [`ReportMailer`] returns (the same boxed shape as
+/// [`ResolveFuture`], so this crate needs no `async-trait`).
+pub type MailFuture<'a> = Pin<Box<dyn Future<Output = DeliverResult> + Send + 'a>>;
+
+/// What the report runner sends mail through, so its tests can use a fake that
+/// never opens a socket (`RPT-1` T3). [`EmailSender`] is the one real
+/// implementation.
+pub trait ReportMailer: Send + Sync {
+    /// Whether mail can be sent at all (`SMTP_HOST` is set).
+    fn is_configured(&self) -> bool;
+
+    /// As [`EmailSender::send_with_attachments`].
+    fn send_with_attachments<'a>(
+        &'a self,
+        bcc: &'a [String],
+        subject: &'a str,
+        html: &'a str,
+        attachments: &'a [Attachment],
+    ) -> MailFuture<'a>;
+}
+
+impl ReportMailer for EmailSender {
+    fn is_configured(&self) -> bool {
+        Self::is_configured(self)
+    }
+
+    fn send_with_attachments<'a>(
+        &'a self,
+        bcc: &'a [String],
+        subject: &'a str,
+        html: &'a str,
+        attachments: &'a [Attachment],
+    ) -> MailFuture<'a> {
+        Box::pin(Self::send_with_attachments(
+            self,
+            bcc,
+            subject,
+            html,
+            attachments,
+        ))
     }
 }
 
@@ -635,5 +813,212 @@ mod tests {
         for (failure, sentence) in all {
             assert_eq!(failure.message(), sentence);
         }
+    }
+    fn pdf(bytes: &[u8]) -> Attachment {
+        Attachment {
+            file_name: "Sales-2026-10-19.pdf".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn xlsx(bytes: &[u8]) -> Attachment {
+        Attachment {
+            file_name: "Revenue.xlsx".to_owned(),
+            content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                .to_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// `RPT-1` T2 (D5): a multipart/mixed message, the HTML first, one part per
+    /// file with its name and type, the file base64 in the body.
+    #[test]
+    fn a_report_message_is_multipart_mixed_with_the_html_first_and_each_file_named() {
+        let message = build_message_with_attachments(
+            "rantai-lake@localhost",
+            &["a@example.com".to_owned()],
+            "Sales report, 2026-10-19",
+            "<p>hello</p>",
+            &[
+                pdf(&[0x25, 0x50, 0x44, 0x46, 0xff, 0xfe, 0x00, 0x01]),
+                xlsx(b"PK fake"),
+            ],
+        )
+        .unwrap();
+        let text = String::from_utf8(message.formatted()).unwrap();
+        assert!(text.contains("Content-Type: multipart/mixed"));
+        let html_at = text.find("Content-Type: text/html").unwrap();
+        let pdf_at = text.find("Content-Type: application/pdf").unwrap();
+        let xlsx_at = text
+            .find("Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            .unwrap();
+        assert!(
+            html_at < pdf_at && pdf_at < xlsx_at,
+            "body, then files in order"
+        );
+        assert!(text.contains("filename=\"Sales-2026-10-19.pdf\""));
+        assert!(text.contains("filename=\"Revenue.xlsx\""));
+        assert!(text.contains("Content-Disposition: attachment"));
+        // Binary bytes are sent base64.
+        assert!(text.contains("Content-Transfer-Encoding: base64"));
+        assert!(text.contains("JVBERv/+AAE="));
+        assert_eq!(
+            message.headers().get_raw("Subject").unwrap(),
+            "Sales report, 2026-10-19"
+        );
+    }
+
+    /// Recipients do not see each other: the visible `To` is the sender, every
+    /// recipient is in the `SMTP` envelope, and no `Bcc` header is written.
+    #[test]
+    fn every_recipient_is_bcc_and_the_sender_is_the_only_visible_to() {
+        let bcc = vec![
+            "a@example.com".to_owned(),
+            "b@example.org".to_owned(),
+            "Carol <c@example.net>".to_owned(),
+        ];
+        let message =
+            build_message_with_attachments("reports@company.example", &bcc, "s", "<p>x</p>", &[])
+                .unwrap();
+        let text = String::from_utf8(message.formatted()).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("\nbcc:"));
+        for hidden in ["a@example.com", "b@example.org", "c@example.net"] {
+            assert!(
+                !text.contains(hidden),
+                "{hidden} must not be in the message text"
+            );
+        }
+        assert!(
+            message
+                .headers()
+                .get_raw("To")
+                .unwrap()
+                .contains("reports@company.example")
+        );
+        let envelope: Vec<String> = message
+            .envelope()
+            .to()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for expected in ["a@example.com", "b@example.org", "c@example.net"] {
+            assert!(
+                envelope.iter().any(|a| a == expected),
+                "{expected} is addressed"
+            );
+        }
+        assert_eq!(envelope.len(), 3, "the Bcc list and nothing else");
+        assert!(
+            !envelope.iter().any(|a| a == "reports@company.example"),
+            "the sender's own mailbox gets no copy: {envelope:?}"
+        );
+        assert_eq!(
+            message
+                .envelope()
+                .from()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("reports@company.example")
+        );
+    }
+
+    #[test]
+    fn a_message_without_recipients_or_with_a_bad_one_is_not_built() {
+        assert!(build_message_with_attachments("a@b.example", &[], "s", "x", &[]).is_err());
+        assert!(
+            build_message_with_attachments("a@b.example", &["nobody".to_owned()], "s", "x", &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_type_that_does_not_parse_is_sent_as_octet_stream() {
+        let mut odd = pdf(b"x");
+        odd.content_type = "not a type".to_owned();
+        let message = build_message_with_attachments(
+            "a@b.example",
+            &["c@d.example".to_owned()],
+            "s",
+            "x",
+            &[odd],
+        )
+        .unwrap();
+        let text = String::from_utf8(message.formatted()).unwrap();
+        assert!(text.contains("Content-Type: application/octet-stream"));
+    }
+
+    /// The size a caller budgets is the files' bytes, not the encoded mail.
+    #[test]
+    fn size_accounting_counts_file_bytes_and_the_mail_is_larger() {
+        let files = [pdf(&[0_u8; 3000]), xlsx(&[1_u8; 1500])];
+        assert_eq!(files[0].size(), 3000);
+        assert_eq!(total_size(&files), 4500);
+        assert_eq!(total_size(&[]), 0);
+        let message = build_message_with_attachments(
+            "a@b.example",
+            &["c@d.example".to_owned()],
+            "s",
+            "x",
+            &files,
+        )
+        .unwrap();
+        // base64 makes each file a third larger, so the mail is bigger than the files.
+        assert!(message.formatted().len() > total_size(&files) * 4 / 3);
+    }
+
+    #[tokio::test]
+    async fn sending_with_attachments_reports_unconfigured_smtp_and_bad_addresses_without_a_network()
+     {
+        let none = EmailSender::new(cfg(None));
+        assert!(!none.is_configured());
+        assert_eq!(
+            none.send_with_attachments(&["a@example.com".to_owned()], "s", "x", &[pdf(b"p")])
+                .await,
+            DeliverResult::err(DeliveryFailure::EmailNotConfigured)
+        );
+        let some = EmailSender::new(cfg(Some("smtp.example.com")));
+        assert!(some.is_configured());
+        for bad in [vec![], vec!["nobody".to_owned()], vec![String::new()]] {
+            assert_eq!(
+                some.send_with_attachments(&bad, "s", "x", &[]).await,
+                DeliverResult::err(DeliveryFailure::EmailAddressRefused),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The fixed reason, never the driver's text, as for a single email.
+    #[tokio::test]
+    async fn an_unreachable_server_gives_the_fixed_reason_for_a_report_too() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut config = cfg(Some("127.0.0.1"));
+        config.port = port;
+        let sender = EmailSender::new(config);
+        let result = sender
+            .send_with_attachments(&["a@example.com".to_owned()], "s", "x", &[pdf(b"p")])
+            .await;
+        assert_eq!(
+            result,
+            DeliverResult::err(DeliveryFailure::MailServerUnreachable)
+        );
+        assert!(!result.error.unwrap().contains("127.0.0.1"));
+    }
+
+    /// The trait the runner's tests fake is implemented by the real sender.
+    #[tokio::test]
+    async fn the_real_sender_is_a_report_mailer() {
+        let sender = EmailSender::new(cfg(None));
+        let mailer: &dyn ReportMailer = &sender;
+        assert!(!mailer.is_configured());
+        assert_eq!(
+            mailer
+                .send_with_attachments(&["a@example.com".to_owned()], "s", "x", &[])
+                .await,
+            DeliverResult::err(DeliveryFailure::EmailNotConfigured)
+        );
     }
 }
