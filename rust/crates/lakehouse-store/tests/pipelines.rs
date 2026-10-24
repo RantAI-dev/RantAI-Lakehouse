@@ -177,6 +177,7 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
         &created.id,
         &pipelines::UpdatePipelineInput {
             depends_on: Some(vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()]),
+            connector_id: pipelines::ConnectorChange::Keep,
             ..pipelines::UpdatePipelineInput {
                 kind: input().kind,
                 source_zone: input().source_zone,
@@ -191,6 +192,7 @@ async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> 
                 description: None,
                 max_retries: None,
                 depends_on: None,
+                connector_id: pipelines::ConnectorChange::Keep,
             }
         },
         None,
@@ -516,6 +518,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             description: Some("edited".to_owned()),
             max_retries: None,
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -552,6 +555,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             description: None,
             max_retries: None,
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -765,6 +769,7 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
         // pass `None` — the field is "unchanged" — to mirror the
         // console's save-without-`dependsOn` shape.
         depends_on: None,
+        connector_id: pipelines::ConnectorChange::Keep,
     }
 }
 
@@ -1002,6 +1007,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
             description: Some("edited".to_owned()),
             max_retries: Some(4),
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1030,6 +1036,7 @@ async fn create_pipeline_writes_one_created_version_in_the_same_transaction(
             description: created_snapshot.description.clone(),
             max_retries: Some(created_snapshot.max_retries),
             depends_on: Some(created_snapshot.depends_on.clone()),
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1104,6 +1111,7 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
             description: Some("edited".to_owned()),
             max_retries: Some(4),
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1145,6 +1153,7 @@ async fn restore_pipeline_writes_exactly_one_restored_version(pool: PgPool) -> s
             // write land the restored chain rather than the stored one
             // (which is what `None` would do).
             depends_on: Some(snap.depends_on.clone()),
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1205,6 +1214,7 @@ async fn update_pipeline_writes_one_updated_version_with_post_write_state(
             description: Some("edited".to_owned()),
             max_retries: Some(4),
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         Some(actor),
     )
@@ -1302,6 +1312,7 @@ async fn failed_update_writes_no_version_row(pool: PgPool) -> sqlx::Result<()> {
             description: None,
             max_retries: Some(99), // out of CHECK range; forces a 23514
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1350,6 +1361,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
             description: Some("second".to_owned()),
             max_retries: Some(created.max_retries),
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1372,6 +1384,7 @@ async fn list_definition_versions_is_newest_first_without_snapshots(
             description: Some("third".to_owned()),
             max_retries: Some(created.max_retries),
             depends_on: None,
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1495,6 +1508,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
             description: Some("edit".to_owned()),
             max_retries: Some(4),
             depends_on: Some(vec!["pl-upstream".to_owned()]),
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -1524,6 +1538,7 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
             description: snap.description.clone(),
             max_retries: Some(snap.max_retries),
             depends_on: Some(snap.depends_on.clone()),
+            connector_id: pipelines::ConnectorChange::Keep,
         },
         None,
     )
@@ -2695,6 +2710,7 @@ async fn update_pipeline_refuses_target_lag_cycle(pool: PgPool) -> sqlx::Result<
         owner: p1_inp.owner.clone(),
         max_retries: Some(p1.max_retries),
         depends_on: None,
+        connector_id: pipelines::ConnectorChange::Keep,
     };
     let err = pipelines::update_pipeline(&pool, &p1.id, &update_input, None)
         .await
