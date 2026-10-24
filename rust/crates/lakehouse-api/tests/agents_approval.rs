@@ -15,7 +15,10 @@ use lakehouse_store::audit::{AuditFilter, list};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{TestApp, session_cookie_for_seeded_user, spin_up};
+use common::{
+    TestApp, create_principal_with_permissions, session_cookie_for_seeded_user,
+    session_cookie_for_user, spin_up,
+};
 
 async fn post(
     app: &axum::Router,
@@ -467,6 +470,16 @@ async fn access_decide_route_refuses_a_principal_approving_their_own_access_requ
 /// The before/after proof (WS7 plan Phase E acceptance): a DIFFERENT
 /// access:approve holder may decide, and approving actually widens what
 /// the requester can do.
+///
+/// `SEC-45` changed WHO may approve: holding `access:approve` is not
+/// enough, the approver must hold the permission the request asks for.
+/// The seeded Governance Admin (`dewi@meridian.example`) holds
+/// `access:approve` but NOT `catalog:write`, so she can no longer approve
+/// this request — she is refused with 403 by the rule under test (see
+/// `access_decide_route_refuses_an_approval_by_a_principal_without_the_requested_permission`).
+/// This test therefore approves as a principal minted with BOTH
+/// `access:approve` and `catalog:write`, which is what the widened rule
+/// asks for.
 #[tokio::test]
 async fn access_decide_route_allows_a_different_access_approve_holder_and_the_grant_widens_access()
 {
@@ -496,9 +509,11 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     .expect("load principal before grant");
     assert!(!before.has("catalog:write"));
 
-    // dewi@meridian.example: Governance Admin, holds access:approve, is
-    // NOT the requester.
-    let cookie = session_cookie_for_seeded_user(&pool, "dewi@meridian.example").await;
+    // An approver who holds `access:approve` AND the requested
+    // `catalog:write`, and is NOT the requester.
+    let approver_id =
+        create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
     let resp = post(
         &router,
         &format!("/api/catalog/access-requests/{approval_id}/decide"),
@@ -523,6 +538,172 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     .await
     .expect("load principal after grant");
     assert!(after.has("catalog:write"));
+}
+
+// ── SEC-45: an approver may only approve a permission they hold ──────────
+//
+// `access:approve` says "you may decide access requests"; it does not say
+// "you may hand out any permission". The rule a direct grant already obeys
+// (`routes::catalog_grants::create`, `PR #106 review R1 BLOCKER 4`) applies
+// here too: to APPROVE a request the decider must hold the permission the
+// request asks for. REJECTING needs no permission of its own — it gives
+// nothing away.
+
+/// The requested permission, read from the approval's own `action`
+/// (`access:<permission>`, the shape `create_access_request` writes).
+async fn requested_permission(approval_id: &str, pool: &sqlx::PgPool) -> String {
+    let (action,): (String,) = sqlx::query_as("SELECT action FROM approval_item WHERE id = $1")
+        .bind(approval_id)
+        .fetch_one(pool)
+        .await
+        .expect("the access request row exists");
+    action
+        .strip_prefix("access:")
+        .expect("an access request's action is \"access:<permission>\"-shaped")
+        .to_owned()
+}
+
+/// How many `access_grant` rows this approval produced — the thing a
+/// refused approval must NOT have written.
+async fn grants_for(approval_id: &str, pool: &sqlx::PgPool) -> i64 {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM access_grant WHERE approval_id = $1")
+            .bind(approval_id)
+            .fetch_one(pool)
+            .await
+            .expect("count the access grants of an approval");
+    count
+}
+
+/// SEC-45: an approver who holds `access:approve` but NOT the permission
+/// the request asks for is refused with 403, and NOTHING changes: the
+/// request stays pending and no grant row is written.
+#[tokio::test]
+async fn access_decide_route_refuses_an_approval_by_a_principal_without_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+    assert_eq!(
+        requested_permission(&approval_id, &pool).await,
+        "catalog:write"
+    );
+
+    // A custom role holding `access:approve` alone: it may decide, but not
+    // hand out a permission it does not itself hold.
+    let approver_id = create_principal_with_permissions(&pool, "access:approve").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["error"],
+        json!("permission_denied: you cannot approve a permission you do not hold")
+    );
+
+    // Nothing changed: the request is still pending, and no grant exists.
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "pending");
+    assert_eq!(grants_for(&approval_id, &pool).await, 0);
+}
+
+/// SEC-45: the same approver, holding the requested permission as well, is
+/// allowed to approve — and the grant really widens the requester's
+/// permissions.
+#[tokio::test]
+async fn access_decide_route_allows_an_approval_by_a_principal_holding_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+
+    let (requester_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
+        .bind("sari@meridian.example")
+        .fetch_one(&pool)
+        .await
+        .expect("seeded user sari@meridian.example must exist");
+
+    let approver_id =
+        create_principal_with_permissions(&pool, "access:approve, catalog:write").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "approved" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "approved");
+    assert_eq!(grants_for(&approval_id, &pool).await, 1);
+
+    let after = lakehouse_auth::repository::load_principal_for_user(
+        &pool,
+        requester_id,
+        "local".to_owned(),
+        false,
+    )
+    .await
+    .expect("load principal after grant");
+    assert!(after.has("catalog:write"));
+}
+
+/// SEC-45: rejecting needs no permission of its own — a principal without
+/// the requested permission may still refuse the request (it gives nothing
+/// away).
+#[tokio::test]
+async fn access_decide_route_allows_a_rejection_by_a_principal_without_the_requested_permission() {
+    let TestApp { router, pool } = spin_up().await;
+    let approval_id = create_pending_access_request(
+        &router,
+        &pool,
+        "sari@meridian.example",
+        "cat-1",
+        "catalog:write",
+    )
+    .await;
+
+    let approver_id = create_principal_with_permissions(&pool, "access:approve").await;
+    let cookie = session_cookie_for_user(&pool, approver_id).await;
+    let resp = post(
+        &router,
+        &format!("/api/catalog/access-requests/{approval_id}/decide"),
+        Some(&cookie),
+        json!({ "decision": "rejected", "comment": "not needed" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let approval = lakehouse_store::agents::get_approval(&pool, &approval_id)
+        .await
+        .expect("read the access request")
+        .expect("the access request exists");
+    assert_eq!(approval.status, "rejected");
+    assert_eq!(grants_for(&approval_id, &pool).await, 0);
 }
 
 // ── AI-1 / AI-20 (plan 20): `delete_board` is a WriteHigh tool ──────────
