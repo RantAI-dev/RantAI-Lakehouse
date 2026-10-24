@@ -280,8 +280,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "ai/tools/dashboards.rs",
-        ".map_err(|e| e.to_string())",
-        "serde error over the model's own tool arguments",
+        "cause.to_string()",
+        "serde error over the model's own tool arguments, the same class as the look.rs entry below: it names the field the model must fix, never a payload from Postgres, Iceberg or ClickHouse",
+    ),
+    (
+        "ai/tools/dashboards.rs",
+        "{field}\\\": {cause}",
+        "the same serde error over the model's own tool arguments, in front of the field's name",
     ),
     (
         "ai/tools/pipelines.rs",
