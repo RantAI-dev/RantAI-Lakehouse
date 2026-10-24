@@ -595,8 +595,14 @@ mod tests {
         // says the site is no longer allowed.
         let mut without = format.clone();
         without.content_sites = vec!["https://other.example".to_owned()];
-        assert!(content_sites_of_cards(&[&img], &without).is_empty());
-        assert!(content_sites_of_cards(&[], &format).is_empty());
+        assert_eq!(
+            content_sites_of_cards(&[&img], &without),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            content_sites_of_cards(&[], &format),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
