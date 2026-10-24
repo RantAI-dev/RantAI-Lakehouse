@@ -194,6 +194,10 @@ pub(crate) fn pdf_supported(config: &crate::config::Config) -> bool {
 ///
 /// The response to send instead: 400 for filters, grain or parameters that do
 /// not fit, a fixed sentence for a store failure.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the caller returns verbatim; boxing it would change every call site for no gain on the success path (REL-9 decision D2, PR #204 CI)"
+)]
 pub(crate) async fn payload_for(
     state: &AppState,
     principal: &Principal,

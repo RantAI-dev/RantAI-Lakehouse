@@ -6138,7 +6138,7 @@ mod tests {
         let unreadable = embed_access_from_aggregate_rows(&[modes("not json")]);
         assert!(unreadable.filter_modes.is_empty());
         // The modes ride in the origins column but are not origins.
-        assert!(access.origins.is_empty());
+        assert!(access.origins.is_empty(), "{:?}", access.origins);
     }
 
     /// PR #105 review SHOULD-FIX 1 / acceptance check (b):
