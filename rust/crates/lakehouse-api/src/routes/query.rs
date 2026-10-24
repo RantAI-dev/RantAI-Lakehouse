@@ -17,6 +17,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
+use lakehouse_store::uploads::TableClaim;
 use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -74,15 +75,39 @@ fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
 /// (`policy_engine::engine_error_message`/`refusal_message` — the
 /// underlying Postgres/`sqlparser` error text never reaches the response,
 /// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
-/// classification/substitution.
+/// classification/substitution, and 404 [`ApiError::NotFound`] with the
+/// fixed sentence of [`table_not_available`] when the statement reads a
+/// table the caller may not read (`SEC-20`).
 pub(crate) async fn rewrite_sql_for_principal(
     state: &AppState,
     sql: &str,
     engine: &str,
     principal: &Principal,
 ) -> Result<String, ApiError> {
+    rewrite_sql_for_principal_with_headers(state, sql, engine, principal, &HeaderMap::new()).await
+}
+
+/// The shared rewrite, with the request's headers.
+///
+/// `SEC-20`: the tenant the caller acts as comes from the request's
+/// `X-Tenant` header when the caller has the request's headers, and from
+/// the caller's first tenant when it does not — the chat, the catalog's
+/// own sample and profile and the dependents list have no headers to
+/// pass. The header only ever narrows the caller's own tenants
+/// ([`crate::tenant_scope`]), so it can never widen anything.
+///
+/// # Errors
+///
+/// The same as [`rewrite_sql_for_principal`].
+pub(crate) async fn rewrite_sql_for_principal_with_headers(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
     let started_rewrite = Instant::now();
-    let result = rewrite_sql_for_principal_inner(state, sql, engine, principal).await;
+    let result = rewrite_sql_for_principal_inner(state, sql, engine, principal, headers).await;
     state
         .policy_decision_latencies
         .record(started_rewrite.elapsed());
@@ -103,6 +128,7 @@ async fn rewrite_sql_for_principal_inner(
     sql: &str,
     engine: &str,
     principal: &Principal,
+    headers: &HeaderMap,
 ) -> Result<String, ApiError> {
     let placeholders = crate::sql_rewrite::PlaceholderValues {
         principal_id: Some(principal.id.uuid().to_string()),
@@ -113,6 +139,18 @@ async fn rewrite_sql_for_principal_inner(
             .collect(),
     };
     let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
+
+    // SEC-20: the tenant gate runs BEFORE the policy rewrite, so a
+    // statement that reads a table the caller may not read is refused
+    // before the policy's own prefetch asks the engine about that table,
+    // and before the statement reaches the engine at all.
+    refuse_unreachable_tables(
+        state,
+        principal,
+        headers,
+        &referenced_table_names(sql, is_trino_engine(engine)),
+    )
+    .await?;
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
     // sequence now lives in ONE place —
@@ -161,6 +199,274 @@ async fn rewrite_sql_for_principal_inner(
         }
         ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
     })
+}
+
+/// `SEC-20`: how far the caller's reach extends over the tables a
+/// statement reads.
+///
+/// One decision per request, resolved by [`resolve_reach`] before any
+/// table is looked at, so "may this caller read that table" is asked
+/// once and answered the same way for every table and every route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantReach {
+    /// Nothing is out of reach: a principal holding every permission
+    /// (`"*:*"`), or a deployment with one tenant (or none) — there is no
+    /// other tenant's table to reach, so the gate changes nothing.
+    All,
+    /// The caller's own tenant, and whether that tenant owns the shared
+    /// catalog (the tenant named in `CATALOG_TENANT_ID`).
+    Tenant { tenant_id: Uuid, owns_catalog: bool },
+    /// The caller belongs to no tenant in a deployment that has more than
+    /// one: it owns no table and may read no shared one.
+    NoTenant,
+}
+
+/// `SEC-20`: the one sentence a table the caller may not read is refused
+/// with.
+///
+/// A 404, never a 403: a 403 would confirm the table exists to a caller
+/// who must not learn that, and Query Studio reads a 403 as "this user
+/// may not run anything at all" and refuses the whole batch. The
+/// sentence is the same whether the table exists and belongs to somebody
+/// else or does not exist at all, so the refusal is not an oracle
+/// either.
+fn table_not_available(table: &str) -> ApiError {
+    ApiError::NotFound(format!(
+        "Table not found or not available to your organisation: {table}"
+    ))
+}
+
+/// `SEC-20`: the caller's reach over tables, resolved once per request.
+///
+/// The answers it composes are the ones the rest of the service already
+/// uses, not copies of them (`AGENTS.md` rule 4):
+/// [`crate::routes::catalog::is_unrestricted`] (the `"*:*"` grant), the
+/// shared catalog's own gate
+/// [`crate::routes::catalog::catalog_tenant_refusal`],
+/// [`crate::tenant_scope::resolve`] (the `X-Tenant` header, or the
+/// caller's first tenant), and [`deployment_tenant_count`] (whether the
+/// deployment holds a second tenant at all).
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when `X-Tenant` names a tenant the caller does
+/// not belong to — the same fail-closed 404 the tenant scope answers
+/// everywhere else, never a 403 that would confirm the tenant exists.
+async fn resolve_reach(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+) -> Result<TenantReach, ApiError> {
+    if crate::routes::catalog::is_unrestricted(principal) {
+        return Ok(TenantReach::All);
+    }
+    let refused = crate::routes::catalog::catalog_tenant_refusal(state, principal, headers)
+        .await?
+        .is_some();
+    let tenant = crate::tenant_scope::resolve(principal, headers)?;
+    Ok(match (refused, tenant) {
+        // The shared catalog is open to this caller: it may read the
+        // shared tables, and its own tenant's uploads besides.
+        (false, Some(tenant_id)) => {
+            // The gate admits the caller for one of two reasons: it owns
+            // the shared catalog, or the deployment holds a single tenant
+            // and there is no other tenant's table to reach. The second
+            // changes nothing at all, so the count is asked for.
+            if deployment_tenant_count(state)
+                .await?
+                .is_some_and(|count| count <= 1)
+            {
+                TenantReach::All
+            } else {
+                TenantReach::Tenant {
+                    tenant_id,
+                    owns_catalog: true,
+                }
+            }
+        }
+        // No tenant of the caller's and nothing to scope (a deployment
+        // with one tenant, or none): the gate changes nothing.
+        (false, None) => TenantReach::All,
+        // The shared catalog is closed to this caller: only the uploads
+        // its own tenant claimed are its own.
+        (true, Some(tenant_id)) => TenantReach::Tenant {
+            tenant_id,
+            owns_catalog: false,
+        },
+        // A caller with no tenant in a deployment that has more than
+        // one: it owns no upload and may read no shared table.
+        (true, None) => TenantReach::NoTenant,
+    })
+}
+
+/// `SEC-20`: how many tenants the deployment holds.
+///
+/// `None` when there is no database to count: the shared catalog's own
+/// gate refuses every caller it cannot verify in that state, and this gate
+/// fails closed with it.
+///
+/// The count is read beside the gate's own answer, never instead of it.
+/// The gate answers "may this caller read the shared catalog"; this
+/// answers "does this deployment hold a second tenant at all". The two
+/// are different questions, and the first does not tell the second: the
+/// gate admits a caller for the catalog's own tenant AND for a
+/// deployment with a single tenant, and those two have to end differently
+/// — a deployment with one tenant changes nothing.
+///
+/// # Errors
+///
+/// 503 when the count cannot be read: the store's own fixed message and a
+/// reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+async fn deployment_tenant_count(state: &AppState) -> Result<Option<i64>, ApiError> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(None);
+    };
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tenant")
+        .fetch_one(pool)
+        .await
+        .map_err(|err| {
+            upstream_error::report_sqlx(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })?;
+    Ok(Some(count))
+}
+
+/// `SEC-20`: the rule, as a pure function of the reach and the claim on
+/// the table.
+///
+/// - [`TenantReach::All`]: everything is reachable.
+/// - [`TableClaim::Ours`]: the caller's own tenant holds the table (an
+///   upload it made) — reachable, whoever owns the shared catalog.
+/// - [`TableClaim::Theirs`]: another tenant holds it — never reachable.
+/// - [`TableClaim::Unclaimed`]: nobody holds it — a table no upload
+///   claimed, or a shared table — and it is reachable only by the
+///   catalog's own tenant.
+fn table_is_reachable(reach: TenantReach, claim: TableClaim) -> bool {
+    match reach {
+        TenantReach::All => true,
+        TenantReach::NoTenant => false,
+        TenantReach::Tenant { owns_catalog, .. } => match claim {
+            TableClaim::Ours => true,
+            TableClaim::Theirs => false,
+            TableClaim::Unclaimed => owns_catalog,
+        },
+    }
+}
+
+/// `SEC-20`: the raw upload table a canonical table name names, when it
+/// names one.
+///
+/// An upload lands in the Bronze namespace under its raw name
+/// (`upload_table_claim.bronze_table`, the key
+/// [`lakehouse_store::uploads::table_claim`] reads), so `bronze.orders`
+/// is the upload table `orders` and no other namespace holds an upload.
+/// A bare one-part name is not it: `orders` alone names whatever the
+/// caller's default database holds.
+fn raw_table_name(table: &str) -> Option<&str> {
+    table
+        .strip_prefix(lakehouse_iceberg::bronze::BRONZE_NAMESPACE)?
+        .strip_prefix('.')
+}
+
+/// `SEC-20`: who holds `table`, as the caller's own tenant sees it.
+///
+/// A table no upload claimed has no holder, so it is nobody's and the
+/// shared rule decides it. The read is the store's own
+/// [`lakehouse_store::uploads::table_claim`] — the same answer the
+/// ingest path's `TABLE_NOT_FREE` conflict is built on, never a second
+/// reading of `upload_table_claim`.
+///
+/// A deployment with no Postgres pool has no claims to read, and the
+/// shared catalog's own gate refuses every principal without the
+/// unrestricted grant in that state anyway, so the answer is "nobody
+/// holds it" and the shared rule decides.
+///
+/// # Errors
+///
+/// 503 when the claim cannot be read: the store's own fixed message and
+/// a reference id, through [`upstream_error`] (the raw error text never
+/// reaches the response, `AGENTS.md` principle 4).
+async fn claim_on(state: &AppState, tenant_id: Uuid, table: &str) -> Result<TableClaim, ApiError> {
+    let Some(raw) = raw_table_name(table) else {
+        return Ok(TableClaim::Unclaimed);
+    };
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(TableClaim::Unclaimed);
+    };
+    lakehouse_store::uploads::table_claim(pool, tenant_id, raw)
+        .await
+        .map_err(|err| {
+            upstream_error::store(&upstream_error::STORE, &err)
+                .into_api_error(upstream_error::FailedAs::ServiceUnavailable)
+        })
+}
+
+/// `SEC-20`: refuse a statement that reads a table the caller may not
+/// read.
+///
+/// The tables are the ones the statement names, as
+/// [`crate::sql_rewrite::referenced_tables`] canonicalises them (a
+/// `CTE`'s own name is not a table), and the first table out of reach is
+/// the one the refusal names.
+///
+/// # Errors
+///
+/// 404 with the fixed sentence of [`table_not_available`] for a table the
+/// caller may not read; 404 for an `X-Tenant` header the caller does not
+/// belong to; 503 when a claim cannot be read.
+async fn refuse_unreachable_tables(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    tables: &[String],
+) -> Result<(), ApiError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let reach = resolve_reach(state, principal, headers).await?;
+    let tenant_id = match reach {
+        TenantReach::All => return Ok(()),
+        TenantReach::NoTenant => return Err(table_not_available(&tables[0])),
+        TenantReach::Tenant { tenant_id, .. } => tenant_id,
+    };
+    let mut claims = Vec::with_capacity(tables.len());
+    for table in tables {
+        claims.push(claim_on(state, tenant_id, table).await?);
+    }
+    match first_unreachable(reach, &claims) {
+        Some(at) => Err(table_not_available(&tables[at])),
+        None => Ok(()),
+    }
+}
+
+/// `SEC-20`: the first table the caller may not read, in the order the
+/// tables were listed.
+///
+/// The rule itself is [`table_is_reachable`]; this only says which table
+/// the refusal names, so the decision stays a pure function of the reach
+/// and the claims.
+fn first_unreachable(reach: TenantReach, claims: &[TableClaim]) -> Option<usize> {
+    claims
+        .iter()
+        .position(|claim| !table_is_reachable(reach, *claim))
+}
+
+/// The tables `sql` names, canonicalised the way the policy rewrite
+/// canonicalises them and sorted, so the refusal always names the same
+/// table for the same statement.
+///
+/// A statement that does not parse has no table list: the policy rewrite
+/// refuses it with a 422 of its own, so there is nothing here to gate.
+fn referenced_table_names(sql: &str, trino: bool) -> Vec<String> {
+    let dialect: &dyn sqlparser::dialect::Dialect = if trino {
+        &sqlparser::dialect::GenericDialect {}
+    } else {
+        &sqlparser::dialect::ClickHouseDialect {}
+    };
+    let mut tables = crate::sql_rewrite::referenced_tables(sql, dialect).unwrap_or_default();
+    tables.sort();
+    tables
 }
 
 /// Fixed text for `DATA-16` F3: past versions are queried on `ClickHouse`
@@ -1580,10 +1886,15 @@ mod settings_rule_tests {
         )
     }
 
+    /// The shared catalog belongs to one tenant, and the query path is
+    /// scoped to the tenant: this fixture principal is the catalog's own
+    /// member, so the shared tables stay reachable.
+    const CATALOG_TENANT_ID: &str = "11111111-1111-4111-8111-000000000001";
+
     fn analyst() -> Principal {
         Principal {
             id: PrincipalId::User(Uuid::nil()),
-            tenant_ids: Vec::new(),
+            tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000001")],
             display_name: "alice".to_owned(),
             permissions: PermissionSet::parse("query:read"),
             provider: "session".to_owned(),
@@ -1608,6 +1919,7 @@ mod settings_rule_tests {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
         env.insert("CH_URL".to_owned(), server.uri());
+        env.insert("CATALOG_TENANT_ID".to_owned(), CATALOG_TENANT_ID.to_owned());
         let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
 
         let refused = check_statement_would_run(
@@ -1983,11 +2295,20 @@ mod tests {
             principal: Principal,
             headers: HeaderMap,
         ) -> Value {
+            estimate_of_caller_sql(state, principal, headers, "SELECT * FROM t").await
+        }
+
+        async fn estimate_of_caller_sql(
+            state: AppState,
+            principal: Principal,
+            headers: HeaderMap,
+            sql: &str,
+        ) -> Value {
             let result = estimate(
                 State(state),
                 Extension(principal),
                 headers,
-                Bytes::from_static(br#"{"sql":"SELECT * FROM t"}"#),
+                Bytes::from(serde_json::to_vec(&json!({ "sql": sql })).unwrap()),
             )
             .await;
             let Ok(ApiJson(body)) = result else {
@@ -2069,6 +2390,16 @@ mod tests {
         }
 
         // PR #106 review R1 BLOCKER 2, SHOULD-FIX DATA-12 2
+        //
+        // `SEC-20` moved the shared table out of this caller's reach: a
+        // caller outside the catalog's tenant is refused a shared table
+        // before the estimate asks the engine anything (the refusal has
+        // its own test below). The DATA-12 rule — a caller outside the
+        // catalog's tenant gets no source marks — is still what happens
+        // for the tables that caller MAY read: its own tenant's upload.
+        // The mark is seeded on that upload, so the assertion below is
+        // "the mark exists and is still withheld", not "there was
+        // nothing to withhold".
         #[sqlx::test(migrations = "../../migrations")]
         async fn caller_outside_catalog_tenant_receives_no_source_marks(
             pool: lakehouse_store::PgPool,
@@ -2076,7 +2407,7 @@ mod tests {
             lakehouse_store::annotation::set_certification(
                 &pool,
                 &lakehouse_store::annotation::CertificationInput {
-                    asset_id: "silver.orders".to_owned(),
+                    asset_id: "bronze.retail_orders".to_owned(),
                     status: "certified".to_owned(),
                     note: None,
                     replacement_asset_id: None,
@@ -2085,8 +2416,19 @@ mod tests {
             )
             .await
             .unwrap();
+            // The retail tenant holds this upload, so the caller below may
+            // read it: a tenant reads its own upload, whoever owns the
+            // shared catalog.
+            lakehouse_store::uploads::claim_table(
+                &pool,
+                uuid::uuid!("11111111-1111-4111-8111-000000000002"),
+                "retail_orders",
+                "upload-retail-orders",
+            )
+            .await
+            .unwrap();
 
-            let ch = clickhouse_reading("silver", "orders").await;
+            let ch = clickhouse_reading("bronze", "retail_orders").await;
             let state = state_for(&pool, &ch.uri());
 
             // A caller who belongs to retail (not meridian-group catalog tenant):
@@ -2100,11 +2442,60 @@ mod tests {
                 role_names: Vec::new(),
             };
 
-            let body = estimate_of_caller(state, outside_caller, HeaderMap::new()).await;
-            assert_eq!(body["sources"], json!(["silver.orders"]));
+            let body = estimate_of_caller_sql(
+                state,
+                outside_caller,
+                HeaderMap::new(),
+                "SELECT * FROM bronze.retail_orders",
+            )
+            .await;
+            assert_eq!(body["sources"], json!(["bronze.retail_orders"]));
             assert!(
                 body.get("sourceMarks").is_none(),
                 "marks must be omitted for caller outside catalog tenant"
+            );
+        }
+
+        // SEC-20: a caller outside the catalog's tenant is refused a shared
+        // table with the fixed 404 sentence, and the engine is never asked.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn caller_outside_catalog_tenant_is_refused_a_shared_table(
+            pool: lakehouse_store::PgPool,
+        ) {
+            let ch = clickhouse_reading("silver", "orders").await;
+            let state = state_for(&pool, &ch.uri());
+
+            let outside_caller = Principal {
+                id: PrincipalId::User(Uuid::new_v4()),
+                tenant_ids: vec![uuid::uuid!("11111111-1111-4111-8111-000000000002")],
+                display_name: "Outsider".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            };
+
+            let result = estimate(
+                State(state),
+                Extension(outside_caller),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"sql":"SELECT * FROM silver.orders"}"#),
+            )
+            .await;
+            let Err(err) = result else {
+                panic!("expected the shared table to be refused");
+            };
+            assert_eq!(err.0.status(), 404);
+            assert_eq!(
+                err.0.to_string(),
+                "Table not found or not available to your organisation: silver.orders"
+            );
+            assert!(
+                ch.received_requests()
+                    .await
+                    .expect("the mock records requests")
+                    .is_empty(),
+                "nothing may reach the engine"
             );
         }
 
@@ -2928,5 +3319,139 @@ mod tests {
             );
             Ok(())
         }
+    }
+}
+
+/// `SEC-20`: the tenant gate's rule, on its own. A separate module from
+/// `tests` so the two do not share a hunk.
+#[cfg(test)]
+mod tenant_scope_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_store::uploads::TableClaim;
+    use uuid::Uuid;
+
+    use super::{
+        TenantReach, first_unreachable, raw_table_name, referenced_table_names, table_is_reachable,
+        table_not_available,
+    };
+
+    const TENANT_A: Uuid = Uuid::from_u128(1);
+    const TENANT_B: Uuid = Uuid::from_u128(2);
+
+    /// The catalog's own tenant: it may read the shared tables.
+    fn catalog_tenant() -> TenantReach {
+        TenantReach::Tenant {
+            tenant_id: TENANT_A,
+            owns_catalog: true,
+        }
+    }
+
+    /// Another tenant: it may read its own uploads, and nothing else.
+    fn other_tenant() -> TenantReach {
+        TenantReach::Tenant {
+            tenant_id: TENANT_B,
+            owns_catalog: false,
+        }
+    }
+
+    #[test]
+    fn an_upload_claimed_by_another_tenant_is_refused() {
+        assert!(!table_is_reachable(other_tenant(), TableClaim::Theirs));
+        assert!(!table_is_reachable(catalog_tenant(), TableClaim::Theirs));
+    }
+
+    #[test]
+    fn an_upload_claimed_by_the_callers_own_tenant_is_allowed() {
+        assert!(table_is_reachable(other_tenant(), TableClaim::Ours));
+        assert!(table_is_reachable(catalog_tenant(), TableClaim::Ours));
+    }
+
+    #[test]
+    fn a_shared_table_follows_the_catalogs_own_gate() {
+        assert!(!table_is_reachable(other_tenant(), TableClaim::Unclaimed));
+        assert!(table_is_reachable(catalog_tenant(), TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_principal_holding_every_permission_passes() {
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Theirs));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_deployment_with_one_tenant_changes_nothing() {
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Ours));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Theirs));
+        assert!(table_is_reachable(TenantReach::All, TableClaim::Unclaimed));
+    }
+
+    #[test]
+    fn a_principal_with_no_tenant_reaches_nothing() {
+        assert!(!table_is_reachable(TenantReach::NoTenant, TableClaim::Ours));
+        assert!(!table_is_reachable(
+            TenantReach::NoTenant,
+            TableClaim::Unclaimed
+        ));
+    }
+
+    #[test]
+    fn a_raw_upload_name_is_the_bronze_namespace_and_the_raw_name() {
+        assert_eq!(raw_table_name("bronze.orders"), Some("orders"));
+        assert_eq!(raw_table_name("bronze"), None);
+        assert_eq!(raw_table_name("silver.orders"), None);
+        assert_eq!(raw_table_name("serving.mart_x"), None);
+        assert_eq!(raw_table_name("orders"), None);
+    }
+
+    #[test]
+    fn every_sql_form_of_a_bronze_table_names_the_same_upload() {
+        for sql in [
+            "SELECT * FROM bronze.orders",
+            "SELECT * FROM iceberg.bronze.orders",
+            "SELECT * FROM icecat_x.`bronze.orders`",
+        ] {
+            assert_eq!(
+                referenced_table_names(sql, false),
+                vec!["bronze.orders".to_owned()],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_reading_two_tables_refuses_on_the_second() {
+        let tables = referenced_table_names(
+            "SELECT * FROM bronze.invoices JOIN silver.orders ON true",
+            false,
+        );
+        assert_eq!(
+            tables,
+            vec!["bronze.invoices".to_owned(), "silver.orders".to_owned()]
+        );
+        // The caller's own upload first, then a shared table it may not
+        // read: the refusal names the second.
+        let claims = [TableClaim::Ours, TableClaim::Unclaimed];
+        assert_eq!(first_unreachable(other_tenant(), &claims), Some(1));
+        assert_eq!(first_unreachable(catalog_tenant(), &claims), None);
+    }
+
+    #[test]
+    fn a_cte_named_like_a_foreign_table_is_not_a_table() {
+        let tables = referenced_table_names(
+            "WITH foreign_orders AS (SELECT 1) SELECT * FROM foreign_orders",
+            false,
+        );
+        assert!(tables.is_empty(), "{tables:?}");
+    }
+
+    #[test]
+    fn the_refusal_is_a_404_with_the_fixed_sentence() {
+        let err = table_not_available("bronze.orders");
+        assert_eq!(err.status(), 404);
+        assert_eq!(
+            err.to_string(),
+            "Table not found or not available to your organisation: bronze.orders"
+        );
     }
 }
