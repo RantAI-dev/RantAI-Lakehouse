@@ -166,7 +166,10 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     .unwrap();
 
     let before = get_connector(&pool, &connector.id).await.unwrap().unwrap();
-    assert!(before.dependent_pipelines.is_empty());
+    assert_eq!(
+        before.dependent_pipelines,
+        [] as [lakehouse_store::connectors::ConnectorDependent; 0]
+    );
 
     let pipeline = create_pipeline(
         &pool,
@@ -1293,7 +1296,10 @@ async fn unknown_connector_probe_writes_nothing(pool: PgPool) -> sqlx::Result<()
     let history = list_probe_results(&pool, "conn-does-not-exist", 50)
         .await
         .unwrap();
-    assert!(history.is_empty());
+    assert_eq!(
+        history,
+        [] as [lakehouse_store::connector_probe_result::ConnectorProbeResult; 0]
+    );
     Ok(())
 }
 
@@ -2148,11 +2154,11 @@ async fn connector_ids_in_tenants_keeps_only_the_ids_of_the_callers_tenants(
         .expect("query");
     assert!(own.contains(&"conn-pg-lakehouse".to_owned()));
     assert!(!own.contains(&"conn-does-not-exist".to_owned()));
-    assert!(
+    assert_eq!(
         connector_ids_in_tenants(&pool, &ids, &[])
             .await
-            .expect("query")
-            .is_empty()
+            .expect("query"),
+        [] as [std::string::String; 0]
     );
     Ok(())
 }

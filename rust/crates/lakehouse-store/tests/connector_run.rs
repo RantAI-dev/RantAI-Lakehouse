@@ -254,7 +254,10 @@ async fn a_run_cannot_be_reported_or_read_through_another_connector(
     assert!(matches!(err, StoreError::NotFound), "{err:?}");
     assert!(get_run_log(&pool, S3, "run-x").await.unwrap().is_none());
     assert!(get_run_log(&pool, PG, "run-nope").await.unwrap().is_none());
-    assert!(list_runs(&pool, S3, 50).await.unwrap().is_empty());
+    assert_eq!(
+        list_runs(&pool, S3, 50).await.unwrap(),
+        [] as [lakehouse_store::connector_run::RunSummary; 0]
+    );
     assert_eq!(
         run_status(&pool, PG, "run-x").await.unwrap().as_deref(),
         Some("running")
@@ -403,7 +406,10 @@ async fn contradictory_reports_are_refused(pool: PgPool) -> sqlx::Result<()> {
         .await
         .unwrap();
     let log = get_run_log(&pool, PG, "run-c").await.unwrap().unwrap();
-    assert!(log.attempts.is_empty());
+    assert_eq!(
+        log.attempts,
+        [] as [lakehouse_store::connector_run::AttemptRecord; 0]
+    );
     assert_eq!(log.lines.len(), 3);
     assert!(log.lines[1].text.contains("2 columns left out"));
     Ok(())

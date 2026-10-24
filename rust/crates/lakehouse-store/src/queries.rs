@@ -87,18 +87,85 @@ impl From<SavedQueryRow> for SavedQuery {
     }
 }
 
-/// List every saved query, newest first.
+/// Which saved queries a caller may read (`SEC-20`).
+///
+/// A saved query is a statement somebody wrote against their own data, so
+/// it belongs to the tenant that wrote it: one tenant's rows are that
+/// tenant's alone, and the rows that belong to no tenant are read only by
+/// the tenant that owns the shared catalog.
+///
+/// The scope is decided once per request, beside the decision the same
+/// request makes about the tables a statement may read, so "which
+/// tenant is this" is answered once for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryScope {
+    /// Every row: a caller who holds every permission, or a deployment
+    /// that holds a single tenant — there is no other tenant's row to
+    /// hide from anybody.
+    All,
+    /// One tenant's rows, and the rows that belong to no tenant when
+    /// `include_tenantless` is set.
+    Tenant {
+        /// The tenant whose rows are read.
+        tenant_id: Uuid,
+        /// Whether the rows that belong to no tenant are read as well.
+        /// They are the rows written before the column existed, and the
+        /// rows whose tenant was deleted: nobody recorded which tenant
+        /// wrote them, so they are the shared catalog's own, and the
+        /// tenant that owns that catalog is the one that reads them.
+        include_tenantless: bool,
+    },
+    /// No row at all: a caller that belongs to no tenant owns no saved
+    /// query and reads none.
+    None,
+}
+
+/// The saved queries the scope allows, newest first.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_saved(pool: &PgPool) -> Result<Vec<SavedQuery>, StoreError> {
-    let rows: Vec<SavedQueryRow> = sqlx::query_as(
-        "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
-         ORDER BY updated_at DESC, title",
-    )
-    .fetch_all(pool)
-    .await?;
+pub async fn list_saved(
+    pool: &PgPool,
+    scope: SavedQueryScope,
+) -> Result<Vec<SavedQuery>, StoreError> {
+    let rows: Vec<SavedQueryRow> = match scope {
+        SavedQueryScope::All => {
+            sqlx::query_as(
+                "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
+                 ORDER BY updated_at DESC, title",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        SavedQueryScope::Tenant {
+            tenant_id,
+            include_tenantless,
+        } => {
+            if include_tenantless {
+                sqlx::query_as(
+                    "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
+                     WHERE tenant_id = $1 OR tenant_id IS NULL \
+                     ORDER BY updated_at DESC, title",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await?
+            } else {
+                sqlx::query_as(
+                    "SELECT id, title, sql, owner, updated_at, tags FROM saved_query \
+                     WHERE tenant_id = $1 \
+                     ORDER BY updated_at DESC, title",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await?
+            }
+        }
+        // A caller that belongs to no tenant reads no row: the answer is
+        // empty, and the database is never asked.
+        SavedQueryScope::None => Vec::new(),
+    };
     Ok(rows.into_iter().map(SavedQuery::from).collect())
 }
 
@@ -217,6 +284,11 @@ pub async fn history_recent(
 /// module doc comment: only `listSaved()` existed), because the console
 /// itself never authored one; the copilot is the first caller that does.
 ///
+/// `tenant_id` is the tenant the query belongs to (`SEC-20`): the row is
+/// that tenant's alone, and the rows written with no tenant are read only
+/// by the tenant that owns the shared catalog. `None` is honest for a
+/// caller that belongs to no tenant — nobody can say whose query it is.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the insert fails.
@@ -227,10 +299,11 @@ pub async fn create_saved_query(
     owner: &str,
     tags: &[String],
     owner_id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
 ) -> Result<SavedQuery, StoreError> {
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags, owner_id) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id, tenant_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          RETURNING id, title, sql, owner, updated_at, tags",
     )
     .bind(title)
@@ -238,6 +311,7 @@ pub async fn create_saved_query(
     .bind(owner)
     .bind(tags)
     .bind(owner_id)
+    .bind(tenant_id)
     .fetch_one(pool)
     .await?;
     Ok(SavedQuery::from(row))

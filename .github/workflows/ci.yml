@@ -348,11 +348,15 @@ jobs:
         working-directory: rust
 
   # ── Rust: MSRV compile check ─────────────────────────────────────────
-  # In PR 1, the 1.88.0 MSRV test run is converted into a fast compile check
-  # (cargo check --workspace --all-targets --locked) so we ensure MSRV
-  # compatibility without duplicating the full integration test run time.
+  # Adds a fast compile check of the declared minimum (REL-9: it moved to
+  # the latest stable, so it is checked one patch below the pin) without
+  # duplicating the full integration test run time. The `+1.99.0` is
+  # load-bearing: `rust/rust-toolchain.toml` overrides whatever toolchain
+  # the checkout action installs as the default (rustup precedence:
+  # command-line spec > rust-toolchain file > default), so a plain
+  # `cargo check` here would rebuild this job on the pin, not the floor.
   msrv:
-    name: Rust · MSRV check (1.88.0)
+    name: Rust · MSRV check (1.99.0)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.all == 'true'
     runs-on: ubuntu-latest
@@ -364,7 +368,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
 
       # Save on `main` only; see the `clippy` job's `Cache cargo` step.
       - name: Cache cargo
@@ -372,10 +376,10 @@ jobs:
         with:
           workspaces: rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: msrv-1.88.0
+          key: msrv-1.99.0
 
-      - name: cargo check --workspace --all-targets --locked
-        run: cargo check --workspace --all-targets --locked
+      - name: cargo +1.99.0 check --workspace --all-targets --locked
+        run: cargo +1.99.0 check --workspace --all-targets --locked
         working-directory: rust
 
   # ── Rust: G1 acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
@@ -2712,6 +2716,12 @@ jobs:
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          # SEC-20: with the four migration-seeded tenants the query gate
+          # refuses a shared table for every principal outside the shared
+          # catalog's tenant. The G8 analyst belongs to that tenant (the
+          # gate's seeding inserts the same stable id), so the gate proves
+          # masking, row filters and time travel, not tenancy.
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           EOF
           # SEC-36: generated per run; no key-shaped literal in the repository.
           echo "CONNECTOR_SECRETS_KEY=$(openssl rand -base64 32)" >> .env
@@ -2851,6 +2861,12 @@ jobs:
           RUSTFS_ACCESS_KEY=ci-only-rustfs-access
           RUSTFS_SECRET_KEY=ci-only-rustfs-secret-0001
           LAKEKEEPER_ENCRYPTION_KEY=ci-only-lakekeeper-key-0001
+          # SEC-20: with the four migration-seeded tenants the query gate
+          # refuses a shared table for every principal outside the shared
+          # catalog's tenant. The G8 analyst belongs to that tenant (the
+          # gate's seeding inserts the same stable id), so the gate proves
+          # masking, row filters and time travel, not tenancy.
+          CATALOG_TENANT_ID=11111111-1111-4111-8111-000000000001
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
           # Same as g3a-dagster's .env: bronze_ingest_job dials this compose

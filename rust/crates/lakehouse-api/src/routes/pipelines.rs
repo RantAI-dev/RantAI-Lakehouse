@@ -2932,6 +2932,14 @@ pub async fn run_finished_event(
 /// not loaded (marked ready while it was down, say) gets one reload; if
 /// the job is still missing, 409 says so rather than a launch error that
 /// reads like a bad job name.
+// `result_large_err` now reports `async fn`s too (clippy 1.98,
+// rust-clippy#17130). The `Err` here is a ready `Response` the route returns
+// verbatim, so boxing it would change this helper's contract and every call
+// site for an allocation only on the error path (REL-9, decision D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
     let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
     let pipeline = pipelines::get_pipeline(pool, id)
@@ -3168,6 +3176,18 @@ pub async fn create(
         .filter(|id| !id.is_empty());
     if let Some(connector_id) = connector_id.as_deref() {
         require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
+        // BLD-7 / decision 2 + DEC-15: a pipeline that names a connector
+        // reads one of that connector's Bronze tables, never the source
+        // directly. Runs AFTER the tenant check, so an out-of-tenant
+        // connector keeps answering "not a connector in your tenant"
+        // whatever the source says.
+        crate::routes::authored_pipelines::validate_connector_source(
+            pool(&state)?,
+            connector_id,
+            &body.source_zone,
+            &body.source_table,
+        )
+        .await?;
     }
     let input = CreatePipelineInput {
         name: body.name,
@@ -3218,7 +3238,11 @@ pub async fn create(
 /// unknown id, another tenant's connector and an unassigned one get the
 /// same answer, so this is no oracle for which connector ids exist. A
 /// creator in no tenant owns no connector, so it cannot name one.
-async fn require_connector_in_tenant(
+///
+/// `BLD-9` / decision 7 calls this from `PUT` too, with the PIPELINE's
+/// tenant (the row `in_scope` already vouched for), so an edit cannot
+/// attach a connector from another tenant.
+pub(crate) async fn require_connector_in_tenant(
     pool: &PgPool,
     connector_id: &str,
     tenant_id: Option<Uuid>,
@@ -3836,6 +3860,12 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// `pipeline_run_pipeline_name` surfaces as 503 with the FIXED body
 /// `{"error": "orchestrator error"}` and the detail only to `tracing`
 /// (PR #80 review BLOCKER 1, AGENTS.md principle 4).
+// Same reason as `authored_launch_target` above: the `Err` is the ready
+// rejection the caller returns, not a value it inspects (REL-9, D2).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is a ready Response the route returns verbatim; boxing it would change every call site for no gain on the success path"
+)]
 async fn enforce_run_id_pipeline_scope(
     state: &AppState,
     principal: &Principal,
@@ -5444,7 +5474,10 @@ mod tests {
                 "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
             );
             assert_eq!(ops[0]["commit"], "unknown");
-            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert_eq!(
+                v["config"].as_array().expect("config array").as_slice(),
+                &[] as &[serde_json::Value]
+            );
             assert!(v["definition"].is_null());
         }
 
@@ -5529,6 +5562,11 @@ mod tests {
         /// dropped: the pipeline was saved (the toast said so) but `list`,
         /// which shows only the caller's tenant, never returned it, and the
         /// connector could be deleted from under it.
+        ///
+        /// BLD-7 / decision 2: the source is now one of the connector's own
+        /// ingest targets (`conn-pg-lakehouse` loads `ingest_demo.orders`
+        /// into `orders`, migration 0034), so the create is also the proof
+        /// that naming that target is accepted.
         #[sqlx::test(migrations = "../../migrations")]
         async fn create_stores_the_authors_tenant_and_the_connector(pool: sqlx::PgPool) {
             use lakehouse_test_support as _;
@@ -5538,7 +5576,10 @@ mod tests {
                 State(state.clone()),
                 Extension(fixture_member_principal()),
                 HeaderMap::new(),
-                create_body(&json!({ "connectorId": "conn-pg-lakehouse" })),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
             )
             .await
             .expect("create should succeed");
@@ -5563,6 +5604,134 @@ mod tests {
             assert!(
                 dependents.iter().any(|d| d.id == created.id),
                 "must depend on its connector"
+            );
+        }
+
+        /// BLD-7 / decision 2: `bronze.<one of the connector's ingest
+        /// targets>` is accepted, and the stored row keeps both the source
+        /// and the connector.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_accepts_a_connector_with_one_of_its_bronze_tables(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let (status, ApiJson(created)) = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect("a Bronze table the connector loads should be accepted");
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.source, "bronze.orders");
+            assert_eq!(created.connector_id.as_deref(), Some("conn-pg-lakehouse"));
+        }
+
+        /// BLD-7 / decision 2: a non-Bronze source is refused with the one
+        /// fixed sentence that names the tables the connector does load,
+        /// and nothing is stored.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_non_bronze_source_for_a_connector(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceZone": "silver",
+                    "sourceTable": "orders",
+                })),
+            )
+            .await
+            .expect_err("a silver source with a connector must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("reads one of that connector's Bronze tables"),
+                "the refusal says what to pick, got: {message}"
+            );
+            assert!(
+                message.contains("orders"),
+                "the refusal lists the connector's own table, got: {message}"
+            );
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                    all_tenants: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|p| !p.name.starts_with("tenant-route-test-")),
+                "a refused create stores nothing"
+            );
+        }
+
+        /// BLD-7 / decision 2: a Bronze table the connector does not load
+        /// is refused the same way.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_bronze_table_the_connector_does_not_load(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-pg-lakehouse",
+                    "sourceTable": "some_other_table",
+                })),
+            )
+            .await
+            .expect_err("a table outside the connector's targets must be refused");
+
+            assert_eq!(err.0.status(), 400);
+            assert!(
+                err.0
+                    .to_string()
+                    .contains("reads one of that connector's Bronze tables"),
+                "the refusal is the same fixed sentence"
+            );
+        }
+
+        /// BLD-7 / decision 2: a connector that has not loaded anything yet
+        /// (`conn-s3-warehouse` ships with an empty `source_objects`,
+        /// migration 0034) says so, instead of pretending it has a table.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_connector_with_no_ingest_targets(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({
+                    "connectorId": "conn-s3-warehouse",
+                    "sourceTable": "anything",
+                })),
+            )
+            .await
+            .expect_err("a connector with no tables cannot be a source yet");
+
+            assert_eq!(err.0.status(), 400);
+            assert_eq!(
+                err.0.to_string(),
+                crate::routes::authored_pipelines::CONNECTOR_HAS_NO_TABLES
             );
         }
 
@@ -6397,7 +6566,10 @@ mod tests {
             // "failed", never the raw Dagster string.
             assert_eq!(steps[0]["status"], "failed");
             assert!(steps[0]["startMs"].is_number());
-            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                steps[0]["materializations"].as_array().unwrap().as_slice(),
+                &[] as &[serde_json::Value]
+            );
         }
 
         #[tokio::test]
@@ -9122,9 +9294,12 @@ mod tests {
         /// the caller sent a non-object (or no body at all).
         #[test]
         fn top_level_keys_for_non_objects_is_empty() {
-            assert!(top_level_keys(&Value::Null).is_empty());
-            assert!(top_level_keys(&json!([])).is_empty());
-            assert!(top_level_keys(&json!("string")).is_empty());
+            assert_eq!(top_level_keys(&Value::Null), [] as [std::string::String; 0]);
+            assert_eq!(top_level_keys(&json!([])), [] as [std::string::String; 0]);
+            assert_eq!(
+                top_level_keys(&json!("string")),
+                [] as [std::string::String; 0]
+            );
         }
     }
 

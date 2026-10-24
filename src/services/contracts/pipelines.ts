@@ -298,6 +298,15 @@ export type UpdatePipelineInput = {
    * See [`CreatePipelineInput.dependsOn`] for the `file_ingest_job` rule.
    */
   dependsOn?: string[]
+  /**
+   * The pipeline's connector (`BLD-9` / decision 7). Omitting it leaves
+   * the stored connector alone; `null` (or an empty string) clears it;
+   * an id sets or replaces it. The API refuses an id whose connector is
+   * not in the pipeline's tenant and a source that is not one of that
+   * connector's Bronze tables (`BLD-7` decision 2), with a message that
+   * names the tables to pick.
+   */
+  connectorId?: string | null
 }
 
 /** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */

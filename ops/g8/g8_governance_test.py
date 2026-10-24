@@ -86,6 +86,16 @@ AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-
 ANALYST_EMAIL = "g8-analyst@lakehouse.invalid"
 ANALYST_PASSWORD = "g8-analyst-password-not-real-456"  # noqa: S105 -- gate fixture, not a real secret
 
+# SEC-20 scopes the query path to the tenant: with more than one seeded
+# tenant (migration 0002 seeds four), a caller in no tenant -- and any
+# caller outside the shared catalog's tenant -- is refused every shared
+# table with the same 404 a missing table gets. This gate proves masking
+# and row filters for an analyst, so the analyst it seeds joins the
+# migration-seeded tenant (stable id, meant to be referenced) that the CI
+# stack names in `CATALOG_TENANT_ID`; a tenant-less analyst would prove
+# the refusal, which `tests/query_tenant_scope.rs` already asserts.
+CATALOG_TENANT_ID = "11111111-1111-4111-8111-000000000001"
+
 # The table this gate seeds and governs, and the fixed row it authors a
 # masking policy against. `region` is never named by the policy's `mask`
 # list below, so it doubles as the "only the named column is masked, not
@@ -155,9 +165,10 @@ def step_seed_gate_table() -> None:
 
 
 def step_seed_analyst_login() -> None:
-    """Inserts one `app_user` + `auth_identity` + `app_user_role` row
-    directly, bypassing `POST /api/identity/users` (which creates no
-    password credential today), the same "gate reaches Postgres directly"
+    """Inserts one `app_user` + `auth_identity` + `app_user_role` +
+    `app_user_tenant` row directly, bypassing `POST /api/identity/users`
+    (which creates no password credential today), the same "gate reaches
+    Postgres directly"
     pattern `ops/g4/g4_test.py::pg_exec` already establishes for its own
     CDC source rows. Idempotent: `ON CONFLICT` on every insert, so a
     repeat run against a persisted volume upserts the same row rather
@@ -188,6 +199,11 @@ def step_seed_analyst_login() -> None:
     psql(
         "INSERT INTO app_user_role (user_id, role_id) "
         f"SELECT '{user_id}', r.id FROM role r WHERE r.name = 'Analyst' "
+        "ON CONFLICT DO NOTHING;"
+    )
+    psql(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) "
+        f"VALUES ('{user_id}', '{CATALOG_TENANT_ID}') "
         "ON CONFLICT DO NOTHING;"
     )
     print("[g8] seeded Analyst login (idempotent upsert)")

@@ -5,12 +5,11 @@
 # clean-clone build problem in a different (and better) way; the two have
 # since been converged onto this single file, and `Dockerfile.api` is gone.
 #
-# Base image pin: `rust:1.85-slim` (this file's old pin) cannot build this
-# workspace — `Cargo.lock` pulls in `time@0.3.55`, which requires rustc
-# >= 1.88. Rather than guessing the minimum that happens to satisfy today's
-# lockfile, this pins the exact toolchain the workspace already commits to
-# in `rust-toolchain.toml` (`channel = "1.96.1"`), so the Docker build and
-# local dev/CI builds are guaranteed to use the same compiler.
+# Base image pin: this file builds the API with the exact toolchain the
+# workspace already commits to in `rust-toolchain.toml` (`channel =
+# "1.99.1"`), not whatever minimum today's `Cargo.lock` happens to
+# satisfy, so the Docker build and local dev/CI builds are guaranteed to
+# use the same compiler. The pin's older values are in CHANGELOG.md.
 #
 # Three build stages share one tools base, so the two `cargo install`s below
 # are compiled once and stay above every `COPY` of repo files (their layer
@@ -20,7 +19,7 @@
 #   planner  copies the manifests + sources, writes `recipe.json`
 #   builder  compiles the dependencies from `recipe.json` alone (`cook`),
 #            then copies the sources and compiles the workspace
-FROM rust:1.96.1-slim AS tools
+FROM rust:1.99.1-slim AS tools
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 # `sqlx-cli`, pinned to the same version as the workspace's `sqlx`
@@ -94,7 +93,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p lakehouse-api \
     && cp "$CARGO_TARGET_DIR/release/lakehouse-api" /usr/local/bin/lakehouse-api
 
-# `debian:trixie-slim`, not `bookworm-slim`: `rust:1.96.1-slim` builds on
+# `debian:trixie-slim`, not `bookworm-slim`: the pinned
+# `rust:1.99.1-slim` builder runs on
 # Debian 13 (trixie), whose glibc is newer than bookworm's. A bookworm
 # runtime image fails to even exec the trixie-built `sqlx-cli` binary
 # (`GLIBC_2.39' not found`) — matching the base OS avoids a glibc skew
