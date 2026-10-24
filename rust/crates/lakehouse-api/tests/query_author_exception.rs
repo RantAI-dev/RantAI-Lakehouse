@@ -38,10 +38,16 @@ async fn failing_clickhouse() -> MockServer {
 }
 
 async fn app_with(env: &[(&str, String)]) -> TestApp {
-    let overrides: HashMap<String, String> = env
+    let mut overrides: HashMap<String, String> = env
         .iter()
         .map(|(k, v)| ((*k).to_owned(), v.clone()))
         .collect();
+    // The shared catalog belongs to one tenant, and the query path is
+    // scoped to the tenant: this principal must be the catalog's own.
+    overrides.insert(
+        "CATALOG_TENANT_ID".to_owned(),
+        "11111111-1111-4111-8111-000000000001".to_owned(),
+    );
     spin_up_with_env(&overrides).await
 }
 
@@ -54,6 +60,14 @@ async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, Str
 
 async fn post_as_author(app: &TestApp, uri: &str, body: &str) -> (StatusCode, String) {
     let user = create_principal_with_permissions(&app.pool, "query:read").await;
+    // The shared catalog belongs to one tenant, and the query path is
+    // scoped to the tenant: this principal is put in the catalog's own.
+    sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2::uuid)")
+        .bind(user)
+        .bind("11111111-1111-4111-8111-000000000001")
+        .execute(&app.pool)
+        .await
+        .expect("attach the fixture principal to the catalog's tenant");
     let cookie = session_cookie_for_user(&app.pool, user).await;
     send(
         &app.router,
