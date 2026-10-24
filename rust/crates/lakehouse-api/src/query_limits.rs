@@ -353,7 +353,7 @@ pub async fn scope_middleware(State(state): State<AppState>, req: Request, next:
 
 /// The most a board request may take (plan D4): 35 minutes, the 30-minute
 /// ceiling of the time limit plus the margin below.
-pub const BOARD_DEADLINE_CAP: Duration = Duration::from_secs(35 * 60);
+pub const BOARD_DEADLINE_CAP: Duration = Duration::from_mins(35);
 
 /// What the deadline adds to the time the tiles may need, for the answer.
 pub const DEADLINE_MARGIN: Duration = Duration::from_secs(15);
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(board_deadline(7, limit), Duration::from_secs(135));
         assert_eq!(board_deadline(13, limit), Duration::from_secs(195));
         assert_eq!(
-            board_deadline(600, Duration::from_secs(1800)),
+            board_deadline(600, Duration::from_mins(30)),
             BOARD_DEADLINE_CAP
         );
     }

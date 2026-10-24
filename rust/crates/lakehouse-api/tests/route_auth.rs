@@ -2797,3 +2797,43 @@ async fn the_query_limits_routes_are_gated_in_both_directions() {
         .expect("router answers");
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// `POST /api/query/cancel` (Stop) is open to any login (it can only end the
+/// caller's own run) and refuses an anonymous caller; a body that is not a
+/// run id UUID never reaches the engine.
+#[tokio::test]
+async fn the_query_cancel_route_needs_a_login_and_a_uuid_run_id() {
+    let TestApp { router, pool } = common::spin_up().await;
+    let plain = create_zero_permission_principal(&pool).await;
+    let cookie = session_cookie_for_user(&pool, plain).await;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/query/cancel")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"runId":"22222222-2222-4222-8222-222222222222"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let bad = request_with_cookie_and_body(
+        &router,
+        "POST",
+        "/api/query/cancel",
+        &cookie,
+        br#"{"runId":"%"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        bad.status(),
+        StatusCode::BAD_REQUEST,
+        "a login is enough to reach the handler"
+    );
+}

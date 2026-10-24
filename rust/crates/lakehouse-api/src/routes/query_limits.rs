@@ -225,7 +225,7 @@ mod tests {
     fn a_body_inside_every_range_is_accepted() {
         let (install, roles) = parse(OK).expect("ok");
         assert_eq!(install, QueryLimits::default());
-        assert!(roles.is_empty());
+        assert_eq!(roles, Vec::<(Uuid, i32)>::new());
     }
 
     #[test]

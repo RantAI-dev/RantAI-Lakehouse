@@ -61,6 +61,7 @@ mod quality_incidents;
 mod quality_load;
 mod quality_schedules;
 mod query;
+mod query_cancel;
 mod query_limits;
 mod schema_changes;
 pub(crate) mod schema_versions;
@@ -1314,6 +1315,11 @@ pub fn router(state: AppState) -> Router {
         )
         // Time and row limits of charts and Query Studio (`BI-5`); see
         // `routes::query_limits`.
+        // Stop (`BI-5`): ends the caller's own queries of one run.
+        .route(
+            "/api/query/cancel",
+            axum::routing::post(query_cancel::cancel),
+        )
         .route(
             "/api/settings/limits",
             get(query_limits::get_limits).put(query_limits::put_limits),

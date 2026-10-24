@@ -33,7 +33,7 @@ async fn the_migration_seeds_the_feature_defaults_and_the_struct_default_matches
             studio_rows: 2000
         }
     );
-    assert!(role_limits(&pool).await.expect("roles").is_empty());
+    assert_eq!(role_limits(&pool).await.expect("roles"), Vec::new());
     Ok(())
 }
 
@@ -56,7 +56,7 @@ async fn a_save_round_trips_and_replaces_the_role_set(pool: PgPool) -> sqlx::Res
     assert_eq!(roles[0].timeout_seconds, 300);
 
     save(&pool, &install, &[], "user-a").await.expect("save");
-    assert!(role_limits(&pool).await.expect("roles").is_empty());
+    assert_eq!(role_limits(&pool).await.expect("roles"), Vec::new());
     Ok(())
 }
 
@@ -103,6 +103,6 @@ async fn deleting_a_role_deletes_its_limit(pool: PgPool) -> sqlx::Result<()> {
         .bind(r)
         .execute(&pool)
         .await?;
-    assert!(role_limits(&pool).await.expect("roles").is_empty());
+    assert_eq!(role_limits(&pool).await.expect("roles"), Vec::new());
     Ok(())
 }
