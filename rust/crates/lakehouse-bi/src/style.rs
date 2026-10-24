@@ -437,6 +437,10 @@ pub struct StyleFields {
     /// part B, plan D2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clusters: Option<Clusters>,
+    /// A Gantt chart's line at today; only `false` is stored (on is the
+    /// default), and only on a Gantt chart (`BI-16` part C1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_line: Option<bool>,
 }
 
 /// How many clusters: the console picks (`auto`), or a whole number of 2 to
@@ -860,7 +864,7 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
             key_ok(f, "a tooltip field")?;
         }
     }
-    check_clusters(style, kind)?;
+    check_kind_bound_fields(style, kind)?;
     if !style.conditional.is_empty() {
         if !takes_conditional(kind) {
             return Err(wrong("conditional colours", "a table, pivot or KPI"));
@@ -877,9 +881,13 @@ pub fn check_style(def: &ChartInput) -> Result<(), String> {
     Ok(())
 }
 
-/// `BI-17` part B (plan D2): clusters are for a scatter or bubble chart and
-/// take "auto" or 2 to 10 groups.
-fn check_clusters(style: &StyleFields, kind: ChartKind) -> Result<(), String> {
+/// The fields that belong to one kind: the today line of a Gantt chart
+/// (`BI-16` part C1), and clusters (`BI-17` part B, plan D2), which are for a
+/// scatter or bubble chart and take "auto" or 2 to 10 groups.
+fn check_kind_bound_fields(style: &StyleFields, kind: ChartKind) -> Result<(), String> {
+    if style.today_line.is_some() && kind != ChartKind::Gantt {
+        return Err("the today line is only for a Gantt chart.".to_owned());
+    }
     let Some(clusters) = &style.clusters else {
         return Ok(());
     };

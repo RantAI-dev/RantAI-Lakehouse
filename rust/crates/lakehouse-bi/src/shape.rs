@@ -646,6 +646,9 @@ fn is_grouped_kind(kind: ChartKind) -> bool {
             | ChartKind::Progress
             | ChartKind::Histogram
             | ChartKind::Bullet
+            // BI-16 part C1: a Gantt chart has its own statement (tasks with a
+            // start and an end), so no sort, "Other" or own-aggregate measure.
+            | ChartKind::Gantt
             | ChartKind::Kpi
             | ChartKind::Gauge
             | ChartKind::Boxplot

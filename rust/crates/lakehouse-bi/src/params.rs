@@ -962,6 +962,7 @@ fn takes_param_slots(def: &ChartInput) -> bool {
             | ChartKind::Web
             | ChartKind::Progress
             | ChartKind::Histogram
+            | ChartKind::Gantt
             | ChartKind::Bullet
     ) && def.shape.steps.is_none()
         && def.shape.groupings.is_none()

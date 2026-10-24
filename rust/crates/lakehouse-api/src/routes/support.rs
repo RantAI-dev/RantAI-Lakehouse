@@ -716,6 +716,26 @@ pub(crate) async fn annotate_table(
                 tile.insert("truncated".to_owned(), json!(true));
             }
         }
+        // BI-16 part C1: the Gantt chart's reversed rows, counted through the
+        // same role rewrite; a failed count only leaves the note out.
+        Some(TableRead::Reversed { count_sql }) => {
+            match try_run_spec_sql(ch, count_sql, roles, placeholders, obligations).await {
+                Ok(counted) => {
+                    let n = counted["rows"][0]["n"].as_u64().or_else(|| {
+                        counted["rows"][0]["n"]
+                            .as_str()
+                            .and_then(|t| t.parse().ok())
+                    });
+                    if let Some(n) = n.filter(|n| *n > 0) {
+                        tile.insert("reversedRows".to_owned(), json!(n));
+                    }
+                }
+                Err(SpecRunFailure::Clickhouse(err)) => {
+                    let _logged = upstream_error::report_ch(&upstream_error::TILE, &err);
+                }
+                Err(SpecRunFailure::Refused(_)) => {}
+            }
+        }
         Some(TableRead::Trend { .. }) | None => {}
     }
 }

@@ -1053,6 +1053,134 @@ fn histogram_sql(def: &ChartInput, from: &Relation, where_clauses: Vec<String>) 
     )
 }
 
+/// Most tasks a Gantt chart keeps; the statement asks for one more so the tile
+/// can say "more than 1,000" (`BI-16` part C1, plan D2).
+pub const GANTT_LIMIT: u32 = 1001;
+
+/// The first result column of a Gantt chart's statement, also the `y` of its
+/// spec: the result has `task`, `group`, `start`, `end` and optionally
+/// `progress` (the names the console reads).
+pub const GANTT_START: &str = "start";
+
+/// The columns a Gantt chart reads, as `Ident`s, from its definition.
+struct GanttColumns {
+    task: Ident,
+    group: Option<Ident>,
+    start: Ident,
+    end: Ident,
+    progress: Option<Ident>,
+}
+
+fn gantt_columns(def: &ChartInput) -> Option<GanttColumns> {
+    let named = |v: &Option<String>| v.clone().filter(|c| !c.trim().is_empty());
+    Some(GanttColumns {
+        task: Ident::new(def.dimension.clone()).ok()?,
+        group: match def.breakdown.as_deref().filter(|g| !g.is_empty()) {
+            Some(g) => Some(Ident::new(g.to_owned()).ok()?),
+            None => None,
+        },
+        start: Ident::new(named(&def.types.start)?).ok()?,
+        end: Ident::new(named(&def.types.end)?).ok()?,
+        progress: match named(&def.types.progress) {
+            Some(p) => Some(Ident::new(p).ok()?),
+            None => None,
+        },
+    })
+}
+
+/// A date or timestamp column as the tile reads it: a timestamp in the report
+/// zone (a `Date` is never shifted).
+fn gantt_instant<H: std::hash::BuildHasher>(
+    column: &Ident,
+    kinds: &HashMap<String, ColumnKind, H>,
+    time: &TimeContext,
+) -> String {
+    if kinds.get(column.as_str()) == Some(&ColumnKind::DateTime) {
+        time.in_zone_expr(&column.to_string())
+    } else {
+        column.to_string()
+    }
+}
+
+/// A Gantt chart's statement (`BI-16` part C1, plan D2): one row per task and
+/// group with its first start and last end (and mean progress), the first
+/// [`GANTT_LIMIT`] by start. Rows that end before they start are left out and
+/// counted by [`gantt_reversed_sql`] for the note. The inner select renames
+/// the columns to `__`-prefixed names so a source column called `start` or
+/// `end` can neither shadow nor be shadowed by the result's names, and the
+/// dashboard's predicates sit under it on the raw rows, as in every other
+/// builder here. `None` when the definition no longer checks out.
+fn gantt_sql<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    from: &Relation,
+    where_clauses: &[String],
+    (kinds, time): (&HashMap<String, ColumnKind, H>, &TimeContext),
+) -> Option<String> {
+    let c = gantt_columns(def)?;
+    let group = c
+        .group
+        .as_ref()
+        .map_or_else(|| "''".to_owned(), ToString::to_string);
+    let progress_inner = c
+        .progress
+        .as_ref()
+        .map(|p| format!(", toFloat64({p}) AS __p"))
+        .unwrap_or_default();
+    let progress_outer = if c.progress.is_some() {
+        ", avg(__p) AS `progress`"
+    } else {
+        ""
+    };
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+    Some(format!(
+        "SELECT __t AS `task`, __g AS `group`, min(__s) AS `start`, max(__e) AS `end`{progress_outer} \
+         FROM (SELECT {task} AS __t, {group} AS __g, {start} AS __s, {end} AS __e{progress_inner} \
+         FROM {from}{where_sql}) WHERE __e >= __s GROUP BY __t, __g ORDER BY min(__s), __t LIMIT {GANTT_LIMIT}{}",
+        from.settings(),
+        task = c.task,
+        start = gantt_instant(&c.start, kinds, time),
+        end = gantt_instant(&c.end, kinds, time),
+        from = from.render(),
+    ))
+}
+
+/// How many rows of a Gantt chart end before they start: they cannot be drawn,
+/// and the tile says how many were left out (`reversedRows`).
+fn gantt_reversed_sql<H: std::hash::BuildHasher>(
+    def: &ChartInput,
+    from: &Relation,
+    where_clauses: &[String],
+    (kinds, time): (&HashMap<String, ColumnKind, H>, &TimeContext),
+) -> Option<String> {
+    let c = gantt_columns(def)?;
+    let mut clauses = where_clauses.to_vec();
+    clauses.push(format!(
+        "{} < {}",
+        gantt_instant(&c.end, kinds, time),
+        gantt_instant(&c.start, kinds, time)
+    ));
+    Some(format!(
+        "SELECT count() AS n FROM {} WHERE {}{}",
+        from.render(),
+        clauses.join(" AND "),
+        from.settings()
+    ))
+}
+
+/// The statement a Gantt chart is saved with (no dashboard filter).
+pub(crate) fn gantt_stored_sql(
+    def: &ChartInput,
+    from: &Relation,
+    kinds: &HashMap<String, ColumnKind>,
+    time: &TimeContext,
+) -> Option<String> {
+    gantt_sql(def, from, &[], (kinds, time))
+}
+
 /// The statement a histogram is saved with (no dashboard filter).
 pub(crate) fn histogram_stored_sql(def: &ChartInput, from: &Relation) -> Option<String> {
     histogram_sql(def, from, Vec::new())
@@ -1229,6 +1357,12 @@ pub enum TableRead {
         /// Rows to keep ([`tables::pivot_row_cap`]).
         row_cap: u32,
     },
+    /// A Gantt chart: the statement that counts the rows that end before they
+    /// start, left out of the bars (`BI-16` part C1).
+    Reversed {
+        /// `SELECT count() AS n ...` over the same relation and predicates.
+        count_sql: String,
+    },
     /// A KPI that compares with its previous period: the period the buckets
     /// are cut by, so the tile can label them.
     Trend {
@@ -1401,6 +1535,9 @@ where
         // BI-16 part B: a histogram reads the bins' widths, so it is always
         // rebuilt (the tile carries them), like a binned chart.
         || kind == crate::specs::ChartKind::Histogram
+        // BI-16 part C1: a Gantt chart carries the count of its reversed rows,
+        // built here and not stored.
+        || kind == crate::specs::ChartKind::Gantt
         || def.tables.is_rows_mode(kind)
         || def.tables.compares_to_previous(kind)
         || def.uses_shaping()
@@ -2100,6 +2237,15 @@ fn rebuild<H: std::hash::BuildHasher>(
             table: Some(TableRead::Trend { period: *period }),
         });
     }
+    if kind == crate::specs::ChartKind::Gantt {
+        let inputs = (ctx.cols, ctx.read.time);
+        let sql = gantt_sql(def, from, &where_clauses, inputs)?;
+        let count_sql = gantt_reversed_sql(def, from, &where_clauses, inputs)?;
+        return Some(Rebuilt {
+            sql,
+            table: Some(TableRead::Reversed { count_sql }),
+        });
+    }
     rebuild_chart(
         spec,
         from,
@@ -2169,6 +2315,10 @@ fn result_aliases(
         crate::specs::ChartKind::Histogram => {
             vec![def.dimension.clone(), HISTOGRAM_COUNT.to_owned()]
         }
+        // The rewritten select names its columns `__t` ...; a predicate on a
+        // source column of the same name as a result column stays on the raw
+        // rows (the predicates sit in the inner select).
+        crate::specs::ChartKind::Gantt => Vec::new(),
         crate::specs::ChartKind::Boxplot => def
             .measures
             .first()

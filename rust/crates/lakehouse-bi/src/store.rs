@@ -111,6 +111,7 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Gauge,
     ChartKind::Progress,
     ChartKind::Histogram,
+    ChartKind::Gantt,
     ChartKind::Bullet,
     ChartKind::Table,
     ChartKind::Pivot,
@@ -4593,7 +4594,7 @@ fn check_measures(
 ) -> Result<(), BiError> {
     // BI-16 part B: a histogram counts the rows of its dimension; it has no
     // measure (`types_b::check_fields` refused any).
-    if kind == ChartKind::Histogram {
+    if kind == ChartKind::Histogram || kind == ChartKind::Gantt {
         return Ok(());
     }
     if kind == ChartKind::Pivot || input.tables.is_rows_mode(kind) {
@@ -4898,7 +4899,9 @@ fn spec_from_resolved(
         grain,
         time,
     };
-    let spec = if kind == ChartKind::Histogram {
+    let spec = if kind == ChartKind::Gantt {
+        spec_from_gantt_input(input, ctx)
+    } else if kind == ChartKind::Histogram {
         spec_from_histogram_input(input, ctx)
     } else if kind == ChartKind::Pivot {
         spec_from_pivot_input(input, ctx)
@@ -5077,6 +5080,143 @@ fn spec_from_histogram_input(
         lat: None,
         lon: None,
         format: Some(NumFmt::Int),
+        span: Some(ctx.span),
+        text: None,
+        caption: None,
+        target: None,
+        click: None,
+    };
+    Ok(StoredChartSpec {
+        spec,
+        source,
+        board,
+        def,
+        has_year,
+        created_by: Some(created_by),
+        created_at: None,
+    })
+}
+
+/// The start, end and progress columns of a Gantt chart, checked against the
+/// relation: they exist, the first two are dates or date-times, progress is a
+/// number, and the task and group columns exist.
+fn check_gantt_columns(
+    input: &ChartInput,
+    ctx: &ChartCtx<'_>,
+) -> Result<(String, String, String), BiError> {
+    let named = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (start, end, progress) = (
+        named(&input.types.start),
+        named(&input.types.end),
+        named(&input.types.progress),
+    );
+    let known = |column: &str, what: &str| {
+        if IDENT_ALLOWED(column) && ctx.cols.contains(column) {
+            Ok(())
+        } else {
+            Err(BiError::Validation(format!(
+                "invalid or missing {what} column '{column}'."
+            )))
+        }
+    };
+    known(&input.dimension, "task")?;
+    known(&start, "start")?;
+    known(&end, "end")?;
+    for (column, what) in [(&start, "start"), (&end, "end")] {
+        if !matches!(
+            ctx.kinds.get(column),
+            Some(ColumnKind::Date | ColumnKind::DateTime)
+        ) {
+            return Err(BiError::Validation(format!(
+                "'{column}' is not a date or date-time column; the {what} of a Gantt chart must be one."
+            )));
+        }
+    }
+    if !progress.is_empty() {
+        known(&progress, "progress")?;
+        if ctx.kinds.get(&progress) != Some(&ColumnKind::Number) {
+            return Err(BiError::Validation(format!(
+                "'{progress}' is not a number column; the progress of a Gantt chart must be one."
+            )));
+        }
+    }
+    if let Some(group) = input.breakdown.as_deref() {
+        known(group, "group")?;
+    }
+    Ok((start, end, progress))
+}
+
+/// A Gantt chart (`BI-16` part C1, plan D1 and D2): one row per task with its
+/// first start and last end, grouped by the optional breakdown. The task,
+/// group, start, end and progress columns are checked against the relation
+/// here; the statement itself is [`crate::builder::gantt_stored_sql`].
+fn spec_from_gantt_input(
+    input: &ChartInput,
+    ctx: ChartCtx<'_>,
+) -> Result<StoredChartSpec, BiError> {
+    let (start, end, progress) = check_gantt_columns(input, &ctx)?;
+    let def = ChartInput {
+        title: ctx.title.clone(),
+        subtitle: ctx.subtitle.clone(),
+        mart: ctx.mart.clone(),
+        sql_source: ctx.sql_source.clone(),
+        kind: ctx.kind,
+        dimension: input.dimension.clone(),
+        measures: MeasureList::default(),
+        breakdown: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        aggregate: None,
+        limit: None,
+        order: None,
+        span: Some(ctx.span),
+        board: Some(ctx.board.clone()),
+        text: None,
+        caption: None,
+        target: None,
+        click: input.click.clone(),
+        grain: None,
+        tables: TableFields::default(),
+        shape: stored_shape(input),
+        style: input.style.clone(),
+        types: Box::new(crate::types_b::TypeFields {
+            start: Some(start),
+            end: Some(end),
+            progress: Some(progress).filter(|p| !p.is_empty()),
+            ..crate::types_b::TypeFields::default()
+        }),
+    };
+    let sql = crate::builder::gantt_stored_sql(&def, &ctx.from, &ctx.kinds, ctx.time)
+        .ok_or_else(|| BiError::Validation("this Gantt chart cannot be built.".to_owned()))?;
+    crate::style::check_style_names(input, &ctx.cols).map_err(BiError::Validation)?;
+    let (source, board, has_year, created_by) = (
+        ctx.source,
+        ctx.board.clone(),
+        ctx.has_year,
+        ctx.created_by.to_owned(),
+    );
+    let spec = ChartSpec {
+        id: ctx.new_id,
+        title: ctx.title,
+        subtitle: ctx.subtitle,
+        kind: ctx.kind,
+        mart: ctx.mart,
+        sql_source: ctx.sql_source,
+        sql,
+        x: input.dimension.clone(),
+        y: ChartY::Single(crate::builder::GANTT_START.to_owned()),
+        series: input.breakdown.clone(),
+        map: None,
+        lat: None,
+        lon: None,
+        format: None,
         span: Some(ctx.span),
         text: None,
         caption: None,

@@ -4147,7 +4147,16 @@ fn push_shape_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
 /// the address and description of an image or web card), present only on the
 /// charts that carry them.
 fn push_type_fields(def: &ChartInput, out: &mut Vec<(&'static str, Value)>) {
-    const NAMES: [&str; 5] = ["goal", "bands", "histogram", "url", "alt"];
+    const NAMES: [&str; 8] = [
+        "goal",
+        "bands",
+        "histogram",
+        "url",
+        "alt",
+        "start",
+        "end",
+        "progress",
+    ];
     let Ok(Value::Object(fields)) = serde_json::to_value(&def.types) else {
         return;
     };
