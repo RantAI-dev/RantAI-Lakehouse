@@ -1156,7 +1156,6 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use base64::Engine as _;
     use tower::ServiceExt;
 
     use super::*;
