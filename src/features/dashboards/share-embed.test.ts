@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test"
-import { formatLifetime, relativeTime, signSnippet, suggestedLifetimeSeconds, tokenRules } from "./share-embed"
+import { embedLookQuery, formatLifetime, iframeSnippet, relativeTime, signSnippet, suggestedLifetimeSeconds, tokenRules } from "./share-embed"
 
 describe("formatLifetime", () => {
   it("uses the largest whole unit", () => {
@@ -48,5 +48,38 @@ describe("relativeTime", () => {
     expect(relativeTime(1_800_000_000 - 3 * 3600, now)).toBe("3 hours ago")
     expect(relativeTime(1_800_000_000 - 2 * 86_400, now)).toBe("2 days ago")
     expect(relativeTime(1_800_000_000 + 500, now)).toBe("just now")
+  })
+})
+
+describe("the BI-26 snippets", () => {
+  it("names one chart instead of the dashboard, and every locked filter the token must set", () => {
+    const text = signSnippet({
+      board: "b_1", origin: "https://lake.example", maxLifetimeSeconds: 600, chart: "u_9", lockedFilters: ["region", "year"], query: "theme=dark",
+    })
+    expect(text).toContain('resource: { chart: "u_9" }')
+    expect(text).not.toContain("dashboard:")
+    expect(text).toContain('"region": "<value for region>"')
+    expect(text).toContain('"year": "<value for year>"')
+    expect(text).toContain('+ token + "?theme=dark"')
+  })
+
+  it("keeps the dashboard resource and the old example when nothing is locked", () => {
+    const text = signSnippet({ board: "b_1", origin: "o", maxLifetimeSeconds: 600 })
+    expect(text).toContain('resource: { dashboard: "b_1" }')
+    expect(text).toContain("kawasan")
+  })
+
+  it("writes the look options into the address", () => {
+    expect(embedLookQuery({ theme: "dashboard", hideName: false, transparent: false })).toBe("")
+    expect(embedLookQuery({ theme: "dark", hideName: true, transparent: true })).toBe("theme=dark&logo=none&background=transparent")
+  })
+
+  it("gives the host a short listener that accepts only the console's origin and its own frame", () => {
+    const text = iframeSnippet({ url: "https://lake.example/embed/signed/T?theme=dark", origin: "https://lake.example" })
+    expect(text).toContain('src="https://lake.example/embed/signed/T?theme=dark"')
+    expect(text).toContain('event.origin !== "https://lake.example"')
+    expect(text).toContain("event.source !== frame.contentWindow")
+    expect(text).toContain("rantai-embed:size")
+    expect(text.split("\n").length).toBeLessThanOrEqual(15)
   })
 })

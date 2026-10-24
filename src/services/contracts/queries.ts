@@ -191,7 +191,18 @@ export interface QueryService {
   saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
-  run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>
+  /**
+   * `runId` (`BI-5` plan D5) goes out as `X-Run-Id`, so a Stop can name the
+   * run; absent, the server makes one and the run cannot be stopped by id.
+   */
+  run(sql: string, options: { engine: QueryEngine; runId?: string }, signal?: AbortSignal): Promise<QueryResult>
+  /**
+   * `POST /api/query/cancel { runId }` (`BI-5` plan D5): ends the caller's own
+   * queries of that run on the engine and answers how many it found running.
+   * **The route does not exist on the server yet** (T4 of the BI-5 plan), so
+   * the call answers 404 until then; Stop aborts the request either way.
+   */
+  cancel(runId: string, signal?: AbortSignal): Promise<{ stopped: number }>
   /** Asks the chat's engine; masking, row filters and `query:read` apply to the SQL it runs. */
   askQuestion(question: string, signal?: AbortSignal): Promise<NlAnswer>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string }>

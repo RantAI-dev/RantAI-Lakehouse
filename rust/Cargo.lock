@@ -2461,6 +2461,7 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
@@ -2656,6 +2657,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rsa",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2676,6 +2678,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -2828,6 +2831,7 @@ dependencies = [
 name = "lakehouse-store"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "lakehouse-core",
  "lakehouse-test-support",
  "serde",
@@ -4179,6 +4183,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34f2d2cda7223168a14fb86bc7411dbc3379bd7d49749ecc53b91ed98585b6b0"
+dependencies = [
+ "tempfile",
+ "zip",
 ]
 
 [[package]]

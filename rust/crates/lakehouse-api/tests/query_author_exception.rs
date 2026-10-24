@@ -243,6 +243,7 @@ async fn a_failing_tile_inside_a_signed_embed_is_the_fixed_message_with_a_refere
     let token = lakehouse_embed::sign_embed(
         &lakehouse_embed::EmbedClaims {
             resource: Some(lakehouse_embed::EmbedResource {
+                chart: None,
                 dashboard: Some("b_embed".to_owned()),
             }),
             params: None,
@@ -376,6 +377,7 @@ async fn combined_embed(layer: Value) -> Value {
     let token = lakehouse_embed::sign_embed(
         &lakehouse_embed::EmbedClaims {
             resource: Some(lakehouse_embed::EmbedResource {
+                chart: None,
                 dashboard: Some("b_embed".to_owned()),
             }),
             params: None,

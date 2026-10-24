@@ -5,7 +5,7 @@ import { join } from "node:path"
 import type { BoardTab, LayoutMap } from "@/services";
 import type { FilterDef } from "@/services/clients/bi-store";
 import {
-  addTab, appliesOnTab, bottomOfTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isStaticKind, moveTab, moveTileToTab, placeUnboxed,
+  addTab, appliesOnTab, bottomOfTab, collapseLayout, defaultTileHeight, deleteTab, filtersOnTab, foldedTiles, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed,
   phoneOrder, readingOrder, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, withTies, movePhoneTile, resizePhoneTile,
 } from "./dashboard-tabs"
 import { decodeFilters, encodeFilters, normalizeFilters } from "./dashboard-filter-state"
@@ -135,6 +135,17 @@ test("the selected tab is the one in the address when it exists, else the first"
 test("static kinds are the text tile and the three section kinds", () => {
   for (const k of ["text", "heading", "divider", "section"]) assert.equal(isStaticKind(k), true)
   for (const k of ["bar", "kpi", "table"]) assert.equal(isStaticKind(k), false)
+})
+
+test("a single-value chart is a KPI, progress, gauge or any chart without a dimension, but not a table (RPT-1 QA fix Q3)", () => {
+  for (const k of ["kpi", "progress", "gauge"]) assert.equal(isSingleValueChart(k, { dimension: "region" }), true)
+  assert.equal(isSingleValueChart("bullet", { dimension: "" }), true)
+  assert.equal(isSingleValueChart("bar", {}), true)
+  assert.equal(isSingleValueChart("bar", undefined), true)
+  assert.equal(isSingleValueChart("bullet", { dimension: "place" }), false)
+  assert.equal(isSingleValueChart("bar", { dimension: "region" }), false)
+  assert.equal(isSingleValueChart("table", { dimension: "" }), false)
+  assert.equal(isSingleValueChart("pivot", { dimension: "" }), false)
 })
 
 test("the reading order is row then column, and a phone layout replaces it for the tiles it names", () => {

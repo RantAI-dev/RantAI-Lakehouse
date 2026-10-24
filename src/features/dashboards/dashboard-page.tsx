@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Table2, Trash2, Rows3 } from "lucide-react";
+import { ArrowRightLeft, ChartColumn, Download, Heading, Maximize2, Minus, MousePointerClick, Move, Moon, Pencil, Plus, Smartphone, SlidersHorizontal, Sparkles, Square, Table2, Trash2, Rows3 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@rantai/design-system/ui/empty";
@@ -28,14 +28,16 @@ import { extractViewFiltersFromChat } from "@/lib/dashboard-view-filter-from-cha
 import { canDrill, drillTarget, offersTileRecords, type ChartClickHandler, type ClickSpec } from "@/lib/chart-click";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import {
-  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
+  TAB_PARAM, addTab, bottomOfTab, defaultTileHeight, deleteTab, filtersOnTab, isSingleValueChart, isStaticKind, moveTab, moveTileToTab, placeUnboxed, renameTab, selectedTab, tabOf, tilesOnTab, withTabParam, type TabEdit,
 } from "@/lib/dashboard-tabs";
 import type { BoardTab, LayoutMap, PhoneTile } from "@/services";
 import type { ChartClick, FilterDef, FilterField } from "@/services/clients/bi-store";
 import { useAuth } from "@/features/auth/auth-provider";
 import { useCopilot } from "@/features/copilot/use-copilot";
 import { useService } from "@/hooks/use-service";
-import { dashboardService } from "@/services";
+import { dashboardService, queryService } from "@/services";
+import { newRunId, RUN_ID_HEADER } from "@/lib/run-id";
+import { STOPPED_SENTENCE } from "@/lib/query-limits";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
@@ -71,7 +73,10 @@ import type { RecordsRequest } from "./records";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
-import { downloadTableExport, exportNotice } from "./table-export";
+import { exportNotice } from "./table-export";
+import { downloadChartData, downloadDashboardPdf, downloadMenuKind, type DataChoice, type PdfChoice, type ReadState } from "./chart-download";
+import { DownloadDataDialog, DownloadPdfDialog } from "./download-dialogs";
+import { SubscriptionsDialog } from "./subscriptions-dialog";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 /**
@@ -101,6 +106,10 @@ type Payload = {
   grain?: string; appliedGrain?: string | null;
   /** The zone and first weekday the buckets were cut with (BI-9). */
   reporting?: ReportingContext;
+  /** False when every role of the viewer is switched off from downloading (BI-1); the download items are hidden. Absent from an older server: allowed. */
+  canDownload?: boolean;
+  /** False when the deployment has no PDF renderer (`BI-1`, feature decision 6). Absent from an older server: not offered. */
+  pdfSupported?: boolean;
   /** The dashboard's own theme and font (BI-17 part A); absent when it follows the console. */
   theme?: string; font?: string;
   /** The parameters the board shows with this response's value, the value each has saved (or by default), and every value in force (BI-11). */
@@ -248,9 +257,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // old board's response (slower: it runs the built-in tiles) used to land
   // last and paint its charts under the new dashboard's name.
   const loadSeq = React.useRef(0);
+  // BI-5 (plan D5): the run in flight, so Stop can end its queries on the engine and abort the request.
+  const runRef = React.useRef<{ runId: string; controller: AbortController } | null>(null);
+  const [stopped, setStopped] = React.useState(false);
   const load = React.useCallback(async (): Promise<Payload | undefined> => {
     const seq = ++loadSeq.current;
-    setLoading(true); setError(null);
+    const run = { runId: newRunId(), controller: new AbortController() };
+    runRef.current = run;
+    setLoading(true); setError(null); setStopped(false);
     try {
       const q = new URLSearchParams({ board });
       // A parameter that is not a filter list is ignored: the saved default shows.
@@ -260,7 +274,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (grainAsked) q.set("grain", grainAsked);
       const paramsAsked = paramsQuery(pValues);
       if (paramsAsked) q.set("params", paramsAsked);
-      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store", headers: { [RUN_ID_HEADER]: run.runId }, signal: run.controller.signal });
       const json = (await res.json()) as Payload;
       if (seq !== loadSeq.current) return undefined;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
@@ -270,12 +284,29 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       setPhone(json.phoneLayout);
       return json;
     } catch (e) {
+      // Stop is an answer, not an error: the tiles that were already on screen stay, and the page says "Stopped".
+      if (run.controller.signal.aborted) {
+        if (seq === loadSeq.current) setStopped(true);
+        return undefined;
+      }
       if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
       return undefined;
     } finally {
       if (seq === loadSeq.current) setLoading(false);
     }
   }, [board, fParam, gChoice, pValues]);
+
+  /**
+   * Stop on a dashboard that is still loading (BI-5 decision 4): ask the server to end this
+   * run's queries on the engine, then abort the request. The cancel call is best effort (the
+   * route lands with T4 of the BI-5 plan; until then it answers 404): the abort always happens.
+   */
+  const stopLoading = React.useCallback(() => {
+    const run = runRef.current;
+    if (!run) return;
+    void queryService.cancel(run.runId).catch(() => undefined);
+    run.controller.abort();
+  }, []);
 
   // Switching dashboard starts in view mode; the switcher navigates without
   // `f`, so the new board opens on its own default.
@@ -913,14 +944,16 @@ export function DashboardPage({ boardId }: { boardId: string }) {
 
   // The sort a viewer chose on a raw table, by tile, so its export follows the tile.
   const tableSorts = React.useRef<Record<string, { column: string; dir: "asc" | "desc" }>>({});
-  async function exportRawTable(id: string) {
-    try {
-      const done = await downloadTableExport(id, filters, tableSorts.current[id], paramsQuery(data?.appliedParams ?? null));
-      const note = exportNotice(done);
-      if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
-    } catch (e) {
-      notifyFailure("The export failed", e instanceof Error ? e.message : undefined);
-    }
+  // BI-1: what the page sent to read the dashboard, sent again with a download, so the file holds what is on screen.
+  const readState = (): ReadState => ({ filters, params: paramsQuery(data?.appliedParams ?? null), grain: grainQuery(gChoice) });
+  const canDownload = data?.canDownload !== false;
+  const [pdfOpen, setPdfOpen] = React.useState(false);
+  const [subsOpen, setSubsOpen] = React.useState(false);
+  const [dataFor, setDataFor] = React.useState<{ id: string; title: string } | null>(null);
+  async function downloadData(id: string, choice: DataChoice) {
+    const done = await downloadChartData(id, choice, readState(), tableSorts.current[id]);
+    const note = exportNotice(done);
+    if (done.cut) notifyInfo(note.message, note.description); else notifySuccess(note.message);
   }
 
   // Build the tiles for the grid.
@@ -951,6 +984,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     const clickSpec = clickSpecOf(spec, level);
     const drillable = !edit && canDrill(clickSpec);
     const own = spec.source !== "builtin";
+    const downloadKind = downloadMenuKind({ own, hasRows: hasRows(cell) && cell.rows.length > 0 }, canDownload);
     const write = chartWriteItems({
       canWrite, own, hasDef: Boolean(spec.def),
       onEdit: () => setEditing({ id: spec.id, def: spec.def as ChartDef }),
@@ -972,12 +1006,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ...(hasRows(cell) && isGrain(cell.grain) && !isTruncation(cell.grain)
         ? [{ label: "Why clicking does nothing", icon: <MousePointerClick />, onSelect: () => notifyInfo("Nothing to open from this value", PART_NO_CLICK_REASON) }]
         : []),
-      // BI-16A T8: a raw table exports its whole result (every row, the tile's
-      // filters and sort), from the server; other tiles keep the rows on screen.
-      ...(hasRows(cell) && cell.rows.length && own && spec.kind === "table" && spec.def?.tableMode === "rows"
-        ? [{ label: "Download CSV (all rows)", icon: <Download />, onSelect: () => void exportRawTable(spec.id) }]
-        : hasRows(cell) && cell.rows.length
-          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => downloadRowsCsv(spec.title, cell) }]
+      // BI-1: a chart of the board downloads its whole result from the server, as
+      // Excel or CSV, formatted or raw. A built-in tile has no stored definition to
+      // read and keeps the rows on screen as CSV.
+      ...(downloadKind === "data"
+        ? [{ label: "Download data…", icon: <Download />, onSelect: () => setDataFor({ id: spec.id, title: spec.title }) }]
+        : downloadKind === "csv"
+          ? [{ label: "Download CSV", icon: <Download />, onSelect: () => hasRows(cell) && downloadRowsCsv(spec.title, cell) }]
           : []),
       ...write.edit,
       ...moveItems(spec.id),
@@ -1081,6 +1116,11 @@ export function DashboardPage({ boardId }: { boardId: string }) {
                 }}
               />
             ) : null}
+            {loading ? (
+              <Button size="sm" variant="outline" onClick={stopLoading}>
+                <Square className="size-4" aria-hidden /> Stop
+              </Button>
+            ) : null}
             <DashboardActionsMenu
               isDefault={isDefault}
               canWrite={canWrite}
@@ -1100,6 +1140,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onRename={() => setRenameOpen(true)}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
+              onDownloadPdf={() => setPdfOpen(true)}
+              onSubscriptions={() => setSubsOpen(true)}
+              pdfSupported={data?.pdfSupported === true}
+              canDownload={canDownload}
               onDuplicate={() => void duplicateDashboard()}
               onDelete={() => void deleteDashboard()}
             />
@@ -1160,9 +1204,12 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
 
       {/* Canvas */}
+      {stopped ? (
+        <p role="status" className="text-sm text-muted-foreground">{STOPPED_SENTENCE}. Press Refresh to load the dashboard again.</p>
+      ) : null}
       {loading && charts.length === 0 ? (
         <DashboardTilesSkeleton />
-      ) : !loading && charts.length === 0 ? (
+      ) : !loading && charts.length === 0 && !stopped ? (
         <Empty className="border border-dashed">
           <EmptyHeader>
             <EmptyMedia variant="icon">
@@ -1304,7 +1351,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {noteFor ? <NoteDialog point={noteFor.point} saving={savingNote} error={noteError} onSave={(t) => void saveNote(t)} onClose={() => setNoteFor(null)} /> : null}
 
       {tileDialog?.kind === "data" && dialogSpec ? (
-        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} />
+        <TileDataDialog title={dialogSpec.title} cell={data?.results[dialogSpec.id]} onClose={() => setTileDialog(null)} canDownload={canDownload} />
       ) : null}
       {tileDialog?.kind === "expand" && dialogSpec ? (
         <TileExpandDialog spec={dialogSpec} cell={data?.results[dialogSpec.id]} dark={dark} onClose={() => setTileDialog(null)} />
@@ -1325,6 +1372,35 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
+      ) : null}
+      {subsOpen ? (
+        <SubscriptionsDialog
+          open={subsOpen}
+          onOpenChange={setSubsOpen}
+          board={board}
+          dashName={dashName}
+          charts={(data?.charts ?? []).filter((c) => c.def && !isStaticKind(c.kind)).map((c) => ({ id: c.id, title: c.title, grouped: !isSingleValueChart(c.kind, c.def) }))}
+          readState={readState()}
+          reportZone={data?.reporting?.timeZone ?? "UTC"}
+        />
+      ) : null}
+      {pdfOpen ? (
+        <DownloadPdfDialog
+          open={pdfOpen}
+          onOpenChange={setPdfOpen}
+          onDownload={async (choice: PdfChoice) => {
+            const fileName = await downloadDashboardPdf(board, choice, readState());
+            notifySuccess("PDF downloaded", fileName);
+          }}
+        />
+      ) : null}
+      {dataFor ? (
+        <DownloadDataDialog
+          open
+          onOpenChange={(next) => { if (!next) setDataFor(null); }}
+          title={dataFor.title}
+          onDownload={(choice) => downloadData(dataFor.id, choice)}
+        />
       ) : null}
     </div>
     </ReportingProvider>

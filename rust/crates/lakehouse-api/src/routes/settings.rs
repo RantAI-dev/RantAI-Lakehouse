@@ -70,9 +70,20 @@ use crate::upstream_error;
 const CONTENT_SITES_REFUSED: &str = "contentSites must be at most 50 sites, each written \
 https://host or https://host:port, with no wildcard, path or user name.";
 
+/// What the person is told when `downloadDeniedRoles` names a role that does
+/// not exist.
+const DOWNLOAD_ROLES_REFUSED: &str = "downloadDeniedRoles must name roles that exist.";
+
+/// What the person is told when `reportAllowedDomains` is not at most 50
+/// domain names (`RPT-1`, D8).
+const REPORT_DOMAINS_REFUSED: &str = "reportAllowedDomains must be at most 50 domain names such as example.com, with no wildcard, address or path.";
+
+/// What the person is told when their roles may not download (`BI-1`, D7).
+pub(crate) const DOWNLOADS_OFF: &str = "Downloads are switched off for your role.";
+
 /// What the person is told when the body is not the two fields.
 const BODY_SHAPE: &str = "body must be {\"timeZone\": string, \"weekStart\": \"monday\"|\"sunday\", \
-\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...]}";
+\"numberLocale\"?: \"en-US\"|\"id-ID\", \"companyPalette\"?: [\"#rrggbb\", ...], \"fonts\"?: [string, ...], \"contentSites\"?: [\"https://host\", ...], \"downloadDeniedRoles\"?: [string, ...], \"reportAllowedDomains\"?: [string, ...], \"publicLinksEnabled\"?: boolean}";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -83,6 +94,9 @@ struct SettingsBody {
     company_palette: Option<Vec<String>>,
     fonts: Option<Vec<String>>,
     content_sites: Option<Vec<String>>,
+    download_denied_roles: Option<Vec<String>>,
+    report_allowed_domains: Option<Vec<String>>,
+    public_links_enabled: Option<bool>,
 }
 
 /// The formatting half of the settings, as the console reads it.
@@ -92,6 +106,19 @@ pub(crate) struct FormatSettings {
     pub company_palette: Vec<String>,
     pub fonts: Vec<String>,
     pub content_sites: Vec<String>,
+    /// Role names that may not download (`BI-1`, D7). Not part of
+    /// [`Self::to_json`]: the payload every view reads (a public link and a
+    /// signed embed included) must not list the deployment's role names; the
+    /// settings screen reads it through `body_json`, and the dashboard page
+    /// gets only the answer for its own viewer (`canDownload`).
+    pub download_denied_roles: Vec<String>,
+    /// The outside email domains a scheduled report may go to (`RPT-1`, D8).
+    /// Like `download_denied_roles`, not part of [`Self::to_json`].
+    pub report_allowed_domains: Vec<String>,
+    /// Whether public links work (`BI-19` part A, feature A7). Not part of
+    /// [`Self::to_json`]: an anonymous reader has no use for it, and an
+    /// administrator reads it through `body_json`.
+    pub public_links_enabled: bool,
 }
 
 impl Default for FormatSettings {
@@ -103,6 +130,9 @@ impl Default for FormatSettings {
             company_palette: Vec::new(),
             fonts: SHIPPED_FONTS.iter().map(|f| (*f).to_owned()).collect(),
             content_sites: Vec::new(),
+            download_denied_roles: Vec::new(),
+            report_allowed_domains: Vec::new(),
+            public_links_enabled: true,
         }
     }
 }
@@ -114,6 +144,9 @@ impl FormatSettings {
             company_palette: row.company_palette.clone(),
             fonts: row.fonts.clone(),
             content_sites: row.content_sites.clone(),
+            download_denied_roles: row.download_denied_roles.clone(),
+            report_allowed_domains: row.report_allowed_domains.clone(),
+            public_links_enabled: row.public_links_enabled,
         }
     }
 
@@ -212,6 +245,7 @@ pub(crate) fn add_formatting_for_anonymous(body: &mut Value, format: &FormatSett
 fn checked_formatting(
     parsed: &SettingsBody,
     current: &FormatSettings,
+    known_roles: Option<&[String]>,
 ) -> Result<FormatSettings, ApiError> {
     let number_locale = match &parsed.number_locale {
         Some(l) if NUMBER_LOCALES.contains(&l.as_str()) => l.clone(),
@@ -261,12 +295,127 @@ fn checked_formatting(
             .map_err(|_| ApiError::BadRequest(CONTENT_SITES_REFUSED.to_owned()))?,
         None => current.content_sites.clone(),
     };
+    let download_denied_roles = match (&parsed.download_denied_roles, known_roles) {
+        (Some(roles), Some(known)) => {
+            // `BI-1` D7: only names of roles that exist, so a typo does not
+            // look like a rule. A fixed sentence (the names are the
+            // caller's own text).
+            if roles.iter().all(|r| known.contains(r)) {
+                let mut roles = roles.clone();
+                roles.sort();
+                roles.dedup();
+                roles
+            } else {
+                return Err(ApiError::BadRequest(DOWNLOAD_ROLES_REFUSED.to_owned()));
+            }
+        }
+        _ => current.download_denied_roles.clone(),
+    };
+    let report_allowed_domains = match &parsed.report_allowed_domains {
+        // A fixed sentence: the entries are the administrator's own text.
+        Some(domains) => validate_report_domains(domains)
+            .ok_or_else(|| ApiError::BadRequest(REPORT_DOMAINS_REFUSED.to_owned()))?,
+        None => current.report_allowed_domains.clone(),
+    };
     Ok(FormatSettings {
         number_locale,
         company_palette,
         fonts,
         content_sites,
+        download_denied_roles,
+        report_allowed_domains,
+        public_links_enabled: parsed
+            .public_links_enabled
+            .unwrap_or(current.public_links_enabled),
     })
+}
+
+/// The outside email domains for reports (`RPT-1`, D8): at most 50, each a
+/// valid domain name (`report_runner::domain_is_valid`: no wildcard, at least
+/// two labels), lower-cased, sorted, no duplicates. `None` when any entry or the
+/// count is refused.
+fn validate_report_domains(domains: &[String]) -> Option<Vec<String>> {
+    if domains.len() > 50 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(domains.len());
+    for raw in domains {
+        let domain = raw.trim().to_ascii_lowercase();
+        if !crate::routes::report_runner::domain_is_valid(&domain) {
+            return None;
+        }
+        out.push(domain);
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+/// Whether `principal` may download (`BI-1`, D7): a Platform Admin always,
+/// and when no role is switched off everyone; otherwise a person who holds
+/// at least one role that is not on the list. The one copy: the PDF route,
+/// the chart and table exports, the dashboard payload's `canDownload` and the
+/// assistant's tools all call it (rule 4).
+#[must_use]
+pub(crate) fn may_download(principal: &Principal, denied_roles: &[String]) -> bool {
+    if denied_roles.is_empty()
+        || principal
+            .role_names
+            .iter()
+            .any(|r| r == PLATFORM_ADMIN_ROLE)
+    {
+        return true;
+    }
+    principal
+        .role_names
+        .iter()
+        .any(|role| !denied_roles.contains(role))
+}
+
+/// The role that always may download, whatever the list says.
+const PLATFORM_ADMIN_ROLE: &str = "Platform Admin";
+
+/// Refuse with [`DOWNLOADS_OFF`] unless `principal` may download.
+///
+/// # Errors
+///
+/// 403 when every role of the person is switched off; the settings read
+/// failing is reported through `upstream_error`.
+pub(crate) async fn require_download(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<(), ApiError> {
+    let settings = format_settings(state).await?;
+    if may_download(principal, &settings.download_denied_roles) {
+        Ok(())
+    } else {
+        Err(ApiError::PermissionDenied(DOWNLOADS_OFF.to_owned()))
+    }
+}
+
+/// Today's date in the report time zone, `YYYY-MM-DD`, for a download's file
+/// name (`BI-1` review note: it was the UTC date). The engine knows the zone
+/// list, so it is asked (`toDate(now(zone))`, the same expression "today" is
+/// everywhere else); when it cannot answer, the UTC date stands and the failure
+/// is logged under a reference.
+pub(crate) async fn report_date(state: &AppState) -> String {
+    let utc = || chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let Ok(time) = time_context(state).await else {
+        return utc();
+    };
+    let sql = format!("SELECT toString({}) AS d", time.today_expr());
+    match state.clickhouse.rows(&sql, None).await {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.get("d"))
+            .and_then(Value::as_str)
+            .filter(|d| d.len() == 10 && d.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+            .map_or_else(utc, str::to_owned),
+        Err(err) => {
+            let _logged = upstream_error::report_ch(&upstream_error::DATABASE, &err);
+            utc()
+        }
+    }
 }
 
 /// The time context every dashboard read uses, loaded once per request.
@@ -309,6 +458,9 @@ fn body_json(ctx: &TimeContext, format: &FormatSettings, saved: bool) -> Value {
         "timeZone": ctx.zone(),
         "weekStart": ctx.week_start().as_str(),
         "saved": saved,
+        "downloadDeniedRoles": format.download_denied_roles,
+        "reportAllowedDomains": format.report_allowed_domains,
+        "publicLinksEnabled": format.public_links_enabled,
     });
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), format.to_json()) {
         map.extend(fields);
@@ -364,7 +516,20 @@ pub async fn put_reporting(
         .into());
     };
     let current = format_settings(&state).await?;
-    let format = checked_formatting(&parsed, &current)?;
+    // Role names are read only when the body sends the list.
+    let known_roles = if parsed.download_denied_roles.is_some() {
+        Some(
+            lakehouse_store::identity::list_roles(pool)
+                .await
+                .map_err(|err| upstream_error::internal_error(&upstream_error::STORE, &err))?
+                .into_iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    let format = checked_formatting(&parsed, &current, known_roles.as_deref())?;
     if !engine_knows_zone(&state, ctx.zone()).await? {
         return Err(ApiError::BadRequest("Unknown time zone.".to_owned()).into());
     }
@@ -377,6 +542,9 @@ pub async fn put_reporting(
             company_palette: format.company_palette,
             fonts: format.fonts,
             content_sites: format.content_sites,
+            download_denied_roles: format.download_denied_roles,
+            report_allowed_domains: format.report_allowed_domains,
+            public_links_enabled: format.public_links_enabled,
         },
         &principal.id.uuid().to_string(),
     )
@@ -448,7 +616,7 @@ mod tests {
                 "timeZone": "Europe/Berlin", "weekStart": "sunday", "saved": true,
                 "numberLocale": "en-US", "companyPalette": [],
                 "fonts": ["inter", "ibm-plex-sans", "source-serif", "jetbrains-mono", "system"],
-                "contentSites": [],
+                "contentSites": [], "downloadDeniedRoles": [], "reportAllowedDomains": [], "publicLinksEnabled": true,
             })
         );
         assert_eq!(
@@ -471,8 +639,39 @@ mod tests {
             company_palette: vec!["#112233".to_owned(), "#445566".to_owned()],
             fonts: vec!["inter".to_owned()],
             content_sites: vec!["https://img.example".to_owned()],
+            download_denied_roles: vec!["Viewer".to_owned()],
+            report_allowed_domains: vec!["example.com".to_owned()],
+            public_links_enabled: false,
         };
-        assert_eq!(checked_formatting(&body(""), &current).unwrap(), current);
+        assert_eq!(
+            checked_formatting(&body(""), &current, None).unwrap(),
+            current
+        );
+    }
+
+    /// `BI-19` part A (feature A7): the switch is kept when the body does not
+    /// send it, changed when it does, and is for the settings screen only.
+    #[test]
+    fn the_public_links_switch_is_kept_changed_and_kept_out_of_the_dashboard_payload() {
+        let on = FormatSettings::default();
+        assert!(on.public_links_enabled, "on at first, as before");
+        let off = checked_formatting(&body(r#","publicLinksEnabled":false"#), &on, None).unwrap();
+        assert!(!off.public_links_enabled);
+        assert!(
+            !checked_formatting(&body(""), &off, None)
+                .unwrap()
+                .public_links_enabled
+        );
+        assert!(
+            checked_formatting(&body(r#","publicLinksEnabled":true"#), &off, None)
+                .unwrap()
+                .public_links_enabled
+        );
+        assert!(off.to_json().get("publicLinksEnabled").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &off, true)["publicLinksEnabled"],
+            json!(false)
+        );
     }
 
     #[test]
@@ -496,7 +695,8 @@ mod tests {
             ),
         ];
         for (extra, message) in cases {
-            let err = checked_formatting(&body(extra), &FormatSettings::default()).unwrap_err();
+            let err =
+                checked_formatting(&body(extra), &FormatSettings::default(), None).unwrap_err();
             assert!(
                 matches!(&err, ApiError::BadRequest(m) if m == message),
                 "{extra}: {err:?}"
@@ -505,12 +705,13 @@ mod tests {
         let wildcard = checked_formatting(
             &body(r#","contentSites":["https://*.example"]"#),
             &FormatSettings::default(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(&wildcard, ApiError::BadRequest(m) if m == CONTENT_SITES_REFUSED));
         let thirteen: Vec<String> = (0..13).map(|_| "\"#000000\"".to_owned()).collect();
         let extra = format!(r#","companyPalette":[{}]"#, thirteen.join(","));
-        assert!(checked_formatting(&body(&extra), &FormatSettings::default()).is_err());
+        assert!(checked_formatting(&body(&extra), &FormatSettings::default(), None).is_err());
     }
 
     #[test]
@@ -520,10 +721,84 @@ mod tests {
                 r##","companyPalette":["#AABBCC","#112233"],"fonts":["system","inter","inter"]"##,
             ),
             &FormatSettings::default(),
+            None,
         )
         .unwrap();
         assert_eq!(got.company_palette, ["#aabbcc", "#112233"]);
         assert_eq!(got.fonts, ["inter", "system"]);
+    }
+
+    fn person(roles: &[&str]) -> Principal {
+        Principal {
+            id: lakehouse_auth::PrincipalId::User(uuid::Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "Test".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::parse("dashboard:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: roles.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn nothing_is_switched_off_until_an_administrator_chooses() {
+        assert!(may_download(&person(&["Viewer"]), &[]));
+        assert!(may_download(&person(&[]), &[]));
+    }
+
+    #[test]
+    fn a_platform_admin_may_download_whatever_the_list_says() {
+        let denied = vec!["Platform Admin".to_owned(), "Viewer".to_owned()];
+        assert!(may_download(&person(&["Platform Admin"]), &denied));
+    }
+
+    #[test]
+    fn one_role_off_does_not_stop_a_person_who_holds_another() {
+        let denied = vec!["Viewer".to_owned()];
+        assert!(may_download(&person(&["Viewer", "Analyst"]), &denied));
+        assert!(!may_download(&person(&["Viewer"]), &denied));
+    }
+
+    #[test]
+    fn a_person_whose_every_role_is_off_cannot_download() {
+        let denied = vec!["Viewer".to_owned(), "Analyst".to_owned()];
+        assert!(!may_download(&person(&["Viewer", "Analyst"]), &denied));
+        assert!(
+            !may_download(&person(&[]), &denied),
+            "no role is not a way around the list"
+        );
+    }
+
+    #[test]
+    fn denied_roles_must_exist_and_are_sorted_without_duplicates() {
+        let known = vec!["Analyst".to_owned(), "Viewer".to_owned()];
+        let got = checked_formatting(
+            &body(r#","downloadDeniedRoles":["Viewer","Analyst","Viewer"]"#),
+            &FormatSettings::default(),
+            Some(&known),
+        )
+        .unwrap();
+        assert_eq!(got.download_denied_roles, ["Analyst", "Viewer"]);
+        let err = checked_formatting(
+            &body(r#","downloadDeniedRoles":["Nobody"]"#),
+            &FormatSettings::default(),
+            Some(&known),
+        )
+        .unwrap_err();
+        assert!(matches!(&err, ApiError::BadRequest(m) if m == DOWNLOAD_ROLES_REFUSED));
+    }
+
+    #[test]
+    fn the_payload_reporting_object_never_lists_role_names() {
+        let denied = FormatSettings {
+            download_denied_roles: vec!["Viewer".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert!(denied.to_json().get("downloadDeniedRoles").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &denied, true)["downloadDeniedRoles"],
+            json!(["Viewer"])
+        );
     }
 
     /// `PR #199 review M SHOULD-FIX BI-16 1` (decision M6): an anonymous
@@ -575,5 +850,64 @@ mod tests {
         let mut none = json!({});
         add_formatting(&mut none, &FormatSettings::default());
         assert_eq!(none, json!({}));
+    }
+
+    /// `RPT-1` D8: the outside domains are validated names, lower-cased, sorted,
+    /// without duplicates, at most 50, and refused with one fixed sentence.
+    #[test]
+    fn report_domains_are_validated_lower_cased_and_bounded() {
+        let current = FormatSettings::default();
+        let got = checked_formatting(
+            &body(r#","reportAllowedDomains":["Partner.Example "," a.example","partner.example"]"#),
+            &current,
+            None,
+        )
+        .unwrap();
+        assert_eq!(got.report_allowed_domains, ["a.example", "partner.example"]);
+        for bad in [
+            r#"["*.example.com"]"#,
+            r#"["example"]"#,
+            r#"["a@example.com"]"#,
+            r#"["https://example.com"]"#,
+            r#"[""]"#,
+        ] {
+            let err = checked_formatting(
+                &body(&format!(r#","reportAllowedDomains":{bad}"#)),
+                &current,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, ApiError::BadRequest(m) if m == REPORT_DOMAINS_REFUSED),
+                "{bad}"
+            );
+        }
+        let fifty_one: Vec<String> = (0..51).map(|i| format!("d{i}.example")).collect();
+        assert!(validate_report_domains(&fifty_one).is_none());
+        assert!(validate_report_domains(&fifty_one[..50]).is_some());
+        // Absent: what is stored stays.
+        let kept = FormatSettings {
+            report_allowed_domains: vec!["x.example".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert_eq!(
+            checked_formatting(&body(""), &kept, None)
+                .unwrap()
+                .report_allowed_domains,
+            ["x.example"]
+        );
+    }
+
+    #[test]
+    fn the_domain_list_is_in_the_settings_screen_and_not_in_the_dashboard_payload() {
+        let f = FormatSettings {
+            report_allowed_domains: vec!["x.example".to_owned()],
+            ..FormatSettings::default()
+        };
+        assert!(f.to_json().get("reportAllowedDomains").is_none());
+        assert_eq!(
+            body_json(&TimeContext::default(), &f, true)["reportAllowedDomains"],
+            json!(["x.example"])
+        );
     }
 }

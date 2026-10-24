@@ -96,6 +96,13 @@ pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
     TestApp { router, pool }
 }
 
+/// The [`AppState`] and the migrated per-test database behind
+/// [`spin_up_with_env`], without a router: for a test that calls a
+/// background job (the scheduled-report runner, `RPT-1`) directly.
+pub async fn spin_up_state(overrides: &HashMap<String, String>) -> (AppState, PgPool) {
+    build_state_and_pool(overrides).await
+}
+
 /// Same as [`spin_up_with_env`], but replaces
 /// [`AppState::connector_secret_resolver`] with `resolver` before the
 /// router is built.
