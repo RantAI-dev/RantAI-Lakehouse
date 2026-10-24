@@ -89,6 +89,7 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-46` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-21: bundled root certificates still trusted distrusted emSign intermediates (`RUSTSEC-2026-0381`, `-0382`, `-0383`). `rustls-webpki`, `webpki-root-certs` and `webpki-roots` 1.x bumped; `-0381` on the `webpki-roots` 0.26 shim (re-exports 1.x, pulled only by `sqlx-core` 0.8) ignored until `SEC-41` | Administration & Security | P1 | Done | #219 | Security workflow re-run on `main`, 2026-10-21 |
 | `SEC-47` | Task | The console sends no Content-Security-Policy. With an `img-src`/`frame-src` policy, image and web cards (`BI-16` part B) could only load from the administrator's allowed sites even after a redirect; today the list checks the address as written | Administration & Security | P2 | Todo |  | `#199` review (`BI-16` part B, decision D4) |
 | `SEC-48` | Task | `cargo audit` and `cargo deny` went red on 2026-10-23: `ctutils` 0.4.2 (pulled in by the RustCrypto crates) generated non-constant-time masks and `u128` comparisons (`RUSTSEC-2026-0385`). Bumped to the patched 0.4.4 in `Cargo.lock`; no code change | Administration & Security | P1 | Done | #230 | Security check on #224, 2026-10-23 |
+| `SEC-51` | Task | `cargo audit` and `cargo deny` went red on `main` on 2026-10-24: `crypto-bigint` 0.5.5 (via `elliptic-curve` 0.13.8 <- `p256`/`p384` 0.13 <- `jsonwebtoken` 11.1.0) has timing variability in operations meant to be constant-time (`RUSTSEC-2026-0387`), fixed in `crypto-bigint` >= 0.7.6. `elliptic-curve` 0.13 pins `crypto-bigint` ^0.5, so the fix needs `elliptic-curve` 0.14 with `p256`/`p384` 0.14, and `jsonwebtoken` 11.1.0, the newest release, still requires `p256` ^0.13.2: the fix waits on an upstream `jsonwebtoken` release. Until then a pull request that touches dependencies cannot merge (`AGENTS.md`, step 6) | Administration & Security | P1 | Todo |  | Security workflow on `main` at `21af4276`, 2026-10-24 |
 | `SRC-16` | Task | A connector loaded after the fact (files, REST, MongoDB, Kafka, SFTP) on the "pause" policy stays paused for good after its first change: nothing waits for approval, so nothing can lift it. Also a pending change that Approve refuses keeps the connector paused after every other change is approved | Data | P1 | Done | #120 | `superpowers/plans/2026-10-12-delivery-review.md` (`SRC-8` BLOCKER) |
 | `BLD-7` | Task | A pipeline made from a connector's page cannot run: *Create pipeline* fills in the connector, the API accepts it, and every run with a connector set is refused (`authored_factory.py`, `CONNECTOR_SOURCE_UNSUPPORTED_REASON`) after the pipeline was saved as ready. The connector becomes where the data came from, never a second way to read the source (`DEC-15`): such a pipeline reads one of that connector's Bronze tables, checked on create and update with a clear refusal otherwise; the run reads it like any Bronze source; the connector page opens the form with Bronze and the connector's own tables to pick from, and the pipeline runs after that table's load | Build | P1 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
 | `BLD-8` | Task | A failed pipeline run gives no reason in the console, and the page says "Running" for a run that failed after 5 seconds. Show the run's real state and its failure reason (the fixed, classified text, never upstream detail) on the pipeline page | Build | P1 | Todo |  | QA report 2026-10-23 (connector-sourced pipeline) |
@@ -137,8 +138,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-2` | Feature | Login rate limiting | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Done | #181 | PRODUCT §2 |
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
-| `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
-| `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/OPERATIONS.md` |
+| `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
+| `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix. The remaining part after `SEC-39` is the Graph call that applies the mapped role | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/OPERATIONS.md` |
 | `SEC-7` | Task | A monitored security contact address | Administration & Security | P2 | Todo |  | `SECURITY.md` |
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
@@ -198,7 +199,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-18` | Task | No default credentials in compose (`lakehouse`, `rustfsadmin`); must-set secrets use `${X:?}` (rule 5) | Administration & Security | P2 | Done | #83 | `docker-compose.yml` |
 | `SEC-37` | Task | Default credentials left in code after `SEC-18`: `rustfsadmin` fallbacks in `ops/g3/g3_loadgen.py`, `ops/g6/g6_ingest_matrix_test.py` and `dagster/dispar_orchestrate/dlt_pipeline.py`, and `postgres://lakehouse:lakehouse@localhost` as `DATABASE_URL`'s default in `lakehouse-api` `config.rs`. Compose always sets them now, so none is reached in a compose start | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | PR #83 review |
 | `SEC-19` | Task | The query cost estimate runs raw SQL without the read-only check or table-function block, and returns database error text. The error-text half is met by `SEC-11`'s query-author exception. The author sees the engine's diagnosis with the version and addresses trimmed, and other routes still answer the fixed message | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
-| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | Todo |  | `routes/query.rs` |
+| `SEC-20` | Task | Queries are not scoped to the tenant: no tenant gate on query runs; saved queries listed for everyone | Administration & Security | P2 | In Progress | #244 | `routes/query.rs` |
+| `SEC-50` | Task | Dashboards, gold export, alerts and authored pipelines are not scoped to the tenant: they call the role rewrite directly, not the query path that `SEC-20` gates | Administration & Security | P2 | Todo |  | `routes/dashboard.rs` |
 | `SEC-21` | Task | Downloads re-run SQL rewritten for an older policy; whole results buffered before the 2,000-row cut | Administration & Security | P2 | Done | #203 | `routes/query.rs` |
 | `SEC-12` | Feature | Embed tokens: require an expiry, allow revocation, keep the signing secret out of plain text, set a frame-ancestors policy | Administration & Security | P2 | In Acceptance | #105, #201 | `lakehouse-embed` |
 | `SEC-25` | Task | Connector security follow-ups: a connector that signs in with no credential (Kafka, auth `none`) can never be re-pointed (409 without a credential, 400 with one); the PATCH-`host` rule and its doc for `files` connectors are stale since `SRC-6`; the `SEC-15` refusal message has runs of spaces | Administration & Security | P2 | Done | [#238](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/238) | `superpowers/plans/2026-10-12-delivery-review.md` |
@@ -305,7 +307,7 @@ parity), built after it.
 | `QS-5` | Planned | `BI-18` (the dashboard date filter) | `AI-12` (variables part) |
 | `REL-9` | Todo | — | `SEC-41` |
 | `SEC-14` | Building | `SEC-41` (part B) | `SRC-4` (credentials) |
-| `SEC-20` | Todo | — | `QS-3` |
+| `SEC-20` | In Progress | — | `QS-3` |
 | `SEC-41` | Todo | `REL-9` | `SEC-14` (part B) |
 | `AI-10` | Planned | `RPT-1`, `BI-1` | — |
 | `AI-11` | Planned | `BI-19`, `BI-26`, `DEC-8` | — |
@@ -323,7 +325,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `BLD-7`, `BLD-8`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-33`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-10`, `BLD-6`, `BLD-7`, `BLD-8`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-50`, `SEC-51`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-33`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -333,6 +335,7 @@ set by the product owner and are left empty until they are.
 
 | ID | Started | Shipped | Due |
 | --- | --- | --- | --- |
+| `SEC-20` | 2026-10-24 | | |
 | `DATA-1` | 2026-10-02 | 2026-10-03 | |
 | `SEC-2` | 2026-10-02 | 2026-10-03 | |
 | `SEC-5` | 2026-10-02 | 2026-10-03 | |
@@ -386,9 +389,11 @@ set by the product owner and are left empty until they are.
 | `OPS-4` | 2026-10-23 | 2026-10-23 | |
 | `BLD-5` | 2026-10-23 | 2026-10-23 | |
 | `BLD-6` | | | |
-| `SEC-45` | 2026-10-23 | 2026-10-23 | |
-| `SEC-37` | 2026-10-23 | 2026-10-23 | |
-| `SEC-25` | 2026-10-23 | 2026-10-23 | |
+| `SEC-45` | 2026-10-23 | 2026-10-24 | |
+| `SEC-37` | 2026-10-23 | 2026-10-24 | |
+| `SEC-25` | 2026-10-23 | 2026-10-24 | |
+| `SEC-38` | 2026-10-23 | 2026-10-24 | |
+| `SEC-39` | 2026-10-23 | 2026-10-24 | |
 | `SRC-32` | | | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |
