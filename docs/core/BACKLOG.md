@@ -124,7 +124,7 @@ estimate (S, M, L), which the base has no field for.
 | `AI-12` | Feature | The assistant fixes and explains SQL inside the editor; variables. **Blocked by `QS-5` (variables part)** | AI Copilot | P2 | Building | #127, #128 | `AGENTS.md` (assistant parity) |
 | `AI-13` | Feature | The assistant answers "where does this number come from" from the chart's lineage (`get_lineage` exists today). **Blocked by `BI-14`** | AI Copilot | P2 | Planned |  | `AGENTS.md` (assistant parity) |
 | `AI-14` | Feature | Ongoing, with every BI item. What the dashboard page sends to the assistant grows with the features: filters, tabs, metrics, formats. Filters and the time grain are sent since #188; a heavy filter list can still push the tile list past the server's 6000-character cut | AI Copilot | P2 | Building | #188, #222 | `AGENTS.md` (assistant parity) |
-| `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse. The run after #200 and #202 passed 25 of 41 cases (61%) against the spec's 90%, and one case waits for #199 | AI Copilot | P2 | In Progress | #175, #198, #200 | `AGENTS.md` (assistant parity) |
+| `AI-15` | Task | A standard set of about 30 typical dashboard requests, re-run whenever an assistant tool changes, so the assistant does not silently get worse. The run after #200 and #202 passed 25 of 41 cases (61%) against the spec's 90%, and one case waits for #199 | AI Copilot | P2 | In Progress | #175, #198, #200, #223, #240 | `AGENTS.md` (assistant parity) |
 | `BI-26` | Feature | Better embedding, without overdoing it: a single-chart embed that really shows only that chart, light/dark theme and our logo optional, filters passed through the link or token, sizing that fits the host page. Token hardening is `SEC-12`. No embedding SDK and no editing inside embeds. **Blocked by `BI-18` (locking a dashboard filter in an embed)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BI-19` | Feature | Sharing and delivery, except Slack, Teams, Office and Google integrations: public link expiry and password; permissions per dashboard and folder; comments; a schedule per digest; alerts with filters that fire once; PNG export; import of exported dashboards. Scheduled reports are `RPT-1`, PDF and Excel export `BI-1`, embedding `BI-26`. **Blocked by `RPT-1` (digest schedules)** | Dashboards | P2 | Planned |  | `reference/competitive-comparison.md` (BI matrix) |
 | `BLD-1` | Feature | Joins, aggregations and a SQL step in the pipeline builder, and the same through the assistant. | Build | P2 | Building | [#173](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/173) (slice 1: a pipeline reads as its author) | PRODUCT §2; [spec](specs/bld-1.md) |
@@ -135,8 +135,8 @@ estimate (S, M, L), which the base has no field for.
 | `SEC-2` | Feature | Login rate limiting | Administration & Security | P2 | In Acceptance | #67 | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Task | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Administration & Security | P2 | Done | #181 | PRODUCT §2 |
 | `SEC-40` | Task | Sign in once through Microsoft Entra ID and once through Google with a test app registration and test user each, following `docs/OPERATIONS.md` (single sign-on), and record the date, settings (no secrets) and outcome in `docs/plans/SEC-3-RESULT.md` (`SEC-3-AC2`, `SEC-3-AC3`). Product owner's test, later | Administration & Security | P3 | Todo |  | `SEC-3` (#181) |
-| `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
-| `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix | Administration & Security | P3 | Todo |  | `SEC-3` review, `docs/OPERATIONS.md` |
+| `SEC-38` | Task | Single sign-on reads the signing keys' location (`jwks_uri`) from the provider's discovery document, so `OIDC_JWKS_URL` no longer has to be set by hand: today the API assumes `{OIDC_ISSUER}/.well-known/jwks.json`, which Entra ID and Google do not serve | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/plans/SEC-3-RESULT.md` |
+| `SEC-39` | Task | An Entra ID user in more groups than the token can carry gets a group overage marker instead of `groups`; the console then applies no mapped role, silently. At least log it and say so on the user's sign-in; following the Microsoft Graph link is the full fix. The remaining part after `SEC-39` is the Graph call that applies the mapped role | Administration & Security | P3 | Done | [#241](https://github.com/RantAI-dev/RantAI-Lakehouse/pull/241) | `SEC-3` review, `docs/OPERATIONS.md` |
 | `SEC-7` | Task | A monitored security contact address | Administration & Security | P2 | Todo |  | `SECURITY.md` |
 | `REL-2` | Task | Adopt a version and release policy; cut a release from the unreleased work | Delivery | P2 | Todo |  | `reference/release-policy.md` |
 | `GOV-1` | Feature | Audit trail covers every console change | Governance | P2 | Idea |  | PRODUCT §3 |
@@ -316,7 +316,7 @@ parity), built after it.
 
 **Ready to start** (Todo, Planned or Idea, nothing open blocks it; Idea items still need a spec):
 
-`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-38`, `SEC-39`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
+`ADM-1`, `ADM-2`, `AI-21`, `AI-22`, `BI-1`, `BI-14`, `BI-20`, `BI-27`, `BI-28`, `BI-29`, `BI-3`, `BI-30`, `BI-31`, `BI-32`, `BI-33`, `BI-4`, `BI-5`, `BIZ-1`, `BIZ-2`, `BLD-6`, `DATA-18`, `DATA-20`, `DATA-21`, `DATA-22`, `DATA-23`, `DATA-24`, `DATA-25`, `DATA-26`, `DATA-27`, `DATA-4`, `DATA-5`, `DATA-6`, `DATA-8`, `DOC-2`, `GOV-1`, `GOV-3`, `GOV-5`, `INT-2`, `OPS-2`, `OPS-3`, `OPS-6`, `OPS-8`, `QA-1`, `QRY-1`, `QS-2`, `QS-4`, `REL-1`, `REL-2`, `REL-4`, `REL-7`, `REL-9`, `SEC-20`, `SEC-22`, `SEC-34`, `SEC-4`, `SEC-40`, `SEC-47`, `SEC-7`, `SRC-15`, `SRC-18`, `SRC-2`, `SRC-22`, `SRC-23`, `SRC-24`, `SRC-25`, `SRC-26`, `SRC-27`, `SRC-28`, `SRC-30`, `SRC-31`, `SRC-32`, `SRC-5`, `VER-1`
 
 ## Dates
 
@@ -379,9 +379,11 @@ set by the product owner and are left empty until they are.
 | `OPS-4` | 2026-10-23 | 2026-10-23 | |
 | `BLD-5` | 2026-10-23 | 2026-10-23 | |
 | `BLD-6` | | | |
-| `SEC-45` | 2026-10-23 | 2026-10-23 | |
-| `SEC-37` | 2026-10-23 | 2026-10-23 | |
-| `SEC-25` | 2026-10-23 | 2026-10-23 | |
+| `SEC-45` | 2026-10-23 | 2026-10-24 | |
+| `SEC-37` | 2026-10-23 | 2026-10-24 | |
+| `SEC-25` | 2026-10-23 | 2026-10-24 | |
+| `SEC-38` | 2026-10-23 | 2026-10-24 | |
+| `SEC-39` | 2026-10-23 | 2026-10-24 | |
 | `SRC-32` | | | |
 | `SEC-3` | 2026-10-16 | 2026-10-16 | |
 | `REL-5` | 2026-10-16 | 2026-10-16 | |

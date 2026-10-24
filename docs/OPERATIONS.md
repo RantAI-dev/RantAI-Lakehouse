@@ -997,7 +997,7 @@ skips that check.
 | AI chat (Copilot and Query Studio's Natural language box) | LLM API key | `503` from `/api/ai/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | `POST /api/embed/data` answers `503` "embedding is not configured"; the Share dialog says so | Set `EMBED_SECRET` (see "Signed dashboard embeds (`SEC-12`)") |
-| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs and `OIDC_JWKS_URL`); see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
+| SSO / OIDC login | An OIDC provider | Local password auth only | Set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (and, for the browser flow, the four URLs); `OIDC_JWKS_URL` is optional — see "Single sign-on (OIDC)" below and `rust/crates/lakehouse-auth/README.md` |
 
 ## Login throttling and session cleanup
 
@@ -1139,20 +1139,26 @@ client also sets `OIDC_CLIENT_SECRET`.
 | `OIDC_TOKEN_URL` | for the browser flow | unset | The provider's token endpoint. |
 | `OIDC_REDIRECT_URI` | for the browser flow | unset | This deployment's callback: `<api-origin>/api/auth/oidc/callback`. Register the same value on the provider. |
 | `OIDC_CLIENT_SECRET` | for a confidential client | unset | Sent only in the code exchange; never logged, redacted in `Config`'s `Debug`. |
-| `OIDC_JWKS_URL` | for providers not serving `{issuer}/.well-known/jwks.json` | `{OIDC_ISSUER}/.well-known/jwks.json` | See the limitation below: Entra ID and Google both need this set. |
+| `OIDC_JWKS_URL` | no | discovery | The key set's address. Unset means it is read from the provider's discovery document (`{OIDC_ISSUER}/.well-known/openid-configuration`, its `jwks_uri`), on the first token check. Set it only when that document is unavailable or names a key set this deployment cannot reach; an explicit value wins and no discovery request is made. |
 | `OIDC_PROVIDER_NAME` | no | `default` | Label behind `oidc:<name>` in `auth_identity.provider`. |
 | `OIDC_GROUPS_CLAIM` | no | `groups` | Which token claim carries the caller's groups. |
 | `OIDC_ROLE_MAP` | no | empty | `group=Role Name,...`; a group not named here is ignored. |
 | `OIDC_JIT_PROVISIONING` | no | `false` | Exactly the string `true` (not `TRUE`/`1`/`yes`) creates an `app_user` on first sign-in. |
 | `OIDC_CLOCK_SKEW_SECONDS` | no | `60` | Leeway on `exp`/`nbf`; an unparseable value falls back to `60` instead of failing boot. |
 
-**A limitation worth stating plainly: the API does not read `jwks_uri` from
-the provider's discovery document.** It builds the JWKS URL as
-`{OIDC_ISSUER}/.well-known/jwks.json` unless `OIDC_JWKS_URL` overrides it
-(`state.rs`). Neither vendor below serves keys at that path, so both require
-`OIDC_JWKS_URL`; the setting's whole purpose is this case. A future
-change could fetch the discovery document and read `jwks_uri` from it —
-reported, not built (SEC-3).
+**Where the signing keys come from.** With `OIDC_JWKS_URL` unset, the API
+reads the provider's discovery document
+(`{OIDC_ISSUER}/.well-known/openid-configuration`) and uses its `jwks_uri`
+(`SEC-38`). The document is read on the first token check — not at start-up,
+so an unreachable provider does not stop the API — and cached with the key
+set for five minutes, or re-read the moment a token names a key id the cache
+does not know. It is trusted only when its own `issuer` equals
+`OIDC_ISSUER` exactly and `jwks_uri` is an absolute `https` URL (`http` only
+under an `http` issuer, which is how the local test providers are reached);
+otherwise every token is refused with the same generic 401 and a `warn` line
+names the failed check. Set `OIDC_JWKS_URL` to skip discovery entirely, for
+a provider that publishes no discovery document or one this deployment
+cannot reach.
 
 ### Keycloak
 
@@ -1211,25 +1217,35 @@ token. Entra's issuer and endpoints are per tenant:
 | `OIDC_CLIENT_SECRET` | the client secret value |
 | `OIDC_AUTHORIZE_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/authorize` |
 | `OIDC_TOKEN_URL` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` |
-| `OIDC_JWKS_URL` | `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys` |
+| `OIDC_JWKS_URL` | optional — discovery names `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys`; set it only to skip discovery |
 | `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
 | `OIDC_GROUPS_CLAIM` | `groups` |
 
 **Limits.** Entra's `groups` claim carries group **object ids** (GUIDs), not
 names, so `OIDC_ROLE_MAP` keys are those GUIDs. When a user is in more groups
 than the claim can hold, Entra replaces the claim with an overage marker
-(`_claim_names`/`_claim_sources`, or `hasgroups`) and the group list must be
-fetched from Microsoft Graph instead — the console does not follow that, so a
-role mapping for such a user silently does not apply. (Microsoft docs:
+(`_claim_names`/`_claim_sources`, or `hasgroups` in the implicit flow) and
+the group list must be fetched from Microsoft Graph instead — the console
+does not follow that. `SEC-39` makes the case visible rather than silent:
+the code flow this deployment uses carries `_claim_names`, so the sign-in
+still succeeds, a `warn` line records the user and provider (never the
+token or the claim source), and the console shows: "Your account is in more
+groups than the sign-in token can list, so no group-based role was applied.
+Ask an administrator to assign your role directly or to limit the groups
+sent in the token." Following the Graph link to apply the mapped role
+remains the full fix and is not built. (Microsoft docs:
 <https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference>,
-the `groups` and overage claims.) Backlog `SEC-39` makes this case visible.
+the `groups` and overage claims.)
 
 ### Google
 
 Create an OAuth client (Google Cloud console → APIs & Services →
 Credentials → OAuth client ID, type **Web application**) and add the
-authorized redirect URI equal to `OIDC_REDIRECT_URI`. Google publishes its
-keys at a fixed URL, so `OIDC_JWKS_URL` must be set:
+authorized redirect URI equal to `OIDC_REDIRECT_URI`. Google publishes a
+discovery document at
+`https://accounts.google.com/.well-known/openid-configuration`, so
+`OIDC_JWKS_URL` can stay unset; the value it names is shown below for an
+operator who prefers to set it explicitly:
 
 | Setting | Value |
 | --- | --- |
@@ -1238,7 +1254,7 @@ keys at a fixed URL, so `OIDC_JWKS_URL` must be set:
 | `OIDC_CLIENT_SECRET` | the client secret |
 | `OIDC_AUTHORIZE_URL` | `https://accounts.google.com/o/oauth2/v2/auth` |
 | `OIDC_TOKEN_URL` | `https://oauth2.googleapis.com/token` |
-| `OIDC_JWKS_URL` | `https://www.googleapis.com/oauth2/v3/certs` |
+| `OIDC_JWKS_URL` | optional — `https://www.googleapis.com/oauth2/v3/certs` |
 | `OIDC_REDIRECT_URI` | `<api-origin>/api/auth/oidc/callback` |
 | `OIDC_GROUPS_CLAIM` | not usable — see below |
 

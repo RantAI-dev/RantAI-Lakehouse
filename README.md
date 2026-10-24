@@ -262,7 +262,7 @@ guessed.
 | `OIDC_CLIENT_ID` | This app's client id as registered with the OIDC provider | unset | No — see above |
 | `OIDC_CLIENT_SECRET` | Client secret sent as `client_secret` in the authorization-code exchange at `OIDC_TOKEN_URL` (`routes/auth.rs`); leave unset for a public client | unset | No |
 | `OIDC_PROVIDER_NAME` | Short label combined with `oidc:` to form `Principal::provider` / `auth_identity.provider` | `default` | No |
-| `OIDC_JWKS_URL` | Explicit JWKS endpoint override | derived: `{OIDC_ISSUER}/.well-known/jwks.json` | No |
+| `OIDC_JWKS_URL` | Explicit JWKS endpoint override. Unset means the `jwks_uri` from `{OIDC_ISSUER}/.well-known/openid-configuration` (`SEC-38`) | discovery | No |
 | `OIDC_JIT_PROVISIONING` | `"true"` to auto-create an `app_user` for a validating token with no linked identity yet | `false` | No |
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No |

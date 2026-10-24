@@ -29,6 +29,7 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine;
@@ -37,7 +38,7 @@ use jsonwebtoken::jwk::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use lakehouse_auth::oidc::{JwksClient, OidcAuthenticator};
-use lakehouse_auth::{AuthError, Authenticator, Credential, OidcConfig, Secret};
+use lakehouse_auth::{AuthError, Authenticator, Credential, OidcConfig, Secret, SignInNotice};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
@@ -121,6 +122,11 @@ struct Claims<'a> {
     groups: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonce: Option<&'a str>,
+    /// Entra ID's overage marker (`SEC-39`): names each claim whose values
+    /// did not fit in the token, so the claim itself is absent. `None` for
+    /// every ordinary test token.
+    #[serde(rename = "_claim_names", skip_serializing_if = "Option::is_none")]
+    claim_names: Option<HashMap<&'a str, &'a str>>,
 }
 
 impl<'a> Claims<'a> {
@@ -135,6 +141,7 @@ impl<'a> Claims<'a> {
             name: None,
             groups: None,
             nonce: None,
+            claim_names: None,
         }
     }
 }
@@ -159,13 +166,49 @@ fn authenticator(server: &MockServer, pool: PgPool, ttl: Duration, jit: bool) ->
     OidcAuthenticator::with_jwks_client(config, jwks, pool)
 }
 
+/// Build an authenticator with no explicit key-set address: `issuer`'s
+/// discovery document names it (`SEC-38`). `issuer` is a `wiremock`
+/// server's own URI in these tests, so the discovery document (and the
+/// key set it names) are the ones the mock serves.
+fn discovering_authenticator(
+    issuer: &str,
+    pool: PgPool,
+    ttl: Duration,
+    jit: bool,
+) -> OidcAuthenticator {
+    let mut config = OidcConfig::with_discovery(issuer, CLIENT_ID, "test");
+    config.jit_provisioning = jit;
+    let jwks = JwksClient::discovering(issuer, ttl);
+    OidcAuthenticator::with_jwks_client(config, jwks, pool)
+}
+
 async fn mount_jwks(server: &MockServer, keys: &[&TestKey]) {
+    mount_jwks_at(server, "/jwks", keys).await;
+}
+
+/// Mount a key set at an arbitrary path, for the discovery tests whose
+/// document names a `jwks_uri` other than `/jwks`.
+async fn mount_jwks_at(server: &MockServer, jwks_path: &str, keys: &[&TestKey]) {
     let set = JwkSet {
         keys: keys.iter().map(|k| k.jwk.clone()).collect(),
     };
     Mock::given(method("GET"))
-        .and(path("/jwks"))
+        .and(path(jwks_path.to_owned()))
         .respond_with(ResponseTemplate::new(200).set_body_json(&set))
+        .mount(server)
+        .await;
+}
+
+/// Mount an `OpenID Connect` Discovery 1.0 document at the path
+/// [`DISCOVERY_PATH`](lakehouse_auth::oidc) names, claiming `issuer` and
+/// pointing at `jwks_uri` (`SEC-38`).
+async fn mount_discovery(server: &MockServer, issuer: &str, jwks_uri: &str) {
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": jwks_uri,
+        })))
         .mount(server)
         .await;
 }
@@ -651,17 +694,20 @@ async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
 ) -> sqlx::Result<()> {
     let (_server, auth, key) = test_authenticator(pool).await;
     let token = mint_test_id_token(&key, "user-1", "nonce-xyz");
-    let (principal, mapped_role_names) = auth
+    let login = auth
         .authenticate_with_nonce(&Secret::new(token), "nonce-xyz")
         .await
         .expect("a matching nonce must be accepted");
     // `oidc:test` — this file's existing config fixture (`authenticator`'s
     // `OidcConfig::new(ISSUER, CLIENT_ID, "test", ..)`), not `oidc:okta`.
-    assert_eq!(principal.provider, "oidc:test");
+    assert_eq!(login.principal.provider, "oidc:test");
     // This fixture's `OidcConfig` carries no `role_map`
     // (`authenticator`'s own construction), so there is nothing to map —
     // `mapped_role_names` must be empty, not fabricated.
-    assert_eq!(mapped_role_names, [] as [std::string::String; 0]);
+    assert_eq!(login.mapped_role_names, [] as [std::string::String; 0]);
+    // An ordinary token carries the groups claim (or none at all), so no
+    // overage caveat applies (`SEC-39`).
+    assert!(login.notice.is_none());
     Ok(())
 }
 
@@ -701,11 +747,205 @@ async fn authenticate_with_nonce_returns_the_mapped_role_names(pool: PgPool) -> 
     claims.nonce = Some("nonce-role-names");
     let token = sign(&claims, &key, Algorithm::RS256);
 
-    let (principal, mapped_role_names) = auth
+    let login = auth
         .authenticate_with_nonce(&Secret::new(token), "nonce-role-names")
         .await
         .expect("a matching nonce must be accepted");
-    assert_eq!(mapped_role_names, vec!["Platform Admin".to_owned()]);
-    assert!(principal.has("identity:write"));
+    assert_eq!(login.mapped_role_names, vec!["Platform Admin".to_owned()]);
+    assert!(login.principal.has("identity:write"));
+    Ok(())
+}
+
+/// `SEC-39`: a token carrying `_claim_names` instead of `groups` — the
+/// marker Entra ID sends for a user in more groups than the claim can hold
+/// — still signs in (decision 2), maps no role, and comes back with the
+/// `GroupOverage` notice the console shows. Same fixture as
+/// `authenticate_with_nonce_returns_the_mapped_role_names`, with the group
+/// list replaced by the marker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authenticate_with_nonce_reports_a_group_overage_and_maps_no_role(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+
+    let jwks_url = format!("{}/jwks", server.uri());
+    let mut config = OidcConfig::new(ISSUER, CLIENT_ID, "test", jwks_url.clone());
+    config.jit_provisioning = false;
+    config
+        .role_map
+        .insert("lakehouse-admins".to_owned(), "Platform Admin".to_owned());
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+         VALUES ('oidc:test', 'rina-oidc-subject-5', $1, NULL)",
+    )
+    .bind(uuid::Uuid::parse_str(RINA).unwrap())
+    .execute(&pool)
+    .await?;
+
+    let jwks = JwksClient::with_ttl(jwks_url, Duration::from_secs(300));
+    let auth = OidcAuthenticator::with_jwks_client(config, jwks, pool);
+
+    let mut claims = Claims::valid("rina-oidc-subject-5");
+    claims.groups = None;
+    claims.claim_names = Some(HashMap::from([("groups", "src1")]));
+    claims.nonce = Some("nonce-overage");
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let login = auth
+        .authenticate_with_nonce(&Secret::new(token), "nonce-overage")
+        .await
+        .expect("an overage does not refuse the sign-in");
+    assert_eq!(login.notice, Some(SignInNotice::GroupOverage));
+    assert!(
+        login.mapped_role_names.is_empty(),
+        "an overage marker carries no group list, so no role can map"
+    );
+    assert!(!login.principal.has("identity:write"));
+    Ok(())
+}
+
+// ── `SEC-38`: the key set's address comes from discovery ───────────────────
+//
+// Every test here uses the mock server itself as the configured issuer, so
+// the discovery document lives at `{server}/.well-known/openid-
+// configuration` — the address this change reads when `OIDC_JWKS_URL` is
+// unset. The token's `iss` is the same server URI, because the configured
+// issuer must still match the token exactly.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_verifies_when_the_key_sets_address_comes_from_discovery(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    let issuer = server.uri();
+    mount_jwks_at(&server, "/keys", &[&key]).await;
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+    let auth = discovering_authenticator(&issuer, pool, Duration::from_secs(300), true);
+
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap();
+    assert_eq!(principal.provider, "oidc:test");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_discovery_document_whose_issuer_is_not_the_configured_one_is_refused() {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    mount_discovery(
+        &server,
+        "https://not-the-configured-issuer.example",
+        &format!("{issuer}/keys"),
+    )
+    .await;
+    let auth = discovering_authenticator(&issuer, lazy_pool(), Duration::from_secs(300), true);
+
+    let key = TestKey::generate("kid-1");
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let err = auth
+        .authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::InvalidCredentials));
+
+    // The key set the untrusted document named is never fetched: the only
+    // request made is for the discovery document itself.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/.well-known/openid-configuration");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_jwks_url_makes_no_discovery_request(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    let issuer = server.uri();
+    mount_jwks(&server, &[&key]).await;
+    // Mounted and usable, so a discovery request would succeed — the
+    // client must not make one anyway (`SEC-38`, decision 1).
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let jwks_url = format!("{issuer}/jwks");
+    let mut config = OidcConfig::new(&issuer, CLIENT_ID, "test", jwks_url.clone());
+    config.jit_provisioning = true;
+    let jwks = JwksClient::with_ttl(jwks_url, Duration::from_secs(300));
+    let auth = OidcAuthenticator::with_jwks_client(config, jwks, pool);
+
+    auth.authenticate(&Credential::Bearer(Secret::new(token)))
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/jwks");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_kid_re_reads_the_discovery_document(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let old_key = TestKey::generate("kid-old");
+    mount_jwks_at(&server, "/keys", &[&old_key]).await;
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+    // Long TTL: if the re-read relied on the address expiring, this test
+    // would fail — the refresh must be the unknown `kid` itself.
+    let auth = discovering_authenticator(&issuer, pool, Duration::from_secs(3600), true);
+
+    let mut claims = Claims::valid("user-1");
+    claims.iss = &issuer;
+    let old_token = sign(&claims, &old_key, Algorithm::RS256);
+    auth.authenticate(&Credential::Bearer(Secret::new(old_token)))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "first validation reads the discovery document, then the key set"
+    );
+
+    // The provider moves its keys: both documents change, and the token is
+    // signed by a `kid` the cached set does not contain.
+    server.reset().await;
+    let new_key = TestKey::generate("kid-new");
+    mount_jwks_at(&server, "/keys", &[&old_key, &new_key]).await;
+    mount_discovery(&server, &issuer, &format!("{issuer}/keys")).await;
+
+    let new_token = sign(&claims, &new_key, Algorithm::RS256);
+    let principal = auth
+        .authenticate(&Credential::Bearer(Secret::new(new_token)))
+        .await
+        .unwrap();
+    assert_eq!(principal.provider, "oidc:test");
+
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.path().to_owned())
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == "/.well-known/openid-configuration"),
+        "an unknown kid must re-read the discovery document, got {paths:?}"
+    );
     Ok(())
 }
