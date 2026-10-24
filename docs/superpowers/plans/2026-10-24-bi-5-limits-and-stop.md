@@ -234,6 +234,16 @@ Checks (from `/home/hv/lakehouse-phase5-build`):
 - Not verified: the webpack build (plan asks for it after T6); any of this in a real browser or against a server that has the routes; the settings page layout (two sections stacked in one page).
 
 
+### Handoff (main merge, developer, branch `feat/bi-phase-5`)
+
+Merged `origin/feat/bi-phase-4b` (QS-1, the Query Studio editor) into the branch; two conflicts, both in `src/features/queries`. Resolution: QS-1's `runBatch` owns the run (one request per statement), and BI-5 moved into it. Each statement is sent with its own `X-Run-Id` (`Batch.runId`, `Batch.engine`); `stopRun` calls `queryService.cancel` for the statement in flight on ClickHouse (best effort; Trino is only aborted, the button title says so), then aborts the batch controller, and the statements after it are reported "not run" as QS-1 does for a failure. `runAct` is gone from the hook and the panel. Query Studio has no limit sentence of its own in the T6 code (limit sentences are on tiles), so there is none to carry over; a limit error shows as the statement's error tab like any other.
+
+- Added a Run all case to `src/features/queries/query-studio-stop.test.tsx`.
+- `bun run typecheck`: exit 0. `bun run lint`: 0 errors, 9 warnings (none in these files).
+- `bun test src/features/queries src/services/clients/queries.test.ts src/features/dashboards/dashboard-stop.test.tsx`: 85 pass, 0 fail (before the new test); `query-studio-stop.test.tsx` alone: 3 pass.
+- `bun run test`: 2610 pass, 0 fail (2611 tests, 270 files).
+- Not verified: a real browser; a server with the cancel route (T4 is not built); the webpack build.
+
 ## 8. Review (planner appends)
 
 Planner, 2026-10-24: the console's shapes are accepted as the contract for the Rust tasks (the `/api/settings/limits` GET/PUT shape, the failed tile's `limit`, `X-Run-Id`, `POST /api/query/cancel`). The row-cut marker on a tile result is named **`limitHit`**, because `limit` is already a raw table's page size. T1 to T5 build to these shapes.
