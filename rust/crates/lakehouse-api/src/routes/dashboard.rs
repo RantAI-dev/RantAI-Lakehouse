@@ -638,7 +638,7 @@ fn parse_filters_param(raw: Option<&str>) -> Result<Option<Vec<FilterDef>>, ApiE
 ///
 /// When two relations disagree on a column's kind the first chart's wins;
 /// the tiles it does not fit report `wrong_type` rather than being coerced.
-fn filter_fields(
+pub(crate) fn filter_fields(
     charts: &[&StoredChartSpec],
     mart_cols: &HashMap<String, RelationColumns>,
     sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,

@@ -1033,7 +1033,9 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     // aggregation:
     // - `revoked_before` = `max(revoked_before)` over `revoke_all` events;
     // - withdrawn tokens = `jti` with `max(exp)` over unexpired `withdraw` events;
-    // - allowed origins = newest `origins` event (`argMax` on `at`).
+    // - allowed origins = newest `origins` event (`argMax` on `at`);
+    // - filter modes = newest `filter_modes` event (its JSON object is kept in
+    //   `origins_json`, BI-26 D2).
     ch.exec(
         "CREATE TABLE IF NOT EXISTS console.bi_board_embed_event (\n\
            board_id String, kind LowCardinality(String),\n\
@@ -2236,6 +2238,7 @@ pub(crate) fn embed_access_from_aggregate_rows(
 ) -> EmbedAccess {
     let mut revoked_before: u64 = 0;
     let mut origins = Vec::new();
+    let mut filter_modes = std::collections::BTreeMap::new();
     let mut withdrawn_map: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
 
@@ -2250,6 +2253,18 @@ pub(crate) fn embed_access_from_aggregate_rows(
             let origins_json = row_str(row, "origins_json").trim();
             if let Ok(list) = serde_json::from_str::<Vec<String>>(origins_json) {
                 origins = list;
+            }
+        } else if kind == "filter_modes" {
+            // BI-26 (D2): the newest `filter_modes` event, kept in the same
+            // `origins_json` column (a JSON text column) so the table needs no
+            // new column. An unreadable one leaves every filter hidden, which
+            // is the safe mode.
+            let text = row_str(row, "origins_json").trim();
+            if let Ok(modes) = serde_json::from_str::<
+                std::collections::BTreeMap<String, crate::embed_access::FilterMode>,
+            >(text)
+            {
+                filter_modes = modes;
             }
         } else if kind == "withdraw" {
             let jti = row_str(row, "jti");
@@ -2273,6 +2288,7 @@ pub(crate) fn embed_access_from_aggregate_rows(
         revoked_before,
         withdrawn,
         origins,
+        filter_modes,
     }
 }
 
@@ -2323,6 +2339,35 @@ pub async fn set_board_embed_origins(
     );
     ch.exec(&sql, None).await?;
     Ok(origins)
+}
+
+/// Replace the embed mode of a board's filters (`BI-26`, plan D2): an event in
+/// `console.bi_board_embed_event`, so a dashboard save cannot bring an old set
+/// back (`SEC-12` decision 8). The newest event wins. Returns what was stored.
+///
+/// # Errors
+///
+/// [`BiError::Validation`] if the board does not exist or the modes are not
+/// acceptable ([`embed_access::validate_filter_modes`]);
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn set_board_embed_filter_modes(
+    ch: &ChClient,
+    id: &str,
+    modes: &std::collections::BTreeMap<String, embed_access::FilterMode>,
+) -> Result<(), BiError> {
+    embed_access::validate_filter_modes(modes).map_err(BiError::Validation)?;
+    ensure_bi_table(ch).await?;
+    if !board_exists(ch, id).await? {
+        return Err(BiError::Validation("dashboard not found.".to_owned()));
+    }
+    let json = serde_json::to_string(modes).unwrap_or_else(|_| "{}".to_owned());
+    let sql = format!(
+        "INSERT INTO console.bi_board_embed_event (board_id, kind, origins_json) VALUES ({}, 'filter_modes', {})",
+        SqlLiteral::from(id),
+        SqlLiteral::from(json),
+    );
+    ch.exec(&sql, None).await?;
+    Ok(())
 }
 
 /// "Withdraw all embed tokens" for a board (`SEC-12`): every token whose
@@ -5990,6 +6035,35 @@ mod tests {
             .unwrap()
             .clone(),
         ]
+    }
+
+    /// `BI-26` plan D2: the filter modes are the newest `filter_modes` event
+    /// (the aggregate query gives one row per kind and `jti`, `argMax` on
+    /// `at`); no such event leaves every filter hidden; an unreadable one too.
+    #[test]
+    fn the_aggregate_read_takes_the_filter_modes_event_and_hides_what_it_cannot_read() {
+        use crate::embed_access::FilterMode;
+        let modes = |json: &str| {
+            serde_json::json!({ "kind": "filter_modes", "origins_json": json })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let access = embed_access_from_aggregate_rows(&[modes(
+            r#"{"region":"locked","year":"editable","city":"hidden"}"#,
+        )]);
+        assert_eq!(access.mode_of("region"), FilterMode::Locked);
+        assert_eq!(access.mode_of("year"), FilterMode::Editable);
+        assert_eq!(access.mode_of("city"), FilterMode::Hidden);
+        assert_eq!(access.mode_of("not_listed"), FilterMode::Hidden);
+        assert_eq!(
+            embed_access_from_aggregate_rows(&[]).mode_of("region"),
+            FilterMode::Hidden
+        );
+        let unreadable = embed_access_from_aggregate_rows(&[modes("not json")]);
+        assert!(unreadable.filter_modes.is_empty());
+        // The modes ride in the origins column but are not origins.
+        assert!(access.origins.is_empty());
     }
 
     /// PR #105 review SHOULD-FIX 1 / acceptance check (b):

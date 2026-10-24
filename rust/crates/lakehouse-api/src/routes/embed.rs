@@ -43,11 +43,15 @@ use crate::upstream_error;
 /// plan Hard Requirement 2).
 pub(crate) const EMBED_VIEWER_ROLE: &str = "Dashboard Viewer";
 
-/// `{ jwt }` — the `POST /api/embed/data` body shape.
+/// `{ jwt, filters? }` — the `POST /api/embed/data` body shape. `filters` is
+/// the dashboard page's filter shape (`BI-26`, plan D4): the values a viewer
+/// chose for the filters a manager made editable.
 #[derive(Debug, Default, Deserialize)]
 struct EmbedDataBody {
     #[serde(default)]
     jwt: Option<String>,
+    #[serde(default)]
+    filters: Option<Vec<FilterDef>>,
 }
 
 /// The one message every refused signed token gets (`SEC-12`): a bad
@@ -66,6 +70,70 @@ fn token_refused() -> Response {
         ApiJson(json!({ "error": TOKEN_REFUSED })),
     )
         .into_response()
+}
+
+/// The filters of one signed-embed read (`BI-26` plan D3).
+struct ResolvedFilters {
+    /// What the tiles are filtered by.
+    filters: Vec<FilterDef>,
+    /// The columns whose filter the viewer may change here: editable, and not
+    /// set by the token.
+    editable: Vec<String>,
+}
+
+/// Work out the filters of a signed-embed read from the board's saved filters,
+/// each one's embed mode, the token's `params` and the viewer's values.
+///
+/// - `locked`: the token must name the column, else the read is refused
+///   (`Err(column)`; feature decision 6). A forgotten value never shows all rows.
+/// - `editable`: the viewer's value replaces the saved one; with none the saved
+///   value applies.
+/// - `hidden` (and a column nobody chose a mode for): the saved value applies.
+///
+/// A viewer value for a column that is not editable, or that the token set, is
+/// dropped. The token's `params` are applied last, as before, and only narrow
+/// (feature decision 7): a legacy token that locks a column that is no filter
+/// keeps working.
+fn resolve_embed_filters(
+    saved: &[FilterDef],
+    access: &lakehouse_bi::embed_access::EmbedAccess,
+    params: Option<&std::collections::HashMap<String, Value>>,
+    viewer: &[FilterDef],
+) -> Result<ResolvedFilters, String> {
+    use lakehouse_bi::embed_access::FilterMode;
+    let token_sets = |column: &str| params.is_some_and(|p| p.contains_key(column));
+    let mode_of = |f: &FilterDef| {
+        if f.column.is_empty() {
+            FilterMode::Hidden
+        } else {
+            access.mode_of(&f.column)
+        }
+    };
+    for f in saved {
+        if mode_of(f) == FilterMode::Locked && !token_sets(&f.column) {
+            return Err(f.column.clone());
+        }
+    }
+    let mut editable: Vec<String> = Vec::new();
+    for f in saved {
+        if mode_of(f) == FilterMode::Editable
+            && !token_sets(&f.column)
+            && !editable.contains(&f.column)
+        {
+            editable.push(f.column.clone());
+        }
+    }
+    let mut filters: Vec<FilterDef> = saved.to_vec();
+    for v in viewer {
+        if v.column.is_empty() || !editable.contains(&v.column) {
+            tracing::info!(column = %v.column, "a viewer filter value for a column that is not editable was dropped");
+            continue;
+        }
+        filters.retain(|f| f.column != v.column);
+        filters.push(v.clone());
+    }
+    filters.extend(params_to_filters(params.cloned()));
+    Ok(ResolvedFilters { filters, editable })
 }
 
 /// What a verified token names, resolved to its dashboard (`BI-26` plan D1).
@@ -111,15 +179,68 @@ pub(crate) async fn subject_of(
     }
 }
 
+/// What every signed read checks about its token's dashboard, once: what the
+/// token names ([`subject_of`]), that embedding is on for it, and that the
+/// token has not been withdrawn. Returns the dashboard and the subject, or the
+/// response to send.
+async fn admit(
+    state: &AppState,
+    claims: &lakehouse_embed::EmbedClaims,
+) -> Result<(Board, Subject), Response> {
+    let subject = match subject_of(&state.clickhouse, claims.resource.as_ref()).await {
+        Ok(Some(subject)) => subject,
+        Ok(None) => return Err(token_refused()),
+        Err(err) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+            )
+                .into_response());
+        }
+    };
+    let board =
+        match store::get_board(&state.clickhouse, &subject.board_id, &Viewer::anonymous()).await {
+            Ok(b) => b,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
+                )
+                    .into_response());
+            }
+        };
+    let Some(board) = board.filter(|b| b.embed_enabled.unwrap_or(false)) else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ApiJson(json!({ "error": "embedding_disabled" })),
+        )
+            .into_response());
+    };
+    // SEC-12: withdrawal is read on every request — the board's embed events
+    // are aggregated on each read, with no cache in this process — so
+    // "withdraw all" and "withdraw one" take effect on the next request. A
+    // token with no `iat` cannot get here (`verify_embed` refuses it);
+    // `NEG_INFINITY` would be refused if it did.
+    // PR #201 review F SHOULD-FIX 4: the withdrawal is not read from the
+    // board row any more (it lives in `console.bi_board_embed_event`), so
+    // this is an aggregation of that table, not a `FINAL` read of the board.
+    if board.embed_access.is_withdrawn(
+        claims.iat.unwrap_or(f64::NEG_INFINITY),
+        claims.jti.as_deref(),
+    ) {
+        return Err(token_refused());
+    }
+    Ok((board, subject))
+}
+
 /// `POST /api/embed/data` — signed-embed (Metabase-style) dashboard data.
 pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     // `try { jwt = String((await req.json())?.jwt ?? "") } catch { /* ignore */ }`
     // — an unparseable body is swallowed, not a 400; it just yields an
     // empty jwt, which the emptiness check below rejects the normal way.
-    let jwt = serde_json::from_slice::<EmbedDataBody>(&body)
-        .ok()
-        .and_then(|b| b.jwt)
-        .filter(|s| !s.is_empty());
+    let parsed = serde_json::from_slice::<EmbedDataBody>(&body).ok();
+    let viewer_filters = parsed.as_ref().and_then(|b| b.filters.clone());
+    let jwt = parsed.and_then(|b| b.jwt).filter(|s| !s.is_empty());
     let Some(jwt) = jwt else {
         return (
             StatusCode::BAD_REQUEST,
@@ -152,53 +273,33 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         }
     };
 
-    let subject = match subject_of(&state.clickhouse, claims.resource.as_ref()).await {
-        Ok(Some(subject)) => subject,
-        Ok(None) => return token_refused(),
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
-        }
+    let (board, subject) = match admit(&state, &claims).await {
+        Ok(admitted) => admitted,
+        Err(refusal) => return refusal,
     };
-    let board_id = subject.board_id;
+    let board_id = subject.board_id.clone();
 
-    let board = match store::get_board(&state.clickhouse, &board_id, &Viewer::anonymous()).await {
-        Ok(b) => b,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(upstream_error::report_ch(&upstream_error::DATABASE, &err).to_json()),
-            )
-                .into_response();
-        }
-    };
-    let Some(board) = board.filter(|b| b.embed_enabled.unwrap_or(false)) else {
-        return (
-            StatusCode::FORBIDDEN,
-            ApiJson(json!({ "error": "embedding_disabled" })),
-        )
-            .into_response();
-    };
-    // SEC-12: withdrawal is read on every request — the board's embed events
-    // are aggregated on each read, with no cache in this process — so
-    // "withdraw all" and "withdraw one" take effect on the next request. A
-    // token with no `iat` cannot get here (`verify_embed` refuses it);
-    // `NEG_INFINITY` would be refused if it did.
-    // PR #201 review F SHOULD-FIX 4: the withdrawal is not read from the
-    // board row any more (it lives in `console.bi_board_embed_event`), so
-    // this is an aggregation of that table, not a `FINAL` read of the board.
-    if board.embed_access.is_withdrawn(
-        claims.iat.unwrap_or(f64::NEG_INFINITY),
-        claims.jti.as_deref(),
-    ) {
-        return token_refused();
+    // BI-26 (D3): the saved filters, each by its embed mode, then the viewer's
+    // values for the editable ones, then the token's values last.
+    if let Some(viewer) = &viewer_filters
+        && let Err(msg) = lakehouse_bi::filters::validate_filters(viewer)
+    {
+        return (StatusCode::BAD_REQUEST, ApiJson(json!({ "error": msg }))).into_response();
     }
-
-    let mut filters = board.filters.clone().unwrap_or_default();
-    filters.extend(params_to_filters(claims.params));
+    let resolved = match resolve_embed_filters(
+        board.filters.as_deref().unwrap_or_default(),
+        &board.embed_access,
+        claims.params.as_ref(),
+        viewer_filters.as_deref().unwrap_or_default(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(column) => {
+            // The log says which column; the response never does.
+            tracing::info!(%column, board = %board_id, "signed embed token refused: a locked filter has no value");
+            return token_refused();
+        }
+    };
+    let filters = resolved.filters;
 
     let time = match crate::routes::settings::time_context(&state).await {
         Ok(t) => t,
@@ -219,6 +320,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
         &filters,
         &time,
         subject.only_chart.as_deref(),
+        &resolved.editable,
     )
     .await;
     match payload {
@@ -499,6 +601,7 @@ pub async fn public_dashboard(
         &filters,
         &time,
         None,
+        &[],
     )
     .await;
     match payload {
@@ -572,11 +675,13 @@ async fn board_columns(
     charts: &[&StoredChartSpec],
     filters: &[FilterDef],
     fields: &lakehouse_bi::fields::FieldCatalog,
+    need_kinds: bool,
 ) -> Result<
     std::collections::HashMap<String, lakehouse_bi::builder::RelationColumns>,
     lakehouse_clickhouse::ChError,
 > {
-    let need_cols = filters.iter().any(FilterDef::is_active)
+    let need_cols = need_kinds
+        || filters.iter().any(FilterDef::is_active)
         || charts.iter().any(|c| {
             c.def.needs_columns()
                 || fields.chart_uses(&c.def)
@@ -612,6 +717,57 @@ fn tile_filters<'a>(
         board.layout.as_ref().unwrap_or(&no_tiles),
         chart_id,
     )
+}
+
+/// The charts a read covers: those of `board_id`, or only `only_chart` for a
+/// chart token (`BI-26` plan D1: a chart token reads that chart and no other).
+fn charts_of<'a>(
+    stored: &'a [StoredChartSpec],
+    board_id: &str,
+    only_chart: Option<&str>,
+) -> Vec<&'a StoredChartSpec> {
+    stored
+        .iter()
+        .filter(|c| {
+            only_chart.is_none_or(|only| c.spec.id == only)
+                && if c.board.is_empty() {
+                    board_id == "default"
+                } else {
+                    c.board == board_id
+                }
+        })
+        .collect()
+}
+
+/// A chart as the payload carries it, with `resolved` when its slots take a
+/// parameter. `BI-19` part A QA fix P3: the columns the parameters gave this
+/// read are sent as the dashboard payload sends them; without them the page
+/// read `{param}` measures as column names.
+fn rendered_chart(original: &StoredChartSpec, effective: &StoredChartSpec) -> Value {
+    let mut rendered = embed_rendered(original, effective);
+    if lakehouse_bi::params::changes_statement(&original.def) {
+        rendered["resolved"] = crate::routes::support::resolved_json(effective);
+    }
+    rendered
+}
+
+/// The `embedFilters` of a payload: for each editable column its kind (from the
+/// relation's columns, `null` when unknown) and the filter now applied to it.
+fn describe_editable(editable: &[String], fields: &[Value], filters: &[FilterDef]) -> Value {
+    let described: Vec<Value> = editable
+        .iter()
+        .map(|column| {
+            json!({
+                "column": column,
+                "kind": fields
+                    .iter()
+                    .find(|f| f["column"] == json!(column))
+                    .map_or(Value::Null, |f| f["kind"].clone()),
+                "filter": filters.iter().find(|f| &f.column == column),
+            })
+        })
+        .collect();
+    json!(described)
 }
 
 /// The `{ board, layout, charts, results }` payload of an embed or a public
@@ -699,6 +855,7 @@ async fn render_board_payload(
     filters: &[FilterDef],
     time: &lakehouse_bi::grain::TimeContext,
     only_chart: Option<&str>,
+    editable: &[String],
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let roles = [EMBED_VIEWER_ROLE.to_owned()];
     let placeholders = crate::sql_rewrite::PlaceholderValues::none();
@@ -706,20 +863,16 @@ async fn render_board_payload(
     // trash or on a personal board is not in it (BI-18 part C, part 2).
     let stored = store::list_stored_charts(ch, &Viewer::anonymous()).await?;
     let field_catalog = catalog_or_empty(ch).await;
-    let stored_for_board: Vec<&StoredChartSpec> = stored
-        .iter()
-        .filter(|c| {
-            // BI-26 (D1): a chart token reads that chart and no other.
-            only_chart.is_none_or(|only| c.spec.id == only)
-                && if c.board.is_empty() {
-                    board_id == "default"
-                } else {
-                    c.board == board_id
-                }
-        })
-        .collect();
+    let stored_for_board = charts_of(&stored, board_id, only_chart);
 
-    let cols = board_columns(ch, &stored_for_board, filters, &field_catalog).await?;
+    let cols = board_columns(
+        ch,
+        &stored_for_board,
+        filters,
+        &field_catalog,
+        !editable.is_empty(),
+    )
+    .await?;
 
     let mut results = serde_json::Map::new();
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
@@ -805,18 +958,17 @@ async fn render_board_payload(
             }
         }
 
-        let mut rendered = embed_rendered(original, c);
-        // BI-19 part A QA fix P3: a chart whose slots take a parameter is sent
-        // with the columns the parameters gave this read, as the dashboard
-        // payload does. Without it the public page read `{param}` measures as
-        // column names ("name.startsWith is not a function").
-        if lakehouse_bi::params::changes_statement(&original.def) {
-            rendered["resolved"] = crate::routes::support::resolved_json(c);
-        }
-        charts_out.push(rendered);
+        charts_out.push(rendered_chart(original, c));
     }
 
-    Ok(board_body(board, &charts_out, &results, time, only_chart))
+    let mut body = board_body(board, &charts_out, &results, time, only_chart);
+    // BI-26 (D4): the editable filters only (column, kind, current value).
+    // Locked and hidden filters are not described.
+    if !editable.is_empty() {
+        let fields = crate::routes::dashboard::filter_fields(&stored_for_board, &cols, &sources);
+        body["embedFilters"] = describe_editable(editable, &fields, filters);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -957,6 +1109,7 @@ mod typed_filters {
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -1104,6 +1257,7 @@ mod typed_filters {
             &filters,
             &lakehouse_bi::grain::TimeContext::default(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -1212,6 +1366,7 @@ mod typed_filters {
             &locked,
             &lakehouse_bi::grain::TimeContext::default(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -1312,6 +1467,7 @@ mod typed_filters {
             &[],
             &time,
             None,
+            &[],
         )
         .await
         .unwrap();

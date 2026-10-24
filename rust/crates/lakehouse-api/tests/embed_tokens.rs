@@ -176,6 +176,24 @@ impl FakeCh {
         }
     }
 
+    /// A `filter_modes` event for `board` (`BI-26`): the newest one is pushed last.
+    fn add_modes(&self, board: &str, modes: &Value) {
+        self.events.lock().unwrap().push(json!({
+            "board_id": board, "kind": "filter_modes", "revoked_before": "0",
+            "jti": "", "exp": "0", "origins_json": modes.to_string(),
+        }));
+    }
+
+    /// The statements that read the test mart's data.
+    fn tile_statements(&self) -> Vec<String> {
+        self.statements()
+            .into_iter()
+            .filter(|s| {
+                s.contains("mart_x") && s.contains("visitors") && !s.contains("system.columns")
+            })
+            .collect()
+    }
+
     /// A stored chart row (`BI-26`): `id` titled `title` on `board`.
     fn add_chart(&self, id: &str, board: &str, title: &str) {
         let spec = json!({
@@ -345,6 +363,14 @@ impl Respond for FakeCh {
         }
         if sql.contains("FROM console.bi_chart") {
             return rows(self.charts.lock().unwrap().clone());
+        }
+        // BI-26: the columns of the one mart the test charts read, so a filter
+        // on `region` reaches the tile's statement.
+        if sql.contains("FROM system.columns") {
+            return rows(vec![
+                json!({ "table": "mart_x", "name": "region", "type": "String" }),
+                json!({ "table": "mart_x", "name": "visitors", "type": "Int64" }),
+            ]);
         }
         ResponseTemplate::new(200).set_body_string(
             "Ok.
@@ -1161,4 +1187,171 @@ async fn a_chart_token_is_framed_and_withdrawn_through_its_charts_board() {
     // The same token cannot be withdrawn through another board.
     let (status, _) = revoke_one(&app, "dashboard:write", "b_other", &jwt).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── BI-26 T2: filter modes ─────────────────────────────────────────────
+
+const SAVED_BALI: &str = r#"[{"column":"region","op":"in","values":["Bali"]}]"#;
+
+/// A board with a saved `region = Bali` filter, one chart, and `modes` chosen.
+fn modal_board(modes: &Value) -> FakeCh {
+    let fake = FakeCh::new(&json!({ "filters_json": SAVED_BALI }));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    if !modes.is_null() {
+        fake.add_modes(BOARD, modes);
+    }
+    fake
+}
+
+async fn embed_with(app: &TestApp, jwt: &str, filters: Option<Value>) -> (StatusCode, Value) {
+    let mut body = json!({ "jwt": jwt });
+    if let Some(f) = filters {
+        body["filters"] = f;
+    }
+    send(
+        &app.router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/embed/data")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+fn token_with(params: Option<Value>) -> String {
+    let iat = (unix_now() - 5.0).floor();
+    sign_embed(
+        &EmbedClaims {
+            resource: Some(EmbedResource {
+                chart: None,
+                dashboard: Some(BOARD.to_owned()),
+            }),
+            params: params.map(|p| serde_json::from_value(p).unwrap()),
+            exp: Some(iat + 3600.0),
+            iat: Some(iat),
+            jti: None,
+        },
+        SECRET,
+    )
+}
+
+fn sql_has(fake: &FakeCh, needle: &str) -> bool {
+    fake.tile_statements().iter().any(|s| s.contains(needle))
+}
+
+#[tokio::test]
+async fn a_locked_filter_needs_its_value_in_the_token_and_the_refusal_is_the_fixed_one() {
+    let fake = modal_board(&json!({ "region": "locked" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_with(&app, &token_with(None), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "embed token is invalid or expired");
+    assert!(
+        !body.to_string().contains("region"),
+        "the column is not named: {body}"
+    );
+    assert!(fake.tile_statements().is_empty(), "nothing was read");
+
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(sql_has(&fake, "Bali"));
+    assert!(
+        body.get("embedFilters").is_none(),
+        "a locked filter is not described"
+    );
+}
+
+#[tokio::test]
+async fn an_editable_filter_takes_the_viewers_value_and_is_described() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let first = app(&ch, Some(SECRET)).await;
+
+    let (status, body) = embed_with(
+        &first,
+        &token_with(None),
+        Some(json!([{ "column": "region", "op": "in", "values": ["Java"] }])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        sql_has(&fake, "Java") && !sql_has(&fake, "Bali"),
+        "{:?}",
+        fake.tile_statements()
+    );
+    let described = body["embedFilters"].as_array().unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0]["column"], "region");
+    assert_eq!(described[0]["filter"]["values"], json!(["Java"]));
+
+    // Without a viewer value the saved one applies.
+    let fake2 = modal_board(&json!({ "region": "editable" }));
+    let ch2 = fake2.serve().await;
+    let app2 = app(&ch2, Some(SECRET)).await;
+    let (status, _) = embed_with(&app2, &token_with(None), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(sql_has(&fake2, "Bali"));
+}
+
+#[tokio::test]
+async fn a_viewer_value_for_a_hidden_or_locked_column_is_dropped_and_a_token_value_wins() {
+    let java = json!([{ "column": "region", "op": "in", "values": ["Java"] }]);
+    for (modes, params) in [
+        (json!({ "region": "hidden" }), None),
+        (Value::Null, None), // no mode chosen: hidden
+        (
+            json!({ "region": "locked" }),
+            Some(json!({ "region": "Bali" })),
+        ),
+        // editable, but the token set it: decision 7, the token wins.
+        (
+            json!({ "region": "editable" }),
+            Some(json!({ "region": "Bali" })),
+        ),
+    ] {
+        let fake = modal_board(&modes);
+        let ch = fake.serve().await;
+        let app = app(&ch, Some(SECRET)).await;
+        let (status, body) = embed_with(&app, &token_with(params), Some(java.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{modes}: {body}");
+        assert!(sql_has(&fake, "Bali"), "{modes}");
+        assert!(
+            !sql_has(&fake, "Java"),
+            "{modes}: the viewer's value was applied"
+        );
+        assert!(body.get("embedFilters").is_none(), "{modes}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_old_token_that_locks_a_column_that_is_no_filter_still_narrows() {
+    // BI-26-AC7: no saved filter, no mode; the token's params apply as before.
+    let fake = FakeCh::new(&json!({}));
+    fake.add_chart("u_one", BOARD, "Visitors by region");
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let (status, body) =
+        embed_with(&app, &token_with(Some(json!({ "region": "Bali" }))), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(sql_has(&fake, "Bali"));
+}
+
+#[tokio::test]
+async fn an_invalid_viewer_filter_is_a_400() {
+    let fake = modal_board(&json!({ "region": "editable" }));
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let (status, body) = embed_with(
+        &app,
+        &token_with(None),
+        Some(json!([{ "column": "bad column!", "op": "in", "values": ["x"] }])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(fake.tile_statements().is_empty());
 }
