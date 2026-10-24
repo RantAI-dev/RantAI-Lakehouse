@@ -5,6 +5,7 @@ import * as React from "react"
 import { useDebouncedCallback } from "@/hooks/use-debounced-callback"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { readDraft, writeDraft } from "@/lib/query-draft"
+import { newRunId } from "@/lib/run-id"
 import { hasStatement } from "@/lib/sql-text"
 import { assetService, queryService } from "@/services"
 import { toServiceError, type ServiceError } from "@/services/errors"
@@ -60,9 +61,27 @@ export function useQueryStudio() {
   const estimateAct = useServiceAction((signal, s: string) =>
     queryService.estimate(s, signal)
   )
-  const runAct = useServiceAction((signal, s: string, runEngine: QueryEngine) =>
-    queryService.run(s, { engine: runEngine }, signal)
-  )
+  // BI-5 (plan D5): each run has an id the server can end by name; Stop sends it. A Trino run
+  // has none to send: the built-in engine is the only one that can stop a query (feature page).
+  const runningRef = React.useRef<{ runId: string; engine: QueryEngine } | null>(null)
+  const runAct = useServiceAction((signal, s: string, runEngine: QueryEngine) => {
+    const runId = newRunId()
+    runningRef.current = { runId, engine: runEngine }
+    return queryService.run(s, { engine: runEngine, runId }, signal)
+  })
+  const cancelRun = runAct.cancel
+  /**
+   * Stop: ask the server to end the run's queries on the engine, then abort the
+   * request. The cancel call is best effort (the route lands with T4 of the BI-5
+   * plan; until then it answers 404): Stop always aborts, so the page never waits
+   * on a query the person gave up on.
+   */
+  const stopRun = React.useCallback(() => {
+    const running = runningRef.current
+    runningRef.current = null
+    if (running && running.engine === "clickhouse") void queryService.cancel(running.runId).catch(() => undefined)
+    cancelRun()
+  }, [cancelRun])
   const saveAct = useServiceAction((signal, input: SaveQueryInput) =>
     queryService.saveQuery(input, signal)
   )
@@ -266,6 +285,7 @@ export function useQueryStudio() {
     generateAct,
     estimateAct,
     runAct,
+    stopRun,
     saveAct,
     savedState,
     historyState,

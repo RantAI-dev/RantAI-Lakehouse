@@ -38,6 +38,7 @@ export function SqlPanel({
     setEngine,
     sqlSchema,
     runAct,
+    stopRun,
     estimateAct,
     estimatable,
     runQuery,
@@ -82,7 +83,12 @@ export function SqlPanel({
           {running ? "Running…" : "Run query"}
         </Button>
         {running ? (
-          <Button size="sm" variant="outline" onClick={runAct.cancel}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={stopRun}
+            title={engine === "trino" ? "Stops the page waiting; the query keeps running on Trino." : "Ends the query on the engine and stops the page waiting."}
+          >
             <Square className="size-4" aria-hidden />
             Stop
           </Button>
