@@ -708,7 +708,15 @@ async fn render_board_payload(
             }
         }
 
-        charts_out.push(embed_rendered(original, c));
+        let mut rendered = embed_rendered(original, c);
+        // BI-19 part A QA fix P3: a chart whose slots take a parameter is sent
+        // with the columns the parameters gave this read, as the dashboard
+        // payload does. Without it the public page read `{param}` measures as
+        // column names ("name.startsWith is not a function").
+        if lakehouse_bi::params::changes_statement(&original.def) {
+            rendered["resolved"] = crate::routes::support::resolved_json(c);
+        }
+        charts_out.push(rendered);
     }
 
     Ok(board_body(board, &charts_out, &results, time))

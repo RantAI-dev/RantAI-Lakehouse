@@ -99,4 +99,20 @@ describe("a public link in the browser (BI-19 part A)", () => {
     expect(refusalMessage("wrong")).toBe("That password did not work.")
     expect(refusalMessage("error")).toContain("Could not check")
   })
+
+  // BI-19 part A QA fix P3: the public page's tile path with a metric measure
+  // and a parameter measure, as "Copy of Map demo" holds them.
+  it("renders a tile whose measures are a metric and a parameter slot", async () => {
+    const chart = {
+      id: "c_k", kind: "kpi", title: "Visitors", source: "stored", board: "b_1", x: "", y: ["total_visitors_demo", "sum_which"],
+      def: { kind: "kpi", measures: [{ metric: "total_visitors_demo" }, { aggregate: "sum", column: { param: "which" } }] },
+    }
+    stub(() => json({
+      board: { id: "b_1", name: "Map demo" }, layout: {}, charts: [chart],
+      results: { c_k: { columns: ["v"], rows: [{ v: 7 }], metricLabels: { total_visitors_demo: "Total visitors" } } },
+    }))
+    render(<PublicDashboard token="p_param" />)
+    await screen.findByText("Visitors")
+    expect(screen.queryByText(/went wrong/i)).toBeNull()
+  })
 })

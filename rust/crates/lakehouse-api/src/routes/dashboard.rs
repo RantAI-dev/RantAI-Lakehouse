@@ -540,12 +540,7 @@ async fn get_body(
         if let Ok(e) = &effective
             && lakehouse_bi::params::changes_statement(&c.def)
         {
-            rendered["resolved"] = json!({
-                "dimension": e.def.dimension,
-                "breakdown": e.def.breakdown,
-                "measures": e.def.measures,
-                "limit": e.def.limit_value(),
-            });
+            rendered["resolved"] = crate::routes::support::resolved_json(e);
         }
         charts_out.push(rendered);
     }
