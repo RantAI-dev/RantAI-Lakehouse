@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
 import { Toaster } from "@rantai/design-system/ui/sonner";
@@ -7,8 +8,24 @@ import { AppFrame } from "@/components/app-shell/app-frame";
 import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
 import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
+import { NONCE_HEADER } from "@/lib/csp";
 import { dashboardFontVariables } from "./fonts";
 import "./globals.css";
+
+/**
+ * `SEC-47`: every route renders per request.
+ *
+ * The console's `Content-Security-Policy` carries a fresh nonce for each
+ * request (`src/proxy.ts`, `src/lib/csp.ts`), and Next applies that nonce to
+ * its own inline bootstrap and chunks only while it renders a page for a
+ * request. A page prerendered at build time has no nonce in its scripts, and
+ * with `script-src 'strict-dynamic'` a browser refuses every one of them, so
+ * the console would not hydrate at all. Reading the nonce below already makes
+ * a route request-rendered; this export states the requirement itself, so
+ * moving the theme provider does not quietly turn pages static again. It is
+ * the price of a nonce policy: no static shell, no CDN page cache.
+ */
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Rantai Lake",
@@ -35,11 +52,16 @@ export const metadata: Metadata = {
  * Note: This is a server component — keep the body free of client-only state.
  * Theme class (`dark` / light) is applied by next-themes on `<html>`.
  */
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // `SEC-47`: Next applies the request's nonce to its own scripts on its own;
+  // `next-themes` renders one inline script of its own (the theme class before
+  // first paint) and only a nonce passed here lets the browser run it. Without
+  // it the page paints light and only switches after hydration.
+  const nonce = (await headers()).get(NONCE_HEADER) ?? undefined;
   return (
     <html
       lang="en"
@@ -58,7 +80,7 @@ export default function RootLayout({
           showed as a permanent "1 Issue". This only covers <body>'s own
           attributes, never a mismatch inside it. */}
       <body suppressHydrationWarning>
-        <ThemeProvider>
+        <ThemeProvider nonce={nonce}>
           <TooltipProvider>
             <AuthProvider>
               <TableProviders>
