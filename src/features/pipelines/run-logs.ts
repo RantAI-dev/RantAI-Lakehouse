@@ -5,8 +5,12 @@
  * The run record (`PipelineRun`) carries no error text: `run_to_json`
  * sends no `error` for a Dagster run. The reason a run failed therefore
  * lives only in its log, as `ERROR` events. `failureLines` picks those out
- * so the inspector can show the engine's own words. It never writes a
- * summary of its own.
+ * for the log viewer, which shows the engine's own words.
+ *
+ * `classifiedFailureReason` is the narrower one the page may present AS
+ * THE REASON (BLD-8 / decision 6): only the descriptions this product
+ * raises itself, never whatever a driver or a Python traceback said. See
+ * its own doc comment.
  */
 import type { PipelineRunLogsPage } from "@/services/contracts/pipelines"
 
@@ -71,6 +75,38 @@ export function failureLines(lines: readonly LogLine[], max = 3): LogLine[] {
   const errors = lines.filter((l) => levelRank(l.level) >= 3 && l.message.trim() !== "")
   const specific = errors.filter((l) => !GENERIC_FAILURE.test(l.message))
   return (specific.length > 0 ? specific : errors).slice(0, max)
+}
+
+/**
+ * BLD-8 / decision 6: the fixed failure reason the pipeline page may show.
+ *
+ * A failed authored run's log carries two kinds of error text. Ours: the
+ * descriptions this product's own code raised -- `authored_factory`'s
+ * `Failure("authored pipeline ... config rejected: <reason>")` and the
+ * enforcement refusal `Failure("... refused: <reason>")`. Their `<reason>`
+ * is a constant written here (`BRONZE_TARGET_REFUSED_REASON`,
+ * `CONNECTOR_SOURCE_NOT_BRONZE_REASON`, the policy engine's fixed
+ * message), so it is safe to show and is the one thing that tells the
+ * author what to fix. Everything else in the log is upstream text
+ * (ClickHouse, `requests`, a Python traceback), which the API never puts
+ * in a response (`AGENTS.md` principle 4) and the page must not present as
+ * the reason either.
+ *
+ * Returns the classified sentence (from the marker to the end of that
+ * line, so the pipeline id in front of it is dropped) or `null` when the
+ * log holds none -- the caller then says "The run failed; see the run log".
+ */
+const OUR_REASON = /(config rejected:|refused:)\s*([^"]*)/
+
+export function classifiedFailureReason(lines: readonly LogLine[]): string | null {
+  for (const line of failureLines(lines, 6)) {
+    const match = OUR_REASON.exec(line.message)
+    // `Failure(description="…")` puts the description in a quoted string,
+    // so the capture stops at the closing quote rather than carrying it.
+    const reason = `${match?.[1] ?? ""} ${match?.[2] ?? ""}`.trim()
+    if (match?.[1] && match[2]?.trim()) return reason
+  }
+  return null
 }
 
 /** "+00:03.214" from the run's start, "+1:02:03.000" past an hour. */
