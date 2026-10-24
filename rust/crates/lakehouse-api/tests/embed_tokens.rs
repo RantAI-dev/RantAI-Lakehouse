@@ -1543,3 +1543,48 @@ async fn the_sample_token_carries_the_chart_when_asked_and_the_locked_values_it_
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(one["onlyChart"], "u_one");
 }
+
+#[tokio::test]
+async fn a_locked_or_token_set_editable_value_replaces_the_saved_one_and_a_hidden_one_is_anded() {
+    // BI-26 review fix (BLOCKER) R1. Saved `region = Bali`, the token says Java.
+    for (modes, token_region, replaced) in [
+        (json!({ "region": "locked" }), "Java", true),
+        (json!({ "region": "editable" }), "Java", true),
+        (json!({ "region": "hidden" }), "Java", false),
+    ] {
+        let fake = modal_board(&modes);
+        let ch = fake.serve().await;
+        let app = app(&ch, Some(SECRET)).await;
+        let params = json!({ "region": token_region });
+        let (status, body) = embed_with(&app, &token_with(Some(params)), None).await;
+        assert_eq!(status, StatusCode::OK, "{modes}: {body}");
+        assert!(
+            sql_has(&fake, "Java"),
+            "{modes}: the token's value is applied"
+        );
+        assert_eq!(
+            sql_has(&fake, "Bali"),
+            !replaced,
+            "{modes}: the saved Bali predicate is {} the statement",
+            if replaced { "gone from" } else { "still in" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_dropdown_of_another_filter_sees_the_tokens_value_not_the_saved_one() {
+    // BI-26 review fix (BLOCKER) R1, in the values route: `year` is locked and
+    // saved as 2024; the token says 2025.
+    let fake = dropdown_board();
+    let ch = fake.serve().await;
+    let app = app(&ch, Some(SECRET)).await;
+    let jwt = token_with(Some(json!({ "year": "2025" })));
+    let (status, body) = embed_values(&app, &jwt, "region").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = value_statements(&fake);
+    assert!(
+        sent[0].contains("2025") && !sent[0].contains("2024"),
+        "{}",
+        sent[0]
+    );
+}

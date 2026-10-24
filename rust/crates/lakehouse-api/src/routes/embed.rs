@@ -86,6 +86,7 @@ struct ResolvedFilters {
 ///
 /// - `locked`: the token must name the column, else the read is refused
 ///   (`Err(column)`; feature decision 6). A forgotten value never shows all rows.
+///   The token's value replaces the saved filter on that column (R1).
 /// - `editable`: the viewer's value replaces the saved one; with none the saved
 ///   value applies.
 /// - `hidden` (and a column nobody chose a mode for): the saved value applies.
@@ -123,7 +124,23 @@ fn resolve_embed_filters(
             editable.push(f.column.clone());
         }
     }
-    let mut filters: Vec<FilterDef> = saved.to_vec();
+    // BI-26 review fix (BLOCKER) R1: for a locked column, and an editable one
+    // the token sets, the token's value REPLACES the saved filter. Left in
+    // place, the saved value was ANDed with the token's: a board saved with
+    // `Bali` and a token for `Java` showed nothing, and a locked filter could
+    // never show a value outside the saved one. A hidden column keeps being
+    // ANDed with the saved filter, so tokens signed before filter modes (which
+    // lock a column that is hidden or no filter at all) read exactly as before.
+    let mut filters: Vec<FilterDef> = saved
+        .iter()
+        .filter(|f| {
+            let replaced = !f.column.is_empty()
+                && token_sets(&f.column)
+                && matches!(mode_of(f), FilterMode::Locked | FilterMode::Editable);
+            !replaced
+        })
+        .cloned()
+        .collect();
     for v in viewer {
         if v.column.is_empty() || !editable.contains(&v.column) {
             tracing::info!(column = %v.column, "a viewer filter value for a column that is not editable was dropped");
